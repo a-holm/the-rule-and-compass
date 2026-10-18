@@ -355,6 +355,45 @@ rcsr --data data.csv --target y --vars x1,x2
 # constant errors (rank 5): 1.013675±1.33e-7 (rel 1.31e-7), 2.495876±1.33e-7 (rel 5.32e-8) | dof=28
 ```
 
+### 3.11 Stability selection — implemented
+
+A real relationship is **rediscovered** when the data is resampled; a fit to
+noise is a lottery winner. `--stability B` bootstraps the training rows `B`
+times (with replacement), re-runs the **identical** search on each resample, and
+counts what comes back:
+
+* how often each **structural form** is selected, and
+* how often each **input variable** appears.
+
+The form is the expression with every fitted constant collapsed to `c`, so
+`c + c·x`, `c − c·x` and `c·(c + x)` count as one law — they are the same family
+with different free constants. Polynomials are compared by the terms they
+contain; anything non-polynomial (`sin`, `exp`, division by a variable, `if`, …)
+falls back to its structural shape. The representative of each resample is the
+model the search would **recommend**: the Pareto member with the lowest
+held-out error. Picking by training error would let a spurious term win by a
+numerical hair, which is the very failure this check exists to expose.
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2 --stability 8
+# stability (8 resamples, 8 found a solution): modal form 88%  y = (0.7536 + (2.285 * x1))
+#   variable selection: x1 8/8 (100%) | x2 0/8 (0%)
+#   forms: 7/8 (88%) (0.7536 + (2.285 * x1)) | 1/8 (12%) (2.285 * x1)
+```
+
+How to read it:
+
+* a variable at or near **100%** is one the data insists on; a variable well
+  below is one the search only sometimes needs — usually noise;
+* the **modal form's** frequency is the honest confidence in the *shape* of the
+  answer, not just in its error;
+* every reported solution carries `stability`, its own form's frequency, so a
+  low-error solution that no resample reproduced is visibly a coincidence;
+* the whole summary is reproducible from `--seed`.
+
+Cost: `B` extra searches, so it is opt-in and best used on the final candidate
+set rather than inside a tuning loop.
+
 ## 4. What `rcsr` reports today
 
 Every solution carries:
@@ -369,6 +408,7 @@ Every solution carries:
 | `durbin_watson` | residual autocorrelation in row order (≈2 clean) |
 | `overfit_index` | `test_error / train_error` |
 | `constant_errors` | per-constant standard error and relative uncertainty, plus an `ill_conditioned` flag for unidentified constants (§3.10) |
+| `stability` | fraction of `--stability` resamples that selected this same structural form (§3.11); `null` when the flag is off |
 
 and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
@@ -377,7 +417,9 @@ verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
 `relative_overfitting`, `weight` and `estimate` values of §3.9. With `--cv
 <scheme>`, a top-level `cross_validation` object reports the scheme, `k`, the
 `mean_train_error`, `mean_test_error` and `std_test_error`, and the per-fold
-`train_error` / `test_error` / `complexity` / `expression`.
+`train_error` / `test_error` / `complexity` / `expression`. With `--stability
+B`, a top-level `stability` object carries the runs, how many found a solution,
+and the ranked `forms` and `variables` with their counts and frequencies.
 
 Alongside the front, `rcsr` reports:
 
@@ -397,8 +439,6 @@ Alongside the front, `rcsr` reports:
 
 ## 5. Not yet implemented (on the roadmap)
 
-* **Bootstrap and seed stability** — how often the same form reappears
-  (stability selection).
 * **Units / dimensional consistency** as a structural constraint.
 * **Beta / variance-ratio drift tests**, and a **White** general
   heteroscedasticity test (more regressors than just the fitted value).

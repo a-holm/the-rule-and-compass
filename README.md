@@ -165,7 +165,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--gap-break f] [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
-     [--eval-expr expr]
+     [--stability B] [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
@@ -270,6 +270,7 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 | `null_control` | could the search have produced this from noise? |
 | `bootstrap_error` | apparent, out-of-bag and .632+ error estimates (`--bootstrap-error`) |
 | `cross_validation` | mean and spread of held-out error over `k` folds (`--cv`) |
+| `stability` | how often each form and variable is selected on resampled rows (`--stability`) |
 
 The null baselines are fit on the training rows and scored on the training rows
 and the test folds in the search's own metric: a model that does not beat the
@@ -294,6 +295,12 @@ alone) and reports the mean and spread of the held-out error, so a single lucky
 split cannot flatter the answer. Use `rolling` for time series (it never trains
 on the future) and `purged` to embargo `--gap` rows around each test block. It
 costs about `k` extra searches.
+
+`--stability B` asks the question that matters most: **does the same law come
+back?** It bootstraps the training rows `B` times, re-runs the identical search
+on each resample and ranks the structural forms and input variables by how often
+they are selected. A variable at 100% is one the data insists on; one near 0% is
+noise the search only sometimes needed. Cost: `B` extra searches.
 
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
@@ -356,8 +363,10 @@ list and the recorded results.
   Breusch–Pagan, skewness/kurtosis) reported automatically, plus a
   `--null-runs` permutation control that runs the identical search on shuffled
   targets, a `--bootstrap-error` `.632+` bootstrap estimate that refits each
-  solution's constants on resamples, and `--cv` cross-validation (`k-fold`,
-  `rolling`, `purged`) that reports the mean and spread of the held-out error;
+  solution's constants on resamples, `--cv` cross-validation (`k-fold`,
+  `rolling`, `purged`) that reports the mean and spread of the held-out error,
+  and `--stability` bootstrap selection that ranks forms and variables by how
+  often they are rediscovered;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 

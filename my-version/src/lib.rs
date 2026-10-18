@@ -14,3 +14,4 @@ pub mod pareto;
 pub mod parse;
 pub mod rng;
 pub mod search;
+pub mod stability;
