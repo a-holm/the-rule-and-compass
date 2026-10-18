@@ -391,11 +391,29 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
     *isl = next;
 }
 
+/// A user-provided starting expression, after simplification, constant fitting
+/// and evaluation on the training sample.
+///
+/// The tree is in the search's own (normalised input) space. Callers that show
+/// formulas to a person should denormalise it first, exactly as they do for an
+/// archive entry.
+#[derive(Clone, Debug)]
+pub struct SeedResult {
+    pub tree: Node,
+    /// Configured complexity from [`Config::complexity_model`].
+    pub complexity: f64,
+    /// Training error under [`Config::metric`].
+    pub error: f64,
+}
+
 pub struct Outcome {
     pub archive: Archive,
     pub test_errors: Vec<f64>,
     pub generations: usize,
     pub converged_early: bool,
+    /// The seeds that were accepted, in command-line order. Empty when the run
+    /// was not seeded.
+    pub seeds: Vec<SeedResult>,
 }
 
 /// Run a search once, from a fresh start.
@@ -403,7 +421,22 @@ pub struct Outcome {
 /// This is the historical entry point. It delegates to [`run_resumable`] with
 /// no checkpoint and no callback, so its behaviour is unchanged bit for bit.
 pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
-    run_search(cfg, train, test, None, 0, None)
+    run_search(cfg, train, test, None, 0, &[], None)
+        .unwrap_or_else(|e| panic!("search failed: {}", e))
+}
+
+/// Run a search from a fresh start with prior solutions injected.
+///
+/// Every seed is simplified, its constants are fitted on the training sample
+/// and its error is evaluated before the first generation. It is then inserted
+/// into the archive and into the initial population of **every** island, so an
+/// island keeps the seed until migration even when it would not have found it
+/// itself. Structurally identical seeds are inserted once.
+///
+/// A seed is an elite: it is inserted even when its complexity exceeds
+/// `cfg.max_complexity`, which otherwise limits generated offspring only.
+pub fn run_seeded(cfg: &Config, train: &Sample, test: &Sample, seeds: &[Node]) -> Outcome {
+    run_search(cfg, train, test, None, 0, seeds, None)
         .unwrap_or_else(|e| panic!("search failed: {}", e))
 }
 
@@ -425,6 +458,32 @@ pub fn run_resumable(
     test: &Sample,
     resume: Option<Checkpoint>,
     save_every: usize,
+    on_checkpoint: impl FnMut(&Checkpoint),
+) -> Result<Outcome, String> {
+    run_resumable_seeded(
+        cfg,
+        train,
+        test,
+        resume,
+        save_every,
+        &[],
+        on_checkpoint,
+    )
+}
+
+/// [`run_resumable`] with prior solutions injected, exactly as
+/// [`run_seeded`] describes.
+///
+/// Seeds are not part of the checkpoint format: on resume they are added to
+/// the loaded populations and archive, so a caller that wants the identical
+/// resumed trajectory should not pass them again.
+pub fn run_resumable_seeded(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    resume: Option<Checkpoint>,
+    save_every: usize,
+    seeds: &[Node],
     mut on_checkpoint: impl FnMut(&Checkpoint),
 ) -> Result<Outcome, String> {
     run_search(
@@ -433,6 +492,7 @@ pub fn run_resumable(
         test,
         resume,
         save_every,
+        seeds,
         Some(&mut on_checkpoint),
     )
 }
@@ -489,12 +549,46 @@ fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
     }
 }
 
+/// Simplify each seed, fit its constants on the training sample and evaluate
+/// it, in that order. A seed that is structurally identical to an earlier one
+/// (after simplification and again after fitting) is dropped: the archive and
+/// every island need it once.
+fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
+    let mut out: Vec<Ind> = Vec::new();
+    // Two sets: one for the simplified input form (so a repeated line is
+    // dropped even before fitting) and one for the fitted tree (so two
+    // different starts that converge to the same expression count once).
+    let mut seen_input: HashSet<u64> = HashSet::new();
+    let mut seen_fitted: HashSet<u64> = HashSet::new();
+    for seed in seeds {
+        let mut tree = expr::simplify(seed);
+        if !seen_input.insert(expr::structural_hash(&tree)) {
+            continue;
+        }
+        if cfg.fit_iters > 0 {
+            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+            tree = expr::simplify(&tree);
+        }
+        if !seen_fitted.insert(expr::structural_hash(&tree)) {
+            continue;
+        }
+        out.push(Ind::evaluated(
+            tree,
+            train,
+            cfg.metric,
+            &cfg.complexity_model,
+        ));
+    }
+    out
+}
+
 fn run_search(
     cfg: &Config,
     train: &Sample,
     test: &Sample,
     resume: Option<Checkpoint>,
     save_every: usize,
+    seeds: &[Node],
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
@@ -605,6 +699,50 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
+    }
+
+    // ---- seeded solutions (issue #16) ---------------------------------
+    // Process every seed once: simplify, fit constants on the training
+    // sample, evaluate its error, then insert it into the archive and into
+    // every island's initial population. Seeds are elites: they are inserted
+    // even above `max_complexity`, which only limits generated offspring.
+    let mut seed_results: Vec<SeedResult> = Vec::new();
+    if !seeds.is_empty() {
+        // The population is being inserted before generation 0, whose subset
+        // (if any) already scores the initial individuals; use the same sample
+        // so every individual competes on identical rows.
+        let init_sample = training_for_generation(cfg, train, 0);
+        let init_train = init_sample.as_ref().unwrap_or(train);
+        for (k, ind) in prepare_seeds(cfg, train, seeds).into_iter().enumerate() {
+            archive.try_insert(Sol {
+                complexity: expr::complexity(&ind.tree),
+                cost: ind.complexity,
+                tree: ind.tree.clone(),
+                error: ind.error,
+            });
+            if k < cfg.pop {
+                let in_pop = if init_sample.is_some() {
+                    Ind::evaluated(
+                        ind.tree.clone(),
+                        init_train,
+                        cfg.metric,
+                        &cfg.complexity_model,
+                    )
+                } else {
+                    ind.clone()
+                };
+                for pop in islands.iter_mut() {
+                    if k < pop.len() {
+                        pop[k] = in_pop.clone();
+                    }
+                }
+            }
+            seed_results.push(SeedResult {
+                tree: ind.tree,
+                complexity: ind.complexity,
+                error: ind.error,
+            });
+        }
     }
 
     if !converged_early {
@@ -846,5 +984,56 @@ fn run_search(
         test_errors,
         generations: gens_done,
         converged_early,
+        seeds: seed_results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{constant, input, node, Op};
+
+    /// `y = x0` on a small grid, two inputs.
+    fn sample() -> Sample {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..21 {
+            let a = -1.0 + 2.0 * i as f64 / 20.0;
+            x.push(vec![a, 0.5 * a + 1.0]);
+            y.push(a);
+        }
+        Sample { x, y, w: Vec::new() }
+    }
+
+    #[test]
+    fn prepare_seeds_simplifies_fits_and_dedupes() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.fit_iters = 8;
+        // A deliberately wrong constant on the right shape.
+        let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let accepted = prepare_seeds(&cfg, &s, &[seed.clone(), seed]);
+        assert_eq!(accepted.len(), 1, "a repeated seed is inserted once");
+        assert!(
+            accepted[0].error < 1e-12,
+            "the constant must be fitted, error = {}",
+            accepted[0].error
+        );
+        let shown = expr::to_string(&accepted[0].tree, &["x".to_string()]);
+        assert!(
+            !shown.contains("3 *"),
+            "the fitted constant must replace 3, got {}",
+            shown
+        );
+    }
+
+    #[test]
+    fn prepare_seeds_respects_no_fit() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.fit_iters = 0;
+        let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let accepted = prepare_seeds(&cfg, &s, &[seed]);
+        assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
+    }
 }
