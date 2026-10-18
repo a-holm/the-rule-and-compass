@@ -169,6 +169,7 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
+     [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
@@ -289,6 +290,42 @@ The report says what ran, one commented line per active transformation:
 `--json` carries the same numbers in a `preparation` object (methods, filled /
 dropped / smoothed / filtered counts), and `--ndjson` emits a `preparation`
 event when something is active.
+
+### Boolean and categorical variables
+
+Real tables mix continuous measurements with switches and labels. `--dtype`
+says what each input is:
+
+| kind | meaning |
+|---|---|
+| `continuous` (default) | a number, centred and scaled on the training rows |
+| `boolean` | a `0`/`1` switch; validated, and **never** standardised |
+| `categorical` | a text or low-cardinality numeric label; expanded to one-hot `col=value` boolean indicators |
+
+```sh
+# x1 AND NOT x2, from two 0/1 switches
+rcsr --data and_not.csv --target y --dtype x1=boolean,x2=boolean \
+     --ops and,not
+
+# One indicator per symbol, all levels kept and sorted
+rcsr --data panel.csv --target next_close --dtype symbol=categorical
+```
+
+A boolean column must contain only `0`/`1`; any other value is a usage-level
+data error naming the row and the value. It is not centred or scaled, because
+the evaluator's truthiness rule (`> 0` is true) and comparisons such as
+`flag == 1` depend on the literal `0`/`1`. Categorical levels are the distinct
+values in the **whole table**, sorted (numerically when they are numbers,
+lexicographically otherwise), with missing cells as the final
+`col=<missing>` level. `--max-levels N` (default 16) refuses a column with too
+many levels rather than silently creating a huge input set. All levels are
+kept: the search selects terms, so it does not need a dropped reference level.
+
+`--json` reports the result as
+`"variables_detail":[{"name":"flag","dtype":"boolean","source":null}, ...]`,
+and the text log prints `# variables: flag (boolean), ...`. See
+[`docs/variable-types.md`](docs/variable-types.md) for the exact rules, why
+boolean columns bypass normalisation, and the `x1 AND NOT x2` truth table.
 
 ### Weighing rows
 
@@ -538,6 +575,7 @@ docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
+docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results

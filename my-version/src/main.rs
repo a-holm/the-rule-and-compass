@@ -69,6 +69,12 @@ INPUT:
   --target <col>             name of the target column
   --vars <a,b,..>            input columns (default: all numeric columns except
                              the target and any --time/--group-by column)
+  --dtype <col>=<kind>,..    per-variable datatype: continuous (default),
+                             boolean (0/1, never standardised) or categorical
+                             (expanded to one-hot columns named col=value).
+                             Example: --dtype flag=boolean,symbol=categorical
+  --max-levels <N>           maximum distinct values in a categorical column
+                             before one-hot expansion (default 16)
   --test-frac <f>            held-out fraction (default 0.25)
 
 ROW WEIGHTS:
@@ -239,6 +245,8 @@ fn schema() -> String {
         ("--data", "string", "none", "table path, or '-' for stdin"),
         ("--target", "string", "none", "target column name"),
         ("--vars", "csv", "all-except-target", "input column names"),
+        ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),
+        ("--max-levels", "int", "16", "maximum distinct values in a categorical column"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
@@ -340,6 +348,27 @@ fn jnum(v: f64) -> String {
     } else {
         "null".to_string()
     }
+}
+
+/// The `variables_detail` array shared by `--json`, `--ndjson` and
+/// `--eval-expr`: one object per search input with its datatype. A one-hot
+/// indicator also reports its source column.
+fn variables_detail_json(types: &[data::VariableDType]) -> String {
+    types
+        .iter()
+        .map(|v| {
+            format!(
+                "{{\"name\":{},\"dtype\":{},\"source\":{}}}",
+                jstr(&v.name),
+                jstr(v.dtype.name()),
+                v.source
+                    .as_ref()
+                    .map(|s| jstr(s))
+                    .unwrap_or_else(|| "null".to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Parse a boolean row expression (`--filter`, `--exclude`, `--train-select`,
@@ -462,6 +491,8 @@ fn main() {
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
+    let mut dtype_src: Option<String> = None;
+    let mut max_levels = 16usize;
     let mut test_frac = 0.25;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
@@ -518,6 +549,17 @@ fn main() {
                     .map(|x| x.trim().to_string())
                     .filter(|x| !x.is_empty())
                     .collect();
+            }
+            "--dtype" => dtype_src = Some(val!()),
+            "--max-levels" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => max_levels = n,
+                    _ => {
+                        eprintln!("error: --max-levels needs an integer >= 1, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             "--metric" => {
                 let v = val!();
@@ -840,6 +882,7 @@ fn main() {
 
     // Default inputs: numeric columns that are neither the target nor a
     // split-only column.
+    let vars_explicit = !vars.is_empty();
     if vars.is_empty() {
         vars = (0..table.names.len())
             .filter(|&j| {
@@ -851,6 +894,58 @@ fn main() {
             })
             .map(|j| table.names[j].clone())
             .collect();
+    }
+
+    // Per-variable datatypes (issue #5). A declared datatype is also a request
+    // to use the column as an input: when --vars was omitted, a text
+    // categorical column is added to the defaults. An explicit --vars wins, and
+    // naming a column that is not in it is a usage error rather than a silent
+    // addition.
+    let dtype_spec = match dtype_src.as_deref() {
+        Some(s) => match data::parse_dtype_spec(s) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        None => Vec::new(),
+    };
+    for (name, _) in &dtype_spec {
+        if name == &target {
+            eprintln!(
+                "error: column '{}' is the target; --dtype applies to input variables",
+                name
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        let j = match table.index_of(name) {
+            Ok(j) => j,
+            Err(_) => {
+                eprintln!(
+                    "error: unknown --dtype column '{}' (columns: {:?})",
+                    name, table.names
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        };
+        if Some(j) == time_col || Some(j) == group_col || Some(j) == weight_col {
+            eprintln!(
+                "error: column '{}' is used for --time/--group-by/--weight and cannot be an input",
+                name
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        if !vars.iter().any(|v| v == name) {
+            if vars_explicit {
+                eprintln!(
+                    "error: column '{}' is not an input variable; add it to --vars or drop it from --dtype",
+                    name
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+            vars.push(name.clone());
+        }
     }
     if vars.is_empty() {
         eprintln!("error: no input variables");
@@ -982,6 +1077,21 @@ fn main() {
         notes.push("--gap only applies to temporal splits; ignored".to_string());
     }
 
+    // Per-variable datatypes (issue #5): validate boolean columns and expand
+    // categorical columns into one-hot indicators. This runs before lags so a
+    // delayed copy of an indicator is itself a 0/1 boolean.
+    let typed = match data::apply_dtypes(&table, &vars, &dtype_spec, max_levels) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(if e.usage { EXIT_USAGE } else { EXIT_INPUT });
+        }
+    };
+    let table = typed.table;
+    vars = typed.vars;
+    let dtypes = typed.dtypes;
+    let variable_types = typed.variables;
+
     // Time-delay embedding. New columns are only appended, so the indices in
     // `time_col`/`group_col` stay valid. The leading rows of each series become
     // history: they supply the past for later rows but are not scored.
@@ -1008,6 +1118,38 @@ fn main() {
     };
     notes.extend(lag_report.notes.iter().cloned());
 
+    // Delayed copies of boolean inputs are boolean too, so keep the datatype
+    // plan aligned with the expanded variable list.
+    let mut dtypes = dtypes;
+    let mut variable_types = variable_types;
+    if dtypes.len() < vars.len() {
+        let base = dtypes.len();
+        for v in &vars[base..] {
+            let source = v
+                .rsplit_once("_lag")
+                .and_then(|(stem, n)| {
+                    if n.parse::<usize>().is_ok() {
+                        variable_types
+                            .iter()
+                            .find(|t| t.name == stem)
+                            .map(|t| (t.dtype, t.name.clone()))
+                    } else {
+                        None
+                    }
+                });
+            let (kind, src) = match source {
+                Some((k, s)) => (k, Some(s)),
+                None => (data::DType::Continuous, None),
+            };
+            dtypes.push(kind);
+            variable_types.push(data::VariableDType {
+                name: v.clone(),
+                dtype: kind,
+                source: src,
+            });
+        }
+    }
+
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -1026,6 +1168,7 @@ fn main() {
         center,
         scale,
         filter,
+        dtypes: dtypes.clone(),
     };
     let mut rng = Mt::new(cfg.seed);
     let prepared = match data::prepare_full_weighted_with(
@@ -1120,12 +1263,13 @@ fn main() {
             .map(|f| f.len().to_string())
             .collect();
         println!(
-            "{{\"event\":\"start\",\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{{\"mode\":{},\"gap\":{},\"folds\":[{}]}}}}",
+            "{{\"event\":\"start\",\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{{\"mode\":{},\"gap\":{},\"folds\":[{}]}}}}",
             jstr(VERSION),
             cfg.seed,
             jstr(cfg.metric.name()),
             jstr(&target),
             vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+            variables_detail_json(&variable_types),
             prepared.train.len(),
             prepared.test.len(),
             jstr(prepared.report.mode),
@@ -1151,6 +1295,11 @@ fn main() {
             vars.join(","),
             split_line
         );
+        let type_line: Vec<String> = variable_types
+            .iter()
+            .map(|v| format!("{} ({})", v.name, v.dtype.name()))
+            .collect();
+        eprintln!("# variables: {}", type_line.join(", "));
         if prepared.report.groups_total > 1 && mode == data::SplitMode::Group {
             eprintln!(
                 "# groups held out whole: {}/{} (never on both sides)",
@@ -1165,6 +1314,7 @@ fn main() {
             &vars,
             &target,
             &prepared,
+            &variable_types,
             cfg.metric,
             &cfg.complexity_model,
             format,
@@ -1310,7 +1460,7 @@ fn main() {
     // search on each fold's own training rows, and score the model it returns on
     // the held-out block. Each fold is normalised on its training rows alone.
     let cv: Option<CvReport> = cv_mode.map(|mode| {
-        let folds = match data::cv_folds_weighted(
+        let folds = match data::cv_folds_typed(
             &table,
             &vars,
             &target,
@@ -1319,6 +1469,7 @@ fn main() {
             cv_k,
             gap,
             cfg.seed,
+            &dtypes,
         ) {
             Ok(f) => f,
             Err(e) => {
@@ -1411,6 +1562,7 @@ fn main() {
             &prepared,
             &target,
             &vars,
+            &variable_types,
             &cfg,
             &outcome,
             &full_rows,
@@ -1814,12 +1966,13 @@ fn main() {
                 None => "null".to_string(),
             };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
                 jstr(&target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                variables_detail_json(&variable_types),
                 weight_column_json,
                 weight_sum_json,
                 weight_rows_json,
@@ -2004,6 +2157,7 @@ fn run_eval(
     vars: &[String],
     target: &str,
     prepared: &data::Prepared,
+    variable_types: &[data::VariableDType],
     metric: Metric,
     model: &ComplexityModel,
     format: Format,
@@ -2047,11 +2201,12 @@ fn run_eval(
         Format::Json => {
             let folds: Vec<String> = fold_errors.iter().map(|e| jnum(*e)).collect();
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
                 jstr(VERSION),
                 jstr(metric.name()),
                 jstr(target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                variables_detail_json(variable_types),
                 prepared.train.len(),
                 prepared.test.len(),
                 prepared.prep.json(),
@@ -2151,6 +2306,7 @@ fn summary_markdown(
     prepared: &data::Prepared,
     target: &str,
     vars: &[String],
+    variable_types: &[data::VariableDType],
     cfg: &search::Config,
     outcome: &search::Outcome,
     rows: &[Row],
@@ -2217,6 +2373,15 @@ fn summary_markdown(
         "| inputs | {} |",
         vars.iter()
             .map(|v| format!("`{}`", md_esc(v)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        s,
+        "| variable types | {} |",
+        variable_types
+            .iter()
+            .map(|v| format!("`{}` ({})", md_esc(&v.name), v.dtype.name()))
             .collect::<Vec<_>>()
             .join(", ")
     );
