@@ -13,8 +13,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn json() -> String {
     let opts = [
         ("--data", "string", "none", "table path, or '-' for stdin"),
-        ("--target", "string", "none", "target column name"),
-        ("--vars", "csv", "all-except-target", "input column names"),
+        ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
+        ("--vars", "csv", "all-except-targets", "input column names"),
         ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),
         ("--max-levels", "int", "16", "maximum distinct values in a categorical column"),
         ("--test-frac", "float", "0.25", "held-out fraction"),

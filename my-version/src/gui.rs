@@ -1451,6 +1451,7 @@ impl RunPlan {
                     x: prepared.train.x.clone(),
                     y,
                     w: prepared.train.w.clone(),
+                    ys: Vec::new(),
                 };
                 let out = search::run(&self.cfg, &shuffled, &shuffled);
                 let b = out

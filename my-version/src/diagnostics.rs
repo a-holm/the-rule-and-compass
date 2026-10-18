@@ -434,6 +434,7 @@ pub fn breusch_pagan(resid: &[f64], fitted: &[f64]) -> BreuschPagan {
         x: f.iter().map(|&v| vec![v]).collect(),
         y: u.clone(),
         w: Vec::new(),
+        ys: Vec::new(),
     };
     let ss_res = match least_squares_linear(&aux) {
         Some(c) => u
@@ -773,6 +774,7 @@ pub fn bootstrap_error(
                 x: oob.iter().map(|&j| train.x[j].clone()).collect(),
                 y: oob.iter().map(|&j| train.y[j]).collect(),
                 w: Vec::new(),
+                ys: Vec::new(),
             };
             let e = crate::search::eval_error(&t, &scored, metric);
             if e.is_finite() {
@@ -1195,6 +1197,7 @@ mod tests {
                 x,
                 y,
                 w: Vec::new(),
+                ys: Vec::new(),
             },
             &[1.0, 1.0],
         );
@@ -1263,6 +1266,7 @@ mod tests {
             x,
             y,
             w: Vec::new(),
+            ys: Vec::new(),
         }
     }
 
@@ -1455,6 +1459,7 @@ mod tests {
             x: xs.iter().map(|&v| vec![v]).collect(),
             y: ys,
             w: Vec::new(),
+            ys: Vec::new(),
         };
         let mut tree = poly2_tree();
         crate::fit::fit(&mut tree, &train.x, &train.y, 16);
@@ -1501,6 +1506,7 @@ mod tests {
             x: (0..20).map(|i| vec![i as f64]).collect(),
             y: vec![5.0; 20],
             w: Vec::new(),
+            ys: Vec::new(),
         };
         let mut tree = crate::expr::constant(5.0);
         crate::fit::fit(&mut tree, &train.x, &train.y, 8);
@@ -1519,6 +1525,7 @@ mod tests {
             x: (0..10).map(|i| vec![i as f64]).collect(),
             y: (0..10).map(|i| 2.0 * i as f64 + 1.0).collect(),
             w: Vec::new(),
+            ys: Vec::new(),
         };
         // A tree with no constants: the refit is a no-op, but the estimator
         // still fits and scores.

@@ -19,6 +19,8 @@ use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
 use crate::metrics::{score_weighted, Metric};
+// #15: multi-output combined error and per-output constant fitting.
+use crate::multi;
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use std::collections::HashSet;
@@ -142,10 +144,19 @@ struct Ind {
 }
 
 impl Ind {
-    fn evaluated(tree: Node, train: &Sample, metric: Metric, model: &ComplexityModel) -> Self {
+    // #15: `fit_iters` lets a multi-output sample fit one constant vector per
+    // output. For a single-output sample the value is ignored and the path is
+    // exactly `eval_error`, bit for bit.
+    fn evaluated(
+        tree: Node,
+        train: &Sample,
+        metric: Metric,
+        model: &ComplexityModel,
+        fit_iters: usize,
+    ) -> Self {
         let tree = expr::simplify(&tree);
         let complexity = model.complexity(&tree);
-        let error = eval_error(&tree, train, metric);
+        let error = score_tree(&tree, train, metric, fit_iters);
         Ind {
             tree,
             error,
@@ -153,10 +164,10 @@ impl Ind {
         }
     }
 
-    fn reeval(&mut self, train: &Sample, metric: Metric, model: &ComplexityModel) {
+    fn reeval(&mut self, train: &Sample, metric: Metric, model: &ComplexityModel, fit_iters: usize) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = model.complexity(&self.tree);
-        self.error = eval_error(&self.tree, train, metric);
+        self.error = score_tree(&self.tree, train, metric, fit_iters);
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -185,6 +196,17 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
     score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
+}
+
+/// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
+/// objective when more than one target is present. Single-output samples call
+/// [`eval_error`] unchanged.
+fn score_tree(tree: &Node, s: &Sample, metric: Metric, fit_iters: usize) -> f64 {
+    if s.is_multi() {
+        multi::combined_error(tree, s, metric, fit_iters)
+    } else {
+        eval_error(tree, s, metric)
+    }
 }
 
 /// True when candidate scoring should use a per-generation subset of the
@@ -246,6 +268,17 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
         } else {
             idx.iter().map(|&i| train.w[i]).collect()
         },
+        // #15: subset every output column, not just the first, so a
+        // multi-output generation scores the same rows for every target.
+        ys: if train.ys.is_empty() {
+            Vec::new()
+        } else {
+            train
+                .ys
+                .iter()
+                .map(|col| idx.iter().map(|&i| col[i]).collect())
+                .collect()
+        },
     })
 }
 
@@ -259,6 +292,7 @@ fn full_data_archive(
     train: &Sample,
     metric: Metric,
     model: &ComplexityModel,
+    fit_iters: usize, // #15: refit per-output constants on the full sample
 ) -> Archive {
     let trees: Vec<&Node> = archive
         .items
@@ -273,7 +307,8 @@ fn full_data_archive(
             continue;
         }
         let tree = expr::simplify(tree);
-        let error = eval_error(&tree, train, metric);
+        // #15: combined error on a multi-output sample.
+        let error = score_tree(&tree, train, metric, fit_iters);
         out.try_insert(Sol {
             complexity: expr::complexity(&tree),
             cost: model.complexity(&tree),
@@ -318,7 +353,7 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample, nvars: usize) {
     for ind in isl.iter_mut() {
         if !ind.error.is_finite() {
-            ind.reeval(train, cfg.metric, &cfg.complexity_model);
+            ind.reeval(train, cfg.metric, &cfg.complexity_model, cfg.fit_iters);
         }
     }
 
@@ -362,11 +397,15 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
             continue;
         }
 
-        if cfg.fit_iters > 0 {
+        // #15: a multi-output shape must keep the constant slots that only some
+        // outputs need. Fitting it to target 0 first would simplify `c + 0`
+        // away and delete the offset the other outputs require, so the
+        // per-output fit inside `Ind::evaluated` is the only fit there.
+        if cfg.fit_iters > 0 && !train.is_multi() {
             crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
-        let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model);
+        let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model, cfg.fit_iters);
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
@@ -376,7 +415,8 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
     // Fill any remainder with fresh random trees.
     while next.len() < pop {
         let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
-        if cfg.fit_iters > 0 {
+        // #15: see the offspring fit above; multi-output fits per output instead.
+        if cfg.fit_iters > 0 && !train.is_multi() {
             crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
@@ -385,6 +425,7 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
             train,
             cfg.metric,
             &cfg.complexity_model,
+            cfg.fit_iters, // #15
         ));
     }
 
@@ -565,7 +606,8 @@ fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
         if !seen_input.insert(expr::structural_hash(&tree)) {
             continue;
         }
-        if cfg.fit_iters > 0 {
+        // #15: do not collapse a multi-output shape onto target 0.
+        if cfg.fit_iters > 0 && !train.is_multi() {
             crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
@@ -577,6 +619,7 @@ fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
             train,
             cfg.metric,
             &cfg.complexity_model,
+            cfg.fit_iters, // #15
         ));
     }
     out
@@ -690,6 +733,7 @@ fn run_search(
                     init_train,
                     cfg.metric,
                     &cfg.complexity_model,
+                    cfg.fit_iters, // #15
                 ));
             }
             islands.push(pop);
@@ -727,6 +771,7 @@ fn run_search(
                         init_train,
                         cfg.metric,
                         &cfg.complexity_model,
+                        cfg.fit_iters, // #15
                     )
                 } else {
                     ind.clone()
@@ -760,7 +805,7 @@ fn run_search(
             if gen > 0 && gen_sample.is_some() {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.reeval(gen_train, cfg.metric, &cfg.complexity_model);
+                        ind.reeval(gen_train, cfg.metric, &cfg.complexity_model, cfg.fit_iters);
                     }
                 }
             }
@@ -857,6 +902,7 @@ fn run_search(
                                 gen_train,
                                 cfg.metric,
                                 &cfg.complexity_model,
+                                cfg.fit_iters, // #15
                             );
                         }
                     }
@@ -884,7 +930,8 @@ fn run_search(
                         let mut r = rngs[ii].clone();
                         for ind in islands[ii].iter_mut() {
                             let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
-                            if cfg.fit_iters > 0 {
+                            // #15: multi-output constants are fitted per output.
+                            if cfg.fit_iters > 0 && !gen_train.is_multi() {
                                 crate::fit::fit_weighted(
                                     &mut t,
                                     &gen_train.x,
@@ -898,6 +945,7 @@ fn run_search(
                                 gen_train,
                                 cfg.metric,
                                 &cfg.complexity_model,
+                                cfg.fit_iters, // #15
                             );
                         }
                         rngs[ii] = r;
@@ -959,6 +1007,7 @@ fn run_search(
             train,
             cfg.metric,
             &cfg.complexity_model,
+            cfg.fit_iters, // #15
         );
     } else {
         for pop in &islands {
@@ -975,7 +1024,14 @@ fn run_search(
     let sorted = archive.sorted();
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| eval_error(&s.tree, test, cfg.metric))
+        .map(|s| {
+            // #15: fit the per-output constants on train, then score test.
+            if train.is_multi() {
+                multi::combined_test_error(&s.tree, train, test, cfg.metric, cfg.fit_iters)
+            } else {
+                eval_error(&s.tree, test, cfg.metric)
+            }
+        })
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
@@ -1002,7 +1058,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new() }
     }
 
     #[test]

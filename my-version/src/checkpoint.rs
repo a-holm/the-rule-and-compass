@@ -305,6 +305,17 @@ pub fn fingerprint(s: &Sample) -> Fingerprint {
     for v in &s.y {
         mix(&mut h, v.to_bits());
     }
+    // #15: extra targets are part of the data a checkpoint was fitted on.
+    // Guarded so a single-output fingerprint stays byte-for-byte compatible.
+    if !s.ys.is_empty() {
+        mix(&mut h, s.ys.len() as u64);
+        for col in &s.ys {
+            mix(&mut h, col.len() as u64);
+            for v in col {
+                mix(&mut h, v.to_bits());
+            }
+        }
+    }
     for v in &s.w {
         mix(&mut h, v.to_bits());
     }

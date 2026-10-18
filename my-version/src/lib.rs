@@ -13,6 +13,7 @@ pub mod fit;
 pub mod gpu;
 pub mod gui;
 pub mod metrics;
+pub mod multi;
 pub mod pareto;
 pub mod parse;
 pub mod rng;
