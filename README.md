@@ -682,6 +682,17 @@ list and the recorded results.
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
 
+## Is the search converging?
+
+`--progress` reports four bounded numbers every generation — **confidence**
+(the best error stopped moving), **stability** (the front's structural forms
+survive), **maturity** (the oldest surviving form's age) and **percent
+converged** (their weighted headline) — and the final `--json`/NDJSON output
+carries the same `"convergence"` object. They are computed from the archive
+alone, cost O(front size) and never touch a training row. See
+[`docs/convergence.md`](docs/convergence.md) for the exact formulas, the
+20-generation window, how to read them and the easy/hard evidence.
+
 ## Layout
 
 ```
@@ -697,6 +708,7 @@ docs/meta-operators.md        structural meta operators and their cache rule
 docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
+docs/convergence.md           confidence, stability, maturity and percent converged
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

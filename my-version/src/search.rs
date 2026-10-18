@@ -22,6 +22,9 @@ use crate::expr::{
 };
 use crate::metrics::{score_weighted, Metric};
 use crate::pareto::{Archive, Sol};
+// #18: convergence statistics live in their own module; the search only calls
+// `ProgressStats::observe` once per generation.
+use crate::progress_stats::{Convergence, ProgressStats};
 use crate::rng::Mt;
 use std::collections::HashSet;
 
@@ -63,6 +66,8 @@ pub struct Progress {
     pub total_generations: usize,
     pub best_error: f64,
     pub pareto_members: usize,
+    // #18: confidence, stability, maturity and percent_converged.
+    pub convergence: Convergence,
 }
 
 /// Progress callback type. `Send + Sync` so islands can report concurrently.
@@ -429,6 +434,8 @@ pub struct Outcome {
     /// The seeds that were accepted, in command-line order. Empty when the run
     /// was not seeded.
     pub seeds: Vec<SeedResult>,
+    // #18: convergence statistics at the end of the run.
+    pub convergence: Convergence,
 }
 
 /// Run a search once, from a fresh start.
@@ -773,6 +780,11 @@ fn run_search(
         }
     }
 
+    // #18: one tracker, updated once per generation from the archive. It holds
+    // no population state, so it cannot affect the search trajectory.
+    let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
+    let mut stats_observed = false;
+
     if !converged_early {
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
@@ -831,12 +843,18 @@ fn run_search(
                 }
             }
 
+            // #18: convergence is a pure reading of the archive; O(front size).
+            let convergence = progress_stats.observe(gens_done, gen_best, &archive);
+            stats_observed = true;
+
             if let Some(report) = &cfg.progress {
                 report(Progress {
                     generation: gens_done,
                     total_generations: cfg.generations,
                     best_error: gen_best,
                     pareto_members: archive.items.len(),
+                    // #18: every progress event carries the four numbers.
+                    convergence,
                 });
             }
 
@@ -1016,12 +1034,28 @@ fn run_search(
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
+
+    // #18: the last in-loop reading describes the final generation. If no
+    // generation ran (a resumed run that had already converged, or a zero
+    // budget), take one reading of the final archive so the JSON is populated.
+    let mut convergence = progress_stats.current();
+    if !stats_observed {
+        let best = final_archive
+            .items
+            .iter()
+            .map(|s| s.error)
+            .fold(f64::INFINITY, f64::min);
+        convergence = progress_stats.observe(gens_done, best, &final_archive);
+    }
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
         generations: gens_done,
         converged_early,
         seeds: seed_results,
+        // #18: the four convergence numbers for the final --json output.
+        convergence,
     })
 }
 

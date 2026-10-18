@@ -64,6 +64,7 @@ pub fn json() -> String {
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data must match"),
         ("--format", "enum", "text", "text | json | ndjson"),
+        ("--progress", "flag", "false", "emit per-generation progress with convergence statistics (confidence, stability, maturity, percent_converged); see docs/convergence.md"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
         ("--report", "enum", "none", "Markdown report: summary | sensitivity | benchmark (single value; last wins)"),
@@ -89,6 +90,7 @@ pub fn json() -> String {
          \"options\":[{}\n  ],\n  \
          \"operators\":[{}],\n  \
          \"complexity\":{{\"formula\":\"sum(op_cost) + var_weight*n_vars + const_weight*n_consts + depth_weight*max_depth\",\"defaults\":{{\"op_cost\":1,\"var_weight\":1,\"const_weight\":1,\"depth_weight\":0}},\"operator_nodes_only\":true,\"depth\":\"edges from the root; a single node has depth 0\"}},\n  \
+         \"convergence\":{{\"window\":20,\"confidence\":\"exp(-max(0,(e[g-w]-e[g])/(1+|e[g-w]|))/1e-3)\",\"stability\":\"mean Jaccard overlap of the front's structural forms over the last w comparisons\",\"maturity\":\"(g - first_generation_of_oldest_surviving_form) / max(g,1)\",\"percent_converged\":\"0.5*confidence + 0.3*stability + 0.2*maturity\",\"converged_threshold\":0.75,\"doc\":\"docs/convergence.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
