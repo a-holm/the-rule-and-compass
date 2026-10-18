@@ -6,7 +6,11 @@ use rcsr::metrics::{score, Metric};
 use rcsr::search::{run, Config, Outcome};
 
 fn sample(xs: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
-    Sample { x: xs, y }
+    Sample {
+        x: xs,
+        y,
+        w: Vec::new(),
+    }
 }
 
 fn best_test_error(out: &Outcome) -> f64 {

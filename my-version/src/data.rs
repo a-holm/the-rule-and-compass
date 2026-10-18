@@ -41,14 +41,62 @@ pub struct Sample {
     /// x[row][variable]
     pub x: Vec<Vec<f64>>,
     pub y: Vec<f64>,
+    /// Per-row weights. **Empty means every row weighs 1** (the behaviour
+    /// before issue #1); otherwise `w[i]` is the weight of row `i`. Weights are
+    /// finite, non-negative and relative: in the weighted mean
+    /// `Σ wᵢ·lossᵢ / Σ wᵢ` only their ratios matter.
+    pub w: Vec<f64>,
 }
 
 impl Sample {
+    /// An unweighted sample (every row weighs 1).
+    pub fn new(x: Vec<Vec<f64>>, y: Vec<f64>) -> Self {
+        Sample {
+            x,
+            y,
+            w: Vec::new(),
+        }
+    }
+
+    /// A sample with one weight per row.
+    ///
+    /// The caller is responsible for `w.len() == y.len()` and for the values
+    /// being finite and non-negative; `prepare_full_weighted_with` validates a
+    /// weight column before it gets this far.
+    pub fn weighted(x: Vec<Vec<f64>>, y: Vec<f64>, w: Vec<f64>) -> Self {
+        Sample { x, y, w }
+    }
+
     pub fn len(&self) -> usize {
         self.y.len()
     }
     pub fn is_empty(&self) -> bool {
         self.y.is_empty()
+    }
+    /// True when an explicit weight vector was supplied.
+    pub fn has_weights(&self) -> bool {
+        !self.w.is_empty()
+    }
+    /// Weight of row `i`; `1.0` when the sample is unweighted.
+    pub fn weight(&self, i: usize) -> f64 {
+        self.w.get(i).copied().unwrap_or(1.0)
+    }
+    /// Sum of the row weights (`len` for an unweighted sample).
+    pub fn weight_sum(&self) -> f64 {
+        if self.w.is_empty() {
+            self.len() as f64
+        } else {
+            self.w.iter().sum()
+        }
+    }
+    /// Number of rows with a strictly positive weight; the effective `n` for
+    /// the information criteria and the residual degrees of freedom.
+    pub fn positive_weight_rows(&self) -> usize {
+        if self.w.is_empty() {
+            self.len()
+        } else {
+            self.w.iter().filter(|&&v| v > 0.0).count()
+        }
     }
 }
 
@@ -595,6 +643,57 @@ fn resolve_columns(t: &Table, vars: &[String], target: &str) -> Result<(Vec<usiz
     Ok((var_idx, tgt_idx))
 }
 
+/// Resolve and validate the `--weight` column. Returns its index, or `None`
+/// when no weight column was requested.
+fn resolve_weight_column(t: &Table, weight: Option<&str>) -> Result<Option<usize>, String> {
+    let Some(name) = weight else {
+        return Ok(None);
+    };
+    let j = match t.names.iter().position(|n| n == name) {
+        Some(j) => j,
+        None => {
+            return Err(format!(
+                "weight column '{}' not found (columns: {:?})",
+                name, t.names
+            ))
+        }
+    };
+    if !t.numeric[j] {
+        return Err(format!(
+            "weight column '{}' is not numeric; weights must be finite and >= 0",
+            name
+        ));
+    }
+    Ok(Some(j))
+}
+
+/// Check the weight values as a whole: every value finite and `>= 0`, and at
+/// least one strictly positive. The error names the column and the number of
+/// offending rows.
+fn validate_weights(name: &str, w: &[f64]) -> Result<(), String> {
+    let non_finite = w.iter().filter(|v| !v.is_finite()).count();
+    if non_finite > 0 {
+        return Err(format!(
+            "weight column '{}' has {} non-finite value(s); weights must be finite and >= 0",
+            name, non_finite
+        ));
+    }
+    let negative = w.iter().filter(|&&v| v < 0.0).count();
+    if negative > 0 {
+        return Err(format!(
+            "weight column '{}' has {} negative value(s); weights must be finite and >= 0",
+            name, negative
+        ));
+    }
+    if w.iter().all(|&v| v == 0.0) {
+        return Err(format!(
+            "weight column '{}' is all zero; at least one row must have a positive weight",
+            name
+        ));
+    }
+    Ok(())
+}
+
 pub fn prepare_full(
     t: &Table,
     vars: &[String],
@@ -627,6 +726,27 @@ pub fn prepare_full_with(
     rng: &mut Mt,
     prep: &PrepSpec,
 ) -> Result<Prepared, String> {
+    prepare_full_weighted_with(t, vars, target, None, spec, rng, prep)
+}
+
+/// Like [`prepare_full_with`], with an optional per-row weight column.
+///
+/// `weight` names a numeric column whose values become [`Sample::w`] on the
+/// training sample, every test fold and the pooled test sample. The column is
+/// never an input variable. Its values are validated **after** `--exclude` and
+/// `--filter` have selected the population and must be finite, non-negative and
+/// not all zero; the error names the column and the number of offending rows.
+/// When `weight` is `None` the samples carry an empty `w` and every calculation
+/// is bit-for-bit the unweighted one.
+pub fn prepare_full_weighted_with(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    weight: Option<&str>,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+    prep: &PrepSpec,
+) -> Result<Prepared, String> {
     // With an explicit --fill method, a junk token in an otherwise numeric
     // column is treated as a missing value (and then filled or dropped).
     // Without it the column stays non-numeric, exactly as before.
@@ -637,6 +757,7 @@ pub fn prepare_full_with(
     };
     let t = coerced.as_ref().unwrap_or(t);
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
+    let weight_idx = resolve_weight_column(t, weight)?;
     let nv = var_idx.len();
 
     // 0. Explicit exclusions remove rows from the population (issue #3). They
@@ -698,6 +819,17 @@ pub fn prepare_full_with(
         .iter()
         .map(|r| var_idx.iter().map(|&i| r[i]).collect())
         .collect();
+    // Weights follow the rows through the split; validate them on the surviving
+    // population (after --exclude / --filter) rather than on discarded rows.
+    let weights_raw: Option<Vec<f64>> = match weight_idx {
+        Some(j) => {
+            let name = weight.unwrap_or("");
+            let w: Vec<f64> = filtered.rows.iter().map(|r| r[j]).collect();
+            validate_weights(name, &w)?;
+            Some(w)
+        }
+        None => None,
+    };
     let (mut train_idx, mut fold_idx, mut report) = build_split(&filtered, spec, rng, &x_raw)?;
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
@@ -977,15 +1109,28 @@ pub fn prepare_full_with(
             );
             s.y.push(y_vals[i]);
         }
+        if let Some(w) = &weights_raw {
+            s.w = idx.iter().map(|&i| w[i]).collect();
+        }
         s
     };
 
     let train = make(&train_idx);
+    if let (Some(w), Some(name)) = (&weights_raw, weight) {
+        let positive = train_idx.iter().filter(|&&i| w[i] > 0.0).count();
+        if positive == 0 {
+            return Err(format!(
+                "weight column '{}' has no positive weight in the training rows after preparation",
+                name
+            ));
+        }
+    }
     let fold_samples: Vec<Sample> = fold_idx.iter().map(|f| make(f)).collect();
     let mut test = Sample::default();
     for f in &fold_samples {
         test.x.extend(f.x.iter().cloned());
         test.y.extend(f.y.iter().copied());
+        test.w.extend(f.w.iter().copied());
     }
 
     Ok(Prepared {
@@ -1163,7 +1308,33 @@ pub fn cv_folds(
     gap: usize,
     seed: u32,
 ) -> Result<Vec<CvFold>, String> {
+    cv_folds_weighted(t, vars, target, None, mode, k, gap, seed)
+}
+
+/// Like [`cv_folds`], with an optional per-row weight column carried into each
+/// fold's training and test samples. The column is validated once on the whole
+/// table with the same rules as [`prepare_full_weighted_with`].
+pub fn cv_folds_weighted(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    weight: Option<&str>,
+    mode: CvMode,
+    k: usize,
+    gap: usize,
+    seed: u32,
+) -> Result<Vec<CvFold>, String> {
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
+    let weight_idx = resolve_weight_column(t, weight)?;
+    let weights_raw: Option<Vec<f64>> = match weight_idx {
+        Some(j) => {
+            let name = weight.unwrap_or("");
+            let w: Vec<f64> = t.rows.iter().map(|r| r[j]).collect();
+            validate_weights(name, &w)?;
+            Some(w)
+        }
+        None => None,
+    };
     let n = t.rows.len();
     let k = k.max(2);
     if n < k + 1 {
@@ -1241,6 +1412,14 @@ pub fn cv_folds(
             means[j] = m;
             stds[j] = if s < 1e-12 { 1.0 } else { s };
         }
+        if let (Some(w), Some(name)) = (&weights_raw, weight) {
+            if train_idx.iter().all(|&i| w[i] <= 0.0) {
+                return Err(format!(
+                    "weight column '{}' has no positive weight in a cross-validation training fold",
+                    name
+                ));
+            }
+        }
         let make = |idx: &[usize]| -> Sample {
             let mut s = Sample::default();
             for &i in idx {
@@ -1250,6 +1429,9 @@ pub fn cv_folds(
                         .collect(),
                 );
                 s.y.push(y[i]);
+            }
+            if let Some(w) = &weights_raw {
+                s.w = idx.iter().map(|&i| w[i]).collect();
             }
             s
         };

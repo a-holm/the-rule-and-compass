@@ -231,7 +231,15 @@ fn sensitivity_puts_the_driving_input_first() {
         x.push(vec![x1, x2]);
         y.push(3.0 * x1);
     }
-    let report = diagnostics::sensitivity(&tree, &data::Sample { x, y }, &[1.0, 1.0]);
+    let report = diagnostics::sensitivity(
+        &tree,
+        &data::Sample {
+            x,
+            y,
+            w: Vec::new(),
+        },
+        &[1.0, 1.0],
+    );
     assert_eq!(report.rows[0].input, 0);
     assert!(
         report.rows[0].mean_abs_elasticity > 100.0 * report.rows[1].mean_abs_elasticity,

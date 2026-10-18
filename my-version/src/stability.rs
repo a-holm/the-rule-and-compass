@@ -160,6 +160,10 @@ fn collect(n: &Node, out: &mut Vec<usize>) {
 }
 
 /// A bootstrap resample of `s`: `s.len()` rows drawn **with replacement**.
+///
+/// When `s` is weighted the weights are drawn along with their rows, so the
+/// resampled search solves the same weighted problem on the resampled rows. An
+/// unweighted sample stays unweighted (empty `w`), preserving the old results.
 pub fn resample(s: &Sample, rng: &mut Mt) -> Sample {
     let n = s.len();
     let mut out = Sample::default();
@@ -167,6 +171,9 @@ pub fn resample(s: &Sample, rng: &mut Mt) -> Sample {
         let i = rng.usize_below(n);
         out.x.push(s.x[i].clone());
         out.y.push(s.y[i]);
+        if !s.w.is_empty() {
+            out.w.push(s.w[i]);
+        }
     }
     out
 }
@@ -370,6 +377,7 @@ mod tests {
         let s = Sample {
             x: vec![vec![0.0], vec![1.0], vec![2.0]],
             y: vec![0.0, 10.0, 20.0],
+            w: Vec::new(),
         };
         let mut rng = Mt::new(7);
         let r = resample(&s, &mut rng);
@@ -377,6 +385,24 @@ mod tests {
         for (x, y) in r.x.iter().zip(&r.y) {
             // y is the row label, so it pins the row the sample came from.
             assert_eq!(x[0] * 10.0, *y);
+        }
+    }
+
+    #[test]
+    fn resample_carries_weights_with_their_rows() {
+        // Row i has x = i, y = 10i and weight i + 1, so any resampled row keeps
+        // its three values together.
+        let s = Sample::weighted(
+            vec![vec![0.0], vec![1.0], vec![2.0]],
+            vec![0.0, 10.0, 20.0],
+            vec![1.0, 2.0, 3.0],
+        );
+        let mut rng = Mt::new(11);
+        let r = resample(&s, &mut rng);
+        assert_eq!(r.w.len(), r.len());
+        for i in 0..r.len() {
+            assert_eq!(r.x[i][0] * 10.0, r.y[i], "row values were split");
+            assert_eq!(r.x[i][0] + 1.0, r.w[i], "weight did not follow its row");
         }
     }
 

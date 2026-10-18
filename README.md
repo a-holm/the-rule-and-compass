@@ -266,6 +266,7 @@ run:
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
+| `--weight col` | per-row weight column (finite, `>= 0`, at least one positive); a weight of 2 means "this row twice" |
 
 ```sh
 # Robust preparation: fill gaps with the training median, drop extreme
@@ -288,6 +289,42 @@ The report says what ran, one commented line per active transformation:
 `--json` carries the same numbers in a `preparation` object (methods, filled /
 dropped / smoothed / filtered counts), and `--ndjson` emits a `preparation`
 event when something is active.
+
+### Weighing rows
+
+`--weight <col>` gives every row its own weight. The weight says **how much a
+row counts**, not how large its target is: recent measurements, reliable sensors
+or duplicated observations can be emphasised, and a row given weight zero has no
+influence on the fit or the error.
+
+```sh
+# y = 2x + 1, with the second observation counted twice
+rcsr --data d.csv --target y --vars x --weight w --metric squared
+```
+
+`absolute`, `squared`, `signed`, `log_squashed` and `correlation` become
+weighted means (weighted Pearson for the correlation); `aic`, `aicc` and `bic`
+use the weighted RSS and the number of positive-weight rows as `n`. A weight of
+2 is exactly a duplicated row because the normalisation is `Σwᵢ·lossᵢ / Σwᵢ`,
+not division by the row count. The fitter solves the weighted least-squares
+problem (`sqrt(w)` on every residual), and the standard errors use the weighted
+`JᵀWJ` with `dof = #positive weights − k`.
+
+Metrics with no standard weighted form (`median`, `maximum`, `interquartile`,
+`slope`, `rank_correlation`, `auc`, `log_loss`, `hinge`) **refuse** `--weight`
+with a usage error that lists the supported ones: weights are never silently
+ignored. The text report says
+
+```
+# weights: column w, sum 12.5 over 20 rows (2 zero-weight)
+```
+
+and `--json` echoes `"weight_column"`, `"weight_sum"` and `"weight_rows"`.
+Stability resamples carry the weights with their rows; cross-validation and
+`--eval-expr` are weighted too. Null baselines and residual tests remain
+unweighted, and the report says so. See
+[`docs/weights.md`](docs/weights.md) for the formulas, the doubling proof, why
+the other metrics refuse weights, and a worked example.
 
 **No leakage:** filling statistics, outlier bounds and centre/scale are all
 computed from the **training rows only** and applied to both sides; smoothing
@@ -501,6 +538,7 @@ docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
+docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
@@ -527,6 +565,7 @@ my-version/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)
     prep.rs       data-preparation tests (fill, outliers, smoothing, scaling, filters)
+    weights.rs    row weights, weighted metrics and weighted least squares
     bench.rs      known-truth benchmark harness tests
   examples/
     line.csv, sine.csv
