@@ -12,6 +12,7 @@
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
 use rcsr::expr::{self, Op};
+use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::{data, diagnostics, search};
@@ -83,6 +84,9 @@ OVERFITTING DIAGNOSTICS (always on):
                               in the same metric as the search: a model must
                               beat them to earn its complexity
   overfit index               test_error / train_error
+  constant errors             standard error and relative uncertainty of every
+                              fitted constant, from the Gauss-Newton Jacobian
+                              (J^T J); flags constants the data cannot pin down
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
                              distribution and a p-value; inferential, costs n
@@ -241,6 +245,9 @@ struct Row {
     overfit: f64,
     /// Per-block test errors (`--folds`); one entry when folds == 1.
     fold_errors: Vec<f64>,
+    /// Standard errors of the fitted constants (issue #22); `None` when they
+    /// are not defined (no constants, or no residual degrees of freedom).
+    constant_errors: Option<fit::ConstantErrors>,
     expression: String,
 }
 
@@ -785,6 +792,9 @@ fn main() {
                 bootstrap,
                 overfit,
                 fold_errors,
+                // Parameter uncertainty at the fitted solution (issue #22):
+                // reuse the fitter's Jacobian on the training rows.
+                constant_errors: fit::constant_errors(&s.tree, &prepared.train.x, &prepared.train.y),
                 expression: expr::to_string(&den, &vars),
             }
         })
@@ -944,6 +954,28 @@ fn main() {
                     );
                 }
             }
+            for r in &rows {
+                if let Some(ce) = &r.constant_errors {
+                    let parts: Vec<String> = ce
+                        .values
+                        .iter()
+                        .zip(&ce.std_errors)
+                        .zip(&ce.relative)
+                        .map(|((v, se), rel)| format!("{:.6}±{:.2e} (rel {:.2e})", v, se, rel))
+                        .collect();
+                    eprintln!(
+                        "# constant errors (rank {}): {} | dof={}{}",
+                        r.rank,
+                        parts.join(", "),
+                        ce.dof,
+                        if ce.ill_conditioned {
+                            " | ill-conditioned: JᵀJ near-singular, constants not identified by the data"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             eprintln!(
                 "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
                 cfg.metric.name(),
@@ -982,7 +1014,7 @@ fn main() {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -994,6 +1026,7 @@ fn main() {
                         jnum(r.overfit),
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
+                        constant_errors_json(&r.constant_errors),
                         jstr(&r.expression)
                     )
                 })
@@ -1059,7 +1092,7 @@ fn main() {
         Format::Ndjson => {
             for r in &rows {
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -1071,6 +1104,7 @@ fn main() {
                     jnum(r.overfit),
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
+                    constant_errors_json(&r.constant_errors),
                     jstr(&r.expression)
                 );
             }
@@ -1258,6 +1292,36 @@ fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
             jnum(b.weight),
             jnum(b.estimate)
         ),
+        None => "null".to_string(),
+    }
+}
+
+/// JSON for one solution's fitted-constant standard errors, or `null` when
+/// they are not defined (issue #22).
+fn constant_errors_json(ce: &Option<fit::ConstantErrors>) -> String {
+    match ce {
+        Some(ce) => {
+            let items: Vec<String> = ce
+                .values
+                .iter()
+                .zip(&ce.std_errors)
+                .zip(&ce.relative)
+                .map(|((v, se), rel)| {
+                    format!(
+                        "{{\"value\":{},\"std_error\":{},\"relative\":{}}}",
+                        jnum(*v),
+                        jnum(*se),
+                        jnum(*rel)
+                    )
+                })
+                .collect();
+            format!(
+                "{{\"dof\":{},\"ill_conditioned\":{},\"constants\":[{}]}}",
+                ce.dof,
+                ce.ill_conditioned,
+                items.join(",")
+            )
+        }
         None => "null".to_string(),
     }
 }

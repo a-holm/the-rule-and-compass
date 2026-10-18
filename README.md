@@ -138,7 +138,12 @@ cat examples/line.csv | rcsr --data - --target y --top 3
   },
   "pareto": [
     { "rank": 5, "complexity": 5, "train_error": 5.3e-7,
-      "test_error": 5.2e-7, "expression": "(1 + (2 * x))" }
+      "test_error": 5.2e-7,
+      "constant_errors": {
+        "dof": 28, "ill_conditioned": false,
+        "constants": [ { "value": 1.0, "std_error": 4.1e-7, "relative": 4.1e-7 },
+                       { "value": 2.0, "std_error": 3.2e-7, "relative": 1.6e-7 } ] },
+      "expression": "(1 + (2 * x))" }
   ]
 }
 ```
@@ -250,6 +255,7 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 | `k_constants` | how many free parameters did it really earn? |
 | `aicc`, `bic` | is the extra complexity paid for by the fit? |
 | `durbin_watson` | did anything get left in the residuals? |
+| `constant_errors` | are the constants well determined, or do they trade off? |
 | `baselines` | does it beat the mean, a straight line and a 5-NN learner? |
 | `residual_tests` | Ljung–Box autocorrelation, Breusch–Pagan changing variance, residual skew/kurtosis |
 | `null_control` | could the search have produced this from noise? |
@@ -324,11 +330,13 @@ list and the recorded results.
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
   forecast is never scored on data it has already seen;
 - **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
-  overfit index), **null baselines** (mean, least-squares line, 5-NN) and
-  **residual tests** (Ljung–Box, Breusch–Pagan, skewness/kurtosis) reported
-  automatically, plus a `--null-runs` permutation control that runs the
-  identical search on shuffled targets and a `--bootstrap-error` `.632+`
-  bootstrap estimate that refits each solution's constants on resamples;
+  overfit index, and per-constant **standard errors** from the Gauss–Newton
+  Jacobian that flag constants the data cannot pin down), **null baselines**
+  (mean, least-squares line, 5-NN) and **residual tests** (Ljung–Box,
+  Breusch–Pagan, skewness/kurtosis) reported automatically, plus a
+  `--null-runs` permutation control that runs the identical search on shuffled
+  targets and a `--bootstrap-error` `.632+` bootstrap estimate that refits each
+  solution's constants on resamples;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 
