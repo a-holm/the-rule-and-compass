@@ -16,6 +16,128 @@ how a new flag reaches the GUI without new GUI code.
 
 ---
 
+## As built — MVP from issue #38
+
+This section records what the first implementation actually ships, so the design
+above stays the target while the present state is unambiguous.
+
+### How to run it
+
+```sh
+cd my-version
+cargo build --release
+./target/release/rcsr_serve --port 8080 --open
+# open the printed URL (default http://127.0.0.1:8080)
+```
+
+`rcsr_serve` accepts `--host` (default `127.0.0.1`), `--port` (default `8080`;
+`0` asks the OS for a free port) and `--open` (prints the URL; it never launches
+a browser). The binary has no dependencies beyond the Rust standard library, and
+the server refuses anything but the address it was bound to.
+
+### What exists
+
+* **Data pane** — open a local CSV/TSV/text file or paste a table; the page
+  parses it locally only to render a preview. Each column gets a role selector:
+  input, target, time, group, weight, ignore. Roles build `--vars`,
+  `--target`, `--time`, `--group-by` and `--weight`; the target, time, group and
+  weight roles are unique.
+* **Search pane** — the form is generated from `GET /api/schema`. Metric,
+  generations, population, islands, maximum complexity and seed are pinned at
+  the top; every other option the schema declares is rendered under **More
+  options**. The widget is chosen from the declared `type` (`enum` → select,
+  `int`/`float` → number, `flag` → checkbox, `string`/`csv` → text). There is
+  no hand-written list of the non-pinned flags.
+* **Run pane** — `POST /api/run` streams `application/x-ndjson`; the page
+  parses one event per line and updates the progress line and a canvas Pareto
+  chart (x = complexity, y = train and test error on a log axis). Solution
+  events append points as they arrive; baseline events draw reference rules.
+* **Solutions pane** — the front table (rank, complexity, `k_constants`, train
+  and test error, AICc, expression) and a detail panel for the selected row:
+  formula, constants ± standard errors, overfit index, AICc/BIC,
+  Durbin–Watson, Ljung–Box and Breusch–Pagan p-values, skewness/kurtosis,
+  baselines, `.632+` bootstrap (when requested), cross-validation (when
+  requested), stability frequency and the null-control verdict.
+* **Copy as CLI** — emits the exact `rcsr` command for the current roles and
+  form values. When the table was pasted, the command carries it as a
+  here-document so it reproduces the run headlessly.
+
+### Endpoints and stream contract
+
+| endpoint | response |
+|---|---|
+| `GET /` | the embedded single-page app (HTML, relative `app.js`/`style.css`) |
+| `GET /api/schema` | the same document as `rcsr schema` |
+| `GET /api/example` | a 20-row bundled CSV |
+| `POST /api/run` | `application/x-ndjson` |
+
+`POST /api/run` takes `{"args":["--data","-","--target","y",…],"table":"x,y\n…"}`.
+`args` is a CLI argv without the program name; `--data -` reads the request's
+`table` string, while `--data <path>` reads that local file. Errors in the
+request or the arguments return HTTP 400 with a JSON `{"error": …}` object;
+failures after the stream starts arrive as `{"event":"error","code":3,"message":…}`.
+
+The stream uses the `--ndjson` event names and payloads: `start`, `progress`,
+`solution`, `note`, `preparation`, `null_control`, `baselines`,
+`cross_validation`, `residual_tests`, `stability`, `done` (and `eval` for
+`--eval-expr`). The `solution` event additionally carries `bic`, which the CLI's
+`--json` object reports but its NDJSON event did not; this is additive and does
+not change existing field meaning. HTTP status replaces the CLI exit-code
+channel: a completed run is HTTP 200 and ends with `done`, including a front
+with no finite member.
+
+### Deliberate deviation from the design above
+
+The design's §6.6 and the original issue text describe driving `rcsr` as a child
+process. The implementation instead runs the **same library pipeline
+in-process** (`data::parse_table` → `data::prepare_full_weighted_with` →
+`search::run`), because this build is a single local HTTP response and adding a
+process/pipe layer would only duplicate the streaming code. It still consumes
+the JSON/NDJSON contract and never parses human-readable text. The CLI remains
+the canonical interface: the server is a second front end over the same
+functions, and the page can hand back the equivalent command.
+
+### Deferred (not in this MVP)
+
+* Project save/load, multiple datasets and multi-search front overlays.
+* A dedicated Prepare pane, split stripe, series preview and per-fold strip;
+  the split, lags, history and gap flags are still settable through the
+  schema-generated form.
+* The observed-vs-predicted chart, the four-panel residual gallery and the
+  overfitting-wall chart. The numbers behind them are present; only the Pareto
+  chart is drawn.
+* Front/JSON export, the Markdown report and TSV output. The server rejects
+  `--out`, `--save*`, `--resume` and `--report*` with a clear message instead of
+  writing files on the server.
+* Keyboard shortcuts beyond native tab order, a project tree, and a
+  paste-a-command parser.
+* Checkpoint streaming events and resume. The CLI supports them; the web MVP
+  does not.
+* Multi-run comparison, seed-stability views and rolling-origin charts.
+
+### Headless test strategy
+
+`my-version/tests/gui.rs` starts the real server on port 0, speaks HTTP/1.1 over
+a socket and exercises the real endpoints:
+
+1. `/api/schema` returns 200 and valid JSON with `options`, `operators` and
+   `exit_codes`.
+2. The library's schema copy is compared field-for-field (name, type, default,
+   description and order) with the `let opts = [...]` table in `src/main.rs`, so
+   a new CLI flag cannot silently drift out of the generated form.
+3. `POST /api/run` over a 20-row table returns lines that all parse as JSON and
+   end with `done`.
+4. Malformed HTTP and malformed JSON both return 400 without hanging.
+5. `GET /` contains the app title and the page's JS reads the schema.
+6. The three embedded assets contain no `http://` or `https://` string.
+7. Dropping the server handle stops the listener.
+
+There is **no screenshot test**: no browser or display was used in this build.
+The visual layer is documented and checked by these headless contract tests, not
+by an image comparison.
+
+---
+
 ## 1. Principles
 
 ### 1.1 The formula is the hero
