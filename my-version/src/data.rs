@@ -23,7 +23,7 @@
 
 use crate::expr::{self, Node};
 use crate::rng::Mt;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// Tokens that stand for a missing cell. They are accepted in numeric columns;
 /// anything else that does not parse as a number still makes the column
@@ -141,6 +141,319 @@ impl Table {
         }
         seen.len()
     }
+}
+
+/// The datatype of one search input (issue #5).
+///
+/// `Continuous` is the default and is standardised like every column before
+/// issue #5. `Boolean` holds `0`/`1` and is **never** centred or scaled, so the
+/// evaluator receives exactly the values from the file. `Categorical` is not a
+/// value the search can use directly: [`apply_dtypes`] expands it into one-hot
+/// `Boolean` columns named `column=value`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DType {
+    #[default]
+    Continuous,
+    Boolean,
+    Categorical,
+}
+
+impl DType {
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::Continuous => "continuous",
+            DType::Boolean => "boolean",
+            DType::Categorical => "categorical",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "continuous" | "numeric" | "float" => Ok(DType::Continuous),
+            "boolean" | "bool" | "binary" => Ok(DType::Boolean),
+            "categorical" | "category" | "factor" => Ok(DType::Categorical),
+            other => Err(format!(
+                "unknown --dtype kind '{}' (expected continuous, boolean or categorical)",
+                other
+            )),
+        }
+    }
+}
+
+/// One row of the datatype report: an input variable as the search sees it.
+#[derive(Clone, Debug)]
+pub struct VariableDType {
+    /// Name of the input (for a one-hot indicator, `column=value`).
+    pub name: String,
+    pub dtype: DType,
+    /// Original column, when `name` is a one-hot indicator.
+    pub source: Option<String>,
+}
+
+/// A table after [`apply_dtypes`]: the expanded table plus the input list the
+/// rest of the pipeline must use.
+#[derive(Clone)]
+pub struct TypedTable {
+    pub table: Table,
+    pub vars: Vec<String>,
+    /// Datatype per entry of `vars`; categorical never appears here.
+    pub dtypes: Vec<DType>,
+    /// Human-readable datatype of every input, for the text report and JSON.
+    pub variables: Vec<VariableDType>,
+}
+
+/// Why a datatype request failed. `usage` separates a bad flag (exit 2) from
+/// bad data (exit 3); both carry a complete message.
+#[derive(Clone, Debug)]
+pub struct DTypeError {
+    pub usage: bool,
+    pub message: String,
+}
+
+impl DTypeError {
+    fn usage(message: impl Into<String>) -> Self {
+        DTypeError {
+            usage: true,
+            message: message.into(),
+        }
+    }
+
+    fn input(message: impl Into<String>) -> Self {
+        DTypeError {
+            usage: false,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for DTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for DTypeError {}
+
+/// Level name used for a missing/empty cell in a categorical column.
+pub const MISSING_LEVEL: &str = "<missing>";
+
+/// Parse `--dtype <col>=<kind>[,...]`. Kinds are validated here; column names
+/// are validated against the table by [`apply_dtypes`].
+pub fn parse_dtype_spec(s: &str) -> Result<Vec<(String, DType)>, String> {
+    let mut out: Vec<(String, DType)> = Vec::new();
+    for item in s.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, kind) = item.split_once('=').ok_or_else(|| {
+            format!(
+                "--dtype entry '{}' must be <column>=<kind>, e.g. flag=boolean",
+                item
+            )
+        })?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("--dtype entry '{}' has an empty column name", item));
+        }
+        let kind = DType::parse(kind)?;
+        if out.iter().any(|(n, _)| n == name) {
+            return Err(format!("--dtype names column '{}' more than once", name));
+        }
+        out.push((name.to_string(), kind));
+    }
+    if out.is_empty() {
+        return Err("--dtype needs at least one <column>=<kind> entry".to_string());
+    }
+    Ok(out)
+}
+
+/// Apply the per-variable datatype plan to a table.
+///
+/// * `continuous` columns pass through unchanged;
+/// * `boolean` columns are validated to contain only `0`/`1` (missing cells are
+///   left for `--fill`) and pass through unchanged;
+/// * `categorical` columns are expanded into one `0`/`1` indicator per distinct
+///   value, appended to the table in sorted level order and named
+///   `column=value`. Missing/empty cells become the level
+///   [`MISSING_LEVEL`]. All levels are kept: the search selects terms, it does
+///   not invert a design matrix, so dropping a reference level would only throw
+///   information away.
+///
+/// `max_levels` bounds the number of distinct values in a categorical column;
+/// exceeding it is a usage error naming the column, the count and the flag.
+pub fn apply_dtypes(
+    t: &Table,
+    vars: &[String],
+    spec: &[(String, DType)],
+    max_levels: usize,
+) -> Result<TypedTable, DTypeError> {
+    let mut per_col: HashMap<usize, DType> = HashMap::new();
+    for (name, kind) in spec {
+        let j = t.names.iter().position(|n| n == name).ok_or_else(|| {
+            DTypeError::usage(format!(
+                "unknown --dtype column '{}' (columns: {:?})",
+                name, t.names
+            ))
+        })?;
+        if !vars.iter().any(|v| v == name) {
+            return Err(DTypeError::usage(format!(
+                "column '{}' is not an input variable; add it to --vars or drop it from --dtype",
+                name
+            )));
+        }
+        if per_col.insert(j, *kind).is_some() {
+            return Err(DTypeError::usage(format!(
+                "column '{}' has more than one --dtype entry",
+                name
+            )));
+        }
+    }
+
+    let mut table = t.clone();
+    let mut new_vars: Vec<String> = Vec::with_capacity(vars.len());
+    let mut dtypes: Vec<DType> = Vec::with_capacity(vars.len());
+    let mut variables: Vec<VariableDType> = Vec::new();
+
+    for v in vars {
+        let j = t.index_of(v).map_err(DTypeError::usage)?;
+        match per_col.get(&j).copied().unwrap_or(DType::Continuous) {
+            DType::Continuous => {
+                new_vars.push(v.clone());
+                dtypes.push(DType::Continuous);
+                variables.push(VariableDType {
+                    name: v.clone(),
+                    dtype: DType::Continuous,
+                    source: None,
+                });
+            }
+            DType::Boolean => {
+                validate_boolean(t, j)?;
+                new_vars.push(v.clone());
+                dtypes.push(DType::Boolean);
+                variables.push(VariableDType {
+                    name: v.clone(),
+                    dtype: DType::Boolean,
+                    source: None,
+                });
+            }
+            DType::Categorical => {
+                let levels = categorical_levels(t, j, max_levels)?;
+                for level in levels {
+                    let name = format!("{}={}", v, level);
+                    if table.names.iter().any(|n| n == &name) {
+                        return Err(DTypeError::usage(format!(
+                            "categorical column '{}' would create '{}', which already exists; rename the column or the level",
+                            v, name
+                        )));
+                    }
+                    for (r, raw) in t.raw.iter().enumerate() {
+                        let cell = raw[j].trim();
+                        let hit = if is_missing_token(cell) {
+                            level == MISSING_LEVEL
+                        } else {
+                            cell == level
+                        };
+                        table.rows[r].push(if hit { 1.0 } else { 0.0 });
+                        table.raw[r].push(if hit { "1" } else { "0" }.to_string());
+                    }
+                    table.names.push(name.clone());
+                    table.numeric.push(true);
+                    new_vars.push(name.clone());
+                    dtypes.push(DType::Boolean);
+                    variables.push(VariableDType {
+                        name,
+                        dtype: DType::Boolean,
+                        source: Some(v.clone()),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(TypedTable {
+        table,
+        vars: new_vars,
+        dtypes,
+        variables,
+    })
+}
+
+/// A boolean column may contain only numeric `0` and `1`. Missing cells are
+/// skipped here because `--fill` owns the decision about them (and rejects a
+/// fill that would produce a fraction later).
+fn validate_boolean(t: &Table, j: usize) -> Result<(), DTypeError> {
+    let name = &t.names[j];
+    for (r, raw) in t.raw.iter().enumerate() {
+        let cell = raw[j].trim();
+        if is_missing_token(cell) {
+            continue;
+        }
+        match cell.parse::<f64>() {
+            Ok(v) if v == 0.0 || v == 1.0 => {}
+            _ => {
+                return Err(DTypeError::input(format!(
+                    "boolean column '{}' must contain only 0 and 1; row {} (1-based, header excluded) has '{}'",
+                    name,
+                    r + 1,
+                    cell
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Distinct values of a categorical column, sorted and independent of row
+/// order. All-numeric levels sort by value (`1, 2, 10`); otherwise the level
+/// text sorts lexicographically. A missing/empty cell becomes the final
+/// [`MISSING_LEVEL`] level.
+fn categorical_levels(
+    t: &Table,
+    j: usize,
+    max_levels: usize,
+) -> Result<Vec<String>, DTypeError> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for raw in &t.raw {
+        let cell = raw[j].trim();
+        if is_missing_token(cell) {
+            set.insert(MISSING_LEVEL.to_string());
+        } else if cell == MISSING_LEVEL {
+            return Err(DTypeError::usage(format!(
+                "categorical column '{}' contains the literal '{}', which is reserved for missing cells; rename that value",
+                t.names[j], MISSING_LEVEL
+            )));
+        } else {
+            set.insert(cell.to_string());
+        }
+    }
+    let mut levels: Vec<String> = set.into_iter().collect();
+    let has_missing = levels.iter().any(|l| l == MISSING_LEVEL);
+    levels.retain(|l| l != MISSING_LEVEL);
+    let count = levels.len() + if has_missing { 1 } else { 0 };
+    if count > max_levels {
+        return Err(DTypeError::usage(format!(
+            "categorical column '{}' has {} distinct values, more than --max-levels {}; raise the limit (e.g. --max-levels {})",
+            t.names[j],
+            count,
+            max_levels,
+            count
+        )));
+    }
+    let numeric = !levels.is_empty() && levels.iter().all(|l| l.parse::<f64>().is_ok());
+    if numeric {
+        levels.sort_by(|a, b| {
+            let av = a.parse::<f64>().unwrap_or(f64::NAN);
+            let bv = b.parse::<f64>().unwrap_or(f64::NAN);
+            av.partial_cmp(&bv)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+    }
+    if has_missing {
+        levels.push(MISSING_LEVEL.to_string());
+    }
+    Ok(levels)
 }
 
 pub fn read_table(path: &str) -> Result<Table, String> {
@@ -485,6 +798,10 @@ pub struct PrepSpec {
     pub center: Center,
     pub scale: Scale,
     pub filter: Option<Filter>,
+    /// Datatype per input variable, aligned with `vars` after [`apply_dtypes`]
+    /// expansion. Empty means every input is continuous. A `Boolean` column is
+    /// never centred or scaled (see `docs/variable-types.md`).
+    pub dtypes: Vec<DType>,
 }
 
 impl Default for PrepSpec {
@@ -496,6 +813,7 @@ impl Default for PrepSpec {
             center: Center::Mean,
             scale: Scale::Std,
             filter: None,
+            dtypes: Vec::new(),
         }
     }
 }
@@ -759,6 +1077,14 @@ pub fn prepare_full_weighted_with(
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let weight_idx = resolve_weight_column(t, weight)?;
     let nv = var_idx.len();
+    if !prep.dtypes.is_empty() && prep.dtypes.len() != nv {
+        return Err(format!(
+            "internal datatype plan has {} entries for {} input variables",
+            prep.dtypes.len(),
+            nv
+        ));
+    }
+    let dtype_at = |j: usize| prep.dtypes.get(j).copied().unwrap_or(DType::Continuous);
 
     // 0. Explicit exclusions remove rows from the population (issue #3). They
     // run before the row filter, so `--exclude` can never be undone by it.
@@ -1000,6 +1326,37 @@ pub fn prepare_full_weighted_with(
     }
     let rows_filled = row_filled.iter().filter(|&&b| b).count();
 
+    // A boolean input must still be exactly 0/1 after preparation. Fill methods
+    // such as mean/median/interpolate can average two truth values into a
+    // fraction, which would silently change the semantics of every logical
+    // operator (and of `if`), so refuse it and name the column and the fix.
+    for j in 0..nv {
+        if dtype_at(j) != DType::Boolean {
+            continue;
+        }
+        for r in 0..n {
+            if !keep[r] {
+                continue;
+            }
+            let v = cells[r][j];
+            if !(v == 0.0 || v == 1.0) {
+                let name = t
+                    .names
+                    .get(var_idx[j])
+                    .cloned()
+                    .unwrap_or_else(|| format!("column {}", var_idx[j]));
+                return Err(format!(
+                    "--fill {} produced value {} in boolean column '{}' (row {}); \
+                     use --fill zero|drop|previous so the column stays 0/1",
+                    prep.fill.name(),
+                    v,
+                    name,
+                    r + 1
+                ));
+            }
+        }
+    }
+
     // 3. Outlier removal. Bounds come from the training rows only.
     let mut rows_dropped_outlier = 0usize;
     if let Some(k) = prep.outlier_iqr {
@@ -1048,6 +1405,12 @@ pub fn prepare_full_weighted_with(
         for side in split_sides(&train_idx, &fold_idx) {
             let side: Vec<usize> = side.into_iter().filter(|&r| keep[r]).collect();
             for col in 0..nc {
+                // Smoothing a 0/1 column would create fractions and break the
+                // truthiness contract; it applies to continuous inputs and the
+                // target only.
+                if col < nv && dtype_at(col) == DType::Boolean {
+                    continue;
+                }
                 smoothed += smooth_cells(&mut cells, &side, col, prep.smooth);
             }
         }
@@ -1077,6 +1440,14 @@ pub fn prepare_full_weighted_with(
     let mut means = vec![0.0; nv];
     let mut stds = vec![1.0; nv];
     for j in 0..nv {
+        // Boolean inputs pass through unchanged: mean 0 / std 1 are the affine
+        // identity, so `make` below hands the evaluator exactly the 0/1 from the
+        // file and a denormalised formula is still in original units.
+        if dtype_at(j) == DType::Boolean {
+            means[j] = 0.0;
+            stds[j] = 1.0;
+            continue;
+        }
         let vals: Vec<f64> = train_idx.iter().map(|&i| x_vals[i][j]).collect();
         let m = vals.iter().sum::<f64>() / vals.len() as f64;
         let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
@@ -1324,7 +1695,35 @@ pub fn cv_folds_weighted(
     gap: usize,
     seed: u32,
 ) -> Result<Vec<CvFold>, String> {
+    cv_folds_typed(t, vars, target, weight, mode, k, gap, seed, &[])
+}
+
+/// Like [`cv_folds_weighted`], with the per-input datatypes produced by
+/// [`apply_dtypes`]. A `Boolean` input is never centred or scaled, exactly as in
+/// [`prepare_full_weighted_with`]; an empty slice means every input is
+/// continuous.
+#[allow(clippy::too_many_arguments)]
+pub fn cv_folds_typed(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    weight: Option<&str>,
+    mode: CvMode,
+    k: usize,
+    gap: usize,
+    seed: u32,
+    dtypes: &[DType],
+) -> Result<Vec<CvFold>, String> {
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
+    let nv = var_idx.len();
+    if !dtypes.is_empty() && dtypes.len() != nv {
+        return Err(format!(
+            "internal datatype plan has {} entries for {} input variables",
+            dtypes.len(),
+            nv
+        ));
+    }
+    let dtype_at = |j: usize| dtypes.get(j).copied().unwrap_or(DType::Continuous);
     let weight_idx = resolve_weight_column(t, weight)?;
     let weights_raw: Option<Vec<f64>> = match weight_idx {
         Some(j) => {
@@ -1402,6 +1801,11 @@ pub fn cv_folds_weighted(
         let mut means = vec![0.0; nv];
         let mut stds = vec![1.0; nv];
         for j in 0..nv {
+            if dtype_at(j) == DType::Boolean {
+                means[j] = 0.0;
+                stds[j] = 1.0;
+                continue;
+            }
             let m = train_idx.iter().map(|&i| x_raw[i][j]).sum::<f64>() / train_idx.len() as f64;
             let var = train_idx
                 .iter()
@@ -2175,6 +2579,46 @@ mod tests {
         // A genuinely unparseable cell still makes the column non-numeric.
         let bad = table("x\n1\nnot-a-number\n");
         assert!(!bad.numeric[0]);
+    }
+
+    #[test]
+    fn dtype_spec_parses_kinds_and_rejects_bad_entries() {
+        let spec = parse_dtype_spec("flag=boolean, temp = continuous,sym=categorical").unwrap();
+        assert_eq!(spec.len(), 3);
+        assert_eq!(spec[0].0, "flag");
+        assert_eq!(spec[0].1, DType::Boolean);
+        assert_eq!(spec[2].1, DType::Categorical);
+        assert!(parse_dtype_spec("flag=ordinal").unwrap_err().contains("boolean"));
+        assert!(parse_dtype_spec("flag").unwrap_err().contains("<column>=<kind>"));
+        assert!(parse_dtype_spec("flag=boolean,flag=continuous")
+            .unwrap_err()
+            .contains("more than once"));
+    }
+
+    #[test]
+    fn apply_dtypes_expands_levels_and_keeps_boolean_raw() {
+        let t = table("symbol,flag,y\nB,0,0\nA,1,1\nB,1,0\n");
+        let typed = apply_dtypes(
+            &t,
+            &["symbol".into(), "flag".into()],
+            &[
+                ("symbol".into(), DType::Categorical),
+                ("flag".into(), DType::Boolean),
+            ],
+            16,
+        )
+        .unwrap();
+        assert_eq!(typed.vars, vec!["symbol=A", "symbol=B", "flag"]);
+        assert_eq!(
+            typed.dtypes,
+            vec![DType::Boolean, DType::Boolean, DType::Boolean]
+        );
+        assert_eq!(typed.variables[1].source.as_deref(), Some("symbol"));
+        let a = typed.table.index_of("symbol=A").unwrap();
+        assert_eq!(
+            typed.table.rows.iter().map(|r| r[a]).collect::<Vec<_>>(),
+            vec![0.0, 1.0, 0.0]
+        );
     }
 
     #[test]
