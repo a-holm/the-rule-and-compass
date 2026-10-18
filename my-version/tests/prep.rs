@@ -392,3 +392,33 @@ fn bad_filter_is_a_usage_error_with_the_column() {
     assert!(err.contains("column 5"), "stderr: {err}");
     assert!(err.contains("unexpected end of input"), "stderr: {err}");
 }
+
+/// A gap left in a used column must be a loud, actionable error -- never a
+/// silent empty front with `inf` baselines and exit code 0.
+#[test]
+fn a_gap_without_a_fill_method_is_an_error() {
+    let t = data::parse_table("x,y\n1,3\n2,\n3,7\n4,9\n").unwrap();
+    let split = SplitSpec::default();
+    let vars = ["x".to_string()];
+    let err = data::prepare_full_with(
+        &t,
+        &vars,
+        "y",
+        &split,
+        &mut Mt::new(0),
+        &PrepSpec::default(),
+    )
+    .err()
+    .expect("a gap must not be silently accepted");
+    assert!(err.contains("1 missing cell"), "err: {err}");
+    assert!(err.contains("y: 1"), "the message must name the column: {err}");
+    assert!(err.contains("--fill"), "the message must name the fix: {err}");
+
+    // The same table is fine once a method is chosen.
+    let prep = PrepSpec {
+        fill: FillMethod::Drop,
+        ..Default::default()
+    };
+    let p = data::prepare_full_with(&t, &vars, "y", &split, &mut Mt::new(0), &prep).unwrap();
+    assert_eq!(p.prep.rows_dropped_missing, 1);
+}

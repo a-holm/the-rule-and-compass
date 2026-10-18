@@ -675,7 +675,35 @@ pub fn prepare_full_with(
 
     // 2. Missing values.
     match prep.fill {
-        FillMethod::None => {}
+        FillMethod::None => {
+            // Leaving a gap in a used column would poison every evaluation: the
+            // search would return an empty front and report `inf`/`NaN`
+            // baselines while still exiting 0. That reads as "no structure
+            // found" when the real answer is "you have gaps". Fail loudly and
+            // name the columns and the fix.
+            let mut detail: Vec<String> = Vec::new();
+            let mut total = 0usize;
+            for (k, &c) in used_cols.iter().enumerate() {
+                let missing = (0..n).filter(|&r| cells[r][k].is_nan()).count();
+                if missing > 0 {
+                    total += missing;
+                    let name = t
+                        .names
+                        .get(c)
+                        .cloned()
+                        .unwrap_or_else(|| format!("column {}", c));
+                    detail.push(format!("{}: {}", name, missing));
+                }
+            }
+            if total > 0 {
+                return Err(format!(
+                    "{} missing cell(s) in used columns ({}); pass --fill \
+                     drop|mean|median|zero|previous|interpolate",
+                    total,
+                    detail.join(", ")
+                ));
+            }
+        }
         FillMethod::Drop => {
             for r in 0..n {
                 if (0..nc).any(|k| cells[r][k].is_nan()) {

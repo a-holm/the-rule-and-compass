@@ -2,9 +2,9 @@
 
 A symbolic search will fit whatever it is given, including gaps, spikes and
 typos. `rcsr` therefore has an explicit preparation step. **Every option is
-opt-in, and the defaults reproduce the behaviour of a plain run**: no filling,
-no outlier removal, no smoothing, mean/standard-deviation normalisation and no
-row filter.
+opt-in, and the defaults reproduce the behaviour of a plain run**: no filling
+(a gap is an error, not a silent `NaN`), no outlier removal, no smoothing,
+mean/standard-deviation normalisation and no row filter.
 
 The one rule that shapes the whole design is the same as for splitting:
 **nothing about the test rows may influence the numbers used to prepare the
@@ -38,15 +38,24 @@ At load time a cell is **missing** when it is empty, `NA`, `NaN` or `null`,
 case-insensitively. A column that otherwise contains numbers is still numeric
 with gaps in it, so it remains usable as an input or a target.
 
-Without `--fill`, a gap stays missing (`NaN`), exactly as in earlier versions.
-That keeps complete tables bit-for-bit unchanged; it also means a search on a
-gappy table will see `NaN` and reject candidates that touch it.
+Without `--fill`, a gap in a used column is an **error**, not a silent `NaN`:
+complete tables stay bit-for-bit unchanged, and a gappy table fails with the
+count and the affected columns:
+
+```
+error: 1 missing cell(s) in used columns (y: 1); pass --fill drop|mean|median|zero|previous|interpolate
+```
+
+That is deliberate. A `NaN` that reaches the search rejects every candidate it
+touches, so the run finishes with an empty Pareto front and `inf` baselines —
+which reads as "no structure found" when the real answer is "the data has
+gaps". Failing loudly names the problem and the fix.
 
 `--fill <method>` chooses what to do:
 
 | method | what happens | use when | do not use when |
 |---|---|---|---|
-| `none` (default) | leave the gap; `NaN` propagates | the table is complete, or you want to see the effect of gaps | you need a usable fit and have gaps |
+| `none` (default) | gaps are an error that names the column and the fix | the table is complete | you have gaps — choose one of the methods below |
 | `drop` | drop any row with a gap in a used column | gaps are rare and random | dropping loses an important subgroup, or rows are ordered (dropping creates holes) |
 | `mean` | fill with the **training** column mean | values are roughly symmetric | the column is skewed or has outliers (the mean is dragged) |
 | `median` | fill with the **training** column median | skewed values or outliers | the column is multi-modal and the median is unrepresentative |
