@@ -224,6 +224,13 @@ pub struct SplitSpec {
     pub gap: usize,
     /// Number of contiguous evaluation blocks in the test region.
     pub folds: usize,
+    /// Rows where this expression is true are assigned to training (issue #3).
+    /// When either selection is present it replaces the positional mode.
+    pub train_select: Option<Filter>,
+    /// Rows where this expression is true are assigned to test (issue #3).
+    pub test_select: Option<Filter>,
+    /// Rows where this expression is true are dropped before splitting (#3).
+    pub exclude: Option<Filter>,
 }
 
 impl Default for SplitSpec {
@@ -235,6 +242,9 @@ impl Default for SplitSpec {
             test_frac: 0.25,
             gap: 0,
             folds: 1,
+            train_select: None,
+            test_select: None,
+            exclude: None,
         }
     }
 }
@@ -253,6 +263,12 @@ pub struct SplitReport {
     pub groups_test: usize,
     pub train_time_max: Option<f64>,
     pub test_time_min: Option<f64>,
+    /// Rows dropped by `--exclude` before splitting (issue #3).
+    pub excluded_rows: usize,
+    /// Rows matching both selections; they are assigned to training (#3).
+    pub overlap_rows: usize,
+    /// Rows matching neither selection; unused (#3).
+    pub unassigned_rows: usize,
     pub notes: Vec<String>,
 }
 
@@ -623,8 +639,35 @@ pub fn prepare_full_with(
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let nv = var_idx.len();
 
-    // 1. The row filter defines the population the split is drawn from.
+    // 0. Explicit exclusions remove rows from the population (issue #3). They
+    // run before the row filter, so `--exclude` can never be undone by it.
+    let mut excluded_count = 0usize;
     let mut filtered = t.clone();
+    if let Some(x) = &spec.exclude {
+        let cols: Vec<usize> = x
+            .vars
+            .iter()
+            .map(|v| filtered.index_of(v))
+            .collect::<Result<_, _>>()?;
+        let mut rows = Vec::new();
+        let mut raw = Vec::new();
+        for r in 0..filtered.rows.len() {
+            let vals: Vec<f64> = cols.iter().map(|&c| filtered.rows[r][c]).collect();
+            if expr::eval(&x.tree, &vals) > 0.0 {
+                excluded_count += 1;
+            } else {
+                rows.push(filtered.rows[r].clone());
+                raw.push(filtered.raw[r].clone());
+            }
+        }
+        if rows.is_empty() {
+            return Err("--exclude removed every row".to_string());
+        }
+        filtered.rows = rows;
+        filtered.raw = raw;
+    }
+
+    // 1. The row filter defines the population the split is drawn from.
     let mut filtered_count = 0usize;
     if let Some(f) = &prep.filter {
         let cols: Vec<usize> = f
@@ -656,6 +699,7 @@ pub fn prepare_full_with(
         .map(|r| var_idx.iter().map(|&i| r[i]).collect())
         .collect();
     let (mut train_idx, mut fold_idx, mut report) = build_split(&filtered, spec, rng, &x_raw)?;
+    report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
     }
@@ -1239,6 +1283,100 @@ fn build_split(
         gap: spec.gap,
         ..Default::default()
     };
+
+    // Explicit row selection (issue #3). The expressions assign rows to a side;
+    // because they say exactly which rows belong where, they replace the
+    // positional modes rather than competing with them.
+    if spec.train_select.is_some() || spec.test_select.is_some() {
+        let evaluate = |f: &Filter, t: &Table| -> Result<Vec<bool>, String> {
+            let cols: Vec<usize> = f
+                .vars
+                .iter()
+                .map(|v| t.index_of(v))
+                .collect::<Result<_, _>>()?;
+            Ok((0..n)
+                .map(|r| {
+                    let vals: Vec<f64> = cols.iter().map(|&c| t.rows[r][c]).collect();
+                    expr::eval(&f.tree, &vals) > 0.0
+                })
+                .collect())
+        };
+        let tr_mask = spec
+            .train_select
+            .as_ref()
+            .map(|f| evaluate(f, t))
+            .transpose()?;
+        let te_mask = spec
+            .test_select
+            .as_ref()
+            .map(|f| evaluate(f, t))
+            .transpose()?;
+
+        let mut train = Vec::new();
+        let mut test = Vec::new();
+        let mut overlap = 0usize;
+        let mut unused = 0usize;
+        for r in 0..n {
+            let want_train = tr_mask.as_ref().map(|m| m[r]);
+            let want_test = te_mask.as_ref().map(|m| m[r]);
+            let (to_train, to_test) = match (want_train, want_test) {
+                (Some(a), Some(b)) => match (a, b) {
+                    // Both sides claim the row: training wins, and the overlap
+                    // is reported rather than silently resolved.
+                    (true, true) => {
+                        overlap += 1;
+                        (true, false)
+                    }
+                    (true, false) => (true, false),
+                    (false, true) => (false, true),
+                    (false, false) => {
+                        unused += 1;
+                        (false, false)
+                    }
+                },
+                // Only one side was given: the other side is the complement.
+                (Some(a), None) => (a, !a),
+                (None, Some(b)) => (!b, b),
+                (None, None) => unreachable!(),
+            };
+            if to_train {
+                train.push(r);
+            }
+            if to_test {
+                test.push(r);
+            }
+        }
+
+        report.mode = "select";
+        report.overlap_rows = overlap;
+        report.unassigned_rows = unused;
+        notes.push(format!(
+            "row selection assigned {} train / {} test row(s)",
+            train.len(),
+            test.len()
+        ));
+        if overlap > 0 {
+            notes.push(format!(
+                "{} row(s) matched both selections; they were assigned to training",
+                overlap
+            ));
+        }
+        if unused > 0 {
+            notes.push(format!(
+                "{} row(s) matched neither selection and were left unused",
+                unused
+            ));
+        }
+        notes.push(format!(
+            "row selection replaced the {} split",
+            spec.mode.name()
+        ));
+        if spec.gap > 0 {
+            notes.push("the embargo gap does not apply to a row selection".to_string());
+        }
+        report.notes = notes;
+        return Ok((train, split_blocks(&test, folds), report));
+    }
 
     let (train, fold_idx) = match spec.mode {
         SplitMode::Random => {

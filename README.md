@@ -166,7 +166,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
-     [--filter expr] [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
+     [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
+     [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
@@ -211,6 +212,13 @@ rcsr --data panel.csv --target next_close --group-by symbol
 
 # Let it decide, and report the choice:
 rcsr --data panel.csv --target next_close --split auto
+
+# You know exactly which rows belong where: say so.
+rcsr --data d.csv --target y --vars x1,x2 \
+     --train-select "year < 2020" --test-select "year >= 2020"
+
+# Drop rows first, then let a mode split the rest.
+rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
 ```
 
 * `--time <col>` may be a number or a date (`2024-01-31`, `2024/01/31`,
@@ -223,6 +231,10 @@ rcsr --data panel.csv --target next_close --split auto
   a lucky pooled number.
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
+* `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
+  and override `--split`; `--exclude` drops rows and composes with any mode.
+  A row matching both selections goes to training, one matching neither is
+  unused, and both counts are reported — nothing is discarded silently.
 
 See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
 worked examples.
