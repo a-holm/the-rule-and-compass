@@ -47,6 +47,8 @@ constants — changing its target value cannot move anything.
 | `signed` | `|Σ wᵢ·eᵢ / Σ wᵢ|` |
 | `log_squashed` | `Σ wᵢ·ln(1 + eᵢ²) / Σ wᵢ` |
 | `correlation` | `1 − |r_w|`, weighted Pearson `r_w` |
+| `implicit` | `Σ wᵢ·(|f(pᵢ)| / ||∇f(pᵢ)||) / Σ wᵢ` |
+| `implicit_residual` | `Σ wᵢ·|f(pᵢ)| / Σ wᵢ` |
 | `aic`, `aicc`, `bic` | weighted RSS, `n = number of rows with wᵢ > 0` |
 
 The weighted Pearson correlation uses weighted means and weighted covariance:

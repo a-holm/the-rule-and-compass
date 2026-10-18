@@ -26,6 +26,16 @@ for a plain-language walkthrough,
 [`docs/optimisation.md`](docs/optimisation.md) for the theory and measurements
 behind the search strategy, and [`SPEC.md`](SPEC.md) for the precise behaviour.
 
+### Implicit relations
+
+Some laws are level sets rather than functions: a circle `x² + y² = 1` has no
+single-valued `y = g(x)`. `--implicit` appends the target as one more input and
+searches `f(x1, …, xn, y) = 0`. `--metric implicit` (or the shorthand
+`--implicit-derivative`) scores the distance to the level set,
+`|f| / ||∇f||`, using the adjoint gradient the fitter already computes. See
+[`docs/implicit.md`](docs/implicit.md) for the model, both implicit metrics, the
+zero-gradient guard and a worked unit-circle example.
+
 ## Build & run
 
 Requires a Rust toolchain (`rustup` recommended). No third-party crates are used.
@@ -81,9 +91,12 @@ minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
 `and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`,
 `require`/`constrain` (a violated constraint makes the candidate infeasible
-rather than merely wrong), and the opt-in meta operators `complexity`,
+rather than merely wrong), the opt-in meta operators `complexity`,
 `variables`, `constants`, `contains` and `contains_op` (see
-[`docs/meta-operators.md`](docs/meta-operators.md)), parentheses, the constants
+[`docs/meta-operators.md`](docs/meta-operators.md)), the opt-in dataset
+aggregates `mean(x1)`, `std(x1)`, `median(x1)`, `iqr(x1)`, `sum(x1)`,
+`amin(x1)`, `amax(x1)` and `count()` (see
+[`docs/aggregation.md`](docs/aggregation.md)), parentheses, the constants
 `pi` and `e`, and variable names from your table (the `x0`, `x1`, … fallback
 also works). Comparisons are non-associative, so write
 `(a < b) and (b < c)`.
@@ -144,6 +157,24 @@ input error (exit 3). `--json` reports a `seeds` array and `--ndjson` a `seed`
 event per seed. See [`docs/seeds.md`](docs/seeds.md) for the processing order,
 the elite rule, the file format and the measured before/after numbers.
 
+## Building blocks
+
+`--function` (repeatable, up to four) supplies a sub-formula the search may
+reuse as an operator of its own:
+
+```sh
+cargo run --release -- --data examples/sine.csv --target y --vars x \
+  --function "wave(a)=sin(a)" --generations 100
+```
+
+A definition is `name(a,b)=<expr>` or `name=<expr>` (parameters inferred from
+the free variables). The recovered model prints the name, e.g. `y = wave(x)`,
+and the definition's constants are shared by every call.
+A block costs 1 by default and can be priced with
+`--op-complexity "wave=2"` (or `custom0=2`); the Pareto front ranks on that
+cost. See [`docs/building-blocks.md`](docs/building-blocks.md) for the syntax,
+parameter inference, shared-constant fitting and limits.
+
 ## Choosing what "complexity" means
 
 By default complexity is the node count. `--op-complexity "pow=2,sin=1.5"`,
@@ -152,6 +183,24 @@ operators, terminals and nesting instead. The configured value is what the
 Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
+
+## Dimensional constraints
+
+`--units 'x=m,t=s,y=m/s'` declares the dimensions of the inputs and the target;
+`--require-dimensions` then rejects every candidate whose dimensions cannot be
+reconciled with the target's with an infinite error. The algebra knows the SI
+names `m`, `s`, `kg`, `A`, `K`, `mol` and `cd`, and **any other identifier is
+its own base dimension**, so `price=USD,volume=shares` catches `price + volume`.
+It models dimensions only, not unit identity or scale: declare `volume=m^3`, not
+`litre`. Fitted constants are allowed to carry dimensions (a coefficient absorbs
+a unit ratio, an intercept absorbs the target's), and each solution reports their
+apparent dimensions as a plausibility check. Undeclared names are dimensionless
+and column names are never inspected. Units are strictly optional in three
+layers: no `--units` changes nothing and adds no output fields; `--units` alone
+only reports and never rejects; `--require-dimensions` turns the hard filter on
+and is a usage error without `--units`. See
+[`docs/units.md`](docs/units.md) for the operator table, the radian/degree and
+dB/pH caveats, a worked example and the limitations of a hard filter.
 
 ## Meta operators
 
@@ -164,6 +213,18 @@ describe the model rather than the data, they are useful for self-describing
 models and structural conditions, not as a source of row-level signal. See
 [`docs/meta-operators.md`](docs/meta-operators.md) for the semantics table and
 the caching rule.
+
+## Dataset aggregates
+
+`mean(x1)`, `std(x1)`, `median(x1)`, `iqr(x1)`, `sum(x1)`, `amin(x1)`,
+`amax(x1)` and `count()` reduce one input column over the training rows. They
+are opt-in (`--ops mean,std,...`), computed once into a small per-column table
+before the search and cached in the node, so per-row evaluation cost does not
+grow. They are dataset facts, not fitted parameters: no constant slot, no
+gradient and no `k_constants`; and the table is built from the training rows
+only, never the test split. See
+[`docs/aggregation.md`](docs/aggregation.md) for the semantics table, the cache
+and leakage rules, and a worked recovery example.
 
 ## Save and resume a run
 
@@ -269,6 +330,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
+     [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
@@ -602,11 +664,14 @@ list and the recorded results.
   opt-in `floor ceil round mod min max sign step erf erfc atan2 asinh acosh
   atanh`, the conditional family
   `equal less less_or_equal greater greater_or_equal and or xor not require
-  between constrain`, and the meta operators
-  `complexity variables constants contains contains_op` selected with `--ops`
+  between constrain`, the meta operators
+  `complexity variables constants contains contains_op` and the dataset
+  aggregates `mean std median iqr sum amin amax count` selected with `--ops`
   (all with domain guards; the meta operators describe a subexpression's shape
   and are evaluated once per candidate, not per row — see
-  [`docs/meta-operators.md`](docs/meta-operators.md));
+  [`docs/meta-operators.md`](docs/meta-operators.md); the aggregates are
+  training-column statistics cached once per search — see
+  [`docs/aggregation.md`](docs/aggregation.md));
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
@@ -642,6 +707,9 @@ list and the recorded results.
   smoothing, median/IQR/range scaling and expression row filters (`--filter`) —
   with every statistic computed from the training rows only and a preparation
   report in text, JSON and NDJSON;
+- **multi-output regression** (`--target y1,y2,...`): one shared tree shape,
+  one fitted constant vector per output, combined error = mean per-output
+  error; see [`docs/multi-output.md`](docs/multi-output.md);
 - **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
   overfit index, and per-constant **standard errors** from the Gauss–Newton
   Jacobian that flag constants the data cannot pin down), **null baselines**
@@ -664,6 +732,17 @@ list and the recorded results.
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
 
+## Is the search converging?
+
+`--progress` reports four bounded numbers every generation — **confidence**
+(the best error stopped moving), **stability** (the front's structural forms
+survive), **maturity** (the oldest surviving form's age) and **percent
+converged** (their weighted headline) — and the final `--json`/NDJSON output
+carries the same `"convergence"` object. They are computed from the archive
+alone, cost O(front size) and never touch a training row. See
+[`docs/convergence.md`](docs/convergence.md) for the exact formulas, the
+20-generation window, how to read them and the easy/hard evidence.
+
 ## Layout
 
 ```
@@ -674,10 +753,15 @@ docs/data-splitting.md        train/test splitting for time series and panel dat
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
+docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/meta-operators.md        structural meta operators and their cache rule
+docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
+docs/building-blocks.md       user-defined reusable sub-formulas (--function)
+docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
+docs/convergence.md           confidence, stability, maturity and percent converged
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

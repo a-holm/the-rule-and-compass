@@ -378,6 +378,7 @@ mod tests {
             x: vec![vec![0.0], vec![1.0], vec![2.0]],
             y: vec![0.0, 10.0, 20.0],
             w: Vec::new(),
+            ys: Vec::new(),
         };
         let mut rng = Mt::new(7);
         let r = resample(&s, &mut rng);

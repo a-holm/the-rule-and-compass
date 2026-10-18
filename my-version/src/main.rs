@@ -18,7 +18,8 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
-use rcsr::{data, diagnostics, search, stability};
+use rcsr::units::{Unit, Units};
+use rcsr::{data, diagnostics, multi, search, stability};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -56,21 +57,50 @@ impl ReportKind {
     }
 }
 
+/// Parse one `--units` value: `name=unit[,name=unit...]` (issue #25).
+///
+/// The unit expression is parsed immediately; names are resolved against the
+/// prepared input list once `--vars`, `--dtype` and `--lags` are known.
+fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
+    let mut out = Vec::new();
+    for item in src.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, expr) = item
+            .split_once('=')
+            .ok_or_else(|| format!("expected name=unit, got '{}'", item))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("missing name in '{}'", item));
+        }
+        out.push((name.to_string(), Unit::parse(expr.trim())?));
+    }
+    if out.is_empty() {
+        return Err("no units given".to_string());
+    }
+    Ok(out)
+}
+
 fn usage() -> String {
     format!(
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
 USAGE:
-  rcsr --data <file|-> --target <col> [options]
+  rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
 INPUT:
   --data <file|->            CSV/TSV/whitespace table, header row required
                              ('-' reads the table from standard input)
-  --target <col>             name of the target column
+  --target <col>[,<col>..]   target column; a comma-separated list enables
+                             multi-output regression (one shared shape, one
+                             fitted constant vector per output). See
+                             docs/multi-output.md
   --vars <a,b,..>            input columns (default: all numeric columns except
-                             the target and any --time/--group-by column)
+                             the targets and any --time/--group-by column)
   --dtype <col>=<kind>,..    per-variable datatype: continuous (default),
                              boolean (0/1, never standardised) or categorical
                              (expanded to one-hot columns named col=value).
@@ -82,11 +112,12 @@ INPUT:
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
                              positive. A weight of 2 means \"this row twice\":
-                             absolute, squared, correlation, signed and
-                             log_squashed become weighted means, and aic/aicc/bic
-                             use the weighted RSS. Refused for metrics with no
-                             weighted definition (median, maximum, interquartile,
-                             slope, rank_correlation, auc, log_loss, hinge).
+                             absolute, squared, correlation, signed,
+                             log_squashed, implicit, implicit_residual become
+                             weighted means, and aic/aicc/bic use the weighted
+                             RSS. Refused for metrics with no weighted definition
+                             (median, maximum, interquartile, slope,
+                             rank_correlation, auc, log_loss, hinge).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
@@ -150,6 +181,8 @@ OVERFITTING DIAGNOSTICS (always on):
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
                               (J^T J); flags constants the data cannot pin down
+  constant dimensions         with --units, the apparent dimension each fitted
+                              constant needs (a value:dimension plausibility check)
   --cv <mode>                cross-validation: rerun the search on k folds and
                              report the mean and spread of the held-out errors.
                              k-fold  shuffled partition (i.i.d. data)
@@ -175,19 +208,46 @@ MODE:
                              split, print the result and exit. Write variables
                              by name in original units, e.g. \"2.5*x + sin(y)\";
                              operators as in --ops. `x0,x1,..` also work.
+  --function <def>           define a reusable building block (repeatable, up to
+                             four): \"name(a,b)=sin(a)*cos(b)\" or
+                             \"name=<expr>\" (parameters are the free variables
+                             in order of first appearance). Blocks are searched
+                             as operators of their own arity, named in output,
+                             and cost 1 by default; set a cost with
+                             --op-complexity. Constants inside a body are shared
+                             by every call. See docs/building-blocks.md.
+
+MULTI-OUTPUT (--target y1,y2):
+  Candidates share one tree shape; each target gets its own fitted constants.
+  The combined error is the mean of the per-target errors, and the Pareto front
+  ranks on that mean and the shape's complexity. Text prints one line per
+  target; --json carries a targets array with each expression, constants and
+  error plus the combined error. k_constants is the total across outputs.
+  Not available with --ndjson, --cv, --null-runs, --bootstrap-error,
+  --stability, --report, --save/--resume, or seed expressions.
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
                              absolute  squared  correlation  median  maximum
                              signed  log_squashed  rank_correlation  interquartile
                              slope  auc  log_loss  hinge  aic  aicc  bic
+                             implicit  implicit_residual  (implicit model)
                              (auc/log_loss/hinge treat the target as two classes)
+  --implicit                 fit an implicit relation f(inputs, target) = 0: the
+                             target becomes one extra input (normalised with its
+                             training mean/std) and the fit target is 0. Plain
+                             metrics then score |f|; --smooth first is recommended
+  --implicit-derivative      shorthand for --implicit --metric implicit: score
+                             the level-set distance |f| / ||grad f||, the
+                             recommended implicit objective
   --generations <N>          (default 200)
   --islands <I>              (default 1)
   --pop <P>                  population per island (default 200)
   --max-complexity <K>       max configured complexity per expression (default 30)
   --op-complexity <spec>     per-operator costs, e.g. \"pow=2,sin=1.5,if=3\";
-                             operators not listed keep the default cost of 1
+                             operators not listed keep the default cost of 1.
+                             A block costs 1 unless set here, by its --function
+                             name or its custom0..custom3 slot
   --complexity-weights <s>   terminal weights, e.g. \"var=1,const=1\"; keys
                              var, const and depth (default: 1, 1 and 0)
   --depth-weight <w>         cost per nesting level, i.e. edge below the root
@@ -206,7 +266,22 @@ SEARCH:
                              constraints: between,require,constrain
                              meta: complexity,variables,constants,contains,
                              contains_op (describe the argument's structure)
+                             aggregates: mean,std,median,iqr,sum,amin,amax,
+                             count (training-column statistics; min(x1) and
+                             max(x1) with one argument also work)
                              (full set: `rcsr schema` -> operators list)
+  --units <name=dim,..>      declare dimensions of inputs and the target, e.g.
+                             \"x=m,t=s,y=m/s\"; m,s,kg,A,K,mol,cd are SI names,
+                             any other identifier is its own base dimension
+                             (price=USD). Model dimensions, not unit symbols
+                             (volume=m^3, not litre). *, /, ^integer, (...);
+                             repeatable; an undeclared name is dimensionless.
+                             Alone it reports constant dimensions and never
+                             rejects a candidate
+  --require-dimensions       reject a candidate whose dimensions cannot be made
+                             consistent with the target's (infinite error);
+                             requires --units (usage error without it). Without
+                             this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -229,7 +304,10 @@ OUTPUT:
   --format text|json|ndjson  (default text)
   --json                     shorthand for --format json
   --ndjson                   shorthand for --format ndjson
-  --progress                 emit per-generation progress (stderr, or stdout in ndjson)
+  --progress                 emit per-generation progress, including
+                             convergence statistics (confidence, stability,
+                             maturity, percent_converged); stderr, or stdout in
+                             ndjson. See docs/convergence.md
   --top <N>                  report at most N Pareto rows (default: all)
   --quiet                    suppress the human-readable header
   --out <file>               also write the Pareto front as TSV
@@ -260,6 +338,19 @@ EXIT CODES:
     )
 }
 
+
+fn expand_block_aliases(spec: &str, blocks: &[expr::Block]) -> String {
+    spec.split(',')
+        .map(|token| match token.split_once('=') {
+            Some((name, cost)) => match blocks.iter().position(|b| b.name == name.trim()) {
+                Some(slot) => format!("{}={}", Op::Custom(slot).symbol(), cost),
+                None => token.to_string(),
+            },
+            None => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -360,6 +451,13 @@ struct Row {
     /// Standard errors of the fitted constants (issue #22); `None` when they
     /// are not defined (no constants, or no residual degrees of freedom).
     constant_errors: Option<fit::ConstantErrors>,
+    /// #25: constant values and their apparent dimensions, in tree order.
+    /// Empty when `--units` is not active; `None` means undetermined.
+    constant_values: Vec<f64>,
+    constant_units: Vec<Option<Unit>>,
+    /// #25: `None` when units are inactive. `Some(false)` means the archived
+    /// candidate would be rejected if `--require-dimensions` were on.
+    dimensionally_consistent: Option<bool>,
     /// Structural form of the (normalised) tree, with constants collapsed; the
     /// key stability selection counts.
     shape: String,
@@ -454,6 +552,7 @@ fn main() {
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
     let mut seed_files: Vec<String> = Vec::new();
+    let mut function_defs: Vec<String> = Vec::new();
     let mut stability_runs = 0usize;
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
@@ -467,6 +566,7 @@ fn main() {
     let mut train_select_src: Option<String> = None;
     let mut test_select_src: Option<String> = None;
     let mut weight_name: Option<String> = None;
+    let mut implicit_mode = false;
     let mut save_path: Option<String> = None;
     let mut save_every = 25usize;
     let mut save_every_set = false;
@@ -486,6 +586,10 @@ fn main() {
     let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
+    // #25: `--units` is resolved against the prepared input list later; the
+    // expressions themselves are parsed here so a typo is a usage error.
+    let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
+    let mut require_dimensions = false;
     let mut op_complexity_spec: Option<String> = None;
     let mut complexity_weights_spec: Option<String> = None;
     let mut depth_weight_spec: Option<f64> = None;
@@ -537,6 +641,13 @@ fn main() {
                     }
                 }
             }
+            "--implicit" => implicit_mode = true,
+            "--implicit-derivative" => {
+                // #14: the recommended implicit objective, as one flag.
+                implicit_mode = true;
+                cfg.metric = Metric::ImplicitDerivative;
+                metric_set = true;
+            }
             "--generations" => {
                 cfg.generations = val!().parse().unwrap_or(cfg.generations);
                 generations_set = true;
@@ -554,12 +665,9 @@ fn main() {
                 max_complexity_set = true;
             }
             "--op-complexity" => {
-                let v = val!();
-                if let Err(e) = cfg.complexity_model.apply_op_costs(&v) {
-                    eprintln!("error: {}", e);
-                    std::process::exit(EXIT_USAGE);
-                }
-                op_complexity_spec = Some(v);
+                // Applied after --function definitions are known, so a user's
+                // block name can be resolved to its slot.
+                op_complexity_spec = Some(val!());
             }
             "--complexity-weights" => {
                 let v = val!();
@@ -664,6 +772,7 @@ fn main() {
                 ops_set = true;
             }
             "--eval-expr" => eval_expr = Some(val!()),
+            "--function" => function_defs.push(val!()),
             "--seed-expr" => seed_exprs.push(val!()),
             "--seed-file" => seed_files.push(val!()),
             "--stability" => stability_runs = val!().parse().unwrap_or(0),
@@ -706,6 +815,16 @@ fn main() {
                     }
                 }
             }
+            "--units" => {
+                match parse_unit_assignments(&val!()) {
+                    Ok(mut entries) => unit_assignments.append(&mut entries),
+                    Err(e) => {
+                        eprintln!("error: --units: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--require-dimensions" => require_dimensions = true,
             "--patience" => {
                 cfg.patience = val!().parse().unwrap_or(cfg.patience);
                 patience_set = true;
@@ -784,6 +903,13 @@ fn main() {
         i += 1;
     }
 
+    if !function_defs.is_empty() && (save_path.is_some() || resume_path.is_some()) {
+        eprintln!(
+            "error: --function cannot be combined with --save or --resume \
+             (a checkpoint does not store block definitions)"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     if report_out.is_some() && report.is_none() {
         eprintln!("error: --report-out requires --report summary|sensitivity|benchmark");
         std::process::exit(EXIT_USAGE);
@@ -794,6 +920,11 @@ fn main() {
     }
     if report.is_some() && eval_expr.is_some() {
         eprintln!("error: --report cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+    // #25: the filter needs a declaration, unless a checkpoint saved one.
+    if require_dimensions && unit_assignments.is_empty() && resume_path.is_none() {
+        eprintln!("error: --require-dimensions needs --units");
         std::process::exit(EXIT_USAGE);
     }
     if save_every_set && save_path.is_none() {
@@ -814,6 +945,36 @@ fn main() {
              (seeds are inserted at the start of a fresh run; the checkpoint already \
              contains them)"
         );
+        std::process::exit(EXIT_USAGE);
+    }
+    // #14: the implicit metrics need the target as an input. Refuse the metric
+    // on its own rather than silently fitting a different model.
+    if cfg.metric.is_implicit() && !implicit_mode {
+        eprintln!(
+            "error: --metric {} requires --implicit (or use --implicit-derivative)",
+            cfg.metric.name()
+        );
+        eprintln!(
+            "  --implicit appends the target as an input and searches f(inputs, target) = 0"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // A y-randomisation control shuffles the target. In implicit mode the target
+    // is an input and the scored target is all zeros, so every null run would be
+    // the real run: refuse rather than report a meaningless p-value.
+    if implicit_mode && null_runs > 0 {
+        eprintln!("error: --implicit cannot be combined with --null-runs");
+        eprintln!("  the null control shuffles the target, which is an input here");
+        std::process::exit(EXIT_USAGE);
+    }
+    if implicit_mode && cv_mode.is_some() {
+        eprintln!("error: --implicit cannot be combined with --cv (not implemented yet)");
+        eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
+        std::process::exit(EXIT_USAGE);
+    }
+    if implicit_mode && bootstrap_resamples > 0 {
+        eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
+        eprintln!("  the bootstrap refits constants on |f|, not on the geometric residual");
         std::process::exit(EXIT_USAGE);
     }
 
@@ -969,6 +1130,40 @@ fn main() {
         resume_checkpoint = Some(cp);
     }
 
+    // User-defined building blocks (issue #10). The definitions are parsed
+    // before the data so a syntax error is reported as a usage error; the
+    // thread-local registry makes them visible to the parser, the evaluator,
+    // the fitter and every search island.
+    let blocks = match expr::parse_blocks(&function_defs) {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    if blocks.is_empty() && cfg.ops.iter().any(|op| op.is_custom()) {
+        eprintln!(
+            "error: --ops names a custom slot but no --function was supplied"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if !blocks.is_empty() {
+        expr::set_blocks(blocks.clone());
+        for slot in 0..blocks.len() {
+            let op = Op::Custom(slot);
+            if !cfg.ops.contains(&op) {
+                cfg.ops.push(op);
+            }
+        }
+    }
+    if let Some(spec) = &op_complexity_spec {
+        let spec = expand_block_aliases(spec, &blocks);
+        if let Err(e) = cfg.complexity_model.apply_op_costs(&spec) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
     let data_path = match data_path {
         Some(p) => p,
         None => {
@@ -983,6 +1178,53 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+
+    // #15: `--target` accepts a comma-separated list. One name is the historical
+    // single-output path, byte for byte; two or more enable the shared-shape
+    // multi-output mode.
+    let target_names: Vec<String> = target
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if target_names.is_empty() {
+        eprintln!("error: --target needs at least one column name");
+        std::process::exit(EXIT_USAGE);
+    }
+    for (i, name) in target_names.iter().enumerate() {
+        if target_names[..i].iter().any(|n| n == name) {
+            eprintln!("error: --target names column '{}' more than once", name);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+    let target_refs: Vec<&str> = target_names.iter().map(|s| s.as_str()).collect();
+    let multi_output = target_names.len() > 1;
+    if multi_output {
+        // Honest limits: the single-target diagnostics and report builders
+        // assume one target column. Refusing is better than a half-filled report.
+        let unsupported = [
+            (eval_expr.is_some(), "--eval-expr"),
+            (!seed_exprs.is_empty() || !seed_files.is_empty(), "--seed-expr/--seed-file"),
+            (save_path.is_some(), "--save"),
+            (resume_path.is_some(), "--resume"),
+            (cv_mode.is_some(), "--cv"),
+            (null_runs > 0, "--null-runs"),
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (report.is_some(), "--report"),
+            (format == Format::Ndjson, "--ndjson"),
+        ];
+        for (present, flag) in unsupported {
+            if present {
+                eprintln!(
+                    "error: {} is not supported with multiple targets (--target y1,y2); \
+                     see docs/multi-output.md",
+                    flag
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
 
     let table = if data_path == "-" {
         let mut buf = String::new();
@@ -1025,13 +1267,32 @@ fn main() {
         std::process::exit(EXIT_USAGE);
     }
 
-    let target_idx = match table.index_of(&target) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+    // #15: resolve every target up front. The single-target branch keeps the
+    // historical error text exactly; the multi branch names the bad target.
+    let target_indices: Vec<usize> = if multi_output {
+        target_names
+            .iter()
+            .map(|name| match table.index_of(name) {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!(
+                        "error: target column '{}' not found (columns: {:?})",
+                        name, table.names
+                    );
+                    std::process::exit(EXIT_INPUT);
+                }
+            })
+            .collect()
+    } else {
+        match table.index_of(&target) {
+            Ok(j) => vec![j],
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
         }
     };
+    let target_idx = target_indices[0];
 
     // Resolve the weight column by name here so it can be excluded from the
     // default inputs; numeric/value validation happens in `data`.
@@ -1079,14 +1340,14 @@ fn main() {
         None => None,
     };
 
-    // Default inputs: numeric columns that are neither the target nor a
+    // Default inputs: numeric columns that are neither a target nor a
     // split-only column.
     let vars_explicit = !vars.is_empty();
     if vars.is_empty() {
         vars = (0..table.names.len())
             .filter(|&j| {
                 table.numeric[j]
-                    && table.names[j] != target
+                    && !target_names.iter().any(|t| t == &table.names[j]) // #15
                     && Some(j) != time_col
                     && Some(j) != group_col
                     && Some(j) != weight_col
@@ -1111,10 +1372,11 @@ fn main() {
         None => Vec::new(),
     };
     for (name, _) in &dtype_spec {
-        if name == &target {
+        if target_names.iter().any(|t| t == name) {
             eprintln!(
-                "error: column '{}' is the target; --dtype applies to input variables",
-                name
+                "error: column '{}' is {}target; --dtype applies to input variables",
+                name,
+                if multi_output { "a " } else { "the " }
             );
             std::process::exit(EXIT_USAGE);
         }
@@ -1153,7 +1415,8 @@ fn main() {
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
     let exclusion = |a: Option<usize>, b: Option<usize>| -> Vec<usize> {
-        let mut e = vec![target_idx];
+        // #15: every target is a split-only column, never a model input.
+        let mut e = target_indices.clone();
         e.extend_from_slice(&known_vars);
         if let Some(j) = a {
             e.push(j);
@@ -1371,10 +1634,10 @@ fn main() {
         dtypes: dtypes.clone(),
     };
     let mut rng = Mt::new(cfg.seed);
-    let prepared = match data::prepare_full_weighted_with(
+    let mut prepared = match data::prepare_full_targets_weighted_with(
         &table,
         &vars,
-        &target,
+        &target_refs,
         weight_name.as_deref(),
         &spec,
         &mut rng,
@@ -1387,6 +1650,95 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #14: implicit relations. The target becomes one more input (normalised
+    // with its training mean/std, so denormalisation prints original units) and
+    // the target itself becomes the constant 0. From here on every search,
+    // diagnostic and report sees an ordinary sample with one extra input; the
+    // tree machinery is unchanged.
+    if implicit_mode {
+        let (mean, std) = data::make_implicit(&mut prepared);
+        vars.push(target.clone());
+        notes.push(format!(
+            "implicit: target '{}' is input {} (mean {:.6}, std {:.6}); searching \
+             f({}) = 0 with metric {}",
+            target,
+            vars.len(),
+            mean,
+            std,
+            vars.join(", "),
+            cfg.metric.name()
+        ));
+        if smooth < 2 {
+            notes.push(
+                "warning: --implicit on unsmoothed data: the level-set distance divides by a \
+                 gradient estimated from row-to-row noise. Smooth the series first (for \
+                 example --smooth 5); see docs/implicit.md"
+                    .to_string(),
+            );
+        }
+    }
+    // #25: resolve --units names against the prepared input list. A lagged
+    // copy (`x_lag1`) inherits the unit declared for its source (`x`); every
+    // other undeclared name, including the target, is dimensionless.
+    if !unit_assignments.is_empty() {
+        for (i, (name, _)) in unit_assignments.iter().enumerate() {
+            if unit_assignments[..i].iter().any(|(n, _)| n == name) {
+                eprintln!("error: --units declares '{}' more than once", name);
+                std::process::exit(EXIT_USAGE);
+            }
+            let is_target = name == &target;
+            let is_input = vars.iter().any(|v| v == name);
+            let is_lag_source = vars.iter().any(|v| {
+                v.rsplit_once("_lag")
+                    .map(|(base, n)| base == name && n.parse::<usize>().is_ok())
+                    .unwrap_or(false)
+            });
+            if !is_target && !is_input && !is_lag_source {
+                eprintln!(
+                    "error: --units names '{}', which is neither the target nor an input \
+                     (inputs: {})",
+                    name,
+                    vars.join(", ")
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        let declared = |name: &str| {
+            unit_assignments
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, u)| u.clone())
+        };
+        let target_unit = declared(&target).unwrap_or(Unit::DIMENSIONLESS);
+        let mut var_units = Vec::with_capacity(vars.len());
+        for v in &vars {
+            let unit = declared(v).or_else(|| {
+                v.rsplit_once("_lag")
+                    .filter(|(_, n)| n.parse::<usize>().is_ok())
+                    .and_then(|(base, _)| declared(base))
+            });
+            var_units.push(unit.unwrap_or(Unit::DIMENSIONLESS));
+        }
+        cfg.units = Some(Units::new(var_units, target_unit.clone()));
+        notes.push(format!(
+            "units: target '{}' is {}{}",
+            target,
+            target_unit,
+            if require_dimensions || cfg.require_dimensions {
+                " — dimensional filter on"
+            } else {
+                " — not filtering; pass --require-dimensions to reject mismatches"
+            }
+        ));
+    }
+    if require_dimensions {
+        cfg.require_dimensions = true;
+    }
+    if cfg.require_dimensions && cfg.units.is_none() {
+        eprintln!("error: --require-dimensions needs --units (or a checkpoint that saved them)");
+        std::process::exit(EXIT_USAGE);
+    }
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.
@@ -1402,9 +1754,30 @@ fn main() {
     // population. A syntax error is a usage error and keeps the parser's
     // 1-based column.
     let mut seeds: Vec<expr::Node> = Vec::new();
+    // Layer 3 only: check the seed in original units, before normalisation
+    // inserts constants that could otherwise absorb a mismatch.
+    let seed_dimensions_ok = |tree: &expr::Node| -> bool {
+        match (&cfg.units, cfg.require_dimensions) {
+            (Some(units), true) => units.accepts(tree),
+            _ => true,
+        }
+    };
     for src in &seed_exprs {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: --seed-expr '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        src
+                    );
+                    // Keep it so the search records the infinite error; it can
+                    // never enter the archive.
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: --seed-expr '{}': {}", src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1413,7 +1786,18 @@ fn main() {
     }
     for (origin, src) in &seed_lines {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: {}: '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        origin, src
+                    );
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: {}: '{}': {}", origin, src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1426,11 +1810,13 @@ fn main() {
         let to_stdout = format == Format::Ndjson;
         cfg.progress = Some(std::sync::Arc::new(move |p: search::Progress| {
             let line = format!(
-                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{},\"convergence\":{}}}",
                 p.generation,
                 p.total_generations,
                 jnum(p.best_error),
-                p.pareto_members
+                p.pareto_members,
+                // #18: confidence, stability, maturity, percent_converged.
+                p.convergence.json()
             );
             if to_stdout {
                 println!("{}", line);
@@ -1522,12 +1908,22 @@ fn main() {
             cfg.metric.name(),
             cfg.seed
         );
-        eprintln!(
-            "# target: {} = f({}) | {}",
-            target,
-            vars.join(","),
-            split_line
-        );
+        if multi_output {
+            // #15: one shared shape, one fitted constant vector per output.
+            eprintln!(
+                "# targets: {} = f({}) | {}",
+                target_names.join(","),
+                vars.join(","),
+                split_line
+            );
+        } else {
+            eprintln!(
+                "# target: {} = f({}) | {}",
+                target,
+                vars.join(","),
+                split_line
+            );
+        }
         let type_line: Vec<String> = variable_types
             .iter()
             .map(|v| format!("{} ({})", v.name, v.dtype.name()))
@@ -1554,6 +1950,23 @@ fn main() {
         }
     }
 
+    // #15: multi-output reporting has its own shape (one entry per target);
+    // the single-output path below is untouched.
+    if multi_output {
+        run_multi_output(
+            &cfg,
+            &prepared,
+            &target_names,
+            &vars,
+            format,
+            quiet,
+            top,
+            out_path,
+            start,
+        );
+        std::process::exit(EXIT_OK);
+    }
+
     if let Some(src) = eval_expr.as_deref() {
         run_eval(
             src,
@@ -1563,6 +1976,7 @@ fn main() {
             &variable_types,
             cfg.metric,
             &cfg.complexity_model,
+            implicit_mode,
             format,
             quiet,
             start,
@@ -1657,11 +2071,14 @@ fn main() {
         }
     }
     if format == Format::Text {
+        // #14: an implicit model is printed as `0 = f(...)`.
+        let lhs = if implicit_mode { "0" } else { target.as_str() };
         for (expression, complexity, error) in &seed_rows {
             eprintln!(
-                "# seeded: complexity={} train_error={}  y = {}",
+                "# seeded: complexity={} train_error={}  {} = {}",
                 complexity,
                 fmt_err(*error),
+                lhs,
                 expression
             );
         }
@@ -1709,6 +2126,18 @@ fn main() {
                 .collect();
             let rss: f64 = resid.iter().map(|e| e * e).sum();
             let kconst = expr::count_constants(&s.tree);
+            // #25: dimensions of the fitted constants in the search tree. This
+            // is the same tree `constant_errors` uses, so values and units
+            // line up; the printed law is the denormalised form of it.
+            let (constant_values, constant_units) = match &cfg.units {
+                Some(units) => (
+                    rcsr::units::constant_values(&s.tree),
+                    rcsr::units::constant_dimensions(&s.tree, &units.vars, &units.target),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            let dimensionally_consistent =
+                cfg.units.as_ref().map(|units| units.accepts(&s.tree));
             let (_, aicc, bic) =
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
@@ -1762,6 +2191,9 @@ fn main() {
                         &prepared.train.w,
                     )
                 },
+                constant_values,
+                constant_units,
+                dimensionally_consistent,
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
@@ -1874,6 +2306,7 @@ fn main() {
                 x: prepared.train.x.clone(),
                 y,
                 w: prepared.train.w.clone(),
+                ys: Vec::new(),
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -1961,6 +2394,8 @@ fn main() {
                 );
             }
             for r in &rows {
+                // #14: an implicit model is printed as 0 = f(...).
+                let lhs = if implicit_mode { "0" } else { target.as_str() };
                 println!(
                     "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
                     r.rank,
@@ -1968,7 +2403,7 @@ fn main() {
                     fmt_err(r.train_error),
                     fmt_err(r.test_error),
                     fmt_err(r.aicc),
-                    target,
+                    lhs,
                     r.expression
                 );
             }
@@ -2059,6 +2494,32 @@ fn main() {
                         } else {
                             ""
                         }
+                    );
+                }
+            }
+            // #25: a cheap plausibility check for the constants in the law.
+            for r in &rows {
+                if !r.constant_units.is_empty() {
+                    eprintln!(
+                        "# constant dimensions (rank {}): {} (value:dimension, tree order)",
+                        r.rank,
+                        constant_units_text(&r.constant_values, &r.constant_units)
+                    );
+                }
+            }
+            // Layer 2: units alone never filter, but say how many archived
+            // solutions the Layer 3 flag would reject.
+            if cfg.units.is_some() && !cfg.require_dimensions {
+                let inconsistent = rows
+                    .iter()
+                    .filter(|r| r.dimensionally_consistent == Some(false))
+                    .count();
+                if inconsistent > 0 {
+                    eprintln!(
+                        "# dimensional note: {} of {} archived solution(s) would be rejected by \
+                         --require-dimensions (units are not filtering)",
+                        inconsistent,
+                        rows.len()
                     );
                 }
             }
@@ -2188,8 +2649,17 @@ fn main() {
             let pareto: Vec<String> = rows
                 .iter()
                 .map(|r| {
+                    // Layer 1: no `--units` means no new output field at all.
+                    let dimensions = if cfg.units.is_some() {
+                        format!(
+                            ",\"constant_dimensions\":{}",
+                            constant_units_json(&r.constant_values, &r.constant_units)
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -2202,6 +2672,7 @@ fn main() {
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
                         constant_errors_json(&r.constant_errors),
+                        dimensions,
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
                     )
@@ -2329,7 +2800,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -2346,6 +2817,8 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.converged_early,
+                // #18: the four convergence numbers.
+                outcome.convergence.json(),
                 jnum(elapsed),
                 checkpoint_json,
                 null_json,
@@ -2367,8 +2840,17 @@ fn main() {
                 );
             }
             for r in &rows {
+                // Layer 1: no `--units` means no new output field at all.
+                let dimensions = if cfg.units.is_some() {
+                    format!(
+                        ",\"constant_dimensions\":{}",
+                        constant_units_json(&r.constant_values, &r.constant_units)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -2381,6 +2863,7 @@ fn main() {
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
                     constant_errors_json(&r.constant_errors),
+                    dimensions,
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
                 );
@@ -2471,9 +2954,11 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
                 outcome.generations,
                 outcome.converged_early,
+                // #18: the final reading also closes the NDJSON stream.
+                outcome.convergence.json(),
                 jnum(elapsed),
                 outcome.archive.items.len()
             );
@@ -2519,6 +3004,271 @@ fn main() {
     std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
 }
 
+// ---------------------------------------------------------------------------
+// Multi-output reporting (issue #15)
+// ---------------------------------------------------------------------------
+
+struct MultiTargetRow {
+    name: String,
+    expression: String,
+    constants: Vec<f64>,
+    train_error: f64,
+    test_error: f64,
+    fold_errors: Vec<f64>,
+    constant_errors: Option<fit::ConstantErrors>,
+}
+
+struct MultiParetoRow {
+    rank: usize,
+    complexity: f64,
+    k_constants: usize,
+    train_error: f64,
+    test_error: f64,
+    targets: Vec<MultiTargetRow>,
+}
+
+/// Run the shared-shape search and report one expression per target.
+///
+/// `k_constants` is the **total** across outputs (`shape constants x targets`).
+/// `constant_errors`, the printed formula and each target's error are per
+/// output; `train_error`/`test_error` on the row are the combined (mean) error
+/// the archive was ranked on. Shape complexity is counted once.
+#[allow(clippy::too_many_arguments)]
+fn run_multi_output(
+    cfg: &search::Config,
+    prepared: &data::Prepared,
+    target_names: &[String],
+    vars: &[String],
+    format: Format,
+    quiet: bool,
+    top: usize,
+    out_path: Option<String>,
+    start: std::time::Instant,
+) {
+    let outcome = search::run(cfg, &prepared.train, &prepared.test);
+    let elapsed = start.elapsed().as_secs_f64();
+    let sorted = outcome.archive.sorted();
+    let fold_samples: Vec<data::Sample> = if prepared.fold_samples.is_empty() {
+        vec![prepared.test.clone()]
+    } else {
+        prepared.fold_samples.clone()
+    };
+    let n_targets = target_names.len();
+
+    let mut rows: Vec<MultiParetoRow> = sorted
+        .iter()
+        .enumerate()
+        .map(|(k, s)| {
+            // Fit one constant vector per output on the training rows, then
+            // score every output on the same fitted trees (no test leakage).
+            let trees = multi::fitted_outputs(&s.tree, &prepared.train, cfg.fit_iters);
+            let train_errors = multi::output_errors(&trees, &prepared.train, cfg.metric);
+            let test_errors = multi::output_errors(&trees, &prepared.test, cfg.metric);
+            let targets = target_names
+                .iter()
+                .enumerate()
+                .map(|(j, name)| {
+                    let den = expr::simplify(&expr::denormalize(
+                        &expr::simplify(&trees[j]),
+                        &prepared.means,
+                        &prepared.stds,
+                    ));
+                    let ce = if prepared.train.w.is_empty() {
+                        fit::constant_errors(&trees[j], &prepared.train.x, prepared.train.target(j))
+                    } else {
+                        fit::constant_errors_weighted(
+                            &trees[j],
+                            &prepared.train.x,
+                            prepared.train.target(j),
+                            &prepared.train.w,
+                        )
+                    };
+                    MultiTargetRow {
+                        name: name.clone(),
+                        expression: expr::to_string(&den, vars),
+                        constants: multi::constants(&trees[j]),
+                        train_error: train_errors[j],
+                        test_error: test_errors[j],
+                        fold_errors: fold_samples
+                            .iter()
+                            .map(|f| multi::eval_target(&trees[j], f, cfg.metric, j))
+                            .collect(),
+                        constant_errors: ce,
+                    }
+                })
+                .collect::<Vec<_>>();
+            MultiParetoRow {
+                rank: k + 1,
+                complexity: s.cost,
+                // Every output carries its own constant vector.
+                k_constants: expr::count_constants(&s.tree) * n_targets,
+                train_error: multi::mean_error(&train_errors),
+                test_error: multi::mean_error(&test_errors),
+                targets,
+            }
+        })
+        .collect();
+    let finite = rows.iter().any(|r| r.train_error.is_finite());
+    if top > 0 && rows.len() > top {
+        rows.truncate(top);
+    }
+
+    match format {
+        Format::Text => {
+            if !quiet {
+                eprintln!(
+                    "# elapsed: {:.2}s | generations: {} | pareto members: {}{} | targets: {}",
+                    elapsed,
+                    outcome.generations,
+                    outcome.archive.items.len(),
+                    if outcome.converged_early {
+                        " (stopped early)"
+                    } else {
+                        ""
+                    },
+                    target_names.join(",")
+                );
+                eprintln!(
+                    "# multi-output: one shared shape, one fitted constant vector per output; \
+                     train_err/test_err are the mean over {} target(s)",
+                    n_targets
+                );
+            }
+            for r in &rows {
+                println!(
+                    "{:>3}  complexity={:<3} combined_train_err={:<13} combined_test_err={:<13}",
+                    r.rank,
+                    r.complexity,
+                    fmt_err(r.train_error),
+                    fmt_err(r.test_error)
+                );
+                for t in &r.targets {
+                    println!(
+                        "     {} = {}  (train_err={} test_err={})",
+                        t.name,
+                        t.expression,
+                        fmt_err(t.train_error),
+                        fmt_err(t.test_error)
+                    );
+                }
+                // Constant uncertainties are per output, like the expressions.
+                for t in &r.targets {
+                    if let Some(ce) = &t.constant_errors {
+                        let parts: Vec<String> = ce
+                            .values
+                            .iter()
+                            .zip(&ce.std_errors)
+                            .zip(&ce.relative)
+                            .map(|((v, se), rel)| {
+                                format!("{:.6}±{:.2e} (rel {:.2e})", v, se, rel)
+                            })
+                            .collect();
+                        eprintln!(
+                            "# constant errors (rank {}, {}): {} | dof={}{}",
+                            r.rank,
+                            t.name,
+                            parts.join(", "),
+                            ce.dof,
+                            if ce.ill_conditioned {
+                                " | ill-conditioned"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+            }
+            if let Some(r) = rows.iter().min_by(|a, b| {
+                a.train_error
+                    .partial_cmp(&b.train_error)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                eprintln!("# diagnostics: n={} k={} constants (total across outputs)", prepared.train.len(), r.k_constants);
+            }
+        }
+        Format::Json => {
+            let pareto: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let targets: Vec<String> = r
+                        .targets
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{{\"name\":{},\"expression\":{},\"constants\":[{}],\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}],\"constant_errors\":{}}}",
+                                jstr(&t.name),
+                                jstr(&t.expression),
+                                t.constants.iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
+                                jnum(t.train_error),
+                                jnum(t.test_error),
+                                t.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
+                                constant_errors_json(&t.constant_errors)
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"targets\":[{}]}}",
+                        r.rank,
+                        jnum(r.complexity),
+                        r.k_constants,
+                        jnum(r.train_error),
+                        jnum(r.test_error),
+                        targets.join(",")
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                jstr(VERSION),
+                cfg.seed,
+                jstr(cfg.metric.name()),
+                jstr(&target_names.join(",")),
+                target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
+                vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                prepared.train.len(),
+                prepared.test.len(),
+                outcome.generations,
+                outcome.converged_early,
+                jnum(elapsed),
+                pareto.join(",")
+            );
+        }
+        Format::Ndjson => {
+            // Refused earlier; kept exhaustive so a future change cannot
+            // silently emit a misleading stream.
+            eprintln!("error: --ndjson is not supported with multiple targets");
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
+    if let Some(path) = out_path {
+        let mut buf = String::from(
+            "rank\tcomplexity\tcombined_train_error\tcombined_test_error\ttarget\ttrain_error\ttest_error\texpression\n",
+        );
+        for r in &rows {
+            for t in &r.targets {
+                buf.push_str(&format!(
+                    "{}\t{}\t{:.8}\t{:.8}\t{}\t{:.8}\t{:.8}\t{}\n",
+                    r.rank,
+                    r.complexity,
+                    r.train_error,
+                    r.test_error,
+                    t.name,
+                    t.train_error,
+                    t.test_error,
+                    t.expression
+                ));
+            }
+        }
+        if let Err(e) = std::fs::write(&path, buf) {
+            eprintln!("error writing {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+
+    std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
+}
+
 /// Rewrite a formula written in **original units** into the search's
 /// normalised-input space: every `Input(i)` standing for the raw variable
 /// `x_i` becomes `x_i * std_i + mean_i`, so the search's normalised input
@@ -2528,6 +3278,13 @@ fn main() {
 /// and `--seed-file`. A variable whose affine transform is the identity (a
 /// boolean column, or `--center none --scale none`) is left as a bare input.
 fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
+    // A meta operator describes the searched tree, and an aggregate names a
+    // dataset column: rewriting an input inside either would change its
+    // meaning. They are carried over verbatim (the aggregate is bound to the
+    // training sample later, in `search`).
+    if n.op.is_meta() || n.op.is_agg() {
+        return n.clone();
+    }
     match n.op {
         Op::Input => {
             let i = n.val as usize;
@@ -2553,6 +3310,8 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
                 .iter()
                 .map(|k| normalise_inputs(k, means, stds))
                 .collect(),
+            // A block body is in parameter space and must not be rewritten.
+            block: n.block.clone(),
         },
     }
 }
@@ -2571,11 +3330,12 @@ fn run_eval(
     variable_types: &[data::VariableDType],
     metric: Metric,
     model: &ComplexityModel,
+    implicit: bool,
     format: Format,
     quiet: bool,
     started: std::time::Instant,
 ) {
-    let tree = match expr::parse(src, vars) {
+    let mut tree = match expr::parse(src, vars) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: cannot parse --eval-expr: {}", e);
@@ -2583,10 +3343,8 @@ fn run_eval(
             std::process::exit(EXIT_USAGE);
         }
     };
-    let k = expr::count_constants(&tree);
-    let complexity = model.complexity(&tree);
-    let shown = expr::to_string(&tree, vars);
-
+    // `--eval-expr` evaluates in original units, so an aggregate is the
+    // statistic of the raw training column, not the normalised one.
     let raw_row = |row: &[f64]| -> Vec<f64> {
         row.iter()
             .enumerate()
@@ -2596,6 +3354,17 @@ fn run_eval(
             })
             .collect()
     };
+    let raw_train: Vec<Vec<f64>> = prepared.train.x.iter().map(|r| raw_row(r)).collect();
+    let aggs = expr::AggTable::from_rows(&raw_train);
+    if let Err(e) = expr::bind_aggregates(&mut tree, &aggs) {
+        eprintln!("error: cannot evaluate --eval-expr: {}", e);
+        eprintln!("  expression: {}", src);
+        std::process::exit(EXIT_USAGE);
+    }
+    let k = expr::count_constants(&tree);
+    let complexity = model.complexity(&tree);
+    let shown = expr::to_string(&tree, vars);
+
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
         metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
@@ -2649,11 +3418,12 @@ fn run_eval(
                 );
             }
             println!(
-                "  1  complexity={}   k_constants={}   train_err={}      test_err={}      y = {}",
+                "  1  complexity={}   k_constants={}   train_err={}      test_err={}      {} = {}",
                 complexity,
                 k,
                 fmt_err(train_error),
                 fmt_err(test_error),
+                if implicit { "0" } else { target },
                 shown
             );
         }
@@ -2898,6 +3668,16 @@ fn summary_markdown(
                         "Standard errors are undefined (too few residual degrees of freedom).\n"
                     );
                 }
+            }
+            // #25: the units are inferred from the printed law, not from the
+            // fitted values, so they are a plausibility check rather than an
+            // uncertainty estimate.
+            if !r.constant_units.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "Apparent constant dimensions (value:dimension, tree order): {}.\n",
+                    constant_units_text(&r.constant_values, &r.constant_units)
+                );
             }
         }
         None => {
@@ -3697,6 +4477,47 @@ fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
     }
 }
 
+/// #25: `value:dimension` pairs in tree order, with `?` for undetermined.
+fn constant_units_text(values: &[f64], units: &[Option<Unit>]) -> String {
+    units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| format!("{}", v))
+                .unwrap_or_else(|| "?".to_string());
+            let dimension = u
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}:{}", value, dimension)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// #25: JSON array of `{value, dimension}` objects in tree order. An empty
+/// array means `--units` was not active; `null` dimensions are undetermined.
+fn constant_units_json(values: &[f64], units: &[Option<Unit>]) -> String {
+    let items: Vec<String> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| jnum(*v))
+                .unwrap_or_else(|| "null".to_string());
+            let dimension = match u {
+                Some(u) => jstr(&u.to_string()),
+                None => "null".to_string(),
+            };
+            format!("{{\"value\":{},\"dimension\":{}}}", value, dimension)
+        })
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 /// JSON for one solution's fitted-constant standard errors, or `null` when
 /// they are not defined (issue #22).
 fn constant_errors_json(ce: &Option<fit::ConstantErrors>) -> String {
@@ -3853,5 +4674,23 @@ mod tests {
         }
         assert!(usage().contains("between"), "usage() is missing 'between'");
         assert!(usage().contains("constrain"), "usage() is missing 'constrain'");
+    }
+
+    /// Dataset aggregates must be discoverable from `schema`, named in
+    /// `--ops`, and listed in the help text.
+    #[test]
+    fn help_and_schema_list_dataset_aggregates() {
+        let schema_text = schema::json();
+        for name in [
+            "mean", "std", "median", "iqr", "sum", "amin", "amax", "count",
+        ] {
+            assert!(
+                schema_text.contains(&format!("\"{name}\"")),
+                "schema::json() is missing operator '{name}'"
+            );
+            assert!(usage().contains(name), "usage() is missing '{name}'");
+        }
+        assert!(usage().contains("aggregates:"));
+        assert!(Op::parse_list_checked("mean,count").is_ok());
     }
 }

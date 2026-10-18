@@ -17,10 +17,20 @@
 use crate::checkpoint::{Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
-use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
+use crate::expr::{
+    self, crossover_with, eval, mutate_with, random_tree_with, AggTable, Node, Op,
+};
 use crate::metrics::{score_weighted, Metric};
+// #15: multi-output combined error and per-output constant fitting.
+use crate::multi;
 use crate::pareto::{Archive, Sol};
+// #18: convergence statistics live in their own module; the search only calls
+// `ProgressStats::observe` once per generation.
+use crate::progress_stats::{Convergence, ProgressStats};
 use crate::rng::Mt;
+// #25: the dimensional algebra lives in its own module; the search only asks
+// `Config::accepts_dimensions`.
+use crate::units::Units;
 use std::collections::HashSet;
 
 #[derive(Clone)]
@@ -50,6 +60,12 @@ pub struct Config {
     /// generation. `None`, or any value at least the training size, scores the
     /// full training sample. Values below 2 are rejected by the CLI.
     pub predictor_samples: Option<usize>,
+    /// #25: declared units for the inputs (in input order) and the target.
+    /// `None` disables dimensional analysis entirely.
+    pub units: Option<Units>,
+    /// #25: reject a candidate whose root dimension differs from the target's
+    /// (infinite error) instead of merely noting the mismatch.
+    pub require_dimensions: bool,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
 }
@@ -61,6 +77,8 @@ pub struct Progress {
     pub total_generations: usize,
     pub best_error: f64,
     pub pareto_members: usize,
+    // #18: confidence, stability, maturity and percent_converged.
+    pub convergence: Convergence,
 }
 
 /// Progress callback type. `Send + Sync` so islands can report concurrently.
@@ -85,6 +103,8 @@ impl Default for Config {
             time_budget: None,
             patience: 40,
             predictor_samples: None,
+            units: None,
+            require_dimensions: false,
             progress: None,
         }
     }
@@ -123,6 +143,10 @@ impl Config {
         }
         compare!(patience, "patience");
         compare!(predictor_samples, "predictor_samples");
+        // #25: units only change the trajectory when they are required; the
+        // declaration itself is still part of the saved configuration.
+        compare!(units, "units");
+        compare!(require_dimensions, "require_dimensions");
         diff
     }
 
@@ -130,6 +154,18 @@ impl Config {
     /// The generation budget is excluded (see [`Config::search_setting_differences`]).
     pub fn same_search_settings(&self, other: &Config) -> bool {
         self.search_setting_differences(other).is_empty()
+    }
+
+    /// #25: the only dimensional question the search asks.
+    ///
+    /// A tree is accepted when no units are declared, when dimensional
+    /// constraints are not required, or when its inferred root dimension
+    /// equals the target's. Everything else is rejected.
+    pub fn accepts_dimensions(&self, tree: &Node) -> bool {
+        match &self.units {
+            Some(units) if self.require_dimensions => units.accepts(tree),
+            _ => true,
+        }
     }
 }
 
@@ -142,10 +178,17 @@ struct Ind {
 }
 
 impl Ind {
-    fn evaluated(tree: Node, train: &Sample, metric: Metric, model: &ComplexityModel) -> Self {
+    // #15: `fit_iters` lets a multi-output sample fit one constant vector per
+    // output. #25: a dimensionally inconsistent candidate is rejected outright
+    // when units are required (the predicate is a no-op otherwise).
+    fn evaluated(tree: Node, train: &Sample, cfg: &Config) -> Self {
         let tree = expr::simplify(&tree);
-        let complexity = model.complexity(&tree);
-        let error = eval_error(&tree, train, metric);
+        let complexity = cfg.complexity_model.complexity(&tree);
+        let error = if cfg.accepts_dimensions(&tree) {
+            score_tree(&tree, train, cfg.metric, cfg.fit_iters)
+        } else {
+            f64::INFINITY
+        };
         Ind {
             tree,
             error,
@@ -153,10 +196,15 @@ impl Ind {
         }
     }
 
-    fn reeval(&mut self, train: &Sample, metric: Metric, model: &ComplexityModel) {
+    fn reeval(&mut self, train: &Sample, cfg: &Config) {
         self.tree = expr::simplify(&self.tree);
-        self.complexity = model.complexity(&self.tree);
-        self.error = eval_error(&self.tree, train, metric);
+        self.complexity = cfg.complexity_model.complexity(&self.tree);
+        // #25: re-evaluation must not resurrect a rejected candidate.
+        self.error = if cfg.accepts_dimensions(&self.tree) {
+            score_tree(&self.tree, train, cfg.metric, cfg.fit_iters)
+        } else {
+            f64::INFINITY
+        };
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -180,11 +228,47 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     if s.is_empty() {
         return f64::INFINITY;
     }
+    // #14: an implicit metric measures the distance to the level set
+    // |f| / ||grad f||. That needs f and its gradient at each row, so it is
+    // scored from the tree and the row instead of a prediction vector. Every
+    // other metric takes the original path, bit for bit.
+    if metric.is_implicit() {
+        return crate::implicit::score(tree, s, metric);
+    }
     let pred: Vec<f64> = s.x.iter().map(|row| eval(tree, row)).collect();
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
     score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
+}
+
+/// #14: fit a candidate's constants on the objective its metric actually
+/// scores.
+///
+/// The implicit-derivative metric is scale-free. Fitting `f` against the zero
+/// target with ordinary least squares would shrink every multiplicative
+/// constant towards zero, collapsing the level set into the trivial `f == 0`;
+/// the guard rightly rejects that candidate, so a good shape would be destroyed
+/// before it could be scored. In this one case [`crate::implicit::fit`]
+/// minimises the signed geometric residual `f / ||grad f||` instead. Every
+/// other metric (including `implicit_residual`, which by definition scores
+/// `|f|`) keeps the historical `fit_weighted` path bit for bit.
+fn fit_constants(tree: &mut Node, cfg: &Config, train: &Sample) {
+    if cfg.metric.is_implicit_derivative() {
+        crate::implicit::fit(tree, &train.x, &train.w, cfg.fit_iters);
+    } else {
+        crate::fit::fit_weighted(tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+    }
+}
+
+/// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
+/// objective when more than one target is present. Single-output samples call
+/// [`eval_error`] unchanged.
+fn score_tree(tree: &Node, s: &Sample, metric: Metric, fit_iters: usize) -> f64 {
+    if s.is_multi() {
+        multi::combined_error(tree, s, metric, fit_iters)
+    } else {
+        eval_error(tree, s, metric)    }
 }
 
 /// True when candidate scoring should use a per-generation subset of the
@@ -246,6 +330,17 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
         } else {
             idx.iter().map(|&i| train.w[i]).collect()
         },
+        // #15: subset every output column, not just the first, so a
+        // multi-output generation scores the same rows for every target.
+        ys: if train.ys.is_empty() {
+            Vec::new()
+        } else {
+            train
+                .ys
+                .iter()
+                .map(|col| idx.iter().map(|&i| col[i]).collect())
+                .collect()
+        },
     })
 }
 
@@ -257,8 +352,7 @@ fn full_data_archive(
     archive: &Archive,
     islands: &[Vec<Ind>],
     train: &Sample,
-    metric: Metric,
-    model: &ComplexityModel,
+    cfg: &Config, // #15 refit per-output constants; #25 dimensional filter
 ) -> Archive {
     let trees: Vec<&Node> = archive
         .items
@@ -273,10 +367,16 @@ fn full_data_archive(
             continue;
         }
         let tree = expr::simplify(tree);
-        let error = eval_error(&tree, train, metric);
+        // #15: combined error on a multi-output sample; #25: a rejected
+        // candidate must not sneak back in on the full-data rebuild.
+        let error = if cfg.accepts_dimensions(&tree) {
+            score_tree(&tree, train, cfg.metric, cfg.fit_iters)
+        } else {
+            f64::INFINITY
+        };
         out.try_insert(Sol {
             complexity: expr::complexity(&tree),
-            cost: model.complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
             tree,
             error,
         });
@@ -315,10 +415,17 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
-fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample, nvars: usize) {
+fn evolve_island(
+    isl: &mut Vec<Ind>,
+    rng: &mut Mt,
+    cfg: &Config,
+    train: &Sample,
+    nvars: usize,
+    aggs: &AggTable,
+) {
     for ind in isl.iter_mut() {
         if !ind.error.is_finite() {
-            ind.reeval(train, cfg.metric, &cfg.complexity_model);
+            ind.reeval(train, cfg); // #25
         }
     }
 
@@ -347,11 +454,11 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
         if rng.bool(0.5) {
             let p2 = tournament(isl, rng, 4);
             let parent2 = isl[p2].tree.clone();
-            crossover(&mut child, &parent2, rng);
+            crossover_with(&mut child, &parent2, rng, Some(aggs));
         }
-        mutate(&mut child, rng, nvars, &cfg.ops);
+        mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
         if rng.bool(0.5) {
-            mutate(&mut child, rng, nvars, &cfg.ops);
+            mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
         }
 
         let mut tree = expr::simplify(&child);
@@ -362,11 +469,13 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
             continue;
         }
 
-        if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
-            tree = expr::simplify(&tree);
+        // #15: a multi-output shape keeps the constant slots that only some
+        // outputs need; it is fitted per output inside the evaluator.
+        // #14: otherwise fit on the objective the metric actually scores.
+        if cfg.fit_iters > 0 && !train.is_multi() {
+            fit_constants(&mut tree, cfg, train);            tree = expr::simplify(&tree);
         }
-        let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model);
+        let ind = Ind::evaluated(tree, train, cfg); // #25
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
@@ -375,17 +484,19 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
 
     // Fill any remainder with fresh random trees.
     while next.len() < pop {
-        let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
-        if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
-            tree = expr::simplify(&tree);
-        }
-        next.push(Ind::evaluated(
-            tree,
-            train,
-            cfg.metric,
-            &cfg.complexity_model,
+        let mut tree = expr::simplify(&random_tree_with(
+            rng,
+            nvars,
+            &cfg.ops,
+            cfg.init_depth,
+            Some(aggs),
         ));
+        // #15: multi-output fits per output inside the evaluator.
+        // #14: otherwise fit on the objective the metric actually scores.
+        if cfg.fit_iters > 0 && !train.is_multi() {
+            fit_constants(&mut tree, cfg, train);            tree = expr::simplify(&tree);
+        }
+        next.push(Ind::evaluated(tree, train, cfg)); // #25
     }
 
     *isl = next;
@@ -414,6 +525,8 @@ pub struct Outcome {
     /// The seeds that were accepted, in command-line order. Empty when the run
     /// was not seeded.
     pub seeds: Vec<SeedResult>,
+    // #18: convergence statistics at the end of the run.
+    pub convergence: Convergence,
 }
 
 /// Run a search once, from a fresh start.
@@ -553,7 +666,7 @@ fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
 /// it, in that order. A seed that is structurally identical to an earlier one
 /// (after simplification and again after fitting) is dropped: the archive and
 /// every island need it once.
-fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
+fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node], aggs: &AggTable) -> Vec<Ind> {
     let mut out: Vec<Ind> = Vec::new();
     // Two sets: one for the simplified input form (so a repeated line is
     // dropped even before fitting) and one for the fitted tree (so two
@@ -562,22 +675,23 @@ fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
     let mut seen_fitted: HashSet<u64> = HashSet::new();
     for seed in seeds {
         let mut tree = expr::simplify(seed);
+        // A parsed seed carries unresolved aggregates (`val = NaN`); resolve
+        // them against the training sample before anything evaluates it.
+        if expr::bind_aggregates(&mut tree, aggs).is_err() {
+            continue;
+        }
         if !seen_input.insert(expr::structural_hash(&tree)) {
             continue;
         }
-        if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
-            tree = expr::simplify(&tree);
+        // #15: multi-output fits per output inside the evaluator.
+        // #14: otherwise fit on the objective the metric actually scores.
+        if cfg.fit_iters > 0 && !train.is_multi() {
+            fit_constants(&mut tree, cfg, train);            tree = expr::simplify(&tree);
         }
         if !seen_fitted.insert(expr::structural_hash(&tree)) {
             continue;
         }
-        out.push(Ind::evaluated(
-            tree,
-            train,
-            cfg.metric,
-            &cfg.complexity_model,
-        ));
+        out.push(Ind::evaluated(tree, train, cfg)); // #25
     }
     out
 }
@@ -592,7 +706,16 @@ fn run_search(
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
+    // The aggregates are a property of the training rows, computed once. They
+    // are deliberately **not** rebuilt for a generation's row subset and never
+    // read the test sample: a subset changes which rows score a candidate, not
+    // what the dataset's statistics are.
+    let aggs = AggTable::from_sample(train);
     let t0 = std::time::Instant::now();
+    // #10: user-defined blocks are thread-local. Snapshot the registry here so
+    // every island thread (and the initial population below) sees the same
+    // definitions; the list is empty unless --function was supplied.
+    let blocks = expr::current_blocks();
 
     let mut rng: Mt;
     let mut archive: Archive;
@@ -686,10 +809,9 @@ fn run_search(
             let mut pop = Vec::with_capacity(cfg.pop);
             for _ in 0..cfg.pop {
                 pop.push(Ind::evaluated(
-                    random_tree(&mut rng, nvars, &cfg.ops, depth),
+                    random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs)),
                     init_train,
-                    cfg.metric,
-                    &cfg.complexity_model,
+                    cfg, // #25
                 ));
             }
             islands.push(pop);
@@ -713,7 +835,10 @@ fn run_search(
         // so every individual competes on identical rows.
         let init_sample = training_for_generation(cfg, train, 0);
         let init_train = init_sample.as_ref().unwrap_or(train);
-        for (k, ind) in prepare_seeds(cfg, train, seeds).into_iter().enumerate() {
+        for (k, ind) in prepare_seeds(cfg, train, seeds, &aggs)
+            .into_iter()
+            .enumerate()
+        {
             archive.try_insert(Sol {
                 complexity: expr::complexity(&ind.tree),
                 cost: ind.complexity,
@@ -722,12 +847,7 @@ fn run_search(
             });
             if k < cfg.pop {
                 let in_pop = if init_sample.is_some() {
-                    Ind::evaluated(
-                        ind.tree.clone(),
-                        init_train,
-                        cfg.metric,
-                        &cfg.complexity_model,
-                    )
+                    Ind::evaluated(ind.tree.clone(), init_train, cfg) // #25
                 } else {
                     ind.clone()
                 };
@@ -745,6 +865,11 @@ fn run_search(
         }
     }
 
+    // #18: one tracker, updated once per generation from the archive. It holds
+    // no population state, so it cannot affect the search trajectory.
+    let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
+    let mut stats_observed = false;
+
     if !converged_early {
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
@@ -760,17 +885,25 @@ fn run_search(
             if gen > 0 && gen_sample.is_some() {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.reeval(gen_train, cfg.metric, &cfg.complexity_model);
+                        ind.reeval(gen_train, cfg); // #25
                     }
                 }
             }
 
             // ---- parallel generation across islands ---------------------
+            let aggs_ref = &aggs;
             std::thread::scope(|s| {
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
-                    .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
+                    .map(|(isl, r)| {
+                        // #10: carry the block registry into the island thread.
+                        let blocks = blocks.clone();
+                        s.spawn(move || {
+                            expr::set_blocks(blocks);
+                            evolve_island(isl, r, cfg, gen_train, nvars, aggs_ref)
+                        })
+                    })
                     .collect();
                 for h in handles {
                     let _ = h.join();
@@ -800,12 +933,18 @@ fn run_search(
                 }
             }
 
+            // #18: convergence is a pure reading of the archive; O(front size).
+            let convergence = progress_stats.observe(gens_done, gen_best, &archive);
+            stats_observed = true;
+
             if let Some(report) = &cfg.progress {
                 report(Progress {
                     generation: gens_done,
                     total_generations: cfg.generations,
                     best_error: gen_best,
                     pareto_members: archive.items.len(),
+                    // #18: every progress event carries the four numbers.
+                    convergence,
                 });
             }
 
@@ -852,12 +991,7 @@ fn run_search(
                                 .partial_cmp(&b.error)
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         }) {
-                            *worst = Ind::evaluated(
-                                t.clone(),
-                                gen_train,
-                                cfg.metric,
-                                &cfg.complexity_model,
-                            );
+                            *worst = Ind::evaluated(t.clone(), gen_train, cfg); // #25
                         }
                     }
                 }
@@ -883,22 +1017,18 @@ fn run_search(
                     if stagnant[ii] >= 2 {
                         let mut r = rngs[ii].clone();
                         for ind in islands[ii].iter_mut() {
-                            let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
-                            if cfg.fit_iters > 0 {
-                                crate::fit::fit_weighted(
-                                    &mut t,
-                                    &gen_train.x,
-                                    &gen_train.y,
-                                    &gen_train.w,
-                                    cfg.fit_iters,
-                                );
-                            }
-                            *ind = Ind::evaluated(
-                                t,
-                                gen_train,
-                                cfg.metric,
-                                &cfg.complexity_model,
+                            let mut t = random_tree_with(
+                                &mut r,
+                                nvars,
+                                &cfg.ops,
+                                cfg.init_depth,
+                                Some(&aggs),
                             );
+                            // #15: multi-output fits per output inside the evaluator.
+                            if cfg.fit_iters > 0 && !gen_train.is_multi() {
+                                fit_constants(&mut t, cfg, gen_train);
+                            }
+                            *ind = Ind::evaluated(t, gen_train, cfg);
                         }
                         rngs[ii] = r;
                         stagnant[ii] = 0;
@@ -953,13 +1083,7 @@ fn run_search(
         // Generation fitness was estimated on subsets, so the front is rebuilt
         // from the surviving trees and scored on every training row. From here
         // on the archive and every number derived from it are full-data.
-        archive = full_data_archive(
-            &archive,
-            &islands,
-            train,
-            cfg.metric,
-            &cfg.complexity_model,
-        );
+        archive = full_data_archive(&archive, &islands, train, cfg); // #25
     } else {
         for pop in &islands {
             for ind in pop {
@@ -975,16 +1099,39 @@ fn run_search(
     let sorted = archive.sorted();
     let test_errors: Vec<f64> = sorted
         .iter()
-        .map(|s| eval_error(&s.tree, test, cfg.metric))
+        .map(|s| {
+            // #15: fit the per-output constants on train, then score test.
+            if train.is_multi() {
+                multi::combined_test_error(&s.tree, train, test, cfg.metric, cfg.fit_iters)
+            } else {
+                eval_error(&s.tree, test, cfg.metric)
+            }
+        })
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
+
+    // #18: the last in-loop reading describes the final generation. If no
+    // generation ran (a resumed run that had already converged, or a zero
+    // budget), take one reading of the final archive so the JSON is populated.
+    let mut convergence = progress_stats.current();
+    if !stats_observed {
+        let best = final_archive
+            .items
+            .iter()
+            .map(|s| s.error)
+            .fold(f64::INFINITY, f64::min);
+        convergence = progress_stats.observe(gens_done, best, &final_archive);
+    }
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
         generations: gens_done,
         converged_early,
         seeds: seed_results,
+        // #18: the four convergence numbers for the final --json output.
+        convergence,
     })
 }
 
@@ -1002,7 +1149,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new() }
     }
 
     #[test]
@@ -1012,7 +1159,8 @@ mod tests {
         cfg.fit_iters = 8;
         // A deliberately wrong constant on the right shape.
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
-        let accepted = prepare_seeds(&cfg, &s, &[seed.clone(), seed]);
+        let aggs = AggTable::from_sample(&s);
+        let accepted = prepare_seeds(&cfg, &s, &[seed.clone(), seed], &aggs);
         assert_eq!(accepted.len(), 1, "a repeated seed is inserted once");
         assert!(
             accepted[0].error < 1e-12,
@@ -1033,7 +1181,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.fit_iters = 0;
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
-        let accepted = prepare_seeds(&cfg, &s, &[seed]);
+        let aggs = AggTable::from_sample(&s);
+        let accepted = prepare_seeds(&cfg, &s, &[seed], &aggs);
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
     }
 }

@@ -30,8 +30,8 @@
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
 //!
 //! Trees are encoded recursively as `op_index val arity child...`, where
-//! `op_index` is the [`Op`] discriminant and `val` is the exact floating-point
-//! value (`{:?}`, or `inf`/`-inf`/`NaN`). `expr::to_string` is deliberately not
+//! `op_index` is [`Op::index`] and `val` is the exact floating-point value
+//! (`{:?}`, or `inf`/`-inf`/`NaN`). `expr::to_string` is deliberately not
 //! used: it rounds constants, which would change the search.
 //!
 //! The loader is strict: an unknown version, a truncated file, a bad operator
@@ -40,11 +40,14 @@
 
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
-use crate::expr::{Node, Op};
+use crate::expr::{AggKind, Node, Op};
 use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use crate::search::Config;
+// #25: units are part of the saved search settings, so a resumed run keeps the
+// same dimensional filter.
+use crate::units::{Unit, Units};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -102,7 +105,8 @@ pub struct Checkpoint {
     pub main_rng: Mt,
 }
 
-/// The operators in discriminant order. The array index is exactly `op as usize`.
+/// The operators in [`Op::index`] order. The array index is exactly
+/// `op.index()`.
 const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Const,
     Op::Input,
@@ -158,6 +162,18 @@ const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Constants,
     Op::Contains,
     Op::ContainsOp,
+    Op::Agg(AggKind::Mean),
+    Op::Agg(AggKind::Std),
+    Op::Agg(AggKind::Median),
+    Op::Agg(AggKind::Iqr),
+    Op::Agg(AggKind::Sum),
+    Op::Agg(AggKind::Min),
+    Op::Agg(AggKind::Max),
+    Op::Agg(AggKind::Count),
+    Op::Custom0,
+    Op::Custom1,
+    Op::Custom2,
+    Op::Custom3,
 ];
 
 fn op_by_index(i: usize) -> Option<Op> {
@@ -182,7 +198,7 @@ fn write_tree(n: &Node, out: &mut String) {
     let _ = write!(
         out,
         "{} {} {}",
-        n.op as usize,
+        n.op.index(),
         encode_f64(n.val),
         n.kids.len()
     );
@@ -239,7 +255,12 @@ fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
     for _ in 0..arity {
         kids.push(parse_tree(tokens, pos)?);
     }
-    Ok(Node { op, val, kids })
+    Ok(Node {
+        op,
+        val,
+        kids,
+        block: None,
+    })
 }
 
 fn next_token<'a>(
@@ -304,6 +325,17 @@ pub fn fingerprint(s: &Sample) -> Fingerprint {
     }
     for v in &s.y {
         mix(&mut h, v.to_bits());
+    }
+    // #15: extra targets are part of the data a checkpoint was fitted on.
+    // Guarded so a single-output fingerprint stays byte-for-byte compatible.
+    if !s.ys.is_empty() {
+        mix(&mut h, s.ys.len() as u64);
+        for col in &s.ys {
+            mix(&mut h, col.len() as u64);
+            for v in col {
+                mix(&mut h, v.to_bits());
+            }
+        }
     }
     for v in &s.w {
         mix(&mut h, v.to_bits());
@@ -819,21 +851,22 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "patience",
         "predictor_samples",
     ];
+    // #25: optional so a checkpoint written before units existed still loads,
+    // and so a units-free run writes exactly the old checkpoint bytes.
+    const OPTIONAL_KEYS: &[&str] = &["units", "units.target", "require_dimensions"];
     for key in KEYS {
         required(fields, key)?;
     }
-    if fields.len() != KEYS.len() {
-        let extras: Vec<&str> = fields
-            .keys()
-            .map(|s| s.as_str())
-            .filter(|k| !KEYS.contains(k))
-            .collect();
-        if !extras.is_empty() {
-            return Err(format!(
-                "checkpoint has unknown config field(s): {}",
-                extras.join(", ")
-            ));
-        }
+    let extras: Vec<&str> = fields
+        .keys()
+        .map(|s| s.as_str())
+        .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k))
+        .collect();
+    if !extras.is_empty() {
+        return Err(format!(
+            "checkpoint has unknown config field(s): {}",
+            extras.join(", ")
+        ));
     }
 
     let num_usize = |key: &str| -> Result<usize, String> {
@@ -936,6 +969,46 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         ));
     }
 
+    // #25: optional fields. Missing means "no units, no filter", which is
+    // bit-identical to a checkpoint written before this feature existed.
+    if fields.contains_key("units.target") && !fields.contains_key("units") {
+        return Err(
+            "checkpoint has 'units.target' without 'units'; both or neither are expected"
+                .to_string(),
+        );
+    }
+    let units = match fields.get("units").map(|s| s.as_str()) {
+        None | Some("none") => None,
+        Some(raw) => {
+            let vars = Units::decode_vars(raw)
+                .map_err(|e| format!("bad config value for 'units': {}", e))?;
+            let target = Unit::parse(
+                fields
+                    .get("units.target")
+                    .ok_or_else(|| "checkpoint has 'units' without 'units.target'".to_string())?,
+            )
+            .map_err(|e| format!("bad config value for 'units.target': {}", e))?;
+            Some(Units::new(vars, target))
+        }
+    };
+    let require_dimensions = match fields.get("require_dimensions").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'require_dimensions' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
+    if require_dimensions && units.is_none() {
+        return Err(
+            "config 'require_dimensions' is true but 'units' is none; \
+             the filter needs declared units"
+                .to_string(),
+        );
+    }
+
     Ok(Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -953,6 +1026,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         time_budget,
         patience: num_usize("patience")?,
         predictor_samples,
+        units,
+        require_dimensions,
         progress: None,
     })
 }
@@ -986,7 +1061,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     .unwrap();
     writeln!(out, "config metric {}", cfg.metric.name()).unwrap();
     writeln!(out, "config seed {}", cfg.seed).unwrap();
-    let ops: Vec<String> = cfg.ops.iter().map(|op| (*op as usize).to_string()).collect();
+    let ops: Vec<String> = cfg.ops.iter().map(|op| op.index().to_string()).collect();
     writeln!(out, "config ops {}", ops.join(",")).unwrap();
     writeln!(out, "config migration_interval {}", cfg.migration_interval).unwrap();
     writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
@@ -1012,6 +1087,13 @@ fn write_config(cfg: &Config, out: &mut String) {
         }
     )
     .unwrap();
+    // #25: only write these when units are active, so a units-free checkpoint
+    // is byte-identical to one written before this feature existed.
+    if let Some(u) = &cfg.units {
+        writeln!(out, "config units {}", u.encode_vars()).unwrap();
+        writeln!(out, "config units.target {}", u.target).unwrap();
+        writeln!(out, "config require_dimensions {}", cfg.require_dimensions).unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1020,11 +1102,11 @@ mod tests {
 
     #[test]
     fn op_index_table_matches_the_enum_discriminants() {
-        // The text format stores `op as usize`; the decoding table must be in
+        // The text format stores `op.index()`; the decoding table must be in
         // exactly that order. A new or reordered variant fails here rather
         // than silently decoding into a different expression.
         for (i, op) in OP_BY_INDEX.iter().enumerate() {
-            assert_eq!(*op as usize, i, "OP_BY_INDEX is out of order at {}", i);
+            assert_eq!(op.index(), i, "OP_BY_INDEX is out of order at {}", i);
         }
         assert_eq!(OP_BY_INDEX.len(), Op::COUNT);
     }

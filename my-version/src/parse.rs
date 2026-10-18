@@ -20,12 +20,24 @@
 //! power   := primary ('^' unary)?          // right associative
 //! primary := number
 //!          | meta '(' expr ')'              // structural meta operator
+//!          | agg '(' expr? ')'              // dataset aggregate (count is empty)
 //!          | name '(' expr (',' expr)* ')' // function call, any arity
 //!          | name                          // variable
 //!          | '(' expr ')'
 //! meta    := 'complexity' | 'variables' | 'constants' | 'contains'
 //!          | 'contains_op'
+//! agg     := 'mean' | 'std' | 'median' | 'iqr' | 'sum' | 'amin' | 'amax'
+//!          | 'count'
 //! ```
+//!
+//! An aggregate is a reduction over one **input column**, so its argument must
+//! be a bare variable (`mean(x1)`), not an expression. `count()` takes no
+//! argument. Because `min`/`max` are also the binary primitives, the parser
+//! accepts `min(x1)`/`max(x1)` with one argument as the column reduction and
+//! keeps `min(a, b)` for the binary form; the canonical `--ops` names are
+//! `amin`/`amax`. An aggregate parsed from text has no data yet: its value is
+//! `NaN` until [`crate::expr::bind_aggregates`] resolves it against an
+//! [`crate::expr::AggTable`].
 //!
 //! Operator precedence, loosest to tightest:
 //! `or` < `xor` < `and` < comparisons `< <= > >= ==` < `+`/`-` < `*`/`/` <
@@ -53,13 +65,19 @@
 //!   rather than evaluating it, so the call is built through
 //!   [`crate::expr::node`], which caches the structural value on the node.
 //!   `complexity(x * x)` prints back and re-parses to the same tree.
+//! * The aggregates `mean`, `std`, `median`, `iqr`, `sum`, `amin`/`amax`
+//!   (also `min(x)`/`max(x)` with one argument) take exactly one input column,
+//!   and `count` takes none. They are recognised as calls, so a column called
+//!   `mean` is still available without parentheses. A parsed aggregate has
+//!   `val = NaN` until it is bound to an
+//!   [`crate::expr::AggTable`](crate::expr::AggTable).
 //!
 //! # Errors
 //!
 //! [`ParseError`] carries the offending **1-based column**, so a caller can
 //! point at the exact character that failed.
 
-use crate::expr::{constant, input, node, Node, Op};
+use crate::expr::{constant, current_blocks, custom_node, input, node, Block, Node, Op};
 
 /// A syntax error, with the 1-based column of the offending token.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,12 +95,23 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 /// Parse `src` into an expression tree. Variable names are resolved against
-/// `vars` (see the module docs for the resolution rules).
+/// `vars` (see the module docs for the resolution rules). User-defined blocks
+/// installed on the current thread (see [`crate::expr::set_blocks`]) are
+/// callable by name; [`parse_with`] takes the definitions explicitly instead.
 pub fn parse(src: &str, vars: &[String]) -> Result<Node, ParseError> {
+    parse_with(src, vars, &current_blocks())
+}
+
+/// [`parse`] with an explicit block table. Definitions are tried before the
+/// primitive table, so a block can have the user's own name. A call is accepted
+/// under either that name or the canonical `customN` for its slot, and the
+/// argument count must equal the block's arity.
+pub fn parse_with(src: &str, vars: &[String], blocks: &[Block]) -> Result<Node, ParseError> {
     let mut p = Parser {
         src: src.as_bytes(),
         pos: 0,
         vars,
+        blocks,
     };
     p.skip_ws();
     if p.peek().is_none() {
@@ -100,6 +129,7 @@ struct Parser<'a> {
     src: &'a [u8],
     pos: usize,
     vars: &'a [String],
+    blocks: &'a [Block],
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -436,8 +466,49 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        let op = match Op::from_name(&name) {
-            Some(op) if op.arity() > 0 => op,
+        // A user-defined block resolves before the primitive table. Both the
+        // user's name and the canonical `customN` for its slot are accepted.
+        let block = self
+            .blocks
+            .iter()
+            .enumerate()
+            .find(|(slot, b)| b.name == name || Block::slot_name(*slot) == name)
+            .map(|(slot, b)| (slot, b.clone()));
+        if let Some((slot, block)) = block {
+            if block.params.len() != args.len() {
+                return Err(ParseError {
+                    message: format!(
+                        "'{name}' takes {} argument{}, got {}",
+                        block.params.len(),
+                        if block.params.len() == 1 { "" } else { "s" },
+                        args.len()
+                    ),
+                    column: start + 1,
+                });
+            }
+            return Ok(custom_node(Op::Custom(slot), args, block));
+        }
+        // Aggregate names share the `--ops` table. `min`/`max` with exactly one
+        // argument are the column reductions; with two they stay binary.
+        let agg_override = if args.len() == 1 {
+            match name.to_ascii_lowercase().as_str() {
+                "min" => Some(Op::Agg(crate::expr::AggKind::Min)),
+                "max" => Some(Op::Agg(crate::expr::AggKind::Max)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let op = match agg_override.or_else(|| Op::from_name(&name)) {
+            Some(op) if op.arity() > 0 || op.is_agg() => op,
+            Some(op) if op.is_custom() => {
+                return Err(ParseError {
+                    message: format!(
+                        "'{name}' is a user-defined block slot with no --function definition"
+                    ),
+                    column: start + 1,
+                })
+            }
             Some(_) => {
                 return Err(ParseError {
                     message: format!("'{name}' is not a function"),
@@ -462,6 +533,21 @@ impl<'a> Parser<'a> {
                 column: start + 1,
             });
         }
+        if op.is_agg() {
+            if let Op::Agg(kind) = op {
+                if kind.arity() == 1 {
+                    let ok = args.first().map(|a| a.op == Op::Input).unwrap_or(false);
+                    if !ok {
+                        return Err(ParseError {
+                            message: format!(
+                                "'{name}' reduces one input column (for example {name}(x1)), not an expression"
+                            ),
+                            column: start + 1,
+                        });
+                    }
+                }
+            }
+        }
         Ok(node(op, args))
     }
 }
@@ -473,6 +559,138 @@ fn x_index(name: &str) -> Option<usize> {
         return None;
     }
     rest.parse().ok()
+}
+
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The variable name in a parser error produced by an unresolved bare name.
+fn unknown_variable(message: &str) -> Option<&str> {
+    message
+        .strip_prefix("unknown variable '")?
+        .strip_suffix('\'')
+}
+
+/// Parse up to four `--function` definitions, in command-line order.
+///
+/// Each definition is `name(a,b)=<expr>` or `name=<expr>`; the latter infers
+/// the parameters from the free variables in order of first appearance. A body
+/// may call only the blocks defined before it (so recursion and forward
+/// references are rejected). Every definition gets the slot matching its
+/// position: `custom0`, `custom1`, …
+pub fn parse_blocks(defs: &[String]) -> Result<Vec<Block>, String> {
+    if defs.len() > 4 {
+        return Err(format!(
+            "at most four --function definitions are supported, got {}",
+            defs.len()
+        ));
+    }
+    let mut blocks: Vec<Block> = Vec::with_capacity(defs.len());
+    for def in defs {
+        let block = parse_block(def, &blocks)
+            .map_err(|why| format!("--function '{}': {}", def.trim(), why))?;
+        if block.params.len() > 4 {
+            return Err(format!(
+                "--function '{}': a block takes at most four parameters, got {}",
+                block.name,
+                block.params.len()
+            ));
+        }
+        blocks.push(block);
+    }
+    Ok(blocks)
+}
+
+/// Parse one definition against the blocks defined before it.
+pub fn parse_block(def: &str, prior: &[Block]) -> Result<Block, String> {
+    let (left, body_src) = def
+        .split_once('=')
+        .ok_or("expected name(a,b)=expression or name=expression")?;
+    let left = left.trim();
+    let body_src = body_src.trim();
+    if left.is_empty() {
+        return Err("missing block name".to_string());
+    }
+    if body_src.is_empty() {
+        return Err("missing block body".to_string());
+    }
+
+    let (name, explicit) = match left.find('(') {
+        Some(open) => {
+            if !left.ends_with(')') {
+                return Err(format!("malformed parameter list in '{}'", left));
+            }
+            let name = left[..open].trim().to_string();
+            let inner = &left[open + 1..left.len() - 1];
+            let params: Vec<String> = inner
+                .split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect();
+            (name, Some(params))
+        }
+        None => (left.to_string(), None),
+    };
+
+    if !is_ident(&name) {
+        return Err(format!("'{}' is not a valid block name", name));
+    }
+    if Op::from_name(&name).is_some() {
+        return Err(format!(
+            "'{}' is a reserved primitive or block-slot name",
+            name
+        ));
+    }
+    if prior.iter().any(|b| b.name == name) {
+        return Err(format!("duplicate block name '{}'", name));
+    }
+
+    let (params, body) = if let Some(params) = explicit {
+        for p in &params {
+            if !is_ident(p) {
+                return Err(format!("'{}' is not a valid parameter name", p));
+            }
+        }
+        let mut seen = Vec::new();
+        for p in &params {
+            if seen.contains(p) {
+                return Err(format!("duplicate parameter name '{}'", p));
+            }
+            seen.push(p.clone());
+        }
+        let body = parse_with(body_src, &params, prior)
+            .map_err(|e| format!("body does not parse: {}", e))?;
+        (params, body)
+    } else {
+        // Infer parameters by letting the parser report the first unresolved
+        // bare name, adding it, and retrying. The order is therefore first
+        // appearance, and a name the parser already understands (`x0`, `pi`,
+        // a primitive, a prior block) is never a parameter.
+        let mut params: Vec<String> = Vec::new();
+        let body = loop {
+            match parse_with(body_src, &params, prior) {
+                Ok(body) => break body,
+                Err(e) => match unknown_variable(&e.message) {
+                    Some(var) => {
+                        if params.len() >= 4 {
+                            return Err(format!(
+                                "a block takes at most four parameters; '{}' is a fifth",
+                                var
+                            ));
+                        }
+                        params.push(var.to_string());
+                    }
+                    None => return Err(format!("body does not parse: {}", e)),
+                },
+            }
+        };
+        (params, body)
+    };
+
+    Ok(Block { name, params, body })
 }
 
 #[cfg(test)]
@@ -612,6 +830,67 @@ mod tests {
                 same(&tree, &again),
                 "'{s}' printed as '{printed}' did not round-trip"
             );
+        }
+    }
+
+    #[test]
+    fn aggregates_parse_as_column_reductions() {
+        use crate::expr::AggKind;
+        let v = vars();
+        for (src, kind) in [
+            ("mean(x)", AggKind::Mean),
+            ("std(x)", AggKind::Std),
+            ("stddev(x)", AggKind::Std),
+            ("median(x)", AggKind::Median),
+            ("iqr(x)", AggKind::Iqr),
+            ("sum(x)", AggKind::Sum),
+            ("amin(x)", AggKind::Min),
+            ("amax(x)", AggKind::Max),
+            ("min(x)", AggKind::Min),
+            ("max(x)", AggKind::Max),
+        ] {
+            let n = p(src);
+            assert_eq!(n.op, Op::Agg(kind), "{src}");
+            assert_eq!(n.kids.len(), 1, "{src}");
+            assert_eq!(n.kids[0].op, Op::Input, "{src}");
+            assert!(n.val.is_nan(), "{src} is unresolved until bound");
+        }
+        let c = p("count()");
+        assert_eq!(c.op, Op::Agg(AggKind::Count));
+        assert!(c.kids.is_empty());
+
+        // `min`/`max` keep the binary form with two arguments.
+        assert_eq!(p("min(x, y)").op, Op::Min);
+        assert_eq!(p("max(x, y)").op, Op::Max);
+
+        // An aggregate reduces a column, not an expression.
+        assert!(parse("mean(x + 1)", &v).is_err());
+        assert!(parse("mean()", &v).is_err());
+        assert!(parse("count(x)", &v).is_err());
+    }
+
+    #[test]
+    fn aggregates_round_trip_through_to_string() {
+        let v = vars();
+        for s in [
+            "mean(x)",
+            "std(y)",
+            "median(x)",
+            "iqr(y)",
+            "sum(z)",
+            "amin(x)",
+            "amax(y)",
+            "min(x)",
+            "max(z)",
+            "count()",
+            "x / mean(x)",
+            "(x - median(x)) / iqr(x)",
+        ] {
+            let tree = p(s);
+            let printed = crate::expr::to_string(&tree, &v);
+            let again = parse(&printed, &v)
+                .unwrap_or_else(|e| panic!("re-parsing '{printed}' (from '{s}'): {e}"));
+            assert!(same(&tree, &again), "'{s}' printed as '{printed}' did not round-trip");
         }
     }
 

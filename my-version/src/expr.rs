@@ -6,7 +6,7 @@
 use crate::rng::Mt;
 
 /// The expression parser, re-exported so callers can write [`crate::expr::parse`].
-pub use crate::parse::{parse, ParseError};
+pub use crate::parse::{parse, parse_block, parse_blocks, parse_with, ParseError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -67,13 +67,223 @@ pub enum Op {
     Constants,
     Contains,
     ContainsOp,
+    // Dataset aggregates: a reduction over one input column, computed once
+    // from the training rows and cached when the node is built. Opt-in only.
+    Agg(AggKind),
+    // User-defined building blocks (issue #10). Appended after the aggregates so
+    // the aggregate indices stay where issue #8 put them; the four slots keep
+    // every earlier discriminant meaningful.
+    Custom0,
+    Custom1,
+    Custom2,
+    Custom3,
+}
+
+/// The dataset-wide reductions behind [`Op::Agg`] (issue #8).
+///
+/// Every variant except [`AggKind::Count`] takes one input column as its child;
+/// `count` is zero-arity and returns the number of training rows. The value is
+/// a property of the **training sample**, not of a row, so it is computed once
+/// into an [`AggTable`] and cached in [`Node::val`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggKind {
+    Mean,
+    Std,
+    Median,
+    Iqr,
+    Sum,
+    Min,
+    Max,
+    Count,
+}
+
+impl AggKind {
+    /// Number of aggregate kinds; `Op::Agg` uses a dense index per kind.
+    pub const COUNT: usize = 8;
+
+    /// Every aggregate, in index order (the order of [`AggKind::index`]).
+    pub const ALL: [AggKind; AggKind::COUNT] = [
+        AggKind::Mean,
+        AggKind::Std,
+        AggKind::Median,
+        AggKind::Iqr,
+        AggKind::Sum,
+        AggKind::Min,
+        AggKind::Max,
+        AggKind::Count,
+    ];
+
+    /// Canonical name used by `--ops`, the parser and `to_string`.
+    ///
+    /// `min` and `max` are already the binary primitives, so the column
+    /// reductions are named `amin`/`amax`; the parser also accepts `min(x1)` /
+    /// `max(x1)` with a single argument.
+    pub fn name(self) -> &'static str {
+        match self {
+            AggKind::Mean => "mean",
+            AggKind::Std => "std",
+            AggKind::Median => "median",
+            AggKind::Iqr => "iqr",
+            AggKind::Sum => "sum",
+            AggKind::Min => "amin",
+            AggKind::Max => "amax",
+            AggKind::Count => "count",
+        }
+    }
+
+    pub fn arity(self) -> usize {
+        if self == AggKind::Count {
+            0
+        } else {
+            1
+        }
+    }
+
+    /// Dense index in `0..COUNT`, stable for the checkpoint format.
+    pub fn index(self) -> usize {
+        match self {
+            AggKind::Mean => 0,
+            AggKind::Std => 1,
+            AggKind::Median => 2,
+            AggKind::Iqr => 3,
+            AggKind::Sum => 4,
+            AggKind::Min => 5,
+            AggKind::Max => 6,
+            AggKind::Count => 7,
+        }
+    }
+
+    /// Map an `--ops` / parser name to an aggregate kind.
+    pub fn from_name(s: &str) -> Option<AggKind> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "mean" => AggKind::Mean,
+            "std" | "stddev" => AggKind::Std,
+            "median" => AggKind::Median,
+            "iqr" => AggKind::Iqr,
+            "sum" => AggKind::Sum,
+            "amin" | "agg_min" | "min_over" => AggKind::Min,
+            "amax" | "agg_max" | "max_over" => AggKind::Max,
+            "count" => AggKind::Count,
+            _ => return None,
+        })
+    }
 }
 
 impl Op {
-    /// Number of operator variants. `Op` is a fieldless enum, so a discriminant
-    /// is a valid dense index into a cost table; `complexity::ComplexityModel`
-    /// relies on this. A new variant must bump the count (a test guards it).
-    pub const COUNT: usize = 54;
+    /// Dense index into a cost table (`complexity::ComplexityModel`). Replaces
+    /// the enum discriminant, which stopped being usable when [`Op::Agg`]
+    /// gained a payload. A new variant must bump [`Op::COUNT`] (a test guards
+    /// it) and must be appended to the checkpoint table in that order.
+    pub const AGG_BASE: usize = 54;
+    /// First user-defined building block (`Custom0`); the four slots are
+    /// contiguous (issue #10).
+    pub const CUSTOM_BASE: usize = Self::AGG_BASE + AggKind::COUNT;
+    pub const COUNT: usize = Self::CUSTOM_BASE + 4;
+
+    /// Dense index in `0..COUNT`; `Op::Agg(kind)` occupies one index per kind.
+    pub fn index(self) -> usize {
+        use Op::*;
+        match self {
+            Const => 0,
+            Input => 1,
+            Neg => 2,
+            Exp => 3,
+            Ln => 4,
+            Abs => 5,
+            Sqrt => 6,
+            Sin => 7,
+            Cos => 8,
+            Tan => 9,
+            Sinh => 10,
+            Cosh => 11,
+            Tanh => 12,
+            Logistic => 13,
+            Step => 14,
+            Gauss => 15,
+            Square => 16,
+            Cube => 17,
+            Floor => 18,
+            Ceil => 19,
+            Round => 20,
+            Sign => 21,
+            Erf => 22,
+            Erfc => 23,
+            Asinh => 24,
+            Acosh => 25,
+            Atanh => 26,
+            Add => 27,
+            Sub => 28,
+            Mul => 29,
+            Div => 30,
+            Pow => 31,
+            Mod => 32,
+            Min => 33,
+            Max => 34,
+            Atan2 => 35,
+            If => 36,
+            Equal => 37,
+            Less => 38,
+            LessOrEqual => 39,
+            Greater => 40,
+            GreaterOrEqual => 41,
+            And => 42,
+            Or => 43,
+            Xor => 44,
+            Not => 45,
+            Require => 46,
+            Between => 47,
+            Constrain => 48,
+            Complexity => 49,
+            Variables => 50,
+            Constants => 51,
+            Contains => 52,
+            ContainsOp => 53,
+            Agg(kind) => Self::AGG_BASE + kind.index(),
+            Custom0 => Self::CUSTOM_BASE,
+            Custom1 => Self::CUSTOM_BASE + 1,
+            Custom2 => Self::CUSTOM_BASE + 2,
+            Custom3 => Self::CUSTOM_BASE + 3,
+        }
+    }
+
+    /// Whether this is a dataset aggregate. Like a meta operator it returns a
+    /// cached value that does not depend on the row, but its cache comes from
+    /// the data ([`AggTable`]) rather than from the tree's shape.
+    pub fn is_agg(self) -> bool {
+        matches!(self, Op::Agg(_))
+    }
+
+    /// The `Op::Custom(slot)` spelling used throughout the code for a
+    /// user-defined building block; the slot is one of `0..=3`.
+    ///
+    /// The **arity** of a custom operator comes from the thread-local block
+    /// registry installed with [`set_blocks`], because it is a property of the
+    /// user's definition, not of the variant. A custom operator with no
+    /// installed block has arity `0` and evaluates to `NaN`.
+    #[allow(non_snake_case)]
+    pub const fn Custom(slot: usize) -> Op {
+        match slot {
+            0 => Op::Custom0,
+            1 => Op::Custom1,
+            2 => Op::Custom2,
+            _ => Op::Custom3,
+        }
+    }
+
+    /// The slot of a user-defined block, or `None` for a primitive.
+    pub fn custom_slot(self) -> Option<usize> {
+        match self {
+            Op::Custom0 => Some(0),
+            Op::Custom1 => Some(1),
+            Op::Custom2 => Some(2),
+            Op::Custom3 => Some(3),
+            _ => None,
+        }
+    }
+
+    pub fn is_custom(self) -> bool {
+        self.custom_slot().is_some()
+    }
 
     /// Whether this operator inspects its argument's structure instead of
     /// evaluating it per row. Meta nodes cache their result in [`Node::val`];
@@ -90,6 +300,12 @@ impl Op {
         use Op::*;
         match self {
             Const | Input => 0,
+            Agg(kind) => kind.arity(),
+            Custom0 | Custom1 | Custom2 | Custom3 => {
+                block_for_slot(self.custom_slot().unwrap())
+                    .map(|b| b.params.len())
+                    .unwrap_or(0)
+            }
             Neg | Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step
             | Gauss | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Asinh | Acosh
             | Atanh | Not | Require | Constrain | Complexity | Variables | Constants | Contains
@@ -103,6 +319,7 @@ impl Op {
     pub fn symbol(self) -> &'static str {
         use Op::*;
         match self {
+            Agg(kind) => kind.name(),
             Const => "c",
             Input => "x",
             Neg => "-",
@@ -157,6 +374,10 @@ impl Op {
             Constants => "constants",
             Contains => "contains",
             ContainsOp => "contains_op",
+            Custom0 => "custom0",
+            Custom1 => "custom1",
+            Custom2 => "custom2",
+            Custom3 => "custom3",
         }
     }
 
@@ -178,6 +399,10 @@ impl Op {
 
     /// Canonical names accepted by [`Op::parse_list`], in a stable order. Used by
     /// the `schema` output so callers can discover the full primitive set.
+    ///
+    /// The four `custom0..custom3` slots are deliberately absent: they are
+    /// enabled by `--function` and their arity comes from the supplied
+    /// definition, so they are not part of the static vocabulary.
     pub fn names() -> &'static [&'static str] {
         &[
             "neg", "exp", "ln", "abs", "sqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh",
@@ -185,7 +410,8 @@ impl Op {
             "erf", "erfc", "asinh", "acosh", "atanh", "mod", "min", "max", "atan2", "add", "sub",
             "mul", "div", "pow", "if", "equal", "less", "less_or_equal", "greater",
             "greater_or_equal", "and", "or", "xor", "not", "require", "between", "constrain",
-            "complexity", "variables", "constants", "contains", "contains_op",
+            "complexity", "variables", "constants", "contains", "contains_op", "mean", "std",
+            "median", "iqr", "sum", "amin", "amax", "count",
         ]
     }
 
@@ -285,19 +511,86 @@ impl Op {
             "constants" => Constants,
             "contains" => Contains,
             "contains_op" => ContainsOp,
-            _ => return None,
+            "custom0" => Custom0,
+            "custom1" => Custom1,
+            "custom2" => Custom2,
+            "custom3" => Custom3,
+            _ => {
+                return AggKind::from_name(s).map(Op::Agg);
+            }
         })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub op: Op,
     /// `Const` -> value; `Input` -> variable index; a meta operator -> its
-    /// cached structural value. Build meta nodes through [`meta`] or
-    /// [`node`], never from a literal.
+    /// cached structural value; an aggregate -> its cached dataset value
+    /// (`NaN` until [`bind_aggregates`] or the sampler resolves it). Build meta
+    /// nodes through [`meta`] or [`node`], and aggregate nodes through
+    /// [`aggregate`], never from a literal.
     pub val: f64,
     pub kids: Vec<Node>,
+    /// For `Op::Custom(slot)` only: the user's definition. Every use of the
+    /// block carries its own copy so a candidate can hold fitted constants
+    /// without mutating a process-wide table; the fitter keeps the copies of
+    /// one slot in step (see `docs/building-blocks.md`).
+    pub block: Option<Box<Block>>,
+}
+
+/// A user-defined building block (`--function`).
+///
+/// `params` are the names used inside `body`; the body refers to them through
+/// [`Op::Input`] with the parameter's index, exactly like a compiled function.
+/// A use of the block is an [`Op::Custom`] node whose children are the argument
+/// expressions; [`eval`] substitutes their values for the parameters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    /// The name the user wrote (or `customN` when the definition had no name).
+    pub name: String,
+    /// Parameter names, in order of first appearance for `name=expr`.
+    pub params: Vec<String>,
+    /// Body in parameter space (`Input(i)` is `params[i]`).
+    pub body: Node,
+}
+
+impl Block {
+    /// The canonical slot name, used when a definition omits a parameter list.
+    pub fn slot_name(slot: usize) -> String {
+        format!("custom{slot}")
+    }
+}
+
+thread_local! {
+    /// The blocks visible to the current thread. Search islands inherit a copy
+    /// explicitly (they are new threads); the CLI installs the command-line
+    /// definitions before the run. Empty means "no `--function`", which keeps
+    /// every historical code path unchanged.
+    static BLOCKS: std::cell::RefCell<Vec<Block>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the process's user-defined blocks on the current thread.
+pub fn set_blocks(blocks: Vec<Block>) {
+    BLOCKS.with(|cell| *cell.borrow_mut() = blocks);
+}
+
+/// A copy of the blocks visible on the current thread.
+pub fn current_blocks() -> Vec<Block> {
+    BLOCKS.with(|cell| cell.borrow().clone())
+}
+
+fn block_for_slot(slot: usize) -> Option<Block> {
+    BLOCKS.with(|cell| cell.borrow().get(slot).cloned())
+}
+
+/// Arity of the custom operator in `slot` under the current thread's blocks.
+pub fn block_arity(slot: usize) -> usize {
+    block_for_slot(slot).map(|b| b.params.len()).unwrap_or(0)
+}
+
+fn block_arity_of(op: Op) -> usize {
+    op.arity()
 }
 
 pub fn constant(v: f64) -> Node {
@@ -305,6 +598,7 @@ pub fn constant(v: f64) -> Node {
         op: Op::Const,
         val: v,
         kids: Vec::new(),
+        block: None,
     }
 }
 
@@ -313,20 +607,238 @@ pub fn input(i: usize) -> Node {
         op: Op::Input,
         val: i as f64,
         kids: Vec::new(),
+        block: None,
     }
 }
 
 /// Build an operator node. For a meta operator the structural value is
 /// computed immediately and stored in `val`, so every constructor path (the
 /// parser, `random_tree`, mutation and crossover) produces a consistent node.
+/// An aggregate starts **unresolved** (`val = NaN`): its value is data, so the
+/// sampler or [`bind_aggregates`] must supply it.
+///
+/// An [`Op::Custom`] node automatically carries a copy of the current thread's
+/// block definition, which is what makes a generated call evaluable.
 pub fn node(op: Op, kids: Vec<Node>) -> Node {
     let val = if op.is_meta() {
         debug_assert_eq!(kids.len(), 1, "meta operators are unary");
         meta_value(op, &kids[0])
+    } else if op.is_agg() {
+        f64::NAN
     } else {
         0.0
     };
-    Node { op, val, kids }
+    let block = op
+        .custom_slot()
+        .and_then(block_for_slot)
+        .map(Box::new);
+    Node {
+        op,
+        val,
+        kids,
+        block,
+    }
+}
+
+/// Build a custom call with an explicit definition, for the parser while it
+/// validates a new `--function` (the new block is not yet on the thread).
+pub fn custom_node(op: Op, kids: Vec<Node>, block: Block) -> Node {
+    debug_assert!(op.is_custom(), "{op:?} is not a custom operator");
+    Node {
+        op,
+        val: 0.0,
+        kids,
+        block: Some(Box::new(block)),
+    }
+}
+
+/// Build an aggregate node with its cached value.
+///
+/// `kind.arity() == 1` requires `column`; `count` takes none. Passing `None`
+/// for a columned aggregate (or a column for `count`) is a programming error
+/// and produces the correct shape with an unresolved value.
+pub fn aggregate(kind: AggKind, column: Option<usize>, value: f64) -> Node {
+    let kids = match (kind.arity(), column) {
+        (1, Some(i)) => vec![input(i)],
+        _ => Vec::new(),
+    };
+    Node {
+        op: Op::Agg(kind),
+        val: value,
+        kids,
+        block: None,
+    }
+}
+
+/// The per-column aggregate values a search computed from its **training**
+/// sample, once, before the first generation (issue #8).
+///
+/// `values[column][kind.index()]` is the cached statistic; `count` is
+/// `rows`. Missing/non-finite cells are ignored by every aggregate except
+/// `count`; a column with no finite value at all yields `NaN`, which makes the
+/// candidate infeasible through the ordinary domain guard.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AggTable {
+    values: Vec<[f64; AggKind::COUNT]>,
+    rows: usize,
+}
+
+impl AggTable {
+    /// Build the table from rows in the sample's own space. This is the only
+    /// place an aggregate is ever computed; nothing downstream recomputes it
+    /// per row or per test row.
+    pub fn from_rows(rows: &[Vec<f64>]) -> Self {
+        let nrows = rows.len();
+        let nvars = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        let mut values = Vec::with_capacity(nvars);
+        for col in 0..nvars {
+            let mut finite: Vec<f64> = rows
+                .iter()
+                .filter_map(|r| r.get(col).copied())
+                .filter(|v| v.is_finite())
+                .collect();
+            let mut out = [f64::NAN; AggKind::COUNT];
+            if !finite.is_empty() {
+                let n = finite.len() as f64;
+                let sum: f64 = finite.iter().sum();
+                let mean = sum / n;
+                let var = finite.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n;
+                out[AggKind::Mean.index()] = mean;
+                out[AggKind::Std.index()] = var.sqrt();
+                out[AggKind::Sum.index()] = sum;
+                finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                out[AggKind::Min.index()] = finite[0];
+                out[AggKind::Max.index()] = finite[finite.len() - 1];
+                out[AggKind::Median.index()] = quantile(&finite, 0.5);
+                out[AggKind::Iqr.index()] =
+                    quantile(&finite, 0.75) - quantile(&finite, 0.25);
+            }
+            values.push(out);
+        }
+        AggTable { values, rows: nrows }
+    }
+
+    /// Build the table from a [`crate::data::Sample`]'s input columns. Only the
+    /// rows in `sample` contribute; test data never does.
+    pub fn from_sample(sample: &crate::data::Sample) -> Self {
+        Self::from_rows(&sample.x)
+    }
+
+    /// Cached value of `kind` on `column`; `NaN` when the column is unknown or
+    /// has no finite value. `count` is always the number of rows.
+    pub fn get(&self, kind: AggKind, column: usize) -> f64 {
+        if kind == AggKind::Count {
+            return self.rows as f64;
+        }
+        self.values
+            .get(column)
+            .map(|v| v[kind.index()])
+            .unwrap_or(f64::NAN)
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn nvars(&self) -> usize {
+        self.values.len()
+    }
+}
+
+/// Linear-interpolated quantile (`p` in `[0, 1]`) of a sorted slice, the same
+/// convention as the data-preparation code. Empty slices return `NaN`.
+fn quantile(sorted: &[f64], p: f64) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let pos = p.clamp(0.0, 1.0) * (n as f64 - 1.0);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let f = pos - lo as f64;
+        sorted[lo] * (1.0 - f) + sorted[hi] * f
+    }
+}
+
+/// Resolve every aggregate in `tree` against `table`, bottom-up.
+///
+/// The parser cannot know the data, so it leaves each aggregate with `val =
+/// NaN`; this is the step that turns `mean(x1)` into a number. An aggregate
+/// whose child is not a bare input column, or a column outside the table, is an
+/// error: the value must never be invented.
+pub fn bind_aggregates(tree: &mut Node, table: &AggTable) -> Result<(), String> {
+    for k in &mut tree.kids {
+        bind_aggregates(k, table)?;
+    }
+    if let Op::Agg(kind) = tree.op {
+        if kind.arity() == 0 {
+            tree.val = table.get(kind, 0);
+            return Ok(());
+        }
+        let child = tree
+            .kids
+            .first()
+            .ok_or_else(|| format!("{}() is missing its input column", kind.name()))?;
+        if child.op != Op::Input {
+            return Err(format!(
+                "{}() takes a single input column (for example {}(x1)), not an expression",
+                kind.name(),
+                kind.name()
+            ));
+        }
+        let column = child.val as usize;
+        if column >= table.nvars() {
+            return Err(format!(
+                "{}() refers to column x{}, but the data has {} input column(s)",
+                kind.name(),
+                column,
+                table.nvars()
+            ));
+        }
+        tree.val = table.get(kind, column);
+    }
+    Ok(())
+}
+
+/// Recompute every aggregate's cached value after a structural edit. With no
+/// table the cache is left alone (an unbound tree keeps its `NaN`).
+///
+/// A structural edit can also replace the column child itself. An aggregate
+/// must reduce a real column, so a malformed child is repaired to the first
+/// input column (the only well-formed child) rather than left behind.
+fn refresh_aggregates(n: &mut Node, table: Option<&AggTable>) {
+    for k in &mut n.kids {
+        refresh_aggregates(k, table);
+    }
+    if let (Some(table), Op::Agg(kind)) = (table, n.op) {
+        if kind.arity() == 0 {
+            n.val = table.get(kind, 0);
+            return;
+        }
+        let column = n
+            .kids
+            .first()
+            .filter(|c| c.op == Op::Input)
+            .map(|c| c.val as usize)
+            .filter(|&c| c < table.nvars());
+        match column {
+            Some(c) => n.val = table.get(kind, c),
+            None => {
+                if table.nvars() > 0 {
+                    n.kids = vec![input(0)];
+                    n.val = table.get(kind, 0);
+                } else {
+                    n.val = f64::NAN;
+                }
+            }
+        }
+    }
 }
 
 /// Build a meta operator node from `kind` and its one child.
@@ -543,6 +1055,16 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
     use Op::*;
     match n.op {
         Const => n.val,
+        // A block call: evaluate the arguments, then evaluate the body with
+        // `Input(i)` bound to argument `i`. The body is parameter space, so no
+        // row is involved beyond the arguments' own inputs.
+        Custom0 | Custom1 | Custom2 | Custom3 => {
+            let Some(block) = &n.block else {
+                return f64::NAN;
+            };
+            let args: Vec<f64> = n.kids.iter().map(|k| eval(k, x)).collect();
+            eval(&block.body, &args)
+        }
         Input => {
             let i = n.val as usize;
             if i < x.len() {
@@ -563,6 +1085,11 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
             );
             n.val
         }
+        // An aggregate is a dataset fact: return the value cached when the node
+        // was built. Never walk the column child here, and never look at the
+        // row. `NaN` means the statistic is undefined (e.g. an empty column),
+        // which the metric turns into infeasible.
+        Agg(_) => n.val,
         Neg => -eval(&n.kids[0], x),
         Exp => {
             let a = eval(&n.kids[0], x);
@@ -812,9 +1339,32 @@ pub fn complexity(n: &Node) -> usize {
 /// A meta operator is never counted itself. Constant leaves *inside* its
 /// argument are real leaves and stay counted, but the zero gradient through a
 /// meta node means the fitter cannot identify them from the model output.
+/// An aggregate has no constant leaf at all: it is a dataset fact, not a fitted
+/// parameter, so it never contributes to `k`.
+///
+/// Constants inside a block body are **shared** by every use of that block, so
+/// they are counted once per distinct slot no matter how many calls appear.
 pub fn count_constants(n: &Node) -> usize {
-    let me = if n.op == Op::Const { 1 } else { 0 };
-    me + n.kids.iter().map(count_constants).sum::<usize>()
+    let mut seen = [false; 4];
+    count_constants_seen(n, &mut seen)
+}
+
+fn count_constants_seen(n: &Node, seen: &mut [bool; 4]) -> usize {
+    let mut total = usize::from(n.op == Op::Const);
+    total += n
+        .kids
+        .iter()
+        .map(|k| count_constants_seen(k, seen))
+        .sum::<usize>();
+    if let Some(slot) = n.op.custom_slot() {
+        if !seen[slot] {
+            seen[slot] = true;
+            if let Some(block) = &n.block {
+                total += count_constants_seen(&block.body, seen);
+            }
+        }
+    }
+    total
 }
 
 pub fn nth<'a>(n: &'a Node, i: usize) -> Option<&'a Node> {
@@ -863,15 +1413,60 @@ fn random_terminal(rng: &mut Mt, nvars: usize) -> Node {
 }
 
 pub fn random_tree(rng: &mut Mt, nvars: usize, ops: &[Op], depth: usize) -> Node {
+    random_tree_with(rng, nvars, ops, depth, None)
+}
+
+/// [`random_tree`] with the training-sample aggregate table.
+///
+/// When the sampler emits [`Op::Agg`] it reads the precomputed statistic from
+/// `aggs` (one lookup, no pass over the rows). With no table the node is built
+/// unresolved (`NaN`), which the metric treats as infeasible.
+pub fn random_tree_with(
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    depth: usize,
+    aggs: Option<&AggTable>,
+) -> Node {
     if depth == 0 || rng.bool(0.15) {
         return random_terminal(rng, nvars);
     }
     let op = *rng.pick(ops);
+    if let Op::Agg(kind) = op {
+        return random_aggregate(rng, nvars, kind, aggs);
+    }
     let k = op.arity();
     let kids = (0..k)
-        .map(|_| random_tree(rng, nvars, ops, depth - 1))
+        .map(|_| random_tree_with(rng, nvars, ops, depth - 1, aggs))
         .collect();
     node(op, kids)
+}
+
+/// A column aggregate with its value read from `aggs`; `count()` needs none.
+/// With no input column there is nothing to reduce, so the sampler falls back
+/// to a constant rather than emitting a malformed node.
+fn random_aggregate(
+    rng: &mut Mt,
+    nvars: usize,
+    kind: AggKind,
+    aggs: Option<&AggTable>,
+) -> Node {
+    if kind.arity() == 0 {
+        return aggregate(
+            kind,
+            None,
+            aggs.map(|t| t.get(kind, 0)).unwrap_or(f64::NAN),
+        );
+    }
+    if nvars == 0 {
+        return constant(0.0);
+    }
+    let column = rng.usize_below(nvars);
+    aggregate(
+        kind,
+        Some(column),
+        aggs.map(|t| t.get(kind, column)).unwrap_or(f64::NAN),
+    )
 }
 
 fn perturb(rng: &mut Mt, v: f64) -> f64 {
@@ -886,6 +1481,19 @@ fn perturb(rng: &mut Mt, v: f64) -> f64 {
 /// In-place mutation: point-change an operator, perturb a constant, or replace a
 /// subtree (grow / shrink). [I]
 pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
+    mutate_with(n, rng, nvars, ops, None)
+}
+
+/// [`mutate`] with the training-sample aggregate table, so a node switched to
+/// [`Op::Agg`] (or an input column changed under one) gets the right cached
+/// value immediately.
+pub fn mutate_with(
+    n: &mut Node,
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    aggs: Option<&AggTable>,
+) {
     let total = complexity(n);
     if total == 0 {
         return;
@@ -896,26 +1504,44 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
         if let Some(t) = nth_mut(n, i) {
             let ar = t.op.arity();
             if ar == 0 {
-                // flip terminal kind, or re-value
+                // flip terminal kind, or re-value. An aggregate leaf (`count`)
+                // keeps its cached dataset value.
                 if t.op == Op::Const {
                     t.val = perturb(rng, t.val);
-                } else if nvars > 0 {
+                } else if t.op == Op::Input && nvars > 0 {
                     t.val = rng.usize_below(nvars) as f64;
                 }
+                // A zero-arity custom block is a named constant: leave it.
             } else {
                 let cands: Vec<Op> = ops
                     .iter()
                     .copied()
-                    .filter(|o| o.arity() == ar && *o != t.op)
+                    .filter(|o| block_arity_of(*o) == ar && *o != t.op)
+                    .filter(|o| !(o.is_agg() && nvars == 0))
                     .collect();
                 if !cands.is_empty() {
-                    t.op = cands[rng.usize_below(cands.len())];
-                    // `val` belongs to the old operator; meta operators get a
-                    // fresh structural value in the refresh below.
-                    t.val = 0.0;
-                    t.kids.truncate(t.op.arity());
-                    while t.kids.len() < t.op.arity() {
-                        t.kids.push(constant(1.0));
+                    let new_op = cands[rng.usize_below(cands.len())];
+                    if let Op::Agg(kind) = new_op {
+                        // An aggregate's single child is its column, never an
+                        // arbitrary expression.
+                        let column = rng.usize_below(nvars);
+                        t.op = new_op;
+                        t.kids = vec![input(column)];
+                        t.val = aggs
+                            .map(|a| a.get(kind, column))
+                            .unwrap_or(f64::NAN);
+                        t.block = None;
+                    } else {
+                        t.op = new_op;
+                        // `val` belongs to the old operator; meta operators get
+                        // a fresh structural value in the refresh below.
+                        t.val = 0.0;
+                        // #10: a custom operator carries its block definition.
+                        t.block = t.op.custom_slot().and_then(block_for_slot).map(Box::new);
+                        t.kids.truncate(t.op.arity());
+                        while t.kids.len() < t.op.arity() {
+                            t.kids.push(constant(1.0));
+                        }
                     }
                 }
             }
@@ -931,15 +1557,23 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
     } else {
         let depth = if r < 0.85 { 2 } else { 1 };
         if let Some(t) = nth_mut(n, i) {
-            *t = random_tree(rng, nvars, ops, depth);
+            *t = random_tree_with(rng, nvars, ops, depth, aggs);
         }
     }
     // A structural edit anywhere below a meta node invalidates its cache.
     refresh_meta(n);
+    // The same is true for an aggregate when the edit changed its column (or
+    // replaced the node with a malformed child).
+    refresh_aggregates(n, aggs);
 }
 
 /// Replace a random subtree of `a` with a random subtree of `b` (crossover). [I]
 pub fn crossover(a: &mut Node, b: &Node, rng: &mut Mt) {
+    crossover_with(a, b, rng, None)
+}
+
+/// [`crossover`] with the training-sample aggregate table.
+pub fn crossover_with(a: &mut Node, b: &Node, rng: &mut Mt, aggs: Option<&AggTable>) {
     let ta = complexity(a);
     let tb = complexity(b);
     if ta == 0 || tb == 0 {
@@ -955,6 +1589,8 @@ pub fn crossover(a: &mut Node, b: &Node, rng: &mut Mt) {
     // The graft may sit below a meta node, whose cached value must follow the
     // new shape.
     refresh_meta(a);
+    // Likewise an aggregate whose column child was replaced.
+    refresh_aggregates(a, aggs);
 }
 
 // ---------------- display & simplification ----------------
@@ -972,6 +1608,16 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
     use Op::*;
     match n.op {
         Const => fmt_f(n.val),
+        // A block prints by the user's name (or `customN`), with its arguments.
+        Custom0 | Custom1 | Custom2 | Custom3 => {
+            let name = n
+                .block
+                .as_ref()
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| n.op.symbol().to_string());
+            let args: Vec<String> = n.kids.iter().map(|k| to_string(k, vars)).collect();
+            format!("{}({})", name, args.join(", "))
+        }
         Input => {
             let i = n.val as usize;
             vars.get(i)
@@ -979,6 +1625,13 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
                 .unwrap_or_else(|| format!("x{}", i))
         }
         Neg => format!("(-{})", to_string(&n.kids[0], vars)),
+        Op::Agg(kind) => {
+            if kind.arity() == 0 {
+                format!("{}()", kind.name())
+            } else {
+                format!("{}({})", kind.name(), to_string(&n.kids[0], vars))
+            }
+        }
         Add | Sub | Mul | Div | Pow => {
             let s = match n.op {
                 Add => " + ",
@@ -1058,12 +1711,14 @@ fn near_val(n: &Node, v: f64, rel: f64) -> bool {
         .unwrap_or(false)
 }
 
-/// Structural equality (exact shape and constant values).
+/// Structural equality (exact shape, constant values and a custom block's
+/// definition).
 pub fn same(a: &Node, b: &Node) -> bool {
     a.op == b.op
         && a.val.to_bits() == b.val.to_bits()
         && a.kids.len() == b.kids.len()
         && a.kids.iter().zip(&b.kids).all(|(x, y)| same(x, y))
+        && a.block == b.block
 }
 
 /// FNV-1a structural hash, for de-duplicating equivalent candidates before
@@ -1074,11 +1729,22 @@ pub fn structural_hash(n: &Node) -> u64 {
         *h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     fn go(n: &Node, h: &mut u64) {
-        mix(h, n.op as u64);
+        mix(h, n.op.index() as u64);
         mix(h, n.val.to_bits());
         mix(h, n.kids.len() as u64);
         for k in &n.kids {
             go(k, h);
+        }
+        // A custom call's fitted body constants are part of its structure.
+        if let Some(block) = &n.block {
+            mix(h, 1);
+            for b in block.name.bytes() {
+                mix(h, b as u64);
+            }
+            mix(h, block.params.len() as u64);
+            go(&block.body, h);
+        } else {
+            mix(h, 0);
         }
     }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1136,8 +1802,18 @@ pub fn simplify(n: &Node) -> Node {
         op: n.op,
         val: n.val,
         kids: n.kids.iter().map(simplify).collect(),
+        block: n.block.clone(),
     };
     if m.op == Const || m.op == Input {
+        return m;
+    }
+    // A block call is kept named (that is the point of supplying it), but its
+    // body is simplified in parameter space. Its constants stay shared by every
+    // use; the fitter synchronises the copies (see `docs/building-blocks.md`).
+    if m.op.is_custom() {
+        if let Some(block) = &mut m.block {
+            block.body = simplify(&block.body);
+        }
         return m;
     }
     // Simplifying the argument can change its shape, so a meta node must take
@@ -1145,8 +1821,10 @@ pub fn simplify(n: &Node) -> Node {
     if m.op.is_meta() {
         m.val = meta_value(m.op, &m.kids[0]);
     }
-    // Fold any operator whose children are all constants.
-    if m.kids.iter().all(|k| k.op == Const) {
+    // Fold any operator whose children are all constants. An aggregate is
+    // never folded: its name is the point (and `count()` has no children at
+    // all, so the test below would otherwise be vacuously true).
+    if !m.op.is_agg() && m.kids.iter().all(|k| k.op == Const) {
         let v = eval(&m, &[]);
         if v.is_finite() {
             return constant(v);
@@ -1231,16 +1909,30 @@ pub fn simplify(n: &Node) -> Node {
 /// Rewrite `Input(i)` from normalised space back to original units:
 /// `X_i -> (x_i - mean_i) / std_i`. [C: Expression_denormalizer]
 ///
-/// A meta operator is carried over verbatim: its value describes the *searched*
-/// (normalised) tree, and rewriting the inputs inside its argument would change
-/// that argument's node count and make the printed value disagree with the
-/// model. `to_string` still prints input names for the untouched argument.
+/// A meta operator or an aggregate is carried over verbatim: a meta value
+/// describes the *searched* (normalised) tree, and an aggregate names a dataset
+/// column whose cache came from the searched sample. Rewriting the inputs
+/// inside either would change its meaning and make the printed value disagree
+/// with the model. `to_string` still prints input names for the untouched
+/// argument.
 pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
-    if n.op.is_meta() {
+    // A block body is in parameter space: parameter `Input(i)` is bound to an
+    // argument, not to a data column, so only the calls' arguments are
+    // rewritten. The definition is carried over unchanged.
+    if n.op.is_custom() {
+        return Node {
+            op: n.op,
+            val: n.val,
+            kids: n.kids.iter().map(|k| denormalize(k, means, stds)).collect(),
+            block: n.block.clone(),
+        };
+    }
+    if n.op.is_meta() || n.op.is_agg() {
         return Node {
             op: n.op,
             val: n.val,
             kids: n.kids.clone(),
+            block: None,
         };
     }
     match n.op {
@@ -1257,6 +1949,7 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
             op: n.op,
             val: n.val,
             kids: n.kids.iter().map(|k| denormalize(k, means, stds)).collect(),
+            block: n.block.clone(),
         },
     }
 }
@@ -1402,5 +2095,119 @@ mod tests {
             Ok(vec![Op::Complexity, Op::Variables])
         );
         assert!(Op::parse_list_checked("complexity,nope").is_err());
+    }
+
+    /// One column, five rows: mean/median = 3, population std = sqrt(2),
+    /// q1 = 2, q3 = 4, sum = 15, min = 1, max = 5, count = 5.
+    fn hand_table() -> AggTable {
+        AggTable::from_rows(&[
+            vec![1.0],
+            vec![2.0],
+            vec![3.0],
+            vec![4.0],
+            vec![5.0],
+        ])
+    }
+
+    #[test]
+    fn aggregate_values_are_exact_and_row_independent() {
+        let t = hand_table();
+        let cases = [
+            (AggKind::Mean, 3.0),
+            (AggKind::Std, 2.0f64.sqrt()),
+            (AggKind::Median, 3.0),
+            (AggKind::Iqr, 2.0),
+            (AggKind::Sum, 15.0),
+            (AggKind::Min, 1.0),
+            (AggKind::Max, 5.0),
+        ];
+        for (kind, want) in cases {
+            let n = aggregate(kind, Some(0), t.get(kind, 0));
+            assert!((eval(&n, &[1.0]) - want).abs() < 1e-12, "{kind:?}");
+            assert!((eval(&n, &[999.0]) - want).abs() < 1e-12, "{kind:?}");
+            assert_eq!(n.kids.len(), 1, "{kind:?} has one column child");
+            assert_eq!(n.kids[0].op, Op::Input);
+        }
+        let c = aggregate(AggKind::Count, None, t.get(AggKind::Count, 0));
+        assert!(c.kids.is_empty(), "count() is zero-arity");
+        assert_eq!(eval(&c, &[]), 5.0);
+        assert_eq!(eval(&c, &[1.0, 2.0]), 5.0);
+    }
+
+    #[test]
+    fn aggregate_eval_returns_the_cache_without_walking_the_child() {
+        let mut n = aggregate(AggKind::Mean, Some(0), 4.25);
+        // Corrupting the child behind the constructor's back must not change
+        // the value: `eval` may not touch the column or the row.
+        n.kids[0] = node(Op::Add, vec![input(0), input(1)]);
+        assert_eq!(eval(&n, &[0.0, 0.0]), 4.25);
+        assert_eq!(eval(&n, &[1e30, -1e30]), 4.25);
+    }
+
+    #[test]
+    fn aggregates_are_opt_in_unary_and_named() {
+        for kind in AggKind::ALL {
+            let op = Op::Agg(kind);
+            assert_eq!(op.arity(), kind.arity(), "{kind:?}");
+            assert!(op.is_agg() && !op.is_meta(), "{kind:?}");
+            assert!(!Op::default_set().contains(&op), "{kind:?} must be opt-in");
+            assert!(Op::names().contains(&op.symbol()), "{kind:?}");
+            assert_eq!(Op::from_name(op.symbol()), Some(op));
+        }
+        assert_eq!(Op::Agg(AggKind::Std).arity(), 1);
+        assert_eq!(Op::Agg(AggKind::Count).arity(), 0);
+        // `min`/`max` stay binary in the shared name table; the column
+        // reductions have their own canonical names.
+        assert_eq!(Op::from_name("min"), Some(Op::Min));
+        assert_eq!(Op::from_name("amax"), Some(Op::Agg(AggKind::Max)));
+        assert_eq!(
+            Op::parse_list_checked("mean,count"),
+            Ok(vec![Op::Agg(AggKind::Mean), Op::Agg(AggKind::Count)])
+        );
+        assert!(Op::parse_list_checked("mean,nope").is_err());
+        // Dense indices are unique and in `0..COUNT`.
+        let mut seen = std::collections::HashSet::new();
+        for kind in AggKind::ALL {
+            let i = Op::Agg(kind).index();
+            assert!(i < Op::COUNT);
+            assert!(seen.insert(i), "duplicate operator index {i}");
+        }
+    }
+
+    #[test]
+    fn simplify_preserves_an_aggregate_cache_and_binds_correctly() {
+        let t = hand_table();
+        let mean = aggregate(AggKind::Mean, Some(0), t.get(AggKind::Mean, 0));
+        let expr = node(Op::Add, vec![mean.clone(), constant(0.0)]);
+        let simple = simplify(&expr);
+        assert_eq!(simple.op, Op::Agg(AggKind::Mean));
+        assert_eq!(simple.val, 3.0, "the cached value survives simplification");
+        assert_eq!(eval(&simple, &[123.0]), 3.0);
+
+        // `count()` has no children; simplification must not fold it into a
+        // bare constant (which would lose the name and the zero-arity shape).
+        let c = aggregate(AggKind::Count, None, 5.0);
+        let simple = simplify(&c);
+        assert_eq!(simple.op, Op::Agg(AggKind::Count));
+        assert!(simple.kids.is_empty());
+        assert_eq!(simple.val, 5.0);
+
+        // Binding resolves a parser-built node against the table.
+        let mut parsed = node(Op::Agg(AggKind::Iqr), vec![input(0)]);
+        assert!(parsed.val.is_nan());
+        bind_aggregates(&mut parsed, &t).unwrap();
+        assert_eq!(parsed.val, 2.0);
+    }
+
+    #[test]
+    fn bind_rejects_expressions_and_unknown_columns() {
+        let t = hand_table();
+        let mut not_a_column = node(
+            Op::Agg(AggKind::Mean),
+            vec![node(Op::Add, vec![input(0), constant(1.0)])],
+        );
+        assert!(bind_aggregates(&mut not_a_column, &t).is_err());
+        let mut out_of_range = node(Op::Agg(AggKind::Mean), vec![input(3)]);
+        assert!(bind_aggregates(&mut out_of_range, &t).is_err());
     }
 }

@@ -228,11 +228,13 @@ fn a_custom_model_still_recovers_a_known_law() {
         x: xs.clone(),
         y: ys.clone(),
         w: Vec::new(),
+        ys: Vec::new(),
     };
     let test = Sample {
         x: xs,
         y: ys,
         w: Vec::new(),
+        ys: Vec::new(),
     };
 
     let mut cfg = Config::default();

@@ -1291,11 +1291,12 @@ impl RunPlan {
             emit(
                 &progress_writer,
                 &format!(
-                    "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{}}}",
+                    "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{},\"convergence\":{}}}",
                     p.generation,
                     p.total_generations,
                     jnum(p.best_error),
-                    p.pareto_members
+                    p.pareto_members,
+                    p.convergence.json()
                 ),
             );
         });
@@ -1451,6 +1452,7 @@ impl RunPlan {
                     x: prepared.train.x.clone(),
                     y,
                     w: prepared.train.w.clone(),
+                    ys: Vec::new(),
                 };
                 let out = search::run(&self.cfg, &shuffled, &shuffled);
                 let b = out

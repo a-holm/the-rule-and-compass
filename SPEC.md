@@ -49,13 +49,15 @@ Expression **tree** over these primitives:
 - unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh, Not, Require, Constrain, Complexity, Variables, Constants, Contains, ContainsOp`
 - binary: `Add, Sub, Mul, Div, Pow, Mod, Min, Max, Atan2, Equal, Less, LessOrEqual, Greater, GreaterOrEqual, And, Or, Xor`
 - ternary: `If(cond, a, b)` where `cond` is `a > 0`, `Between(x, lo, hi)`
+- aggregates: `Agg(kind)` with `kind` in `Mean, Std, Median, Iqr, Sum, Min,
+  Max, Count`; the column is a single `Input` child (`Count` is zero-arity)
 
 `Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`, the whole conditional
 family (`Equal`…`GreaterOrEqual`, `And`/`Or`/`Xor`/`Not`,
-`Require`/`Between`/`Constrain`) and the meta operators
-(`Complexity`…`ContainsOp`) are **opt-in** primitives: they are not part of
-the default operator set but are accepted by `--ops` and listed by
-`rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
+`Require`/`Between`/`Constrain`), the meta operators
+(`Complexity`…`ContainsOp`) and the dataset aggregates (`Agg`) are **opt-in**
+primitives: they are not part of the default operator set but are accepted by
+`--ops` and listed by `rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
 precision with no external crates, and the Levenberg–Marquardt adjoint pass uses
 the analytic derivative of each operator where one exists (`0` a.e. for
 `floor`/`ceil`/`round`/`sign`/`step`, the comparisons and `not`; a documented
@@ -102,6 +104,40 @@ meta nodes and their arguments like ordinary structure. See
 [`docs/meta-operators.md`](docs/meta-operators.md) for the cache rule and the
 caveat that a meta operator describes the model, not the data.
 
+**Dataset aggregates** reduce one input column over the **training rows** and
+return the same value on every row:
+
+| op | value |
+|---|---|
+| `mean(x)` | arithmetic mean |
+| `std(x)` | population standard deviation (divide by `n`) |
+| `median(x)` | 50th percentile (linear interpolation) |
+| `iqr(x)` | `q75 - q25`, the same interpolated quantiles |
+| `sum(x)` | sum |
+| `amin(x)` / `min(x)` | smallest finite value (`amin` is the `--ops` name) |
+| `amax(x)` / `max(x)` | largest finite value (`amax` is the `--ops` name) |
+| `count()` | number of training rows (zero-arity) |
+
+The column is the aggregate's single `Input` child; `mean(x1 + 1)` is a parse
+error. Non-finite cells are ignored; a column with no finite value yields `NaN`,
+which the domain guard turns into an infeasible candidate (`+inf` score), never
+an invented number.
+
+The values are computed **once**, before the first generation, into a
+per-column `AggTable` and cached in `Node::val`. `eval` returns the cache
+without walking the child, so per-row cost does not grow. An aggregate has no
+constant slot, no gradient in the adjoint sweep, and is ignored by
+`count_constants` and the `constants(e)` meta operator: a dataset fact is not a
+fitted parameter. `simplify` never folds an aggregate, and `mutate`/`crossover`
+refresh the cache after a structural edit.
+
+The table is built from the search's **training** sample only. Test rows never
+contribute, and it is not rebuilt for `--predictor-samples` subsets; the test
+split is only ever scored with the training statistics. Because the search
+normalises inputs by default, the statistic is that of the normalised column;
+use `--center none --scale none` to read aggregates in original units. See
+[`docs/aggregation.md`](docs/aggregation.md).
+
 Evaluation is a recursive `f64` evaluator with **domain guards**, so
 out-of-domain operations yield a non-finite value (treated as a hard failure):
 `Ln(a<=0) -> NaN`, `Sqrt(a<0) -> NaN`, `Div(|b|<eps) -> NaN`,
@@ -128,10 +164,12 @@ unary   := ('-' | '+' | 'not') unary | power
 power   := primary ('^' unary)?          // right associative
 primary := number
          | meta '(' expr ')'
+         | agg '(' expr? ')'
          | name '(' expr (',' expr)* ')'
          | name
          | '(' expr ')'
 meta    := 'complexity' | 'variables' | 'constants' | 'contains' | 'contains_op'
+agg     := 'mean' | 'std' | 'median' | 'iqr' | 'sum' | 'amin' | 'amax' | 'count'
 ```
 
 Precedence, loosest to tightest: `or`, `xor`, `and`, comparisons
@@ -152,7 +190,40 @@ declared variables. Unknown names, unmatched parentheses and wrong argument
 counts produce a `ParseError` carrying the **1-based column**. The meta
 operators are ordinary unary calls in this grammar
 (`complexity(x1 * x2)`), and the parsed node caches the structural value.
+The aggregates are calls too (`mean(x1)`, `count()`); their argument must be a
+bare variable, and a parsed node's value is `NaN` until it is bound to the
+training table (`expr::bind_aggregates`). `min(x1)`/`max(x1)` with one
+argument are the column reductions; `min(a, b)`/`max(a, b)` stay binary.
 `--eval-expr` exposes the parser on the command line.
+
+### 4.2 User-defined building blocks (`--function`)
+
+Up to four `--function` definitions make a sub-formula available as an operator
+of its own arity. The syntax is `name(a,b)=<expr>` or `name=<expr>`; in the
+latter form the parameters are the free variables in order of first appearance.
+A body is parsed with the same grammar and may call only blocks defined before
+it, so recursion and forward references are rejected. Names must be unique and
+must not shadow a primitive or a canonical slot name (`custom0`..`custom3`).
+Each definition occupies the slot matching its position. A block has 0 to 4
+parameters.
+
+A call `name(e1, e2)` is an expression node with two children. Evaluation
+substitutes the argument values for the body's parameters and evaluates the
+body. The printed form uses the user's name (`name(e1, e2)`) and parses back
+when the same definitions are supplied. Constants inside a body are **shared**
+by every call in a candidate: the constant fitter maps them to one parameter
+per `(block slot, constant ordinal)`, writes the fitted value back into every
+use, and `count_constants` counts them once per block, not once per call.
+
+A block costs its configured operator cost (default `1`) plus the cost of its
+arguments; the body's internal nodes are not charged again. `--op-complexity`
+accepts either the user's name or the canonical slot. Supplying a block adds its
+slot to the run's operator set. Without `--function` no custom operator exists
+and behaviour is unchanged. `--function` is incompatible with `--save` and
+`--resume`, because the checkpoint format does not store definitions.
+
+See [`docs/building-blocks.md`](docs/building-blocks.md) for examples and the
+shared-constant fitting rule.
 
 ## 5. Complexity
 
@@ -175,7 +246,9 @@ complexity(f) = sum(op_cost)              # over operator nodes only
   `depth_weight = 0`. The value is then exactly the number of nodes, bit for
   bit, which is the historical behaviour.
 - `--op-complexity "pow=2,sin=1.5,if=3"` sets per-operator costs. Names use the
-  same table as `--ops`; any operator not listed keeps the cost `1`.
+  same table as `--ops`; any operator not listed keeps the cost `1`. A
+  user-defined block is priced by its name or `customN`; its body is not
+  re-priced, so the cost is the price of the block as one primitive.
 - `--complexity-weights "var=1,const=1"` sets terminal weights. The keys are
   `var` (aliases `variable`, `input`) and `const` (alias `constant`); `depth`
   is also accepted as a synonym for `--depth-weight`.
@@ -201,6 +274,22 @@ For training pairs `(x_k, y_k)`, prediction `p_k = f(x_k)`:
   correlation coefficient)
 
 Any non-finite `p_k` makes the metric `+inf`.
+
+### Implicit metrics (issue #14)
+
+`--implicit` appends the target as one more input (normalised with its training
+mean/std) and sets the fitting target to `0`, so the model is
+`f(x1..xn, y) = 0`. Two metrics score it:
+
+- **implicit** (alias `implicit_derivative`): `mean_k |f(p_k)| / ||∇f(p_k)||`,
+  the first-order distance to the zero level set;
+- **implicit_residual**: `mean_k |f(p_k)|`, the plain residual.
+
+Both use the adjoint sweep for `∇f`. A row with `||∇f|| = 0`, a non-finite
+`f`/gradient component, or an overflowing distance makes the candidate `+inf`.
+The implicit-derivative metric fits constants on the signed geometric residual
+`f / ||∇f||`; the plain residual keeps the ordinary least-squares fit against
+the zero target. See [`docs/implicit.md`](docs/implicit.md).
 
 ## 7. Search algorithm
 

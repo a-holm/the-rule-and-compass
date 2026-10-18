@@ -86,15 +86,18 @@ than a single number: an unstable model cannot hide behind one lucky block.
 A real relationship is usually found by many runs; a noise fit is a lottery
 winner. Re-run with different `--seed`s, or bootstrap the rows, and see whether
 the same form (or at least the same variables) comes back — **stability
-selection** (Meinshausen & Bühlmann 2010). `rcsr` currently reports per-fold
-errors but does not yet automate a seed/bootstrap stability run; it is on the
-roadmap.
+selection** (Meinshausen & Bühlmann 2010). `rcsr` automates this: `--cv`
+re-runs the whole search on `k` folds, and `--stability B` bootstraps the rows,
+re-runs the search and ranks forms and variables by how often they come back
+(§3.11).
 
 ### 2.6 Respect the physics when you have it
 If the variables carry units, a true equation is dimensionally consistent
 (Buckingham's π theorem). Requiring that eliminates huge families of spurious
-candidate structures before any statistics. The original tool exposed this as
-per-variable metadata and building-block constraints; `rcsr` does not yet.
+candidate structures before any statistics. `rcsr` makes this available without
+making it mandatory: `--units x=m,t=s --require-dimensions` rejects candidates
+whose dimensions cannot be consistent (see [`units.md`](units.md)), and
+`--function` supplies a known sub-formula as a building block.
 
 ### 2.7 Feed it clean data
 Noise, outliers and gaps are exactly what gets fitted. Smoothing, outlier
@@ -439,7 +442,6 @@ Alongside the front, `rcsr` reports:
 
 ## 5. Not yet implemented (on the roadmap)
 
-* **Units / dimensional consistency** as a structural constraint.
 * **Beta / variance-ratio drift tests**, and a **White** general
   heteroscedasticity test (more regressors than just the fitted value).
 * **A flexible non-symbolic learner beyond k-NN** (random forest, Gaussian
