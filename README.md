@@ -79,11 +79,14 @@ A syntax error names the offending column:
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
-`and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`, and
+`and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`,
 `require`/`constrain` (a violated constraint makes the candidate infeasible
-rather than merely wrong), parentheses, the constants `pi` and `e`, and variable
-names from your table (the `x0`, `x1`, … fallback also works). Comparisons are
-non-associative, so write `(a < b) and (b < c)`.
+rather than merely wrong), and the opt-in meta operators `complexity`,
+`variables`, `constants`, `contains` and `contains_op` (see
+[`docs/meta-operators.md`](docs/meta-operators.md)), parentheses, the constants
+`pi` and `e`, and variable names from your table (the `x0`, `x1`, … fallback
+also works). Comparisons are non-associative, so write
+`(a < b) and (b < c)`.
 
 `cargo test` runs the unit tests and the end-to-end recovery tests
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
@@ -97,6 +100,18 @@ operators, terminals and nesting instead. The configured value is what the
 Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
+
+## Meta operators
+
+`complexity(e)`, `variables(e)`, `constants(e)`, `contains(e)` and
+`contains_op(e)` describe the shape of a subexpression: node count, distinct
+input variables, constant leaves, and whether an input or an operator is
+present. They are opt-in (`--ops complexity,...`), return one value per model
+rather than one per row, and are cached when the node is built. Because they
+describe the model rather than the data, they are useful for self-describing
+models and structural conditions, not as a source of row-level signal. See
+[`docs/meta-operators.md`](docs/meta-operators.md) for the semantics table and
+the caching rule.
 
 ## Save and resume a run
 
@@ -532,9 +547,13 @@ list and the recorded results.
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
   sin cos tan sinh cosh tanh logistic gauss square cube`, `if`), plus the
   opt-in `floor ceil round mod min max sign step erf erfc atan2 asinh acosh
-  atanh` and the conditional family
+  atanh`, the conditional family
   `equal less less_or_equal greater greater_or_equal and or xor not require
-  between constrain` selected with `--ops` (all with domain guards);
+  between constrain`, and the meta operators
+  `complexity variables constants contains contains_op` selected with `--ops`
+  (all with domain guards; the meta operators describe a subexpression's shape
+  and are evaluated once per candidate, not per row — see
+  [`docs/meta-operators.md`](docs/meta-operators.md));
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
@@ -600,6 +619,7 @@ docs/data-preparation.md      missing values, outliers, smoothing, scaling and f
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/overfitting.md           avoiding and detecting overfitting, with references
+docs/meta-operators.md        structural meta operators and their cache rule
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan

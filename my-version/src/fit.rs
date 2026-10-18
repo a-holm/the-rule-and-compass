@@ -213,6 +213,10 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 f64::NAN
             }
         }
+        // Meta operators return the structural value cached on the node. It is
+        // row-independent by construction; the flat copy keeps it so a fitted
+        // constant inside the argument cannot change it.
+        Complexity | Variables | Constants | Contains | ContainsOp => node_val,
     }
 }
 
@@ -491,6 +495,10 @@ fn backward_impl(
                     adj[ks[0]] += a;
                 }
             }
+            // Meta operators are structural constants: the fitter must not
+            // move them, so their gradient is zero (like `floor`/`step`).
+            // Nothing flows into the argument either.
+            Complexity | Variables | Constants | Contains | ContainsOp => {}
             Const | Input => {}
         }
     }
