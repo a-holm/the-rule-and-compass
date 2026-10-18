@@ -20,6 +20,25 @@ impl Mt {
         Mt { mt, idx: 624 }
     }
 
+    /// The exact MT19937 state: the 624-word state array and the next index.
+    ///
+    /// This is the entire state of the generator, so a value obtained here and
+    /// passed to [`Mt::from_state`] reproduces the stream bit for bit, from the
+    /// next draw onwards. Used by the checkpoint format to resume a search.
+    pub fn state(&self) -> (&[u32; 624], usize) {
+        (&self.mt, self.idx)
+    }
+
+    /// Rebuild a generator from an exact MT19937 state.
+    ///
+    /// `idx` is the index of the next word to temper, in `0..=624`; `624` means
+    /// the state array is due to be twisted before the next draw (the value
+    /// [`Mt::new`] starts with). A restored generator produces the identical
+    /// stream to the one it was copied from.
+    pub fn from_state(mt: [u32; 624], idx: usize) -> Self {
+        Mt { mt, idx }
+    }
+
     pub fn next_u32(&mut self) -> u32 {
         if self.idx >= 624 {
             for i in 0..624 {

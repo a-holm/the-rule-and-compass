@@ -98,6 +98,27 @@ Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
 
+## Save and resume a run
+
+A long search can be checkpointed and continued later. The checkpoint carries
+the complete search state — configuration, populations, per-island RNG states,
+stagnation and patience counters, archive and a data fingerprint — so a resumed
+run follows the identical trajectory:
+
+```sh
+rcsr --data examples/line.csv --target y --vars x \
+     --generations 20 --seed 7 --save run.rcsr
+rcsr --data examples/line.csv --target y --vars x \
+     --generations 40 --seed 7 --resume run.rcsr
+```
+
+`--save-every <N>` sets the interval (default 25 generations); a checkpoint is
+always written on exit. Saving does not consume randomness, so it cannot change
+the result. The saved search settings win on resume; only the generation budget
+may be raised, and data that does not match the saved fingerprint is refused.
+See [`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format,
+the determinism guarantee and its limits.
+
 ## Using it from other programs
 
 `rcsr` is built to be driven by scripts and agents.
@@ -182,7 +203,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--stability B] [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
      [--patience N]
-     [--time-budget seconds] [--format text|json|ndjson] [--progress]
+     [--time-budget seconds] [--save file] [--save-every N] [--resume file]
+     [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]

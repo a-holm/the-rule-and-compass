@@ -14,6 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
+use crate::checkpoint::{Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
@@ -89,6 +90,49 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// The names of search settings that differ between two configurations.
+    ///
+    /// `generations` is deliberately excluded: it is a **budget**, not a
+    /// property of the trajectory. Resuming may extend it (never shorten it),
+    /// and every other setting must match the checkpoint exactly. `progress`
+    /// is a reporting callback, not search state, and is ignored.
+    pub fn search_setting_differences(&self, other: &Config) -> Vec<&'static str> {
+        let mut diff = Vec::new();
+        macro_rules! compare {
+            ($field:ident, $name:expr) => {
+                if self.$field != other.$field {
+                    diff.push($name);
+                }
+            };
+        }
+        compare!(islands, "islands");
+        compare!(pop, "pop");
+        compare!(max_complexity, "max_complexity");
+        compare!(complexity_model, "complexity model");
+        compare!(metric, "metric");
+        compare!(seed, "seed");
+        compare!(ops, "ops");
+        compare!(migration_interval, "migration_interval");
+        compare!(restart_interval, "restart_interval");
+        compare!(init_depth, "init_depth");
+        compare!(fit_iters, "fit_iters");
+        compare!(dedup, "dedup");
+        if self.time_budget.map(f64::to_bits) != other.time_budget.map(f64::to_bits) {
+            diff.push("time_budget");
+        }
+        compare!(patience, "patience");
+        compare!(predictor_samples, "predictor_samples");
+        diff
+    }
+
+    /// True when both configurations describe the same search trajectory.
+    /// The generation budget is excluded (see [`Config::search_setting_differences`]).
+    pub fn same_search_settings(&self, other: &Config) -> bool {
+        self.search_setting_differences(other).is_empty()
+    }
+}
+
 #[derive(Clone)]
 struct Ind {
     tree: Node,
@@ -113,6 +157,22 @@ impl Ind {
         self.tree = expr::simplify(&self.tree);
         self.complexity = model.complexity(&self.tree);
         self.error = eval_error(&self.tree, train, metric);
+    }
+
+    fn to_checkpoint(&self) -> Individual {
+        Individual {
+            tree: self.tree.clone(),
+            error: self.error,
+            complexity: self.complexity,
+        }
+    }
+
+    fn from_checkpoint(ind: Individual) -> Self {
+        Ind {
+            tree: ind.tree,
+            error: ind.error,
+            complexity: ind.complexity,
+        }
     }
 }
 
@@ -338,195 +398,417 @@ pub struct Outcome {
     pub converged_early: bool,
 }
 
+/// Run a search once, from a fresh start.
+///
+/// This is the historical entry point. It delegates to [`run_resumable`] with
+/// no checkpoint and no callback, so its behaviour is unchanged bit for bit.
 pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
+    run_search(cfg, train, test, None, 0, None)
+        .unwrap_or_else(|e| panic!("search failed: {}", e))
+}
+
+/// Run a search, optionally continuing a checkpoint, and report snapshots.
+///
+/// A snapshot is handed to `on_checkpoint` after every `save_every`
+/// generations (when non-zero) and once more before the final archive is
+/// rebuilt, so a save always includes the state at a generation boundary.
+/// The callback must not mutate the search; saving therefore cannot change the
+/// result.
+///
+/// When `resume` is `Some`, the checkpoint's data fingerprint is checked
+/// against `train`/`test` and its search settings must match `cfg`; the
+/// generation budget in `cfg` may be larger than the saved one (to continue a
+/// run), but never smaller. Any mismatch is a descriptive `Err`.
+pub fn run_resumable(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    resume: Option<Checkpoint>,
+    save_every: usize,
+    mut on_checkpoint: impl FnMut(&Checkpoint),
+) -> Result<Outcome, String> {
+    run_search(
+        cfg,
+        train,
+        test,
+        resume,
+        save_every,
+        Some(&mut on_checkpoint),
+    )
+}
+
+type CheckpointFn<'a> = &'a mut dyn FnMut(&Checkpoint);
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot(
+    cfg: &Config,
+    gens_done: usize,
+    stopped_early: bool,
+    best_prev: f64,
+    no_improve: usize,
+    archive: &Archive,
+    islands: &[Vec<Ind>],
+    rngs: &[Mt],
+    stagnant: &[usize],
+    main_rng: &Mt,
+    train: &Sample,
+    test: &Sample,
+) -> Checkpoint {
+    let (words, idx) = main_rng.state();
+    Checkpoint {
+        config: cfg.clone(),
+        generations: gens_done,
+        stopped_early,
+        best_prev,
+        no_improve,
+        train: crate::checkpoint::fingerprint(train),
+        test: crate::checkpoint::fingerprint(test),
+        archive: Archive {
+            items: archive.items.clone(),
+            cap: archive.cap,
+        },
+        islands: islands
+            .iter()
+            .zip(rngs.iter())
+            .map(|(pop, rng)| {
+                let (words, idx) = rng.state();
+                IslandState {
+                    rng: Mt::from_state(*words, idx),
+                    population: pop.iter().map(Ind::to_checkpoint).collect(),
+                }
+            })
+            .collect(),
+        stagnant: stagnant.to_vec(),
+        main_rng: Mt::from_state(*words, idx),
+    }
+}
+
+fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
+    if let Some(cb) = on_checkpoint.as_deref_mut() {
+        cb(cp);
+    }
+}
+
+fn run_search(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    resume: Option<Checkpoint>,
+    save_every: usize,
+    mut on_checkpoint: Option<CheckpointFn<'_>>,
+) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
-    let mut rng = Mt::new(cfg.seed);
-    let mut archive = Archive::new(4000);
     let t0 = std::time::Instant::now();
 
-    // Distinct, reproducible streams per island.
-    let mut rngs: Vec<Mt> = (0..cfg.islands.max(1))
-        .map(|i| Mt::new(cfg.seed ^ (0x9E37_79B9u32.wrapping_mul(i as u32 + 1))))
-        .collect();
+    let mut rng: Mt;
+    let mut archive: Archive;
+    let mut rngs: Vec<Mt>;
+    let mut islands: Vec<Vec<Ind>>;
+    let mut stagnant: Vec<usize>;
+    let mut gens_done: usize;
+    let mut converged_early: bool;
+    let mut best_prev: f64;
+    let mut no_improve: usize;
 
-    let mut islands: Vec<Vec<Ind>> = Vec::with_capacity(cfg.islands.max(1));
-    let mut stagnant: Vec<usize> = vec![0; cfg.islands.max(1)];
-    // Generation 0's subset also scores the initial population, so nothing is
-    // evaluated on the full table before the first generation.
-    let init_sample = training_for_generation(cfg, train, 0);
-    let init_train = init_sample.as_ref().unwrap_or(train);
-    for isl in 0..cfg.islands.max(1) {
-        let depth = cfg.init_depth.min(1 + isl % 3);
-        let mut pop = Vec::with_capacity(cfg.pop);
-        for _ in 0..cfg.pop {
-            pop.push(Ind::evaluated(
-                random_tree(&mut rng, nvars, &cfg.ops, depth),
-                init_train,
-                cfg.metric,
-                &cfg.complexity_model,
+    if let Some(cp) = resume {
+        cp.check_data(train, test)?;
+        if !cfg.same_search_settings(&cp.config) {
+            let diff = cfg.search_setting_differences(&cp.config);
+            return Err(format!(
+                "checkpoint search settings do not match ({})",
+                diff.join(", ")
             ));
         }
-        islands.push(pop);
+        if cfg.generations < cp.config.generations || cfg.generations < cp.generations {
+            return Err(format!(
+                "cannot resume: {} generation(s) are complete and the saved budget is {}, \
+                 but the requested budget is {} (the budget may be raised, not lowered)",
+                cp.generations, cp.config.generations, cfg.generations
+            ));
+        }
+        let Checkpoint {
+            generations,
+            stopped_early,
+            best_prev: saved_best,
+            no_improve: saved_no_improve,
+            archive: saved_archive,
+            islands: saved_islands,
+            stagnant: saved_stagnant,
+            main_rng,
+            ..
+        } = cp;
+        gens_done = generations;
+        converged_early = stopped_early;
+        best_prev = saved_best;
+        no_improve = saved_no_improve;
+        archive = saved_archive;
+        stagnant = saved_stagnant;
+        rng = main_rng;
+        rngs = Vec::with_capacity(saved_islands.len());
+        islands = Vec::with_capacity(saved_islands.len());
+        for isl in saved_islands {
+            rngs.push(isl.rng);
+            islands.push(
+                isl.population
+                    .into_iter()
+                    .map(Ind::from_checkpoint)
+                    .collect(),
+            );
+        }
+        let want = cfg.islands.max(1);
+        if islands.len() != want || rngs.len() != want || stagnant.len() != want {
+            return Err(format!(
+                "checkpoint has {} island(s), {} rng state(s) and {} counter(s), \
+                 but this configuration needs {}",
+                islands.len(),
+                rngs.len(),
+                stagnant.len(),
+                want
+            ));
+        }
+        if islands.iter().any(|pop| pop.len() != cfg.pop) {
+            return Err(format!(
+                "checkpoint population size does not match the saved pop {}",
+                cfg.pop
+            ));
+        }
+    } else {
+        rng = Mt::new(cfg.seed);
+        archive = Archive::new(4000);
+
+        // Distinct, reproducible streams per island.
+        rngs = (0..cfg.islands.max(1))
+            .map(|i| Mt::new(cfg.seed ^ (0x9E37_79B9u32.wrapping_mul(i as u32 + 1))))
+            .collect();
+
+        islands = Vec::with_capacity(cfg.islands.max(1));
+        stagnant = vec![0; cfg.islands.max(1)];
+        // Generation 0's subset also scores the initial population, so nothing
+        // is evaluated on the full table before the first generation.
+        let init_sample = training_for_generation(cfg, train, 0);
+        let init_train = init_sample.as_ref().unwrap_or(train);
+        for isl in 0..cfg.islands.max(1) {
+            let depth = cfg.init_depth.min(1 + isl % 3);
+            let mut pop = Vec::with_capacity(cfg.pop);
+            for _ in 0..cfg.pop {
+                pop.push(Ind::evaluated(
+                    random_tree(&mut rng, nvars, &cfg.ops, depth),
+                    init_train,
+                    cfg.metric,
+                    &cfg.complexity_model,
+                ));
+            }
+            islands.push(pop);
+        }
+
+        gens_done = 0;
+        converged_early = false;
+        best_prev = f64::INFINITY;
+        no_improve = 0;
     }
 
-    let mut gens_done = 0usize;
-    let mut converged_early = false;
-    let mut best_prev = f64::INFINITY;
-    let mut no_improve = 0usize;
+    if !converged_early {
+        for gen in gens_done..cfg.generations {
+            gens_done = gen + 1;
 
-    for gen in 0..cfg.generations {
-        gens_done = gen + 1;
+            // One fixed subset for the whole generation; a fresh draw next time.
+            // `None` means the full training sample, exactly as before.
+            let gen_sample = training_for_generation(cfg, train, gen);
+            let gen_train = gen_sample.as_ref().unwrap_or(train);
 
-        // One fixed subset for the whole generation; a fresh draw next time.
-        // `None` means the full training sample, exactly as before.
-        let gen_sample = training_for_generation(cfg, train, gen);
-        let gen_train = gen_sample.as_ref().unwrap_or(train);
-
-        // With subsampling active, re-score the carried-over population on this
-        // generation's subset so every individual competes on the same rows.
-        // (Inactive runs keep the original errors untouched.)
-        if gen > 0 && gen_sample.is_some() {
-            for pop in islands.iter_mut() {
-                for ind in pop.iter_mut() {
-                    ind.reeval(gen_train, cfg.metric, &cfg.complexity_model);
+            // With subsampling active, re-score the carried-over population on
+            // this generation's subset so every individual competes on the same
+            // rows. (Inactive runs keep the original errors untouched.)
+            if gen > 0 && gen_sample.is_some() {
+                for pop in islands.iter_mut() {
+                    for ind in pop.iter_mut() {
+                        ind.reeval(gen_train, cfg.metric, &cfg.complexity_model);
+                    }
                 }
             }
-        }
 
-        // ---- parallel generation across islands -------------------------
-        std::thread::scope(|s| {
-            let handles: Vec<_> = islands
-                .iter_mut()
-                .zip(rngs.iter_mut())
-                .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
-                .collect();
-            for h in handles {
-                let _ = h.join();
-            }
-        });
-
-        // ---- archive + convergence bookkeeping --------------------------
-        let mut gen_best = f64::INFINITY;
-        for pop in &islands {
-            for ind in pop {
-                if ind.error < gen_best {
-                    gen_best = ind.error;
+            // ---- parallel generation across islands ---------------------
+            std::thread::scope(|s| {
+                let handles: Vec<_> = islands
+                    .iter_mut()
+                    .zip(rngs.iter_mut())
+                    .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
+                    .collect();
+                for h in handles {
+                    let _ = h.join();
                 }
-                archive.try_insert(Sol {
-                    complexity: expr::complexity(&ind.tree),
-                    cost: ind.complexity,
-                    tree: ind.tree.clone(),
-                    error: ind.error,
+            });
+
+            // ---- archive + convergence bookkeeping ----------------------
+            let mut gen_best = f64::INFINITY;
+            for pop in &islands {
+                for ind in pop {
+                    if ind.error < gen_best {
+                        gen_best = ind.error;
+                    }
+                    archive.try_insert(Sol {
+                        complexity: expr::complexity(&ind.tree),
+                        cost: ind.complexity,
+                        tree: ind.tree.clone(),
+                        error: ind.error,
+                    });
+                }
+            }
+
+            if let Some(budget) = cfg.time_budget {
+                if t0.elapsed().as_secs_f64() >= budget {
+                    converged_early = true;
+                    break;
+                }
+            }
+
+            if let Some(report) = &cfg.progress {
+                report(Progress {
+                    generation: gens_done,
+                    total_generations: cfg.generations,
+                    best_error: gen_best,
+                    pareto_members: archive.items.len(),
                 });
             }
-        }
 
-        if let Some(budget) = cfg.time_budget {
-            if t0.elapsed().as_secs_f64() >= budget {
-                converged_early = true;
-                break;
-            }
-        }
-
-        if let Some(report) = &cfg.progress {
-            report(Progress {
-                generation: gens_done,
-                total_generations: cfg.generations,
-                best_error: gen_best,
-                pareto_members: archive.items.len(),
-            });
-        }
-
-        if gen_best.is_finite() {
-            if gen_best <= 1e-24 {
-                converged_early = true;
-                break;
-            }
-            let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
-            if rel <= 1e-9 {
-                no_improve += 1;
-            } else {
-                no_improve = 0;
-            }
-            best_prev = best_prev.min(gen_best);
-            if cfg.patience > 0 && no_improve >= cfg.patience {
-                converged_early = true;
-                break;
-            }
-        }
-
-        // ---- migration between islands ----------------------------------
-        if cfg.islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
-        {
-            let bests: Vec<Option<Node>> = islands
-                .iter()
-                .map(|pop| {
-                    pop.iter()
-                        .min_by(|a, b| {
-                            a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
-                        })
-                        .map(|i| i.tree.clone())
-                })
-                .collect();
-            for ii in 0..islands.len() {
-                let src = (ii + 1) % islands.len();
-                if let Some(t) = &bests[src] {
-                    if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
-                        a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
-                    }) {
-                        *worst = Ind::evaluated(
-                            t.clone(),
-                            gen_train,
-                            cfg.metric,
-                            &cfg.complexity_model,
-                        );
-                    }
+            if gen_best.is_finite() {
+                if gen_best <= 1e-24 {
+                    converged_early = true;
+                    break;
                 }
-            }
-        }
-
-        // ---- restart stagnant islands -----------------------------------
-        if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
-            let arch_best = archive
-                .items
-                .iter()
-                .map(|s| s.error)
-                .fold(f64::INFINITY, f64::min);
-            for ii in 0..islands.len() {
-                let cur_best = islands[ii]
-                    .iter()
-                    .map(|i| i.error)
-                    .fold(f64::INFINITY, f64::min);
-                if cur_best > arch_best + 1e-9 {
-                    stagnant[ii] += 1;
+                let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
+                if rel <= 1e-9 {
+                    no_improve += 1;
                 } else {
-                    stagnant[ii] = 0;
+                    no_improve = 0;
                 }
-                if stagnant[ii] >= 2 {
-                    let mut r = rngs[ii].clone();
-                    for ind in islands[ii].iter_mut() {
-                        let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
-                        if cfg.fit_iters > 0 {
-                            crate::fit::fit_weighted(
-                                &mut t,
-                                &gen_train.x,
-                                &gen_train.y,
-                                &gen_train.w,
-                                cfg.fit_iters,
+                best_prev = best_prev.min(gen_best);
+                if cfg.patience > 0 && no_improve >= cfg.patience {
+                    converged_early = true;
+                    break;
+                }
+            }
+
+            // ---- migration between islands ------------------------------
+            if cfg.islands > 1
+                && cfg.migration_interval > 0
+                && (gen + 1) % cfg.migration_interval == 0
+            {
+                let bests: Vec<Option<Node>> = islands
+                    .iter()
+                    .map(|pop| {
+                        pop.iter()
+                            .min_by(|a, b| {
+                                a.error
+                                    .partial_cmp(&b.error)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            })
+                            .map(|i| i.tree.clone())
+                    })
+                    .collect();
+                for ii in 0..islands.len() {
+                    let src = (ii + 1) % islands.len();
+                    if let Some(t) = &bests[src] {
+                        if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
+                            a.error
+                                .partial_cmp(&b.error)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        }) {
+                            *worst = Ind::evaluated(
+                                t.clone(),
+                                gen_train,
+                                cfg.metric,
+                                &cfg.complexity_model,
                             );
                         }
-                        *ind = Ind::evaluated(
-                            t,
-                            gen_train,
-                            cfg.metric,
-                            &cfg.complexity_model,
-                        );
                     }
-                    rngs[ii] = r;
-                    stagnant[ii] = 0;
                 }
             }
+
+            // ---- restart stagnant islands -------------------------------
+            if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
+                let arch_best = archive
+                    .items
+                    .iter()
+                    .map(|s| s.error)
+                    .fold(f64::INFINITY, f64::min);
+                for ii in 0..islands.len() {
+                    let cur_best = islands[ii]
+                        .iter()
+                        .map(|i| i.error)
+                        .fold(f64::INFINITY, f64::min);
+                    if cur_best > arch_best + 1e-9 {
+                        stagnant[ii] += 1;
+                    } else {
+                        stagnant[ii] = 0;
+                    }
+                    if stagnant[ii] >= 2 {
+                        let mut r = rngs[ii].clone();
+                        for ind in islands[ii].iter_mut() {
+                            let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
+                            if cfg.fit_iters > 0 {
+                                crate::fit::fit_weighted(
+                                    &mut t,
+                                    &gen_train.x,
+                                    &gen_train.y,
+                                    &gen_train.w,
+                                    cfg.fit_iters,
+                                );
+                            }
+                            *ind = Ind::evaluated(
+                                t,
+                                gen_train,
+                                cfg.metric,
+                                &cfg.complexity_model,
+                            );
+                        }
+                        rngs[ii] = r;
+                        stagnant[ii] = 0;
+                    }
+                }
+            }
+
+            // A checkpoint is taken only at a generation boundary: all of the
+            // generation's work, including migration and restarts, is done.
+            if save_every > 0 && gens_done % save_every == 0 {
+                let cp = snapshot(
+                    cfg,
+                    gens_done,
+                    converged_early,
+                    best_prev,
+                    no_improve,
+                    &archive,
+                    &islands,
+                    &rngs,
+                    &stagnant,
+                    &rng,
+                    train,
+                    test,
+                );
+                emit(&mut on_checkpoint, &cp);
+            }
         }
+    }
+
+    // Write on exit (including a run that stopped early) before the final
+    // full-data archive rebuild, so the saved archive is the search archive at
+    // the last completed generation.
+    if on_checkpoint.is_some() {
+        let cp = snapshot(
+            cfg,
+            gens_done,
+            converged_early,
+            best_prev,
+            no_improve,
+            &archive,
+            &islands,
+            &rngs,
+            &stagnant,
+            &rng,
+            train,
+            test,
+        );
+        emit(&mut on_checkpoint, &cp);
     }
 
     if subsampling_active(cfg, train) {
@@ -559,10 +841,10 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
-    Outcome {
+    Ok(Outcome {
         archive: final_archive,
         test_errors,
         generations: gens_done,
         converged_early,
-    }
+    })
 }
