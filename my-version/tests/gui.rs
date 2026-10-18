@@ -66,90 +66,38 @@ fn schema_endpoint_returns_the_cli_contract() {
     assert!(body.contains("\"options\""));
     assert!(body.contains("\"operators\""));
     assert!(body.contains("\"exit_codes\""));
-    for (name, _, _, _) in gui::SCHEMA_OPTIONS {
-        assert!(
-            body.contains(&format!("\"name\":\"{}\"", name)),
-            "schema omits {}",
-            name
-        );
-    }
+    // One source of truth: the server serves exactly what `rcsr schema` prints.
+    assert_eq!(body, rcsr::schema::json());
 }
 
 #[test]
-fn schema_options_match_the_cli_schema_function() {
-    // `schema()` is private to the `rcsr` binary, so keep the library copy
-    // honest by reading the table in `src/main.rs` and comparing every field.
-    let main = include_str!("../src/main.rs");
-    let start = main
-        .find("let opts = [")
-        .expect("schema opts table not found");
-    let after = &main[start..];
-    let end = after.find("\n    ];").expect("end of schema opts table");
-    let block = &after[..end];
-    let mut from_cli: Vec<(String, String, String, String)> = Vec::new();
-    for line in block.lines() {
-        let line = line.trim();
-        if !line.starts_with("(\"") {
-            continue;
+fn every_flag_has_a_type_default_and_description() {
+    // The document is generated from one table, so the remaining risk is a
+    // half-written entry, not drift between two copies.
+    let doc = rcsr::schema::json();
+    assert!(gui::is_valid_json(&doc), "schema is not valid JSON");
+    let opts = doc
+        .split("\"name\":\"")
+        .skip(1)
+        .collect::<Vec<_>>();
+    assert!(
+        opts.len() >= 50,
+        "expected the full option table, found {}",
+        opts.len()
+    );
+    for entry in opts {
+        assert!(entry.starts_with("--"), "malformed option entry: {entry}");
+        for field in ["\"type\":", "\"default\":", "\"description\":"] {
+            assert!(entry.contains(field), "option missing {field}: {entry}");
         }
-        let strings = rust_strings(line);
+        // An empty description is the failure this guards against.
         assert!(
-            strings.len() >= 4,
-            "cannot parse schema option line: {}",
-            line
-        );
-        from_cli.push((
-            strings[0].clone(),
-            strings[1].clone(),
-            strings[2].clone(),
-            strings[3].clone(),
-        ));
-    }
-    assert!(!from_cli.is_empty());
-    assert_eq!(from_cli.len(), gui::SCHEMA_OPTIONS.len());
-    for (cli, ours) in from_cli.iter().zip(gui::SCHEMA_OPTIONS.iter()) {
-        assert_eq!(
-            (cli.0.as_str(), cli.1.as_str(), cli.2.as_str(), cli.3.as_str()),
-            *ours,
-            "GUI schema drifted from src/main.rs"
+            !entry.contains("\"description\":\"\""),
+            "option has an empty description: {entry}"
         );
     }
 }
 
-/// Extract the Rust string literals on one schema line, honouring backslash
-/// escapes so a description may contain quotes and commas.
-fn rust_strings(line: &str) -> Vec<String> {
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'"' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        let mut s = String::new();
-        while i < bytes.len() && bytes[i] != b'"' {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 1;
-                match bytes[i] {
-                    b'n' => s.push('\n'),
-                    b'r' => s.push('\r'),
-                    b't' => s.push('\t'),
-                    b'\\' => s.push('\\'),
-                    b'"' => s.push('"'),
-                    other => s.push(other as char),
-                }
-            } else {
-                s.push(bytes[i] as char);
-            }
-            i += 1;
-        }
-        i += 1;
-        out.push(s);
-    }
-    out
-}
 
 #[test]
 fn run_endpoint_streams_ndjson_ending_in_done() {
