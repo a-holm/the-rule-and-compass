@@ -201,10 +201,32 @@ impl Ind {
     // when units are required (the predicate is a no-op otherwise).
     // #27: `train` carries the sample and its cached SoA columns.
     fn evaluated(tree: Node, train: &EvalSample, cfg: &Config) -> Self {
+        Ind::evaluated_fitted(tree, None, train, cfg)
+    }
+
+    /// #87: [`Ind::evaluated`] with the fitter's own SSE available.
+    ///
+    /// When the metric is `squared`, the fit ran on the same rows that score
+    /// the candidate, and simplification folded nothing, the fitted SSE *is*
+    /// the score (divided by the row count, exactly as `mean_sq` does), so the
+    /// separate scoring sweep is skipped. Every other case keeps the ordinary
+    /// evaluation path bit for bit.
+    fn evaluated_fitted(
+        tree: Node,
+        fitted: Option<FitResult>,
+        train: &EvalSample,
+        cfg: &Config,
+    ) -> Self {
         let tree = expr::simplify(&tree);
+        let hash = expr::structural_hash(&tree);
         let complexity = cfg.complexity_model.complexity(&tree);
         let error = if cfg.accepts_dimensions(&tree) {
-            score_tree(&tree, train, cfg) // #27
+            match fitted {
+                Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
+                    fit.sse / train.sample.len() as f64
+                }
+                _ => score_tree(&tree, train, cfg), // #27
+            }
         } else {
             f64::INFINITY
         };
@@ -546,12 +568,43 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
 /// minimises the signed geometric residual `f / ||grad f||` instead. Every
 /// other metric (including `implicit_residual`, which by definition scores
 /// `|f|`) keeps the historical `fit_weighted` path bit for bit.
-fn fit_constants(tree: &mut Node, cfg: &Config, train: &Sample) {
+fn fit_constants(tree: &mut Node, cfg: &Config, train: &Sample) -> Option<FitResult> {
     if cfg.metric.is_implicit_derivative() {
         crate::implicit::fit(tree, &train.x, &train.w, cfg.fit_iters);
+        None
     } else {
-        crate::fit::fit_weighted(tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+        let sse = crate::fit::fit_weighted(tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+        // #87: remember the tree the SSE belongs to. Simplification after the
+        // fit may fold constants, in which case the SSE is stale and the
+        // caller must score normally.
+        Some(FitResult {
+            sse,
+            hash: expr::structural_hash(tree),
+        })
     }
+}
+
+/// #87: the fitter's own residual sum of squares at the constants it wrote
+/// back, plus the structural hash of the tree at that moment.
+struct FitResult {
+    sse: f64,
+    hash: u64,
+}
+
+/// #87: whether `fit`'s SSE is provably the score of `tree` on `train`.
+///
+/// The fitter sums `Σ (f(xᵢ) − yᵢ)²` in row order; `Metric::Squared` on an
+/// unweighted, single-output sample divides the same sum by the row count. A
+/// different metric, weights (whose `sqrt(w)` residual squares differently),
+/// a multi-output objective, an empty sample, or a simplification that folded
+/// anything all keep the ordinary evaluation path.
+fn can_reuse_sse(cfg: &Config, train: &EvalSample, fit: &FitResult, hash: u64) -> bool {
+    cfg.metric == Metric::Squared
+        && fit.hash == hash
+        && fit.sse.is_finite()
+        && !train.sample.is_multi()
+        && train.sample.w.is_empty()
+        && !train.sample.is_empty()
 }
 
 /// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
@@ -780,8 +833,9 @@ fn evolve_island(
         // #15: a multi-output shape keeps the constant slots that only some
         // outputs need; it is fitted per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, train.sample); // #87
             tree = expr::simplify(&tree);
         }
         // #26: with the GPU batch active the fitness is filled in after every
@@ -790,7 +844,7 @@ fn evolve_island(
         let ind = if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated(tree, train, cfg) // #25
+            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         };
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
@@ -809,15 +863,16 @@ fn evolve_island(
         ));
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, train.sample); // #87
             tree = expr::simplify(&tree);
         }
         // #26: same deferral for the random fill.
         next.push(if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated(tree, train, cfg) // #25
+            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         });
     }
 
@@ -1012,14 +1067,15 @@ fn prepare_seeds(
         }
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, train.sample); // #87
             tree = expr::simplify(&tree);
         }
         if !seen_fitted.insert(expr::structural_hash(&tree)) {
             continue;
         }
-        out.push(Ind::evaluated(tree, train, cfg)); // #25
+        out.push(Ind::evaluated_fitted(tree, fitted, train, cfg)); // #25 #87
     }
     out
 }
@@ -1452,15 +1508,16 @@ fn run_search(
                                 Some(&aggs),
                             );
                             // #15: multi-output fits per output inside the evaluator.
+                            let mut fitted = None;
                             if cfg.fit_iters > 0 && !gen_train.is_multi() {
-                                fit_constants(&mut t, cfg, gen_train);
+                                fitted = fit_constants(&mut t, cfg, gen_train); // #87
                             }
                             // #26: restart trees are batched with the next GPU
                             // call too, before the checkpoint is taken.
                             *ind = if defer_gpu {
                                 Ind::pending(t, cfg)
                             } else {
-                                Ind::evaluated(t, &gen_data, cfg)
+                                Ind::evaluated_fitted(t, fitted, &gen_data, cfg) // #87
                             };
                         }
                         rngs[ii] = r;
@@ -1634,6 +1691,71 @@ mod tests {
         let data = EvalSample::new(&s, &cfg);
         let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
+    }
+
+    /// #87: on an unweighted `squared` fit the fitter's SSE is the score, bit
+    /// for bit, so the separate scoring sweep can be skipped.
+    #[test]
+    fn fitted_sse_matches_the_squared_score() {
+        // 200 rows, as in the issue's measurement.
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..200 {
+            let a = -1.0 + 2.0 * i as f64 / 199.0;
+            x.push(vec![a]);
+            y.push(0.7 * a);
+        }
+        let s = Sample {
+            x,
+            y,
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let mut cfg = Config::default();
+        cfg.metric = Metric::Squared;
+        cfg.fit_iters = 8;
+        let data = EvalSample::new(&s, &cfg);
+
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let fit = fit_constants(&mut tree, &cfg, &s).expect("the ordinary fit path");
+        let hash = expr::structural_hash(&tree);
+        assert!(
+            can_reuse_sse(&cfg, &data, &fit, hash),
+            "a squared fit on the scoring rows with nothing folded must be reusable"
+        );
+        let fitted_error = fit.sse / s.len() as f64;
+
+        let reused = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(
+            reused.error.to_bits(),
+            scored.error.to_bits(),
+            "the reused SSE must equal the fresh score bit for bit"
+        );
+        assert_eq!(fitted_error.to_bits(), scored.error.to_bits());
+    }
+
+    /// #87: when simplification folds a fitted constant, the stored SSE no
+    /// longer describes the tree that is scored, so evaluation is used.
+    #[test]
+    fn folded_constants_fall_back_to_evaluation() {
+        let s = sample(); // y = x0, so the additive constant fits to 0
+        let mut cfg = Config::default();
+        cfg.metric = Metric::Squared;
+        cfg.fit_iters = 8;
+        let data = EvalSample::new(&s, &cfg);
+
+        let mut tree = node(Op::Add, vec![input(0), constant(3.0)]);
+        let fit = fit_constants(&mut tree, &cfg, &s).expect("the ordinary fit path");
+        let simplified = expr::simplify(&tree);
+        assert!(
+            !can_reuse_sse(&cfg, &data, &fit, expr::structural_hash(&simplified)),
+            "a simplification that folded the constant must force a fresh score"
+        );
+
+        let fitted = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(fitted.error.to_bits(), scored.error.to_bits());
     }
 
     /// #77: a child identical to a parent must be caught by the dedup set, not

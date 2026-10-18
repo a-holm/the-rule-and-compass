@@ -677,8 +677,10 @@ fn sse(
     s
 }
 
-/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
-/// their sum of squared errors, or `None` if the normal equations are singular.
+/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants,
+/// their sum of squared errors, and the SSE at the **current** constants (which
+/// the same row loop forms for free), or `None` if the normal equations are
+/// singular.
 #[allow(clippy::too_many_arguments)]
 fn gn_step(
     f: &Flat,
@@ -691,12 +693,13 @@ fn gn_step(
     v: &mut [f64],
     adj: &mut [f64],
     grad: &mut [f64],
-) -> Option<(Vec<f64>, f64)> {
+) -> Option<(Vec<f64>, f64, f64)> {
     if !w.is_empty() && w.len() != x.len().min(y.len()) {
         return None;
     }
     let mut jtj = vec![vec![0.0; k]; k];
     let mut jtr = vec![0.0; k];
+    let mut cur_sse = 0.0;
     for (i, (row, &t)) in x.iter().zip(y).enumerate() {
         let sw = w.get(i).copied().unwrap_or(1.0);
         if sw == 0.0 {
@@ -709,6 +712,9 @@ fn gn_step(
         if !r.is_finite() {
             return None;
         }
+        // #87: the same residual that builds the normal equations also gives
+        // the current SSE, in exactly the order `sse` would sum it.
+        cur_sse += r * r;
         backward(f, v, adj, grad);
         for i in 0..k {
             let gi = grad[i];
@@ -732,7 +738,7 @@ fn gn_step(
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
     let s = sse(f, x, y, w, &trial, v);
-    Some((trial, s))
+    Some((trial, s, cur_sse))
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -783,18 +789,23 @@ pub fn fit_weighted(
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
-    let mut best_sse = sse(&f, x, y, w, &c, &mut v);
+    // #87: the first `gn_step` forms the SSE at the current constants while it
+    // builds the normal equations, so the standalone sweep is not repeated.
+    // `None` means "not known yet"; the fallback below covers the singular and
+    // zero-iteration cases.
+    let mut best_sse: Option<f64> = None;
     let mut lambda = 1e-3;
 
     for _ in 0..iters.max(1) {
         match gn_step(&f, x, y, w, &c, lambda, k, &mut v, &mut adj, &mut grad) {
-            Some((trial, tsse)) => {
-                if tsse < best_sse {
+            Some((trial, tsse, cur_sse)) => {
+                let best = *best_sse.get_or_insert(cur_sse);
+                if tsse < best {
                     c = trial;
-                    best_sse = tsse;
+                    best_sse = Some(tsse);
                     best_c = c.clone();
                     lambda = (lambda / 8.0).max(1e-12);
-                    if best_sse == 0.0 {
+                    if tsse == 0.0 {
                         break;
                     }
                 } else {
@@ -807,6 +818,7 @@ pub fn fit_weighted(
             None => break,
         }
     }
+    let mut best_sse = best_sse.unwrap_or_else(|| sse(&f, x, y, w, &c, &mut v));
 
     // Undamped Gauss–Newton polish: quadratic convergence to the optimum.
     for _ in 0..4 {
@@ -825,7 +837,7 @@ pub fn fit_weighted(
             &mut adj,
             &mut grad,
         ) {
-            Some((trial, tsse)) if tsse < best_sse => {
+            Some((trial, tsse, _)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
             }
