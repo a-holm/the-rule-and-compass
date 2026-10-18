@@ -122,12 +122,30 @@ Lower is better. Reported per solution as `aicc` and `bic`. Two cautions, both
 real: they compare models **on the same data** (not across datasets), and they
 assume the residuals are roughly Gaussian.
 
-### 3.2 Hold-out and cross-validation
-The direct test: error on rows the search never saw. Variants that matter:
-* **k-fold** for exchangeable rows (`--folds k` reports per-block error).
-* **Forward-chaining / rolling-origin** for time series — train on the past,
-  test on the next block, roll forward.
-* **Purged, embargoed, blocked CV** for dependent data (López de Prado 2018).
+### 3.2 Cross-validation — implemented
+The direct test: error on rows the search never saw. `--cv` makes this a
+first-class mode: it rebuilds the split as `k` folds, re-runs the **whole
+search** on each fold's training rows (normalised on those rows alone), and
+reports the mean and spread of the held-out errors.
+
+```sh
+rcsr --data clean.csv --target y --vars x --cv k-fold --cv-k 4
+# cross-validation (k-fold, k=4): mean test=0.000001 +/- 0.000000 | mean train=0.000001
+#   fold 3/4: train=0.000001 test=0.000000 cx=5  y = (3 + (2 * x))
+```
+
+Three schemes, chosen to match how the data behaves:
+
+* **`k-fold`** — a shuffled partition; the right default for exchangeable rows.
+* **`rolling`** — forward chaining: the training window expands and the next
+  contiguous block is held out. For time-ordered data, and the only scheme that
+  never trains on the future.
+* **`purged`** — `k` contiguous parts with `--gap` rows embargoed either side of
+  each test block, so a leaking neighbour cannot help (López de Prado 2018).
+
+Read the **gap between mean train and mean test error**: that difference is the
+optimism a single split hides, and it is what a flexible model cannot fake.
+`--cv` costs about `k` extra searches.
 
 ### 3.3 The permutation control (y-randomisation) — implemented
 The decisive test for "is this just what the search does to noise?". Shuffle the
@@ -356,7 +374,10 @@ and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
 verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
 `bootstrap_error` object with the `apparent`, `oob`, `no_information`,
-`relative_overfitting`, `weight` and `estimate` values of §3.9.
+`relative_overfitting`, `weight` and `estimate` values of §3.9. With `--cv
+<scheme>`, a top-level `cross_validation` object reports the scheme, `k`, the
+`mean_train_error`, `mean_test_error` and `std_test_error`, and the per-fold
+`train_error` / `test_error` / `complexity` / `expression`.
 
 Alongside the front, `rcsr` reports:
 
@@ -376,8 +397,6 @@ Alongside the front, `rcsr` reports:
 
 ## 5. Not yet implemented (on the roadmap)
 
-* **Cross-validation as a first-class mode** (k-fold / rolling-origin over the
-  whole search, not just per-block reporting).
 * **Bootstrap and seed stability** — how often the same form reappears
   (stability selection).
 * **Units / dimensional consistency** as a structural constraint.

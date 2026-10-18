@@ -87,6 +87,13 @@ OVERFITTING DIAGNOSTICS (always on):
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
                               (J^T J); flags constants the data cannot pin down
+  --cv <mode>                cross-validation: rerun the search on k folds and
+                             report the mean and spread of the held-out errors.
+                             k-fold  shuffled partition (i.i.d. data)
+                             rolling forward chaining (time-ordered data)
+                             purged  k-fold with a --gap embargo either side of
+                                     each test block
+  --cv-k <K>                 number of folds (default 5); --cv costs ~K searches
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
                              distribution and a p-value; inferential, costs n
@@ -153,6 +160,8 @@ fn schema() -> String {
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
         ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
+        ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
+        ("--cv-k", "int", "5", "number of cross-validation folds"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | auc | log_loss | hinge | aic | aicc | bic"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
@@ -251,6 +260,47 @@ struct Row {
     expression: String,
 }
 
+/// Cross-validation summary (issue #19).
+struct CvReport {
+    mode: &'static str,
+    k: usize,
+    folds: Vec<CvFoldRow>,
+}
+
+struct CvFoldRow {
+    train_error: f64,
+    test_error: f64,
+    complexity: usize,
+    expression: String,
+}
+
+impl CvReport {
+    fn mean_train(&self) -> f64 {
+        mean_of(self.folds.iter().map(|r| r.train_error))
+    }
+    fn mean_test(&self) -> f64 {
+        mean_of(self.folds.iter().map(|r| r.test_error))
+    }
+    /// Population standard deviation of the fold test errors.
+    fn std_test(&self) -> f64 {
+        let n = self.folds.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let m = self.mean_test();
+        (self.folds.iter().map(|r| (r.test_error - m).powi(2)).sum::<f64>() / n as f64).sqrt()
+    }
+}
+
+fn mean_of(it: impl Iterator<Item = f64>) -> f64 {
+    let v: Vec<f64> = it.collect();
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -287,6 +337,8 @@ fn main() {
     let mut null_runs = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
+    let mut cv_mode: Option<data::CvMode> = None;
+    let mut cv_k = 5usize;
 
     let mut i = 0;
     macro_rules! val {
@@ -339,6 +391,17 @@ fn main() {
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
             "--eval-expr" => eval_expr = Some(val!()),
+            "--cv" => {
+                let v = val!();
+                match data::CvMode::parse(&v) {
+                    Ok(m) => cv_mode = Some(m),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--cv-k" => cv_k = val!().parse().unwrap_or(5).max(2),
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
             "--no-dedup" => cfg.dedup = false,
@@ -813,6 +876,49 @@ fn main() {
     // Null baselines: the trivial models a real fit must beat (issue #23).
     let baselines = diagnostics::Baselines::fit(&prepared.train, &fold_samples, cfg.metric);
 
+    // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
+    // search on each fold's own training rows, and score the model it returns on
+    // the held-out block. Each fold is normalised on its training rows alone.
+    let cv: Option<CvReport> = cv_mode.map(|mode| {
+        let folds = match data::cv_folds(&table, &vars, &target, mode, cv_k, gap, cfg.seed) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let mut fold_rows = Vec::new();
+        for f in &folds {
+            let out = search::run(&cfg, &f.train, &f.test);
+            // Pick by the engine's own criterion (lowest training error), then
+            // score on rows that fold's search never saw.
+            let best = out
+                .archive
+                .sorted()
+                .into_iter()
+                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal));
+            if let Some(s) = best {
+                let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
+                let den = expr::simplify(&expr::denormalize(
+                    &expr::simplify(&s.tree),
+                    &f.means,
+                    &f.stds,
+                ));
+                fold_rows.push(CvFoldRow {
+                    train_error: s.error,
+                    test_error,
+                    complexity: s.complexity,
+                    expression: expr::to_string(&den, &vars),
+                });
+            }
+        }
+        CvReport {
+            mode: mode.name(),
+            k: cv_k,
+            folds: fold_rows,
+        }
+    });
+
     if top > 0 && rows.len() > top {
         rows.truncate(top);
     }
@@ -987,6 +1093,27 @@ fn main() {
                 baselines.knn.train_error,
                 baselines.knn.test_error
             );
+            if let Some(cv) = &cv {
+                eprintln!(
+                    "# cross-validation ({}, k={}): mean test={:.6} +/- {:.6} | mean train={:.6}",
+                    cv.mode,
+                    cv.k,
+                    cv.mean_test(),
+                    cv.std_test(),
+                    cv.mean_train()
+                );
+                for (i, r) in cv.folds.iter().enumerate() {
+                    eprintln!(
+                        "#   fold {}/{}: train={:.6} test={:.6} cx={}  y = {}",
+                        i + 1,
+                        cv.folds.len(),
+                        r.train_error,
+                        r.test_error,
+                        r.complexity,
+                        r.expression
+                    );
+                }
+            }
         }
         Format::Json => {
             let split_json = format!(
@@ -1070,8 +1197,35 @@ fn main() {
                 ),
                 None => "null".to_string(),
             };
+            let cv_json = match &cv {
+                Some(c) => {
+                    let folds: Vec<String> = c
+                        .folds
+                        .iter()
+                        .map(|r| {
+                            format!(
+                                "{{\"train_error\":{},\"test_error\":{},\"complexity\":{},\"expression\":{}}}",
+                                jnum(r.train_error),
+                                jnum(r.test_error),
+                                r.complexity,
+                                jstr(&r.expression)
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{{\"mode\":{},\"k\":{},\"mean_train_error\":{},\"mean_test_error\":{},\"std_test_error\":{},\"folds\":[{}]}}",
+                        jstr(c.mode),
+                        c.k,
+                        jnum(c.mean_train()),
+                        jnum(c.mean_test()),
+                        jnum(c.std_test()),
+                        folds.join(",")
+                    )
+                }
+                None => "null".to_string(),
+            };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -1086,6 +1240,7 @@ fn main() {
                 null_json,
                 baselines_json,
                 resid_json,
+                cv_json,
                 pareto.join(",")
             );
         }
@@ -1129,6 +1284,16 @@ fn main() {
                 jnum(baselines.knn.train_error),
                 jnum(baselines.knn.test_error)
             );
+            if let Some(cv) = &cv {
+                println!(
+                    "{{\"event\":\"cross_validation\",\"mode\":{},\"k\":{},\"mean_train_error\":{},\"mean_test_error\":{},\"std_test_error\":{}}}",
+                    jstr(cv.mode),
+                    cv.k,
+                    jnum(cv.mean_train()),
+                    jnum(cv.mean_test()),
+                    jnum(cv.std_test())
+                );
+            }
             if let Some(rt) = &best_resid {
                 println!(
                     "{{\"event\":\"residual_tests\",\"n\":{},\"lags\":{},\"ljung_box\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"breusch_pagan\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"skewness\":{},\"kurtosis\":{}}}",
