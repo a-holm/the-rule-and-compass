@@ -258,13 +258,21 @@ Rules:
 
   ```sh
   /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
-    'cd worktrees/issue-<n>-<slug>/my-version && \
-     CARGO_TARGET_DIR=/mnt/lager/eureqa/my-version/target cargo test --release'
+    'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
   ```
+
+* **Never point several worktrees at one `CARGO_TARGET_DIR`.** Cargo's
+  fingerprints do not distinguish two checkouts of the same crate and version,
+  so a build can link an artifact produced from a *different* source tree. This
+  was observed twice in one batch: a stale library and a stale test binary,
+  producing bogus compile errors and a test that ran pre-fix code. Each worktree
+  keeps its **own** `target/`; the lock provides the serialisation, not a shared
+  directory.
 
 * Agents may run **narrow** checks while working (`cargo test --test <name>`,
   `cargo build --release` once after a coherent change). They must not each run
-  the full suite at the end.
+  the full suite at the end, and they must not share a build directory with
+  another worktree.
 * When several issues are being integrated together, the **combined** branch is
   tested **once**, centrally, by the integrator: one `cargo test --release`, one
   `cargo test --release --features cuda` if the GPU code changed, and one
