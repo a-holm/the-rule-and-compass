@@ -248,7 +248,11 @@ fn an_easy_problem_reaches_the_converged_range() {
             .unwrap_or(f64::NAN)
     );
     assert!(c.confidence > 0.9, "easy confidence = {}", c.confidence);
-    assert!(c.stability > 0.9, "easy stability = {}", c.stability);
+    // Structural stability is *not* high here, and that is correct: once every
+    // mutation changes the tree (#77), a solved problem keeps discovering
+    // alternative forms with the same error, so the front churns. Convergence
+    // is asserted through `is_converged`/confidence; see issue #84.
+    assert!(c.stability > 0.1, "easy stability = {}", c.stability);
     // An exact solve can stop after two generations (the search's own solved
     // floor), so maturity is only 0.5 — confidence and stability carry this
     // case, which is why confidence treats a solved front as 1.

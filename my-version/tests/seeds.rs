@@ -241,11 +241,17 @@ fn seeds_enter_every_island() {
 fn a_seed_reaches_a_lower_error_at_the_same_small_budget() {
     let (vars, train, test) = spring();
     let seed: Node = expr::parse("sqrt(m / k)", &vars).expect("parse");
-    // The table below is the measurement quoted in docs/seeds.md. Every seed
-    // runs the identical budget; only `--seed-expr` differs.
+    // Every seed runs the identical budget; only `--seed-expr` differs.
+    //
+    // The budget is deliberately tiny. It was 15 generations when this test was
+    // written, but #77 (mutation now always changes the tree) improved the
+    // unseeded search enough that it sometimes solves this law by generation
+    // 15 — which is a win for the engine and invalidates the comparison. At 3
+    // generations the seed's advantage is unambiguous: it is exact from
+    // generation 1, while a random start has barely begun.
     let mut rows = Vec::new();
     for s in 1..=3u32 {
-        let cfg = config(s, 15);
+        let cfg = config(s, 3);
         let plain = search::run(&cfg, &train, &test);
         let seeded = search::run_seeded(&cfg, &train, &test, &[seed.clone()]);
         let (plain_err, seeded_err) = (best_error(&plain), best_error(&seeded));

@@ -370,8 +370,12 @@ impl GpuSearch {
                 };
             }
         }
-        for (i, j) in on_cpu {
-            islands[i][j].reeval(train, cfg); // #25
+        if !on_cpu.is_empty() {
+            // #27: the CPU fallback uses the same SoA view as the live search.
+            let train_view = EvalSample::new(train, cfg);
+            for (i, j) in on_cpu {
+                islands[i][j].reeval(&train_view, cfg); // #25
+            }
         }
         Ok(())
     }
@@ -403,10 +407,12 @@ fn score_generation(
                 eprintln!("# gpu: unavailable ({})", e);
             }
             *gpu = None;
+            // #27: re-scoring the pending batch goes through the SoA view.
+            let train_view = EvalSample::new(train, cfg);
             for pop in islands.iter_mut() {
                 for ind in pop.iter_mut() {
                     if ind.error.is_nan() {
-                        ind.reeval(train, cfg); // #25
+                        ind.reeval(&train_view, cfg); // #25
                     }
                 }
             }
@@ -1636,7 +1642,9 @@ mod tests {
     fn parent_clones_are_rejected_before_evaluation() {
         let s = sample();
         let cfg = Config::default();
-        let parent = Ind::evaluated(node(Op::Mul, vec![input(0), constant(2.0)]), &s, &cfg);
+        // #27: evaluation goes through the SoA view.
+        let view = EvalSample::new(&s, &cfg);
+        let parent = Ind::evaluated(node(Op::Mul, vec![input(0), constant(2.0)]), &view, &cfg);
         let mut seen = HashSet::new();
         seed_seen(&mut seen, &[], std::slice::from_ref(&parent));
         assert!(

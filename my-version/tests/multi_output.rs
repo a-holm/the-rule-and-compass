@@ -119,8 +119,12 @@ fn shared_shape_recovery_beats_two_independent_runs() {
         shared_error, independent[0], independent[1], independent_mean
     );
 
+    // Both paths can land at the floating-point noise floor (one exactly 0.0,
+    // the other ~1e-31), so an exact `<=` comparison is a coin flip. The claim
+    // is "not measurably worse", which needs an absolute tolerance.
+    const NOISE: f64 = 1e-12;
     assert!(
-        shared_error <= independent_mean,
+        shared_error <= independent_mean + NOISE,
         "shared combined error {shared_error:.9} must not be worse than the mean \
          independent error {independent_mean:.9} (independent: {independent:?})"
     );
