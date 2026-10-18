@@ -14,8 +14,9 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
+use crate::complexity::ComplexityModel;
 use crate::data::Sample;
-use crate::expr::{self, complexity, crossover, eval, mutate, random_tree, Node, Op};
+use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
 use crate::metrics::{score_with_constants, Metric};
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
@@ -26,7 +27,10 @@ pub struct Config {
     pub generations: usize,
     pub islands: usize,
     pub pop: usize,
+    /// Maximum configured complexity (see [`ComplexityModel`]).
     pub max_complexity: usize,
+    /// How a candidate's complexity is measured and ranked on the front.
+    pub complexity_model: ComplexityModel,
     pub metric: Metric,
     pub seed: u32,
     pub ops: Vec<Op>,
@@ -68,6 +72,7 @@ impl Default for Config {
             islands: 1,
             pop: 200,
             max_complexity: 30,
+            complexity_model: ComplexityModel::default(),
             metric: Metric::Absolute,
             seed: 0,
             ops: Op::default_set(),
@@ -88,13 +93,14 @@ impl Default for Config {
 struct Ind {
     tree: Node,
     error: f64,
-    complexity: usize,
+    /// Configured complexity from [`Config::complexity_model`].
+    complexity: f64,
 }
 
 impl Ind {
-    fn evaluated(tree: Node, train: &Sample, metric: Metric) -> Self {
+    fn evaluated(tree: Node, train: &Sample, metric: Metric, model: &ComplexityModel) -> Self {
         let tree = expr::simplify(&tree);
-        let complexity = complexity(&tree);
+        let complexity = model.complexity(&tree);
         let error = eval_error(&tree, train, metric);
         Ind {
             tree,
@@ -103,9 +109,9 @@ impl Ind {
         }
     }
 
-    fn reeval(&mut self, train: &Sample, metric: Metric) {
+    fn reeval(&mut self, train: &Sample, metric: Metric, model: &ComplexityModel) {
         self.tree = expr::simplify(&self.tree);
-        self.complexity = complexity(&self.tree);
+        self.complexity = model.complexity(&self.tree);
         self.error = eval_error(&self.tree, train, metric);
     }
 }
@@ -186,6 +192,7 @@ fn full_data_archive(
     islands: &[Vec<Ind>],
     train: &Sample,
     metric: Metric,
+    model: &ComplexityModel,
 ) -> Archive {
     let trees: Vec<&Node> = archive
         .items
@@ -202,7 +209,8 @@ fn full_data_archive(
         let tree = expr::simplify(tree);
         let error = eval_error(&tree, train, metric);
         out.try_insert(Sol {
-            complexity: complexity(&tree),
+            complexity: expr::complexity(&tree),
+            cost: model.complexity(&tree),
             tree,
             error,
         });
@@ -244,7 +252,7 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample, nvars: usize) {
     for ind in isl.iter_mut() {
         if !ind.error.is_finite() {
-            ind.reeval(train, cfg.metric);
+            ind.reeval(train, cfg.metric, &cfg.complexity_model);
         }
     }
 
@@ -281,7 +289,7 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
         }
 
         let mut tree = expr::simplify(&child);
-        if complexity(&tree) > cfg.max_complexity {
+        if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
             continue;
         }
         if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
@@ -292,8 +300,8 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
             crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
-        let ind = Ind::evaluated(tree, train, cfg.metric);
-        if ind.complexity > cfg.max_complexity {
+        let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model);
+        if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
         next.push(ind);
@@ -306,7 +314,12 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
             crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
-        next.push(Ind::evaluated(tree, train, cfg.metric));
+        next.push(Ind::evaluated(
+            tree,
+            train,
+            cfg.metric,
+            &cfg.complexity_model,
+        ));
     }
 
     *isl = next;
@@ -344,6 +357,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                 random_tree(&mut rng, nvars, &cfg.ops, depth),
                 init_train,
                 cfg.metric,
+                &cfg.complexity_model,
             ));
         }
         islands.push(pop);
@@ -368,7 +382,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
         if gen > 0 && gen_sample.is_some() {
             for pop in islands.iter_mut() {
                 for ind in pop.iter_mut() {
-                    ind.reeval(gen_train, cfg.metric);
+                    ind.reeval(gen_train, cfg.metric, &cfg.complexity_model);
                 }
             }
         }
@@ -393,9 +407,10 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     gen_best = ind.error;
                 }
                 archive.try_insert(Sol {
+                    complexity: expr::complexity(&ind.tree),
+                    cost: ind.complexity,
                     tree: ind.tree.clone(),
                     error: ind.error,
-                    complexity: ind.complexity,
                 });
             }
         }
@@ -453,7 +468,12 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
                         a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
                     }) {
-                        *worst = Ind::evaluated(t.clone(), gen_train, cfg.metric);
+                        *worst = Ind::evaluated(
+                            t.clone(),
+                            gen_train,
+                            cfg.metric,
+                            &cfg.complexity_model,
+                        );
                     }
                 }
             }
@@ -483,7 +503,12 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                         if cfg.fit_iters > 0 {
                             crate::fit::fit(&mut t, &gen_train.x, &gen_train.y, cfg.fit_iters);
                         }
-                        *ind = Ind::evaluated(t, gen_train, cfg.metric);
+                        *ind = Ind::evaluated(
+                            t,
+                            gen_train,
+                            cfg.metric,
+                            &cfg.complexity_model,
+                        );
                     }
                     rngs[ii] = r;
                     stagnant[ii] = 0;
@@ -496,14 +521,21 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
         // Generation fitness was estimated on subsets, so the front is rebuilt
         // from the surviving trees and scored on every training row. From here
         // on the archive and every number derived from it are full-data.
-        archive = full_data_archive(&archive, &islands, train, cfg.metric);
+        archive = full_data_archive(
+            &archive,
+            &islands,
+            train,
+            cfg.metric,
+            &cfg.complexity_model,
+        );
     } else {
         for pop in &islands {
             for ind in pop {
                 archive.try_insert(Sol {
+                    complexity: expr::complexity(&ind.tree),
+                    cost: ind.complexity,
                     tree: ind.tree.clone(),
                     error: ind.error,
-                    complexity: ind.complexity,
                 });
             }
         }

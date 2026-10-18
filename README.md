@@ -89,6 +89,15 @@ non-associative, so write `(a < b) and (b < c)`.
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
 reaches machine precision.
 
+## Choosing what "complexity" means
+
+By default complexity is the node count. `--op-complexity "pow=2,sin=1.5"`,
+`--complexity-weights "var=1,const=3"` and `--depth-weight 0.5` price
+operators, terminals and nesting instead. The configured value is what the
+Pareto front is ranked on, what `--max-complexity` limits, and what every row
+reports; the defaults reproduce the node count exactly. See
+[`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
+
 ## Using it from other programs
 
 `rcsr` is built to be driven by scripts and agents.
@@ -162,6 +171,7 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
+     [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
@@ -409,6 +419,9 @@ list and the recorded results.
   restarts, run in parallel across islands;
 - **ε-dominance** archiving and **lexicographic parsimony pressure**, so the
   front stays small and expressions stay short;
+- **configurable complexity** (`--op-complexity`, `--complexity-weights`,
+  `--depth-weight`): per-operator costs, variable/constant weights and a
+  nesting-depth penalty, with the node-count default preserved exactly;
 - **structural de-duplication** and **convergence/time-budget stopping**, so the
   same expression is never evaluated twice and the search stops when there is
   nothing left to gain;

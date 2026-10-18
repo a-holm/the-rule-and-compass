@@ -6,7 +6,13 @@ use crate::expr::Node;
 pub struct Sol {
     pub tree: Node,
     pub error: f64,
+    /// Structural node count. Retained as a stable, integer measure for
+    /// callers that report tree size (bench and stability summaries).
     pub complexity: usize,
+    /// The configured complexity from
+    /// [`crate::complexity::ComplexityModel`]. This is the value the front is
+    /// ranked and pruned on, and the value the CLI reports.
+    pub cost: f64,
 }
 
 pub struct Archive {
@@ -26,7 +32,7 @@ impl Archive {
     /// count as equal, so a marginally smaller error no longer justifies a much
     /// larger expression. This keeps the front small, well-spread and readable
     /// instead of filling it with numerically-equivalent, bloated variants.
-    fn dominates(a_e: f64, a_c: usize, b_e: f64, b_c: usize) -> bool {
+    fn dominates(a_e: f64, a_c: f64, b_e: f64, b_c: f64) -> bool {
         if a_c > b_c {
             return false;
         }
@@ -43,17 +49,16 @@ impl Archive {
             return;
         }
         for it in &self.items {
-            if Self::dominates(it.error, it.complexity, s.error, s.complexity) {
+            if Self::dominates(it.error, it.cost, s.error, s.cost) {
                 return;
             }
         }
-        self.items.retain(|it| {
-            !Self::dominates(s.error, s.complexity, it.error, it.complexity)
-        });
+        self.items
+            .retain(|it| !Self::dominates(s.error, s.cost, it.error, it.cost));
         if self
             .items
             .iter()
-            .any(|it| it.complexity == s.complexity && (it.error - s.error).abs() < 1e-12)
+            .any(|it| it.cost == s.cost && (it.error - s.error).abs() < 1e-12)
         {
             return;
         }
@@ -66,11 +71,11 @@ impl Archive {
     /// Keep the front readable: one entry per complexity level, then trim.
     fn prune(&mut self) {
         self.items.sort_by(|a, b| {
-            a.complexity
-                .cmp(&b.complexity)
+            a.cost
+                .total_cmp(&b.cost)
                 .then(a.error.partial_cmp(&b.error).unwrap())
         });
-        self.items.dedup_by(|a, b| a.complexity == b.complexity);
+        self.items.dedup_by(|a, b| a.cost == b.cost);
         while self.items.len() > self.cap {
             self.items.remove(self.items.len() / 2);
         }
@@ -79,8 +84,8 @@ impl Archive {
     pub fn sorted(&self) -> Vec<Sol> {
         let mut v = self.items.clone();
         v.sort_by(|a, b| {
-            a.complexity
-                .cmp(&b.complexity)
+            a.cost
+                .total_cmp(&b.cost)
                 .then(a.error.partial_cmp(&b.error).unwrap())
         });
         v
