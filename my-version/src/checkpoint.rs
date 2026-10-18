@@ -30,8 +30,8 @@
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
 //!
 //! Trees are encoded recursively as `op_index val arity child...`, where
-//! `op_index` is the [`Op`] discriminant and `val` is the exact floating-point
-//! value (`{:?}`, or `inf`/`-inf`/`NaN`). `expr::to_string` is deliberately not
+//! `op_index` is [`Op::index`] and `val` is the exact floating-point value
+//! (`{:?}`, or `inf`/`-inf`/`NaN`). `expr::to_string` is deliberately not
 //! used: it rounds constants, which would change the search.
 //!
 //! The loader is strict: an unknown version, a truncated file, a bad operator
@@ -40,7 +40,7 @@
 
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
-use crate::expr::{Node, Op};
+use crate::expr::{AggKind, Node, Op};
 use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
@@ -102,7 +102,8 @@ pub struct Checkpoint {
     pub main_rng: Mt,
 }
 
-/// The operators in discriminant order. The array index is exactly `op as usize`.
+/// The operators in [`Op::index`] order. The array index is exactly
+/// `op.index()`.
 const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Const,
     Op::Input,
@@ -158,6 +159,14 @@ const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Constants,
     Op::Contains,
     Op::ContainsOp,
+    Op::Agg(AggKind::Mean),
+    Op::Agg(AggKind::Std),
+    Op::Agg(AggKind::Median),
+    Op::Agg(AggKind::Iqr),
+    Op::Agg(AggKind::Sum),
+    Op::Agg(AggKind::Min),
+    Op::Agg(AggKind::Max),
+    Op::Agg(AggKind::Count),
 ];
 
 fn op_by_index(i: usize) -> Option<Op> {
@@ -182,7 +191,7 @@ fn write_tree(n: &Node, out: &mut String) {
     let _ = write!(
         out,
         "{} {} {}",
-        n.op as usize,
+        n.op.index(),
         encode_f64(n.val),
         n.kids.len()
     );
@@ -986,7 +995,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     .unwrap();
     writeln!(out, "config metric {}", cfg.metric.name()).unwrap();
     writeln!(out, "config seed {}", cfg.seed).unwrap();
-    let ops: Vec<String> = cfg.ops.iter().map(|op| (*op as usize).to_string()).collect();
+    let ops: Vec<String> = cfg.ops.iter().map(|op| op.index().to_string()).collect();
     writeln!(out, "config ops {}", ops.join(",")).unwrap();
     writeln!(out, "config migration_interval {}", cfg.migration_interval).unwrap();
     writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
@@ -1020,11 +1029,11 @@ mod tests {
 
     #[test]
     fn op_index_table_matches_the_enum_discriminants() {
-        // The text format stores `op as usize`; the decoding table must be in
+        // The text format stores `op.index()`; the decoding table must be in
         // exactly that order. A new or reordered variant fails here rather
         // than silently decoding into a different expression.
         for (i, op) in OP_BY_INDEX.iter().enumerate() {
-            assert_eq!(*op as usize, i, "OP_BY_INDEX is out of order at {}", i);
+            assert_eq!(op.index(), i, "OP_BY_INDEX is out of order at {}", i);
         }
         assert_eq!(OP_BY_INDEX.len(), Op::COUNT);
     }

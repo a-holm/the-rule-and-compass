@@ -81,9 +81,12 @@ minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
 `and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`,
 `require`/`constrain` (a violated constraint makes the candidate infeasible
-rather than merely wrong), and the opt-in meta operators `complexity`,
+rather than merely wrong), the opt-in meta operators `complexity`,
 `variables`, `constants`, `contains` and `contains_op` (see
-[`docs/meta-operators.md`](docs/meta-operators.md)), parentheses, the constants
+[`docs/meta-operators.md`](docs/meta-operators.md)), the opt-in dataset
+aggregates `mean(x1)`, `std(x1)`, `median(x1)`, `iqr(x1)`, `sum(x1)`,
+`amin(x1)`, `amax(x1)` and `count()` (see
+[`docs/aggregation.md`](docs/aggregation.md)), parentheses, the constants
 `pi` and `e`, and variable names from your table (the `x0`, `x1`, … fallback
 also works). Comparisons are non-associative, so write
 `(a < b) and (b < c)`.
@@ -164,6 +167,18 @@ describe the model rather than the data, they are useful for self-describing
 models and structural conditions, not as a source of row-level signal. See
 [`docs/meta-operators.md`](docs/meta-operators.md) for the semantics table and
 the caching rule.
+
+## Dataset aggregates
+
+`mean(x1)`, `std(x1)`, `median(x1)`, `iqr(x1)`, `sum(x1)`, `amin(x1)`,
+`amax(x1)` and `count()` reduce one input column over the training rows. They
+are opt-in (`--ops mean,std,...`), computed once into a small per-column table
+before the search and cached in the node, so per-row evaluation cost does not
+grow. They are dataset facts, not fitted parameters: no constant slot, no
+gradient and no `k_constants`; and the table is built from the training rows
+only, never the test split. See
+[`docs/aggregation.md`](docs/aggregation.md) for the semantics table, the cache
+and leakage rules, and a worked recovery example.
 
 ## Save and resume a run
 
@@ -602,11 +617,14 @@ list and the recorded results.
   opt-in `floor ceil round mod min max sign step erf erfc atan2 asinh acosh
   atanh`, the conditional family
   `equal less less_or_equal greater greater_or_equal and or xor not require
-  between constrain`, and the meta operators
-  `complexity variables constants contains contains_op` selected with `--ops`
+  between constrain`, the meta operators
+  `complexity variables constants contains contains_op` and the dataset
+  aggregates `mean std median iqr sum amin amax count` selected with `--ops`
   (all with domain guards; the meta operators describe a subexpression's shape
   and are evaluated once per candidate, not per row — see
-  [`docs/meta-operators.md`](docs/meta-operators.md));
+  [`docs/meta-operators.md`](docs/meta-operators.md); the aggregates are
+  training-column statistics cached once per search — see
+  [`docs/aggregation.md`](docs/aggregation.md));
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
@@ -676,6 +694,7 @@ docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/meta-operators.md        structural meta operators and their cache rule
+docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract

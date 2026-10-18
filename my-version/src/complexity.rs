@@ -22,7 +22,7 @@ use crate::expr::{Node, Op};
 /// A per-operator, per-terminal, depth-weighted complexity model.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ComplexityModel {
-    /// Cost of each operator node, indexed by `Op as usize`. Terminals
+    /// Cost of each operator node, indexed by [`Op::index`]. Terminals
     /// (`Const`, `Input`) are ignored here; they use the weights below.
     op_costs: Vec<f64>,
     var_weight: f64,
@@ -50,7 +50,7 @@ impl ComplexityModel {
     /// Cost of one operator node. An operator outside the table (which cannot
     /// happen for the current [`Op`] set) falls back to the default of `1`.
     pub fn op_cost(&self, op: Op) -> f64 {
-        self.op_costs.get(op as usize).copied().unwrap_or(1.0)
+        self.op_costs.get(op.index()).copied().unwrap_or(1.0)
     }
 
     pub fn var_weight(&self) -> f64 {
@@ -66,7 +66,7 @@ impl ComplexityModel {
     }
 
     pub fn set_op_cost(&mut self, op: Op, cost: f64) {
-        if let Some(slot) = self.op_costs.get_mut(op as usize) {
+        if let Some(slot) = self.op_costs.get_mut(op.index()) {
             *slot = cost;
         }
     }
@@ -236,9 +236,12 @@ mod tests {
 
     #[test]
     fn op_count_covers_every_variant() {
-        // `Op::COUNT` indexes a table by discriminant; a new variant at the end
-        // must bump it. `Op::ContainsOp` is the last variant today.
-        assert_eq!(Op::ContainsOp as usize + 1, Op::COUNT);
+        // `Op::COUNT` indexes a table by [`Op::index`]; a new variant at the
+        // end must bump it. `Op::Agg(Count)` is the last variant today.
+        assert_eq!(
+            Op::Agg(crate::expr::AggKind::Count).index() + 1,
+            Op::COUNT
+        );
     }
 
     #[test]
