@@ -289,6 +289,12 @@ float rc_eval(void *ctx, float *out)
        output lives in managed memory, so a plain memcpy (page migration) is the
        download; there is no explicit device-to-host copy. */
     cudaEventSynchronize(c->t1);
+    /* A launch or execution error must be visible to the caller: the search
+       turns it into a CPU fallback instead of trusting a stale output buffer.
+       A negative time is the error marker; the benchmark treats it the same. */
+    if (cudaGetLastError() != cudaSuccess) {
+        return -1.0f;
+    }
     rc_download(out, c->d_out, sizeof(float) * (size_t)c->nprog);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);

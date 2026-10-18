@@ -331,7 +331,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
+     [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--format text|json|ndjson] [--progress]
@@ -342,7 +342,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
-are kept and can be used for splitting. A numeric cell may be missing (empty,
+are kept and can be used for splitting. Blank lines and `#` comment lines are
+ignored. A data row with a different number of fields from the header is
+refused with an input error (exit 3) naming the 1-based line and both counts;
+`--skip-malformed` drops such rows instead and reports how many it skipped.
+A numeric cell may be missing (empty,
 `NA`, `NaN` or `null`, case-insensitively); `--fill` chooses whether those rows
 are dropped or filled, and the default leaves them untouched.
 
@@ -420,6 +424,7 @@ run:
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
 | `--weight col` | per-row weight column (finite, `>= 0`, at least one positive); a weight of 2 means "this row twice" |
+| `--skip-malformed` | drop rows whose field count differs from the header and report the count (default: refuse the file with exit 3) |
 
 ```sh
 # Robust preparation: fill gaps with the training median, drop extreme

@@ -144,29 +144,103 @@ fn a_zero_weight_row_has_no_influence_on_fit_error_or_constants() {
     let y = vec![1.0, 3.0, 5.0, 7.0];
     let w = vec![1.0, 1.0, 0.0, 1.0];
 
-    // Change the zero-weight target wildly.
-    let mut y_wild = y.clone();
-    y_wild[2] = 1.0e9;
-
     let mut clean = line();
-    let mut wild = line();
     fit::fit_weighted(&mut clean, &x, &y, &w, 40);
-    fit::fit_weighted(&mut wild, &x, &y_wild, &w, 40);
 
-    assert_eq!(constants(&clean), constants(&wild));
-
-    let sample_clean = Sample::weighted(x.clone(), y, w.clone());
-    let sample_wild = Sample::weighted(x.clone(), y_wild, w.clone());
+    let sample_clean = Sample::weighted(x.clone(), y.clone(), w.clone());
     let e_clean = search::eval_error(&clean, &sample_clean, Metric::Absolute);
-    let e_wild = search::eval_error(&wild, &sample_wild, Metric::Absolute);
-    assert_eq!(e_clean, e_wild, "a zero-weight row moved the error");
-
     let c_clean = fit::constant_errors_weighted(&clean, &x, &sample_clean.y, &w)
         .expect("two constants and three positive-weight rows");
-    let c_wild =
-        fit::constant_errors_weighted(&wild, &x, &sample_wild.y, &w).expect("same information");
-    assert_eq!(c_clean.values, c_wild.values);
     assert_eq!(c_clean.dof, 3 - 2);
+
+    // A large finite value, then the two non-finite values that used to slip
+    // through the scorer's finiteness guard before the weights were read.
+    for wild in [1.0e9, f64::INFINITY, f64::NAN] {
+        let mut y_wild = y.clone();
+        y_wild[2] = wild;
+
+        let mut wild_tree = line();
+        fit::fit_weighted(&mut wild_tree, &x, &y_wild, &w, 40);
+        assert_eq!(constants(&clean), constants(&wild_tree), "target {wild}");
+
+        let sample_wild = Sample::weighted(x.clone(), y_wild, w.clone());
+        let e_wild = search::eval_error(&wild_tree, &sample_wild, Metric::Absolute);
+        assert_eq!(
+            e_clean, e_wild,
+            "a zero-weight target of {wild} moved the error"
+        );
+
+        let c_wild = fit::constant_errors_weighted(&wild_tree, &x, &sample_wild.y, &w)
+            .expect("same information");
+        assert_eq!(c_clean.values, c_wild.values, "target {wild}");
+        assert_eq!(c_wild.dof, 3 - 2);
+    }
+}
+
+/// A masked row is exactly a deleted row, even when the model's prediction or
+/// the target there is undefined (`+inf` or `NaN`). This is the scorer-side
+/// counterpart of `fit.rs` skipping `w == 0`.
+#[test]
+fn a_zero_weight_row_is_invisible_to_every_weighted_metric() {
+    let kept_pred = [1.0, 2.0];
+    let kept_y = [1.0, 2.5];
+    let w = [0.0, 1.0, 1.0];
+
+    for bad in [f64::INFINITY, f64::NAN] {
+        let cases = [
+            ([bad, 1.0, 2.0], [9.0, 1.0, 2.5], "prediction"),
+            ([1.0, 1.0, 2.0], [bad, 1.0, 2.5], "target"),
+        ];
+        for (pred, y, what) in cases {
+            for name in metrics::weighted_metric_names() {
+                let m = Metric::parse(name);
+                assert_eq!(
+                    score_weighted(&pred, &y, &w, m, 0).to_bits(),
+                    score(&kept_pred, &kept_y, m).to_bits(),
+                    "{name}: a masked {what} of {bad} changed the score"
+                );
+            }
+        }
+    }
+}
+
+/// The same non-finite prediction on a row that counts must still reject the
+/// candidate; only the zero weight can hide it.
+#[test]
+fn a_non_finite_prediction_on_a_positive_weight_row_is_infeasible() {
+    let y = [1.0, 2.5, 4.0];
+    let w = [0.0, 1.0, 1.0];
+
+    for bad in [f64::INFINITY, f64::NAN] {
+        let pred = [0.5, bad, 4.0];
+        for name in metrics::weighted_metric_names() {
+            let m = Metric::parse(name);
+            assert_eq!(
+                score_weighted(&pred, &y, &w, m, 0),
+                f64::INFINITY,
+                "{name}: a positive-weight prediction of {bad} must be infeasible"
+            );
+        }
+    }
+}
+
+/// The fitter already skips the row; pin the equivalence so the two paths
+/// cannot drift.
+#[test]
+fn a_zero_weight_row_is_invisible_to_the_fit_as_a_deleted_row() {
+    let x = rows(&[0.0, 1.0, 2.0]);
+    let y = [f64::INFINITY, 1.0, 2.5];
+    let w = [0.0, 1.0, 1.0];
+
+    let kept_x = rows(&[1.0, 2.0]);
+    let kept_y = [1.0, 2.5];
+
+    let mut masked = line();
+    let mut kept = line();
+    fit::fit_weighted(&mut masked, &x, &y, &w, 40);
+    fit::fit(&mut kept, &kept_x, &kept_y, 40);
+
+    assert_eq!(constants(&masked), constants(&kept));
 }
 
 // ---------------------------------------------------------------------------

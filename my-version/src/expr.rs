@@ -1478,6 +1478,168 @@ fn perturb(rng: &mut Mt, v: f64) -> f64 {
     }
 }
 
+/// A perturbed constant that is guaranteed to change its bits.
+fn perturb_changed(rng: &mut Mt, v: f64) -> f64 {
+    for _ in 0..4 {
+        let w = perturb(rng, v);
+        if w.to_bits() != v.to_bits() {
+            return w;
+        }
+    }
+    // Four draws can all round back to `v`; take a fresh value instead.
+    let w = round_sig(rng.range(-2.0, 2.0));
+    if w.to_bits() != v.to_bits() {
+        w
+    } else {
+        round_sig(w + 1.0)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EditKind {
+    Point,
+    Terminal,
+    Subtree,
+}
+
+/// Whether a point change can actually change this node: it must be an
+/// operator and `ops` must offer another operator of the same arity.
+fn point_changeable(t: &Node, nvars: usize, ops: &[Op]) -> bool {
+    let ar = t.op.arity();
+    ar > 0
+        && ops.iter().any(|&o| {
+            block_arity_of(o) == ar && o != t.op && !(o.is_agg() && nvars == 0)
+        })
+}
+
+/// Whether a terminal edit can change this node. A univariate input has no
+/// other column to move to, so it is handled by a point edit instead.
+fn terminal_changeable(t: &Node, nvars: usize) -> bool {
+    t.op == Op::Const || (t.op == Op::Input && nvars > 1)
+}
+
+/// Pre-order positions of the nodes `kind` can edit, in one pass. `mutate_with`
+/// therefore still costs O(nodes), like [`nth_mut`].
+fn mutation_sites(n: &Node, kind: EditKind, nvars: usize, ops: &[Op]) -> Vec<usize> {
+    fn walk(
+        n: &Node,
+        kind: EditKind,
+        nvars: usize,
+        ops: &[Op],
+        i: &mut usize,
+        out: &mut Vec<usize>,
+    ) {
+        let editable = match kind {
+            EditKind::Point => point_changeable(n, nvars, ops),
+            EditKind::Terminal => terminal_changeable(n, nvars),
+            EditKind::Subtree => true,
+        };
+        if editable {
+            out.push(*i);
+        }
+        *i += 1;
+        for k in &n.kids {
+            walk(k, kind, nvars, ops, i, out);
+        }
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    walk(n, kind, nvars, ops, &mut i, &mut out);
+    out
+}
+
+/// Point-change an operator to a different operator of the same arity.
+fn change_operator(
+    t: &mut Node,
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    aggs: Option<&AggTable>,
+) {
+    let ar = t.op.arity();
+    let cands: Vec<Op> = ops
+        .iter()
+        .copied()
+        .filter(|o| block_arity_of(*o) == ar && *o != t.op)
+        .filter(|o| !(o.is_agg() && nvars == 0))
+        .collect();
+    if cands.is_empty() {
+        return;
+    }
+    let new_op = cands[rng.usize_below(cands.len())];
+    if let Op::Agg(kind) = new_op {
+        // An aggregate's single child is its column, never an arbitrary
+        // expression.
+        let column = rng.usize_below(nvars);
+        t.op = new_op;
+        t.kids = vec![input(column)];
+        t.val = aggs
+            .map(|a| a.get(kind, column))
+            .unwrap_or(f64::NAN);
+        t.block = None;
+    } else {
+        t.op = new_op;
+        // `val` belongs to the old operator; meta operators get a fresh
+        // structural value in the refresh below.
+        t.val = 0.0;
+        // #10: a custom operator carries its block definition.
+        t.block = t.op.custom_slot().and_then(block_for_slot).map(Box::new);
+        t.kids.truncate(t.op.arity());
+        while t.kids.len() < t.op.arity() {
+            t.kids.push(constant(1.0));
+        }
+    }
+}
+
+/// Perturb a constant, or move an input to a different column. Both paths
+/// change the node whenever they are called; [`terminal_changeable`] only
+/// offers sites where that is possible.
+fn change_terminal(t: &mut Node, rng: &mut Mt, nvars: usize) {
+    if t.op == Op::Const {
+        t.val = perturb_changed(rng, t.val);
+    } else if t.op == Op::Input && nvars > 1 {
+        let cur = t.val as usize;
+        let mut column = rng.usize_below(nvars - 1);
+        if column >= cur {
+            column += 1;
+        }
+        t.val = column as f64;
+    }
+}
+
+/// A leaf that differs structurally from `t`.
+fn different_leaf(t: &Node) -> Node {
+    if t.op == Op::Const && t.val == 0.0 {
+        constant(1.0)
+    } else {
+        constant(0.0)
+    }
+}
+
+/// Replace `t` with a random subtree; retry rather than return the same shape.
+fn replace_subtree(
+    t: &mut Node,
+    rng: &mut Mt,
+    nvars: usize,
+    ops: &[Op],
+    aggs: Option<&AggTable>,
+) {
+    let old = structural_hash(t);
+    let depth = if rng.next_f64() < 0.625 { 2 } else { 1 };
+    for _ in 0..8 {
+        let cand = if ops.is_empty() {
+            different_leaf(t)
+        } else {
+            random_tree_with(rng, nvars, ops, depth, aggs)
+        };
+        if structural_hash(&cand) != old {
+            *t = cand;
+            return;
+        }
+    }
+    *t = different_leaf(t);
+}
+
 /// In-place mutation: point-change an operator, perturb a constant, or replace a
 /// subtree (grow / shrink). [I]
 pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
@@ -1487,6 +1649,12 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
 /// [`mutate`] with the training-sample aggregate table, so a node switched to
 /// [`Op::Agg`] (or an input column changed under one) gets the right cached
 /// value immediately.
+///
+/// The edit kind is drawn first — point change (25 %), terminal perturb (35 %)
+/// or subtree replacement (40 %) — and only nodes that kind can actually edit
+/// are candidate sites, so a mutation never returns the parent unchanged. If a
+/// kind has no compatible site, a fixed fallback order is used; subtree
+/// replacement covers every non-empty tree.
 pub fn mutate_with(
     n: &mut Node,
     rng: &mut Mt,
@@ -1498,73 +1666,46 @@ pub fn mutate_with(
     if total == 0 {
         return;
     }
-    let i = rng.usize_below(total);
+    let before = structural_hash(n);
     let r = rng.next_f64();
-    if r < 0.25 {
-        if let Some(t) = nth_mut(n, i) {
-            let ar = t.op.arity();
-            if ar == 0 {
-                // flip terminal kind, or re-value. An aggregate leaf (`count`)
-                // keeps its cached dataset value.
-                if t.op == Op::Const {
-                    t.val = perturb(rng, t.val);
-                } else if t.op == Op::Input && nvars > 0 {
-                    t.val = rng.usize_below(nvars) as f64;
-                }
-                // A zero-arity custom block is a named constant: leave it.
-            } else {
-                let cands: Vec<Op> = ops
-                    .iter()
-                    .copied()
-                    .filter(|o| block_arity_of(*o) == ar && *o != t.op)
-                    .filter(|o| !(o.is_agg() && nvars == 0))
-                    .collect();
-                if !cands.is_empty() {
-                    let new_op = cands[rng.usize_below(cands.len())];
-                    if let Op::Agg(kind) = new_op {
-                        // An aggregate's single child is its column, never an
-                        // arbitrary expression.
-                        let column = rng.usize_below(nvars);
-                        t.op = new_op;
-                        t.kids = vec![input(column)];
-                        t.val = aggs
-                            .map(|a| a.get(kind, column))
-                            .unwrap_or(f64::NAN);
-                        t.block = None;
-                    } else {
-                        t.op = new_op;
-                        // `val` belongs to the old operator; meta operators get
-                        // a fresh structural value in the refresh below.
-                        t.val = 0.0;
-                        // #10: a custom operator carries its block definition.
-                        t.block = t.op.custom_slot().and_then(block_for_slot).map(Box::new);
-                        t.kids.truncate(t.op.arity());
-                        while t.kids.len() < t.op.arity() {
-                            t.kids.push(constant(1.0));
-                        }
-                    }
-                }
-            }
-        }
+    let drawn = if r < 0.25 {
+        EditKind::Point
     } else if r < 0.6 {
+        EditKind::Terminal
+    } else {
+        EditKind::Subtree
+    };
+    let order: &[EditKind] = match drawn {
+        EditKind::Point => &[EditKind::Point, EditKind::Subtree],
+        EditKind::Terminal => &[EditKind::Terminal, EditKind::Point, EditKind::Subtree],
+        EditKind::Subtree => &[EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+    };
+    for &kind in order {
+        let sites = mutation_sites(n, kind, nvars, ops);
+        if sites.is_empty() {
+            continue;
+        }
+        let i = sites[rng.usize_below(sites.len())];
         if let Some(t) = nth_mut(n, i) {
-            if t.op == Op::Const {
-                t.val = perturb(rng, t.val);
-            } else if t.op == Op::Input && nvars > 0 {
-                t.val = rng.usize_below(nvars) as f64;
+            match kind {
+                EditKind::Point => change_operator(t, rng, nvars, ops, aggs),
+                EditKind::Terminal => change_terminal(t, rng, nvars),
+                EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs),
             }
         }
-    } else {
-        let depth = if r < 0.85 { 2 } else { 1 };
-        if let Some(t) = nth_mut(n, i) {
-            *t = random_tree_with(rng, nvars, ops, depth, aggs);
+        // A structural edit anywhere below a meta node invalidates its cache.
+        refresh_meta(n);
+        // The same is true for an aggregate when the edit changed its column
+        // (or replaced the node with a malformed child).
+        refresh_aggregates(n, aggs);
+        if structural_hash(n) != before {
+            return;
         }
     }
-    // A structural edit anywhere below a meta node invalidates its cache.
-    refresh_meta(n);
-    // The same is true for an aggregate when the edit changed its column (or
-    // replaced the node with a malformed child).
-    refresh_aggregates(n, aggs);
+    // Every kind fell through, or an aggregate repair undid the edit. Replacing
+    // the root with a different constant cannot be a no-op.
+    let leaf = different_leaf(n);
+    *n = leaf;
 }
 
 /// Replace a random subtree of `a` with a random subtree of `b` (crossover). [I]
@@ -2209,5 +2350,48 @@ mod tests {
         assert!(bind_aggregates(&mut not_a_column, &t).is_err());
         let mut out_of_range = node(Op::Agg(AggKind::Mean), vec![input(3)]);
         assert!(bind_aggregates(&mut out_of_range, &t).is_err());
+    }
+
+    /// Each fixture is mutated with many seeds; a mutation that returns the
+    /// parent unchanged (a wasted fit and score) is a failure. The table mixes
+    /// hand-built univariate trees with generated univariate and bivariate
+    /// ones, so both the terminal-edit fall-through and the ordinary paths are
+    /// covered.
+    #[test]
+    fn mutation_always_changes_generated_trees() {
+        let ops = Op::default_set();
+        let mut fixtures: Vec<(usize, Node)> = vec![
+            (
+                1,
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Sin, vec![input(0)]),
+                        node(Op::Cos, vec![input(0)]),
+                    ],
+                ),
+            ),
+            (1, input(0)),
+            (1, constant(0.5)),
+        ];
+        for tseed in 0..6u32 {
+            for &nvars in &[1usize, 2] {
+                let mut rng = crate::rng::Mt::new(0x7700 ^ (tseed << 4) ^ nvars as u32);
+                fixtures.push((nvars, random_tree_with(&mut rng, nvars, &ops, 3, None)));
+            }
+        }
+        for (k, (nvars, tree)) in fixtures.iter().enumerate() {
+            for mseed in 0..128u32 {
+                let mut rng = crate::rng::Mt::new(mseed.wrapping_mul(0x9E37_79B9) ^ k as u32);
+                let mut t = tree.clone();
+                let before = structural_hash(&t);
+                mutate_with(&mut t, &mut rng, *nvars, &ops, None);
+                assert_ne!(
+                    structural_hash(&t),
+                    before,
+                    "fixture {k} (nvars {nvars}), mutation seed {mseed}: no change"
+                );
+            }
+        }
     }
 }

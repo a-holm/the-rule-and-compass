@@ -491,6 +491,31 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 /// document. That is a change from a *different* feature, not from units, so it
 /// is masked here: the assertion still fails on any other difference, and the
 /// separate checks below still forbid a `constant_dimensions` field.
+fn mask_batch_fields(s: &str) -> String {
+    // #72 adds `rows_skipped_malformed` to the always-present preparation
+    // object. Mask it here for the same reason as `convergence`: it is a
+    // deliberate change from another feature, not from units.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("\"rows_skipped_malformed\":") {
+        out.push_str(&rest[..at]);
+        let mut i = at + "\"rows_skipped_malformed\":".len();
+        let b = rest.as_bytes();
+        while i < b.len() && (b[i] as char).is_ascii_digit() {
+            i += 1;
+        }
+        if rest[i..].starts_with(',') {
+            i += 1;
+        } else if out.ends_with(',') {
+            // The field was last in its object: drop the separator before it.
+            out.pop();
+        }
+        rest = &rest[i..];
+    }
+    out.push_str(rest);
+    mask_convergence(&out)
+}
+
 fn mask_convergence(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -586,7 +611,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_convergence(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
+    let got = mask_batch_fields(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_json.stdout"));
     assert_eq!(got, want, "--json changed");
     assert!(
@@ -599,7 +624,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_convergence(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
+    let got = mask_batch_fields(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_ndjson.stdout"));
     assert_eq!(got, want, "--ndjson changed");
     assert!(

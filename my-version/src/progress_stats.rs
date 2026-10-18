@@ -89,9 +89,16 @@ impl Convergence {
         }
     }
 
-    /// True when the headline number has reached [`CONVERGED_THRESHOLD`].
+    /// True when the headline number has reached [`CONVERGED_THRESHOLD`], or
+    /// when the problem is **solved** (`confidence == 1.0`, i.e. the best error
+    /// is below `SOLVED_ERROR`).
+    ///
+    /// Solving is a sufficient condition because a converged search can keep
+    /// discovering alternative forms with the same error (`x`, `exp(c*x)`,
+    /// `c + c*x`), which lowers the structural `stability` without meaning the
+    /// search is still moving. Issue #84.
     pub fn is_converged(&self) -> bool {
-        self.percent_converged >= CONVERGED_THRESHOLD
+        self.percent_converged >= CONVERGED_THRESHOLD || self.confidence >= 1.0
     }
 
     /// The JSON object shared by `--json`, `--ndjson` and `--progress`.

@@ -1,14 +1,18 @@
-//! Structure-of-arrays (SoA) CPU evaluator — **stage 1 of 2**.
+//! Structure-of-arrays (SoA) CPU evaluator — **stages 1 and 2 of #27**.
 //!
 //! The scalar walk in [`crate::expr::eval`] visits a pointer-based tree once per
 //! data row. This module instead *compiles* a tree once into a flat postfix
 //! instruction stream and evaluates that stream over whole columns: the data
 //! layout is `cols[var][row]`, and every instruction produces one value per row.
 //!
-//! Nothing in the search calls this module yet. Stage 1 exists to make the
-//! evaluator measurable and testable on its own; stage 2 (a separate commit
-//! after [#8]) wires it into `search::eval_error` with a fallback to the scalar
-//! walk. Until then the search still uses [`crate::expr::eval`].
+//! Stage 2 wires this evaluator into the search's fitness path
+//! (`search::eval_error`). [`crate::search::Config::simd`] selects it per run;
+//! `--no-simd` forces the historical scalar walk. A tree that
+//! [`compile`] cannot handle — an aggregate, meta, constraint, block or
+//! comparison operator — transparently falls back to [`crate::expr::eval`], so
+//! the two paths always agree.
+//!
+//! [`columns`] transposes row-major inputs to the `cols[var][row]` layout.
 //!
 //! # API
 //!
@@ -440,6 +444,24 @@ fn eval_scalar_rows(p: &Program, cols: &[Vec<f64>], start: usize, end: usize, ou
         debug_assert_eq!(sp, 1);
         out[row] = stack[0];
     }
+}
+
+/// Transpose row-major inputs (`x[row][var]`) to the SoA layout
+/// (`cols[var][row]`) this module evaluates over.
+///
+/// The number of columns is the longest input row, so a row that is shorter
+/// than the rest reads as `NaN` exactly as [`crate::expr::eval`]'s `Input` rule
+/// does. This is the one O(rows × vars) pass the caller pays per sample, not
+/// per row of the tree walk.
+pub fn columns(x: &[Vec<f64>]) -> Vec<Vec<f64>> {
+    let nvars = x.iter().map(Vec::len).max().unwrap_or(0);
+    let mut cols = vec![vec![f64::NAN; x.len()]; nvars];
+    for (row, values) in x.iter().enumerate() {
+        for (var, &v) in values.iter().enumerate() {
+            cols[var][row] = v;
+        }
+    }
+    cols
 }
 
 /// Evaluate `program` over `rows` rows with the portable scalar SoA loop.

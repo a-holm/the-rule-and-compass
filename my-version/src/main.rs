@@ -107,6 +107,10 @@ INPUT:
                              Example: --dtype flag=boolean,symbol=categorical
   --max-levels <N>           maximum distinct values in a categorical column
                              before one-hot expansion (default 16)
+  --skip-malformed           drop data rows whose field count differs from the
+                             header and report how many were skipped. Default:
+                             refuse the file with an input error (exit 3) naming
+                             the 1-based line and both field counts
   --test-frac <f>            held-out fraction (default 0.25)
 
 ROW WEIGHTS:
@@ -285,11 +289,17 @@ SEARCH:
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
+  --no-simd                  force the scalar tree walk instead of the
+                             SoA/AVX evaluator (same results, slower; an
+                             escape hatch for debugging and A/B runs)
   --predictor-samples <N>    score and fit candidates on N training rows per
                              generation (default: all rows; N >= 2). The archive
                              and every reported error are always full-data
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
+  --no-gpu                   force CPU evaluation even when built with
+                             --features cuda (alias --cpu). Reported errors are
+                             always CPU f64; the GPU only guides the search
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -524,6 +534,11 @@ fn main() {
     }
 
     let mut cfg = search::Config::default();
+    // #26: the CLI uses a device automatically in a CUDA build. The library
+    // default stays CPU so embedders and tests are unaffected; --no-gpu / --cpu
+    // turns the CLI path off again.
+    cfg.gpu = true;
+    let mut force_cpu = false;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -557,6 +572,7 @@ fn main() {
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
     let mut fill = data::FillMethod::None;
+    let mut skip_malformed = false;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
     let mut center = data::Center::Mean;
@@ -608,6 +624,7 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--data" => data_path = Some(val!()),
+            "--skip-malformed" => skip_malformed = true,
             "--target" => target = Some(val!()),
             "--vars" => {
                 vars = val!()
@@ -798,6 +815,15 @@ fn main() {
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #27: evaluator path only; deliberately not a saved search
+            // setting, because both paths produce identical errors.
+            "--no-simd" => cfg.simd = false,
+            // #26: force the CPU evaluator even in a CUDA build. A
+            // performance choice, not saved search state.
+            "--no-gpu" | "--cpu" => {
+                cfg.gpu = false;
+                force_cpu = true;
             }
             "--predictor-samples" => {
                 let v = val!();
@@ -1232,9 +1258,9 @@ fn main() {
             eprintln!("error reading stdin: {}", e);
             std::process::exit(EXIT_INPUT);
         }
-        data::parse_table(&buf)
+        data::parse_table_with(&buf, skip_malformed)
     } else {
-        data::read_table(&data_path)
+        data::read_table_with(&data_path, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -1948,6 +1974,14 @@ fn main() {
         } else {
             eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
         }
+    }
+
+    // #26: the forced-CPU note belongs to the CLI, not to the library, so it is
+    // printed here once and only when the flag was written. `--quiet` promises
+    // an empty stderr for machine-readable output, so it suppresses every note.
+    cfg.gpu_notes = !quiet;
+    if force_cpu && !quiet {
+        eprintln!("# gpu: off (--no-gpu)");
     }
 
     // #15: multi-output reporting has its own shape (one entry per target);
@@ -4640,6 +4674,7 @@ mod tests {
             "--center",
             "--scale",
             "--filter",
+            "--skip-malformed",
         ] {
             assert!(usage().contains(flag), "usage() is missing {flag}");
             assert!(schema::json().contains(flag), "schema::json() is missing {flag}");
