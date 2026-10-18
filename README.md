@@ -79,15 +79,70 @@ A syntax error names the offending column:
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
-`and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`, and
+`and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`,
 `require`/`constrain` (a violated constraint makes the candidate infeasible
-rather than merely wrong), parentheses, the constants `pi` and `e`, and variable
-names from your table (the `x0`, `x1`, … fallback also works). Comparisons are
-non-associative, so write `(a < b) and (b < c)`.
+rather than merely wrong), and the opt-in meta operators `complexity`,
+`variables`, `constants`, `contains` and `contains_op` (see
+[`docs/meta-operators.md`](docs/meta-operators.md)), parentheses, the constants
+`pi` and `e`, and variable names from your table (the `x0`, `x1`, … fallback
+also works). Comparisons are non-associative, so write
+`(a < b) and (b < c)`.
 
 `cargo test` runs the unit tests and the end-to-end recovery tests
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
 reaches machine precision.
+
+## GUI
+
+A local web front end ships as a second binary. It is a self-contained
+single-page app embedded in the executable, so it has no CDN, framework or
+network dependency at runtime and binds loopback only:
+
+```sh
+cd my-version
+cargo build --release
+./target/release/rcsr_serve --port 8080 --open
+# open http://127.0.0.1:8080
+```
+
+The tour: paste or open a CSV/TSV and give each column a role (input, target,
+time, group, weight, ignore); the Search pane is generated from `rcsr schema`,
+with metric, generations, population, islands, complexity cap and seed pinned
+and every other flag under **More options**; Run streams NDJSON and grows a
+log-scale Pareto chart as solutions arrive; Solutions lists the front and the
+selected row shows the formula, constants ± standard errors, train/test error,
+AICc/BIC, Durbin–Watson, residual checks, baselines, bootstrap and
+cross-validation; **Copy as CLI** emits the exact `rcsr` invocation (including a
+here-document when the table was pasted). The page consumes only the JSON
+contract: `/api/schema`, `/api/example` and the `/api/run` event stream. See
+[`docs/gui.md`](docs/gui.md) for the as-built notes, the event shapes and what
+is deferred.
+### Start from what you already know
+
+`--seed-expr` (repeatable) and `--seed-file` inject prior solutions into the
+search instead of making it start from random trees alone:
+
+```sh
+cargo run --release -- --data examples/sine.csv --target y --vars x \
+  --seed-expr "sin(x)" --generations 15
+```
+
+and reports the processed seed on stderr:
+
+```text
+# seeded: complexity=... train_error=0.000000  y = sin(x)
+```
+
+Each seed is parsed in original units, simplified, its constants fitted on the
+training sample, then inserted into the archive and the initial population of
+**every** island. A seed is an elite: it is kept even above `--max-complexity`,
+which limits generated offspring, and the run prints a `# note:` when that
+happens. `--seed-file` takes one expression per line, skipping `#` comments and
+blank lines; both flags can be combined. A malformed seed is a usage error
+(exit 2) naming the flag, text and parser column; an unreadable file is an
+input error (exit 3). `--json` reports a `seeds` array and `--ndjson` a `seed`
+event per seed. See [`docs/seeds.md`](docs/seeds.md) for the processing order,
+the elite rule, the file format and the measured before/after numbers.
 
 ## Choosing what "complexity" means
 
@@ -97,6 +152,18 @@ operators, terminals and nesting instead. The configured value is what the
 Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
+
+## Meta operators
+
+`complexity(e)`, `variables(e)`, `constants(e)`, `contains(e)` and
+`contains_op(e)` describe the shape of a subexpression: node count, distinct
+input variables, constant leaves, and whether an input or an operator is
+present. They are opt-in (`--ops complexity,...`), return one value per model
+rather than one per row, and are cached when the node is built. Because they
+describe the model rather than the data, they are useful for self-describing
+models and structural conditions, not as a source of row-level signal. See
+[`docs/meta-operators.md`](docs/meta-operators.md) for the semantics table and
+the caching rule.
 
 ## Save and resume a run
 
@@ -193,6 +260,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
+     [--seed-expr expr] [--seed-file path]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
@@ -532,9 +600,13 @@ list and the recorded results.
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
   sin cos tan sinh cosh tanh logistic gauss square cube`, `if`), plus the
   opt-in `floor ceil round mod min max sign step erf erfc atan2 asinh acosh
-  atanh` and the conditional family
+  atanh`, the conditional family
   `equal less less_or_equal greater greater_or_equal and or xor not require
-  between constrain` selected with `--ops` (all with domain guards);
+  between constrain`, and the meta operators
+  `complexity variables constants contains contains_op` selected with `--ops`
+  (all with domain guards; the meta operators describe a subexpression's shape
+  and are evaluated once per candidate, not per row — see
+  [`docs/meta-operators.md`](docs/meta-operators.md));
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
@@ -558,6 +630,9 @@ list and the recorded results.
 - **subsampled fitness** (`--predictor-samples N`): each generation scores and
   fits candidates on `N` training rows drawn without replacement, while the
   archive and every reported error are re-scored on the full training set;
+- **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
+  simplified, fitted and inserted into the archive and every island before
+  generation 1; a seed is an elite, kept even above `--max-complexity`;
 - **split modes for time series and panel data** (`random`, `temporal`, `group`,
   `temporal-group`, `auto`) with an embargo gap, per-block test errors and
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
@@ -600,6 +675,8 @@ docs/data-preparation.md      missing values, outliers, smoothing, scaling and f
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/overfitting.md           avoiding and detecting overfitting, with references
+docs/meta-operators.md        structural meta operators and their cache rule
+docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan

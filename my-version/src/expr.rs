@@ -60,13 +60,31 @@ pub enum Op {
     Require,
     Between,
     Constrain,
+    // Meta operators: they describe the *shape* of their argument, not a row.
+    // Opt-in only, and their value is cached when the node is built.
+    Complexity,
+    Variables,
+    Constants,
+    Contains,
+    ContainsOp,
 }
 
 impl Op {
     /// Number of operator variants. `Op` is a fieldless enum, so a discriminant
     /// is a valid dense index into a cost table; `complexity::ComplexityModel`
     /// relies on this. A new variant must bump the count (a test guards it).
-    pub const COUNT: usize = 49;
+    pub const COUNT: usize = 54;
+
+    /// Whether this operator inspects its argument's structure instead of
+    /// evaluating it per row. Meta nodes cache their result in [`Node::val`];
+    /// see [`meta`].
+    pub fn is_meta(self) -> bool {
+        use Op::*;
+        matches!(
+            self,
+            Complexity | Variables | Constants | Contains | ContainsOp
+        )
+    }
 
     pub fn arity(self) -> usize {
         use Op::*;
@@ -74,7 +92,8 @@ impl Op {
             Const | Input => 0,
             Neg | Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step
             | Gauss | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Asinh | Acosh
-            | Atanh | Not | Require | Constrain => 1,
+            | Atanh | Not | Require | Constrain | Complexity | Variables | Constants | Contains
+            | ContainsOp => 1,
             Add | Sub | Mul | Div | Pow | Mod | Min | Max | Atan2 | Equal | Less | LessOrEqual
             | Greater | GreaterOrEqual | And | Or | Xor => 2,
             If | Between => 3,
@@ -133,16 +152,22 @@ impl Op {
             Require => "require",
             Between => "between",
             Constrain => "constrain",
+            Complexity => "complexity",
+            Variables => "variables",
+            Constants => "constants",
+            Contains => "contains",
+            ContainsOp => "contains_op",
         }
     }
 
     /// Default operator set for a search (all non-terminal primitives).
     ///
-    /// The extended primitives (`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`) and
+    /// The extended primitives (`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`),
     /// the conditional family (comparisons, `and`/`or`/`xor`/`not`, and the
-    /// constraints `require`/`between`/`constrain`) are not in the default set:
-    /// they are opt-in through `--ops` so that broad searches are not diluted by
-    /// them. Use [`Op::names`] for the full vocabulary.
+    /// constraints `require`/`between`/`constrain`) and the meta operators
+    /// (`Complexity`…`ContainsOp`) are not in the default set: they are opt-in
+    /// through `--ops` so that broad searches are not diluted by them. Use
+    /// [`Op::names`] for the full vocabulary.
     pub fn default_set() -> Vec<Op> {
         use Op::*;
         vec![
@@ -160,6 +185,7 @@ impl Op {
             "erf", "erfc", "asinh", "acosh", "atanh", "mod", "min", "max", "atan2", "add", "sub",
             "mul", "div", "pow", "if", "equal", "less", "less_or_equal", "greater",
             "greater_or_equal", "and", "or", "xor", "not", "require", "between", "constrain",
+            "complexity", "variables", "constants", "contains", "contains_op",
         ]
     }
 
@@ -174,6 +200,27 @@ impl Op {
             Op::default_set()
         } else {
             out
+        }
+    }
+
+    /// Strict variant of [`Op::parse_list`] for command-line parsing: every
+    /// non-empty token must name an operator, otherwise the whole list is
+    /// rejected. An empty list still means the default set.
+    pub fn parse_list_checked(s: &str) -> Result<Vec<Op>, String> {
+        let mut out = Vec::new();
+        for tok in s.split(|c| c == ',' || c == ' ') {
+            if tok.is_empty() {
+                continue;
+            }
+            match Op::from_name(tok) {
+                Some(op) => out.push(op),
+                None => return Err(format!("unknown operator '{tok}'")),
+            }
+        }
+        if out.is_empty() {
+            Ok(Op::default_set())
+        } else {
+            Ok(out)
         }
     }
 
@@ -233,6 +280,11 @@ impl Op {
             "require" => Require,
             "between" => Between,
             "constrain" => Constrain,
+            "complexity" => Complexity,
+            "variables" => Variables,
+            "constants" => Constants,
+            "contains" => Contains,
+            "contains_op" => ContainsOp,
             _ => return None,
         })
     }
@@ -241,7 +293,9 @@ impl Op {
 #[derive(Clone, Debug)]
 pub struct Node {
     pub op: Op,
-    /// `Const` -> value; `Input` -> variable index.
+    /// `Const` -> value; `Input` -> variable index; a meta operator -> its
+    /// cached structural value. Build meta nodes through [`meta`] or
+    /// [`node`], never from a literal.
     pub val: f64,
     pub kids: Vec<Node>,
 }
@@ -262,11 +316,100 @@ pub fn input(i: usize) -> Node {
     }
 }
 
+/// Build an operator node. For a meta operator the structural value is
+/// computed immediately and stored in `val`, so every constructor path (the
+/// parser, `random_tree`, mutation and crossover) produces a consistent node.
 pub fn node(op: Op, kids: Vec<Node>) -> Node {
-    Node {
-        op,
-        val: 0.0,
-        kids,
+    let val = if op.is_meta() {
+        debug_assert_eq!(kids.len(), 1, "meta operators are unary");
+        meta_value(op, &kids[0])
+    } else {
+        0.0
+    };
+    Node { op, val, kids }
+}
+
+/// Build a meta operator node from `kind` and its one child.
+///
+/// The returned node caches the structural value in [`Node::val`];
+/// [`eval`] returns that cache without walking the child. The result depends
+/// only on the child's shape (and, for `variables`, its input indices), never
+/// on a data row.
+pub fn meta(kind: Op, child: Node) -> Node {
+    debug_assert!(kind.is_meta(), "{kind:?} is not a meta operator");
+    node(kind, vec![child])
+}
+
+/// The cached structural value of `kind` applied to `child`.
+///
+/// | operator | value |
+/// |---|---|
+/// | `complexity(e)` | node count of `e` |
+/// | `variables(e)` | number of distinct input variables in `e` |
+/// | `constants(e)` | number of constant leaves in `e` |
+/// | `contains(e)` | `1` if `e` contains an input variable, else `0` |
+/// | `contains_op(e)` | `1` if `e` contains an operator node, else `0` |
+fn meta_value(kind: Op, child: &Node) -> f64 {
+    use Op::*;
+    match kind {
+        Complexity => complexity(child) as f64,
+        Variables => distinct_variables(child) as f64,
+        Constants => count_constants(child) as f64,
+        Contains => {
+            if has_input(child) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        ContainsOp => {
+            if has_operator(child) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// Number of distinct input indices appearing in `n`.
+fn distinct_variables(n: &Node) -> usize {
+    fn collect(n: &Node, out: &mut Vec<usize>) {
+        if n.op == Op::Input {
+            out.push(n.val as usize);
+        }
+        for k in &n.kids {
+            collect(k, out);
+        }
+    }
+    let mut out = Vec::new();
+    collect(n, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out.len()
+}
+
+fn has_input(n: &Node) -> bool {
+    n.op == Op::Input || n.kids.iter().any(has_input)
+}
+
+/// Whether the tree contains any operator node. A bare leaf (`Const` or
+/// `Input`) has none; any other root is an operator.
+fn has_operator(n: &Node) -> bool {
+    n.op != Op::Const && n.op != Op::Input
+}
+
+/// Recompute the cached value of every meta node bottom-up. Used after a
+/// structural edit (mutation, crossover) that may have changed a meta
+/// argument's shape.
+fn refresh_meta(n: &mut Node) {
+    for k in &mut n.kids {
+        refresh_meta(k);
+    }
+    if n.op.is_meta() {
+        debug_assert_eq!(n.kids.len(), 1, "meta operators are unary");
+        n.val = meta_value(n.op, &n.kids[0]);
     }
 }
 
@@ -407,6 +550,18 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
             } else {
                 f64::NAN
             }
+        }
+        // Meta operators describe the tree, not the row: return the value
+        // cached when the node was built. Never walk the child here; `eval` is
+        // the innermost loop of the engine.
+        Complexity | Variables | Constants | Contains | ContainsOp => {
+            debug_assert_eq!(n.kids.len(), 1, "meta operators are unary");
+            debug_assert!(
+                n.val.is_finite(),
+                "meta operator {op:?} has a non-finite cached value",
+                op = n.op
+            );
+            n.val
         }
         Neg => -eval(&n.kids[0], x),
         Exp => {
@@ -653,6 +808,10 @@ pub fn complexity(n: &Node) -> usize {
 
 /// Number of constant nodes: the free parameters the fitter tunes. Used by the
 /// information criteria in [`crate::diagnostics`].
+///
+/// A meta operator is never counted itself. Constant leaves *inside* its
+/// argument are real leaves and stay counted, but the zero gradient through a
+/// meta node means the fitter cannot identify them from the model output.
 pub fn count_constants(n: &Node) -> usize {
     let me = if n.op == Op::Const { 1 } else { 0 };
     me + n.kids.iter().map(count_constants).sum::<usize>()
@@ -751,6 +910,9 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
                     .collect();
                 if !cands.is_empty() {
                     t.op = cands[rng.usize_below(cands.len())];
+                    // `val` belongs to the old operator; meta operators get a
+                    // fresh structural value in the refresh below.
+                    t.val = 0.0;
                     t.kids.truncate(t.op.arity());
                     while t.kids.len() < t.op.arity() {
                         t.kids.push(constant(1.0));
@@ -772,6 +934,8 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
             *t = random_tree(rng, nvars, ops, depth);
         }
     }
+    // A structural edit anywhere below a meta node invalidates its cache.
+    refresh_meta(n);
 }
 
 /// Replace a random subtree of `a` with a random subtree of `b` (crossover). [I]
@@ -788,6 +952,9 @@ pub fn crossover(a: &mut Node, b: &Node, rng: &mut Mt) {
             *t = sub;
         }
     }
+    // The graft may sit below a meta node, whose cached value must follow the
+    // new shape.
+    refresh_meta(a);
 }
 
 // ---------------- display & simplification ----------------
@@ -965,13 +1132,18 @@ fn add_const(k: f64, u: Node) -> Node {
 /// `x/1.1839` becomes `0.8447*x`, and `(x/c1)/c2` becomes `1.6894*x`.
 pub fn simplify(n: &Node) -> Node {
     use Op::*;
-    let m = Node {
+    let mut m = Node {
         op: n.op,
         val: n.val,
         kids: n.kids.iter().map(simplify).collect(),
     };
     if m.op == Const || m.op == Input {
         return m;
+    }
+    // Simplifying the argument can change its shape, so a meta node must take
+    // a fresh structural value before the fold check below reads it.
+    if m.op.is_meta() {
+        m.val = meta_value(m.op, &m.kids[0]);
     }
     // Fold any operator whose children are all constants.
     if m.kids.iter().all(|k| k.op == Const) {
@@ -1058,7 +1230,19 @@ pub fn simplify(n: &Node) -> Node {
 
 /// Rewrite `Input(i)` from normalised space back to original units:
 /// `X_i -> (x_i - mean_i) / std_i`. [C: Expression_denormalizer]
+///
+/// A meta operator is carried over verbatim: its value describes the *searched*
+/// (normalised) tree, and rewriting the inputs inside its argument would change
+/// that argument's node count and make the printed value disagree with the
+/// model. `to_string` still prints input names for the untouched argument.
 pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
+    if n.op.is_meta() {
+        return Node {
+            op: n.op,
+            val: n.val,
+            kids: n.kids.clone(),
+        };
+    }
     match n.op {
         Op::Input => {
             let i = n.val as usize;
@@ -1074,5 +1258,149 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
             val: n.val,
             kids: n.kids.iter().map(|k| denormalize(k, means, stds)).collect(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Evaluate a meta operator on `child`; `row` must not matter.
+    fn meta_val(kind: Op, child: Node, row: &[f64]) -> f64 {
+        eval(&meta(kind, child), row)
+    }
+
+    /// Assert all five operators against one known shape, on two very different
+    /// rows (the value is structural, so both must agree at every operator).
+    fn check_shape(child: Node, want: (f64, f64, f64, f64, f64)) {
+        let rows = [[0.0, 0.0], [3.5, -7.25]];
+        for row in rows {
+            assert_eq!(meta_val(Op::Complexity, child.clone(), &row), want.0);
+            assert_eq!(meta_val(Op::Variables, child.clone(), &row), want.1);
+            assert_eq!(meta_val(Op::Constants, child.clone(), &row), want.2);
+            assert_eq!(meta_val(Op::Contains, child.clone(), &row), want.3);
+            assert_eq!(meta_val(Op::ContainsOp, child.clone(), &row), want.4);
+        }
+    }
+
+    #[test]
+    fn meta_operators_describe_the_shape_of_hand_built_trees() {
+        // (complexity, variables, constants, contains, contains_op)
+
+        // A bare input.
+        check_shape(input(0), (1.0, 1.0, 0.0, 1.0, 0.0));
+        // A bare constant.
+        check_shape(constant(7.5), (1.0, 0.0, 1.0, 0.0, 0.0));
+
+        // x1 * x1: the same variable twice still counts once.
+        let repeated = node(Op::Mul, vec![input(0), input(0)]);
+        check_shape(repeated, (3.0, 1.0, 0.0, 1.0, 1.0));
+
+        // x1 * x2 + 3.5
+        let mixed = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![input(0), input(1)]),
+                constant(3.5),
+            ],
+        );
+        check_shape(mixed, (5.0, 2.0, 1.0, 1.0, 1.0));
+
+        // sin(x1) ^ 2
+        let nested = node(
+            Op::Pow,
+            vec![node(Op::Sin, vec![input(0)]), constant(2.0)],
+        );
+        check_shape(nested, (4.0, 1.0, 1.0, 1.0, 1.0));
+
+        // A meta operator nested in another meta operator is counted like any
+        // other operator node: complexity(complexity(x1*x2)) = 5 nodes (both
+        // meta nodes, the product and its two inputs).
+        let inner = meta(Op::Complexity, node(Op::Mul, vec![input(0), input(1)]));
+        let nested_meta = meta(Op::Complexity, inner);
+        check_shape(nested_meta, (5.0, 2.0, 0.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn meta_values_are_cached_at_construction() {
+        for kind in [
+            Op::Complexity,
+            Op::Variables,
+            Op::Constants,
+            Op::Contains,
+            Op::ContainsOp,
+        ] {
+            let n = meta(kind, node(Op::Mul, vec![input(0), input(1)]));
+            assert_eq!(n.val, eval(&n, &[1.0, 2.0]), "{kind:?}");
+            assert!(n.val.is_finite());
+        }
+
+        // `eval` must return the cache without walking the child. Corrupting
+        // the child's shape behind the constructor's back would change a fresh
+        // walk (3 nodes); the cached value must stay at 1.
+        let mut n = meta(Op::Complexity, input(0));
+        n.kids[0] = node(Op::Add, vec![input(0), input(1)]);
+        assert_eq!(eval(&n, &[]), 1.0);
+    }
+
+    #[test]
+    fn simplify_refreshes_a_meta_value_after_the_argument_shrinks() {
+        let tree = meta(
+            Op::Complexity,
+            node(Op::Add, vec![input(0), constant(0.0)]),
+        );
+        assert_eq!(tree.val, 3.0);
+        let simple = simplify(&tree);
+        assert_eq!(simple.op, Op::Complexity);
+        // `x + 0` becomes `x`, so the argument is one node.
+        assert_eq!(simple.val, 1.0);
+        assert_eq!(eval(&simple, &[4.0]), 1.0);
+    }
+
+    #[test]
+    fn constants_operator_counts_leaves_in_the_argument_only() {
+        // constants(3) is 1, not 2: the meta node itself is not a constant.
+        let n = meta(Op::Constants, constant(3.0));
+        assert_eq!(n.val, 1.0);
+        assert_eq!(count_constants(&n), 1);
+        assert_eq!(count_constants(&meta(Op::Complexity, input(0))), 0);
+    }
+
+    #[test]
+    fn denormalize_leaves_a_meta_argument_alone() {
+        let tree = meta(Op::Complexity, node(Op::Mul, vec![input(0), constant(2.0)]));
+        let den = denormalize(&tree, &[10.0], &[2.0]);
+        assert_eq!(den.op, Op::Complexity);
+        assert_eq!(den.val, 3.0, "the searched structural value is preserved");
+        assert_eq!(den.kids[0].op, Op::Mul);
+        assert_eq!(den.kids[0].kids[0].op, Op::Input);
+    }
+
+    #[test]
+    fn meta_operators_are_unary_opt_in_and_named() {
+        for op in [
+            Op::Complexity,
+            Op::Variables,
+            Op::Constants,
+            Op::Contains,
+            Op::ContainsOp,
+        ] {
+            assert_eq!(op.arity(), 1, "{op:?}");
+            assert!(op.is_meta(), "{op:?}");
+            assert!(!Op::default_set().contains(&op), "{op:?} must be opt-in");
+            assert!(Op::names().contains(&op.symbol()), "{op:?}");
+            assert_eq!(Op::from_name(op.symbol()), Some(op));
+        }
+        // The five are the only meta operators.
+        let count = Op::names()
+            .iter()
+            .filter(|n| Op::from_name(n).unwrap().is_meta())
+            .count();
+        assert_eq!(count, 5);
+        assert_eq!(
+            Op::parse_list_checked("complexity,variables"),
+            Ok(vec![Op::Complexity, Op::Variables])
+        );
+        assert!(Op::parse_list_checked("complexity,nope").is_err());
     }
 }

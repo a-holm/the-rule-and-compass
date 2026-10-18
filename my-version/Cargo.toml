@@ -23,6 +23,11 @@ required-features = ["cuda"]
 name = "rcsr-bench"
 path = "src/bin/rcsr_bench.rs"
 
+[[bin]]
+name = "rcsr_serve"
+path = "src/bin/rcsr_serve.rs"
+required-features = []
+
 [features]
 default = []
 cuda = []

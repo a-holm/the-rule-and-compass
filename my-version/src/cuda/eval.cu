@@ -171,6 +171,44 @@ __global__ void eval_kernel(const float *__restrict__ cols,
 
 extern "C" {
 
+/* Allocation strategy.
+ *
+ * With RCSR_UNIFIED every buffer lives in managed (unified) memory: the host
+ * writes directly into it, the device migrates pages on demand, and there is no
+ * explicit host<->device copy. That is what lets a GB10 with 128 GB of coherent
+ * memory hold a dataset larger than the device's VRAM.
+ *
+ * Without the macro the dataset is copied once into plain device memory, which
+ * is faster on a discrete GPU with its own VRAM (the RTX 3060 default).
+ */
+#ifdef RCSR_UNIFIED
+static int rc_alloc(void **p, size_t bytes)
+{
+    return (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+}
+static void rc_upload(void *dst, const void *src, size_t bytes)
+{
+    memcpy(dst, src, bytes);
+}
+static void rc_download(void *dst, const void *src, size_t bytes)
+{
+    memcpy(dst, src, bytes);
+}
+#else
+static int rc_alloc(void **p, size_t bytes)
+{
+    return (int)cudaMalloc(p, bytes);
+}
+static void rc_upload(void *dst, const void *src, size_t bytes)
+{
+    cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+}
+static void rc_download(void *dst, const void *src, size_t bytes)
+{
+    cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+}
+#endif
+
 void *rc_create(const float *cols, int n, int v, const float *y)
 {
     RcCtx *c = (RcCtx *)calloc(1, sizeof(RcCtx));
@@ -179,10 +217,17 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     c->v = v;
     c->nprog = 0;
     c->out_cap = 0;
-    cudaMalloc((void **)&c->d_cols, sizeof(float) * (size_t)n * (size_t)v);
-    cudaMalloc((void **)&c->d_y, sizeof(float) * (size_t)n);
-    cudaMemcpy(c->d_cols, cols, sizeof(float) * (size_t)n * (size_t)v, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->d_y, y, sizeof(float) * (size_t)n, cudaMemcpyHostToDevice);
+    size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
+    size_t y_bytes = sizeof(float) * (size_t)n;
+    if (rc_alloc((void **)&c->d_cols, col_bytes) != 0 ||
+        rc_alloc((void **)&c->d_y, y_bytes) != 0) {
+        if (c->d_cols) cudaFree(c->d_cols);
+        if (c->d_y) cudaFree(c->d_y);
+        free(c);
+        return 0;
+    }
+    rc_upload(c->d_cols, cols, col_bytes);
+    rc_upload(c->d_y, y, y_bytes);
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
     return (void *)c;
@@ -210,13 +255,18 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
     if (c->d_off) { cudaFree(c->d_off); c->d_off = 0; }
     c->nprog = nprog;
     size_t prog_bytes = sizeof(unsigned int) * (size_t)off[nprog];
-    cudaMalloc((void **)&c->d_prog, prog_bytes);
-    cudaMalloc((void **)&c->d_off, sizeof(unsigned int) * (size_t)(nprog + 1));
-    cudaMemcpy(c->d_prog, prog, prog_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(c->d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1), cudaMemcpyHostToDevice);
+    rc_alloc((void **)&c->d_prog, prog_bytes);
+    rc_alloc((void **)&c->d_off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    if (!c->d_prog || !c->d_off) return -1;
+    rc_upload(c->d_prog, prog, prog_bytes);
+    rc_upload(c->d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
     if (c->out_cap < nprog) {
         if (c->d_out) cudaFree(c->d_out);
-        cudaMalloc((void **)&c->d_out, sizeof(float) * (size_t)nprog);
+        if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
+            c->d_out = 0;
+            c->out_cap = 0;
+            return -1;
+        }
         c->out_cap = nprog;
     }
     return 0;
@@ -235,11 +285,25 @@ float rc_eval(void *ctx, float *out)
     eval_kernel<<<c->nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
                                        c->d_prog, c->d_off, c->d_out);
     cudaEventRecord(c->t1, 0);
-    cudaMemcpy(out, c->d_out, sizeof(float) * (size_t)c->nprog, cudaMemcpyDeviceToHost);
+    /* Wait for the kernel before reading the result. In the unified build the
+       output lives in managed memory, so a plain memcpy (page migration) is the
+       download; there is no explicit device-to-host copy. */
     cudaEventSynchronize(c->t1);
+    rc_download(out, c->d_out, sizeof(float) * (size_t)c->nprog);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
+}
+
+/* 1 when the context uses managed (unified) memory, 0 for plain device memory.
+   The benchmark prints this so a recorded run states which path it measured. */
+int rc_unified(void)
+{
+#ifdef RCSR_UNIFIED
+    return 1;
+#else
+    return 0;
+#endif
 }
 
 const char *rc_device_name(void)

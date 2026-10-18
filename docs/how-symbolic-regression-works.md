@@ -56,6 +56,12 @@ closed interval. Because a non-finite prediction makes the error metric infinite
 (§5), a violated constraint marks the candidate **infeasible** and removes it
 from the search rather than scoring it as a merely large error.
 
+The **meta operators** — `complexity`, `variables`, `constants`, `contains`,
+`contains_op` — are also opt-in. They inspect the shape of their argument
+instead of evaluating it, so they return the same value on every row and are
+cached when the node is built. They describe the model, not the data; see
+[`meta-operators.md`](meta-operators.md).
+
 ## 4. Complexity
 
 The second objective is a size measure of the expression. The simplest choice is

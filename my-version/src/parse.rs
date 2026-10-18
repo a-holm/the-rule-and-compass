@@ -19,9 +19,12 @@
 //! unary   := ('-' | '+' | 'not') unary | power
 //! power   := primary ('^' unary)?          // right associative
 //! primary := number
+//!          | meta '(' expr ')'              // structural meta operator
 //!          | name '(' expr (',' expr)* ')' // function call, any arity
 //!          | name                          // variable
 //!          | '(' expr ')'
+//! meta    := 'complexity' | 'variables' | 'constants' | 'contains'
+//!          | 'contains_op'
 //! ```
 //!
 //! Operator precedence, loosest to tightest:
@@ -45,6 +48,11 @@
 //!   `min`, `if`, …). A name followed by `(` is a call; a bare name is a
 //!   variable, so a variable called `sin` still works on its own.
 //! * `pi` and `e` are constants when they are not declared variables.
+//! * The meta operators `complexity`, `variables`, `constants`, `contains` and
+//!   `contains_op` are unary calls. They inspect the shape of their argument
+//!   rather than evaluating it, so the call is built through
+//!   [`crate::expr::node`], which caches the structural value on the node.
+//!   `complexity(x * x)` prints back and re-parses to the same tree.
 //!
 //! # Errors
 //!
@@ -587,6 +595,12 @@ mod tests {
             "constrain(x)",
             "x * greater(x, 0)",
             "if((x > 0) and (y > 0), x, 0)",
+            "complexity(x * x)",
+            "variables(x * y)",
+            "constants(x + 1)",
+            "contains(sin(x))",
+            "contains_op(x)",
+            "complexity(complexity(x))",
         ];
         let v = vars();
         for s in corpus {

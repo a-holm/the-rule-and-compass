@@ -11,9 +11,11 @@ pub mod expr;
 pub mod fit;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod gui;
 pub mod metrics;
 pub mod pareto;
 pub mod parse;
 pub mod rng;
+pub mod schema;
 pub mod search;
 pub mod stability;

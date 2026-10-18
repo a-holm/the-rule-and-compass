@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>rule-and-compass — rcsr GUI</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="mark" aria-hidden="true">R</span>
+      <div>
+        <h1>rule-and-compass</h1>
+        <p class="tagline">symbolic regression over the JSON contract</p>
+      </div>
+    </div>
+    <div class="topmeta">
+      <span id="engineVersion" class="pill">schema …</span>
+      <span id="statusBadge" class="pill ready">ready</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar" aria-label="Data">
+      <section class="card">
+        <div class="cardhead">
+          <h2>Data</h2>
+          <span id="rowCount" class="muted">no table</span>
+        </div>
+        <p class="hint">Paste a CSV/TSV table or open a local file. Everything stays on this machine.</p>
+        <label class="filelabel">
+          <span>Open file</span>
+          <input id="fileInput" type="file" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values,text/plain">
+        </label>
+        <textarea id="dataText" spellcheck="false" placeholder="x,y&#10;0,1&#10;1,3&#10;2,5"></textarea>
+        <div class="buttonrow">
+          <button id="exampleBtn" type="button" class="secondary">Load example</button>
+          <button id="parseBtn" type="button" class="secondary">Parse table</button>
+        </div>
+        <p id="dataMessage" class="message" role="status"></p>
+        <div class="tablewrap">
+          <table id="grid" class="grid" aria-label="Column roles"></table>
+        </div>
+        <p class="hint small">Roles build <code>--vars</code>, <code>--target</code>, <code>--time</code>, <code>--group-by</code> and <code>--weight</code>. Numeric columns default to input; the last numeric column defaults to target.</p>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <nav class="tabs" role="tablist" aria-label="Workspace">
+        <button type="button" role="tab" data-tab="data" aria-selected="true">Data</button>
+        <button type="button" role="tab" data-tab="search">Search</button>
+        <button type="button" role="tab" data-tab="run">Run</button>
+        <button type="button" role="tab" data-tab="solutions">Solutions</button>
+      </nav>
+
+      <section id="tab-data" class="tabpanel active" role="tabpanel">
+        <div class="card">
+          <h2>Table preview</h2>
+          <p class="hint">The grid below is the parsed local table. Change a column role on the left; the search form reads the result.</p>
+          <div class="tablewrap large">
+            <table id="preview" class="preview" aria-label="Data preview"></table>
+          </div>
+          <p id="previewNote" class="muted small"></p>
+        </div>
+      </section>
+
+      <section id="tab-search" class="tabpanel" role="tabpanel" hidden>
+        <div class="card">
+          <div class="cardhead">
+            <h2>Search</h2>
+            <span class="muted small">generated from <code>rcsr schema</code></span>
+          </div>
+          <p class="hint">The pinned controls cover the usual run. Everything the schema declares lives under <strong>More options</strong>; a new flag appears there without GUI code.</p>
+          <div id="pinned" class="formgrid" aria-label="Common search options"></div>
+          <details id="moreOptions" class="more">
+            <summary>More options</summary>
+            <div id="more" class="formgrid"></div>
+          </details>
+          <p id="formMessage" class="message" role="status"></p>
+          <div class="clibar">
+            <code id="cliBar">rcsr --data - --target …</code>
+            <div class="buttonrow">
+              <button id="copyCli" type="button" class="secondary">Copy as CLI</button>
+              <button id="runBtn" type="button" class="primary">Run search</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="tab-run" class="tabpanel" role="tabpanel" hidden>
+        <div class="card">
+          <div class="cardhead">
+            <h2>Live Pareto front</h2>
+            <span id="progressLine" class="muted">waiting for a run</span>
+          </div>
+          <div class="chartwrap">
+            <canvas id="pareto" width="960" height="360" aria-label="Pareto front: training and test error against complexity"></canvas>
+          </div>
+          <p class="hint small">Solid points are training error, hollow points are test error. Horizontal rules mark the mean, linear and k-nearest-neighbour baselines once they arrive. Vertical axis is logarithmic.</p>
+          <div id="runLog" class="log" aria-live="polite"></div>
+        </div>
+      </section>
+
+      <section id="tab-solutions" class="tabpanel" role="tabpanel" hidden>
+        <div class="solutions">
+          <div class="card grow">
+            <div class="cardhead">
+              <h2>Pareto front</h2>
+              <span id="solutionCount" class="muted">no solutions</span>
+            </div>
+            <div class="tablewrap large">
+              <table id="solutionsTable" class="preview" aria-label="Pareto solutions">
+                <thead>
+                  <tr><th>rank</th><th>complexity</th><th>k</th><th>train</th><th>test</th><th>AICc</th><th>expression</th></tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+          <aside class="card detail" aria-label="Selected solution">
+            <h2>Selected law</h2>
+            <pre id="detailFormula" class="formula">Run a search, then pick a row.</pre>
+            <div id="detailBody" class="detailbody"></div>
+          </aside>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <span id="footerStatus">ready</span>
+    <span id="footerMeta"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
