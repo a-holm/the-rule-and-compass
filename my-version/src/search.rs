@@ -72,6 +72,14 @@ pub struct Config {
     // path choice, not a search setting: both paths must produce the same
     // errors, so it is ignored by `search_setting_differences`.
     pub simd: bool,
+    /// #26: allow the batched GPU evaluator when the crate is built with
+    /// `--features cuda` and a device is present. This is a performance choice
+    /// only: it is not part of the checkpoint settings, and the numbers the
+    /// user reads are always re-scored on the CPU in `f64`.
+    pub gpu: bool,
+    /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
+    /// `--quiet`, which promises an empty stderr for machine-readable output.
+    pub gpu_notes: bool,
 }
 
 /// A per-generation progress report.
@@ -111,6 +119,11 @@ impl Default for Config {
             require_dimensions: false,
             progress: None,
             simd: true, // #27
+            // #26: the library defaults to the CPU so every existing caller and
+            // test keeps its trajectory; the `rcsr` CLI opts in automatically.
+            // `--no-gpu` turns it off again.
+            gpu: false,
+            gpu_notes: true,
         }
     }
 }
@@ -202,6 +215,28 @@ impl Ind {
         }
     }
 
+    /// #26: prepare an individual for a batched GPU score.
+    ///
+    /// Everything that depends on the CPU (simplification, complexity, the
+    /// dimensional filter) happens here; only the fitness is left `NaN` for
+    /// [`GpuSearch::score`](GpuSearch) to fill in. A candidate rejected by the
+    /// dimensional filter keeps an infinite error, so the batching never
+    /// resurrects it. NaN is the explicit "pending" marker used by the search.
+    fn pending(tree: Node, cfg: &Config) -> Self {
+        let tree = expr::simplify(&tree);
+        let complexity = cfg.complexity_model.complexity(&tree);
+        let error = if cfg.accepts_dimensions(&tree) {
+            f64::NAN
+        } else {
+            f64::INFINITY
+        };
+        Ind {
+            tree,
+            error,
+            complexity,
+        }
+    }
+
     fn reeval(&mut self, train: &EvalSample, cfg: &Config) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
@@ -228,6 +263,185 @@ impl Ind {
             complexity: ind.complexity,
         }
     }
+}
+
+/// #26: the optional batched evaluator used by the search loop.
+///
+/// The dataset is uploaded once per run (the full training sample), and one
+/// [`Population`](crate::gpu::Population) is scored per generation in a single
+/// kernel launch. Constants are still fitted on the CPU *before* the batch: the
+/// GPU only supplies the fitness that selection consumes.
+///
+/// The kernel sums squared errors in `f32`; [`GpuSearch::score`] divides by the
+/// row count so the search sees a mean squared error. For `--metric squared`
+/// that is the configured objective (up to `f32` rounding); for the other
+/// regression metrics it is a monotone ranking proxy. Either way it is only
+/// used to guide the search: the archive and every reported number are rebuilt
+/// on the full training sample with the CPU `f64` evaluator.
+#[cfg(feature = "cuda")]
+struct GpuSearch {
+    ev: crate::gpu::GpuEvaluator,
+    n_rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuSearch {
+    fn new(train: &Sample) -> Result<Self, String> {
+        // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
+        // if no device were present, so the fallback path can be exercised on
+        // a machine that has one.
+        if matches!(
+            std::env::var("RCSR_GPU").as_deref(),
+            Ok("0") | Ok("false") | Ok("off") | Ok("no")
+        ) {
+            return Err("RCSR_GPU=0 (device use disabled)".to_string());
+        }
+        let n_rows = train.len();
+        let n_vars = train.x.first().map(|r| r.len()).unwrap_or(0);
+        if n_rows == 0 || n_vars == 0 {
+            return Err("empty training sample".to_string());
+        }
+        // The kernel wants column-major f32; the sample is row-major f64.
+        let mut cols = vec![0.0f32; n_rows * n_vars];
+        for (r, row) in train.x.iter().enumerate() {
+            for (v, &x) in row.iter().enumerate().take(n_vars) {
+                cols[v * n_rows + r] = x as f32;
+            }
+        }
+        let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
+        match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
+            Some(ev) => Ok(GpuSearch { ev, n_rows }),
+            None => Err(format!(
+                "no usable CUDA device ({})",
+                crate::gpu::GpuEvaluator::device_name()
+            )),
+        }
+    }
+
+    /// Score every pending (`error.is_nan()`) individual in every island in one
+    /// batched call. Candidates the kernel cannot compile (an operator with no
+    /// GPU opcode) are scored on the CPU instead, so they never lose fitness.
+    ///
+    /// Any CUDA failure returns `Err`; the caller switches the backend off and
+    /// re-scores the whole batch on the CPU, so a failed batch can never leave
+    /// a wrong number behind.
+    fn score(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        train: &Sample,
+        cfg: &Config,
+    ) -> Result<(), String> {
+        let pending: Vec<(usize, usize)> = islands
+            .iter()
+            .enumerate()
+            .flat_map(|(i, isl)| {
+                isl.iter()
+                    .enumerate()
+                    .filter(|(_, ind)| ind.error.is_nan())
+                    .map(move |(j, _)| (i, j))
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        let mut pop = crate::gpu::Population::new();
+        let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
+        let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        for &(i, j) in &pending {
+            if pop.add(&islands[i][j].tree) {
+                slots.push((i, j));
+            } else {
+                on_cpu.push((i, j));
+            }
+        }
+
+        if !pop.is_empty() {
+            let (sse, ms) = self.ev.eval_population(&pop);
+            if ms < 0.0 || sse.len() != pop.len() {
+                return Err("CUDA batch evaluation failed".to_string());
+            }
+            let n = self.n_rows as f64;
+            for (&(i, j), &s) in slots.iter().zip(sse.iter()) {
+                islands[i][j].error = if s.is_finite() {
+                    (s as f64) / n
+                } else {
+                    f64::INFINITY
+                };
+            }
+        }
+        for (i, j) in on_cpu {
+            islands[i][j].reeval(train, cfg); // #25
+        }
+        Ok(())
+    }
+}
+
+/// #26: score the pending individuals, falling back to the CPU on any error.
+///
+/// Returns whether the GPU remains usable. On failure the whole pending batch
+/// is re-scored by [`Ind::reeval`], so the search continues with correct `f64`
+/// numbers and a single visible `# gpu: unavailable (...)` note.
+#[cfg(feature = "cuda")]
+fn score_generation(
+    gpu: &mut Option<GpuSearch>,
+    used: &mut bool,
+    islands: &mut [Vec<Ind>],
+    train: &Sample,
+    cfg: &Config,
+) -> bool {
+    let Some(g) = gpu.as_mut() else {
+        return false;
+    };
+    match g.score(islands, train, cfg) {
+        Ok(()) => {
+            *used = true;
+            true
+        }
+        Err(e) => {
+            if cfg.gpu_notes {
+                eprintln!("# gpu: unavailable ({})", e);
+            }
+            *gpu = None;
+            for pop in islands.iter_mut() {
+                for ind in pop.iter_mut() {
+                    if ind.error.is_nan() {
+                        ind.reeval(train, cfg); // #25
+                    }
+                }
+            }
+            false
+        }
+    }
+}
+
+/// #26: whether a run may use the GPU at all.
+///
+/// Restricted to the single-output, unweighted, full-sample regression path:
+/// multi-output and implicit objectives need more than one prediction per row,
+/// and `--predictor-samples` changes the rows every generation, so each of
+/// those keeps the CPU evaluator.
+#[cfg(feature = "cuda")]
+fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    if train.is_multi() {
+        return Some("multi-output objective");
+    }
+    if !train.w.is_empty() {
+        return Some("weighted rows");
+    }
+    if cfg.metric.is_implicit() {
+        return Some("implicit objective");
+    }
+    if cfg.metric.is_classification() {
+        return Some("classification metric");
+    }
+    if cfg.metric.is_parameter_aware() {
+        return Some("parameter-aware metric");
+    }
+    if subsampling_active(cfg, train) {
+        return Some("--predictor-samples changes the rows per generation");
+    }
+    None
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
@@ -499,6 +713,8 @@ fn evolve_island(
     train: &EvalSample, // #27 sample + cached SoA columns
     nvars: usize,
     aggs: &AggTable,
+    // #26: leave the fitness pending when the caller will batch it on the GPU.
+    defer_gpu: bool,
 ) {
     for ind in isl.iter_mut() {
         if !ind.error.is_finite() {
@@ -553,7 +769,14 @@ fn evolve_island(
             fit_constants(&mut tree, cfg, train.sample);
             tree = expr::simplify(&tree);
         }
-        let ind = Ind::evaluated(tree, train, cfg); // #25
+        // #26: with the GPU batch active the fitness is filled in after every
+        // island has been generated; the CPU still owns simplification,
+        // fitting, de-duplication and the complexity/dimension checks.
+        let ind = if defer_gpu {
+            Ind::pending(tree, cfg)
+        } else {
+            Ind::evaluated(tree, train, cfg) // #25
+        };
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
@@ -575,7 +798,12 @@ fn evolve_island(
             fit_constants(&mut tree, cfg, train.sample);
             tree = expr::simplify(&tree);
         }
-        next.push(Ind::evaluated(tree, train, cfg)); // #25
+        // #26: same deferral for the random fill.
+        next.push(if defer_gpu {
+            Ind::pending(tree, cfg)
+        } else {
+            Ind::evaluated(tree, train, cfg) // #25
+        });
     }
 
     *isl = next;
@@ -791,6 +1019,10 @@ fn run_search(
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
+    // #26: a checkpoint written during a GPU run stores the f32 proxy fitness,
+    // so a resumed run must rebuild the reported front on the CPU even when it
+    // is resumed with `--no-gpu`.
+    let resumed = resume.is_some();
     // The aggregates are a property of the training rows, computed once. They
     // are deliberately **not** rebuilt for a generation's row subset and never
     // read the test sample: a subset changes which rows score a candidate, not
@@ -801,6 +1033,53 @@ fn run_search(
     // every island thread (and the initial population below) sees the same
     // definitions; the list is empty unless --function was supplied.
     let blocks = expr::current_blocks();
+
+    // #26: one resident evaluator for the full training sample, used for whole
+    // generations. Constants were already fitted on the CPU; this only chooses
+    // where the tree evaluation runs. A missing feature, a missing device or an
+    // unsupported objective leaves `defer_gpu` false and the CPU path runs.
+    #[cfg(feature = "cuda")]
+    let mut gpu: Option<GpuSearch> = if !cfg.gpu {
+        None
+    } else {
+        match gpu_blocker(cfg, train) {
+            Some(reason) => {
+                if cfg.gpu_notes {
+                    eprintln!("# gpu: off ({})", reason);
+                }
+                None
+            }
+            None => match GpuSearch::new(train) {
+                Ok(g) => {
+                    if cfg.gpu_notes {
+                        eprintln!(
+                            "# gpu: {} (one batch per generation; f32 fitness, reported numbers stay f64)",
+                            crate::gpu::GpuEvaluator::device_name()
+                        );
+                    }
+                    Some(g)
+                }
+                Err(e) => {
+                    if cfg.gpu_notes {
+                        eprintln!("# gpu: unavailable ({})", e);
+                    }
+                    None
+                }
+            },
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    if cfg.gpu && cfg.gpu_notes {
+        eprintln!("# gpu: unavailable (built without --features cuda)");
+    }
+    #[cfg(feature = "cuda")]
+    let mut defer_gpu = gpu.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let defer_gpu = false;
+    #[cfg(feature = "cuda")]
+    let mut gpu_used = false;
+    #[cfg(not(feature = "cuda"))]
+    let gpu_used = false;
 
     let mut rng: Mt;
     let mut archive: Archive;
@@ -894,11 +1173,15 @@ fn run_search(
             let depth = cfg.init_depth.min(1 + isl % 3);
             let mut pop = Vec::with_capacity(cfg.pop);
             for _ in 0..cfg.pop {
-                pop.push(Ind::evaluated(
-                    random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs)),
-                    &init_data,
-                    cfg, // #25
-                ));
+                let tree =
+                    random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs));
+                // #26: generation 0 is a whole generation too; defer it to the
+                // same batch as the first real generation.
+                pop.push(if defer_gpu {
+                    Ind::pending(tree, cfg)
+                } else {
+                    Ind::evaluated(tree, &init_data, cfg) // #25
+                });
             }
             islands.push(pop);
         }
@@ -907,6 +1190,20 @@ fn run_search(
         converged_early = false;
         best_prev = f64::INFINITY;
         no_improve = 0;
+    }
+
+    // #26: a checkpoint from a GPU run carries the f32 proxy, and a run forced
+    // onto the CPU must not select against the wrong objective. Re-scoring the
+    // loaded populations is deterministic, so an ordinary CPU resume keeps the
+    // exact same trajectory.
+    if resumed && !defer_gpu {
+        // #27: re-scoring goes through the same SoA view as the live search.
+        let train_view = EvalSample::new(train, cfg);
+        for pop in islands.iter_mut() {
+            for ind in pop.iter_mut() {
+                ind.reeval(&train_view, cfg); // #25
+            }
+        }
     }
 
     // ---- seeded solutions (issue #16) ---------------------------------
@@ -938,6 +1235,10 @@ fn run_search(
             if k < cfg.pop {
                 let in_pop = if init_sample.is_some() {
                     Ind::evaluated(ind.tree.clone(), &init_data, cfg) // #25
+                } else if defer_gpu {
+                    // #26: the archive keeps the CPU error; the population copy
+                    // is scored with the rest of generation 0.
+                    Ind::pending(ind.tree.clone(), cfg)
                 } else {
                     ind.clone()
                 };
@@ -953,6 +1254,13 @@ fn run_search(
                 error: ind.error,
             });
         }
+    }
+
+    // #26: score generation 0 (and any seed population copies) in one batch
+    // before the first selection step reads an error.
+    #[cfg(feature = "cuda")]
+    {
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg);
     }
 
     // #18: one tracker, updated once per generation from the archive. It holds
@@ -993,7 +1301,7 @@ fn run_search(
                         let blocks = blocks.clone();
                         s.spawn(move || {
                             expr::set_blocks(blocks);
-                            evolve_island(isl, r, cfg, gen_view, nvars, aggs_ref)
+                            evolve_island(isl, r, cfg, &gen_view, nvars, aggs_ref, defer_gpu)
                         })
                     })
                     .collect();
@@ -1001,6 +1309,13 @@ fn run_search(
                     let _ = h.join();
                 }
             });
+
+            // #26: one batched call covers every candidate of the generation.
+            #[cfg(feature = "cuda")]
+            {
+                defer_gpu =
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+            }
 
             // ---- archive + convergence bookkeeping ----------------------
             let mut gen_best = f64::INFINITY;
@@ -1083,7 +1398,12 @@ fn run_search(
                                 .partial_cmp(&b.error)
                                 .unwrap_or(std::cmp::Ordering::Equal)
                         }) {
-                            *worst = Ind::evaluated(t.clone(), &gen_data, cfg); // #25
+                            // #26: batch the migrant with the next GPU call.
+                            *worst = if defer_gpu {
+                                Ind::pending(t.clone(), cfg)
+                            } else {
+                                Ind::evaluated(t.clone(), &gen_data, cfg) // #25
+                            };
                         }
                     }
                 }
@@ -1120,12 +1440,26 @@ fn run_search(
                             if cfg.fit_iters > 0 && !gen_train.is_multi() {
                                 fit_constants(&mut t, cfg, gen_train);
                             }
-                            *ind = Ind::evaluated(t, &gen_data, cfg);
+                            // #26: restart trees are batched with the next GPU
+                            // call too, before the checkpoint is taken.
+                            *ind = if defer_gpu {
+                                Ind::pending(t, cfg)
+                            } else {
+                                Ind::evaluated(t, &gen_data, cfg)
+                            };
                         }
                         rngs[ii] = r;
                         stagnant[ii] = 0;
                     }
                 }
+            }
+
+            // #26: migration and restarts may have added pending individuals;
+            // score them before the checkpoint so a saved state is never NaN.
+            #[cfg(feature = "cuda")]
+            {
+                defer_gpu =
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -1171,10 +1505,11 @@ fn run_search(
         emit(&mut on_checkpoint, &cp);
     }
 
-    if subsampling_active(cfg, train) {
-        // Generation fitness was estimated on subsets, so the front is rebuilt
-        // from the surviving trees and scored on every training row. From here
-        // on the archive and every number derived from it are full-data.
+    if subsampling_active(cfg, train) || gpu_used || resumed {
+        // Generation fitness was estimated on subsets, or on the GPU in f32, so
+        // the front is rebuilt from the surviving trees and scored on every
+        // training row with the CPU in f64. From here on the archive and every
+        // number derived from it are full-data and match the CPU backend.
         archive = full_data_archive(&archive, &islands, &train_data, cfg); // #25
     } else {
         for pop in &islands {
@@ -1210,7 +1545,10 @@ fn run_search(
     // generation ran (a resumed run that had already converged, or a zero
     // budget), take one reading of the final archive so the JSON is populated.
     let mut convergence = progress_stats.current();
-    if !stats_observed {
+    // #26: a GPU-guided run's in-loop readings are on the f32 proxy; take the
+    // final reading from the rebuilt f64 archive so the reported statistics
+    // describe the numbers the user sees.
+    if !stats_observed || gpu_used || resumed {
         let best = final_archive
             .items
             .iter()

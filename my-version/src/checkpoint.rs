@@ -1029,9 +1029,11 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         units,
         require_dimensions,
         progress: None,
-        // #27: the evaluator path is not a search setting, so it is not
-        // persisted; a resumed run takes the current CLI choice (default: on).
+        // #27/#26: evaluator choices are not saved search state; a resumed run
+        // picks the backend afresh from the current build/flags.
         simd: true,
+        gpu: false,
+        gpu_notes: true,
     })
 }
 

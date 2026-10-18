@@ -765,6 +765,8 @@ impl Default for RawOptions {
 fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
     let mut raw = RawOptions::default();
     let mut cfg = search::Config::default();
+    // #26: the web front end also opts into the GPU in a CUDA build.
+    cfg.gpu = true;
     let mut i = 0usize;
     while i < args.len() {
         let flag = args[i].clone();
@@ -836,6 +838,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--fit-iters" => cfg.fit_iters = int(&take(&mut i)?, "--fit-iters", 0)?,
             "--no-fit" => cfg.fit_iters = 0,
             "--no-dedup" => cfg.dedup = false,
+            "--no-gpu" | "--cpu" => cfg.gpu = false,
             "--predictor-samples" => {
                 cfg.predictor_samples = Some(int(&take(&mut i)?, "--predictor-samples", 2)?)
             }

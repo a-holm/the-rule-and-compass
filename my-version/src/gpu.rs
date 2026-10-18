@@ -253,10 +253,15 @@ impl GpuEvaluator {
 
     /// Score a batch of compiled programs. Returns one sum-of-squared-errors per
     /// program, plus the kernel time in milliseconds.
+    ///
+    /// A negative time means the upload or the kernel failed; the output must
+    /// then be ignored. The search uses this marker to fall back to the CPU.
     pub fn eval_batch(&mut self, prog: &[u32], offsets: &[u32]) -> (Vec<f32>, f32) {
         let nprog = offsets.len().saturating_sub(1);
         unsafe {
-            rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32);
+            if rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32) != 0 {
+                return (Vec::new(), -1.0);
+            }
             let mut out = vec![0.0f32; nprog];
             let ms = rc_eval(self.ctx, out.as_mut_ptr());
             (out, ms)
