@@ -230,29 +230,50 @@ data did not already contain.
 ```sh
 rcsr --data data.csv --target y --vars x1,x2
 # null baselines (absolute): mean train=2.003 test=2.250 | linear train=0.000 test=0.000 | 5-NN train=0.130 test=0.250
-# knn baseline: reference_rows=2500 query_rows=2500 sampled=false
+# knn baseline: reference_rows=2500 train_query_rows=2500 test_query_rows=0 sampled=false
 ```
 
 **Cost.** The baseline's **reference set is always every training row**, at
 every `n`: it is never subsampled, because that would change the estimator.
 What changes is how the queries are answered. For up to eight inputs `rcsr`
-builds a balanced k-d tree once over the training rows and answers exact
-k-nearest-neighbour queries in average `O(log n)`; above eight inputs it uses
-the exact brute-force path with a reused distance buffer and
-`select_nth_unstable`, so it does not allocate and fully sort per query. Ties
-break by original row order either way, and the 20 000-row number matches the
-pre-#69 all-rows value bit for bit.
+builds a balanced k-d tree once over the training rows and prunes with
+bounding boxes; above eight inputs it uses the exact brute-force path with a
+reused distance buffer and `select_nth_unstable`, so it does not allocate and
+fully sort per query. Ties break by original row order either way, and the
+20 000-row number matches the pre-#69 all-rows value bit for bit.
+
+The k-d tree is not claimed to be `O(log n)` per query: that is the expected
+behaviour for fixed dimension, and the measured 20k→40k step is larger. What the
+tree removes is the old per-query full sort; the practical claim is a k-d tree
+for `d <= 8`. The `d > 8` exact path is still `O(query_rows × reference_rows ×
+d)`, so "200 000 rows under a minute" is a **`d <= 8` claim**; for wider data,
+sample queries or expect the brute-force cost. Measured on this machine
+(`--generations 0 --pop 1`): 200k rows take 12–18 s at `d = 6` and 35 s at
+`d = 8`; at `d = 12` the exact 200k run did not finish within 120 s, and the
+20k exact runs take 1.1 s (`d = 8`), 6.1 s (`d = 12`) and 6.8 s (`d = 16`).
+The cutoff is a practical choice, not a theorem: the literature puts k-d trees
+in their intended regime around `d <= 10` and worse than linear search beyond
+about 16.
 
 Only when the exact query cost is unaffordable can the **query rows** be
 sampled: `--baseline-samples N` scores at most `N` deterministic query rows per
-set (training and each test fold), seeded from `--seed`. That is an unbiased
-estimate of the same 5-NN error, not a weaker baseline. When it happens the
-text line says `sampled=true sem=...`, and `--json` carries
-`baselines.knn.query_rows` and `baselines.knn.query_sem` (the standard error of
-the mean training error; `null` when the metric is not a plain mean of per-row
-losses). The default `--baseline-samples 0` means no caps at all: every query
-row is scored. `baselines.knn.reference_rows` is reported too and is always the
-training size.
+set (training and each test fold), seeded from `--seed`. This is offered only
+for the mean-loss metrics **absolute**, **squared** and **log_squashed**, where
+the sample average is an unbiased estimate of the full row-average loss. For
+median, maximum, correlation, rank correlation, interquartile, slope,
+classification and information-criterion metrics a subsample is a different
+estimator, so the CLI refuses the flag. When sampling happens the text line
+says `sampled=true`, and `--json` carries `baselines.knn.train_query_rows`,
+`train_query_sem`, `test_query_rows` and `test_query_sem`. The SEMs use the
+finite-population correction for sampling without replacement,
+`(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored. The default
+`--baseline-samples 0` means no caps at all: every query row is scored.
+`baselines.knn.reference_rows` is reported too and is always the training size.
+
+At 20k rows (15k training) `--baseline-samples 4096` gives a 95% interval of
+roughly ±2.5% of the 5-NN value; ask for about 9.5k queries for ±1%. The
+training 5-NN includes the query row itself, as it always has, so the training
+error is optimistic; the test error is the out-of-sample number.
 
 ### 3.6 Out-of-distribution / extrapolation test
 Train on part of the input range and test outside it, or hold out an entire
@@ -491,3 +512,8 @@ Alongside the front, `rcsr` reports:
 * Schmidt & Lipson 2009 — distilling laws with noise-robust objectives.
 * Bates & Watts 1988; Seber & Wild 2003 — nonlinear least squares: parameter
   standard errors and conditioning from the Jacobian.
+* Bentley 1975; Friedman, Bentley & Finkel 1977 — k-d trees and exact k-NN.
+* Kibriya & Frank 2007; Beyer et al. 1999 — k-d tree query cost and the
+  curse of dimensionality for nearest neighbours.
+* Cochran 1977, *Sampling Techniques*; NIST/SEMATECH e-Handbook §1.3.5.2 —
+  standard error with the finite-population correction.

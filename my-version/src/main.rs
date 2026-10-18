@@ -182,9 +182,11 @@ OVERFITTING DIAGNOSTICS (always on):
                               in the same metric as the search: a model must
                               beat them to earn its complexity
   --baseline-samples <N>      score at most N query rows for the k-NN baseline
-                              (default 0 = every row). The reference set is
-                              always all training rows, so sampling queries is
-                              an unbiased estimate of the same 5-NN error (#69)
+                              (default 0 = every row; absolute/squared/
+                              log_squashed only). The reference set is always
+                              all training rows; sampled results report their
+                              standard error with the finite-population
+                              correction (#69)
   overfit index               test_error / train_error
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
@@ -990,6 +992,18 @@ fn main() {
         );
         eprintln!(
             "  --implicit appends the target as an input and searches f(inputs, target) = 0"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // #69: query sampling is an unbiased estimate only for mean-loss metrics.
+    // Refuse the flag elsewhere rather than silently reporting a subsample of a
+    // median/correlation/AIC as if it were the full-sample value.
+    if baseline_samples > 0 && !diagnostics::knn_sampling_supported(cfg.metric) {
+        eprintln!(
+            "error: --baseline-samples {} only supports mean-loss metrics \
+             (absolute, squared, log_squashed), not {}",
+            baseline_samples,
+            cfg.metric.name()
         );
         std::process::exit(EXIT_USAGE);
     }
@@ -2584,18 +2598,22 @@ fn main() {
                 baselines.knn.train_error,
                 baselines.knn.test_error
             );
-            // #69: state whether queries were sampled and the SEM if so.
+            // #69: state whether queries were sampled and the train/test SEMs.
             if baselines.knn_capped {
                 eprintln!(
-                    "# knn baseline: reference_rows={} query_rows={} sampled=true sem={:.3e}",
+                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true",
                     baselines.knn_reference_rows,
-                    baselines.knn_query_rows,
-                    baselines.knn_query_sem
+                    baselines.knn_train_query_rows,
+                    baselines.knn_train_query_sem,
+                    baselines.knn_test_query_rows,
+                    baselines.knn_test_query_sem
                 );
             } else {
                 eprintln!(
-                    "# knn baseline: reference_rows={} query_rows={} sampled=false",
-                    baselines.knn_reference_rows, baselines.knn_query_rows
+                    "# knn baseline: reference_rows={} train_query_rows={} test_query_rows={} sampled=false",
+                    baselines.knn_reference_rows,
+                    baselines.knn_train_query_rows,
+                    baselines.knn_test_query_rows
                 );
             }
             if let Some(cv) = &cv {

@@ -38,8 +38,9 @@ pub fn json() -> String {
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
-        // #69: reference set always exact; only query rows are sampled.
-        ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row); the reference set is always all training rows, so sampling queries is an unbiased estimate of the same error"),
+        // #69: reference set always exact; only query rows are sampled, and
+        // only for mean-loss metrics.
+        ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
         ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),

@@ -1,8 +1,8 @@
 //! #69: the k-NN null baseline keeps an exact reference set and, when query
-//! rows are sampled, stays an unbiased estimate of the same error.
+//! rows are sampled, stays an estimate of the same row-average loss.
 
 use rcsr::data::Sample;
-use rcsr::diagnostics::{knn_predict, Baselines, KNN_KD_MAX_DIM};
+use rcsr::diagnostics::{knn_predict, knn_sampling_supported, Baselines, KNN_KD_MAX_DIM};
 use rcsr::metrics::{self, Metric};
 
 /// Deterministic synthetic sample with `n` rows and `dims` inputs.
@@ -38,8 +38,8 @@ fn assert_bits(a: f64, b: f64, what: &str) {
 
 #[test]
 fn kd_tree_and_brute_force_are_bit_identical_to_knn_predict() {
-    // 3/6 inputs: k-d tree path. 9 inputs: brute-force path.
-    for dims in [3, 6, KNN_KD_MAX_DIM + 1] {
+    // d = 1/3/6/8: k-d tree path. d = 9: brute-force path.
+    for dims in [1, 3, 6, KNN_KD_MAX_DIM, KNN_KD_MAX_DIM + 1] {
         let train = sample(600, dims, 1);
         let query = sample(120, dims, 2);
         let b = Baselines::fit_sampled(&train, &[query.clone()], Metric::Absolute, 0, 7);
@@ -49,10 +49,37 @@ fn kd_tree_and_brute_force_are_bit_identical_to_knn_predict() {
         assert_bits(b.knn.train_error, expected_train, "train");
         assert_bits(b.knn.test_error, expected_test, "test");
         assert_eq!(b.knn_reference_rows, train.len());
-        assert_eq!(b.knn_query_rows, train.len() + query.len());
+        assert_eq!(b.knn_train_query_rows, train.len());
+        assert_eq!(b.knn_test_query_rows, query.len());
         assert!(!b.knn_capped);
-        assert!(b.knn_query_sem.is_nan());
+        assert!(b.knn_train_query_sem.is_nan());
+        assert!(b.knn_test_query_sem.is_nan());
     }
+}
+
+#[test]
+fn duplicate_points_and_exact_ties_match_brute_force() {
+    // Coordinates from {0, 1, 2} produce many exact distance ties; targets
+    // differ so a wrong tie-break changes the mean.
+    let mut x = Vec::new();
+    let mut y = Vec::new();
+    for i in 0..400usize {
+        x.push(vec![(i % 3) as f64, ((i / 3) % 3) as f64, 0.0]);
+        y.push((i % 7) as f64);
+    }
+    let train = Sample::new(x, y);
+    let query = sample(50, 3, 99);
+    let b = Baselines::fit_sampled(&train, &[query.clone()], Metric::Absolute, 0, 5);
+    assert_bits(
+        b.knn.train_error,
+        brute_force_error(&train, &train, Metric::Absolute),
+        "train ties",
+    );
+    assert_bits(
+        b.knn.test_error,
+        brute_force_error(&train, &query, Metric::Absolute),
+        "test ties",
+    );
 }
 
 #[test]
@@ -68,11 +95,13 @@ fn reference_set_stays_exact_at_20k_and_40k() {
     assert_eq!(small.knn_reference_rows, 20_000);
     assert_eq!(large.knn_reference_rows, 40_000);
     // Cost is governed by the query cap, not by n.
-    assert_eq!(small.knn_query_rows, cap);
-    assert_eq!(large.knn_query_rows, cap);
+    assert_eq!(small.knn_train_query_rows, cap);
+    assert_eq!(large.knn_train_query_rows, cap);
+    assert_eq!(small.knn_test_query_rows, 0);
+    assert_eq!(large.knn_test_query_rows, 0);
     assert!(small.knn_capped && large.knn_capped);
-    assert!(small.knn_query_sem.is_finite());
-    assert!(large.knn_query_sem.is_finite());
+    assert!(small.knn_train_query_sem.is_finite());
+    assert!(large.knn_train_query_sem.is_finite());
     assert!(small.knn.train_error.is_finite());
     assert!(large.knn.train_error.is_finite());
 }
@@ -88,24 +117,53 @@ fn zero_samples_means_no_caps_at_all() {
     assert_bits(no_caps.knn.train_error, plain.knn.train_error, "train");
     assert_bits(no_caps.knn.test_error, plain.knn.test_error, "test");
     assert_eq!(no_caps.knn_reference_rows, train.len());
-    assert_eq!(no_caps.knn_query_rows, train.len() + fold.len());
+    assert_eq!(no_caps.knn_train_query_rows, train.len());
+    assert_eq!(no_caps.knn_test_query_rows, fold.len());
     assert!(!no_caps.knn_capped);
-    assert!(no_caps.knn_query_sem.is_nan());
+    assert!(no_caps.knn_train_query_sem.is_nan());
+    assert!(no_caps.knn_test_query_sem.is_nan());
 }
 
 #[test]
-fn json_reports_reference_query_rows_and_sem() {
+fn json_reports_split_query_rows_and_sems() {
     let train = sample(20_000, 3, 8);
     let sampled = Baselines::fit_sampled(&train, &[], Metric::Absolute, 256, 17);
     let json = sampled.knn_json_extra();
     assert!(json.contains("\"reference_rows\":20000"), "{json}");
-    assert!(json.contains("\"query_rows\":256"), "{json}");
+    assert!(json.contains("\"train_query_rows\":256"), "{json}");
+    assert!(json.contains("\"test_query_rows\":0"), "{json}");
     assert!(json.contains("\"capped\":true"), "{json}");
-    assert!(!json.contains("\"query_sem\":null"), "{json}");
+    assert!(!json.contains("\"train_query_sem\":null"), "{json}");
 
     let exact = Baselines::fit_sampled(&train, &[], Metric::Absolute, 0, 17);
     let exact_json = exact.knn_json_extra();
-    assert!(exact_json.contains("\"query_rows\":20000"), "{exact_json}");
-    assert!(exact_json.contains("\"query_sem\":null"), "{exact_json}");
+    assert!(exact_json.contains("\"train_query_rows\":20000"), "{exact_json}");
+    assert!(exact_json.contains("\"train_query_sem\":null"), "{exact_json}");
     assert!(exact_json.contains("\"capped\":false"), "{exact_json}");
+}
+
+#[test]
+fn sampling_is_only_offered_for_mean_loss_metrics() {
+    for m in [Metric::Absolute, Metric::Squared, Metric::LogSquashed] {
+        assert!(knn_sampling_supported(m), "{m:?}");
+    }
+    for m in [
+        Metric::Correlation,
+        Metric::Median,
+        Metric::Maximum,
+        Metric::Interquartile,
+        Metric::RankCorrelation,
+        Metric::Auc,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ] {
+        assert!(!knn_sampling_supported(m), "{m:?}");
+    }
+
+    // The library falls back to exact queries for unsupported metrics.
+    let train = sample(1000, 3, 31);
+    let b = Baselines::fit_sampled(&train, &[], Metric::Median, 100, 3);
+    assert!(!b.knn_capped);
+    assert_eq!(b.knn_train_query_rows, train.len());
 }
