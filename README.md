@@ -143,6 +143,10 @@ cat examples/line.csv | rcsr --data - --target y --top 3
 }
 ```
 
+A graphical front end for the same contract is designed in
+[`docs/gui.md`](docs/gui.md): schema-driven forms, a live Pareto plot, the
+split made visible on the grid, and a "Copy as CLI" action on every search.
+
 ### Full option list
 
 ```
@@ -344,6 +348,7 @@ docs/optimisation.md          theory, literature and measurements behind the sea
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
+docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/
   Cargo.toml
