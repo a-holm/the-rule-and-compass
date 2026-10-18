@@ -115,13 +115,64 @@ cat examples/line.csv | rcsr --data - --target y --top 3
 rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--metric absolute|squared|correlation] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
+     [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--group-by col] [--gap N] [--folds K]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
 ```
 
-Input may be CSV, TSV, or whitespace-delimited, with a header row. 25% of the
-rows are held out for testing; the search only sees the rest.
+Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
+columns can be used as inputs or target; text columns (dates, ticker symbols)
+are kept and can be used for splitting.
+
+## Choosing how rows are split
+
+Which rows go to training and which to testing is the difference between a
+number you can trust and one you cannot. `--split` selects the rule:
+
+| `--split` | training rows | test rows | use when |
+|---|---|---|---|
+| `random` (default) | a random 75% | the rest | rows are exchangeable (i.i.d. samples) |
+| `temporal` | the **first** rows | the **last** rows | one time series; the future must stay unseen |
+| `group` | whole groups | other whole groups | you must generalise to *unseen* entities |
+| `temporal-group` | the past of every group | the future of every group | panel data: many series measured over one period |
+| `auto` | inferred from the columns, and printed | | you want the tool to decide and say why |
+
+A random split of a time series lets the model see the future, and a random
+split of panel data puts the same stock on both sides. `rcsr` warns when the
+rows look non-exchangeable and a random split was requested.
+
+```sh
+# One series: train on the past, test on the future, with a 5-row embargo
+# between them so autocorrelation cannot leak across the boundary.
+rcsr --data prices.csv --target y --split temporal --time date --gap 5
+
+# Panel data (OHLC for several symbols over the same period): train on the
+# past of every symbol, test on its future.
+rcsr --data panel.csv --target next_close --split temporal-group \
+     --time date --group-by symbol
+
+# Generalise to unseen symbols: hold out whole symbols.
+rcsr --data panel.csv --target next_close --group-by symbol
+
+# Let it decide, and report the choice:
+rcsr --data panel.csv --target next_close --split auto
+```
+
+* `--time <col>` may be a number or a date (`2024-01-31`, `2024/01/31`,
+  `2024-01-31T09:30:00`).
+* `--group-by <col>` may be text (tickers) or a low-cardinality number.
+* `--gap N` drops `N` rows after the train/test boundary (an *embargo*), per
+  series in `temporal-group` mode.
+* `--folds K` splits the test region into `K` contiguous blocks and reports the
+  error of each block next to the mean, so an unstable model cannot hide behind
+  a lucky pooled number.
+* Normalisation statistics are computed from the **training rows only**; the
+  test set never influences the model's input scaling.
+
+See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
+worked examples.
 
 ## Features
 
@@ -138,6 +189,9 @@ rows are held out for testing; the search only sees the rest.
 - **structural de-duplication** and **convergence/time-budget stopping**, so the
   same expression is never evaluated twice and the search stops when there is
   nothing left to gain;
+- **split modes for time series and panel data** (`random`, `temporal`, `group`,
+  `temporal-group`, `auto`) with an embargo gap and per-block test errors, so a
+  forecast is never scored on data it has already seen;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 
@@ -150,6 +204,7 @@ numbers and the hardware plan.
 SPEC.md                       behaviour specification
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
+docs/data-splitting.md        train/test splitting for time series and panel data
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/
   Cargo.toml
@@ -160,7 +215,7 @@ my-version/
     fit.rs        Levenberg–Marquardt constant fitting
     metrics.rs    error metrics
     pareto.rs     the error/complexity Pareto front
-    data.rs       CSV/TSV loading, normalisation, train/test split
+    data.rs       table loading, split modes, normalisation
     search.rs     island-model GP loop
     gpu.rs        bytecode compiler + FFI for the optional GPU evaluator
     cuda/eval.cu  the CUDA kernel
@@ -169,6 +224,7 @@ my-version/
       gpu_bench.rs  GPU vs CPU evaluation benchmark (--features cuda)
   tests/
     recover.rs    end-to-end recovery tests + unit tests
+    split.rs      split-mode tests (temporal, group, panel, folds)
   examples/
     line.csv, sine.csv
 ```
