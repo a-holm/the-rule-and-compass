@@ -141,6 +141,19 @@ fn simplify_folds() {
 }
 
 #[test]
+fn fit_refines_constants_to_machine_precision() {
+    // y = sin(1.7 x): start from sin(1 x) and let Levenberg–Marquardt find 1.7.
+    let g = grid(41, -2.0, 2.0);
+    let ys: Vec<f64> = g.iter().map(|v| (1.7 * v).sin()).collect();
+    let xs: Vec<Vec<f64>> = g.iter().map(|v| vec![*v]).collect();
+    let mut t = node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]);
+    rcsr::fit::fit(&mut t, &xs, &ys, 25);
+    let pred: Vec<f64> = g.iter().map(|v| expr::eval(&t, &[*v])).collect();
+    let err = score(&pred, &ys, Metric::Squared);
+    assert!(err < 1e-20, "squared error after fit = {}", err);
+}
+
+#[test]
 fn complexity_counts_nodes() {
     // x + 1 -> 3 nodes
     let e = node(Op::Add, vec![input(0), constant(1.0)]);
