@@ -272,13 +272,9 @@ pub fn prepare(
     Ok((p.train, p.test, p.means, p.stds))
 }
 
-pub fn prepare_full(
-    t: &Table,
-    vars: &[String],
-    target: &str,
-    spec: &SplitSpec,
-    rng: &mut Mt,
-) -> Result<Prepared, String> {
+/// Resolve the input columns and the target column, validating that they are
+/// numeric and distinct. Shared by [`prepare_full`] and [`cv_folds`].
+fn resolve_columns(t: &Table, vars: &[String], target: &str) -> Result<(Vec<usize>, usize), String> {
     let var_idx: Vec<usize> = vars
         .iter()
         .map(|v| {
@@ -299,6 +295,17 @@ pub fn prepare_full(
     if !t.numeric[tgt_idx] {
         return Err(format!("target column '{}' is not numeric", target));
     }
+    Ok((var_idx, tgt_idx))
+}
+
+pub fn prepare_full(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+) -> Result<Prepared, String> {
+    let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let nv = var_idx.len();
 
     let x_raw: Vec<Vec<f64>> = t
@@ -355,6 +362,168 @@ pub fn prepare_full(
         stds,
         report,
     })
+}
+
+/// Cross-validation scheme (see `docs/overfitting.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CvMode {
+    /// A shuffled partition into `k` equal parts: i.i.d. data.
+    KFold,
+    /// Forward chaining: an expanding training window, the next contiguous
+    /// block held out. The honest scheme for time-ordered data.
+    Rolling,
+    /// `k` contiguous parts with `gap` rows embargoed either side of each test
+    /// block, so leaking neighbours (autocorrelation, look-ahead) cannot help.
+    Purged,
+}
+
+impl CvMode {
+    pub fn parse(s: &str) -> Result<CvMode, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "k-fold" | "kfold" | "k_fold" | "fold" | "k" => Ok(CvMode::KFold),
+            "rolling" | "roll" | "forward" | "expanding" => Ok(CvMode::Rolling),
+            "purged" | "purge" | "embargo" => Ok(CvMode::Purged),
+            other => Err(format!(
+                "unknown --cv mode '{}' (expected k-fold, rolling or purged)",
+                other
+            )),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            CvMode::KFold => "k-fold",
+            CvMode::Rolling => "rolling",
+            CvMode::Purged => "purged",
+        }
+    }
+}
+
+/// One cross-validation fold, normalised on its **own** training rows.
+pub struct CvFold {
+    pub train: Sample,
+    pub test: Sample,
+    /// Training-only normalisation statistics, so a fitted model can be
+    /// denormalised back to the original units for display.
+    pub means: Vec<f64>,
+    pub stds: Vec<f64>,
+}
+
+/// Build `k` cross-validation folds from the raw table.
+///
+/// Normalisation statistics are computed from each fold's training rows only,
+/// so nothing leaks from the held-out block. Folds that would be empty are
+/// dropped; an error is returned if no usable fold remains.
+pub fn cv_folds(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    mode: CvMode,
+    k: usize,
+    gap: usize,
+    seed: u32,
+) -> Result<Vec<CvFold>, String> {
+    let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
+    let n = t.rows.len();
+    let k = k.max(2);
+    if n < k + 1 {
+        return Err(format!(
+            "cross-validation needs more than {} rows, got {}",
+            k, n
+        ));
+    }
+    let x_raw: Vec<Vec<f64>> = t
+        .rows
+        .iter()
+        .map(|r| var_idx.iter().map(|&i| r[i]).collect())
+        .collect();
+    let y: Vec<f64> = t.rows.iter().map(|r| r[tgt_idx]).collect();
+
+    // (train indices, test indices) per fold.
+    let splits: Vec<(Vec<usize>, Vec<usize>)> = match mode {
+        CvMode::KFold => {
+            let mut order: Vec<usize> = (0..n).collect();
+            let mut rng = Mt::new(seed);
+            for i in (1..n).rev() {
+                let j = rng.usize_below(i + 1);
+                order.swap(i, j);
+            }
+            (0..k)
+                .map(|f| {
+                    let lo = f * n / k;
+                    let hi = (f + 1) * n / k;
+                    let test = order[lo..hi].to_vec();
+                    let mut train = order[..lo].to_vec();
+                    train.extend_from_slice(&order[hi..]);
+                    (train, test)
+                })
+                .collect()
+        }
+        CvMode::Purged => (0..k)
+            .map(|f| {
+                let lo = f * n / k;
+                let hi = (f + 1) * n / k;
+                let test: Vec<usize> = (lo..hi).collect();
+                // Embargo `gap` rows on both sides of the test block.
+                let a = lo.saturating_sub(gap);
+                let b = (hi + gap).min(n);
+                let train: Vec<usize> = (0..n).filter(|&i| i < a || i >= b).collect();
+                (train, test)
+            })
+            .collect(),
+        CvMode::Rolling => (0..k)
+            .map(|f| {
+                // `k + 1` contiguous blocks; fold `f` trains on 0..=f and tests
+                // on f+1 (an expanding window).
+                let train_end = (f + 1) * n / (k + 1);
+                let test_end = (f + 2) * n / (k + 1);
+                ((0..train_end).collect(), (train_end..test_end).collect())
+            })
+            .collect(),
+    };
+
+    let nv = var_idx.len();
+    let mut folds = Vec::new();
+    for (train_idx, test_idx) in splits {
+        if train_idx.is_empty() || test_idx.is_empty() {
+            continue;
+        }
+        let mut means = vec![0.0; nv];
+        let mut stds = vec![1.0; nv];
+        for j in 0..nv {
+            let m = train_idx.iter().map(|&i| x_raw[i][j]).sum::<f64>() / train_idx.len() as f64;
+            let var = train_idx
+                .iter()
+                .map(|&i| (x_raw[i][j] - m).powi(2))
+                .sum::<f64>()
+                / train_idx.len() as f64;
+            let s = var.sqrt();
+            means[j] = m;
+            stds[j] = if s < 1e-12 { 1.0 } else { s };
+        }
+        let make = |idx: &[usize]| -> Sample {
+            let mut s = Sample::default();
+            for &i in idx {
+                s.x.push(
+                    (0..nv)
+                        .map(|j| (x_raw[i][j] - means[j]) / stds[j])
+                        .collect(),
+                );
+                s.y.push(y[i]);
+            }
+            s
+        };
+        folds.push(CvFold {
+            train: make(&train_idx),
+            test: make(&test_idx),
+            means,
+            stds,
+        });
+    }
+    if folds.is_empty() {
+        return Err("cross-validation produced no usable folds (data too small)".to_string());
+    }
+    Ok(folds)
 }
 
 /// Decide where each row goes. Returns `(train indices, test fold indices, report)`.

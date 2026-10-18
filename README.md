@@ -156,7 +156,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--gap-break f] [--null-runs N] [--bootstrap-error N] [--eval-expr expr]
+     [--gap-break f] [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
+     [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
@@ -260,6 +261,7 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 | `residual_tests` | Ljung–Box autocorrelation, Breusch–Pagan changing variance, residual skew/kurtosis |
 | `null_control` | could the search have produced this from noise? |
 | `bootstrap_error` | apparent, out-of-bag and .632+ error estimates (`--bootstrap-error`) |
+| `cross_validation` | mean and spread of held-out error over `k` folds (`--cv`) |
 
 The null baselines are fit on the training rows and scored on the training rows
 and the test folds in the search's own metric: a model that does not beat the
@@ -277,6 +279,13 @@ bootstrap resamples of the training rows and reports the **apparent**, the
 **out-of-bag** and the **.632+** error (Efron & Tibshirani 1997) per solution;
 the `.632+` estimate interpolates the optimistic and pessimistic numbers and
 always lies between them.
+
+`--cv k-fold|rolling|purged` goes further: it rebuilds the split as `k` folds,
+re-runs the whole search on each fold's training rows (normalised on those rows
+alone) and reports the mean and spread of the held-out error, so a single lucky
+split cannot flatter the answer. Use `rolling` for time series (it never trains
+on the future) and `purged` to embargo `--gap` rows around each test block. It
+costs about `k` extra searches.
 
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
@@ -335,8 +344,9 @@ list and the recorded results.
   (mean, least-squares line, 5-NN) and **residual tests** (Ljung–Box,
   Breusch–Pagan, skewness/kurtosis) reported automatically, plus a
   `--null-runs` permutation control that runs the identical search on shuffled
-  targets and a `--bootstrap-error` `.632+` bootstrap estimate that refits each
-  solution's constants on resamples;
+  targets, a `--bootstrap-error` `.632+` bootstrap estimate that refits each
+  solution's constants on resamples, and `--cv` cross-validation (`k-fold`,
+  `rolling`, `purged`) that reports the mean and spread of the held-out error;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 
