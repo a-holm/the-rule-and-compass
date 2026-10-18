@@ -1029,6 +1029,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         units,
         require_dimensions,
         progress: None,
+        // #27: the evaluator path is not a search setting, so it is not
+        // persisted; a resumed run takes the current CLI choice (default: on).
+        simd: true,
     })
 }
 
