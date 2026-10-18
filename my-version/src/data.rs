@@ -25,8 +25,13 @@ pub struct Table {
 
 pub fn read_table(path: &str) -> Result<Table, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
+    parse_table(&text)
+}
+
+/// Parse a delimited table (header row required, `,`/tab/whitespace detected).
+pub fn parse_table(text: &str) -> Result<Table, String> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next().ok_or_else(|| "empty file".to_string())?;
+    let header = lines.next().ok_or_else(|| "empty input".to_string())?;
     let delim = if header.contains('\t') {
         '\t'
     } else if header.contains(',') {
