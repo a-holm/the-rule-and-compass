@@ -3,6 +3,7 @@
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
 pub mod bench;
+pub mod checkpoint;
 pub mod complexity;
 pub mod data;
 pub mod diagnostics;

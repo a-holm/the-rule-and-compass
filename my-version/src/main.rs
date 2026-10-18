@@ -11,6 +11,7 @@
 //! * `--time-budget` bounds wall-clock time, so a caller never blocks forever;
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
+use rcsr::checkpoint::Checkpoint;
 use rcsr::complexity::ComplexityModel;
 use rcsr::expr::{self, Op};
 use rcsr::fit;
@@ -205,6 +206,15 @@ SEARCH:
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
 
+CHECKPOINTS:
+  --save <file>              write a checkpoint on exit and every --save-every
+                             generations; saving does not change the search
+  --save-every <N>           generation interval for --save (default 25)
+  --resume <file>            continue from a checkpoint. The saved search
+                             settings win; --generations may only be raised.
+                             Training and test data must match the saved
+                             fingerprint; a mismatch is refused (exit 3).
+
 OUTPUT:
   --format text|json|ndjson  (default text)
   --json                     shorthand for --format json
@@ -288,6 +298,9 @@ fn schema() -> String {
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
+        ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations"),
+        ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
+        ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data must match"),
         ("--format", "enum", "text", "text | json | ndjson"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
@@ -527,6 +540,28 @@ fn main() {
     let mut train_select_src: Option<String> = None;
     let mut test_select_src: Option<String> = None;
     let mut weight_name: Option<String> = None;
+    let mut save_path: Option<String> = None;
+    let mut save_every = 25usize;
+    let mut save_every_set = false;
+    let mut resume_path: Option<String> = None;
+
+    // Which search flags were written on the command line. Used to refuse a
+    // resume whose explicit override contradicts the saved configuration.
+    let mut generations_set = false;
+    let mut islands_set = false;
+    let mut pop_set = false;
+    let mut max_complexity_set = false;
+    let mut metric_set = false;
+    let mut seed_set = false;
+    let mut ops_set = false;
+    let mut fit_iters_set = false;
+    let mut dedup_set = false;
+    let mut patience_set = false;
+    let mut time_budget_set = false;
+    let mut predictor_samples_set = false;
+    let mut op_complexity_spec: Option<String> = None;
+    let mut complexity_weights_spec: Option<String> = None;
+    let mut depth_weight_spec: Option<f64> = None;
 
     let mut i = 0;
     macro_rules! val {
@@ -564,7 +599,10 @@ fn main() {
             "--metric" => {
                 let v = val!();
                 match Metric::parse_opt(&v) {
-                    Some(m) => cfg.metric = m,
+                    Some(m) => {
+                        cfg.metric = m;
+                        metric_set = true;
+                    }
                     None => {
                         eprintln!("error: unknown --metric '{}'", v);
                         eprintln!("known metrics: {}", metric_names());
@@ -572,16 +610,29 @@ fn main() {
                     }
                 }
             }
-            "--generations" => cfg.generations = val!().parse().unwrap_or(cfg.generations),
-            "--islands" => cfg.islands = val!().parse().unwrap_or(cfg.islands),
-            "--pop" => cfg.pop = val!().parse().unwrap_or(cfg.pop),
-            "--max-complexity" => cfg.max_complexity = val!().parse().unwrap_or(cfg.max_complexity),
+            "--generations" => {
+                cfg.generations = val!().parse().unwrap_or(cfg.generations);
+                generations_set = true;
+            }
+            "--islands" => {
+                cfg.islands = val!().parse().unwrap_or(cfg.islands);
+                islands_set = true;
+            }
+            "--pop" => {
+                cfg.pop = val!().parse().unwrap_or(cfg.pop);
+                pop_set = true;
+            }
+            "--max-complexity" => {
+                cfg.max_complexity = val!().parse().unwrap_or(cfg.max_complexity);
+                max_complexity_set = true;
+            }
             "--op-complexity" => {
                 let v = val!();
                 if let Err(e) = cfg.complexity_model.apply_op_costs(&v) {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_USAGE);
                 }
+                op_complexity_spec = Some(v);
             }
             "--complexity-weights" => {
                 let v = val!();
@@ -589,6 +640,7 @@ fn main() {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_USAGE);
                 }
+                complexity_weights_spec = Some(v);
             }
             "--depth-weight" => {
                 let v = val!();
@@ -598,6 +650,7 @@ fn main() {
                             eprintln!("error: --depth-weight: {}", e);
                             std::process::exit(EXIT_USAGE);
                         }
+                        depth_weight_spec = Some(w);
                     }
                     Err(_) => {
                         eprintln!(
@@ -608,7 +661,10 @@ fn main() {
                     }
                 }
             }
-            "--seed" => cfg.seed = val!().parse().unwrap_or(cfg.seed),
+            "--seed" => {
+                cfg.seed = val!().parse().unwrap_or(cfg.seed);
+                seed_set = true;
+            }
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
             "--fill" => {
                 let v = val!();
@@ -670,7 +726,10 @@ fn main() {
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
-            "--ops" => cfg.ops = Op::parse_list(&val!()),
+            "--ops" => {
+                cfg.ops = Op::parse_list(&val!());
+                ops_set = true;
+            }
             "--eval-expr" => eval_expr = Some(val!()),
             "--stability" => stability_runs = val!().parse().unwrap_or(0),
             "--cv" => {
@@ -684,13 +743,25 @@ fn main() {
                 }
             }
             "--cv-k" => cv_k = val!().parse().unwrap_or(5).max(2),
-            "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
-            "--no-fit" => cfg.fit_iters = 0,
-            "--no-dedup" => cfg.dedup = false,
+            "--fit-iters" => {
+                cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters);
+                fit_iters_set = true;
+            }
+            "--no-fit" => {
+                cfg.fit_iters = 0;
+                fit_iters_set = true;
+            }
+            "--no-dedup" => {
+                cfg.dedup = false;
+                dedup_set = true;
+            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
-                    Ok(n) if n >= 2 => cfg.predictor_samples = Some(n),
+                    Ok(n) if n >= 2 => {
+                        cfg.predictor_samples = Some(n);
+                        predictor_samples_set = true;
+                    }
                     _ => {
                         eprintln!(
                             "error: --predictor-samples needs an integer >= 2, got '{}'",
@@ -700,8 +771,29 @@ fn main() {
                     }
                 }
             }
-            "--patience" => cfg.patience = val!().parse().unwrap_or(cfg.patience),
-            "--time-budget" => cfg.time_budget = val!().parse().ok(),
+            "--patience" => {
+                cfg.patience = val!().parse().unwrap_or(cfg.patience);
+                patience_set = true;
+            }
+            "--time-budget" => {
+                cfg.time_budget = val!().parse().ok();
+                time_budget_set = true;
+            }
+            "--save" => save_path = Some(val!()),
+            "--save-every" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => {
+                        save_every = n;
+                        save_every_set = true;
+                    }
+                    _ => {
+                        eprintln!("error: --save-every needs an integer >= 1, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--resume" => resume_path = Some(val!()),
             "--format" => {
                 format = match val!().as_str() {
                     "json" => Format::Json,
@@ -768,6 +860,142 @@ fn main() {
     if report.is_some() && eval_expr.is_some() {
         eprintln!("error: --report cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
+    }
+    if save_every_set && save_path.is_none() {
+        eprintln!("error: --save-every requires --save <file>");
+        std::process::exit(EXIT_USAGE);
+    }
+    if eval_expr.is_some() && (save_path.is_some() || resume_path.is_some()) {
+        eprintln!("error: --save and --resume cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+
+    // A resume loads the saved search settings *before* the data is prepared:
+    // the saved seed decides the split, and the saved settings are the base
+    // that explicit flags are checked against.
+    let mut resume_checkpoint: Option<Checkpoint> = None;
+    let mut resumed_generation: Option<usize> = None;
+    if let Some(path) = &resume_path {
+        let cp = match Checkpoint::load(path) {
+            Ok(cp) => cp,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let saved = cp.config.clone();
+        let mut conflicts: Vec<String> = Vec::new();
+        if generations_set && cfg.generations < saved.generations {
+            conflicts.push(format!(
+                "--generations {} would shorten the saved budget {}",
+                cfg.generations, saved.generations
+            ));
+        }
+        if islands_set && cfg.islands != saved.islands {
+            conflicts.push(format!("--islands {} (saved {})", cfg.islands, saved.islands));
+        }
+        if pop_set && cfg.pop != saved.pop {
+            conflicts.push(format!("--pop {} (saved {})", cfg.pop, saved.pop));
+        }
+        if max_complexity_set && cfg.max_complexity != saved.max_complexity {
+            conflicts.push(format!(
+                "--max-complexity {} (saved {})",
+                cfg.max_complexity, saved.max_complexity
+            ));
+        }
+        if metric_set && cfg.metric != saved.metric {
+            conflicts.push(format!(
+                "--metric {} (saved {})",
+                cfg.metric.name(),
+                saved.metric.name()
+            ));
+        }
+        if seed_set && cfg.seed != saved.seed {
+            conflicts.push(format!("--seed {} (saved {})", cfg.seed, saved.seed));
+        }
+        if ops_set && cfg.ops != saved.ops {
+            conflicts.push("--ops differs from the saved operator list".to_string());
+        }
+        if fit_iters_set && cfg.fit_iters != saved.fit_iters {
+            conflicts.push(format!(
+                "--fit-iters {} (saved {})",
+                cfg.fit_iters, saved.fit_iters
+            ));
+        }
+        if dedup_set && cfg.dedup != saved.dedup {
+            conflicts.push(format!("--no-dedup (saved dedup is {})", saved.dedup));
+        }
+        if patience_set && cfg.patience != saved.patience {
+            conflicts.push(format!(
+                "--patience {} (saved {})",
+                cfg.patience, saved.patience
+            ));
+        }
+        if time_budget_set && cfg.time_budget != saved.time_budget {
+            conflicts.push(format!(
+                "--time-budget {:?} (saved {:?})",
+                cfg.time_budget, saved.time_budget
+            ));
+        }
+        if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
+            conflicts.push(format!(
+                "--predictor-samples {:?} (saved {:?})",
+                cfg.predictor_samples, saved.predictor_samples
+            ));
+        }
+        if let Some(spec) = &op_complexity_spec {
+            let mut trial = saved.clone();
+            if trial.complexity_model.apply_op_costs(spec).is_ok() && trial.complexity_model != saved.complexity_model
+            {
+                conflicts.push(format!(
+                    "--op-complexity '{}' differs from the saved complexity model",
+                    spec
+                ));
+            }
+        }
+        if let Some(spec) = &complexity_weights_spec {
+            let mut trial = saved.clone();
+            if trial.complexity_model.apply_weights(spec).is_ok() && trial.complexity_model != saved.complexity_model
+            {
+                conflicts.push(format!(
+                    "--complexity-weights '{}' differs from the saved weights",
+                    spec
+                ));
+            }
+        }
+        if let Some(w) = depth_weight_spec {
+            let mut trial = saved.clone();
+            if trial.complexity_model.set_depth_weight(w).is_ok() && trial.complexity_model != saved.complexity_model
+            {
+                conflicts.push(format!(
+                    "--depth-weight {} differs from the saved depth weight",
+                    w
+                ));
+            }
+        }
+
+        if !conflicts.is_empty() {
+            eprintln!(
+                "error: --resume '{}' conflicts with the saved search settings:",
+                path
+            );
+            for c in &conflicts {
+                eprintln!("  - {}", c);
+            }
+            eprintln!("  the saved run wins; omit the flag or pass the saved value");
+            std::process::exit(EXIT_USAGE);
+        }
+
+        // The generation budget is the one setting that may be *raised* on
+        // resume: all earlier generations are unaffected and a longer run is
+        // the same trajectory plus more generations.
+        let mut effective = saved;
+        if generations_set {
+            effective.generations = cfg.generations;
+        }
+        cfg = effective;
+        resumed_generation = Some(cp.generations);
+        resume_checkpoint = Some(cp);
     }
 
     let data_path = match data_path {
@@ -1189,6 +1417,15 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
 
+    // A resumed search must run on exactly the rows that produced the saved
+    // state, otherwise every saved error and population would be meaningless.
+    if let Some(cp) = &resume_checkpoint {
+        if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+
     // Streaming progress: ndjson goes to stdout, other formats to stderr.
     if progress {
         let to_stdout = format == Format::Ndjson;
@@ -1309,6 +1546,19 @@ fn main() {
         }
     }
 
+    if let Some(gen) = resumed_generation {
+        let path = resume_path.as_deref().unwrap_or("?");
+        if format == Format::Ndjson {
+            println!(
+                "{{\"event\":\"checkpoint\",\"action\":\"resumed\",\"path\":{},\"generation\":{}}}",
+                jstr(path),
+                gen
+            );
+        } else {
+            eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
+        }
+    }
+
     if let Some(src) = eval_expr.as_deref() {
         run_eval(
             src,
@@ -1325,7 +1575,58 @@ fn main() {
         std::process::exit(EXIT_OK);
     }
 
-    let outcome = search::run(&cfg, &prepared.train, &prepared.test);
+    let mut last_saved: Option<(usize, String)> = None;
+    let outcome_result = if let Some(path) = save_path.clone() {
+        let resumed = resume_checkpoint.take();
+        search::run_resumable(
+            &cfg,
+            &prepared.train,
+            &prepared.test,
+            resumed,
+            save_every,
+            |cp| {
+                if let Err(e) = cp.save(&path) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+                let generation = cp.generations;
+                last_saved = Some((generation, path.clone()));
+                if format == Format::Ndjson {
+                    println!(
+                        "{{\"event\":\"checkpoint\",\"action\":\"saved\",\"path\":{},\"generation\":{}}}",
+                        jstr(&path),
+                        generation
+                    );
+                } else {
+                    eprintln!(
+                        "# checkpoint: saved to {} at generation {}",
+                        path, generation
+                    );
+                }
+            },
+        )
+    } else if resume_checkpoint.is_none() {
+        // A fresh run with no save does not need any snapshot at all: keep the
+        // historical path (and avoid hashing the data on exit).
+        Ok(search::run(&cfg, &prepared.train, &prepared.test))
+    } else {
+        let resumed = resume_checkpoint.take();
+        search::run_resumable(
+            &cfg,
+            &prepared.train,
+            &prepared.test,
+            resumed,
+            0,
+            |_| {},
+        )
+    };
+    let outcome = match outcome_result {
+        Ok(outcome) => outcome,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
     let elapsed = start.elapsed().as_secs_f64();
 
     // Test error is reported per block, then averaged, so an unstable model
@@ -1966,8 +2267,20 @@ fn main() {
                 }
                 None => "null".to_string(),
             };
+            let checkpoint_json = format!(
+                "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
+                resume_path
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                last_saved
+                    .as_ref()
+                    .map(|(_, p)| jstr(p))
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome.generations
+            );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -1985,6 +2298,7 @@ fn main() {
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                checkpoint_json,
                 null_json,
                 baselines_json,
                 resid_json,
