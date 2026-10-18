@@ -23,6 +23,14 @@ RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 # benchmark GPU vs the reference CPU evaluator
 ./target/release/rcsr-gpu-bench --data examples/sine.csv --target y --vars x \
     --batch 8000 --depth 5 --seed 5
+
+# the search uses the GPU automatically when a device is present
+./target/release/rcsr --data examples/sine.csv --target y --vars x \
+    --generations 200 --pop 200 --islands 4 --seed 7 --metric squared
+
+# force the CPU evaluator (alias: --cpu), or simulate a missing device
+./target/release/rcsr ... --no-gpu
+RCSR_GPU=0 ./target/release/rcsr ...
 ```
 
 `RCSR_CUDA_ARCH` is validated before `nvcc` runs. A malformed value, or a
@@ -94,8 +102,8 @@ compiles many trees into one byte string plus an offsets table, and
 launch**, returning one SSE per program. `rcsr-gpu-bench` uses this path and
 prints the population size, so the capability is measured rather than assumed;
 `cargo test --features cuda` checks that a whole-population batch returns the
-same SSEs as scoring each program on its own. The search loop still owns its
-own scheduling and is not wired to `Population` yet.
+same SSEs as scoring each program on its own. Since issue #26 the search uses
+this path for every generation (see below).
 
 **Unified memory.** With `RCSR_GPU_UNIFIED=1` (the default for `sm_121`) every
 context buffer is allocated with `cudaMallocManaged`: the host writes into it
@@ -164,17 +172,99 @@ PCIe migration and the trade-off is expected to invert, but that is **not
 measured here**.
 
 
-## Where it plugs into the search
+## Inside the search loop (issue #26)
 
-Compiling a candidate and scoring a whole generation in one launch is the natural
-integration: generate offspring → batch-evaluate on the GPU → spend the
-(CPU-side) Levenberg–Marquardt budget only on the candidates whose *raw* error is
-promising. That is the concrete "avoid useless work" win on top of raw
-throughput. `Population` and `GpuEvaluator::eval_population` provide the batch
-shape; wiring them into the evolutionary loop is issue #26, a separate
-workstream, because that file is owned elsewhere. Until then the search loop
-calls the CPU evaluator, so the integration is a **planned** step rather than a
-shipped one.
+When the crate is built with `--features cuda` and a device opens, `run_search`
+creates one resident `GpuSearch` context for the full training sample. The
+`rcsr` CLI (and the web front end) opts in automatically; library callers set
+`Config::gpu = true`, whose default stays `false` so an embedded search keeps
+the CPU trajectory unless it asks for the GPU. Each generation then runs as:
+
+1. the island threads generate, mutate, de-duplicate and simplify candidates,
+   and fit their constants with the existing **CPU** Levenberg–Marquardt code;
+2. every candidate still pending is compiled into one `Population` and scored
+   with a single `eval_population` call — one kernel launch for the whole
+   generation, all islands included;
+3. selection, migration and restart decisions consume the returned fitness.
+
+The GPU never produces a number a user reads. The kernel sums squared errors;
+the search divides that by the row count and uses it as a mean-squared fitness
+(exact for `--metric squared`, a ranking proxy for the other plain regression
+metrics). At the end `full_data_archive` re-scores the surviving trees on the
+full training sample with the CPU evaluator in `f64`, and the reported
+train/test errors, Pareto front and convergence statistics come from that
+rebuild. Constants stay on the CPU and in `f64` throughout.
+
+The GPU path is used for single-output, unweighted, full-sample runs with a
+plain regression metric. Multi-output (`--target y1,y2`), `--weight`, the
+implicit metrics, classification metrics, AIC/AICc/BIC and
+`--predictor-samples` keep the CPU evaluator, because they need more than one
+prediction per row or a different set of rows every generation; the reason is
+printed in the one-line note.
+
+Fallback and the flag:
+
+* `--no-gpu` (alias `--cpu`) forces the CPU and prints
+  `# gpu: off (--no-gpu)`.
+* A build without the feature prints
+  `# gpu: unavailable (built without --features cuda)`.
+* A CUDA build with no usable device prints
+  `# gpu: unavailable (no usable CUDA device (...))`.
+* `RCSR_GPU=0` makes a CUDA build behave as if no device were present, which is
+  how the fallback test runs on a machine that has one.
+* Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
+  note, re-scores the pending generation on the CPU and disables the GPU for the
+  rest of the run. There is no panic and no stale result.
+
+The failure marker is part of the C API: `rc_eval` returns a negative time when
+`cudaGetLastError` reports a launch or execution failure, and `eval_batch`
+returns an empty result when the program upload fails.
+
+### Measured end to end
+
+Machine and build: the same RTX 3060 (`sm_86`, CUDA 12.0), plain device memory.
+Searches are whole `rcsr` runs on the same table and the same
+`--generations 200 --pop 200 --islands 4 --seed 7 --metric squared`; every cell
+is three interleaved CPU/GPU runs and reports **min / median** wall-clock
+seconds. The host was shared with other builds during the measurement (load
+average 9–15), so absolute times move by tens of percent; each pair ran
+back-to-back on the same host.
+
+| Dataset | Rows | Generations run | CPU wall (s) | GPU wall (s) | Speed-up (min) |
+|---|---|---|---|---|---|
+| `examples/sine.csv` (`--ops add,sub,mul,sin`) | 60 | 41 (early stop) | 1.66 / 2.37 | 1.89 / 2.02 | **0.88×** |
+| two-variable `y = sin x₁ + x₂²` (`--ops add,sub,mul,sin,square`) | 400 | 58 (early stop) | 18.70 / 18.93 | 19.05 / 19.61 | **0.98×** |
+
+Both backends recovered the known law (the GPU-selected forms are algebraically
+equivalent: the sine phase differs by a multiple of 2π, the square is scaled).
+The reported best errors agree to **≤ 5.7 × 10⁻¹⁹ absolute**; the relative
+difference is ~3 × 10⁻⁶ only because both errors are at the f64 noise floor
+(~1.7 × 10⁻¹³ and ~5.5 × 10⁻¹⁹). `tests/gpu_loop.rs` additionally asserts the
+recovered predictions agree to 1e-12 and the reported train/test errors to
+1e-9; on its fixture the observed difference is exactly 0.
+
+The honest conclusion: **at this budget the end-to-end speed-up is zero to
+slightly negative**. The GPU only replaces the tree evaluation used for
+fitness; the CPU Levenberg–Marquardt iterations that fit each candidate's
+constants dominate (roughly 7× more arithmetic than one fitness evaluation),
+and on 60–400 rows the per-generation upload, launch and event sync plus the
+final `full_data_archive` rebuild are a larger fraction than the evaluation
+work saved. Raw kernel throughput (hundreds of times the tree walk) does not
+translate into a whole-search win while fitting stays CPU-side.
+
+Taking the fitting out isolates the evaluation and shows the wiring is doing
+what it should (`--no-fit --patience 0`, two runs each):
+
+| Dataset | Rows | Gens | CPU wall (s) | GPU wall (s) | Speed-up |
+|---|---|---|---|---|---|
+| two-variable | 400 | 100 | 1.41 / 1.42 | 0.77 / 0.91 | **1.7–1.8×** |
+| two-variable | 5 000 | 100 | 14.02 / 14.38 | 1.93 / 1.96 | **7.2–7.5×** |
+
+So the GPU path pays off exactly where the issue says it should — when
+evaluation, rather than constant fitting, is the bottleneck. Making the fit
+cheaper or moving it to the GPU is a separate workstream; batch size and launch
+overhead could also be improved by reusing the device program buffer instead of
+freeing and reallocating it every generation.
 
 ## The DGX Spark path
 
@@ -217,8 +307,8 @@ Plan and status:
    block compiles and runs on `sm_86` with `RCSR_GPU_UNIFIED=1`, where it is
    measurably slower; see the table above.
 3. **Whole-generation batches.** Implemented as `Population` +
-   `eval_population` and measured here with 8 000 programs in one launch.
-   Wiring the search's generation into it belongs to issue #26.
+   `eval_population`, measured here with 8 000 programs in one launch, and
+   wired into the search loop by issue #26 (one batch per generation).
 4. **Bigger blocks and wide-dataset splitting.** Planned: with 48 SMs, use
    larger blocks and split very wide datasets across several blocks per
    expression with an atomic or two-pass reduction.
@@ -245,6 +335,10 @@ single-threaded reference), rising further with row tiling and CUDA graphs.
 | Unified-memory path: build, tests, benchmark | RTX 3060, `sm_86`, `RCSR_GPU_UNIFIED=1` | **verified on a discrete GPU** |
 | Whole-population batch equals one-at-a-time SSEs | RTX 3060, `cargo test --features cuda` | **verified** |
 | GPU-vs-CPU agreement | RTX 3060, test + benchmark | **verified** (tables above) |
+| One GPU batch per generation in the search loop | RTX 3060, `tests/gpu_loop.rs` + end-to-end table | **verified** |
+| Reported law/train/test errors agree with the CPU backend | RTX 3060, `tests/gpu_loop.rs` | **verified** (law predictions within 1e-12; errors within 1e-9, observed 0) |
+| `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
+| Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
 | `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |

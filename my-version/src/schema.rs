@@ -65,6 +65,7 @@ pub fn json() -> String {
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
+        ("--no-gpu", "flag", "false", "force CPU evaluation even when built with --features cuda (alias --cpu); the GPU only guides the search, reported errors are always CPU f64"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data must match"),

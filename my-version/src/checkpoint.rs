@@ -1029,6 +1029,10 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         units,
         require_dimensions,
         progress: None,
+        // #26: a performance choice, not saved search state. A resumed run
+        // picks the backend afresh from the current build/flags.
+        gpu: false,
+        gpu_notes: true,
     })
 }
 

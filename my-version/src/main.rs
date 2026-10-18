@@ -290,6 +290,9 @@ SEARCH:
                              and every reported error are always full-data
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
+  --no-gpu                   force CPU evaluation even when built with
+                             --features cuda (alias --cpu). Reported errors are
+                             always CPU f64; the GPU only guides the search
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -524,6 +527,11 @@ fn main() {
     }
 
     let mut cfg = search::Config::default();
+    // #26: the CLI uses a device automatically in a CUDA build. The library
+    // default stays CPU so embedders and tests are unaffected; --no-gpu / --cpu
+    // turns the CLI path off again.
+    cfg.gpu = true;
+    let mut force_cpu = false;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -798,6 +806,12 @@ fn main() {
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #26: force the CPU evaluator even in a CUDA build. A
+            // performance choice, not saved search state.
+            "--no-gpu" | "--cpu" => {
+                cfg.gpu = false;
+                force_cpu = true;
             }
             "--predictor-samples" => {
                 let v = val!();
@@ -1948,6 +1962,14 @@ fn main() {
         } else {
             eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
         }
+    }
+
+    // #26: the forced-CPU note belongs to the CLI, not to the library, so it is
+    // printed here once and only when the flag was written. `--quiet` promises
+    // an empty stderr for machine-readable output, so it suppresses every note.
+    cfg.gpu_notes = !quiet;
+    if force_cpu && !quiet {
+        eprintln!("# gpu: off (--no-gpu)");
     }
 
     // #15: multi-output reporting has its own shape (one entry per target);
