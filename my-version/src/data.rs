@@ -200,7 +200,7 @@ pub fn make_implicit(p: &mut Prepared) -> (f64, f64) {
 
 /// A parsed table. Numeric cells appear in `rows`; the original text of every
 /// cell is kept in `raw` so date and label columns remain usable.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Table {
     pub names: Vec<String>,
     /// `numeric[j]` is true when every non-empty cell in column `j` parses as a
@@ -210,6 +210,10 @@ pub struct Table {
     pub rows: Vec<Vec<f64>>,
     /// Text view of every cell.
     pub raw: Vec<Vec<String>>,
+    /// Data rows dropped because their field count differed from the header.
+    /// Non-zero only when the loader was explicitly asked to skip them
+    /// (`--skip-malformed`); the default refuses the file instead.
+    pub skipped_malformed: usize,
 }
 
 impl Table {
@@ -555,37 +559,82 @@ fn categorical_levels(
 }
 
 pub fn read_table(path: &str) -> Result<Table, String> {
+    read_table_with(path, false)
+}
+
+/// Like [`read_table`], but `skip_malformed` drops ragged rows instead of
+/// refusing the file. The number dropped is kept on [`Table`].
+pub fn read_table_with(path: &str, skip_malformed: bool) -> Result<Table, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
-    parse_table(&text)
+    parse_table_with(&text, skip_malformed)
+}
+
+/// Split one delimited line into trimmed fields. Whitespace-delimited input
+/// collapses runs of spaces, as the loader always has.
+fn split_fields(line: &str, delim: char) -> Vec<String> {
+    if delim == ' ' {
+        line.split_whitespace().map(|s| s.to_string()).collect()
+    } else {
+        line.split(delim).map(|s| s.trim().to_string()).collect()
+    }
 }
 
 /// Parse a delimited table (header row required, `,`/tab/whitespace detected).
+///
+/// A data row whose field count differs from the header is an error naming its
+/// 1-based file line. Blank lines and lines whose first non-space character is
+/// `#` are not data rows. Missing *cells* in a correct-width row are still
+/// handled by `--fill`; this is about the wrong number of fields.
 pub fn parse_table(text: &str) -> Result<Table, String> {
-    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next().ok_or_else(|| "empty input".to_string())?;
-    let delim = if header.contains('\t') {
-        '\t'
-    } else if header.contains(',') {
-        ','
-    } else {
-        ' '
-    };
-    let split = |l: &str| -> Vec<String> {
-        if delim == ' ' {
-            l.split_whitespace().map(|s| s.to_string()).collect()
-        } else {
-            l.split(delim).map(|s| s.trim().to_string()).collect()
-        }
-    };
-    let names = split(header);
+    parse_table_with(text, false)
+}
+
+/// [`parse_table`] with an explicit choice for ragged rows. With
+/// `skip_malformed`, rows whose field count differs from the header are
+/// dropped and counted (`Table::skipped_malformed`) instead of refused.
+pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, String> {
+    let mut header: Option<&str> = None;
+    let mut nfields = 0usize;
+    let mut delim = ',';
     let mut raw: Vec<Vec<String>> = Vec::new();
-    for l in lines {
-        let parts = split(l);
-        if parts.len() != names.len() {
+    let mut skipped_malformed = 0usize;
+    for (i, l) in text.lines().enumerate() {
+        let trimmed = l.trim();
+        // Blank lines and comment lines are not data rows. A `#` comment may
+        // appear anywhere, including before the header.
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
+        }
+        if header.is_none() {
+            delim = if l.contains('\t') {
+                '\t'
+            } else if l.contains(',') {
+                ','
+            } else {
+                ' '
+            };
+            nfields = split_fields(l, delim).len();
+            header = Some(l);
+            continue;
+        }
+        let parts = split_fields(l, delim);
+        if parts.len() != nfields {
+            if skip_malformed {
+                skipped_malformed += 1;
+                continue;
+            }
+            return Err(format!(
+                "line {}: expected {} field(s), found {} (ragged row; pass \
+                 --skip-malformed to drop such rows instead)",
+                i + 1,
+                nfields,
+                parts.len()
+            ));
         }
         raw.push(parts);
     }
+    let header = header.ok_or_else(|| "empty input".to_string())?;
+    let names = split_fields(header, delim);
     if raw.is_empty() {
         return Err("no data rows".to_string());
     }
@@ -632,6 +681,7 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
         numeric,
         rows,
         raw,
+        skipped_malformed,
     })
 }
 
@@ -931,6 +981,9 @@ pub struct PrepReport {
     pub scale: &'static str,
     /// Rows removed by `--filter`.
     pub filtered: usize,
+    /// Data rows dropped by `--skip-malformed` because their field count did
+    /// not match the header.
+    pub rows_skipped_malformed: usize,
 }
 
 impl Default for PrepReport {
@@ -944,6 +997,7 @@ impl Default for PrepReport {
             center: "mean",
             scale: "std",
             filtered: 0,
+            rows_skipped_malformed: 0,
         }
     }
 }
@@ -958,6 +1012,7 @@ impl PrepReport {
             || self.center != "mean"
             || self.scale != "std"
             || self.filtered > 0
+            || self.rows_skipped_malformed > 0
     }
 
     /// One short, commented line per active transformation. `params` carries
@@ -996,13 +1051,19 @@ impl PrepReport {
                 self.filtered
             ));
         }
+        if self.rows_skipped_malformed > 0 {
+            out.push(format!(
+                "# preparation: --skip-malformed dropped {} ragged row(s)",
+                self.rows_skipped_malformed
+            ));
+        }
         out
     }
 
     /// The `preparation` object shared by `--json` and `--ndjson`.
     pub fn json(&self) -> String {
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
@@ -1010,7 +1071,8 @@ impl PrepReport {
             self.smoothed,
             self.center,
             self.scale,
-            self.filtered
+            self.filtered,
+            self.rows_skipped_malformed
         )
     }
 }
@@ -1701,6 +1763,7 @@ pub fn prepare_full_targets_weighted_with(
             center: prep.center.name(),
             scale: prep.scale.name(),
             filtered: filtered_count,
+            rows_skipped_malformed: t.skipped_malformed,
         },
     })
 }
@@ -2634,6 +2697,7 @@ pub fn add_lags(
             numeric,
             rows,
             raw,
+            skipped_malformed: t.skipped_malformed,
         },
         new_vars,
         report,

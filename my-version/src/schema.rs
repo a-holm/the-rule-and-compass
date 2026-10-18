@@ -17,6 +17,7 @@ pub fn json() -> String {
         ("--vars", "csv", "all-except-targets", "input column names"),
         ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),
         ("--max-levels", "int", "16", "maximum distinct values in a categorical column"),
+        ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, implicit, implicit_residual, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
