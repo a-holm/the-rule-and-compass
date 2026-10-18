@@ -24,6 +24,10 @@ name = "rcsr-bench"
 path = "src/bin/rcsr_bench.rs"
 
 [[bin]]
+name = "cpu_bench"
+path = "src/bin/cpu_bench.rs"
+
+[[bin]]
 name = "rcsr_serve"
 path = "src/bin/rcsr_serve.rs"
 required-features = []

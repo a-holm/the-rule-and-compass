@@ -243,7 +243,9 @@ Ordered by expected gain per unit effort **[planned]**:
 2. **Column-oriented (SoA) evaluation with cached sub-terms.** Move the data
    matrix to one contiguous array per variable and evaluate node-by-node over
    whole columns, caching each node's column. Re-evaluation after a local
-   mutation then touches only the path to the root.
+   mutation then touches only the path to the root. The evaluator itself is
+   implemented and measured in §3.3; caching sub-term columns and wiring it into
+   the search are stage 2.
 3. **Crowding distance** on top of ε-dominance, for a better-spread front.
 4. **Node-level memoisation** across generations (a hash map from sub-term to
    column), which is the practical, incremental version of "quotient by the
@@ -251,6 +253,160 @@ Ordered by expected gain per unit effort **[planned]**:
 5. **Semantic backpropagation mutation** (replace a sub-tree with the library
    member whose semantics is closest to the desired one).
 6. **Warm starts**: persist the front and restart from it.
+
+### 3.3 Structure-of-arrays CPU evaluator (stage 1 of 2)
+
+**[implemented and benchmarked; not yet wired into the search]** —
+`src/eval_soa.rs` compiles one expression to a flat postfix program and
+evaluates that program over whole columns. It is the CPU counterpart of the
+postfix bytecode in `src/gpu.rs`: the per-row pointer walk becomes one linear
+instruction stream over a structure-of-arrays (SoA) buffer.
+
+**Stage 1 of 2.** The search still calls `expr::eval` through
+`search::eval_error`; `src/search.rs` is untouched. Stage 2, after #8 lands,
+will compile each candidate once, evaluate the batch, and fall back to the
+scalar walk whenever `compile` returns `None` (unsupported operator). The
+numbers below therefore measure the evaluator in isolation, not the search's
+wall-clock time.
+
+The API is deliberately small:
+
+```rust
+use rcsr::eval_soa::{compile, eval_batch, eval_batch_scalar, sse};
+
+// cols[var][row], row-major inside each column.
+let program = compile(&tree).expect("supported tree"); // None => fall back
+let mut out = vec![0.0; rows];
+eval_batch(&program, &cols, rows, &mut out);        // AVX if available
+eval_batch_scalar(&program, &cols, rows, &mut out); // portable SoA loop
+let sum_sq = sse(&program, &cols, rows, &y);        // convenience
+```
+
+`compile` computes the postfix stream and its peak operand-stack depth once;
+`eval_batch` allocates the value stack once per call, not per row. `rows` is
+clamped to `out.len()`, so zero rows and short buffers are safe. A trailing
+group shorter than the SIMD width is evaluated by the scalar loop, so any row
+count works.
+
+**Supported operators.** Unary: `neg`, `exp`, `ln`, `abs`, `sqrt`, `sin`,
+`cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `square`,
+`cube`, `floor`, `ceil`, `round`, `sign`. Binary: `add`, `sub`, `mul`, `div`,
+`pow`, `min`, `max`. Ternary: `if`. This covers the whole default primitive set
+plus `min`/`max`.
+
+Everything else returns `None` from `compile` so the caller can fall back:
+`mod`, `atan2`, `erf`, `erfc`, `asinh`, `acosh`, `atanh`, the comparisons and
+logical operators, the constraint operators (`require`/`between`/`constrain`)
+and the meta operators (`complexity`/`variables`/`constants`/`contains`/
+`contains_op`).
+
+**Domain guards.** The guards are copied from `expr::eval` verbatim:
+`exp(a > 700) = +inf`, `ln(a <= 0) = NaN`, `sqrt(a < 0) = NaN`,
+`div(|b| < 1e-12) = NaN`, `pow(negative, non-integer) = NaN`, `min`/`max`
+propagate `NaN`, and `if` selects `cond > 0`. The tests compare every row of a
+deterministic generated corpus against `expr::eval`; the measured maximum
+relative difference is **0** (bit-identical) on the scalar and AVX paths.
+
+**What vectorises.** On `x86_64`, the kernel is compiled with
+`#[target_feature(enable = "avx")]` and selected at runtime with
+`is_x86_feature_detected!("avx")`. The development CPU has AVX but no AVX2 and
+no FMA, so the kernel is four `f64` lanes and needs neither. Nothing requires
+nightly.
+
+| operation | AVX kernel | portable fallback |
+|---|---|---|
+| `add`, `sub`, `mul`, `div`, `neg`, `abs`, `sqrt`, `square`, `cube`, `min`, `max` | vectorised (4 rows per instruction) | scalar per row |
+| `if` | vectorised as a lane mask + blend | per-row select |
+| `exp`, `ln`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `logistic`, `step`, `gauss`, `floor`, `ceil`, `round`, `sign`, `pow` | one scalar `f64` call per lane (no AVX instruction for them) | scalar per row |
+
+Even where the transcendental itself is scalar, the tree walk and the
+per-row recursion are gone; those cases therefore still gain from the flat
+stream, just less than pure arithmetic.
+
+#### Measured: scalar walk vs SoA
+
+`cargo run --release --bin cpu_bench` evaluates four deterministic trees (5, 9,
+15 and 25 nodes) over 1 000, 20 000 and 200 000 rows. The scalar column is the
+existing `expr::eval` tree walk on row vectors (what the search uses today);
+the SoA columns are `eval_batch_scalar` and the runtime-selected AVX path.
+Times are µs for one full pass, best of five runs, each sized to about 50 ms.
+
+| nodes | rows | walk µs | SoA scalar µs | SoA AVX µs | SoA speed-up | AVX speed-up |
+|---:|---:|---:|---:|---:|---:|---:|
+| 5 | 1 000 | 19.37 | 16.16 | 3.56 | 1.20× | **5.44×** |
+| 5 | 20 000 | 381.87 | 324.25 | 72.09 | 1.18× | **5.30×** |
+| 5 | 200 000 | 4 106.38 | 3 322.97 | 742.16 | 1.24× | **5.53×** |
+| 9 | 1 000 | 59.93 | 48.87 | 34.58 | 1.23× | **1.73×** |
+| 9 | 20 000 | 1 219.78 | 970.00 | 688.92 | 1.26× | **1.77×** |
+| 9 | 200 000 | 12 185.48 | 9 764.19 | 8 217.21 | 1.25× | **1.48×** |
+| 15 | 1 000 | 131.20 | 102.61 | 82.62 | 1.28× | **1.59×** |
+| 15 | 20 000 | 2 613.77 | 2 087.46 | 1 572.26 | 1.25× | **1.66×** |
+| 15 | 200 000 | 29 489.78 | 20 722.41 | 16 505.77 | 1.42× | **1.79×** |
+| 25 | 1 000 | 235.90 | 215.96 | 151.77 | 1.09× | **1.55×** |
+| 25 | 20 000 | 5 020.49 | 4 295.85 | 3 063.77 | 1.17× | **1.64×** |
+| 25 | 200 000 | 49 051.38 | 43 449.00 | 29 596.99 | 1.13× | **1.66×** |
+
+Measured on the development machine in §4.1 (AVX, no AVX2/FMA). The host is
+shared, so each cell is the minimum over eight alternating runs of
+`cpu_bench`; an individual run can be several percent slower. The 5-node tree
+is pure arithmetic and shows the ceiling of the approach. The 9-, 15- and
+25-node trees mix arithmetic with `sin`/`cos`/`exp`/`tanh`, which AVX alone
+cannot vectorise, so their 1.5–1.8× is the more realistic range for search
+candidates.
+
+**Agreement:** maximum relative difference against the scalar tree walk is
+`0.0` for both SoA paths on all twelve tree/row combinations (same `f64`
+operations, same guards). The benchmark prints this check on every run.
+
+The 200 000-row cases are memory-bound and noisier than the smaller ones; the
+trend that matters is the AVX speed-up over the existing walk, which grows with
+the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
+less because AVX alone cannot vectorise those functions.
+
+#### Opt-in codegen: `target-cpu=native` and PGO
+
+Neither flag is forced in the repository; the default build is portable. Both
+are worth trying on the machine that will run the search.
+
+```sh
+# Native code generation (may produce a binary that only runs on this CPU).
+cd my-version
+RUSTFLAGS="-C target-cpu=native" cargo build --release --bin cpu_bench
+./target/release/cpu_bench
+```
+
+Across the twelve tree/row cells, `target-cpu=native` changed the AVX
+evaluation time by between −2 % and +8 % relative to the default build, with no
+consistent direction (for example 15 nodes × 200 000 rows: 16.51 ms default vs
+15.86 ms native; 5 nodes × 1 000 rows: 3.56 µs vs 3.64 µs). The explicit
+intrinsics are selected at runtime, so this flag mostly affects the surrounding
+scalar code. Keep it as an opt-in recipe rather than a requirement; it did not
+change the agreement result (still exactly zero difference).
+
+PGO needs the `llvm-tools` component (`rustup component add llvm-tools-preview`).
+Instrument with a representative workload, merge the profiles, then rebuild
+with the merged profile; combine with `target-cpu=native` if desired:
+
+```sh
+cd my-version
+PROFDATA=$(find "$(rustc --print sysroot)" -name llvm-profdata | head -1)
+PGO=/mnt/lager/tmp/opencode/pgo
+rm -rf "$PGO" && mkdir -p "$PGO"
+
+RUSTFLAGS="-Cprofile-generate=$PGO" cargo build --release --bin cpu_bench
+./target/release/cpu_bench >/dev/null
+
+"$PROFDATA" merge -o "$PGO/merged.profdata" "$PGO"
+RUSTFLAGS="-Cprofile-use=$PGO/merged.profdata \
+           -Cllvm-args=-pgo-warn-missing-function" \
+    cargo build --release --bin cpu_bench
+```
+
+The benchmark is a small, branch-heavy interpreter, so PGO mainly helps the
+instruction dispatch; the explicit AVX intrinsics do not depend on it. As with
+`target-cpu=native`, keep these flags in the build recipe rather than in a
+committed configuration, so a release built on one machine still runs on
+another.
 
 ---
 
@@ -306,10 +462,11 @@ GPU path must be FP32, with FP64 reserved for final verification of survivors).
    speed-up over the reference `f64` tree walk on the RTX 3060 (**done**;
    see `docs/gpu-backend.md`). Wiring it into the generation loop is the next
    step.
-5. Next: SoA data + column-oriented evaluation with cached sub-term columns, and
-   explicit 4-wide `f64` SIMD for the arithmetic nodes.
-6. Compile with `-C target-cpu=native`; consider PGO. Both are free wins of a
-   few percent on branchy code. **[not yet done]**
+5. SoA data + column-oriented evaluation: the standalone evaluator with explicit
+   4-wide `f64` AVX is implemented and measured in §3.3; wiring it into the
+   search and caching sub-term columns is stage 2. **[stage 1 done]**
+6. `-C target-cpu=native` and PGO recipes are documented and measured once in
+   §3.3; neither is forced in the repository. **[recipes documented]**
 
 **On the DGX Spark [planned]**
 
