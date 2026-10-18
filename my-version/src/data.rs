@@ -1867,6 +1867,36 @@ mod tests {
         assert_eq!(p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![6.0]);
     }
 
+    /// `zero` is the literal fill, with no training statistic involved.
+    #[test]
+    fn zero_fill_sets_gaps_to_zero() {
+        let t = table("t,x,y\n0,1,0\n1,NA,0\n2,3,0\n3,NA,0\n4,5,0\n5,6,0\n");
+        let p = prepare_full_with(
+            &t,
+            &["x".into()],
+            "y",
+            &temporal(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Zero,
+                center: Center::None,
+                scale: Scale::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.train.x.iter().map(|r| r[0]).collect::<Vec<_>>(),
+            vec![1.0, 0.0, 3.0, 0.0]
+        );
+        assert_eq!(
+            p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(),
+            vec![5.0, 6.0]
+        );
+        assert_eq!(p.prep.rows_filled, 2);
+        assert_eq!(p.prep.rows_dropped_missing, 0);
+    }
+
     /// `interpolate` uses the two observed neighbours inside a side and drops a
     /// gap at an edge rather than extrapolating.
     #[test]
