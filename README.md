@@ -113,7 +113,7 @@ cat examples/line.csv | rcsr --data - --target y --top 3
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
-     [--metric absolute|squared|correlation] [--generations N] [--islands I]
+     [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
@@ -228,6 +228,9 @@ formulas, what is still missing, and the literature.
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
   sin cos tan sinh cosh tanh logistic gauss square cube`, `if`), with domain
   guards;
+- **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
+  maximum, signed, log-squashed, rank correlation, interquartile, slope,
+  AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
 - **Levenberg–Marquardt constant fitting** using adjoint (backpropagation)
   derivatives — one backward sweep gives every constant's gradient;
 - an **island-model, multi-objective** evolutionary search over an

@@ -195,6 +195,25 @@ rcsr ... --null-runs 19
 
 ---
 
+### 3.8 Pick a metric that matches the loss you care about
+The metric decides what "good" means, so choosing it is itself a modelling
+choice. `--metric` selects one of sixteen objectives:
+
+* `absolute` (default) and `squared` — squared punishes large residuals hard;
+* `median` and `interquartile` — robust to a few outliers;
+* `log_squashed` — squared-like but with bounded influence;
+* `maximum` — minimise the single worst row;
+* `signed` — penalise a consistent bias;
+* `correlation` and `rank_correlation` — care about shape, not level or offset;
+* `slope` — match the trend rather than the level;
+* `auc`, `log_loss`, `hinge` — classification; the target is read as two classes
+  and the model output as a logit;
+* `aic`, `aicc`, `bic` — fit measured against the number of fitted constants, so
+  parsimony drives the front directly instead of only being reported.
+
+AICc and BIC are printed for every solution regardless of the search metric, so
+you can compare them without changing the objective.
+
 ## 4. What `rcsr` reports today
 
 Every solution carries:
