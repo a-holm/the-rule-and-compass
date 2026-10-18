@@ -94,7 +94,25 @@ pub struct Baselines {
     /// k-nearest-neighbour regression; `knn_k` is the `k` actually used.
     pub knn: BaselineError,
     pub knn_k: usize,
+    /// #69: training rows the k-NN baseline searched for neighbours. Equal to
+    /// the training size when the run was exact; otherwise the cap.
+    pub knn_reference_rows: usize,
+    /// #69: true when the exact all-rows search was replaced by deterministic
+    /// reference and query subsamples.
+    pub knn_capped: bool,
 }
+
+/// #69: default cap on the k-NN baseline's reference set (and on the scored
+/// query rows). At `n <= cap` the baseline is the exact all-rows algorithm.
+///
+/// The cost is `O(cap² log cap)` instead of `O(n² log n)`. 4096 is the knee of
+/// the measured curve: on 6 inputs, 200 000 rows and `--generations 0`, the
+/// whole run takes 3.5 s at 4096 versus 10.4 s at 8192 (and 19 s for the exact
+/// 15 000-row training set at 20 000 rows). The cap trades some density for
+/// that speed: above it the k-NN error is an estimate on the subsample and is
+/// somewhat larger (a weaker, easier-to-beat baseline) than the exact one. Pass
+/// `--baseline-samples` higher when a tighter baseline matters more than time.
+pub const KNN_REFERENCE_CAP: usize = 4096;
 
 /// Number of neighbours used by the baseline k-NN learner.
 ///
@@ -109,7 +127,33 @@ impl Baselines {
     /// Fit and score all three baselines. `test_folds` is one sample per test
     /// block; the reported test error is the mean over blocks, exactly as for a
     /// searched model. An empty `test_folds` yields an infinite test error.
+    ///
+    /// #69: the k-NN baseline uses at most [`KNN_REFERENCE_CAP`] reference rows
+    /// (seed 0). For larger data use [`Baselines::fit_sampled`] to pass the
+    /// run's seed, or `0` for the exact all-rows path.
     pub fn fit(train: &Sample, test_folds: &[Sample], metric: Metric) -> Baselines {
+        Baselines::fit_sampled(train, test_folds, metric, KNN_REFERENCE_CAP, 0)
+    }
+
+    /// #69: as [`Baselines::fit`], but with an explicit cap on the k-NN
+    /// baseline and the seed that chooses its deterministic subsamples.
+    ///
+    /// `baseline_samples = 0` means "exact": every training row is a neighbour
+    /// and every training/test row is scored, which is the behaviour before
+    /// issue #69. At `train.len() <= baseline_samples` the exact algorithm is
+    /// used too, so small-data numbers are bit-identical.
+    ///
+    /// Above the cap, the reference set (the rows neighbours are drawn from)
+    /// and the scored query rows are both deterministic subsamples of size
+    /// `min(cap, rows)`, drawn from `seed`. The reported train/test error is
+    /// then an estimate on those subsamples rather than on every row.
+    pub fn fit_sampled(
+        train: &Sample,
+        test_folds: &[Sample],
+        metric: Metric,
+        baseline_samples: usize,
+        seed: u32,
+    ) -> Baselines {
         // Mean.
         let mean = if train.is_empty() {
             f64::NAN
@@ -130,15 +174,120 @@ impl Baselines {
 
         // k-NN.
         let k = knn_k(train.len());
-        let knn_err = score_folds(train, test_folds, metric, &|x| knn_predict(train, x, k));
+        let capped = baseline_samples > 0 && train.len() > baseline_samples;
+        let knn_err = if capped {
+            knn_sampled(train, test_folds, metric, k, baseline_samples, seed)
+        } else {
+            score_folds(train, test_folds, metric, &|x| knn_predict(train, x, k))
+        };
+        let knn_reference_rows = if capped {
+            baseline_samples.min(train.len())
+        } else {
+            train.len()
+        };
 
         Baselines {
             mean: mean_err,
             linear: linear_err,
             knn: knn_err,
             knn_k: k,
+            knn_reference_rows,
+            knn_capped: capped,
         }
     }
+
+    /// #69: the extra fields of the `baselines.knn` object in `--json` /
+    /// `--ndjson`, so the text and machine-readable surfaces cannot drift.
+    pub fn knn_json_extra(&self) -> String {
+        format!(
+            "\"reference_rows\":{},\"capped\":{}",
+            self.knn_reference_rows, self.knn_capped
+        )
+    }
+}
+
+/// #69: exact k-NN scoring on deterministic reference and query subsamples.
+///
+/// The reference set is sorted by original row index, so ties in
+/// [`knn_predict`] break exactly as they would on the full sample (the lower
+/// original row wins). Each test fold draws its own query subsample.
+fn knn_sampled(
+    train: &Sample,
+    test_folds: &[Sample],
+    metric: Metric,
+    k: usize,
+    cap: usize,
+    seed: u32,
+) -> BaselineError {
+    let take = cap.min(train.len());
+    let ref_idx = sample_indices(train.len(), take, seed ^ 0x6b6e_6e01);
+    let reference = subset_sample(train, &ref_idx);
+
+    let train_error = score_query_subset(train, &reference, metric, k, take, seed ^ 0x7175_6572);
+    let test_error = if test_folds.is_empty() {
+        f64::INFINITY
+    } else {
+        let mut acc = 0.0;
+        for (f, fold) in test_folds.iter().enumerate() {
+            let fold_seed = seed
+                ^ 0x666f_6c64u32
+                ^ (0x9e37_79b9u32.wrapping_mul(f as u32 + 1));
+            acc += score_query_subset(fold, &reference, metric, k, take, fold_seed);
+        }
+        acc / test_folds.len() as f64
+    };
+    BaselineError {
+        train_error,
+        test_error,
+    }
+}
+
+/// Score `query` on `take` deterministic rows against the fixed `reference`.
+fn score_query_subset(
+    query: &Sample,
+    reference: &Sample,
+    metric: Metric,
+    k: usize,
+    take: usize,
+    seed: u32,
+) -> f64 {
+    if query.is_empty() {
+        return metrics::score(&[], &[], metric);
+    }
+    let take = take.min(query.len());
+    let idx = sample_indices(query.len(), take, seed);
+    let pred: Vec<f64> = idx
+        .iter()
+        .map(|&i| knn_predict(reference, &query.x[i], k))
+        .collect();
+    let y: Vec<f64> = idx.iter().map(|&i| query.y[i]).collect();
+    metrics::score(&pred, &y, metric)
+}
+
+/// `take` distinct row indices from `0..n`, deterministic in `seed` and
+/// returned in ascending order (so neighbour tie-breaking is stable).
+fn sample_indices(n: usize, take: usize, seed: u32) -> Vec<usize> {
+    let take = take.min(n);
+    if take == n {
+        return (0..n).collect();
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    let mut rng = Mt::new(seed);
+    // Partial Fisher–Yates: the first `take` slots become a uniform sample.
+    for i in 0..take {
+        let j = i + rng.usize_below(n - i);
+        idx.swap(i, j);
+    }
+    idx.truncate(take);
+    idx.sort_unstable();
+    idx
+}
+
+/// Copy the selected rows into a fresh unweighted sample.
+fn subset_sample(s: &Sample, idx: &[usize]) -> Sample {
+    let x: Vec<Vec<f64>> = idx.iter().map(|&i| s.x[i].clone()).collect();
+    let y: Vec<f64> = idx.iter().map(|&i| s.y[i]).collect();
+    Sample::new(x, y)
 }
 
 /// Score one predictor on the training sample and on each test fold. The test

@@ -230,7 +230,19 @@ data did not already contain.
 ```sh
 rcsr --data data.csv --target y --vars x1,x2
 # null baselines (absolute): mean train=2.003 test=2.250 | linear train=0.000 test=0.000 | 5-NN train=0.130 test=0.250
+# knn baseline: cap=4096 reference_rows=2500 capped=false
 ```
+
+**Cost and cap.** The exact k-NN baseline searches and sorts every training row
+for every scored row, which is `O(n² log n)`. Up to `--baseline-samples` rows
+(default **4096**) that is what `rcsr` does, so small-data numbers are exactly
+the ones from before issue #69. Above the cap it draws a deterministic
+reference subsample of `cap` rows (seeded from `--seed`) for the neighbours and
+scores a deterministic subsample of `cap` query rows, both for training and for
+each test fold; ties still break by original row order. The reported error is
+then an estimate on those subsamples, but its cost no longer grows with `n`.
+`--baseline-samples 0` restores the exact all-rows path (slow on large data);
+`--json` carries `baselines.knn.reference_rows` and `baselines.knn.capped`.
 
 ### 3.6 Out-of-distribution / extrapolation test
 Train on part of the input range and test outside it, or hold out an entire
