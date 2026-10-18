@@ -411,6 +411,85 @@ Wiring the LM fitter's value/Jacobian passes onto the same SoA layout is the
 next real win; it is deliberately out of scope here, where the requirement is
 that every existing fit and metric path keeps its exact behaviour.
 
+#### The exact final-SSE reuse (#87)
+
+The fitter's final SSE is the score for a `squared` fit on the same rows, so the
+search reuses it instead of scoring the fitted tree a second time. This changes
+no fit and no trajectory. The **initial** SSE is deliberately still computed by
+the standalone `sse(c)`: using the first `gn_step`'s residual sum as the
+acceptance baseline changed the LM trajectory on guard-free trees, so that
+reuse was reverted. `tests/trajectory.rs` pins the complete front for the
+documented baseline command, so a future shift fails loudly.
+
+The remaining final-reuse saving is small. The 12 `gn_step` sweeps also run the
+adjoint `backward` pass and build `JᵀJ`/`Jᵀr`, so they cost several times a
+forward `sse`; the one removed scoring sweep is the cheap kind. End-to-end it is
+within measurement noise on `w2.csv` (the earlier 2.6–4.8 % figure included the
+now-reverted initial reuse). The reuse is exact and applies to `squared` only —
+this crate has no `rmse` metric — and is refused when the fit and score rows
+differ, the tree folded constants, the sample is weighted/multi-output, or a
+guard makes the fitted SSE non-finite. `fit.rs::value_of` now applies the two
+guards that can leave a *finite* fitter value where the scorer rejects the
+tree — `Exp > 700 → +inf` and `Div |denominator| < 1e-12 → NaN` — and the
+fitter rejects `x.len() != y.len()`. The other operators already produce a
+non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
+`Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
+multi-output search trajectory without fixing a finite-vs-infinite divergence.
+
+#### Screening the fit rows: `--fit-samples`
+
+The fitter reads every training row on each LM sweep, so the cheapest way to
+make it smaller is to spend those sweeps on fewer rows. `--fit-samples N` is a
+**within-generation successive-halving** screen (Karnin et al. 2013; Jamieson &
+Talwalkar 2016), not just a cheaper refit:
+
+1. every offspring is fitted and scored on a **fresh deterministic** `N`-row
+   subset of the generation's sample (a salted stream, independent of
+   `--predictor-samples`; the subset is redrawn every generation);
+2. the top **1/16** of that screening ranking is promoted;
+3. each promoted candidate is **refitted and re-scored on all training rows**;
+4. the next population is selected from the full-data parents plus the promoted
+   offspring, and only full-data scores enter the archive.
+
+There is no Hyperband schedule across generations: candidates are replaced, not
+trained longer, so one promotion round per generation is the relevant
+algorithm. `0` (the default) is the historical full-data path bit for bit; a
+request at least as large as the sample, or `--no-fit`, is an exact no-op. The
+flag is orthogonal to `--predictor-samples`, which also changes the scoring
+rows.
+
+This is a **throughput-for-statistics trade, not a free win**. Screening `P`
+offspring on `N` rows and keeping the best is optimistically biased (the
+winner's curse); promotion and full-data selection reduce that bias but cannot
+remove it, because the candidates that never make the top 1/16 are still lost.
+On **deterministic, noiseless data the screen is a pure loss**: there is no
+noise for the extra rows to average out, so it only spends fewer rows on a
+problem a full fit would solve exactly. Use it when the fitter dominates the
+run and the data are noisy enough that an `N`-row subset is representative.
+
+Measured on the `w2.csv` workload (2 000 rows, 1 500 train, 30 generations,
+pop 100, seed 1, min of three `%U` runs on a shared host), with `m = 200` and a
+1/16 promotion fraction:
+
+| config | full data | `--fit-samples 200` | speed-up | refitted best error |
+|---|---:|---:|---:|---|
+| G=30, absolute | 5.03 s | **2.11 s** | **2.38×** | 0.1633 → **0.0121** (13.5× better) |
+| G=30, squared | 4.58 s | **1.65 s** | **2.78×** | **0.0259 → 0.0398** (1.54× worse) |
+| G=10, absolute | 1.09 s | **0.50 s** | **2.18×** | 0.1762 → **0.2261** (1.28× worse) |
+| G=10, squared | 1.60 s | **0.37 s** | **4.32×** | **0.0259 → 0.0869** (3.36× worse) |
+
+The baselines are the full run's own best shapes **refitted** on all rows, not
+their unrefitted errors (the earlier draft compared against the unrefitted
+0.0865, which was wrong). On the squared metric — the one the 0.0259 baseline
+comes from — the promoted screen is **1.54× worse at G=30** and **3.36× worse
+at G=10**, so the quality cost is visible next to the speed-up. The G=30
+absolute error improves sharply on this seed (0.1633 → 0.0121), which is why
+the delta is reported per metric and not as a general quality claim; the
+recovered squared law is an 11-node expression, while the absolute winner is a
+22-node polynomial/sine form. A larger promotion fraction (1/8) reduced the
+squared error to 0.0042 but erased most of the speed-up (4.03 s, 1.25×), so the
+shipped fraction is 1/16. These are one seed each; the flag stays opt-in.
+
 #### Opt-in codegen: `target-cpu=native` and PGO
 
 Neither flag is forced in the repository; the default build is portable. Both

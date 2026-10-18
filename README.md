@@ -332,6 +332,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--fit-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--format text|json|ndjson] [--progress]
@@ -700,6 +701,15 @@ list and the recorded results.
 - **subsampled fitness** (`--predictor-samples N`): each generation scores and
   fits candidates on `N` training rows drawn without replacement, while the
   archive and every reported error are re-scored on the full training set;
+- **screened constant fitting** (`--fit-samples N`): within each generation,
+  all offspring are fitted and scored on a fresh deterministic `N`-row subset,
+  the top 1/16 are promoted to a full-data refit and re-score, and the next
+  population and archive are selected from those full-data scores. This is a
+  throughput-for-statistics trade, not a free win: the sampled best is
+  optimistically biased (the winner's curse), promotion reduces but does not
+  remove it, and on deterministic, noiseless data the screen is a pure loss.
+  `0` (the default) keeps the historical path; the flag is independent of
+  `--predictor-samples`;
 - **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
   simplified, fitted and inserted into the archive and every island before
   generation 1; a seed is an elite, kept even above `--max-complexity`;
