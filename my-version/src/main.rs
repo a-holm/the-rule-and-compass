@@ -196,6 +196,8 @@ SEARCH:
                              add,sub,mul,div,sin,exp,floor,min,max
                              conditions: less,equal,greater,and,or,xor,not
                              constraints: between,require,constrain
+                             meta: complexity,variables,constants,contains,
+                             contains_op (describe the argument's structure)
                              (full set: `rcsr schema` -> operators list)
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
@@ -290,7 +292,7 @@ fn schema() -> String {
         ("--complexity-weights", "csv", "var=1,const=1", "terminal weights name=weight; keys var, const and depth (depth defaults to 0)"),
         ("--depth-weight", "float", "0", "extra cost per nesting level (edges below the root)"),
         ("--seed", "int", "0", "RNG seed"),
-        ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators and constraints (see \"operators\")"),
+        ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators, constraints and meta operators (see \"operators\")"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
@@ -727,7 +729,13 @@ fn main() {
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
-                cfg.ops = Op::parse_list(&val!());
+                match Op::parse_list_checked(&val!()) {
+                    Ok(ops) => cfg.ops = ops,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
                 ops_set = true;
             }
             "--eval-expr" => eval_expr = Some(val!()),

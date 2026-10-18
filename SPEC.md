@@ -46,13 +46,14 @@ rcsr --data <file.csv>
 Expression **tree** over these primitives:
 
 - terminals: `Const` (real value), `Input(i)`
-- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh, Not, Require, Constrain`
+- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh, Not, Require, Constrain, Complexity, Variables, Constants, Contains, ContainsOp`
 - binary: `Add, Sub, Mul, Div, Pow, Mod, Min, Max, Atan2, Equal, Less, LessOrEqual, Greater, GreaterOrEqual, And, Or, Xor`
 - ternary: `If(cond, a, b)` where `cond` is `a > 0`, `Between(x, lo, hi)`
 
-`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2` and the whole conditional
+`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`, the whole conditional
 family (`Equal`…`GreaterOrEqual`, `And`/`Or`/`Xor`/`Not`,
-`Require`/`Between`/`Constrain`) are **opt-in** primitives: they are not part of
+`Require`/`Between`/`Constrain`) and the meta operators
+(`Complexity`…`ContainsOp`) are **opt-in** primitives: they are not part of
 the default operator set but are accepted by `--ops` and listed by
 `rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
 precision with no external crates, and the Levenberg–Marquardt adjoint pass uses
@@ -81,6 +82,26 @@ rejected. While satisfied they pass their argument through unchanged:
 | `constrain(x)` | `x` when `x > 0` (the unary spelling of `require`) | `NaN` |
 | `between(x, lo, hi)` | `x` when `lo <= x <= hi` | `NaN` |
 
+**Meta operators** describe the *shape* of their argument instead of evaluating
+it, so their value is the same on every row:
+
+| op | returns |
+|---|---|
+| `complexity(e)` | the node count of `e` |
+| `variables(e)` | the number of **distinct** input variables appearing in `e` |
+| `constants(e)` | the number of constant leaves in `e` |
+| `contains(e)` | `1` if `e` contains at least one input variable, else `0` |
+| `contains_op(e)` | `1` if `e` contains at least one operator node (i.e. is not a bare leaf), else `0` |
+
+They are unary, computed **once** when the node is built (or when `simplify`
+changes the argument's shape) and cached in `Node::val`; `eval` returns that
+cache without walking the argument. A meta node has no fitted constant slot and
+a zero gradient in the adjoint sweep, exactly like `floor`/`step`, so
+`count_constants` never counts it. `complexity` and `variables` count nested
+meta nodes and their arguments like ordinary structure. See
+[`docs/meta-operators.md`](docs/meta-operators.md) for the cache rule and the
+caveat that a meta operator describes the model, not the data.
+
 Evaluation is a recursive `f64` evaluator with **domain guards**, so
 out-of-domain operations yield a non-finite value (treated as a hard failure):
 `Ln(a<=0) -> NaN`, `Sqrt(a<0) -> NaN`, `Div(|b|<eps) -> NaN`,
@@ -105,7 +126,12 @@ sum     := term (('+' | '-') term)*
 term    := unary (('*' | '/') unary)*
 unary   := ('-' | '+' | 'not') unary | power
 power   := primary ('^' unary)?          // right associative
-primary := number | name '(' expr (',' expr)* ')' | name | '(' expr ')'
+primary := number
+         | meta '(' expr ')'
+         | name '(' expr (',' expr)* ')'
+         | name
+         | '(' expr ')'
+meta    := 'complexity' | 'variables' | 'constants' | 'contains' | 'contains_op'
 ```
 
 Precedence, loosest to tightest: `or`, `xor`, `and`, comparisons
@@ -123,8 +149,10 @@ the same tree. Function names are the primitives above, via
 `and`/`or`/`not`). Variable names resolve against the table's column names,
 then the `x0`, `x1`, … fallback; `pi` and `e` are constants when they are not
 declared variables. Unknown names, unmatched parentheses and wrong argument
-counts produce a `ParseError` carrying the **1-based column**. `--eval-expr`
-exposes the parser on the command line.
+counts produce a `ParseError` carrying the **1-based column**. The meta
+operators are ordinary unary calls in this grammar
+(`complexity(x1 * x2)`), and the parsed node caches the structural value.
+`--eval-expr` exposes the parser on the command line.
 
 ## 5. Complexity
 

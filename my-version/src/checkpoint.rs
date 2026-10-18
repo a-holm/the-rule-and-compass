@@ -153,6 +153,11 @@ const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Require,
     Op::Between,
     Op::Constrain,
+    Op::Complexity,
+    Op::Variables,
+    Op::Constants,
+    Op::Contains,
+    Op::ContainsOp,
 ];
 
 fn op_by_index(i: usize) -> Option<Op> {
