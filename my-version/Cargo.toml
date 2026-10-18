@@ -1,0 +1,19 @@
+[package]
+name = "rule-and-compass"
+version = "0.1.0"
+edition = "2021"
+description = "A symbolic-regression engine: evolve short equations that fit data"
+license = "MIT"
+
+[lib]
+name = "rcsr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcsr"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
