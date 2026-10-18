@@ -9,9 +9,14 @@
 //! # Grammar
 //!
 //! ```text
-//! expr    := term (('+' | '-') term)*
+//! expr    := or_expr
+//! or_expr := xor_expr ('or' xor_expr)*
+//! xor_expr:= and_expr ('xor' and_expr)*
+//! and_expr:= cmp_expr ('and' cmp_expr)*
+//! cmp_expr:= sum (('<' | '<=' | '>' | '>=' | '==') sum)?   // non-associative
+//! sum     := term (('+' | '-') term)*
 //! term    := unary (('*' | '/') unary)*
-//! unary   := ('-' | '+') unary | power
+//! unary   := ('-' | '+' | 'not') unary | power
 //! power   := primary ('^' unary)?          // right associative
 //! primary := number
 //!          | name '(' expr (',' expr)* ')' // function call, any arity
@@ -19,8 +24,17 @@
 //!          | '(' expr ')'
 //! ```
 //!
-//! Operator precedence, tightest first: `^`, unary `-`/`+`, `*`/`/`, `+`/`-`.
-//! So `-x^2` is `-(x^2)` and `2^3^2` is `2^(3^2)`.
+//! Operator precedence, loosest to tightest:
+//! `or` < `xor` < `and` < comparisons `< <= > >= ==` < `+`/`-` < `*`/`/` <
+//! unary `-`/`+`/`not` < `^`. So `-x^2` is `-(x^2)`, `2^3^2` is `2^(3^2)` and
+//! `x + 1 > y * 2` is `(x + 1) > (y * 2)`.
+//!
+//! `or`, `xor`, `and` are left-associative. Comparisons are **non-associative**:
+//! `a < b < c` is a syntax error, so write `(a < b) and (b < c)`. `not` is a
+//! prefix operator at the unary level, so `not x > 0` parses as `(not x) > 0`
+//! and `(not (x > 0))` is the negated comparison. `and`/`or`/`xor`/`not` are
+//! reserved words in operator position; a column with one of those names is
+//! still reachable through the `xN` fallback.
 //!
 //! # Names
 //!
@@ -107,6 +121,133 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Result<Node, ParseError> {
+        self.or_expr()
+    }
+
+    fn or_expr(&mut self) -> Result<Node, ParseError> {
+        let mut lhs = self.xor_expr()?;
+        while self.peek_infix_keyword() == Some(Op::Or) {
+            self.skip_ws();
+            self.ident();
+            let rhs = self.xor_expr()?;
+            lhs = node(Op::Or, vec![lhs, rhs]);
+        }
+        Ok(lhs)
+    }
+
+    fn xor_expr(&mut self) -> Result<Node, ParseError> {
+        let mut lhs = self.and_expr()?;
+        while self.peek_infix_keyword() == Some(Op::Xor) {
+            self.skip_ws();
+            self.ident();
+            let rhs = self.and_expr()?;
+            lhs = node(Op::Xor, vec![lhs, rhs]);
+        }
+        Ok(lhs)
+    }
+
+    fn and_expr(&mut self) -> Result<Node, ParseError> {
+        let mut lhs = self.cmp_expr()?;
+        while self.peek_infix_keyword() == Some(Op::And) {
+            self.skip_ws();
+            self.ident();
+            let rhs = self.cmp_expr()?;
+            lhs = node(Op::And, vec![lhs, rhs]);
+        }
+        Ok(lhs)
+    }
+
+    /// One (non-associative) comparison: `sum (< | <= | > | >= | ==) sum`.
+    fn cmp_expr(&mut self) -> Result<Node, ParseError> {
+        let lhs = self.sum()?;
+        self.skip_ws();
+        let op = match self.peek() {
+            Some(b'<') => {
+                self.pos += 1;
+                if self.peek() == Some(b'=') {
+                    self.pos += 1;
+                    Op::LessOrEqual
+                } else {
+                    Op::Less
+                }
+            }
+            Some(b'>') => {
+                self.pos += 1;
+                if self.peek() == Some(b'=') {
+                    self.pos += 1;
+                    Op::GreaterOrEqual
+                } else {
+                    Op::Greater
+                }
+            }
+            Some(b'=') => {
+                if self.src.get(self.pos + 1) != Some(&b'=') {
+                    return Err(self.err("expected '==' (a single '=' is not an operator)"));
+                }
+                self.pos += 2;
+                Op::Equal
+            }
+            _ => return Ok(lhs),
+        };
+        let rhs = self.sum()?;
+        let n = node(op, vec![lhs, rhs]);
+        // Comparisons do not chain: `a < b < c` is a syntax error.
+        self.skip_ws();
+        if matches!(self.peek(), Some(b'<') | Some(b'>') | Some(b'=')) {
+            return Err(self.err(
+                "comparisons are non-associative; combine them with 'and'/'or' or parentheses",
+            ));
+        }
+        Ok(n)
+    }
+
+    /// If the next token (after whitespace) is one of the infix keyword
+    /// operators `and`, `or`, `xor`, return it; otherwise return `None`. Does
+    /// not consume anything.
+    fn peek_infix_keyword(&self) -> Option<Op> {
+        let mut p = self.pos;
+        while matches!(
+            self.src.get(p),
+            Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+        ) {
+            p += 1;
+        }
+        if !matches!(self.src.get(p), Some(c) if is_ident_start(*c)) {
+            return None;
+        }
+        let start = p;
+        while matches!(self.src.get(p), Some(c) if is_ident_char(*c)) {
+            p += 1;
+        }
+        match std::str::from_utf8(&self.src[start..p])
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "and" => Some(Op::And),
+            "or" => Some(Op::Or),
+            "xor" => Some(Op::Xor),
+            _ => None,
+        }
+    }
+
+    /// Whether the next token is exactly the identifier `kw` (case-insensitive),
+    /// without consuming it.
+    fn at_keyword(&self, kw: &str) -> bool {
+        let mut p = self.pos;
+        if !matches!(self.src.get(p), Some(c) if is_ident_start(*c)) {
+            return false;
+        }
+        let start = p;
+        while matches!(self.src.get(p), Some(c) if is_ident_char(*c)) {
+            p += 1;
+        }
+        std::str::from_utf8(&self.src[start..p])
+            .map(|w| w.eq_ignore_ascii_case(kw))
+            .unwrap_or(false)
+    }
+
+    fn sum(&mut self) -> Result<Node, ParseError> {
         let mut lhs = self.term()?;
         loop {
             self.skip_ws();
@@ -159,7 +300,13 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 self.unary()
             }
-            _ => self.power(),
+            _ => {
+                if self.at_keyword("not") {
+                    self.ident();
+                    return Ok(node(Op::Not, vec![self.unary()?]));
+                }
+                self.power()
+            }
         }
     }
 
@@ -427,6 +574,19 @@ mod tests {
             "x ^ 2 ^ 3",
             "mod(x, y)",
             "sqrt(abs(x))",
+            "x > 0",
+            "x <= y",
+            "x == 0",
+            "(x > 0) and (y < 1)",
+            "x > 0 or y > 0",
+            "(x > 0) xor (y > 0)",
+            "not(x > 0)",
+            "not x",
+            "between(x, -1, 1)",
+            "require(x > 0)",
+            "constrain(x)",
+            "x * greater(x, 0)",
+            "if((x > 0) and (y > 0), x, 0)",
         ];
         let v = vars();
         for s in corpus {
@@ -439,5 +599,45 @@ mod tests {
                 "'{s}' printed as '{printed}' did not round-trip"
             );
         }
+    }
+
+    #[test]
+    fn conditional_precedence_and_associativity() {
+        // Loosest to tightest: or < xor < and < comparisons < sum < product <
+        // unary < power.
+        assert!(same(&p("x > 0 and y > 0 or z > 0"), &p("((x > 0) and (y > 0)) or (z > 0)")));
+        assert!(same(&p("x > 0 or y > 0 and z > 0"), &p("(x > 0) or ((y > 0) and (z > 0))")));
+        assert!(same(&p("x > 0 xor y > 0 and z > 0"), &p("(x > 0) xor ((y > 0) and (z > 0))")));
+        assert!(same(&p("x and y and z"), &p("(x and y) and z"))); // left associative
+        assert!(same(&p("x + 1 > y * 2"), &p("(x + 1) > (y * 2)")));
+        assert!(same(&p("-x > 0"), &p("(-x) > 0")));
+        // `not` binds at the unary level, so it clings to one operand.
+        assert!(same(&p("not x > 0"), &p("(not x) > 0")));
+        assert!(same(&p("not (x > 0)"), &p("not(x > 0)")));
+        // `>=` / `<=` / `==` produce the right operators.
+        assert_eq!(p("x >= 0").op, Op::GreaterOrEqual);
+        assert_eq!(p("x <= 0").op, Op::LessOrEqual);
+        assert_eq!(p("x == 0").op, Op::Equal);
+        assert_eq!(p("x and y").op, Op::And);
+        assert_eq!(p("x or y").op, Op::Or);
+        assert_eq!(p("x xor y").op, Op::Xor);
+        assert_eq!(p("between(x, y, z)").op, Op::Between);
+        assert_eq!(p("require(x)").op, Op::Require);
+        assert_eq!(p("constrain(x)").op, Op::Constrain);
+        // Keyword matching is case-insensitive, like function names.
+        assert_eq!(p("x AND y").op, Op::And);
+        assert_eq!(p("NOT x").op, Op::Not);
+    }
+
+    #[test]
+    fn comparisons_are_non_associative() {
+        assert!(parse("x < y < z", &vars()).is_err());
+        assert!(parse("x > y > z", &vars()).is_err());
+        assert!(parse("x == y == z", &vars()).is_err());
+        // A parenthesised chain is fine.
+        assert!(parse("(x < y) and (y < z)", &vars()).is_ok());
+        // A single '=' is not an operator.
+        let e = parse("x = y", &vars()).unwrap_err();
+        assert!(e.message.contains("'=='"), "{}", e.message);
     }
 }

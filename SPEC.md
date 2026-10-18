@@ -46,23 +46,47 @@ rcsr --data <file.csv>
 Expression **tree** over these primitives:
 
 - terminals: `Const` (real value), `Input(i)`
-- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh`
-- binary: `Add, Sub, Mul, Div, Pow, Mod, Min, Max, Atan2`
-- ternary: `If(cond, a, b)` where `cond` is `a > 0`
+- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh, Not, Require, Constrain`
+- binary: `Add, Sub, Mul, Div, Pow, Mod, Min, Max, Atan2, Equal, Less, LessOrEqual, Greater, GreaterOrEqual, And, Or, Xor`
+- ternary: `If(cond, a, b)` where `cond` is `a > 0`, `Between(x, lo, hi)`
 
-`Floor`…`Atanh` and `Mod`/`Min`/`Max`/`Atan2` are **opt-in** primitives: they
-are not part of the default operator set but are accepted by `--ops` and listed
-by `rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
+`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2` and the whole conditional
+family (`Equal`…`GreaterOrEqual`, `And`/`Or`/`Xor`/`Not`,
+`Require`/`Between`/`Constrain`) are **opt-in** primitives: they are not part of
+the default operator set but are accepted by `--ops` and listed by
+`rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
 precision with no external crates, and the Levenberg–Marquardt adjoint pass uses
 the analytic derivative of each operator where one exists (`0` a.e. for
-`floor`/`ceil`/`round`/`sign`/`step`; a documented symmetric subgradient for
-`min`/`max`; `d mod(a,b) = (1, -floor(a/b))` a.e.).
+`floor`/`ceil`/`round`/`sign`/`step`, the comparisons and `not`; a documented
+symmetric subgradient for `min`/`max` and for `and`/`or`/`xor`;
+`d mod(a,b) = (1, -floor(a/b))` a.e.; `1` through a satisfied
+`require`/`constrain`/`between`).
+
+**Comparisons** (`equal`, `less`, `less_or_equal`, `greater`,
+`greater_or_equal`) return `1.0` when the relation holds and `0.0` otherwise;
+`NaN` in either operand gives `NaN`.
+
+**Logical** operators treat a value as true when it is **strictly positive**
+(`0` is false): `and`/`or`/`xor` return `1.0`/`0.0`, `not` negates, and a `NaN`
+operand propagates.
+
+**Constraints** make an infeasible candidate a *hard failure* rather than a
+large finite error: a violated constraint evaluates to a non-finite value, which
+the metric turns into `+inf` (section 6), so the row — and the candidate — is
+rejected. While satisfied they pass their argument through unchanged:
+
+| operator | satisfied | violated |
+|---|---|---|
+| `require(cond)` | `cond` when `cond > 0` | `NaN` |
+| `constrain(x)` | `x` when `x > 0` (the unary spelling of `require`) | `NaN` |
+| `between(x, lo, hi)` | `x` when `lo <= x <= hi` | `NaN` |
 
 Evaluation is a recursive `f64` evaluator with **domain guards**, so
 out-of-domain operations yield a non-finite value (treated as a hard failure):
 `Ln(a<=0) -> NaN`, `Sqrt(a<0) -> NaN`, `Div(|b|<eps) -> NaN`,
 `Pow(a<0, non-integer b) -> NaN`, `Tan(x)` guarded near poles,
-`Acosh(a<1) -> NaN`, `Atanh(|a|>=1) -> NaN`, `Mod(_,|b|<eps) -> NaN`.
+`Acosh(a<1) -> NaN`, `Atanh(|a|>=1) -> NaN`, `Mod(_,|b|<eps) -> NaN`, and a
+violated constraint as above.
 
 Evaluation is done **column-wise over all training rows**.
 
@@ -72,17 +96,31 @@ Evaluation is done **column-wise over all training rows**.
 `expr::parse`) reads one back:
 
 ```
-expr    := term (('+' | '-') term)*
+expr    := or_expr
+or_expr := xor_expr ('or' xor_expr)*
+xor_expr:= and_expr ('xor' and_expr)*
+and_expr:= cmp_expr ('and' cmp_expr)*
+cmp_expr:= sum (('<' | '<=' | '>' | '>=' | '==') sum)?   // non-associative
+sum     := term (('+' | '-') term)*
 term    := unary (('*' | '/') unary)*
-unary   := ('-' | '+') unary | power
+unary   := ('-' | '+' | 'not') unary | power
 power   := primary ('^' unary)?          // right associative
 primary := number | name '(' expr (',' expr)* ')' | name | '(' expr ')'
 ```
 
-Precedence, tightest first: `^`, unary `-`/`+`, `*`/`/`, `+`/`-`. So `-x^2` is
-`-(x^2)` and `2^3^2` is `2^(3^2)`. Function names are the primitives above, via
+Precedence, loosest to tightest: `or`, `xor`, `and`, comparisons
+`< <= > >= ==`, `+`/`-`, `*`/`/`, unary `-`/`+`/`not`, `^`. So `-x^2` is
+`-(x^2)`, `2^3^2` is `2^(3^2)` and `x + 1 > y * 2` is `(x + 1) > (y * 2)`.
+`or`/`xor`/`and` are left-associative; comparisons are **non-associative**
+(`a < b < c` is a syntax error — write `(a < b) and (b < c)`); `not` is a prefix
+operator at the unary level, so `not x > 0` is `(not x) > 0` and
+`(not (x > 0))` is the negated comparison. `to_string` prints every binary
+conditional operator parenthesised (`(x > 0)`, `(a and b)`, `(not a)`) and the
+constraints as calls (`between(x, -1, 1)`), so the printed form parses back to
+the same tree. Function names are the primitives above, via
 `Op::from_name`, sharing the alias table with `--ops` (`log` = `ln`,
-`sig` = `logistic`). Variable names resolve against the table's column names,
+`sig` = `logistic`, `lt`/`le`/`gt`/`ge`/`eq` = the comparisons, `&&`/`||`/`!` =
+`and`/`or`/`not`). Variable names resolve against the table's column names,
 then the `x0`, `x1`, … fallback; `pi` and `e` are constants when they are not
 declared variables. Unknown names, unmatched parentheses and wrong argument
 counts produce a `ParseError` carrying the **1-based column**. `--eval-expr`
@@ -176,6 +214,11 @@ machine-readable rows.
    - `y = x1 * x2`
    with fixed seeds for determinism.
 5. `simplify`: `x*1 + 0` folds to `x`; constant subexpressions fold.
+6. conditional operators: evaluation of each comparison/logical/constraint
+   (including the true/false boundary at `0`), a parser round-trip for
+   `x > 0`, `and`, `not` and `between(a, lo, hi)`, a recovery test on the
+   piecewise target `y = x*(x>0)`, and a test that a violated constraint yields
+   a non-finite evaluation (a hard failure), not a small finite error.
 
 ## 12. Out of scope for v1
 

@@ -122,6 +122,8 @@ SEARCH:
   --seed <S>                 RNG seed, echoed in output (default 0)
   --ops <list>               comma/space-separated operators, e.g.
                              add,sub,mul,div,sin,exp,floor,min,max
+                             conditions: less,equal,greater,and,or,xor,not
+                             constraints: between,require,constrain
                              (full set: `rcsr schema` -> operators list)
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
@@ -168,7 +170,7 @@ fn schema() -> String {
         ("--pop", "int", "200", "population per island"),
         ("--max-complexity", "int", "30", "max nodes per expression"),
         ("--seed", "int", "0", "RNG seed"),
-        ("--ops", "csv", "builtin-set", "operator names (see \"operators\")"),
+        ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators and constraints (see \"operators\")"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
@@ -1535,5 +1537,33 @@ mod tests {
             schema().contains("--bootstrap-error"),
             "schema() is missing --bootstrap-error"
         );
+    }
+
+    /// The conditional primitives must be discoverable from `schema`, and the
+    /// `--ops` help must point at them.
+    #[test]
+    fn help_and_schema_list_conditional_operators() {
+        let schema_text = schema();
+        for name in [
+            "equal",
+            "less",
+            "less_or_equal",
+            "greater",
+            "greater_or_equal",
+            "and",
+            "or",
+            "xor",
+            "not",
+            "require",
+            "between",
+            "constrain",
+        ] {
+            assert!(
+                schema_text.contains(name),
+                "schema() is missing operator '{name}'"
+            );
+        }
+        assert!(usage().contains("between"), "usage() is missing 'between'");
+        assert!(usage().contains("constrain"), "usage() is missing 'constrain'");
     }
 }

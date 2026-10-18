@@ -387,3 +387,162 @@ fn recovers_max() {
         best_test_error(&out)
     );
 }
+
+// ---- conditional, logical and constraint operators (issue #7) ----
+
+/// Evaluate a unary / binary / ternary operator on constant arguments.
+fn u1(op: Op, a: f64) -> f64 {
+    expr::eval(&node(op, vec![constant(a)]), &[0.0])
+}
+
+fn u2(op: Op, a: f64, b: f64) -> f64 {
+    expr::eval(&node(op, vec![constant(a), constant(b)]), &[0.0])
+}
+
+fn u3(op: Op, a: f64, b: f64, c: f64) -> f64 {
+    expr::eval(
+        &node(op, vec![constant(a), constant(b), constant(c)]),
+        &[0.0],
+    )
+}
+
+#[test]
+fn comparison_operator_values() {
+    // `==` is exact equality.
+    assert_eq!(u2(Op::Equal, 2.0, 2.0), 1.0);
+    assert_eq!(u2(Op::Equal, 2.0, 3.0), 0.0);
+    assert_eq!(u2(Op::Equal, 0.0, 0.0), 1.0);
+
+    assert_eq!(u2(Op::Less, 1.0, 2.0), 1.0);
+    assert_eq!(u2(Op::Less, 2.0, 2.0), 0.0); // boundary: not strictly less
+    assert_eq!(u2(Op::LessOrEqual, 2.0, 2.0), 1.0); // boundary: less-or-equal
+
+    assert_eq!(u2(Op::Greater, 3.0, 2.0), 1.0);
+    assert_eq!(u2(Op::Greater, 2.0, 2.0), 0.0); // boundary: not strictly greater
+    assert_eq!(u2(Op::GreaterOrEqual, 2.0, 2.0), 1.0);
+
+    // NaN in either operand is a hard failure, not a comparison result.
+    assert!(u2(Op::Greater, f64::NAN, 0.0).is_nan());
+    assert!(u2(Op::Equal, 0.0, f64::NAN).is_nan());
+}
+
+#[test]
+fn logical_operator_values_and_boundary() {
+    // Truthy means strictly positive; exactly 0 is false.
+    assert_eq!(u1(Op::Not, 0.0), 1.0); // boundary: 0 is false
+    assert_eq!(u1(Op::Not, 1.0), 0.0);
+    assert_eq!(u1(Op::Not, -1.0), 1.0); // negative is false, so `not` is true
+    assert_eq!(u1(Op::Not, 1e-300), 0.0);
+    assert!(u1(Op::Not, f64::NAN).is_nan());
+
+    assert_eq!(u2(Op::And, 1.0, 1.0), 1.0);
+    assert_eq!(u2(Op::And, 1.0, 0.0), 0.0); // boundary
+    assert_eq!(u2(Op::And, 0.0, 0.0), 0.0);
+    assert_eq!(u2(Op::And, -1.0, 1.0), 0.0);
+
+    assert_eq!(u2(Op::Or, 1.0, 0.0), 1.0);
+    assert_eq!(u2(Op::Or, 0.0, 0.0), 0.0); // boundary
+    assert_eq!(u2(Op::Or, -1.0, 1.0), 1.0);
+
+    assert_eq!(u2(Op::Xor, 1.0, -1.0), 1.0);
+    assert_eq!(u2(Op::Xor, 1.0, 1.0), 0.0);
+    assert_eq!(u2(Op::Xor, 0.0, 1.0), 1.0); // boundary: 0 is false
+    assert_eq!(u2(Op::Xor, 0.0, 0.0), 0.0);
+
+    assert!(u2(Op::And, f64::NAN, 1.0).is_nan());
+    assert!(u2(Op::Or, 1.0, f64::NAN).is_nan());
+    assert!(u2(Op::Xor, f64::NAN, 1.0).is_nan());
+}
+
+#[test]
+fn constraint_operators_return_their_argument() {
+    // require(cond) -> cond when cond > 0, else NaN.
+    assert_eq!(u1(Op::Require, 2.5), 2.5);
+    assert!(u1(Op::Require, 0.0).is_nan()); // boundary: not > 0
+    assert!(u1(Op::Require, -1.0).is_nan());
+
+    // constrain(x) is the unary spelling of require.
+    assert_eq!(u1(Op::Constrain, 2.5), 2.5);
+    assert!(u1(Op::Constrain, 0.0).is_nan());
+    assert!(u1(Op::Constrain, -3.0).is_nan());
+
+    // between(x, lo, hi) -> x on the closed interval, else NaN.
+    assert_eq!(u3(Op::Between, 0.5, -1.0, 1.0), 0.5);
+    assert_eq!(u3(Op::Between, -1.0, -1.0, 1.0), -1.0); // inclusive lower
+    assert_eq!(u3(Op::Between, 1.0, -1.0, 1.0), 1.0); // inclusive upper
+    assert!(u3(Op::Between, 1.5, -1.0, 1.0).is_nan());
+    assert!(u3(Op::Between, -2.0, -1.0, 1.0).is_nan());
+}
+
+#[test]
+fn violated_constraints_are_a_hard_failure() {
+    // A violated constraint evaluates to NaN, so the error metric is +inf, not
+    // a merely large finite error: the candidate is infeasible.
+    let requires_positive =
+        node(Op::Require, vec![node(Op::Sub, vec![input(0), constant(1.0)])]);
+    assert_eq!(expr::eval(&requires_positive, &[3.0]), 2.0);
+    assert!(expr::eval(&requires_positive, &[0.5]).is_nan());
+
+    let y = vec![1.0, 2.0, 3.0];
+    let good: Vec<f64> = [3.0f64, 4.0, 5.0]
+        .iter()
+        .map(|v| expr::eval(&requires_positive, &[*v]))
+        .collect();
+    assert!(score(&good, &y, Metric::Absolute).is_finite());
+
+    // One violated row poisons the whole candidate.
+    let bad: Vec<f64> = [3.0f64, 0.0, 5.0]
+        .iter()
+        .map(|v| expr::eval(&requires_positive, &[*v]))
+        .collect();
+    assert!(score(&bad, &y, Metric::Absolute).is_infinite());
+
+    // The same holds for between and constrain.
+    let bounded = node(
+        Op::Between,
+        vec![input(0), constant(-1.0), constant(1.0)],
+    );
+    assert!(expr::eval(&bounded, &[2.0]).is_nan());
+    assert!(expr::eval(&node(Op::Constrain, vec![input(0)]), &[-1.0]).is_nan());
+
+    // A constraint with no movable constant can never be made feasible: the
+    // fitter reports an infinite sum of squared errors (a rejected candidate).
+    let infeasible = node(Op::Require, vec![node(Op::Neg, vec![input(0)])]);
+    let xs: Vec<Vec<f64>> = [1.0f64, 2.0, 3.0].iter().map(|v| vec![*v]).collect();
+    let mut tree = infeasible;
+    let sse = rcsr::fit::fit(&mut tree, &xs, &y, 10);
+    assert!(!sse.is_finite(), "infeasible candidate must not be fit: {sse}");
+}
+
+#[test]
+fn recovers_piecewise_x_times_positive() {
+    // y = x * (x > 0), a piecewise target that needs the `greater` comparison.
+    let g = grid(41, -2.0, 2.0);
+    let ys: Vec<f64> = g.iter().map(|v| v * (*v > 0.0) as i32 as f64).collect();
+    let xs: Vec<Vec<f64>> = g.iter().map(|v| vec![*v]).collect();
+    let train = sample(xs.clone(), ys.clone());
+    let test = sample(xs, ys);
+
+    let mut cfg = Config::default();
+    cfg.generations = 400;
+    cfg.pop = 200;
+    cfg.islands = 2;
+    cfg.seed = 9;
+    cfg.metric = Metric::Squared;
+    cfg.ops = vec![
+        Op::Mul,
+        Op::Div,
+        Op::Add,
+        Op::Sub,
+        Op::Greater,
+        Op::GreaterOrEqual,
+        Op::If,
+    ];
+
+    let out = run(&cfg, &train, &test);
+    assert!(
+        best_test_error(&out) < 1e-6,
+        "best test error = {}",
+        best_test_error(&out)
+    );
+}
