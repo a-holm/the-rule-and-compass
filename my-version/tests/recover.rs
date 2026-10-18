@@ -159,3 +159,231 @@ fn complexity_counts_nodes() {
     let e = node(Op::Add, vec![input(0), constant(1.0)]);
     assert_eq!(expr::complexity(&e), 3);
 }
+
+// ---- extended primitive set (issue #6) ----
+
+/// Every canonical name must round-trip through `parse_list`, and the extended
+/// operators must be distinct from the defaults.
+#[test]
+fn extended_ops_parse_and_are_distinct() {
+    for name in Op::names() {
+        assert!(
+            !Op::parse_list(name).is_empty(),
+            "parse_list dropped the name `{name}`"
+        );
+    }
+    // A representative command line using every new operator.
+    let parsed = Op::parse_list(
+        "floor,ceil,round,sign,erf,erfc,asinh,acosh,atanh,mod,min,max,atan2",
+    );
+    let expected = vec![
+        Op::Floor,
+        Op::Ceil,
+        Op::Round,
+        Op::Sign,
+        Op::Erf,
+        Op::Erfc,
+        Op::Asinh,
+        Op::Acosh,
+        Op::Atanh,
+        Op::Mod,
+        Op::Min,
+        Op::Max,
+        Op::Atan2,
+    ];
+    assert_eq!(parsed, expected);
+
+    // Correct arity, and the binary operators print as f(a, b).
+    for op in [
+        Op::Floor,
+        Op::Ceil,
+        Op::Round,
+        Op::Sign,
+        Op::Erf,
+        Op::Erfc,
+        Op::Asinh,
+        Op::Acosh,
+        Op::Atanh,
+    ] {
+        assert_eq!(op.arity(), 1, "{op:?} should be unary");
+    }
+    for op in [Op::Mod, Op::Min, Op::Max, Op::Atan2] {
+        assert_eq!(op.arity(), 2, "{op:?} should be binary");
+    }
+    let t = node(Op::Max, vec![input(0), constant(2.0)]);
+    assert_eq!(expr::to_string(&t, &["x".to_string()]), "max(x, 2)");
+    let t = node(Op::Atan2, vec![input(0), constant(1.0)]);
+    assert_eq!(expr::to_string(&t, &["x".to_string()]), "atan2(x, 1)");
+}
+
+#[test]
+fn extended_op_values() {
+    let unary = |op: Op, v: f64| expr::eval(&node(op, vec![constant(v)]), &[0.0]);
+    let binary = |op: Op, a: f64, b: f64| {
+        expr::eval(&node(op, vec![constant(a), constant(b)]), &[0.0])
+    };
+
+    assert_eq!(unary(Op::Floor, 2.7), 2.0);
+    assert_eq!(unary(Op::Floor, -2.1), -3.0);
+    assert_eq!(unary(Op::Ceil, 2.1), 3.0);
+    assert_eq!(unary(Op::Ceil, -2.7), -2.0);
+    assert_eq!(unary(Op::Round, 2.5), 3.0);
+    assert_eq!(unary(Op::Round, -2.5), -3.0);
+    assert_eq!(unary(Op::Sign, -3.0), -1.0);
+    assert_eq!(unary(Op::Sign, 0.0), 0.0);
+    assert_eq!(unary(Op::Sign, 4.0), 1.0);
+    assert_eq!(unary(Op::Step, 2.0), 1.0);
+    assert_eq!(unary(Op::Step, -2.0), 0.0);
+    assert_eq!(unary(Op::Step, 0.0), 0.0);
+
+    assert!((binary(Op::Mod, 7.5, 2.0) - 1.5).abs() < 1e-12);
+    // Floor-mod has the sign of the divisor: -1 mod 3 = 2.
+    assert!((binary(Op::Mod, -1.0, 3.0) - 2.0).abs() < 1e-12);
+    assert_eq!(binary(Op::Min, 3.0, 5.0), 3.0);
+    assert_eq!(binary(Op::Min, -1.0, -4.0), -4.0);
+    assert_eq!(binary(Op::Max, 3.0, 5.0), 5.0);
+
+    assert!((unary(Op::Asinh, 1.0f64.sinh()) - 1.0).abs() < 1e-12);
+    assert!((unary(Op::Acosh, 2.0f64.cosh()) - 2.0).abs() < 1e-12);
+    assert!((unary(Op::Atanh, 1.0f64.tanh()) - 1.0).abs() < 1e-12);
+
+    assert!((binary(Op::Atan2, 1.0, 1.0) - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+    assert!((binary(Op::Atan2, 1.0, 0.0) - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+    assert_eq!(binary(Op::Atan2, 0.0, 0.0), 0.0);
+
+    // `erf` saturates to ±1.
+    assert_eq!(unary(Op::Erf, 0.0), 0.0);
+    assert_eq!(
+        expr::eval(&node(Op::Erf, vec![constant(f64::INFINITY)]), &[0.0]),
+        1.0
+    );
+}
+
+#[test]
+fn erf_erfc_are_accurate() {
+    let erf = |x: f64| expr::eval(&node(Op::Erf, vec![constant(x)]), &[0.0]);
+    let erfc = |x: f64| expr::eval(&node(Op::Erfc, vec![constant(x)]), &[0.0]);
+
+    // Reference values (DLMF 7.2 / standard tables).
+    assert!((erf(1.0) - 0.842_700_792_949_714_9).abs() < 1e-14);
+    assert!((erf(0.5) - 0.520_499_877_813_046_5).abs() < 1e-14);
+    assert!((erf(-1.0) + 0.842_700_792_949_714_9).abs() < 1e-14);
+    assert!((erfc(1.0) - 0.157_299_207_050_285_13).abs() < 1e-14);
+    assert!((erfc(3.0) - 2.209_049_699_858_544e-5).abs() < 1e-18);
+
+    // Complementary pair, including the far tail that would cancel as 1 - erf.
+    for x in [-3.0, -1.0, -0.2, 0.0, 0.2, 1.0, 3.0, 6.0] {
+        assert!((erf(x) + erfc(x) - 1.0).abs() < 1e-14, "erf+erfc at {x}");
+    }
+    assert!((erfc(10.0) - 2.088_487_583_762_545e-45).abs() / 2.088_487_583_762_545e-45 < 1e-9);
+
+    // Saturation and infinities stay finite.
+    assert_eq!(erf(f64::INFINITY), 1.0);
+    assert_eq!(erf(f64::NEG_INFINITY), -1.0);
+    assert_eq!(erfc(f64::INFINITY), 0.0);
+    assert_eq!(erfc(f64::NEG_INFINITY), 2.0);
+    assert!(erf(f64::NAN).is_nan());
+    assert!(erfc(f64::NAN).is_nan());
+}
+
+#[test]
+fn extended_op_domain_guards_and_finiteness() {
+    let unary = |op: Op, v: f64| expr::eval(&node(op, vec![constant(v)]), &[0.0]);
+    let binary = |op: Op, a: f64, b: f64| {
+        expr::eval(&node(op, vec![constant(a), constant(b)]), &[0.0])
+    };
+
+    // acosh: only [1, inf).
+    assert!(unary(Op::Acosh, 0.5).is_nan());
+    assert!(unary(Op::Acosh, 0.999).is_nan());
+    assert_eq!(unary(Op::Acosh, 1.0), 0.0);
+    assert!((unary(Op::Acosh, 2.0) - 1.316_957_896_924_816_6).abs() < 1e-12);
+
+    // atanh: only (-1, 1).
+    assert!(unary(Op::Atanh, 1.0).is_nan());
+    assert!(unary(Op::Atanh, -1.0).is_nan());
+    assert!(unary(Op::Atanh, 2.0).is_nan());
+    assert_eq!(unary(Op::Atanh, 0.0), 0.0);
+
+    // mod by (near) zero.
+    assert!(binary(Op::Mod, 1.0, 0.0).is_nan());
+    assert!(binary(Op::Mod, 1.0, 1e-13).is_nan());
+
+    // NaN propagates instead of being swallowed by min/max/atan2.
+    let nan = node(Op::Ln, vec![constant(-1.0)]);
+    assert!(expr::eval(&node(Op::Min, vec![nan.clone(), constant(1.0)]), &[0.0]).is_nan());
+    assert!(expr::eval(&node(Op::Max, vec![nan.clone(), constant(1.0)]), &[0.0]).is_nan());
+    assert!(expr::eval(&node(Op::Atan2, vec![nan, constant(1.0)]), &[0.0]).is_nan());
+
+    // Over a valid grid every new operator stays finite (no NaN/Inf escapes).
+    for i in -40..=40 {
+        let v = i as f64 / 8.0; // -5.0 .. 5.0
+        for op in [Op::Floor, Op::Ceil, Op::Round, Op::Sign, Op::Erf, Op::Erfc, Op::Asinh] {
+            assert!(unary(op, v).is_finite(), "{op:?} not finite at {v}");
+        }
+        // acosh/atanh domains.
+        if v >= 1.0 {
+            assert!(unary(Op::Acosh, v).is_finite());
+        }
+        if v.abs() < 1.0 {
+            assert!(unary(Op::Atanh, v).is_finite());
+        }
+        for op in [Op::Min, Op::Max, Op::Atan2] {
+            assert!(binary(op, v, 0.3).is_finite(), "{op:?} not finite at {v}");
+        }
+        if v.abs() > 0.05 {
+            assert!(binary(Op::Mod, 3.0, v).is_finite());
+        }
+    }
+}
+
+#[test]
+fn recovers_floor() {
+    // y = floor(x): exact at every sample, including the integer breakpoints.
+    let g: Vec<f64> = (-25..=25).map(|k| k as f64 / 10.0).collect();
+    let ys: Vec<f64> = g.iter().map(|v| v.floor()).collect();
+    let xs: Vec<Vec<f64>> = g.iter().map(|v| vec![*v]).collect();
+    let train = sample(xs.clone(), ys.clone());
+    let test = sample(xs, ys);
+
+    let mut cfg = Config::default();
+    cfg.generations = 300;
+    cfg.pop = 200;
+    cfg.islands = 2;
+    cfg.seed = 3;
+    cfg.metric = Metric::Absolute;
+    cfg.ops = vec![Op::Floor, Op::Add, Op::Sub, Op::Mul, Op::Div];
+
+    let out = run(&cfg, &train, &test);
+    assert!(
+        best_test_error(&out) < 1e-9,
+        "best test error = {}",
+        best_test_error(&out)
+    );
+}
+
+#[test]
+fn recovers_max() {
+    // y = max(x, 0.5): the constant has to be fitted, so this also exercises
+    // the `max` subgradient through the adjoint pass.
+    let g = grid(41, -2.0, 3.0);
+    let ys: Vec<f64> = g.iter().map(|v| v.max(0.5)).collect();
+    let xs: Vec<Vec<f64>> = g.iter().map(|v| vec![*v]).collect();
+    let train = sample(xs.clone(), ys.clone());
+    let test = sample(xs, ys);
+
+    let mut cfg = Config::default();
+    cfg.generations = 300;
+    cfg.pop = 200;
+    cfg.islands = 2;
+    cfg.seed = 5;
+    cfg.metric = Metric::Squared;
+    cfg.ops = vec![Op::Max, Op::Add, Op::Sub, Op::Mul, Op::Div];
+
+    let out = run(&cfg, &train, &test);
+    assert!(
+        best_test_error(&out) < 1e-6,
+        "best test error = {}",
+        best_test_error(&out)
+    );
+}

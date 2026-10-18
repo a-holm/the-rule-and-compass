@@ -25,11 +25,24 @@ pub enum Op {
     Gauss,
     Square,
     Cube,
+    Floor,
+    Ceil,
+    Round,
+    Sign,
+    Erf,
+    Erfc,
+    Asinh,
+    Acosh,
+    Atanh,
     Add,
     Sub,
     Mul,
     Div,
     Pow,
+    Mod,
+    Min,
+    Max,
+    Atan2,
     If,
 }
 
@@ -39,8 +52,9 @@ impl Op {
         match self {
             Const | Input => 0,
             Neg | Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step
-            | Gauss | Square | Cube => 1,
-            Add | Sub | Mul | Div | Pow => 2,
+            | Gauss | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Asinh | Acosh
+            | Atanh => 1,
+            Add | Sub | Mul | Div | Pow | Mod | Min | Max | Atan2 => 2,
             If => 3,
         }
     }
@@ -66,21 +80,49 @@ impl Op {
             Gauss => "gauss",
             Square => "square",
             Cube => "cube",
+            Floor => "floor",
+            Ceil => "ceil",
+            Round => "round",
+            Sign => "sign",
+            Erf => "erf",
+            Erfc => "erfc",
+            Asinh => "asinh",
+            Acosh => "acosh",
+            Atanh => "atanh",
             Add => "+",
             Sub => "-",
             Mul => "*",
             Div => "/",
             Pow => "^",
+            Mod => "mod",
+            Min => "min",
+            Max => "max",
+            Atan2 => "atan2",
             If => "if",
         }
     }
 
     /// Default operator set for a search (all non-terminal primitives).
+    ///
+    /// The extended primitives (`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`) are
+    /// not in the default set: they are opt-in through `--ops` so that broad
+    /// searches are not diluted by them. Use [`Op::names`] for the full vocabulary.
     pub fn default_set() -> Vec<Op> {
         use Op::*;
         vec![
             Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Gauss, Square,
             Cube, Add, Sub, Mul, Div, Pow, If,
+        ]
+    }
+
+    /// Canonical names accepted by [`Op::parse_list`], in a stable order. Used by
+    /// the `schema` output so callers can discover the full primitive set.
+    pub fn names() -> &'static [&'static str] {
+        &[
+            "neg", "exp", "ln", "abs", "sqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh",
+            "logistic", "step", "gauss", "square", "cube", "floor", "ceil", "round", "sign",
+            "erf", "erfc", "asinh", "acosh", "atanh", "mod", "min", "max", "atan2", "add", "sub",
+            "mul", "div", "pow", "if",
         ]
     }
 
@@ -106,11 +148,24 @@ impl Op {
                 "gauss" => Gauss,
                 "square" => Square,
                 "cube" => Cube,
+                "floor" => Floor,
+                "ceil" => Ceil,
+                "round" => Round,
+                "sign" => Sign,
+                "erf" => Erf,
+                "erfc" => Erfc,
+                "asinh" => Asinh,
+                "acosh" => Acosh,
+                "atanh" => Atanh,
                 "add" | "+" => Add,
                 "sub" => Sub,
                 "mul" | "*" => Mul,
                 "div" | "/" => Div,
                 "pow" | "^" => Pow,
+                "mod" => Mod,
+                "min" => Min,
+                "max" => Max,
+                "atan2" => Atan2,
                 "if" => If,
                 _ => continue,
             };
@@ -153,6 +208,118 @@ pub fn node(op: Op, kids: Vec<Node>) -> Node {
         op,
         val: 0.0,
         kids,
+    }
+}
+
+/// Taylor/continued-fraction accuracy target and the smallest representable
+/// positive number for the continued fraction (nothing here is a hard domain
+/// bound: the function is finite for every finite input).
+const ERF_EPS: f64 = 1e-15;
+const ERF_FPMIN: f64 = 1e-300;
+
+/// Regularised lower incomplete gamma `P(1/2, x)` for `x >= 0`, which is
+/// `erf(sqrt(x))`. Series for the small branch, continued fraction for the
+/// large one (both converge to machine precision).
+fn gammp_half(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 0.0;
+    }
+    if !x.is_finite() {
+        return 1.0;
+    }
+    if x < 1.5 {
+        let a = 0.5;
+        let mut ap = a;
+        let mut sum = 1.0 / a;
+        let mut del = sum;
+        for _ in 0..300 {
+            ap += 1.0;
+            del *= x / ap;
+            sum += del;
+            if del.abs() < sum.abs() * ERF_EPS {
+                break;
+            }
+        }
+        (sum * (-x + a * x.ln() - 0.5 * std::f64::consts::PI.ln()).exp()).clamp(0.0, 1.0)
+    } else {
+        (1.0 - gcf_half(x)).clamp(0.0, 1.0)
+    }
+}
+
+/// Regularised upper incomplete gamma `Q(1/2, x) = 1 - P(1/2, x) = erfc(sqrt(x))`,
+/// computed directly on the large branch so `erfc` never suffers cancellation.
+fn gammq_half(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if !x.is_finite() {
+        return 0.0;
+    }
+    if x < 1.5 {
+        (1.0 - gammp_half(x)).clamp(0.0, 1.0)
+    } else {
+        gcf_half(x).clamp(0.0, 1.0)
+    }
+}
+
+fn gcf_half(x: f64) -> f64 {
+    let a = 0.5;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / ERF_FPMIN;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..300 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < ERF_FPMIN {
+            d = ERF_FPMIN;
+        }
+        c = b + an / c;
+        if c.abs() < ERF_FPMIN {
+            c = ERF_FPMIN;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < ERF_EPS {
+            break;
+        }
+    }
+    (-x + a * x.ln() - 0.5 * std::f64::consts::PI.ln()).exp() * h
+}
+
+/// The error function `erf(x) = 2/sqrt(pi) * integral_0^x e^{-t^2} dt`, finite
+/// for every input; `erf(NaN) = NaN`, `erf(±inf) = ±1`.
+pub fn erf(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let p = gammp_half(x * x);
+    if x < 0.0 {
+        -p
+    } else {
+        p
+    }
+}
+
+/// The complementary error function `erfc(x) = 1 - erf(x)`, evaluated directly
+/// on its tail so large `x` does not cancel; finite for every input.
+pub fn erfc(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let q = gammq_half(x * x);
+    if x < 0.0 {
+        2.0 - q
+    } else {
+        q
     }
 }
 
@@ -232,6 +399,40 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
             let a = eval(&n.kids[0], x);
             a * a * a
         }
+        Floor => eval(&n.kids[0], x).floor(),
+        Ceil => eval(&n.kids[0], x).ceil(),
+        Round => eval(&n.kids[0], x).round(),
+        Sign => {
+            let a = eval(&n.kids[0], x);
+            if a > 0.0 {
+                1.0
+            } else if a < 0.0 {
+                -1.0
+            } else if a == 0.0 {
+                0.0
+            } else {
+                f64::NAN
+            }
+        }
+        Erf => erf(eval(&n.kids[0], x)),
+        Erfc => erfc(eval(&n.kids[0], x)),
+        Asinh => eval(&n.kids[0], x).asinh(),
+        Acosh => {
+            let a = eval(&n.kids[0], x);
+            if a >= 1.0 {
+                a.acosh()
+            } else {
+                f64::NAN
+            }
+        }
+        Atanh => {
+            let a = eval(&n.kids[0], x);
+            if a.abs() < 1.0 {
+                a.atanh()
+            } else {
+                f64::NAN
+            }
+        }
         Add => eval(&n.kids[0], x) + eval(&n.kids[1], x),
         Sub => eval(&n.kids[0], x) - eval(&n.kids[1], x),
         Mul => eval(&n.kids[0], x) * eval(&n.kids[1], x),
@@ -250,6 +451,42 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
                 f64::NAN
             } else {
                 a.powf(b)
+            }
+        }
+        Mod => {
+            let a = eval(&n.kids[0], x);
+            let b = eval(&n.kids[1], x);
+            if !a.is_finite() || !b.is_finite() || b.abs() < 1e-12 {
+                f64::NAN
+            } else {
+                a - b * (a / b).floor()
+            }
+        }
+        Min => {
+            let a = eval(&n.kids[0], x);
+            let b = eval(&n.kids[1], x);
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.min(b)
+            }
+        }
+        Max => {
+            let a = eval(&n.kids[0], x);
+            let b = eval(&n.kids[1], x);
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else {
+                a.max(b)
+            }
+        }
+        Atan2 => {
+            let y = eval(&n.kids[0], x);
+            let xx = eval(&n.kids[1], x);
+            if y.is_nan() || xx.is_nan() {
+                f64::NAN
+            } else {
+                y.atan2(xx)
             }
         }
         If => {
@@ -450,6 +687,12 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             to_string(&n.kids[0], vars),
             to_string(&n.kids[1], vars),
             to_string(&n.kids[2], vars)
+        ),
+        Mod | Min | Max | Atan2 => format!(
+            "{}({}, {})",
+            n.op.symbol(),
+            to_string(&n.kids[0], vars),
+            to_string(&n.kids[1], vars)
         ),
         _ => format!("{}({})", n.op.symbol(), to_string(&n.kids[0], vars)),
     }

@@ -114,6 +114,9 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
             }
         }
         If => false,
+        // Extended primitives have no kernel opcode yet; report them as
+        // unsupported so the caller can fall back to the CPU evaluator.
+        _ => false,
     }
 }
 
