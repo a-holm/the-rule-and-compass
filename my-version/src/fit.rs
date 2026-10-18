@@ -15,6 +15,9 @@
 
 use crate::expr::{self, Node, Op};
 
+/// `1/sqrt(pi)`, the constant in the error-function derivative.
+const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
+
 /// Flattened expression: children always precede parents, so index order is a
 /// post-order and the backward (adjoint) sweep is a simple descending loop.
 struct Flat {
@@ -106,11 +109,70 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         }
         Square => a(0) * a(0),
         Cube => a(0) * a(0) * a(0),
+        Floor => a(0).floor(),
+        Ceil => a(0).ceil(),
+        Round => a(0).round(),
+        Sign => {
+            let x = a(0);
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else if x == 0.0 {
+                0.0
+            } else {
+                f64::NAN
+            }
+        }
+        Erf => expr::erf(a(0)),
+        Erfc => expr::erfc(a(0)),
+        Asinh => a(0).asinh(),
+        Acosh => {
+            let x = a(0);
+            if x >= 1.0 {
+                x.acosh()
+            } else {
+                f64::NAN
+            }
+        }
+        Atanh => {
+            let x = a(0);
+            if x.abs() < 1.0 {
+                x.atanh()
+            } else {
+                f64::NAN
+            }
+        }
         Add => a(0) + a(1),
         Sub => a(0) - a(1),
         Mul => a(0) * a(1),
         Div => a(0) / a(1),
         Pow => a(0).powf(a(1)),
+        Mod => {
+            let (x, b) = (a(0), a(1));
+            if !x.is_finite() || !b.is_finite() || b.abs() < 1e-12 {
+                f64::NAN
+            } else {
+                x - b * (x / b).floor()
+            }
+        }
+        Min => {
+            let (x, y) = (a(0), a(1));
+            if x.is_nan() || y.is_nan() {
+                f64::NAN
+            } else {
+                x.min(y)
+            }
+        }
+        Max => {
+            let (x, y) = (a(0), a(1));
+            if x.is_nan() || y.is_nan() {
+                f64::NAN
+            } else {
+                x.max(y)
+            }
+        }
+        Atan2 => a(0).atan2(a(1)),
         If => {
             if a(0) > 0.0 {
                 a(1)
@@ -190,6 +252,23 @@ fn backward(f: &Flat, v: &[f64], adj: &mut [f64], g: &mut [f64]) {
             Gauss => adj[ks[0]] += a * (-2.0 * get(0)) * (-get(0) * get(0)).exp(),
             Square => adj[ks[0]] += a * 2.0 * get(0),
             Cube => adj[ks[0]] += a * 3.0 * get(0) * get(0),
+            // floor/ceil/round/sign are piecewise constant, derivative 0 a.e.
+            Floor | Ceil | Round | Sign => {}
+            Erf => adj[ks[0]] += a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp(),
+            Erfc => adj[ks[0]] += -a * 2.0 * INV_SQRT_PI * (-get(0) * get(0)).exp(),
+            Asinh => adj[ks[0]] += a / (get(0) * get(0) + 1.0).sqrt(),
+            Acosh => {
+                let x = get(0);
+                if x > 1.0 {
+                    adj[ks[0]] += a / (x * x - 1.0).sqrt();
+                }
+            }
+            Atanh => {
+                let x = get(0);
+                if x.abs() < 1.0 {
+                    adj[ks[0]] += a / (1.0 - x * x);
+                }
+            }
             Add => {
                 adj[ks[0]] += a;
                 adj[ks[1]] += a;
@@ -212,6 +291,47 @@ fn backward(f: &Flat, v: &[f64], adj: &mut [f64], g: &mut [f64]) {
                 if b > 0.0 {
                     adj[ks[0]] += a * e * b.powf(e - 1.0);
                     adj[ks[1]] += a * b.powf(e) * b.ln();
+                }
+            }
+            // `mod(a,b) = a - b*floor(a/b)`; subgradient 1 for `a`, `-floor(a/b)`
+            // for `b`, undefined (0) where `b = 0`.
+            Mod => {
+                let b = get(1);
+                if b.abs() >= 1e-12 {
+                    adj[ks[0]] += a;
+                    adj[ks[1]] += -a * (get(0) / b).floor();
+                }
+            }
+            // `min`/`max` subgradient: all flow to the active argument, split
+            // evenly on a tie (a documented, symmetric choice).
+            Min => {
+                let (x, y) = (get(0), get(1));
+                if x < y {
+                    adj[ks[0]] += a;
+                } else if y < x {
+                    adj[ks[1]] += a;
+                } else {
+                    adj[ks[0]] += 0.5 * a;
+                    adj[ks[1]] += 0.5 * a;
+                }
+            }
+            Max => {
+                let (x, y) = (get(0), get(1));
+                if x > y {
+                    adj[ks[0]] += a;
+                } else if y > x {
+                    adj[ks[1]] += a;
+                } else {
+                    adj[ks[0]] += 0.5 * a;
+                    adj[ks[1]] += 0.5 * a;
+                }
+            }
+            Atan2 => {
+                let (y, x) = (get(0), get(1));
+                let d = x * x + y * y;
+                if d > 0.0 {
+                    adj[ks[0]] += a * x / d;
+                    adj[ks[1]] += -a * y / d;
                 }
             }
             If => {
@@ -418,4 +538,121 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
     xp[var] += h;
     xm[var] -= h;
     (expr::eval(tree, &xp) - expr::eval(tree, &xm)) / (2.0 * h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+
+    /// Gradient of the root w.r.t. every constant, via the adjoint sweep.
+    fn analytic_grad(tree: &Node, x: &[f64]) -> Vec<f64> {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        let mut v = vec![0.0; n];
+        let mut adj = vec![0.0; n];
+        let mut g = vec![0.0; f.nconst];
+        eval_row(&f, x, &c, &mut v);
+        backward(&f, &v, &mut adj, &mut g);
+        g
+    }
+
+    /// Compare the adjoint gradient against central finite differences of the
+    /// evaluator, perturbing one constant at a time.
+    fn check_grad<F: Fn(&[f64]) -> Node>(build: F, c: &[f64], x: &[f64]) {
+        let tree = build(c);
+        let g = analytic_grad(&tree, x);
+        assert_eq!(g.len(), c.len());
+        let h = 1e-6;
+        for k in 0..c.len() {
+            let mut cp = c.to_vec();
+            let mut cm = c.to_vec();
+            cp[k] += h;
+            cm[k] -= h;
+            let fd = (expr::eval(&build(&cp), x) - expr::eval(&build(&cm), x)) / (2.0 * h);
+            assert!(
+                (g[k] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+                "constant {k}: analytic {a} vs finite difference {fd}",
+                a = g[k]
+            );
+        }
+    }
+
+    #[test]
+    fn adjoint_matches_finite_differences() {
+        let x = [0.4];
+        // Modified Bessel-free special functions: erf, erfc, asinh.
+        check_grad(
+            |c| node(Op::Erf, vec![node(Op::Mul, vec![constant(c[0]), input(0)])]),
+            &[1.3],
+            &x,
+        );
+        check_grad(
+            |c| node(Op::Erfc, vec![node(Op::Mul, vec![constant(c[0]), input(0)])]),
+            &[1.3],
+            &x,
+        );
+        check_grad(
+            |c| node(Op::Asinh, vec![node(Op::Mul, vec![constant(c[0]), input(0)])]),
+            &[0.7],
+            &[0.5],
+        );
+        // acosh / atanh, evaluated strictly inside their domains.
+        check_grad(
+            |c| node(Op::Acosh, vec![node(Op::Add, vec![constant(c[0]), input(0)])]),
+            &[2.0],
+            &[0.5],
+        );
+        check_grad(
+            |c| node(Op::Atanh, vec![node(Op::Mul, vec![constant(c[0]), input(0)])]),
+            &[0.5],
+            &[0.8],
+        );
+        // atan2(c, x): d/dc = x / (x^2 + c^2).
+        check_grad(|c| node(Op::Atan2, vec![constant(c[0]), input(0)]), &[1.2], &[2.0]);
+        // mod with both arguments movable: d/da = 1, d/db = -floor(a/b).
+        check_grad(
+            |c| {
+                node(
+                    Op::Mod,
+                    vec![
+                        node(Op::Mul, vec![constant(c[0]), input(0)]),
+                        constant(c[1]),
+                    ],
+                )
+            },
+            &[3.0, 4.0],
+            &[1.7],
+        );
+    }
+
+    #[test]
+    fn min_max_subgradient_flows_to_active_argument() {
+        let x = [3.0];
+        // c is the smaller argument: all of the gradient goes to it.
+        check_grad(|c| node(Op::Min, vec![constant(c[0]), input(0)]), &[-1.0], &x);
+        // c is the larger argument.
+        check_grad(|c| node(Op::Max, vec![constant(c[0]), input(0)]), &[5.0], &x);
+
+        // On a tie the subgradient is split evenly between the arguments.
+        let tie = node(Op::Min, vec![constant(2.0), constant(2.0)]);
+        assert_eq!(analytic_grad(&tie, &[0.0]), vec![0.5, 0.5]);
+        let tie = node(Op::Max, vec![constant(2.0), constant(2.0)]);
+        assert_eq!(analytic_grad(&tie, &[0.0]), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn floor_like_operators_have_zero_gradient() {
+        // Piecewise-constant operators: derivative 0 away from the jumps.
+        for op in [Op::Floor, Op::Ceil, Op::Round, Op::Sign, Op::Step] {
+            let tree = node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+            assert_eq!(analytic_grad(&tree, &[1.7]), vec![0.0]);
+        }
+    }
 }

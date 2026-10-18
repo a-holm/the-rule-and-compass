@@ -99,7 +99,9 @@ SEARCH:
   --pop <P>                  population per island (default 200)
   --max-complexity <K>       max nodes per expression (default 30)
   --seed <S>                 RNG seed, echoed in output (default 0)
-  --ops <list>               e.g. add,sub,mul,div,sin,exp
+  --ops <list>               comma/space-separated operators, e.g.
+                             add,sub,mul,div,sin,exp,floor,min,max
+                             (full set: `rcsr schema` -> operators list)
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -142,7 +144,7 @@ fn schema() -> String {
         ("--pop", "int", "200", "population per island"),
         ("--max-complexity", "int", "30", "max nodes per expression"),
         ("--seed", "int", "0", "RNG seed"),
-        ("--ops", "csv", "builtin-set", "allowed operators"),
+        ("--ops", "csv", "builtin-set", "operator names (see \"operators\")"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
@@ -165,14 +167,17 @@ fn schema() -> String {
             jstr(desc)
         ));
     }
+    let operators: Vec<String> = Op::names().iter().map(|n| jstr(n)).collect();
     format!(
         "{{\n  \"tool\":\"rcsr\",\n  \"version\":{},\n  \"summary\":{},\n  \
          \"options\":[{}\n  ],\n  \
+         \"operators\":[{}],\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
         jstr("symbolic regression: find an interpretable f(x) ~ y"),
-        items
+        items,
+        operators.join(",")
     )
 }
 

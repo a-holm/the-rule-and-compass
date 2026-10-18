@@ -25,7 +25,7 @@ rcsr --data <file.csv>
      --max-complexity <K>       # path-length constraint
      --seed <S>                 # default 0 (MT19937)
      --test-frac <f>            # default 0.25
-     --ops <list>               # default: all primitives in section 4
+     --ops <list>               # default: built-in set (see section 4)
      --out <file>               # optional; write the front as TSV
 ```
 `--help` prints usage. Exit non-zero on unreadable or empty data.
@@ -46,14 +46,23 @@ rcsr --data <file.csv>
 Expression **tree** over these primitives:
 
 - terminals: `Const` (real value), `Input(i)`
-- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube`
-- binary: `Add, Sub, Mul, Div, Pow`
+- unary: `Neg, Exp, Ln, Abs, Sqrt, Sin, Cos, Tan, Sinh, Cosh, Tanh, Logistic, Step, Gauss, Square, Cube, Floor, Ceil, Round, Sign, Erf, Erfc, Asinh, Acosh, Atanh`
+- binary: `Add, Sub, Mul, Div, Pow, Mod, Min, Max, Atan2`
 - ternary: `If(cond, a, b)` where `cond` is `a > 0`
+
+`Floor`…`Atanh` and `Mod`/`Min`/`Max`/`Atan2` are **opt-in** primitives: they
+are not part of the default operator set but are accepted by `--ops` and listed
+by `rcsr schema` under `"operators"`. `erf`/`erfc` are computed to machine
+precision with no external crates, and the Levenberg–Marquardt adjoint pass uses
+the analytic derivative of each operator where one exists (`0` a.e. for
+`floor`/`ceil`/`round`/`sign`/`step`; a documented symmetric subgradient for
+`min`/`max`; `d mod(a,b) = (1, -floor(a/b))` a.e.).
 
 Evaluation is a recursive `f64` evaluator with **domain guards**, so
 out-of-domain operations yield a non-finite value (treated as a hard failure):
 `Ln(a<=0) -> NaN`, `Sqrt(a<0) -> NaN`, `Div(|b|<eps) -> NaN`,
-`Pow(a<0, non-integer b) -> NaN`, `Tan(x)` guarded near poles.
+`Pow(a<0, non-integer b) -> NaN`, `Tan(x)` guarded near poles,
+`Acosh(a<1) -> NaN`, `Atanh(|a|>=1) -> NaN`, `Mod(_,|b|<eps) -> NaN`.
 
 Evaluation is done **column-wise over all training rows**.
 
