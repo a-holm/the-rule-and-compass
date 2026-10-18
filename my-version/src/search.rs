@@ -413,6 +413,15 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
     best
 }
 
+// #77: seed the per-generation duplicate set with the elite (`next`) and every
+// parent (`isl`), so a child that is an unchanged parent is rejected before the
+// expensive fit and score.
+fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
+    for ind in next.iter().chain(parents) {
+        seen.insert(expr::structural_hash(&ind.tree));
+    }
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
 fn evolve_island(
@@ -441,9 +450,9 @@ fn evolve_island(
     }
 
     let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
-    next.iter().for_each(|i| {
-        seen.insert(expr::structural_hash(&i.tree));
-    });
+    // #77: parents are candidates too; seeding them here rejects an unchanged
+    // child before it is fitted and scored.
+    seed_seen(&mut seen, &next, isl);
     let mut attempts = 0usize;
     let max_attempts = pop * 50 + 50;
 
@@ -1184,5 +1193,20 @@ mod tests {
         let aggs = AggTable::from_sample(&s);
         let accepted = prepare_seeds(&cfg, &s, &[seed], &aggs);
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
+    }
+
+    /// #77: a child identical to a parent must be caught by the dedup set, not
+    /// fitted and scored as a new individual.
+    #[test]
+    fn parent_clones_are_rejected_before_evaluation() {
+        let s = sample();
+        let cfg = Config::default();
+        let parent = Ind::evaluated(node(Op::Mul, vec![input(0), constant(2.0)]), &s, &cfg);
+        let mut seen = HashSet::new();
+        seed_seen(&mut seen, &[], std::slice::from_ref(&parent));
+        assert!(
+            !seen.insert(expr::structural_hash(&parent.tree)),
+            "a clone of a parent must be a duplicate"
+        );
     }
 }

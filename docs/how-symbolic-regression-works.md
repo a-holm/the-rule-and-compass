@@ -98,8 +98,10 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   population, update the front, then breed the next generation.
 - **Selection** is by tournament within an island.
 - **Variation** has two parts:
-  - *mutation* — change an operator, perturb a constant, or grow/shrink a
-    subtree;
+  - *mutation* — the edit kind is drawn first (25 % point change, 35 %
+    constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
+    among nodes that the edit can actually change, so a mutation never returns
+    the parent unchanged;
   - *crossover* — swap subtrees between two parents.
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because
