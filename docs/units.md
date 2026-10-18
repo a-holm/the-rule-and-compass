@@ -6,7 +6,7 @@ time` cannot be a law, however well it fits one noisy table. Units are
 
 | layer | flags | behaviour |
 |---|---|---|
-| 1 | none | Nothing happens. No inference, no filtering, no new warning, and **no new output fields**. Text, `--json` and `--ndjson` are byte-identical to the pre-change binary. |
+| 1 | none | Nothing happens. No inference, no filtering, no new warning, and **no new output fields**. Text, `--json` and `--ndjson` match the pre-change binary byte for byte (the regression test masks only `elapsed_seconds`, which was already nondeterministic). |
 | 2 | `--units` | Enables knowledge only. Reports the dimensions of the fitted constants and notes how many archived solutions `--require-dimensions` would reject. It never rejects or drops a model. |
 | 3 | `--units --require-dimensions` | Turns the filter on. `--require-dimensions` without `--units` is a usage error (exit 2), never a silent no-op. |
 
