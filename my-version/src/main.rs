@@ -48,6 +48,23 @@ INPUT:
                              the target and any --time/--group-by column)
   --test-frac <f>            held-out fraction (default 0.25)
 
+DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
+  --fill <method>            what to do with a missing cell (empty, NA, NaN or
+                             null). Default none: leave it, as before.
+                             drop        drop the row
+                             mean|median training-row column statistic
+                             zero        literal 0
+                             previous    last value above it in the same side
+                             interpolate linear between the neighbours
+  --outlier-iqr <k>          drop rows more than k interquartile ranges from the
+                             column median (bounds from training rows only)
+  --smooth <k>               k-wide centred moving average per column (edges
+                             shrink; windows never cross the train/test split)
+  --center <how>             subtract mean (default), median, min, max or none
+  --scale <how>              divide by std (default), iqr, range or none
+  --filter <expr>            keep only rows where the expression is > 0; may
+                             use any numeric column name, e.g. \"x > 0.5 and y < 3\"
+
 HOW ROWS ARE SPLIT (important for time series and panel data):
   --split random|temporal|group|temporal-group|auto   (default random)
                              random          shuffled i.i.d. holdout
@@ -156,6 +173,12 @@ fn schema() -> String {
         ("--target", "string", "none", "target column name"),
         ("--vars", "csv", "all-except-target", "input column names"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
+        ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
+        ("--outlier-iqr", "float", "none", "drop rows beyond k interquartile ranges from the training median"),
+        ("--smooth", "int", "0", "centred moving-average window in rows (0 = off)"),
+        ("--center", "enum", "mean", "subtract mean | median | min | max | none before the search"),
+        ("--scale", "enum", "std", "divide by std | iqr | range | none before the search"),
+        ("--filter", "string", "none", "keep rows where this expression is > 0"),
         ("--split", "enum", "random", "random | temporal | group | temporal-group | auto"),
         ("--time", "string", "none", "time/ordering column (implies temporal)"),
         ("--group-by", "string", "none", "group column (implies group)"),
@@ -352,6 +375,12 @@ fn main() {
     let mut stability_runs = 0usize;
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
+    let mut fill = data::FillMethod::None;
+    let mut outlier_iqr: Option<f64> = None;
+    let mut smooth = 0usize;
+    let mut center = data::Center::Mean;
+    let mut scale = data::Scale::Std;
+    let mut filter_src: Option<String> = None;
 
     let mut i = 0;
     macro_rules! val {
@@ -392,6 +421,52 @@ fn main() {
             "--max-complexity" => cfg.max_complexity = val!().parse().unwrap_or(cfg.max_complexity),
             "--seed" => cfg.seed = val!().parse().unwrap_or(cfg.seed),
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
+            "--fill" => {
+                let v = val!();
+                match data::FillMethod::parse(&v) {
+                    Ok(m) => fill = m,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--outlier-iqr" => match val!().parse::<f64>() {
+                Ok(k) if k > 0.0 => outlier_iqr = Some(k),
+                Ok(_) => outlier_iqr = None,
+                Err(_) => {
+                    eprintln!("error: --outlier-iqr needs a positive number");
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            "--smooth" => match val!().parse::<usize>() {
+                Ok(k) => smooth = k,
+                Err(_) => {
+                    eprintln!("error: --smooth needs a non-negative integer window");
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            "--center" => {
+                let v = val!();
+                match data::Center::parse(&v) {
+                    Ok(c) => center = c,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--scale" => {
+                let v = val!();
+                match data::Scale::parse(&v) {
+                    Ok(s) => scale = s,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--filter" => filter_src = Some(val!()),
             "--split" => split_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
@@ -485,6 +560,30 @@ fn main() {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+    };
+
+    // Parse the row filter against every numeric column. A syntax error is a
+    // usage error (exit 2) and keeps the parser's column number.
+    let filter = match filter_src.as_deref() {
+        Some(src) => {
+            let filter_vars: Vec<String> = (0..table.names.len())
+                .filter(|&j| table.numeric[j])
+                .map(|j| table.names[j].clone())
+                .collect();
+            match expr::parse(src, &filter_vars) {
+                Ok(tree) => Some(data::Filter {
+                    tree,
+                    vars: filter_vars,
+                    expression: src.to_string(),
+                }),
+                Err(e) => {
+                    eprintln!("error: cannot parse --filter: {}", e);
+                    eprintln!("  expression: {}", src);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+        None => None,
     };
 
     // Resolve the two split-only columns (never used as model inputs).
@@ -683,14 +782,23 @@ fn main() {
         gap,
         folds,
     };
-    let mut rng = Mt::new(cfg.seed);
-    let prepared = match data::prepare_full(&table, &vars, &target, &spec, &mut rng) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
+    let prep = data::PrepSpec {
+        fill,
+        outlier_iqr,
+        smooth,
+        center,
+        scale,
+        filter,
     };
+    let mut rng = Mt::new(cfg.seed);
+    let prepared =
+        match data::prepare_full_with(&table, &vars, &target, &spec, &mut rng, &prep) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
     notes.extend(prepared.report.notes.iter().cloned());
 
     // Streaming progress: ndjson goes to stdout, other formats to stderr.
@@ -740,6 +848,11 @@ fn main() {
     for n in &notes {
         eprintln!("# {}", n);
     }
+    if format == Format::Text {
+        for line in prepared.prep.text_lines(outlier_iqr, smooth) {
+            eprintln!("{}", line);
+        }
+    }
     if format == Format::Ndjson {
         let folds_json: Vec<String> = prepared
             .fold_samples
@@ -759,6 +872,11 @@ fn main() {
             prepared.report.gap,
             folds_json.join(",")
         );
+        if prepared.prep.active() {
+            let obj = prepared.prep.json();
+            let inner = obj.trim_matches(|c| c == '{' || c == '}');
+            println!("{{\"event\":\"preparation\",{}}}", inner);
+        }
     } else if format == Format::Text && !quiet {
         eprintln!(
             "# rule-and-compass | {} island(s) x {} pop | metric={} | seed={}",
@@ -1334,7 +1452,7 @@ fn main() {
                 None => "null".to_string(),
             };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -1343,6 +1461,7 @@ fn main() {
                 prepared.train.len(),
                 prepared.test.len(),
                 split_json,
+                prepared.prep.json(),
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
@@ -1539,13 +1658,14 @@ fn run_eval(
         Format::Json => {
             let folds: Vec<String> = fold_errors.iter().map(|e| jnum(*e)).collect();
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
                 jstr(VERSION),
                 jstr(metric.name()),
                 jstr(target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
                 prepared.train.len(),
                 prepared.test.len(),
+                prepared.prep.json(),
                 jstr(&shown),
                 complexity,
                 k,
@@ -1685,6 +1805,24 @@ mod tests {
             schema().contains("--bootstrap-error"),
             "schema() is missing --bootstrap-error"
         );
+    }
+
+    /// Data preparation stayed opt-in, but every flag must be documented.
+    #[test]
+    fn help_and_schema_document_data_preparation() {
+        for flag in [
+            "--fill",
+            "--outlier-iqr",
+            "--smooth",
+            "--center",
+            "--scale",
+            "--filter",
+        ] {
+            assert!(usage().contains(flag), "usage() is missing {flag}");
+            assert!(schema().contains(flag), "schema() is missing {flag}");
+        }
+        // The default for missing values is the old behaviour: leave them.
+        assert!(usage().contains("Default none"));
     }
 
     /// The conditional primitives must be discoverable from `schema`, and the
