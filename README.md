@@ -153,6 +153,17 @@ Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
 
+## Dimensional constraints
+
+`--units 'x=m,t=s,y=m/s'` declares the SI dimensions of the inputs and the
+target; `--require-dimensions` then rejects every candidate whose inferred root
+dimension differs from the target's with an infinite error. The algebra knows
+`m`, `s`, `kg`, `A`, `K`, `mol` and `cd`, products, quotients and integer powers.
+Undeclared names are dimensionless, so the feature is opt-in: without
+`--require-dimensions`, declaring units only adds a summary note and the search
+is unchanged. See [`docs/units.md`](docs/units.md) for the operator table, a
+worked example and the limitations of a hard filter.
+
 ## Meta operators
 
 `complexity(e)`, `variables(e)`, `constants(e)`, `contains(e)` and
@@ -269,6 +280,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
+     [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]

@@ -53,6 +53,8 @@ pub fn json() -> String {
         ("--seed-expr", "string", "none", "seed expression in original units (repeatable); parsed, simplified, constants fitted, then inserted into every island and the archive; kept even above --max-complexity"),
         ("--seed-file", "string", "none", "file of seed expressions, one per line ('#' comments and blank lines skipped; repeatable)"),
         ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators, constraints and meta operators (see \"operators\")"),
+        ("--units", "csv", "none", "declared SI units name=unit (repeatable or comma-separated), e.g. x=m,t=s,y=m/s; base m,s,kg,A,K,mol,cd with *,/,^integer,(); undeclared names are dimensionless"),
+        ("--require-dimensions", "flag", "false", "reject candidates whose inferred root dimension differs from the target's (infinite error; requires --units)"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),

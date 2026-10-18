@@ -61,6 +61,9 @@ config dedup true
 config time_budget none
 config patience 40
 config predictor_samples none
+config units none
+config units.target 1
+config require_dimensions false
 generations 20
 stopped_early false
 best_prev 1.9968344769643271

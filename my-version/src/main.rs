@@ -18,6 +18,7 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
+use rcsr::units::{Unit, Units};
 use rcsr::{data, diagnostics, search, stability};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -54,6 +55,32 @@ impl ReportKind {
             _ => None,
         }
     }
+}
+
+/// Parse one `--units` value: `name=unit[,name=unit...]` (issue #25).
+///
+/// The unit expression is parsed immediately; names are resolved against the
+/// prepared input list once `--vars`, `--dtype` and `--lags` are known.
+fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
+    let mut out = Vec::new();
+    for item in src.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, expr) = item
+            .split_once('=')
+            .ok_or_else(|| format!("expected name=unit, got '{}'", item))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("missing name in '{}'", item));
+        }
+        out.push((name.to_string(), Unit::parse(expr.trim())?));
+    }
+    if out.is_empty() {
+        return Err("no units given".to_string());
+    }
+    Ok(out)
 }
 
 fn usage() -> String {
@@ -207,6 +234,13 @@ SEARCH:
                              meta: complexity,variables,constants,contains,
                              contains_op (describe the argument's structure)
                              (full set: `rcsr schema` -> operators list)
+  --units <name=unit,..>     declare SI units of inputs and the target, e.g.
+                             \"x=m,t=s,y=m/s\"; base dimensions m,s,kg,A,K,mol,cd
+                             with *, /, ^integer and parentheses. Repeatable.
+                             An undeclared name is dimensionless (opt-in)
+  --require-dimensions       reject a candidate whose inferred root dimension
+                             differs from the target's (infinite error); needs
+                             --units. Without it, units only produce a summary note
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -486,6 +520,10 @@ fn main() {
     let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
+    // #25: `--units` is resolved against the prepared input list later; the
+    // expressions themselves are parsed here so a typo is a usage error.
+    let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
+    let mut require_dimensions = false;
     let mut op_complexity_spec: Option<String> = None;
     let mut complexity_weights_spec: Option<String> = None;
     let mut depth_weight_spec: Option<f64> = None;
@@ -706,6 +744,16 @@ fn main() {
                     }
                 }
             }
+            "--units" => {
+                match parse_unit_assignments(&val!()) {
+                    Ok(mut entries) => unit_assignments.append(&mut entries),
+                    Err(e) => {
+                        eprintln!("error: --units: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--require-dimensions" => require_dimensions = true,
             "--patience" => {
                 cfg.patience = val!().parse().unwrap_or(cfg.patience);
                 patience_set = true;
@@ -794,6 +842,11 @@ fn main() {
     }
     if report.is_some() && eval_expr.is_some() {
         eprintln!("error: --report cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+    // #25: the filter needs a declaration, unless a checkpoint saved one.
+    if require_dimensions && unit_assignments.is_empty() && resume_path.is_none() {
+        eprintln!("error: --require-dimensions needs --units");
         std::process::exit(EXIT_USAGE);
     }
     if save_every_set && save_path.is_none() {
@@ -1387,6 +1440,68 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #25: resolve --units names against the prepared input list. A lagged
+    // copy (`x_lag1`) inherits the unit declared for its source (`x`); every
+    // other undeclared name, including the target, is dimensionless.
+    if !unit_assignments.is_empty() {
+        for (i, (name, _)) in unit_assignments.iter().enumerate() {
+            if unit_assignments[..i].iter().any(|(n, _)| n == name) {
+                eprintln!("error: --units declares '{}' more than once", name);
+                std::process::exit(EXIT_USAGE);
+            }
+            let is_target = name == &target;
+            let is_input = vars.iter().any(|v| v == name);
+            let is_lag_source = vars.iter().any(|v| {
+                v.rsplit_once("_lag")
+                    .map(|(base, n)| base == name && n.parse::<usize>().is_ok())
+                    .unwrap_or(false)
+            });
+            if !is_target && !is_input && !is_lag_source {
+                eprintln!(
+                    "error: --units names '{}', which is neither the target nor an input \
+                     (inputs: {})",
+                    name,
+                    vars.join(", ")
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        let declared = |name: &str| {
+            unit_assignments
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, u)| *u)
+        };
+        let target_unit = declared(&target).unwrap_or(Unit::DIMENSIONLESS);
+        let mut var_units = Vec::with_capacity(vars.len());
+        for v in &vars {
+            let unit = declared(v).or_else(|| {
+                v.rsplit_once("_lag")
+                    .filter(|(_, n)| n.parse::<usize>().is_ok())
+                    .and_then(|(base, _)| declared(base))
+            });
+            var_units.push(unit.unwrap_or(Unit::DIMENSIONLESS));
+        }
+        cfg.units = Some(Units::new(var_units, target_unit));
+        notes.push(format!(
+            "units: target '{}' is {}{}",
+            target,
+            target_unit,
+            if require_dimensions || cfg.require_dimensions {
+                " — dimensional filter on"
+            } else {
+                " — not filtering; pass --require-dimensions to reject mismatches"
+            }
+        ));
+    }
+    if require_dimensions {
+        cfg.require_dimensions = true;
+    }
+    if cfg.require_dimensions && cfg.units.is_none() {
+        eprintln!("error: --require-dimensions needs --units (or a checkpoint that saved them)");
+        std::process::exit(EXIT_USAGE);
+    }
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.

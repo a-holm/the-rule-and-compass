@@ -45,6 +45,9 @@ use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use crate::search::Config;
+// #25: units are part of the saved search settings, so a resumed run keeps the
+// same dimensional filter.
+use crate::units::{Unit, Units};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -818,6 +821,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "time_budget",
         "patience",
         "predictor_samples",
+        "units",
+        "units.target",
+        "require_dimensions",
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -936,6 +942,27 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         ));
     }
 
+    // #25: `units` is `none` or one encoded unit per input; the target's unit
+    // is a separate field so the two lists cannot drift.
+    let units = match required(fields, "units")? {
+        "none" => None,
+        raw => {
+            let vars = Units::decode_vars(raw)
+                .map_err(|e| format!("bad config value for 'units': {}", e))?;
+            let target = Unit::parse(required(fields, "units.target")?)
+                .map_err(|e| format!("bad config value for 'units.target': {}", e))?;
+            Some(Units::new(vars, target))
+        }
+    };
+    let require_dimensions = bool_val("require_dimensions")?;
+    if require_dimensions && units.is_none() {
+        return Err(
+            "config 'require_dimensions' is true but 'units' is none; \
+             the filter needs declared units"
+                .to_string(),
+        );
+    }
+
     Ok(Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -953,6 +980,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         time_budget,
         patience: num_usize("patience")?,
         predictor_samples,
+        units,
+        require_dimensions,
         progress: None,
     })
 }
@@ -1010,6 +1039,31 @@ fn write_config(cfg: &Config, out: &mut String) {
             Some(n) => n.to_string(),
             None => "none".to_string(),
         }
+    )
+    .unwrap();
+    // #25: keep the dimensional filter identical across a save/resume.
+    writeln!(
+        out,
+        "config units {}",
+        match &cfg.units {
+            Some(u) => u.encode_vars(),
+            None => "none".to_string(),
+        }
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "config units.target {}",
+        match &cfg.units {
+            Some(u) => u.target.to_string(),
+            None => Unit::DIMENSIONLESS.to_string(),
+        }
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "config require_dimensions {}",
+        cfg.require_dimensions
     )
     .unwrap();
 }
