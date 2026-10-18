@@ -107,6 +107,10 @@ INPUT:
                              Example: --dtype flag=boolean,symbol=categorical
   --max-levels <N>           maximum distinct values in a categorical column
                              before one-hot expansion (default 16)
+  --skip-malformed           drop data rows whose field count differs from the
+                             header and report how many were skipped. Default:
+                             refuse the file with an input error (exit 3) naming
+                             the 1-based line and both field counts
   --test-frac <f>            held-out fraction (default 0.25)
 
 ROW WEIGHTS:
@@ -557,6 +561,7 @@ fn main() {
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
     let mut fill = data::FillMethod::None;
+    let mut skip_malformed = false;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
     let mut center = data::Center::Mean;
@@ -608,6 +613,7 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--data" => data_path = Some(val!()),
+            "--skip-malformed" => skip_malformed = true,
             "--target" => target = Some(val!()),
             "--vars" => {
                 vars = val!()
@@ -1232,9 +1238,9 @@ fn main() {
             eprintln!("error reading stdin: {}", e);
             std::process::exit(EXIT_INPUT);
         }
-        data::parse_table(&buf)
+        data::parse_table_with(&buf, skip_malformed)
     } else {
-        data::read_table(&data_path)
+        data::read_table_with(&data_path, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -4640,6 +4646,7 @@ mod tests {
             "--center",
             "--scale",
             "--filter",
+            "--skip-malformed",
         ] {
             assert!(usage().contains(flag), "usage() is missing {flag}");
             assert!(schema::json().contains(flag), "schema::json() is missing {flag}");

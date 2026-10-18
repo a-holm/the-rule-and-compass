@@ -32,6 +32,26 @@ value. Smoothing windows shrink at the train/test boundary for the same reason.
 Rows that preparation removes disappear from both the training and the test
 set; they are never silently kept.
 
+## Ragged rows
+
+The field count is part of the data contract. A data row with more or fewer
+fields than the header cannot be interpreted without guessing which cell is
+missing or extra, so the loader refuses the file instead of dropping the row:
+
+```
+error: line 3: expected 2 field(s), found 3 (ragged row; pass --skip-malformed to drop such rows instead)
+```
+
+The line number is 1-based in the file. Blank lines and lines whose first
+non-space character is `#` are not data rows and never trigger this error.
+
+`--skip-malformed` is the explicit opt-out: it drops ragged rows instead of
+refusing the file and prints how many were dropped in the preparation report
+(`# preparation: --skip-malformed dropped 1 ragged row(s)`; the JSON reports
+`rows_skipped_malformed`). Do not confuse this with a missing **cell** in a
+correct-width row: `x,y` followed by `1,` has the right field count and is a
+gap for `--fill` to handle.
+
 ## Missing values
 
 At load time a cell is **missing** when it is empty, `NA`, `NaN` or `null`,
