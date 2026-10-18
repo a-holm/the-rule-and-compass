@@ -625,6 +625,10 @@ fn run_search(
     // what the dataset's statistics are.
     let aggs = AggTable::from_sample(train);
     let t0 = std::time::Instant::now();
+    // #10: user-defined blocks are thread-local. Snapshot the registry here so
+    // every island thread (and the initial population below) sees the same
+    // definitions; the list is empty unless --function was supplied.
+    let blocks = expr::current_blocks();
 
     let mut rng: Mt;
     let mut archive: Archive;
@@ -812,7 +816,12 @@ fn run_search(
                     .iter_mut()
                     .zip(rngs.iter_mut())
                     .map(|(isl, r)| {
-                        s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars, aggs_ref))
+                        // #10: carry the block registry into the island thread.
+                        let blocks = blocks.clone();
+                        s.spawn(move || {
+                            expr::set_blocks(blocks);
+                            evolve_island(isl, r, cfg, gen_train, nvars, aggs_ref)
+                        })
                     })
                     .collect();
                 for h in handles {

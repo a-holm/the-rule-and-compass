@@ -167,6 +167,10 @@ const OP_BY_INDEX: [Op; Op::COUNT] = [
     Op::Agg(AggKind::Min),
     Op::Agg(AggKind::Max),
     Op::Agg(AggKind::Count),
+    Op::Custom0,
+    Op::Custom1,
+    Op::Custom2,
+    Op::Custom3,
 ];
 
 fn op_by_index(i: usize) -> Option<Op> {
@@ -248,7 +252,12 @@ fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
     for _ in 0..arity {
         kids.push(parse_tree(tokens, pos)?);
     }
-    Ok(Node { op, val, kids })
+    Ok(Node {
+        op,
+        val,
+        kids,
+        block: None,
+    })
 }
 
 fn next_token<'a>(

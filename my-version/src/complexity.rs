@@ -237,11 +237,8 @@ mod tests {
     #[test]
     fn op_count_covers_every_variant() {
         // `Op::COUNT` indexes a table by [`Op::index`]; a new variant at the
-        // end must bump it. `Op::Agg(Count)` is the last variant today.
-        assert_eq!(
-            Op::Agg(crate::expr::AggKind::Count).index() + 1,
-            Op::COUNT
-        );
+        // end must bump it. `Op::Custom(3)` is the last variant today.
+        assert_eq!(Op::Custom(3).index() + 1, Op::COUNT);
     }
 
     #[test]

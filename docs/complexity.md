@@ -40,7 +40,9 @@ Operator names use the same vocabulary as `--ops` (`rcsr schema` lists them):
 `pow`, `sin`, `add`, `if`, `logistic`, and so on. Weights must be positive and
 finite; the depth weight may also be zero. A malformed pair, an unknown operator
 or key, or a non-positive weight is a usage error (exit code `2`) and the
-message names the token that was wrong.
+message names the token that was wrong. A user-defined block (`--function`) is
+priced by its name or `customN` slot; its body's internal nodes are not charged
+again, because the block is one primitive of the configured cost.
 
 The configured value is what the search prunes on, what the Pareto front is
 sorted and dominated on, and what every solution reports as `complexity=`
