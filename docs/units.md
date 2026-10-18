@@ -71,6 +71,9 @@ an unknown name is not an error.
 | `require`, `constrain`, `between` | arguments dimensionless; result dimensionless |
 | `atan2(y, x)` | `y` and `x` equal; result dimensionless |
 | `complexity`, `variables`, `constants`, `contains`, `contains_op` | result dimensionless; the argument is structural |
+| `mean(x)`, `std`, `median`, `iqr`, `sum`, `amin`, `amax` | the **column's** dimension: an aggregate is a statistic of one column |
+| `count()` | dimensionless (a row count) |
+| `customN(...)` (`--function`) | **not analysed**; see the limitations below |
 
 ## Fitted constants absorb units
 
@@ -235,6 +238,13 @@ Layer 1 is a hard compatibility promise. With no `--units`:
   area).
 * **No unit table.** Write `kg*m/s^2` rather than `N`, and `m^3` rather than
   `litre`; an unknown identifier is a new base dimension, not an alias.
+* **Building blocks are not dimension-analysed.** A `--function` body is in
+  parameter space, so resolving a call needs its own parameter environment,
+  which is not modelled yet. Rather than guess, a call is *unanalysable*: with
+  `--require-dimensions` a candidate containing one is rejected, and
+  `constant_dimensions` reports nothing for its constants. Aggregates are fine
+  (they take their column's dimension); combine `--units` with `--function`
+  only when you are not filtering.
 * **The filter applies to the search**, not to `--eval-expr`, which still
   scores any formula you give it.
 * **One-hot categorical names containing `=` cannot be declared** because the
