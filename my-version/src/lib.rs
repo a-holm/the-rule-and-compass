@@ -10,5 +10,6 @@ pub mod fit;
 pub mod gpu;
 pub mod metrics;
 pub mod pareto;
+pub mod parse;
 pub mod rng;
 pub mod search;
