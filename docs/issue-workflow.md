@@ -243,15 +243,49 @@ A safe pattern:
 Each agent works only inside its own `worktrees/issue-<n>-<slug>/` and pushes only
 its own `issue/<n>-<slug>` branch.
 
+### One full-suite test at a time
+
+Parallel *editing* is fine; parallel **building and testing** is not. Each
+worktree that keeps its own `my-version/target/` bypasses cargo's own target
+lock, so two agents can compile and run the whole suite at once. On an 8-thread
+machine that pushed the load average to 13 and made every run slower and noisier.
+
+Rules:
+
+* **Never run `cargo build`, `cargo test` or `rcsr-bench` while another one is
+  running.** Look first (`ps -eo pcpu,args | grep -E 'cargo|rustc'`), then wait.
+* Run full suites through the shared lock, which queues instead of competing:
+
+  ```sh
+  /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
+    'cd worktrees/issue-<n>-<slug>/my-version && \
+     CARGO_TARGET_DIR=/mnt/lager/eureqa/my-version/target cargo test --release'
+  ```
+
+* Agents may run **narrow** checks while working (`cargo test --test <name>`,
+  `cargo build --release` once after a coherent change). They must not each run
+  the full suite at the end.
+* When several issues are being integrated together, the **combined** branch is
+  tested **once**, centrally, by the integrator: one `cargo test --release`, one
+  `cargo test --release --features cuda` if the GPU code changed, and one
+  `rcsr-bench --tiny`. Individual agents report what they did **not** verify.
+
 ### Brief for a delegated agent
 
 > You are working on issue #<n> of `a-holm/the-rule-and-compass`. Read
 > `docs/issue-workflow.md` and follow it exactly. Create the worktree
 > `worktrees/issue-<n>-<slug>` on branch `issue/<n>-<slug>`, implement the
-> acceptance criteria in the issue (`gh issue view <n>`), add tests, run
-> `cargo test --release` in `my-version/`, commit, push, and open a PR that says
-> `Closes #<n>` with the acceptance checklist ticked. Do not touch files outside
-> the issue's scope. Report back with the PR number and a one-line summary.
+> acceptance criteria in the issue (`gh issue view <n>`), add tests, commit,
+> push, and open a PR that says `Closes #<n>` with the acceptance checklist
+> ticked. Do not touch files outside the issue's scope. Report back with the PR
+> number and a one-line summary.
+>
+> **Do not start an independent full-suite run, and do not start one while any
+> other `cargo`/`rustc` process is running.** Use narrow checks while you work
+> (`cargo test --test <name>`). If a full suite is genuinely required, it must go
+> through `/mnt/lager/tmp/opencode/one-full-suite.sh`. The combined integration
+> branch is tested once, centrally; in your report, list what you did not
+> verify.
 
 ---
 
