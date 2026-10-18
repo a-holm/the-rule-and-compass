@@ -63,6 +63,11 @@ pub enum Op {
 }
 
 impl Op {
+    /// Number of operator variants. `Op` is a fieldless enum, so a discriminant
+    /// is a valid dense index into a cost table; `complexity::ComplexityModel`
+    /// relies on this. A new variant must bump the count (a test guards it).
+    pub const COUNT: usize = 49;
+
     pub fn arity(self) -> usize {
         use Op::*;
         match self {
@@ -638,8 +643,10 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
     }
 }
 
-/// Complexity = node count. A per-operator cost table can refine this;
-/// v1 uses 1.0 per node.
+/// Complexity = node count. This is the default of
+/// [`crate::complexity::ComplexityModel`], which supports per-operator costs
+/// and variable/constant/depth weights; it stays the canonical structural
+/// measure for tree traversal (`nth`, `mutate`, `crossover`).
 pub fn complexity(n: &Node) -> usize {
     1 + n.kids.iter().map(complexity).sum::<usize>()
 }

@@ -11,6 +11,7 @@
 //! * `--time-budget` bounds wall-clock time, so a caller never blocks forever;
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
+use rcsr::complexity::ComplexityModel;
 use rcsr::expr::{self, Op};
 use rcsr::fit;
 use rcsr::metrics::{self, Metric};
@@ -145,7 +146,13 @@ SEARCH:
   --generations <N>          (default 200)
   --islands <I>              (default 1)
   --pop <P>                  population per island (default 200)
-  --max-complexity <K>       max nodes per expression (default 30)
+  --max-complexity <K>       max configured complexity per expression (default 30)
+  --op-complexity <spec>     per-operator costs, e.g. \"pow=2,sin=1.5,if=3\";
+                             operators not listed keep the default cost of 1
+  --complexity-weights <s>   terminal weights, e.g. \"var=1,const=1\"; keys
+                             var, const and depth (default: 1, 1 and 0)
+  --depth-weight <w>         cost per nesting level, i.e. edge below the root
+                             (default 0); a single node has depth 0
   --seed <S>                 RNG seed, echoed in output (default 0)
   --ops <list>               comma/space-separated operators, e.g.
                              add,sub,mul,div,sin,exp,floor,min,max
@@ -208,7 +215,10 @@ fn schema() -> String {
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
         ("--pop", "int", "200", "population per island"),
-        ("--max-complexity", "int", "30", "max nodes per expression"),
+        ("--max-complexity", "int", "30", "max configured complexity per expression"),
+        ("--op-complexity", "csv", "all-1", "per-operator costs name=cost, e.g. pow=2,sin=1.5; unlisted operators cost 1"),
+        ("--complexity-weights", "csv", "var=1,const=1", "terminal weights name=weight; keys var, const and depth (depth defaults to 0)"),
+        ("--depth-weight", "float", "0", "extra cost per nesting level (edges below the root)"),
         ("--seed", "int", "0", "RNG seed"),
         ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators and constraints (see \"operators\")"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
@@ -240,6 +250,7 @@ fn schema() -> String {
         "{{\n  \"tool\":\"rcsr\",\n  \"version\":{},\n  \"summary\":{},\n  \
          \"options\":[{}\n  ],\n  \
          \"operators\":[{}],\n  \
+         \"complexity\":{{\"formula\":\"sum(op_cost) + var_weight*n_vars + const_weight*n_consts + depth_weight*max_depth\",\"defaults\":{{\"op_cost\":1,\"var_weight\":1,\"const_weight\":1,\"depth_weight\":0}},\"operator_nodes_only\":true,\"depth\":\"edges from the root; a single node has depth 0\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
@@ -304,7 +315,7 @@ fn parse_filter(flag: &str, src: Option<&str>, table: &data::Table) -> Option<da
 
 struct Row {
     rank: usize,
-    complexity: usize,
+    complexity: f64,
     /// Fitted constants: the free parameters of the model.
     k_constants: usize,
     train_error: f64,
@@ -344,7 +355,7 @@ struct CvReport {
 struct CvFoldRow {
     train_error: f64,
     test_error: f64,
-    complexity: usize,
+    complexity: f64,
     expression: String,
 }
 
@@ -461,6 +472,38 @@ fn main() {
             "--islands" => cfg.islands = val!().parse().unwrap_or(cfg.islands),
             "--pop" => cfg.pop = val!().parse().unwrap_or(cfg.pop),
             "--max-complexity" => cfg.max_complexity = val!().parse().unwrap_or(cfg.max_complexity),
+            "--op-complexity" => {
+                let v = val!();
+                if let Err(e) = cfg.complexity_model.apply_op_costs(&v) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+            "--complexity-weights" => {
+                let v = val!();
+                if let Err(e) = cfg.complexity_model.apply_weights(&v) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+            "--depth-weight" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(w) => {
+                        if let Err(e) = cfg.complexity_model.set_depth_weight(w) {
+                            eprintln!("error: --depth-weight: {}", e);
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "error: --depth-weight needs a finite number >= 0, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--seed" => cfg.seed = val!().parse().unwrap_or(cfg.seed),
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
             "--fill" => {
@@ -945,7 +988,17 @@ fn main() {
     }
 
     if let Some(src) = eval_expr.as_deref() {
-        run_eval(src, &vars, &target, &prepared, cfg.metric, format, quiet, start);
+        run_eval(
+            src,
+            &vars,
+            &target,
+            &prepared,
+            cfg.metric,
+            &cfg.complexity_model,
+            format,
+            quiet,
+            start,
+        );
         std::process::exit(EXIT_OK);
     }
 
@@ -1024,7 +1077,7 @@ fn main() {
             };
             Row {
                 rank: k + 1,
-                complexity: s.complexity,
+                complexity: s.cost,
                 k_constants: kconst,
                 train_error,
                 test_error,
@@ -1104,7 +1157,7 @@ fn main() {
                 fold_rows.push(CvFoldRow {
                     train_error,
                     test_error,
-                    complexity: s.complexity,
+                    complexity: s.cost,
                     expression: expr::to_string(&den, &vars),
                 });
             }
@@ -1669,6 +1722,7 @@ fn run_eval(
     target: &str,
     prepared: &data::Prepared,
     metric: Metric,
+    model: &ComplexityModel,
     format: Format,
     quiet: bool,
     started: std::time::Instant,
@@ -1682,7 +1736,7 @@ fn run_eval(
         }
     };
     let k = expr::count_constants(&tree);
-    let complexity = expr::complexity(&tree);
+    let complexity = model.complexity(&tree);
     let shown = expr::to_string(&tree, vars);
 
     let raw_row = |row: &[f64]| -> Vec<f64> {

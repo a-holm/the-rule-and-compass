@@ -128,9 +128,40 @@ exposes the parser on the command line.
 
 ## 5. Complexity
 
-- Per-operator cost table; default **1.0 per node** (configurable).
-- `complexity(expr) = sum of the cost of each node`.
-- Reject individuals whose complexity exceeds `max_complexity`.
+Every candidate has a **configured complexity**
+
+```
+complexity(f) = sum(op_cost)              # over operator nodes only
+              + var_weight  * n_vars
+              + const_weight * n_consts
+              + depth_weight * max_depth
+```
+
+- `sum(op_cost)` prices every node that is neither `Const` nor `Input`.
+  Terminals are priced by the two terminal weights, never by `op_cost`.
+- `n_vars` and `n_consts` count `Input` and `Const` nodes.
+- `max_depth` is the number of edges on the longest root-to-node path. A
+  single terminal has depth `0`; `sin(x)` has depth `1`; `sin(cos(x))` has
+  depth `2`.
+- **Defaults:** every operator costs `1`, `var_weight = const_weight = 1` and
+  `depth_weight = 0`. The value is then exactly the number of nodes, bit for
+  bit, which is the historical behaviour.
+- `--op-complexity "pow=2,sin=1.5,if=3"` sets per-operator costs. Names use the
+  same table as `--ops`; any operator not listed keeps the cost `1`.
+- `--complexity-weights "var=1,const=1"` sets terminal weights. The keys are
+  `var` (aliases `variable`, `input`) and `const` (alias `constant`); `depth`
+  is also accepted as a synonym for `--depth-weight`.
+- `--depth-weight 0.5` adds `0.5` per nesting level.
+- Every weight must be positive and finite; the depth weight may also be zero.
+  An unknown operator or key, a missing `=`, an empty entry or a non-positive
+  weight is a **usage error (exit 2)** whose message names the offending token.
+- The configured complexity is the value on which the Pareto front is ranked
+  and pruned, the value compared against `--max-complexity`, and the value
+  reported for every solution (`complexity=` in text, `"complexity"` in JSON).
+- Complexity is computed for every candidate, so the hot path is one
+  allocation-free recursive walk over the tree.
+
+See [`docs/complexity.md`](docs/complexity.md) for worked examples.
 
 ## 6. Error metrics
 
