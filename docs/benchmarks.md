@@ -157,7 +157,7 @@ by noise level:
 ```
 
 The whole tiny sweep (9 problems × 3 noise levels) finishes in about **5 seconds**
-on an idle 8-core machine, which is why it is the CI subset. Engine seeds 7 and
+on an idle 8-thread machine, which is why it is the CI subset. Engine seeds 7 and
 42 give 27/27 (100 %) and 26/27 (96.3 %) at these settings — one 1 %-noise run
 missed the threshold at seed 42 — so the tiny suite is a smoke test, not a
 one-seed fluke.
@@ -176,7 +176,7 @@ cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1
 
 All 25 problems at the three default noise levels with the full budget
 (150 generations, 2 islands, 200 individuals). Recorded with engine seed `1` on
-an 8-core x86-64 machine; the sum of the per-run times was about 365 s
+an 8-thread x86-64 machine; the sum of the per-run times was about 365 s
 (≈ 6–7 min wall-clock, one run at a time).
 
 ```
