@@ -21,8 +21,20 @@
 //! ordering, so the split is still well defined. Group columns may be text
 //! (ticker symbols) — they are never used as model inputs, only for splitting.
 
+use crate::expr::{self, Node};
 use crate::rng::Mt;
 use std::collections::HashMap;
+
+/// Tokens that stand for a missing cell. They are accepted in numeric columns;
+/// anything else that does not parse as a number still makes the column
+/// non-numeric (see [`parse_table`]).
+pub fn is_missing_token(cell: &str) -> bool {
+    let c = cell.trim();
+    c.is_empty()
+        || c.eq_ignore_ascii_case("na")
+        || c.eq_ignore_ascii_case("nan")
+        || c.eq_ignore_ascii_case("null")
+}
 
 #[derive(Clone, Default)]
 pub struct Sample {
@@ -119,14 +131,16 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
         return Err("no data rows".to_string());
     }
 
-    // A column is numeric when every non-empty cell parses as a number.
+    // A column is numeric when every non-missing cell parses as a number.
+    // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
+    // here and become `NaN` in the numeric view.
     let mut numeric = vec![false; names.len()];
     for (j, slot) in numeric.iter_mut().enumerate() {
         let mut any = false;
         let mut all = true;
         for r in &raw {
             let cell = r[j].trim();
-            if cell.is_empty() {
+            if is_missing_token(cell) {
                 continue;
             }
             any = true;
@@ -144,7 +158,7 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
             r.iter()
                 .enumerate()
                 .map(|(j, c)| {
-                    if numeric[j] {
+                    if numeric[j] && !is_missing_token(c) {
                         c.trim().parse::<f64>().unwrap_or(f64::NAN)
                     } else {
                         f64::NAN
@@ -249,9 +263,276 @@ pub struct Prepared {
     /// One sample per evaluation block. With `folds == 1` this is a single
     /// sample identical to `test`.
     pub fold_samples: Vec<Sample>,
+    /// Affine denormalisation constants: original = normalised * stds + means.
+    /// With the default centre/scale these are the training mean and standard
+    /// deviation, exactly as before.
     pub means: Vec<f64>,
     pub stds: Vec<f64>,
     pub report: SplitReport,
+    /// What data preparation did (missing values, outliers, smoothing,
+    /// normalisation, row filter).
+    pub prep: PrepReport,
+}
+
+// ---------------------------------------------------------------------------
+// Data preparation (issue #2)
+// ---------------------------------------------------------------------------
+
+/// How to handle a missing cell in a used column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FillMethod {
+    /// Leave it missing (today's behaviour; the default).
+    None,
+    /// Drop any row with a missing value in a used column.
+    Drop,
+    /// Column mean, computed from the training rows.
+    Mean,
+    /// Column median, computed from the training rows.
+    Median,
+    /// A literal zero.
+    Zero,
+    /// The previous non-missing value in the same side, in row order.
+    Previous,
+    /// Linear interpolation between the neighbouring non-missing values in the
+    /// same side, in row order.
+    Interpolate,
+}
+
+impl FillMethod {
+    pub fn name(self) -> &'static str {
+        match self {
+            FillMethod::None => "none",
+            FillMethod::Drop => "drop",
+            FillMethod::Mean => "mean",
+            FillMethod::Median => "median",
+            FillMethod::Zero => "zero",
+            FillMethod::Previous => "previous",
+            FillMethod::Interpolate => "interpolate",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" => Ok(FillMethod::None),
+            "drop" | "ignore" => Ok(FillMethod::Drop),
+            "mean" => Ok(FillMethod::Mean),
+            "median" => Ok(FillMethod::Median),
+            "zero" | "0" => Ok(FillMethod::Zero),
+            "previous" | "prev" | "forward" => Ok(FillMethod::Previous),
+            "interpolate" | "linear" | "interp" => Ok(FillMethod::Interpolate),
+            other => Err(format!(
+                "unknown --fill method '{}' (expected none, drop, mean, median, zero, previous or interpolate)",
+                other
+            )),
+        }
+    }
+}
+
+/// What to subtract before the search (the `--center` option).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Center {
+    Mean,
+    Median,
+    Min,
+    Max,
+    None,
+}
+
+impl Center {
+    pub fn name(self) -> &'static str {
+        match self {
+            Center::Mean => "mean",
+            Center::Median => "median",
+            Center::Min => "min",
+            Center::Max => "max",
+            Center::None => "none",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "mean" => Ok(Center::Mean),
+            "median" => Ok(Center::Median),
+            "min" | "lower" => Ok(Center::Min),
+            "max" | "upper" => Ok(Center::Max),
+            "none" | "off" => Ok(Center::None),
+            other => Err(format!(
+                "unknown --center '{}' (expected mean, median, min, max or none)",
+                other
+            )),
+        }
+    }
+}
+
+/// What to divide by before the search (the `--scale` option).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scale {
+    Std,
+    Iqr,
+    Range,
+    None,
+}
+
+impl Scale {
+    pub fn name(self) -> &'static str {
+        match self {
+            Scale::Std => "std",
+            Scale::Iqr => "iqr",
+            Scale::Range => "range",
+            Scale::None => "none",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "std" | "sd" | "standard-deviation" | "standard_deviation" => Ok(Scale::Std),
+            "iqr" => Ok(Scale::Iqr),
+            "range" | "minmax" | "min-max" => Ok(Scale::Range),
+            "none" | "off" => Ok(Scale::None),
+            other => Err(format!(
+                "unknown --scale '{}' (expected std, iqr, range or none)",
+                other
+            )),
+        }
+    }
+}
+
+/// A parsed row filter. The tree was parsed against `vars`, so input indices in
+/// the tree refer to positions in this slice.
+#[derive(Clone)]
+pub struct Filter {
+    pub tree: Node,
+    pub vars: Vec<String>,
+    /// Human-readable form, for the report.
+    pub expression: String,
+}
+
+/// Opt-in data preparation. Every default reproduces the behaviour before
+/// issue #2: no filling, no outlier removal, no smoothing, mean/std
+/// normalisation and no row filter.
+#[derive(Clone)]
+pub struct PrepSpec {
+    pub fill: FillMethod,
+    /// Drop rows more than this many interquartile ranges from the column
+    /// median (training rows define the bounds).
+    pub outlier_iqr: Option<f64>,
+    /// Moving-average window in rows (`0` disables it).
+    pub smooth: usize,
+    pub center: Center,
+    pub scale: Scale,
+    pub filter: Option<Filter>,
+}
+
+impl Default for PrepSpec {
+    fn default() -> Self {
+        PrepSpec {
+            fill: FillMethod::None,
+            outlier_iqr: None,
+            smooth: 0,
+            center: Center::Mean,
+            scale: Scale::Std,
+            filter: None,
+        }
+    }
+}
+
+/// Counts and methods actually used during preparation, for the report and the
+/// `preparation` object in `--json` / `--ndjson`.
+#[derive(Clone)]
+pub struct PrepReport {
+    pub fill: &'static str,
+    /// Rows with at least one cell filled.
+    pub rows_filled: usize,
+    pub rows_dropped_missing: usize,
+    pub rows_dropped_outlier: usize,
+    /// Number of cells replaced by a smoothing window.
+    pub smoothed: usize,
+    pub center: &'static str,
+    pub scale: &'static str,
+    /// Rows removed by `--filter`.
+    pub filtered: usize,
+}
+
+impl Default for PrepReport {
+    fn default() -> Self {
+        PrepReport {
+            fill: "none",
+            rows_filled: 0,
+            rows_dropped_missing: 0,
+            rows_dropped_outlier: 0,
+            smoothed: 0,
+            center: "mean",
+            scale: "std",
+            filtered: 0,
+        }
+    }
+}
+
+impl PrepReport {
+    /// True when at least one non-default transformation ran.
+    pub fn active(&self) -> bool {
+        self.fill != "none"
+            || self.rows_dropped_missing > 0
+            || self.rows_dropped_outlier > 0
+            || self.smoothed > 0
+            || self.center != "mean"
+            || self.scale != "std"
+            || self.filtered > 0
+    }
+
+    /// One short, commented line per active transformation. `params` carries
+    /// the raw option values that are not part of the counts.
+    pub fn text_lines(&self, outlier_iqr: Option<f64>, smooth: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.fill != "none" || self.rows_dropped_missing > 0 {
+            out.push(format!(
+                "# preparation: fill={} rows_filled={} rows_dropped_missing={}",
+                self.fill, self.rows_filled, self.rows_dropped_missing
+            ));
+        }
+        if let Some(k) = outlier_iqr {
+            if k > 0.0 {
+                out.push(format!(
+                    "# preparation: outlier-iqr={} rows_dropped_outlier={}",
+                    k, self.rows_dropped_outlier
+                ));
+            }
+        }
+        if smooth > 0 {
+            out.push(format!(
+                "# preparation: smooth={} cells_smoothed={}",
+                smooth, self.smoothed
+            ));
+        }
+        if self.center != "mean" || self.scale != "std" {
+            out.push(format!(
+                "# preparation: center={} scale={}",
+                self.center, self.scale
+            ));
+        }
+        if self.filtered > 0 {
+            out.push(format!(
+                "# preparation: filter removed {} row(s)",
+                self.filtered
+            ));
+        }
+        out
+    }
+
+    /// The `preparation` object shared by `--json` and `--ndjson`.
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{}}}",
+            self.fill,
+            self.rows_filled,
+            self.rows_dropped_missing,
+            self.rows_dropped_outlier,
+            self.smoothed,
+            self.center,
+            self.scale,
+            self.filtered
+        )
+    }
 }
 
 /// Build normalised train/test samples. Returns (train, test, means, stds).
@@ -305,43 +586,352 @@ pub fn prepare_full(
     spec: &SplitSpec,
     rng: &mut Mt,
 ) -> Result<Prepared, String> {
+    prepare_full_with(t, vars, target, spec, rng, &PrepSpec::default())
+}
+
+/// Build normalised train/test samples after applying the opt-in preparation
+/// in `prep`.
+///
+/// Order is what keeps the split honest:
+///
+/// 1. the row filter selects rows, then the train/test split is drawn;
+/// 2. missing values are filled or dropped using statistics from the **training
+///    rows only** (a `previous`/`interpolate` fill never crosses the boundary);
+/// 3. outlier bounds are the training median and IQR;
+/// 4. smoothing runs inside each side, so a training window never reads a test
+///    value;
+/// 5. centre/scale are computed from the surviving training rows and applied to
+///    both sides. `means`/`stds` remain the affine denormalisation constants, so
+///    a printed formula is always in original units.
+pub fn prepare_full_with(
+    t: &Table,
+    vars: &[String],
+    target: &str,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+    prep: &PrepSpec,
+) -> Result<Prepared, String> {
+    // With an explicit --fill method, a junk token in an otherwise numeric
+    // column is treated as a missing value (and then filled or dropped).
+    // Without it the column stays non-numeric, exactly as before.
+    let coerced = if prep.fill != FillMethod::None {
+        Some(coerce_numeric(t))
+    } else {
+        None
+    };
+    let t = coerced.as_ref().unwrap_or(t);
     let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
     let nv = var_idx.len();
 
-    let x_raw: Vec<Vec<f64>> = t
+    // 1. The row filter defines the population the split is drawn from.
+    let mut filtered = t.clone();
+    let mut filtered_count = 0usize;
+    if let Some(f) = &prep.filter {
+        let cols: Vec<usize> = f
+            .vars
+            .iter()
+            .map(|v| filtered.index_of(v))
+            .collect::<Result<_, _>>()?;
+        let mut rows = Vec::new();
+        let mut raw = Vec::new();
+        for r in 0..filtered.rows.len() {
+            let vals: Vec<f64> = cols.iter().map(|&c| filtered.rows[r][c]).collect();
+            if expr::eval(&f.tree, &vals) > 0.0 {
+                rows.push(filtered.rows[r].clone());
+                raw.push(filtered.raw[r].clone());
+            } else {
+                filtered_count += 1;
+            }
+        }
+        if rows.is_empty() {
+            return Err("--filter kept no rows".to_string());
+        }
+        filtered.rows = rows;
+        filtered.raw = raw;
+    }
+
+    let x_raw: Vec<Vec<f64>> = filtered
         .rows
         .iter()
         .map(|r| var_idx.iter().map(|&i| r[i]).collect())
         .collect();
-    let y: Vec<f64> = t.rows.iter().map(|r| r[tgt_idx]).collect();
-
-    let (train_idx, fold_idx, report) = build_split(t, spec, rng, &x_raw)?;
+    let (mut train_idx, mut fold_idx, mut report) = build_split(&filtered, spec, rng, &x_raw)?;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
     }
 
-    // Normalisation statistics come from the training rows alone.
+    let n = filtered.rows.len();
+    // Used columns: every input, then the target.
+    let used_cols: Vec<usize> = var_idx.iter().copied().chain(std::iter::once(tgt_idx)).collect();
+    let nc = used_cols.len();
+    let mut cells: Vec<Vec<f64>> = filtered
+        .rows
+        .iter()
+        .map(|r| used_cols.iter().map(|&c| r[c]).collect())
+        .collect();
+    let mut keep = vec![true; n];
+    let mut row_filled = vec![false; n];
+    let mut rows_dropped_missing = 0usize;
+
+    // 2. Missing values.
+    match prep.fill {
+        FillMethod::None => {
+            // Leaving a gap in a used column would poison every evaluation: the
+            // search would return an empty front and report `inf`/`NaN`
+            // baselines while still exiting 0. That reads as "no structure
+            // found" when the real answer is "you have gaps". Fail loudly and
+            // name the columns and the fix.
+            let mut detail: Vec<String> = Vec::new();
+            let mut total = 0usize;
+            for (k, &c) in used_cols.iter().enumerate() {
+                let missing = (0..n).filter(|&r| cells[r][k].is_nan()).count();
+                if missing > 0 {
+                    total += missing;
+                    let name = t
+                        .names
+                        .get(c)
+                        .cloned()
+                        .unwrap_or_else(|| format!("column {}", c));
+                    detail.push(format!("{}: {}", name, missing));
+                }
+            }
+            if total > 0 {
+                return Err(format!(
+                    "{} missing cell(s) in used columns ({}); pass --fill \
+                     drop|mean|median|zero|previous|interpolate",
+                    total,
+                    detail.join(", ")
+                ));
+            }
+        }
+        FillMethod::Drop => {
+            for r in 0..n {
+                if (0..nc).any(|k| cells[r][k].is_nan()) {
+                    keep[r] = false;
+                    rows_dropped_missing += 1;
+                }
+            }
+        }
+        method => {
+            // Training-only summary statistics.
+            let stats: Vec<f64> = (0..nc)
+                .map(|k| {
+                    let mut vals: Vec<f64> = train_idx
+                        .iter()
+                        .filter_map(|&r| {
+                            let v = cells[r][k];
+                            if v.is_finite() {
+                                Some(v)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    match method {
+                        FillMethod::Mean => {
+                            if vals.is_empty() {
+                                0.0
+                            } else {
+                                vals.iter().sum::<f64>() / vals.len() as f64
+                            }
+                        }
+                        FillMethod::Median => {
+                            vals.sort_by(|a, b| {
+                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            if vals.is_empty() {
+                                0.0
+                            } else {
+                                quantile(&vals, 0.5)
+                            }
+                        }
+                        _ => 0.0,
+                    }
+                })
+                .collect();
+
+            match method {
+                FillMethod::Mean | FillMethod::Median | FillMethod::Zero => {
+                    for r in 0..n {
+                        for k in 0..nc {
+                            if cells[r][k].is_nan() {
+                                cells[r][k] = stats[k];
+                                row_filled[r] = true;
+                            }
+                        }
+                    }
+                }
+                FillMethod::Previous => {
+                    for side in split_sides(&train_idx, &fold_idx) {
+                        let mut last: Vec<Option<f64>> = vec![None; nc];
+                        for &r in &side {
+                            for k in 0..nc {
+                                if cells[r][k].is_nan() {
+                                    if let Some(v) = last[k] {
+                                        cells[r][k] = v;
+                                        row_filled[r] = true;
+                                    }
+                                } else {
+                                    last[k] = Some(cells[r][k]);
+                                }
+                            }
+                        }
+                    }
+                }
+                FillMethod::Interpolate => {
+                    for side in split_sides(&train_idx, &fold_idx) {
+                        for k in 0..nc {
+                            let mut p = 0usize;
+                            while p < side.len() {
+                                if !cells[side[p]][k].is_nan() {
+                                    p += 1;
+                                    continue;
+                                }
+                                let start = p;
+                                while p < side.len() && cells[side[p]][k].is_nan() {
+                                    p += 1;
+                                }
+                                let end = p;
+                                if start > 0 && end < side.len() {
+                                    let a = cells[side[start - 1]][k];
+                                    let b = cells[side[end]][k];
+                                    let span = (end - start + 1) as f64;
+                                    for (q, &r) in side.iter().enumerate().take(end).skip(start) {
+                                        let t = (q - start + 1) as f64 / span;
+                                        cells[r][k] = a + (b - a) * t;
+                                        row_filled[r] = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                FillMethod::None | FillMethod::Drop => {}
+            }
+        }
+    }
+
+    // A requested fill that could not reach an edge (previous at the start of a
+    // side, interpolation outside its two neighbours) leaves the row missing;
+    // it is dropped rather than silently passed to the search.
+    if !matches!(prep.fill, FillMethod::None | FillMethod::Drop) {
+        for r in 0..n {
+            if keep[r] && (0..nc).any(|k| cells[r][k].is_nan()) {
+                keep[r] = false;
+                rows_dropped_missing += 1;
+            }
+        }
+    }
+    let rows_filled = row_filled.iter().filter(|&&b| b).count();
+
+    // 3. Outlier removal. Bounds come from the training rows only.
+    let mut rows_dropped_outlier = 0usize;
+    if let Some(k) = prep.outlier_iqr {
+        if k > 0.0 {
+            let mut bounds = vec![(f64::NEG_INFINITY, f64::INFINITY); nc];
+            for (col, bound) in bounds.iter_mut().enumerate() {
+                let mut vals: Vec<f64> = train_idx
+                    .iter()
+                    .filter_map(|&r| {
+                        let v = cells[r][col];
+                        if keep[r] && v.is_finite() {
+                            Some(v)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if vals.len() < 2 {
+                    continue;
+                }
+                vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let med = quantile(&vals, 0.5);
+                let iqr = quantile(&vals, 0.75) - quantile(&vals, 0.25);
+                *bound = (med - k * iqr, med + k * iqr);
+            }
+            for r in 0..n {
+                if !keep[r] {
+                    continue;
+                }
+                let out = (0..nc).any(|c| {
+                    let v = cells[r][c];
+                    v.is_finite() && (v < bounds[c].0 || v > bounds[c].1)
+                });
+                if out {
+                    keep[r] = false;
+                    rows_dropped_outlier += 1;
+                }
+            }
+        }
+    }
+
+    // 4. Smoothing, one side at a time so a training window cannot read a test
+    // value (and vice versa).
+    let mut smoothed = 0usize;
+    if prep.smooth > 1 {
+        for side in split_sides(&train_idx, &fold_idx) {
+            let side: Vec<usize> = side.into_iter().filter(|&r| keep[r]).collect();
+            for col in 0..nc {
+                smoothed += smooth_cells(&mut cells, &side, col, prep.smooth);
+            }
+        }
+    }
+
+    // Rows dropped by preparation leave both the training and test sets.
+    train_idx.retain(|&i| keep[i]);
+    for f in fold_idx.iter_mut() {
+        f.retain(|&i| keep[i]);
+    }
+    fold_idx.retain(|f| !f.is_empty());
+    if train_idx.is_empty() {
+        return Err("preparation removed every training row".to_string());
+    }
+    report.train_rows = train_idx.len();
+    report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
+    report.folds = fold_idx.len().max(1);
+
+    let x_vals: Vec<Vec<f64>> = cells
+        .iter()
+        .map(|r| r[..nv].to_vec())
+        .collect();
+    let y_vals: Vec<f64> = cells.iter().map(|r| r[nv]).collect();
+
+    // 5. Centre/scale from the surviving training rows, applied to both sides.
+    // The default (mean/std) is the same arithmetic as before issue #2.
     let mut means = vec![0.0; nv];
     let mut stds = vec![1.0; nv];
     for j in 0..nv {
-        let m = train_idx.iter().map(|&i| x_raw[i][j]).sum::<f64>() / train_idx.len() as f64;
-        let var = train_idx
-            .iter()
-            .map(|&i| (x_raw[i][j] - m).powi(2))
-            .sum::<f64>()
-            / train_idx.len() as f64;
+        let vals: Vec<f64> = train_idx.iter().map(|&i| x_vals[i][j]).collect();
+        let m = vals.iter().sum::<f64>() / vals.len() as f64;
+        let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
         let s = var.sqrt();
-        means[j] = m;
-        stds[j] = if s < 1e-12 { 1.0 } else { s };
+        let mut sorted = vals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        means[j] = match prep.center {
+            Center::Mean => m,
+            Center::Median => quantile(&sorted, 0.5),
+            Center::Min => sorted[0],
+            Center::Max => sorted[sorted.len() - 1],
+            Center::None => 0.0,
+        };
+        let factor = match prep.scale {
+            Scale::Std => s,
+            Scale::Iqr => quantile(&sorted, 0.75) - quantile(&sorted, 0.25),
+            Scale::Range => sorted[sorted.len() - 1] - sorted[0],
+            Scale::None => 1.0,
+        };
+        stds[j] = if !(factor.abs() >= 1e-12) { 1.0 } else { factor };
     }
-    let scale = |i: usize| -> Vec<f64> {
-        (0..nv).map(|j| (x_raw[i][j] - means[j]) / stds[j]).collect()
-    };
+
     let make = |idx: &[usize]| -> Sample {
         let mut s = Sample::default();
         for &i in idx {
-            s.x.push(scale(i));
-            s.y.push(y[i]);
+            s.x.push(
+                (0..nv)
+                    .map(|j| (x_vals[i][j] - means[j]) / stds[j])
+                    .collect(),
+            );
+            s.y.push(y_vals[i]);
         }
         s
     };
@@ -361,7 +951,113 @@ pub fn prepare_full(
         means,
         stds,
         report,
+        prep: PrepReport {
+            fill: prep.fill.name(),
+            rows_filled,
+            rows_dropped_missing,
+            rows_dropped_outlier,
+            smoothed,
+            center: prep.center.name(),
+            scale: prep.scale.name(),
+            filtered: filtered_count,
+        },
     })
+}
+
+/// Mark columns numeric when they contain at least one number and every other
+/// non-missing cell is either a number or a junk token. Junk tokens become
+/// missing. Used only when `--fill` was given explicitly, so the default
+/// loader keeps rejecting typo-ridden columns.
+fn coerce_numeric(t: &Table) -> Table {
+    let mut out = t.clone();
+    for j in 0..t.names.len() {
+        if out.numeric[j] {
+            continue;
+        }
+        let mut any_number = false;
+        for r in &t.raw {
+            let cell = r[j].trim();
+            if !is_missing_token(cell) && cell.parse::<f64>().is_ok() {
+                any_number = true;
+                break;
+            }
+        }
+        if !any_number {
+            continue;
+        }
+        out.numeric[j] = true;
+        for (r, row) in out.rows.iter_mut().enumerate() {
+            let cell = t.raw[r][j].trim();
+            row[j] = if is_missing_token(cell) {
+                f64::NAN
+            } else {
+                cell.parse::<f64>().unwrap_or(f64::NAN)
+            };
+        }
+    }
+    out
+}
+
+/// Linear-interpolation quantile (Hyndman–Fan type 7), on sorted values.
+fn quantile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let h = (sorted.len() - 1) as f64 * p.clamp(0.0, 1.0);
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        sorted[lo] + (h - lo as f64) * (sorted[hi] - sorted[lo])
+    }
+}
+
+/// The training and test rows in table order, for operations that walk a
+/// column sequentially. Working per side is what keeps them leak-free.
+fn split_sides(train: &[usize], folds: &[Vec<usize>]) -> Vec<Vec<usize>> {
+    let mut sides = Vec::new();
+    let mut tr = train.to_vec();
+    tr.sort_unstable();
+    sides.push(tr);
+    let mut te: Vec<usize> = folds.iter().flatten().copied().collect();
+    te.sort_unstable();
+    te.dedup();
+    sides.push(te);
+    sides
+}
+
+/// Moving average over a `k`-wide window, centred on each value and shrinking at
+/// the edges of `side`. Missing cells are skipped; a cell with no observed
+/// neighbours is left missing. Returns the number of cells replaced.
+fn smooth_cells(cells: &mut [Vec<f64>], side: &[usize], col: usize, k: usize) -> usize {
+    if side.is_empty() || k < 2 {
+        return 0;
+    }
+    let before = k / 2;
+    let after = k - before - 1;
+    let orig: Vec<f64> = side.iter().map(|&r| cells[r][col]).collect();
+    let mut count = 0usize;
+    for p in 0..side.len() {
+        let a = p.saturating_sub(before);
+        let b = (p + after + 1).min(side.len());
+        let mut sum = 0.0;
+        let mut used = 0usize;
+        for v in &orig[a..b] {
+            if v.is_finite() {
+                sum += *v;
+                used += 1;
+            }
+        }
+        if used > 0 {
+            cells[side[p]][col] = sum / used as f64;
+            count += 1;
+        }
+    }
+    count
 }
 
 /// Cross-validation scheme (see `docs/overfitting.md`).
@@ -1129,4 +1825,129 @@ pub fn suggest_split(
         }
     };
     (mode, time_col, group_col, notes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(csv: &str) -> Table {
+        parse_table(csv).unwrap()
+    }
+
+    fn temporal() -> SplitSpec {
+        SplitSpec {
+            mode: SplitMode::Temporal,
+            time_col: Some(0),
+            test_frac: 0.3,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_markers_are_parsed_as_gaps() {
+        let t = table("x,y\n1,2\nNA,3\n,4\nnull,5\nNaN,6\n");
+        assert!(t.numeric[0] && t.numeric[1]);
+        assert_eq!(t.rows[0][0], 1.0);
+        for r in 1..5 {
+            assert!(t.rows[r][0].is_nan());
+        }
+        // A genuinely unparseable cell still makes the column non-numeric.
+        let bad = table("x\n1\nnot-a-number\n");
+        assert!(!bad.numeric[0]);
+    }
+
+    #[test]
+    fn quantile_interpolates_between_ranks() {
+        let v = [0.0, 1.0, 2.0, 3.0];
+        assert_eq!(quantile(&v, 0.0), 0.0);
+        assert_eq!(quantile(&v, 1.0), 3.0);
+        assert_eq!(quantile(&v, 0.5), 1.5);
+        assert_eq!(quantile(&v, 0.25), 0.75);
+        assert_eq!(quantile(&v, 0.75), 2.25);
+        assert_eq!(quantile(&[7.0], 0.5), 7.0);
+        assert!(quantile(&[], 0.5).is_nan());
+    }
+
+    /// `previous` walks each side in table order; its first missing row cannot
+    /// look into the other side and is dropped instead.
+    #[test]
+    fn previous_fill_stays_inside_the_side() {
+        let t = table("t,x,y\n0,1,0\n1,NA,0\n2,3,0\n3,NA,0\n4,NA,0\n5,6,0\n");
+        let p = prepare_full_with(
+            &t,
+            &["x".into()],
+            "y",
+            &temporal(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Previous,
+                center: Center::None,
+                scale: Scale::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.train.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![1.0, 1.0, 3.0, 3.0]);
+        assert_eq!(p.prep.rows_filled, 2);
+        // Test row 4 is the first row of its side and has no previous value.
+        assert_eq!(p.prep.rows_dropped_missing, 1);
+        assert_eq!(p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![6.0]);
+    }
+
+    /// `zero` is the literal fill, with no training statistic involved.
+    #[test]
+    fn zero_fill_sets_gaps_to_zero() {
+        let t = table("t,x,y\n0,1,0\n1,NA,0\n2,3,0\n3,NA,0\n4,5,0\n5,6,0\n");
+        let p = prepare_full_with(
+            &t,
+            &["x".into()],
+            "y",
+            &temporal(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Zero,
+                center: Center::None,
+                scale: Scale::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            p.train.x.iter().map(|r| r[0]).collect::<Vec<_>>(),
+            vec![1.0, 0.0, 3.0, 0.0]
+        );
+        assert_eq!(
+            p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(),
+            vec![5.0, 6.0]
+        );
+        assert_eq!(p.prep.rows_filled, 2);
+        assert_eq!(p.prep.rows_dropped_missing, 0);
+    }
+
+    /// `interpolate` uses the two observed neighbours inside a side and drops a
+    /// gap at an edge rather than extrapolating.
+    #[test]
+    fn interpolate_uses_neighbours_and_drops_edges() {
+        let t = table("t,x,y\n0,1,0\n1,NA,0\n2,3,0\n3,NA,0\n4,NA,0\n5,6,0\n");
+        let p = prepare_full_with(
+            &t,
+            &["x".into()],
+            "y",
+            &temporal(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Interpolate,
+                center: Center::None,
+                scale: Scale::None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(p.train.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(p.prep.rows_filled, 1);
+        // The trailing train gap and the leading test gap cannot interpolate.
+        assert_eq!(p.prep.rows_dropped_missing, 2);
+        assert_eq!(p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![6.0]);
+    }
 }

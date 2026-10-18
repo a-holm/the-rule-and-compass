@@ -164,7 +164,9 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--gap-break f] [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
+     [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
+     [--center mean|median|min|max|none] [--scale std|iqr|range|none]
+     [--filter expr] [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
@@ -173,7 +175,9 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
-are kept and can be used for splitting.
+are kept and can be used for splitting. A numeric cell may be missing (empty,
+`NA`, `NaN` or `null`, case-insensitively); `--fill` chooses whether those rows
+are dropped or filled, and the default leaves them untouched.
 
 ## Choosing how rows are split
 
@@ -222,6 +226,49 @@ rcsr --data panel.csv --target next_close --split auto
 
 See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
 worked examples.
+
+## Cleaning and preparing data
+
+Real tables have gaps, spikes and rows that should never be scored. Every
+preparation option is opt-in, and the defaults are exactly the plain mean/std
+run:
+
+| flag | effect |
+|---|---|
+| `--fill <method>` | what to do with a missing cell: `none` (default), `drop`, `mean`, `median`, `zero`, `previous`, `interpolate` |
+| `--outlier-iqr k` | drop rows beyond `k` interquartile ranges from the column median |
+| `--smooth k` | `k`-wide centred moving average per column; edges shrink |
+| `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
+| `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
+| `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
+
+```sh
+# Robust preparation: fill gaps with the training median, drop extreme
+# points, smooth a 3-row window and scale by median/IQR.
+rcsr --data panel.csv --target y --vars x1,x2 --split temporal --time date \
+     --fill median --outlier-iqr 1.5 --smooth 3 --center median --scale iqr
+
+# Only score rows that pass a condition:
+rcsr --data panel.csv --target next_close --filter "volume > 100000"
+```
+
+The report says what ran, one commented line per active transformation:
+
+```
+# preparation: fill=median rows_filled=12 rows_dropped_missing=0
+# preparation: outlier-iqr=1.5 rows_dropped_outlier=2
+# preparation: center=median scale=iqr
+```
+
+`--json` carries the same numbers in a `preparation` object (methods, filled /
+dropped / smoothed / filtered counts), and `--ndjson` emits a `preparation`
+event when something is active.
+
+**No leakage:** filling statistics, outlier bounds and centre/scale are all
+computed from the **training rows only** and applied to both sides; smoothing
+and `previous`/`interpolate` never cross the train/test boundary. See
+[`docs/data-preparation.md`](docs/data-preparation.md) for each method, when
+*not* to use it, and a worked example.
 
 ### Forecasting: history and delayed variables
 
@@ -356,6 +403,11 @@ list and the recorded results.
   `temporal-group`, `auto`) with an embargo gap, per-block test errors and
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
   forecast is never scored on data it has already seen;
+- **opt-in data preparation** — missing-value fills (`--fill`, missing marked
+  by an empty cell, `NA`, `NaN` or `null`), IQR outlier removal, moving-average
+  smoothing, median/IQR/range scaling and expression row filters (`--filter`) —
+  with every statistic computed from the training rows only and a preparation
+  report in text, JSON and NDJSON;
 - **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
   overfit index, and per-constant **standard errors** from the Gauss–Newton
   Jacobian that flag constants the data cannot pin down), **null baselines**
@@ -380,6 +432,7 @@ SPEC.md                       behaviour specification
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
+docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
@@ -405,6 +458,7 @@ my-version/
   tests/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)
+    prep.rs       data-preparation tests (fill, outliers, smoothing, scaling, filters)
     bench.rs      known-truth benchmark harness tests
   examples/
     line.csv, sine.csv
