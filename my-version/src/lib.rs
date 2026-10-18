@@ -2,6 +2,7 @@
 //!
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
+pub mod bench;
 pub mod data;
 pub mod diagnostics;
 pub mod expr;

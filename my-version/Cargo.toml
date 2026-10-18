@@ -19,6 +19,10 @@ name = "rcsr-gpu-bench"
 path = "src/bin/gpu_bench.rs"
 required-features = ["cuda"]
 
+[[bin]]
+name = "rcsr-bench"
+path = "src/bin/rcsr_bench.rs"
+
 [features]
 default = []
 cuda = []
