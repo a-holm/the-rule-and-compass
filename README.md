@@ -102,6 +102,18 @@ cat examples/line.csv | rcsr --data - --target y --top 3
   "tool": "rcsr", "version": "0.1.0", "seed": 0, "metric": "absolute",
   "target": "y", "variables": ["x"], "train_rows": 30, "test_rows": 10,
   "generations_run": 200, "converged_early": false, "elapsed_seconds": 1.9,
+  "null_control": null,
+  "baselines": {
+    "mean":   { "train_error": 2.0034, "test_error": 2.2496 },
+    "linear": { "train_error": 4.8e-7, "test_error": 7.6e-7 },
+    "knn":    { "k": 5, "train_error": 0.1299, "test_error": 0.2503 }
+  },
+  "residual_tests": {
+    "n": 30, "lags": 6, "durbin_watson": 2.0,
+    "ljung_box":     { "statistic": 2.01, "df": 6, "p_value": 0.919 },
+    "breusch_pagan": { "statistic": 0.159, "df": 1, "p_value": 0.690 },
+    "skewness": 0.008, "kurtosis": -0.667
+  },
   "pareto": [
     { "rank": 5, "complexity": 5, "train_error": 5.3e-7,
       "test_error": 5.2e-7, "expression": "(1 + (2 * x))" }
@@ -203,6 +215,8 @@ decisive one:
 rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 #  3  complexity=4  train_err=0.0004  test_err=0.0009  aicc=-402.1
 # diagnostics: n=90 k=3 constants | overfit index (test/train)=2.25 | Durbin-Watson=2.01
+# residual tests (best solution): Ljung-Box h=10 Q=9.4 p=0.494 | Breusch-Pagan LM=1.1 p=0.290 | skewness=0.02 excess kurtosis=-0.41
+# null baselines (absolute): mean train=0.88 test=0.91 | linear train=0.42 test=0.46 | 5-NN train=0.31 test=0.35
 # null control (19 shuffled-target runs): best=0.61 median=0.72 p=0.05 — the real fit beats the noise control
 ```
 
@@ -214,7 +228,16 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 | `k_constants` | how many free parameters did it really earn? |
 | `aicc`, `bic` | is the extra complexity paid for by the fit? |
 | `durbin_watson` | did anything get left in the residuals? |
+| `baselines` | does it beat the mean, a straight line and a 5-NN learner? |
+| `residual_tests` | Ljung–Box autocorrelation, Breusch–Pagan changing variance, residual skew/kurtosis |
 | `null_control` | could the search have produced this from noise? |
+
+The null baselines are fit on the training rows and scored on the training rows
+and the test folds in the search's own metric: a model that does not beat the
+5-nearest-neighbour learner has found no structure the data did not already
+contain. The residual tests (Ljung–Box, Breusch–Pagan, skewness, excess
+kurtosis) are reported for the best solution; a small p-value means the model
+left autocorrelation or changing variance behind.
 
 The null control shuffles the target, runs the *identical* search, and repeats:
 if shuffled targets fit as well as the real one, the "law" is manufactured. With
@@ -246,8 +269,10 @@ formulas, what is still missing, and the literature.
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
   forecast is never scored on data it has already seen;
 - **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
-  overfit index) and a `--null-runs` permutation control that runs the identical
-  search on shuffled targets;
+  overfit index), **null baselines** (mean, least-squares line, 5-NN) and
+  **residual tests** (Ljung–Box, Breusch–Pagan, skewness/kurtosis) reported
+  automatically, plus a `--null-runs` permutation control that runs the
+  identical search on shuffled targets;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 

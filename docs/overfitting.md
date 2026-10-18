@@ -149,24 +149,67 @@ weak search can fail to beat the control on real data (it simply cannot find the
 law), so a high p-value is not proof of no signal — only that the search has not
 demonstrated one. This is inherent to the method and worth stating out loud.
 
-### 3.4 Residual diagnostics — Durbin–Watson implemented
-If anything is left in the residuals, the model is incomplete. **Durbin–Watson**
-(Durbin & Watson 1950/51),
+### 3.4 Residual diagnostics — implemented
+If anything is left in the residuals, the model is incomplete. Four checks run
+on the residuals of the best solution and are reported in text and JSON.
+
+**Durbin–Watson** (Durbin & Watson 1950/51),
 
 ```
 d = Σ(e_t − e_{t−1})² / Σ e_t²
 ```
 
-is ≈2 for no autocorrelation, →0 for positive, →4 for negative. It doubles as a
-general misspecification test. Reported as `durbin_watson` and only meaningful
-when the row order is real (temporal splits) — `rcsr` says so in the output when
-the order is arbitrary. See also Ljung–Box for autocorrelation, and
-Breusch–Pagan / White for changing variance.
+is ≈2 for no autocorrelation, →0 for positive, →4 for negative. It only uses
+lag 1 and only makes sense when the row order is real (temporal splits) — `rcsr`
+says so in the output when the order is arbitrary.
 
-### 3.5 Compare against a null model
+**Ljung–Box** (Ljung & Box 1978) generalises it to the first `h` lags and turns
+it into a p-value:
+
+```
+Q = n(n+2) Σ_{k=1}^{h} ρ_k² / (n−k)      ~ χ²_h   under no autocorrelation
+```
+
+where `ρ_k` is the sample autocorrelation at lag `k` and `h = min(10, n/5)` by
+default (a common rule of thumb). A small p-value means autocorrelation the
+model did not explain is still there.
+
+**Breusch–Pagan** (Breusch & Pagan 1979) tests *heteroscedasticity*: regress the
+squared residuals on the fitted values and take
+
+```
+LM = n · R²_aux      ~ χ²_1   under constant residual variance
+```
+
+A small p-value means the residual spread grows or shrinks with the fitted
+value — the errors are not identically distributed even if their average is
+zero.
+
+Finally, the residual **skewness** (`m3 / m2^{3/2}`) and **excess kurtosis**
+(`m4 / m2² − 3`) are printed. Both are 0 for a Gaussian; a large positive
+kurtosis flags the heavy tails of a few big misses, which is exactly what an
+overfit outlier-driven model leaves behind.
+
+### 3.5 Compare against a null model — implemented
 A real model should beat the trivial baselines: the mean, a straight line, and a
-flexible non-symbolic learner (k-NN, random forest, Gaussian process). If it does
-not, the "law" is not earning its complexity.
+flexible non-symbolic learner. `rcsr` fits three and reports each one's training
+and test error in the search's own metric:
+
+* the **constant mean** of the training target;
+* a **least-squares straight line** (hyperplane) with intercept, solved from the
+  normal equations;
+* a **k-nearest-neighbour** predictor with `k = 5` — small enough to follow a
+  gentle curve, large enough not to chase single points.
+
+If the searched expression does not beat these, the "law" is not earning its
+complexity. The `k-NN` baseline is the one to watch: it is a genuinely flexible
+learner, so a symbolic model that only matches it has not found structure the
+data did not already contain.
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2
+# null baselines (absolute): mean train=2.003 test=2.250 | linear train=0.000 test=0.000 | 5-NN train=0.130 test=0.250
+```
 
 ### 3.6 Out-of-distribution / extrapolation test
 Train on part of the input range and test outside it, or hold out an entire
@@ -190,7 +233,8 @@ rcsr --data d.csv --target y --vars x1,x2 --split temporal --time t --gap 5 --fo
 # 2. is it just what the search does to noise?
 rcsr ... --null-runs 19
 # 3. read the diagnostics on the simplest good solution
-#    aicc, bic, durbin_watson, overfit_index are printed for every solution
+#    aicc, bic, durbin_watson, overfit_index are printed per solution, and the
+#    null baselines and Ljung–Box / Breusch–Pagan residual tests come with them
 ```
 
 ---
@@ -232,6 +276,22 @@ and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
 verdict.
 
+Alongside the front, `rcsr` reports:
+
+* a top-level **`baselines`** object with the training and test error of the
+  constant mean, the least-squares line and the `k`-NN learner (`k = 5`), in the
+  search's metric;
+* a top-level **`residual_tests`** object for the best (lowest training-error)
+  solution:
+
+| Field | Meaning |
+|---|---|
+| `durbin_watson` | residual autocorrelation, lag 1 (≈2 clean) |
+| `ljung_box.statistic`, `ljung_box.df`, `ljung_box.p_value` | autocorrelation over `lags = min(10, n/5)` lags (χ²) |
+| `breusch_pagan.statistic`, `breusch_pagan.df`, `breusch_pagan.p_value` | residual variance vs. the fitted value (χ²) |
+| `skewness` | residual asymmetry (0 for a symmetric residual) |
+| `kurtosis` | excess kurtosis (0 for a Gaussian) |
+
 ## 5. Not yet implemented (on the roadmap)
 
 * **Cross-validation as a first-class mode** (k-fold / rolling-origin over the
@@ -241,15 +301,18 @@ verdict.
 * **.632 / .632+ bootstrap error** for small samples (Efron & Tibshirani 1997).
 * **Parameter uncertainty** — standard errors of the constants from the
   Gauss–Newton Jacobian (`JᵀJ`), to flag constants the data does not pin down.
-* **Null baselines** (mean/linear/k-NN) reported automatically alongside the
-  front.
 * **Units / dimensional consistency** as a structural constraint.
-* **Ljung–Box** and heteroscedasticity tests.
+* **Beta / variance-ratio drift tests**, and a **White** general
+  heteroscedasticity test (more regressors than just the fitted value).
+* **A flexible non-symbolic learner beyond k-NN** (random forest, Gaussian
+  process) as an additional baseline.
 
 ## 6. References
 
 * Akaike 1974; Burnham & Anderson 2002 — information criteria, AICc.
 * Durbin & Watson 1950, 1951 — residual autocorrelation.
+* Ljung & Box 1978, Biometrika 65:297–303 — the portmanteau autocorrelation test.
+* Breusch & Pagan 1979, Econometrica 47:1287–1294 — heteroscedasticity test.
 * Rücker, Rücker & Meringer 2007 — y-randomisation in QSAR.
 * Wold & Eriksson — response permutation / chance correlation.
 * Meinshausen & Bühlmann 2010, JRSS-B 72:417–473 — stability selection.

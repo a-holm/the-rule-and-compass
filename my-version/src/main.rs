@@ -74,6 +74,14 @@ HISTORY AND DELAYED VARIABLES (lags, for forecasting):
 OVERFITTING DIAGNOSTICS (always on):
   AICc, BIC                   fit vs. number of fitted constants
   Durbin-Watson               residual autocorrelation in row order (~2 is clean)
+  Ljung-Box                   residual autocorrelation over several lags, with a
+                              chi-square p-value
+  Breusch-Pagan               residual variance vs. the fitted value, with a
+                              chi-square p-value; also skewness/excess kurtosis
+  null baselines              train/test error of the constant mean, an OLS
+                              straight line and a 5-nearest-neighbour learner,
+                              in the same metric as the search: a model must
+                              beat them to earn its complexity
   overfit index               test_error / train_error
   --null-runs <n>            rerun the identical search on n shuffled targets
                              (y-randomisation control) and report the null error
@@ -208,6 +216,8 @@ struct Row {
     bic: f64,
     /// Durbin–Watson residual autocorrelation, in row order (≈2 is clean).
     dw: f64,
+    /// Ljung–Box, Breusch–Pagan and residual shape for this solution.
+    resid_tests: diagnostics::ResidualTests,
     /// test_error / train_error: how much worse the model gets off-sample.
     overfit: f64,
     /// Per-block test errors (`--folds`); one entry when folds == 1.
@@ -709,6 +719,7 @@ fn main() {
             let (_, aicc, bic) =
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
+            let resid_tests = diagnostics::residual_tests(&resid, &pred);
             let overfit = if s.error > 0.0 {
                 test_error / s.error
             } else if test_error > 0.0 {
@@ -725,12 +736,27 @@ fn main() {
                 aicc,
                 bic,
                 dw,
+                resid_tests,
                 overfit,
                 fold_errors,
                 expression: expr::to_string(&den, &vars),
             }
         })
         .collect();
+    // Residual diagnostics for the best (lowest training-error) solution: the
+    // one a reader would quote.
+    let best_resid = rows
+        .iter()
+        .min_by(|a, b| {
+            a.train_error
+                .partial_cmp(&b.train_error)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|r| r.resid_tests);
+
+    // Null baselines: the trivial models a real fit must beat (issue #23).
+    let baselines = diagnostics::Baselines::fit(&prepared.train, &fold_samples, cfg.metric);
+
     if top > 0 && rows.len() > top {
         rows.truncate(top);
     }
@@ -834,6 +860,40 @@ fn main() {
                     c.verdict()
                 );
             }
+            if let Some(rt) = &best_resid {
+                eprintln!(
+                    "# residual tests (best solution): Ljung-Box h={} Q={:.3} p={:.3}{} | \
+                     Breusch-Pagan LM={:.3} p={:.3}{} | skewness={:.3} excess kurtosis={:.3}",
+                    rt.ljung_box.lags,
+                    rt.ljung_box.statistic,
+                    rt.ljung_box.p_value,
+                    if rt.ljung_box.p_value < 0.05 {
+                        " (autocorrelation left)"
+                    } else {
+                        ""
+                    },
+                    rt.breusch_pagan.statistic,
+                    rt.breusch_pagan.p_value,
+                    if rt.breusch_pagan.p_value < 0.05 {
+                        " (variance changes with fitted)"
+                    } else {
+                        ""
+                    },
+                    rt.skewness,
+                    rt.kurtosis
+                );
+            }
+            eprintln!(
+                "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
+                cfg.metric.name(),
+                baselines.mean.train_error,
+                baselines.mean.test_error,
+                baselines.linear.train_error,
+                baselines.linear.test_error,
+                baselines.knn_k,
+                baselines.knn.train_error,
+                baselines.knn.test_error
+            );
         }
         Format::Json => {
             let split_json = format!(
@@ -888,8 +948,35 @@ fn main() {
                 ),
                 None => "null".to_string(),
             };
+            let baselines_json = format!(
+                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                jnum(baselines.mean.train_error),
+                jnum(baselines.mean.test_error),
+                jnum(baselines.linear.train_error),
+                jnum(baselines.linear.test_error),
+                baselines.knn_k,
+                jnum(baselines.knn.train_error),
+                jnum(baselines.knn.test_error)
+            );
+            let resid_json = match &best_resid {
+                Some(rt) => format!(
+                    "{{\"n\":{},\"lags\":{},\"durbin_watson\":{},\"ljung_box\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"breusch_pagan\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"skewness\":{},\"kurtosis\":{}}}",
+                    rt.n,
+                    rt.lags,
+                    jnum(rt.durbin_watson),
+                    jnum(rt.ljung_box.statistic),
+                    rt.ljung_box.lags,
+                    jnum(rt.ljung_box.p_value),
+                    jnum(rt.breusch_pagan.statistic),
+                    rt.breusch_pagan.df,
+                    jnum(rt.breusch_pagan.p_value),
+                    jnum(rt.skewness),
+                    jnum(rt.kurtosis)
+                ),
+                None => "null".to_string(),
+            };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -902,6 +989,8 @@ fn main() {
                 outcome.converged_early,
                 jnum(elapsed),
                 null_json,
+                baselines_json,
+                resid_json,
                 pareto.join(",")
             );
         }
@@ -930,6 +1019,32 @@ fn main() {
                     jnum(c.null_median),
                     jnum(c.p_value),
                     jstr(c.verdict())
+                );
+            }
+            println!(
+                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                jstr(cfg.metric.name()),
+                jnum(baselines.mean.train_error),
+                jnum(baselines.mean.test_error),
+                jnum(baselines.linear.train_error),
+                jnum(baselines.linear.test_error),
+                baselines.knn_k,
+                jnum(baselines.knn.train_error),
+                jnum(baselines.knn.test_error)
+            );
+            if let Some(rt) = &best_resid {
+                println!(
+                    "{{\"event\":\"residual_tests\",\"n\":{},\"lags\":{},\"ljung_box\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"breusch_pagan\":{{\"statistic\":{},\"df\":{},\"p_value\":{}}},\"skewness\":{},\"kurtosis\":{}}}",
+                    rt.n,
+                    rt.lags,
+                    jnum(rt.ljung_box.statistic),
+                    rt.ljung_box.lags,
+                    jnum(rt.ljung_box.p_value),
+                    jnum(rt.breusch_pagan.statistic),
+                    rt.breusch_pagan.df,
+                    jnum(rt.breusch_pagan.p_value),
+                    jnum(rt.skewness),
+                    jnum(rt.kurtosis)
                 );
             }
             println!(

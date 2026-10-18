@@ -10,6 +10,13 @@
 //! * **Durbin–Watson** tests whether the residuals are still autocorrelated
 //!   (Durbin & Watson 1950/1951). For ordered data a value near 2 means "no
 //!   leftover structure"; far below 2 means the model left something in.
+//! * **Ljung–Box** (Ljung & Box 1978) generalises that to several lags and
+//!   turns it into a chi-square p-value; **Breusch–Pagan** (Breusch & Pagan
+//!   1979) tests whether the residual variance changes with the fitted value;
+//!   residual **skewness** and **excess kurtosis** flag non-normal residuals.
+//! * **Null baselines**: the constant mean, a least-squares straight line and a
+//!   k-nearest-neighbour learner. A model that does not beat these has not
+//!   earned its complexity.
 //! * **Permutation (y-randomisation) control**: run the *same* search on a
 //!   shuffled target. If it finds a fit as good as the real one, the real fit
 //!   is what the search can manufacture from noise (Rücker et al. 2007;
@@ -17,6 +24,9 @@
 //!
 //! None of these proves a model is right; together they make "perfect fit"
 //! falsifiable.
+
+use crate::data::Sample;
+use crate::metrics::{self, Metric};
 
 /// Least-squares information criteria for a model with `k` free constants fit
 /// to `n` points with residual sum of squares `rss`.
@@ -57,6 +67,536 @@ pub fn durbin_watson(resid: &[f64]) -> f64 {
         return f64::NAN;
     }
     num / den
+}
+
+// ---------------------------------------------------------------------------
+// Null baselines
+// ---------------------------------------------------------------------------
+
+/// Training and test error of one trivial model, in the search's own metric.
+#[derive(Clone, Copy, Debug)]
+pub struct BaselineError {
+    pub train_error: f64,
+    pub test_error: f64,
+}
+
+/// The three null baselines, fit on the training rows and scored on the
+/// training rows and on every test fold. A real model must beat all of them or
+/// it has not earned its complexity (see `docs/overfitting.md` §3.5).
+#[derive(Clone, Copy, Debug)]
+pub struct Baselines {
+    /// Constant predictor: the training mean of the target.
+    pub mean: BaselineError,
+    /// Ordinary least squares straight line (hyperplane) with intercept.
+    pub linear: BaselineError,
+    /// k-nearest-neighbour regression; `knn_k` is the `k` actually used.
+    pub knn: BaselineError,
+    pub knn_k: usize,
+}
+
+/// Number of neighbours used by the baseline k-NN learner.
+///
+/// `k = 5` is the choice: small enough to follow a gentle curve (a flexible
+/// learner should be a *hard* baseline), large enough not to chase single
+/// points the way `k = 1` does. It is capped at the number of training rows.
+pub fn knn_k(n_train: usize) -> usize {
+    5.min(n_train.max(1))
+}
+
+impl Baselines {
+    /// Fit and score all three baselines. `test_folds` is one sample per test
+    /// block; the reported test error is the mean over blocks, exactly as for a
+    /// searched model. An empty `test_folds` yields an infinite test error.
+    pub fn fit(train: &Sample, test_folds: &[Sample], metric: Metric) -> Baselines {
+        // Mean.
+        let mean = if train.is_empty() {
+            f64::NAN
+        } else {
+            train.y.iter().sum::<f64>() / train.y.len() as f64
+        };
+        let mean_err = score_folds(train, test_folds, metric, &|_x| mean);
+
+        // Least-squares line.
+        let coef = least_squares_linear(train);
+        let linear_err = match &coef {
+            Some(c) => score_folds(train, test_folds, metric, &|x| dot(c, x)),
+            None => BaselineError {
+                train_error: f64::NAN,
+                test_error: f64::NAN,
+            },
+        };
+
+        // k-NN.
+        let k = knn_k(train.len());
+        let knn_err = score_folds(train, test_folds, metric, &|x| knn_predict(train, x, k));
+
+        Baselines {
+            mean: mean_err,
+            linear: linear_err,
+            knn: knn_err,
+            knn_k: k,
+        }
+    }
+}
+
+/// Score one predictor on the training sample and on each test fold. The test
+/// error is the mean over folds (matching how a searched model is scored).
+fn score_folds(
+    train: &Sample,
+    test_folds: &[Sample],
+    metric: Metric,
+    predict: &dyn Fn(&[f64]) -> f64,
+) -> BaselineError {
+    let train_pred: Vec<f64> = train.x.iter().map(|x| predict(x)).collect();
+    let train_error = metrics::score(&train_pred, &train.y, metric);
+    let test_error = if test_folds.is_empty() {
+        f64::INFINITY
+    } else {
+        let mut acc = 0.0;
+        for f in test_folds {
+            let pred: Vec<f64> = f.x.iter().map(|x| predict(x)).collect();
+            acc += metrics::score(&pred, &f.y, metric);
+        }
+        acc / test_folds.len() as f64
+    };
+    BaselineError {
+        train_error,
+        test_error,
+    }
+}
+
+/// `b0 + Σ b_j x_j` for coefficients `c = [b0, b1, ..]` (missing terms are 0).
+fn dot(c: &[f64], x: &[f64]) -> f64 {
+    let mut v = c[0];
+    for (j, &xj) in x.iter().enumerate() {
+        if j + 1 < c.len() {
+            v += c[j + 1] * xj;
+        }
+    }
+    v
+}
+
+/// OLS coefficients `[b0, b1, .., bp]` for `y ≈ b0 + Σ b_j x_j`.
+///
+/// The normal equations `(XᵀX) β = Xᵀy` are formed and solved by Gaussian
+/// elimination with partial pivoting (pure `std`, no dependencies). A constant
+/// input column makes `XᵀX` singular; a small ridge on the diagonal is added
+/// once to keep the baseline defined (the intercept then absorbs the constant).
+/// Returns `None` for an empty sample or a system that is still singular.
+pub fn least_squares_linear(train: &Sample) -> Option<Vec<f64>> {
+    if train.is_empty() {
+        return None;
+    }
+    let p = 1 + train.x.first().map(|r| r.len()).unwrap_or(0);
+    // Normal equations.
+    let mut a = vec![vec![0.0; p]; p];
+    let mut b = vec![0.0; p];
+    for (row, &y) in train.x.iter().zip(&train.y) {
+        let mut design = vec![1.0];
+        design.extend_from_slice(row);
+        for i in 0..p {
+            for j in 0..p {
+                a[i][j] += design[i] * design[j];
+            }
+            b[i] += design[i] * y;
+        }
+    }
+    if let Some(x) = solve_normal(&a, &b) {
+        return Some(x);
+    }
+    // Ridge fallback for a rank-deficient design.
+    let scale = (0..p).map(|i| a[i][i]).fold(0.0_f64, f64::max).max(1.0);
+    for i in 0..p {
+        a[i][i] += 1e-9 * scale;
+    }
+    solve_normal(&a, &b)
+}
+
+/// Solve a dense linear system in place; `None` when a pivot is (numerically)
+/// zero. Row `i` of `a` is one equation.
+fn solve_normal(a: &[Vec<f64>], b: &[f64]) -> Option<Vec<f64>> {
+    let n = b.len();
+    let mut m: Vec<Vec<f64>> = a.to_vec();
+    let mut rhs = b.to_vec();
+    let mut scale = 1.0_f64;
+    for row in &m {
+        for &v in row {
+            scale = scale.max(v.abs());
+        }
+    }
+    let tol = 1e-12 * scale;
+    for col in 0..n {
+        // Partial pivoting.
+        let (mut piv, mut best) = (col, m[col][col].abs());
+        for r in col + 1..n {
+            let v = m[r][col].abs();
+            if v > best {
+                best = v;
+                piv = r;
+            }
+        }
+        if best <= tol {
+            return None;
+        }
+        if piv != col {
+            m.swap(piv, col);
+            rhs.swap(piv, col);
+        }
+        let d = m[col][col];
+        for r in col + 1..n {
+            let f = m[r][col] / d;
+            if f == 0.0 {
+                continue;
+            }
+            for c in col..n {
+                m[r][c] -= f * m[col][c];
+            }
+            rhs[r] -= f * rhs[col];
+        }
+    }
+    let mut x = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut s = rhs[i];
+        for j in i + 1..n {
+            s -= m[i][j] * x[j];
+        }
+        x[i] = s / m[i][i];
+    }
+    if x.iter().all(|v| v.is_finite()) {
+        Some(x)
+    } else {
+        None
+    }
+}
+
+/// Average of the `k` nearest training targets to `x` (Euclidean distance in
+/// the (normalised) input space). Ties are broken by training-row order, so the
+/// result is deterministic.
+pub fn knn_predict(train: &Sample, x: &[f64], k: usize) -> f64 {
+    if train.is_empty() {
+        return f64::NAN;
+    }
+    let mut d: Vec<(f64, usize)> = train
+        .x
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let s: f64 = r
+                .iter()
+                .zip(x)
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum();
+            (s, i)
+        })
+        .collect();
+    d.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let kk = k.clamp(1, d.len());
+    d[..kk].iter().map(|&(_, i)| train.y[i]).sum::<f64>() / kk as f64
+}
+
+// ---------------------------------------------------------------------------
+// Residual tests
+// ---------------------------------------------------------------------------
+
+/// Ljung–Box test for autocorrelation. `statistic ~ χ²` with `lags` degrees of
+/// freedom under the null of no autocorrelation, so a small `p_value` means the
+/// residuals are still autocorrelated.
+#[derive(Clone, Copy, Debug)]
+pub struct LjungBox {
+    pub lags: usize,
+    pub statistic: f64,
+    pub p_value: f64,
+}
+
+/// Breusch–Pagan test for heteroscedasticity against the fitted values.
+/// `statistic ~ χ²` with one degree of freedom; a small `p_value` means the
+/// residual variance changes with the fitted value.
+#[derive(Clone, Copy, Debug)]
+pub struct BreuschPagan {
+    pub statistic: f64,
+    /// Number of auxiliary regressors (1: the fitted value).
+    pub df: usize,
+    pub p_value: f64,
+}
+
+/// The residual diagnostics for one model.
+#[derive(Clone, Copy, Debug)]
+pub struct ResidualTests {
+    pub n: usize,
+    /// Lags used by Ljung–Box ([`default_ljung_box_lags`]).
+    pub lags: usize,
+    pub durbin_watson: f64,
+    pub ljung_box: LjungBox,
+    pub breusch_pagan: BreuschPagan,
+    /// Moment skewness (`0` for a symmetric residual).
+    pub skewness: f64,
+    /// Excess kurtosis (`0` for a Gaussian residual, `< 0` for flat tails).
+    pub kurtosis: f64,
+}
+
+/// Lags used by [`residual_tests`] unless the caller chooses otherwise:
+/// `min(10, n/5)`, the usual rule of thumb.
+pub fn default_ljung_box_lags(n: usize) -> usize {
+    (n / 5).min(10)
+}
+
+/// Every residual check at once, with the default lag count.
+pub fn residual_tests(resid: &[f64], fitted: &[f64]) -> ResidualTests {
+    let n = resid.len();
+    let lags = default_ljung_box_lags(n);
+    ResidualTests {
+        n,
+        lags,
+        durbin_watson: durbin_watson(resid),
+        ljung_box: ljung_box(resid, lags),
+        breusch_pagan: breusch_pagan(resid, fitted),
+        skewness: skewness(resid),
+        kurtosis: kurtosis(resid),
+    }
+}
+
+/// Sample autocorrelation of `resid` at `lag` (the usual biased `1/n`
+/// estimator). NaN for a degenerate input.
+pub fn autocorrelation(resid: &[f64], lag: usize) -> f64 {
+    let n = resid.len();
+    if lag == 0 || lag >= n {
+        return f64::NAN;
+    }
+    let mean = resid.iter().sum::<f64>() / n as f64;
+    let mut den = 0.0;
+    let mut num = 0.0;
+    for i in 0..n {
+        den += (resid[i] - mean) * (resid[i] - mean);
+        if i + lag < n {
+            num += (resid[i] - mean) * (resid[i + lag] - mean);
+        }
+    }
+    if den <= 0.0 {
+        f64::NAN
+    } else {
+        num / den
+    }
+}
+
+/// Ljung–Box statistic `Q = n(n+2) Σ_{k=1}^{h} ρ_k² / (n−k)` and its
+/// chi-square p-value (Ljung & Box 1978).
+pub fn ljung_box(resid: &[f64], lags: usize) -> LjungBox {
+    let n = resid.len();
+    if lags == 0 || n <= lags + 1 {
+        return LjungBox {
+            lags,
+            statistic: f64::NAN,
+            p_value: f64::NAN,
+        };
+    }
+    let mut sum = 0.0;
+    for k in 1..=lags {
+        let r = autocorrelation(resid, k);
+        if r.is_finite() {
+            sum += r * r / (n - k) as f64;
+        }
+    }
+    let q = n as f64 * (n as f64 + 2.0) * sum;
+    LjungBox {
+        lags,
+        statistic: q,
+        p_value: chi2_sf(q, lags),
+    }
+}
+
+/// Breusch–Pagan test: regress the squared residuals on the fitted values and
+/// turn `n·R²` into a chi-square statistic (Breusch & Pagan 1979). One
+/// auxiliary regressor (the fitted value) gives one degree of freedom.
+pub fn breusch_pagan(resid: &[f64], fitted: &[f64]) -> BreuschPagan {
+    let n = resid.len().min(fitted.len());
+    if n < 3 {
+        return BreuschPagan {
+            statistic: f64::NAN,
+            df: 1,
+            p_value: f64::NAN,
+        };
+    }
+    let u: Vec<f64> = resid[..n].iter().map(|e| e * e).collect();
+    let f = &fitted[..n];
+    let ubar = u.iter().sum::<f64>() / n as f64;
+    let ss_tot: f64 = u.iter().map(|v| (v - ubar) * (v - ubar)).sum();
+    if ss_tot <= 0.0 {
+        // The squared residuals are constant: no evidence against the null.
+        return BreuschPagan {
+            statistic: 0.0,
+            df: 1,
+            p_value: 1.0,
+        };
+    }
+    let aux = Sample {
+        x: f.iter().map(|&v| vec![v]).collect(),
+        y: u.clone(),
+    };
+    let ss_res = match least_squares_linear(&aux) {
+        Some(c) => u
+            .iter()
+            .zip(f)
+            .map(|(v, &fv)| {
+                let pred = c[0] + c[1] * fv;
+                (v - pred) * (v - pred)
+            })
+            .sum(),
+        None => ss_tot,
+    };
+    let r2 = (1.0 - ss_res / ss_tot).clamp(0.0, 1.0);
+    let lm = n as f64 * r2;
+    BreuschPagan {
+        statistic: lm,
+        df: 1,
+        p_value: chi2_sf(lm, 1),
+    }
+}
+
+/// Population (moment) skewness `m3 / m2^{3/2}`. NaN for fewer than 3 points or
+/// zero variance.
+pub fn skewness(x: &[f64]) -> f64 {
+    if x.len() < 3 {
+        return f64::NAN;
+    }
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let (mut m2, mut m3) = (0.0, 0.0);
+    for &v in x {
+        let d = v - mean;
+        m2 += d * d;
+        m3 += d * d * d;
+    }
+    m2 /= n;
+    m3 /= n;
+    if m2 <= 0.0 {
+        f64::NAN
+    } else {
+        m3 / m2.powf(1.5)
+    }
+}
+
+/// Excess kurtosis `m4 / m2² − 3`. `0` for a Gaussian; NaN guards as above.
+pub fn kurtosis(x: &[f64]) -> f64 {
+    if x.len() < 4 {
+        return f64::NAN;
+    }
+    let n = x.len() as f64;
+    let mean = x.iter().sum::<f64>() / n;
+    let (mut m2, mut m4) = (0.0, 0.0);
+    for &v in x {
+        let d = v - mean;
+        m2 += d * d;
+        m4 += d * d * d * d;
+    }
+    m2 /= n;
+    m4 /= n;
+    if m2 <= 0.0 {
+        f64::NAN
+    } else {
+        m4 / (m2 * m2) - 3.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chi-square tail probability (pure std)
+// ---------------------------------------------------------------------------
+
+/// Upper-tail probability `P(X > x)` for a chi-square with `df` degrees of
+/// freedom. Uses the regularised incomplete gamma function, so it needs no
+/// dependency.
+pub fn chi2_sf(x: f64, df: usize) -> f64 {
+    if df == 0 {
+        return f64::NAN;
+    }
+    if !x.is_finite() || x <= 0.0 {
+        return 1.0;
+    }
+    let a = df as f64 / 2.0;
+    (1.0 - gamma_p(a, x / 2.0)).clamp(0.0, 1.0)
+}
+
+/// Regularised lower incomplete gamma `P(a, x)` (Numerical Recipes `gammp`).
+fn gamma_p(a: f64, x: f64) -> f64 {
+    if x < 0.0 || a <= 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    if x < a + 1.0 {
+        gamma_series(a, x)
+    } else {
+        1.0 - gamma_cf(a, x)
+    }
+}
+
+fn gamma_series(a: f64, x: f64) -> f64 {
+    let mut ap = a;
+    let mut sum = 1.0 / a;
+    let mut del = sum;
+    for _ in 0..1000 {
+        ap += 1.0;
+        del *= x / ap;
+        sum += del;
+        if del.abs() < sum.abs() * 1e-15 {
+            break;
+        }
+    }
+    sum * (-x + a * x.ln() - ln_gamma(a)).exp()
+}
+
+fn gamma_cf(a: f64, x: f64) -> f64 {
+    let tiny = 1e-300;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / tiny;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..1000 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = b + an / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() < 1e-15 {
+            break;
+        }
+    }
+    (-x + a * x.ln() - ln_gamma(a)).exp() * h
+}
+
+/// Logarithm of the gamma function, Lanczos approximation (g = 7, n = 9).
+fn ln_gamma(x: f64) -> f64 {
+    const G: [f64; 9] = [
+        0.999_999_999_999_809_93,
+        676.520_368_121_885_1,
+        -1_259.139_216_722_402_8,
+        771.323_428_777_653_13,
+        -176.615_029_162_140_59,
+        12.507_343_278_686_905,
+        -0.138_571_095_265_720_12,
+        9.984_369_578_019_572e-6,
+        1.505_632_735_149_311_6e-7,
+    ];
+    if x < 0.5 {
+        return std::f64::consts::PI.ln()
+            - (std::f64::consts::PI * x).sin().ln()
+            - ln_gamma(1.0 - x);
+    }
+    let x = x - 1.0;
+    let mut a = G[0];
+    let t = x + 7.5;
+    for (i, &g) in G.iter().enumerate().skip(1) {
+        a += g / (x + i as f64);
+    }
+    0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + a.ln()
 }
 
 /// Summary of a permutation (y-randomisation) control.
@@ -160,5 +700,172 @@ mod tests {
         assert!(c.p_value < 0.2, "p={}", c.p_value);
         let c2 = NullControl::summarise(5.0, vec![1.0, 1.2, 0.9]);
         assert!(c2.p_value > 0.9, "p={}", c2.p_value);
+    }
+
+    fn sample(x: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
+        Sample { x, y }
+    }
+
+    #[test]
+    fn chi2_sf_matches_known_quantiles() {
+        // df = 2 has the closed form sf(x) = e^{-x/2}.
+        let s = chi2_sf(2.0, 2);
+        assert!((s - (-1.0f64).exp()).abs() < 1e-9, "sf(2,2)={}", s);
+        // Standard 95% quantiles: 3.841459 (df 1) and 18.30704 (df 10).
+        assert!(
+            (chi2_sf(3.841_459, 1) - 0.05).abs() < 1e-3,
+            "{}",
+            chi2_sf(3.841_459, 1)
+        );
+        assert!(
+            (chi2_sf(18.307_038, 10) - 0.05).abs() < 1e-3,
+            "{}",
+            chi2_sf(18.307_038, 10)
+        );
+        // Monotone decreasing in x.
+        assert!(chi2_sf(1.0, 3) > chi2_sf(2.0, 3));
+    }
+
+    #[test]
+    fn mean_baseline_is_the_training_mean() {
+        let train = sample(vec![vec![0.0], vec![1.0], vec![2.0]], vec![1.0, 2.0, 3.0]);
+        let test = sample(vec![vec![3.0], vec![4.0], vec![5.0]], vec![4.0, 5.0, 6.0]);
+        let b = Baselines::fit(&train, &[test], Metric::Absolute);
+        // train: |2-1| + |2-2| + |2-3| over 3 = 2/3.
+        assert!((b.mean.train_error - 2.0 / 3.0).abs() < 1e-12, "{}", b.mean.train_error);
+        // test: |2-4| + |2-5| + |2-6| over 3 = 3.
+        assert!((b.mean.test_error - 3.0).abs() < 1e-12, "{}", b.mean.test_error);
+    }
+
+    #[test]
+    fn linear_baseline_recovers_an_exact_line() {
+        let x = [0.0, 1.0, 2.0, 3.0, 4.0];
+        let train = sample(
+            x.iter().map(|&v| vec![v]).collect(),
+            x.iter().map(|&v| 2.0 + 3.0 * v).collect(),
+        );
+        let c = least_squares_linear(&train).expect("soluble");
+        assert!((c[0] - 2.0).abs() < 1e-9, "intercept {}", c[0]);
+        assert!((c[1] - 3.0).abs() < 1e-9, "slope {}", c[1]);
+        let test = sample(vec![vec![10.0], vec![20.0]], vec![32.0, 62.0]);
+        let b = Baselines::fit(&train, &[test], Metric::Squared);
+        assert!(b.linear.train_error < 1e-12, "{}", b.linear.train_error);
+        assert!(b.linear.test_error < 1e-12, "{}", b.linear.test_error);
+    }
+
+    #[test]
+    fn linear_baseline_beats_mean_on_a_line() {
+        let train = sample(
+            (0..20).map(|i| vec![i as f64]).collect(),
+            (0..20).map(|i| 5.0 + 0.5 * i as f64).collect(),
+        );
+        let b = Baselines::fit(&train, &[], Metric::Squared);
+        assert!(b.linear.train_error < b.mean.train_error);
+    }
+
+    #[test]
+    fn knn_predicts_the_mean_of_the_k_nearest() {
+        let train = sample(
+            vec![vec![0.0], vec![1.0], vec![10.0]],
+            vec![0.0, 10.0, 100.0],
+        );
+        // Nearest two to 0.2 are x=0 (d=0.04) and x=1 (d=0.64): (0+10)/2 = 5.
+        assert!((knn_predict(&train, &[0.2], 2) - 5.0).abs() < 1e-12);
+        // k=1 picks the closest point, x=0.
+        assert!((knn_predict(&train, &[0.2], 1) - 0.0).abs() < 1e-12);
+        assert_eq!(knn_k(100), 5);
+        assert_eq!(knn_k(2), 2);
+    }
+
+    #[test]
+    fn ljung_box_matches_a_hand_computed_alternating_series() {
+        // e = +1,-1,+1,-1,... has rho_k = (-1)^k (n-k)/n with the biased
+        // estimator, so at n = 100, h = 4:
+        // Q = n(n+2) * sum_{k=1..4} rho_k^2 / (n-k)
+        //   = 10200 * (0.99^2/99 + 0.98^2/98 + 0.97^2/97 + 0.96^2/96).
+        let e: Vec<f64> = (0..100)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        assert!((autocorrelation(&e, 1) + 0.99).abs() < 1e-12);
+        assert!((autocorrelation(&e, 2) - 0.98).abs() < 1e-12);
+        let lb = ljung_box(&e, 4);
+        let expected =
+            10200.0 * (0.99f64.powi(2) / 99.0 + 0.98f64.powi(2) / 98.0 + 0.97f64.powi(2) / 97.0 + 0.96f64.powi(2) / 96.0);
+        assert!(
+            (lb.statistic - expected).abs() < 1e-6,
+            "{} vs {}",
+            lb.statistic,
+            expected
+        );
+        assert_eq!(lb.lags, 4);
+        assert!(lb.p_value < 1e-6, "p={}", lb.p_value);
+    }
+
+    #[test]
+    fn ljung_box_does_not_reject_white_noise() {
+        let mut rng = crate::rng::Mt::new(7);
+        let e: Vec<f64> = (0..500).map(|_| rng.next_f64() - 0.5).collect();
+        let lb = ljung_box(&e, default_ljung_box_lags(500));
+        assert!(lb.p_value > 0.01, "p={}", lb.p_value);
+    }
+
+    #[test]
+    fn breusch_pagan_matches_a_hand_computed_example() {
+        // fitted = 0,1,2; resid = 1,2,0 gives u = 1,4,0. The auxiliary OLS
+        // gives R² = 1 - 8.1667/8.6667 = 0.057692, so LM = 3 R² = 0.173077.
+        let bp = breusch_pagan(&[1.0, 2.0, 0.0], &[0.0, 1.0, 2.0]);
+        assert!(
+            (bp.statistic - 0.173_076_923).abs() < 1e-6,
+            "{}",
+            bp.statistic
+        );
+        assert_eq!(bp.df, 1);
+        assert!((bp.p_value - chi2_sf(bp.statistic, 1)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn breusch_pagan_is_significant_for_growing_variance() {
+        let fitted: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let resid: Vec<f64> = fitted
+            .iter()
+            .map(|&f| if f < 10.0 { 0.1 } else { 2.0 })
+            .collect();
+        let bp = breusch_pagan(&resid, &fitted);
+        assert!(bp.p_value < 0.01, "p={}", bp.p_value);
+    }
+
+    #[test]
+    fn breusch_pagan_flat_variance_is_not_significant() {
+        let fitted: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let resid: Vec<f64> = fitted.iter().map(|_| 1.0).collect();
+        let bp = breusch_pagan(&resid, &fitted);
+        assert_eq!(bp.p_value, 1.0);
+    }
+
+    #[test]
+    fn skewness_and_kurtosis_match_hand_checks() {
+        // [0,0,0,0,1]: m2 = 0.16, m3 = 0.096, m4 = 0.0832
+        // -> skew = 0.096 / 0.16^1.5 = 1.5, excess kurtosis = 0.25.
+        let x = [0.0, 0.0, 0.0, 0.0, 1.0];
+        assert!((skewness(&x) - 1.5).abs() < 1e-12, "{}", skewness(&x));
+        assert!((kurtosis(&x) - 0.25).abs() < 1e-12, "{}", kurtosis(&x));
+        // Symmetric data: skew 0, and [-2,-1,0,1,2] has excess kurtosis -1.3.
+        let sym = [-2.0, -1.0, 0.0, 1.0, 2.0];
+        assert!(skewness(&sym).abs() < 1e-12);
+        assert!((kurtosis(&sym) + 1.3).abs() < 1e-12, "{}", kurtosis(&sym));
+    }
+
+    #[test]
+    fn residual_tests_bundle_is_consistent() {
+        let resid: Vec<f64> = (0..50).map(|i| (i as f64 * 0.7).sin()).collect();
+        let fitted: Vec<f64> = (0..50).map(|i| i as f64 * 0.1).collect();
+        let rt = residual_tests(&resid, &fitted);
+        assert_eq!(rt.n, 50);
+        assert_eq!(rt.lags, 10);
+        assert_eq!(rt.ljung_box.lags, 10);
+        assert!(rt.durbin_watson.is_finite());
+        assert!(rt.ljung_box.statistic.is_finite());
+        assert!(rt.breusch_pagan.p_value.is_finite());
+        assert!(rt.skewness.is_finite() && rt.kurtosis.is_finite());
     }
 }
