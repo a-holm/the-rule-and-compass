@@ -163,9 +163,11 @@ its own base dimension**, so `price=USD,volume=shares` catches `price + volume`.
 It models dimensions only, not unit identity or scale: declare `volume=m^3`, not
 `litre`. Fitted constants are allowed to carry dimensions (a coefficient absorbs
 a unit ratio, an intercept absorbs the target's), and each solution reports their
-apparent dimensions as a plausibility check. Undeclared names are dimensionless,
-so the feature is opt-in: without `--require-dimensions`, declaring units only
-adds a summary note and the search is unchanged. See
+apparent dimensions as a plausibility check. Undeclared names are dimensionless
+and column names are never inspected. Units are strictly optional in three
+layers: no `--units` changes nothing and adds no output fields; `--units` alone
+only reports and never rejects; `--require-dimensions` turns the hard filter on
+and is a usage error without `--units`. See
 [`docs/units.md`](docs/units.md) for the operator table, the radian/degree and
 dB/pH caveats, a worked example and the limitations of a hard filter.
 

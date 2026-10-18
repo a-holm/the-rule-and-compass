@@ -241,11 +241,13 @@ SEARCH:
                              any other identifier is its own base dimension
                              (price=USD). Model dimensions, not unit symbols
                              (volume=m^3, not litre). *, /, ^integer, (...);
-                             repeatable; an undeclared name is dimensionless
+                             repeatable; an undeclared name is dimensionless.
+                             Alone it reports constant dimensions and never
+                             rejects a candidate
   --require-dimensions       reject a candidate whose dimensions cannot be made
                              consistent with the target's (infinite error);
-                             needs --units. Without it, units only add a note
-                             and fitted constants absorb unit ratios/offsets
+                             requires --units (usage error without it). Without
+                             this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -403,6 +405,9 @@ struct Row {
     /// Empty when `--units` is not active; `None` means undetermined.
     constant_values: Vec<f64>,
     constant_units: Vec<Option<Unit>>,
+    /// #25: `None` when units are inactive. `Some(false)` means the archived
+    /// candidate would be rejected if `--require-dimensions` were on.
+    dimensionally_consistent: Option<bool>,
     /// Structural form of the (normalised) tree, with constants collapsed; the
     /// key stability selection counts.
     shape: String,
@@ -1526,9 +1531,30 @@ fn main() {
     // population. A syntax error is a usage error and keeps the parser's
     // 1-based column.
     let mut seeds: Vec<expr::Node> = Vec::new();
+    // Layer 3 only: check the seed in original units, before normalisation
+    // inserts constants that could otherwise absorb a mismatch.
+    let seed_dimensions_ok = |tree: &expr::Node| -> bool {
+        match (&cfg.units, cfg.require_dimensions) {
+            (Some(units), true) => units.accepts(tree),
+            _ => true,
+        }
+    };
     for src in &seed_exprs {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: --seed-expr '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        src
+                    );
+                    // Keep it so the search records the infinite error; it can
+                    // never enter the archive.
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: --seed-expr '{}': {}", src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1537,7 +1563,18 @@ fn main() {
     }
     for (origin, src) in &seed_lines {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: {}: '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        origin, src
+                    );
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: {}: '{}': {}", origin, src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1833,16 +1870,18 @@ fn main() {
                 .collect();
             let rss: f64 = resid.iter().map(|e| e * e).sum();
             let kconst = expr::count_constants(&s.tree);
-            // #25: dimensions of the constants the reader actually sees in the
-            // printed law. `den` already includes the denormalisation
-            // constants, so the report matches the displayed expression.
+            // #25: dimensions of the fitted constants in the search tree. This
+            // is the same tree `constant_errors` uses, so values and units
+            // line up; the printed law is the denormalised form of it.
             let (constant_values, constant_units) = match &cfg.units {
                 Some(units) => (
-                    rcsr::units::constant_values(&den),
-                    rcsr::units::constant_dimensions(&den, &units.vars, &units.target),
+                    rcsr::units::constant_values(&s.tree),
+                    rcsr::units::constant_dimensions(&s.tree, &units.vars, &units.target),
                 ),
                 None => (Vec::new(), Vec::new()),
             };
+            let dimensionally_consistent =
+                cfg.units.as_ref().map(|units| units.accepts(&s.tree));
             let (_, aicc, bic) =
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
@@ -1898,6 +1937,7 @@ fn main() {
                 },
                 constant_values,
                 constant_units,
+                dimensionally_consistent,
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
@@ -2208,6 +2248,22 @@ fn main() {
                     );
                 }
             }
+            // Layer 2: units alone never filter, but say how many archived
+            // solutions the Layer 3 flag would reject.
+            if cfg.units.is_some() && !cfg.require_dimensions {
+                let inconsistent = rows
+                    .iter()
+                    .filter(|r| r.dimensionally_consistent == Some(false))
+                    .count();
+                if inconsistent > 0 {
+                    eprintln!(
+                        "# dimensional note: {} of {} archived solution(s) would be rejected by \
+                         --require-dimensions (units are not filtering)",
+                        inconsistent,
+                        rows.len()
+                    );
+                }
+            }
             eprintln!(
                 "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
                 cfg.metric.name(),
@@ -2334,8 +2390,17 @@ fn main() {
             let pareto: Vec<String> = rows
                 .iter()
                 .map(|r| {
+                    // Layer 1: no `--units` means no new output field at all.
+                    let dimensions = if cfg.units.is_some() {
+                        format!(
+                            ",\"constant_dimensions\":{}",
+                            constant_units_json(&r.constant_values, &r.constant_units)
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"constant_dimensions\":{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -2348,7 +2413,7 @@ fn main() {
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
                         constant_errors_json(&r.constant_errors),
-                        constant_units_json(&r.constant_values, &r.constant_units),
+                        dimensions,
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
                     )
@@ -2514,8 +2579,17 @@ fn main() {
                 );
             }
             for r in &rows {
+                // Layer 1: no `--units` means no new output field at all.
+                let dimensions = if cfg.units.is_some() {
+                    format!(
+                        ",\"constant_dimensions\":{}",
+                        constant_units_json(&r.constant_values, &r.constant_units)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"constant_dimensions\":{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -2528,7 +2602,7 @@ fn main() {
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
                     constant_errors_json(&r.constant_errors),
-                    constant_units_json(&r.constant_values, &r.constant_units),
+                    dimensions,
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
                 );

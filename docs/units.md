@@ -1,13 +1,21 @@
 # Dimensional-consistency constraints
 
 A dimensionally inconsistent equation is almost certainly wrong: `distance =
-time` cannot be a law, however well it fits one noisy table. `--units` declares
-the dimensions of the inputs and the target, and `--require-dimensions` rejects
-a candidate whose dimensions cannot be reconciled with the target's. The
-feature is **opt-in**: with no `--units`, the search is bit-for-bit the same as
-before.
+time` cannot be a law, however well it fits one noisy table. Units are
+**strictly optional**, in three layers:
+
+| layer | flags | behaviour |
+|---|---|---|
+| 1 | none | Nothing happens. No inference, no filtering, no new warning, and **no new output fields**. Text, `--json` and `--ndjson` are byte-identical to the pre-change binary. |
+| 2 | `--units` | Enables knowledge only. Reports the dimensions of the fitted constants and notes how many archived solutions `--require-dimensions` would reject. It never rejects or drops a model. |
+| 3 | `--units --require-dimensions` | Turns the filter on. `--require-dimensions` without `--units` is a usage error (exit 2), never a silent no-op. |
 
 ```sh
+# Layer 2: report only.
+rcsr --data orbit.csv --target period --vars radius,mass \
+     --units 'radius=m,mass=kg,period=s^2/m'
+
+# Layer 3: filter.
 rcsr --data orbit.csv --target period --vars radius,mass \
      --units 'radius=m,mass=kg,period=s^2/m' --require-dimensions
 ```
@@ -93,31 +101,39 @@ When `--units` is active, each reported solution gets a plausibility note:
 ```
 
 `--json`/`--ndjson` carry the same information as a `constant_dimensions` array
-of `{value, dimension}` objects. The order is pre-order tree order (the order
-the constants are fitted), which can differ from the printed left-to-right
-order because simplification may reorder commutative operands; the value is
-shown to keep the pairing unambiguous. `?` means the solve did not determine an
-integer dimension, which normally means the tree was rejected.
+of `{value, dimension}` objects. The order is pre-order tree order of the
+fitted (normalised-input) model, the same tree the standard errors use; the
+printed law is its denormalised form. The value is shown to keep the pairing
+unambiguous. `?` means the solve did not determine an integer dimension.
+
+In Layer 2 a note counts archived solutions that Layer 3 would reject:
+
+```text
+# dimensional note: 1 of 1 archived solution(s) would be rejected by
+  --require-dimensions (units are not filtering)
+```
 
 ## `--require-dimensions`
 
-Without it, `--units` only prints a summary note and the search is unchanged.
-With it, a candidate with no consistent integer assignment gets an **infinite
-error**:
+Layer 3 only. Without `--units` the command exits with a usage error (exit 2)
+and a clear message; it is never a silent no-op. With both flags, a candidate
+with no consistent integer assignment gets an **infinite error**:
 
 * it is selected against (the error is not a soft penalty),
 * it never enters the Pareto archive (the archive ignores non-finite errors),
 * it cannot be resurrected by re-evaluation, and
-* a seeded expression that is inconsistent is reported with infinite training
-  error instead of being used as an elite.
+* a seeded expression is checked in original units before normalisation and,
+  if inconsistent, is recorded with infinite training error rather than used
+  as an elite.
 
-We chose a **summary note** rather than a rejected-candidate counter when
-`--units` is given without `--require-dimensions`: a counter would have to be
-threaded through every island for information that does not change the result.
-The note says that units are not filtering and how to turn the filter on.
+In Layer 2 we chose a **note/counter** rather than rejecting: a user who
+declares units for reporting must not silently lose models. The note says that
+units are not filtering and how to turn the filter on.
 
-The declaration and the flag are part of the checkpoint's search settings, so a
-save/resume keeps the same filter.
+When units are active, the declaration and the flag are part of the
+checkpoint's search settings, so a save/resume keeps the same filter.
+Units-free checkpoints do **not** contain the optional unit fields, so their
+bytes are unchanged and older checkpoints still load.
 
 ## Worked example
 
@@ -187,14 +203,21 @@ conversion.
 ## Undeclared names and compatibility
 
 Only names listed in `--units` get a dimension. Every other input, and the
-target unless it is named, has the empty dimension `1`. This is why the flag is
-opt-in: a run without a complete declaration keeps the old behaviour. A delayed
-copy (`x_lag1` from `--lags`) inherits the dimension declared for `x`; you may
-also declare the lagged name directly.
+target unless it is named, has the empty dimension `1`. **Column names are
+never inspected**: a column called `time`, `m` or `kg` is dimensionless unless
+`--units` says otherwise. A delayed copy (`x_lag1` from `--lags`) inherits the
+dimension declared for `x`; you may also declare the lagged name directly.
 
-Without `--units`, `Config::accepts_dimensions` always returns true and the
-search is unchanged bit for bit (a regression test compares archive errors,
-costs and structural hashes).
+Layer 1 is a hard compatibility promise. With no `--units`:
+
+* `Config::accepts_dimensions` returns true before any inference;
+* no note, warning or constant-dimension line is emitted;
+* `--json`/`--ndjson` contain **no** `constant_dimensions` field;
+* a text, JSON or NDJSON run matches the pre-change binary (the regression test
+  compares a stored golden byte for byte, masking only the pre-existing
+  nondeterministic `elapsed_seconds` in JSON/NDJSON);
+* a checkpoint has no optional unit fields and matches the old format, which
+  still loads.
 
 ## Honest limitations
 

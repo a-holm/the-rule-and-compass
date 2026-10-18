@@ -159,12 +159,9 @@ fn constant_dimensions_are_derived_from_the_printed_law() {
     );
 
     // An unsatisfiable case: `c^3 = m` needs `c = m^(1/3)`, which is not an
-    // integer exponent vector, so no constant assignment exists.
+    // integer exponent vector, so the filter rejects it.
     let unknown = node(Op::Pow, vec![constant(2.0), constant(3.0)]);
-    assert_eq!(
-        constant_dimensions(&unknown, &[], &m()),
-        vec![None, None]
-    );
+    assert!(!Units::new(Vec::new(), m()).accepts(&unknown));
 
     // sqrt(c*x) with x in m and y in m is satisfiable: c is an area (m^2),
     // so the root is a length. sqrt(x) alone is not (m^(1/2)).
@@ -334,7 +331,7 @@ fn wrong_units() -> Units {
 }
 
 #[test]
-fn a_numerically_good_but_dimensionally_wrong_seed_is_rejected() {
+fn layer2_and_layer3_units_alone_accepts_require_dimensions_rejects() {
     let train = sample(
         vec![vec![1.0], vec![2.0], vec![3.0]],
         vec![1.0, 2.0, 3.0],
@@ -488,7 +485,102 @@ fn without_required_dimensions_the_result_is_bit_identical() {
     assert_eq!(a.generations, b.generations);
 }
 
+// ---- layer 1: no --units --------------------------------------------------
+
+/// The only nondeterministic field in the pre-change JSON output was
+/// `elapsed_seconds`; mask it so the rest of the byte stream can be compared.
+fn mask_elapsed(src: &str) -> String {
+    let key = "\"elapsed_seconds\":";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(i) = rest.find(key) {
+        out.push_str(&rest[..i + key.len()]);
+        out.push_str("ELAPSED");
+        let after = &rest[i + key.len()..];
+        let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Layer 1: a units-free run is byte-identical to the pre-change binary,
+/// including the absence of any new JSON/NDJSON field. The text golden is
+/// exact; the JSON/NDJSON goldens mask only `elapsed_seconds`, which was
+/// already nondeterministic before this feature.
+#[test]
+fn layer1_no_units_output_is_byte_identical_to_pre_change() {
+    let table = "x,y\n1,2\n2,4\n3,6\n4,8\n";
+    let base = [
+        "--data", "-", "--target", "y", "--vars", "x", "--seed-expr", "x",
+        "--generations", "0", "--pop", "1", "--fit-iters", "0", "--test-frac",
+        "0", "--quiet",
+    ];
+
+    let out = rcsr_stdin(&base, table);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        out.stdout,
+        include_str!("fixtures/units_layer1_text.stdout").as_bytes(),
+        "text stdout changed"
+    );
+    assert_eq!(
+        out.stderr,
+        include_str!("fixtures/units_layer1_text.stderr").as_bytes(),
+        "text stderr changed"
+    );
+
+    let mut args = base.to_vec();
+    args.push("--json");
+    let out = rcsr_stdin(&args, table);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
+    let want = mask_elapsed(include_str!("fixtures/units_layer1_json.stdout"));
+    assert_eq!(got, want, "--json changed");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("constant_dimensions"),
+        "units-free JSON must not gain a constant_dimensions field"
+    );
+
+    let mut args = base.to_vec();
+    args.push("--ndjson");
+    let out = rcsr_stdin(&args, table);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
+    let want = mask_elapsed(include_str!("fixtures/units_layer1_ndjson.stdout"));
+    assert_eq!(got, want, "--ndjson changed");
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("constant_dimensions"),
+        "units-free NDJSON must not gain a constant_dimensions field"
+    );
+}
+
+/// Layer 1: a units-free checkpoint keeps the old text format exactly; the
+/// optional unit fields are absent.
+#[test]
+fn layer1_units_free_checkpoint_has_no_units_fields() {
+    let train = sample(vec![vec![1.0], vec![2.0], vec![3.0]], vec![1.0, 2.0, 3.0]);
+    let test = train.clone();
+    let mut cfg = base_config();
+    cfg.generations = 1;
+    let mut text = None;
+    search::run_resumable(&cfg, &train, &test, None, 1, |cp| {
+        text = Some(cp.to_text());
+    })
+    .expect("run");
+    let text = text.expect("checkpoint");
+    assert!(!text.contains("config units"), "unexpected units field");
+    assert!(
+        !text.contains("require_dimensions"),
+        "unexpected require_dimensions field"
+    );
+    Checkpoint::from_text(&text).expect("old-format checkpoint still parses");
+}
+
 // ---- CLI wiring -----------------------------------------------------------
+
 
 fn rcsr(args: &[&str]) -> std::process::Output {
     std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -550,7 +642,7 @@ fn cli_rejects_malformed_unit_syntax() {
 }
 
 #[test]
-fn cli_requires_units_for_require_dimensions() {
+fn layer3_require_dimensions_without_units_is_usage_error() {
     let out = rcsr(&[
         "--data", "-", "--target", "y", "--require-dimensions", "--generations", "0",
     ]);
@@ -602,17 +694,18 @@ fn cli_resolves_units_and_reports_them() {
     );
 }
 
-/// The fitted constants carry dimensions: the intercept is metres and the
-/// coefficient is dimensionless, and the CLI says so.
+/// Layer 2: `--units` alone reports the constants and keeps a candidate that
+/// Layer 3 rejects. `x + 1` is numerically perfect, but `x` is metres and the
+/// target is seconds; the additive mismatch cannot be absorbed by a constant.
 #[test]
-fn cli_reports_constant_dimensions() {
-    let table = "x,y\n1,3\n2,5\n3,7\n4,9\n";
+fn layer2_units_alone_reports_and_does_not_reject() {
+    let table = "x,y\n1,2\n2,3\n3,4\n4,5\n";
     let run = |extra: &[&str]| {
         let mut args = vec![
-            "--data", "-", "--target", "y", "--vars", "x", "--units", "x=m,y=m",
-            "--require-dimensions", "--seed-expr", "2*x + 1", "--generations", "0",
-            "--pop", "1", "--fit-iters", "0", "--test-frac", "0", "--center",
-            "none", "--scale", "none",
+            "--data", "-", "--target", "y", "--vars", "x", "--units", "x=m,y=s",
+            "--seed-expr", "x + 1", "--generations", "0", "--pop", "1",
+            "--fit-iters", "0", "--test-frac", "0", "--center", "none",
+            "--scale", "none",
         ];
         args.extend_from_slice(extra);
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -632,23 +725,62 @@ fn cli_reports_constant_dimensions() {
         child.wait_with_output().expect("wait for rcsr")
     };
 
+    // Layer 2: accepted, with a constant-dimension note.
     let out = run(&[]);
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.status.code(), Some(0), "units alone must not reject");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("constant dimensions (rank 1): 1:m, 2:1"),
+        stderr.contains("constant dimensions (rank 1): 1:m"),
         "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "dimensional note: 1 of 1 archived solution(s) would be rejected"
+        ),
+        "Layer 2 must note the candidate Layer 3 would reject: {stderr}"
     );
 
     let out = run(&["--json"]);
     assert_eq!(out.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains(
-            "\"constant_dimensions\":[{\"value\":1,\"dimension\":\"m\"},\
-             {\"value\":2,\"dimension\":\"1\"}]"
-        ),
+        stdout.contains("\"constant_dimensions\":[{\"value\":1,\"dimension\":\"m\"}]"),
         "stdout: {stdout}"
+    );
+
+    // Layer 3: the same declaration plus the filter rejects it.
+    let out = run(&["--require-dimensions"]);
+    assert_eq!(out.status.code(), Some(4), "no finite solution expected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("seed rejected"),
+        "the inconsistent seed must be rejected: {stderr}"
+    );
+    assert!(
+        stderr.contains("pareto members: 0"),
+        "rejected candidate must not enter the archive: {stderr}"
+    );
+}
+
+/// Layer 3: a column named `m` is still dimensionless unless declared. The
+/// seed fits the numbers exactly, but `x + m` mixes metres with a pure number.
+#[test]
+fn layer3_undeclared_columns_are_not_inferred_from_their_names() {
+    let table = "x,m,y\n1,10,11\n2,20,22\n3,30,33\n";
+    let out = rcsr_stdin(
+        &[
+            "--data", "-", "--target", "y", "--vars", "x,m",
+            "--units", "x=m,y=m", "--require-dimensions",
+            "--seed-expr", "x + m", "--generations", "0", "--pop", "1",
+            "--fit-iters", "0", "--test-frac", "0",
+        ],
+        table,
+    );
+    assert_eq!(out.status.code(), Some(4), "no finite solution expected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("seed rejected"),
+        "the undeclared 'm' column must stay dimensionless: {stderr}"
     );
 }
 

@@ -526,7 +526,7 @@ impl Units {
     /// target's unit (and an affine offset); an inconsistent tree has no
     /// integer solution and is rejected.
     pub fn accepts(&self, tree: &Node) -> bool {
-        solve(tree, &self.vars, &self.target).is_ok()
+        solve(tree, &self.vars, Some(&self.target)).is_ok()
     }
 
     /// Text form used by the checkpoint format: one dimension per input,
@@ -576,7 +576,12 @@ pub fn constant_values(tree: &Node) -> Vec<f64> {
 /// has no consistent integer assignment the whole vector is `None`.
 pub fn constant_dimensions(tree: &Node, vars: &[Unit], target: &Unit) -> Vec<Option<Unit>> {
     let k = crate::expr::count_constants(tree);
-    match solve(tree, vars, target) {
+    // Prefer the assignment that also matches the target. If the candidate is
+    // dimensionally inconsistent (common with `--units` alone, which does not
+    // filter), fall back to its internal constraints so the constants can
+    // still be reported.
+    let solved = solve(tree, vars, Some(target)).or_else(|_| solve(tree, vars, None));
+    match solved {
         Ok((units, order)) => order
             .iter()
             .map(|&i| Some(units[i].clone()))
@@ -693,7 +698,7 @@ fn equation(
 fn solve(
     tree: &Node,
     vars: &[Unit],
-    target: &Unit,
+    target: Option<&Unit>,
 ) -> Result<(Vec<Unit>, Vec<usize>), Inconsistency> {
     let mut map = VarMap {
         constants: HashMap::new(),
@@ -704,12 +709,14 @@ fn solve(
     index_unknowns(tree, &mut map);
     let mut equations = Vec::new();
     let root = symbolic(tree, vars, &map, &mut equations)?;
-    equation(
-        Op::Const,
-        root,
-        SymDim::from_unit(target.clone(), map.nvars),
-        &mut equations,
-    )?;
+    if let Some(target) = target {
+        equation(
+            Op::Const,
+            root,
+            SymDim::from_unit(target.clone(), map.nvars),
+            &mut equations,
+        )?;
+    }
     let units = solve_equations(&equations, map.nvars)?;
     Ok((units, map.const_order))
 }

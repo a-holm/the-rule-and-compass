@@ -61,9 +61,6 @@ config dedup true
 config time_budget none
 config patience 40
 config predictor_samples none
-config units none
-config units.target 1
-config require_dimensions false
 generations 20
 stopped_early false
 best_prev 1.9968344769643271
@@ -82,7 +79,7 @@ Every record:
 
 | record | contents |
 |---|---|
-| `config <key> <value>` | one search setting. All settings that influence the trajectory are present; `complexity.op_costs` carries one cost per `Op`, in discriminant order. |
+| `config <key> <value>` | one search setting. All settings that influence the trajectory are present; `complexity.op_costs` carries one cost per `Op`, in discriminant order. `units`, `units.target` and `require_dimensions` are optional: they are written only when `--units` is active, and a checkpoint without them loads as units-free. |
 | `generations <n>` | completed generations (the next generation to run). |
 | `stopped_early <bool>` | the saved run had already converged, hit its patience limit or its time budget. Resuming it does not run more generations. |
 | `best_prev <f64>` | lowest error seen so far, used by the patience comparison. |
