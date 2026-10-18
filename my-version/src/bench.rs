@@ -141,6 +141,7 @@ fn draw(p: &Problem, n: usize, noise: f64, rng: &mut Mt, nrng: &mut Mt) -> Sampl
     let mut s = Sample {
         x: Vec::with_capacity(n),
         y: Vec::with_capacity(n),
+        w: Vec::new(),
     };
     for _ in 0..n {
         let row: Vec<f64> = p.ranges.iter().map(|&(lo, hi)| rng.range(lo, hi)).collect();

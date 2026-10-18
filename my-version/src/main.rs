@@ -71,6 +71,15 @@ INPUT:
                              the target and any --time/--group-by column)
   --test-frac <f>            held-out fraction (default 0.25)
 
+ROW WEIGHTS:
+  --weight <col>             per-row weight column: finite, >= 0, at least one
+                             positive. A weight of 2 means \"this row twice\":
+                             absolute, squared, correlation, signed and
+                             log_squashed become weighted means, and aic/aicc/bic
+                             use the weighted RSS. Refused for metrics with no
+                             weighted definition (median, maximum, interquartile,
+                             slope, rank_correlation, auc, log_loss, hinge).
+
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
                              null). Default none: leave it, as before.
@@ -231,6 +240,7 @@ fn schema() -> String {
         ("--target", "string", "none", "target column name"),
         ("--vars", "csv", "all-except-target", "input column names"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
+        ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
         ("--outlier-iqr", "float", "none", "drop rows beyond k interquartile ranges from the training median"),
         ("--smooth", "int", "0", "centred moving-average window in rows (0 = off)"),
@@ -485,6 +495,7 @@ fn main() {
     let mut exclude_src: Option<String> = None;
     let mut train_select_src: Option<String> = None;
     let mut test_select_src: Option<String> = None;
+    let mut weight_name: Option<String> = None;
 
     let mut i = 0;
     macro_rules! val {
@@ -602,6 +613,7 @@ fn main() {
                     }
                 }
             }
+            "--weight" => weight_name = Some(val!()),
             "--filter" => filter_src = Some(val!()),
             "--exclude" => exclude_src = Some(val!()),
             "--train-select" => train_select_src = Some(val!()),
@@ -749,12 +761,51 @@ fn main() {
         }
     };
 
+    // Weights are either applied or refused: never silently dropped. This runs
+    // after the table is read so a piped input is consumed before a usage error.
+    if weight_name.is_some() && !metrics::weights_supported(cfg.metric) {
+        eprintln!(
+            "error: --weight is not supported by the '{}' metric",
+            cfg.metric.name()
+        );
+        eprintln!(
+            "supported weighted metrics: {}",
+            metrics::weighted_metric_names().join(", ")
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // The .632+ bootstrap resamples and refits without weights; refusing the
+    // combination is honest about that rather than reporting a mixed estimate.
+    if weight_name.is_some() && bootstrap_resamples > 0 {
+        eprintln!(
+            "error: --weight cannot be combined with --bootstrap-error \
+             (the .632+ bootstrap resamples rows without weights)"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+
     let target_idx = match table.index_of(&target) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+    };
+
+    // Resolve the weight column by name here so it can be excluded from the
+    // default inputs; numeric/value validation happens in `data`.
+    let weight_col = match &weight_name {
+        Some(n) => match table.index_of(n) {
+            Ok(j) => Some(j),
+            Err(_) => {
+                eprintln!(
+                    "error: weight column '{}' not found (columns: {:?})",
+                    n, table.names
+                );
+                std::process::exit(EXIT_INPUT);
+            }
+        },
+        None => None,
     };
 
     // Parse the row filter against every numeric column. A syntax error is a
@@ -796,6 +847,7 @@ fn main() {
                     && table.names[j] != target
                     && Some(j) != time_col
                     && Some(j) != group_col
+                    && Some(j) != weight_col
             })
             .map(|j| table.names[j].clone())
             .collect();
@@ -813,6 +865,9 @@ fn main() {
             e.push(j);
         }
         if let Some(j) = b {
+            e.push(j);
+        }
+        if let Some(j) = weight_col {
             e.push(j);
         }
         e
@@ -973,14 +1028,21 @@ fn main() {
         filter,
     };
     let mut rng = Mt::new(cfg.seed);
-    let prepared =
-        match data::prepare_full_with(&table, &vars, &target, &spec, &mut rng, &prep) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                std::process::exit(EXIT_INPUT);
-            }
-        };
+    let prepared = match data::prepare_full_weighted_with(
+        &table,
+        &vars,
+        &target,
+        weight_name.as_deref(),
+        &spec,
+        &mut rng,
+        &prep,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
     notes.extend(prepared.report.notes.iter().cloned());
 
     // Streaming progress: ndjson goes to stdout, other formats to stderr.
@@ -1033,6 +1095,22 @@ fn main() {
     if format == Format::Text {
         for line in prepared.prep.text_lines(outlier_iqr, smooth) {
             eprintln!("{}", line);
+        }
+        if let Some(name) = &weight_name {
+            let zero = prepared
+                .train
+                .w
+                .iter()
+                .filter(|&&v| v == 0.0)
+                .count();
+            eprintln!(
+                "# weights: column {}, sum {} over {} rows ({} zero-weight)",
+                name,
+                prepared.train.weight_sum(),
+                prepared.train.len(),
+                zero
+            );
+            eprintln!("# weights: null baselines and residual tests are unweighted");
         }
     }
     if format == Format::Ndjson {
@@ -1184,7 +1262,16 @@ fn main() {
                 fold_errors,
                 // Parameter uncertainty at the fitted solution (issue #22):
                 // reuse the fitter's Jacobian on the training rows.
-                constant_errors: fit::constant_errors(&s.tree, &prepared.train.x, &prepared.train.y),
+                constant_errors: if prepared.train.w.is_empty() {
+                    fit::constant_errors(&s.tree, &prepared.train.x, &prepared.train.y)
+                } else {
+                    fit::constant_errors_weighted(
+                        &s.tree,
+                        &prepared.train.x,
+                        &prepared.train.y,
+                        &prepared.train.w,
+                    )
+                },
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
@@ -1223,7 +1310,16 @@ fn main() {
     // search on each fold's own training rows, and score the model it returns on
     // the held-out block. Each fold is normalised on its training rows alone.
     let cv: Option<CvReport> = cv_mode.map(|mode| {
-        let folds = match data::cv_folds(&table, &vars, &target, mode, cv_k, gap, cfg.seed) {
+        let folds = match data::cv_folds_weighted(
+            &table,
+            &vars,
+            &target,
+            weight_name.as_deref(),
+            mode,
+            cv_k,
+            gap,
+            cfg.seed,
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("error: {}", e);
@@ -1286,6 +1382,7 @@ fn main() {
             let shuffled = data::Sample {
                 x: prepared.train.x.clone(),
                 y,
+                w: prepared.train.w.clone(),
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -1542,6 +1639,25 @@ fn main() {
             }
         }
         Format::Json => {
+            let (
+                weight_column_json,
+                weight_sum_json,
+                weight_rows_json,
+                weight_positive_rows_json,
+            ) = match &weight_name {
+                Some(name) => (
+                    jstr(name),
+                    jnum(prepared.train.weight_sum()),
+                    prepared.train.len().to_string(),
+                    prepared.train.positive_weight_rows().to_string(),
+                ),
+                None => (
+                    "null".to_string(),
+                    "null".to_string(),
+                    "null".to_string(),
+                    "null".to_string(),
+                ),
+            };
             let split_json = format!(
                 "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
                 jstr(prepared.report.mode),
@@ -1698,12 +1814,16 @@ fn main() {
                 None => "null".to_string(),
             };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
                 jstr(&target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                weight_column_json,
+                weight_sum_json,
+                weight_rows_json,
+                weight_positive_rows_json,
                 prepared.train.len(),
                 prepared.test.len(),
                 split_json,
@@ -1913,7 +2033,7 @@ fn run_eval(
     };
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-        metrics::score_with_constants(&pred, &s.y, metric, k)
+        metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
     };
     let train_error = score(&prepared.train);
     let fold_errors: Vec<f64> = prepared.fold_samples.iter().map(score).collect();
@@ -3091,6 +3211,26 @@ mod tests {
             schema().contains("--bootstrap-error"),
             "schema() is missing --bootstrap-error"
         );
+    }
+
+    /// Row weights are a first-class input: the flag and its supported metrics
+    /// must appear in both hand-written descriptions.
+    #[test]
+    fn help_and_schema_document_weights() {
+        assert!(usage().contains("--weight"), "usage() is missing --weight");
+        assert!(schema().contains("--weight"), "schema() is missing --weight");
+        for m in metrics::weighted_metric_names() {
+            assert!(
+                usage().contains(m),
+                "usage() is missing weighted metric '{}'",
+                m
+            );
+            assert!(
+                schema().contains(m),
+                "schema() is missing weighted metric '{}'",
+                m
+            );
+        }
     }
 
     /// Data preparation stayed opt-in, but every flag must be documented.

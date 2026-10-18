@@ -227,8 +227,13 @@ fn a_custom_model_still_recovers_a_known_law() {
     let train = Sample {
         x: xs.clone(),
         y: ys.clone(),
+        w: Vec::new(),
     };
-    let test = Sample { x: xs, y: ys };
+    let test = Sample {
+        x: xs,
+        y: ys,
+        w: Vec::new(),
+    };
 
     let mut cfg = Config::default();
     cfg.generations = 120;

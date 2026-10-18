@@ -194,6 +194,153 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
     }
 }
 
+/// True when `m` has a defined weighted form. The CLI refuses `--weight` for
+/// every other metric rather than silently ignoring the weights.
+///
+/// Supported: `absolute`, `squared`, `correlation`, `signed`, `log_squashed`,
+/// `aic`, `aicc` and `bic`. The order-statistic, classification, rank and
+/// first-difference metrics have no standard weighted definition (see
+/// `docs/weights.md`).
+pub fn weights_supported(m: Metric) -> bool {
+    matches!(
+        m,
+        Metric::Absolute
+            | Metric::Squared
+            | Metric::Correlation
+            | Metric::Signed
+            | Metric::LogSquashed
+            | Metric::Aic
+            | Metric::Aicc
+            | Metric::Bic
+    )
+}
+
+/// Names of the metrics that accept weights, for error messages.
+pub fn weighted_metric_names() -> &'static [&'static str] {
+    &[
+        "absolute",
+        "squared",
+        "correlation",
+        "signed",
+        "log_squashed",
+        "aic",
+        "aicc",
+        "bic",
+    ]
+}
+
+/// Score a prediction against a target with per-row weights.
+///
+/// With an empty `w` this is exactly [`score_with_constants`]: the unweighted
+/// code path is unchanged, bit for bit. Otherwise every supported metric is a
+/// **weighted mean**:
+///
+/// ```text
+/// absolute    Σ wᵢ·|eᵢ| / Σ wᵢ
+/// squared     Σ wᵢ·eᵢ² / Σ wᵢ
+/// signed      |Σ wᵢ·eᵢ / Σ wᵢ|
+/// log_squashed Σ wᵢ·ln(1 + eᵢ²) / Σ wᵢ
+/// correlation 1 - |r_w|, the weighted Pearson correlation
+/// aic/aicc/bic weighted RSS, n = number of rows with wᵢ > 0
+/// ```
+///
+/// Normalising by `Σ wᵢ` (not by the row count) is what makes a weight of 2
+/// mean "this row twice": both the numerator and the denominator grow by that
+/// row's loss and one unit of weight. For an unsupported metric the weights
+/// cannot be applied, so the result is `+inf`; the CLI refuses such a
+/// combination up front.
+pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -> f64 {
+    if w.is_empty() {
+        return score_with_constants(pred, y, m, k);
+    }
+    let n = pred.len();
+    if n == 0 || y.len() != n || w.len() != n {
+        return f64::INFINITY;
+    }
+    for &p in pred {
+        if !p.is_finite() {
+            return f64::INFINITY;
+        }
+    }
+    let mut total = 0.0;
+    for &wi in w {
+        if !wi.is_finite() || wi < 0.0 {
+            return f64::INFINITY;
+        }
+        total += wi;
+    }
+    if !(total > 0.0) {
+        return f64::INFINITY;
+    }
+    let resid: Vec<f64> = pred.iter().zip(y).map(|(p, t)| p - t).collect();
+    match m {
+        Metric::Absolute => resid
+            .iter()
+            .zip(w)
+            .map(|(e, wi)| wi * e.abs())
+            .sum::<f64>()
+            / total,
+        Metric::Squared => resid
+            .iter()
+            .zip(w)
+            .map(|(e, wi)| wi * e * e)
+            .sum::<f64>()
+            / total,
+        Metric::Correlation => 1.0 - weighted_correlation(pred, y, w).abs(),
+        Metric::Signed => {
+            (resid.iter().zip(w).map(|(e, wi)| wi * e).sum::<f64>() / total).abs()
+        }
+        Metric::LogSquashed => resid
+            .iter()
+            .zip(w)
+            .map(|(e, wi)| wi * (1.0 + e * e).ln())
+            .sum::<f64>()
+            / total,
+        Metric::Aic => {
+            let npos = w.iter().filter(|&&v| v > 0.0).count();
+            aic(npos, weighted_rss(&resid, w), k)
+        }
+        Metric::Aicc => {
+            let npos = w.iter().filter(|&&v| v > 0.0).count();
+            aicc(npos, weighted_rss(&resid, w), k)
+        }
+        Metric::Bic => {
+            let npos = w.iter().filter(|&&v| v > 0.0).count();
+            bic(npos, weighted_rss(&resid, w), k)
+        }
+        // No standard weighted form: refuse rather than ignore the weights.
+        _ => f64::INFINITY,
+    }
+}
+
+fn weighted_rss(v: &[f64], w: &[f64]) -> f64 {
+    v.iter().zip(w).map(|(e, wi)| wi * e * e).sum()
+}
+
+/// Weighted Pearson correlation with weighted means and covariance.
+fn weighted_correlation(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
+    let total: f64 = w.iter().sum();
+    if a.len() != b.len() || a.is_empty() || !(total > 0.0) {
+        return 0.0;
+    }
+    let ma = a.iter().zip(w).map(|(v, wi)| wi * v).sum::<f64>() / total;
+    let mb = b.iter().zip(w).map(|(v, wi)| wi * v).sum::<f64>() / total;
+    let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
+    for i in 0..a.len() {
+        let da = a[i] - ma;
+        let db = b[i] - mb;
+        let wi = w[i];
+        sab += wi * da * db;
+        sa += wi * da * da;
+        sb += wi * db * db;
+    }
+    if sa <= 0.0 || sb <= 0.0 {
+        0.0
+    } else {
+        sab / (sa.sqrt() * sb.sqrt())
+    }
+}
+
 /// Gaussian log-likelihood term `n·ln(RSS/n)`, guarding the perfect fit
 /// (`RSS = 0`, which sends every criterion to `-inf`).
 fn loglik(n: usize, rss: f64) -> f64 {
@@ -532,5 +679,74 @@ mod tests {
         let y = [1.0, 2.0];
         assert_eq!(score(&[f64::NAN, 1.0], &y, Metric::Absolute), f64::INFINITY);
         assert_eq!(score(&[1.0], &y, Metric::Absolute), f64::INFINITY);
+    }
+
+    #[test]
+    fn weighted_means_are_hand_checkable() {
+        // residuals -1, 2, -3 with weights 1, 2, 1: Σw = 4.
+        let p = [0.0, 3.0, 0.0];
+        let y = [1.0, 1.0, 3.0];
+        let w = [1.0, 2.0, 1.0];
+        assert!(approx(
+            score_weighted(&p, &y, &w, Metric::Absolute, 0),
+            (1.0 + 4.0 + 3.0) / 4.0,
+            1e-12
+        ));
+        assert!(approx(
+            score_weighted(&p, &y, &w, Metric::Squared, 0),
+            (1.0 + 8.0 + 9.0) / 4.0,
+            1e-12
+        ));
+        // Signed: (−1 + 4 − 3)/4 = 0.
+        assert!(approx(
+            score_weighted(&p, &y, &w, Metric::Signed, 0),
+            0.0,
+            1e-12
+        ));
+    }
+
+    #[test]
+    fn empty_weights_are_exactly_the_unweighted_score() {
+        let p = [0.2, -1.0, 3.5, 2.0];
+        let y = [1.0, 2.0, -0.5, 0.0];
+        for m in Metric::all() {
+            assert_eq!(
+                score_weighted(&p, &y, &[], *m, 2).to_bits(),
+                score_with_constants(&p, &y, *m, 2).to_bits(),
+                "empty weights changed {}",
+                m.name()
+            );
+        }
+    }
+
+    #[test]
+    fn weights_supported_is_the_documented_set() {
+        let supported: Vec<&str> = Metric::all()
+            .iter()
+            .filter(|m| weights_supported(**m))
+            .map(|m| m.name())
+            .collect();
+        assert_eq!(supported, weighted_metric_names());
+        assert!(!weights_supported(Metric::Median));
+        assert!(!weights_supported(Metric::Auc));
+        assert_eq!(
+            score_weighted(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 1.0], Metric::Median, 0),
+            f64::INFINITY,
+            "an unsupported metric must refuse weights, not ignore them"
+        );
+    }
+
+    #[test]
+    fn weighted_correlation_matches_duplicating_the_heavier_row() {
+        let a = [0.0, 1.0, 2.0, 3.0];
+        let b = [0.0, 2.0, 2.5, 4.0];
+        let w = [1.0, 2.0, 1.0, 1.0];
+        let dup_a = [0.0, 1.0, 1.0, 2.0, 3.0];
+        let dup_b = [0.0, 2.0, 2.0, 2.5, 4.0];
+        assert!(approx(
+            score_weighted(&a, &b, &w, Metric::Correlation, 0),
+            score(&dup_a, &dup_b, Metric::Correlation),
+            1e-12
+        ));
     }
 }

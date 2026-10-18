@@ -17,7 +17,7 @@
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
-use crate::metrics::{score_with_constants, Metric};
+use crate::metrics::{score_weighted, Metric};
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use std::collections::HashSet;
@@ -122,8 +122,9 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     }
     let pred: Vec<f64> = s.x.iter().map(|row| eval(tree, row)).collect();
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
-    // search metrics; it is ignored by every other metric.
-    score_with_constants(&pred, &s.y, metric, expr::count_constants(tree))
+    // search metrics; it is ignored by every other metric. The weight vector is
+    // empty for an unweighted sample, which takes the identical unweighted path.
+    score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
 }
 
 /// True when candidate scoring should use a per-generation subset of the
@@ -180,6 +181,11 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
     Some(Sample {
         x: idx.iter().map(|&i| train.x[i].clone()).collect(),
         y: idx.iter().map(|&i| train.y[i]).collect(),
+        w: if train.w.is_empty() {
+            Vec::new()
+        } else {
+            idx.iter().map(|&i| train.w[i]).collect()
+        },
     })
 }
 
@@ -297,7 +303,7 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
         }
 
         if cfg.fit_iters > 0 {
-            crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
+            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
         let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model);
@@ -311,7 +317,7 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
     while next.len() < pop {
         let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
         if cfg.fit_iters > 0 {
-            crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
+            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
         }
         next.push(Ind::evaluated(
@@ -501,7 +507,13 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     for ind in islands[ii].iter_mut() {
                         let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
                         if cfg.fit_iters > 0 {
-                            crate::fit::fit(&mut t, &gen_train.x, &gen_train.y, cfg.fit_iters);
+                            crate::fit::fit_weighted(
+                                &mut t,
+                                &gen_train.x,
+                                &gen_train.y,
+                                &gen_train.w,
+                                cfg.fit_iters,
+                            );
                         }
                         *ind = Ind::evaluated(
                             t,

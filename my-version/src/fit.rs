@@ -552,11 +552,28 @@ fn solve(a: &mut [Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec
     Some(d)
 }
 
-fn sse(f: &Flat, x: &[Vec<f64>], y: &[f64], c: &[f64], v: &mut [f64]) -> f64 {
+/// Weighted residual sum of squares. The residual is multiplied by `sqrt(wᵢ)`
+/// so that minimising this is weighted least squares; an empty `w` leaves the
+/// residual untouched (the unweighted path, bit for bit).
+fn sse(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    c: &[f64],
+    v: &mut [f64],
+) -> f64 {
+    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+        return f64::INFINITY;
+    }
     let mut s = 0.0;
-    for (row, &t) in x.iter().zip(y) {
+    for (i, (row, &t)) in x.iter().zip(y).enumerate() {
+        let sw = w.get(i).copied().unwrap_or(1.0);
+        if sw == 0.0 {
+            continue; // a zero-weight row never influences the fit
+        }
         eval_row(f, row, c, v);
-        let r = v[f.root] - t;
+        let r = sw.sqrt() * (v[f.root] - t);
         if !r.is_finite() {
             return f64::INFINITY;
         }
@@ -572,6 +589,7 @@ fn gn_step(
     f: &Flat,
     x: &[Vec<f64>],
     y: &[f64],
+    w: &[f64],
     c: &[f64],
     lambda: f64,
     k: usize,
@@ -579,11 +597,20 @@ fn gn_step(
     adj: &mut [f64],
     grad: &mut [f64],
 ) -> Option<(Vec<f64>, f64)> {
+    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+        return None;
+    }
     let mut jtj = vec![vec![0.0; k]; k];
     let mut jtr = vec![0.0; k];
-    for (row, &t) in x.iter().zip(y) {
+    for (i, (row, &t)) in x.iter().zip(y).enumerate() {
+        let sw = w.get(i).copied().unwrap_or(1.0);
+        if sw == 0.0 {
+            continue; // a zero-weight row contributes nothing to JᵀJ or Jᵀr
+        }
         eval_row(f, row, c, v);
-        let r = v[f.root] - t;
+        // Scaling the residual by sqrt(w) makes JᵀJ and Jᵀr the weighted normal
+        // equations: (JᵀWJ) δ = -JᵀWr.
+        let r = sw.sqrt() * (v[f.root] - t);
         if !r.is_finite() {
             return None;
         }
@@ -609,7 +636,7 @@ fn gn_step(
     let trial: Vec<f64> = (0..k)
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
-    let s = sse(f, x, y, &trial, v);
+    let s = sse(f, x, y, w, &trial, v);
     Some((trial, s))
 }
 
@@ -619,12 +646,36 @@ fn gn_step(
 /// Gauss–Newton polish drives the constants to machine precision on
 /// well-conditioned problems. The tree is only modified if the fit improves it.
 /// Returns the final sum of squared errors.
+///
+/// This is the unweighted entry point; it delegates to [`fit_weighted`] with an
+/// empty weight vector, so existing results are bit-for-bit unchanged.
 pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
+    fit_weighted(tree, x, y, &[], iters)
+}
+
+/// Weighted least squares: fit `tree`'s constants to minimise
+/// `Σ wᵢ·(f(xᵢ) − yᵢ)²`.
+///
+/// Each residual is multiplied by `sqrt(wᵢ)` before it enters `JᵀJ` and `Jᵀr`,
+/// so the Gauss–Newton step solves the weighted normal equations
+/// `(JᵀWJ) δ = −JᵀWr`. An empty `w` is exactly [`fit`]; a zero weight removes
+/// the row from the objective (it cannot influence the constants). Returns the
+/// final weighted sum of squared errors.
+pub fn fit_weighted(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+) -> f64 {
+    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+        return f64::INFINITY;
+    }
     let f = flatten(tree);
     let k = f.nconst;
     if k == 0 || x.is_empty() {
         let mut v = vec![0.0; f.op.len().max(1)];
-        return sse(&f, x, y, &[], &mut v);
+        return sse(&f, x, y, w, &[], &mut v);
     }
     let n = f.op.len();
     let mut c = vec![0.0; k];
@@ -637,11 +688,11 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
-    let mut best_sse = sse(&f, x, y, &c, &mut v);
+    let mut best_sse = sse(&f, x, y, w, &c, &mut v);
     let mut lambda = 1e-3;
 
     for _ in 0..iters.max(1) {
-        match gn_step(&f, x, y, &c, lambda, k, &mut v, &mut adj, &mut grad) {
+        match gn_step(&f, x, y, w, &c, lambda, k, &mut v, &mut adj, &mut grad) {
             Some((trial, tsse)) => {
                 if tsse < best_sse {
                     c = trial;
@@ -667,7 +718,18 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
         if best_sse == 0.0 {
             break;
         }
-        match gn_step(&f, x, y, &best_c, 0.0, k, &mut v, &mut adj, &mut grad) {
+        match gn_step(
+            &f,
+            x,
+            y,
+            w,
+            &best_c,
+            0.0,
+            k,
+            &mut v,
+            &mut adj,
+            &mut grad,
+        ) {
             Some((trial, tsse)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
@@ -731,10 +793,31 @@ pub struct ConstantErrors {
 /// returned values are in left-to-right constant order, matching
 /// [`crate::expr::nth`].
 pub fn constant_errors(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> Option<ConstantErrors> {
+    constant_errors_weighted(tree, x, y, &[])
+}
+
+/// Weighted standard errors. `JᵀJ` and the RSS are weighted (`Σ wᵢ·…`), and the
+/// residual degrees of freedom are `#rows with wᵢ > 0 − k`: a weight is treated
+/// as a frequency, so a zero-weight row does not buy a degree of freedom. An
+/// empty `w` reproduces [`constant_errors`] exactly.
+pub fn constant_errors_weighted(
+    tree: &Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+) -> Option<ConstantErrors> {
+    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+        return None;
+    }
     let f = flatten(tree);
     let k = f.nconst;
     let n = x.len().min(y.len());
-    if k == 0 || n == 0 || n <= k {
+    let npos = if w.is_empty() {
+        n
+    } else {
+        w.iter().filter(|&&v| v > 0.0).count()
+    };
+    if k == 0 || n == 0 || npos <= k {
         return None;
     }
     let mut c = vec![0.0; k];
@@ -748,7 +831,14 @@ pub fn constant_errors(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> Option<Constan
     let mut grad = vec![0.0; k];
     let mut jtj = vec![vec![0.0; k]; k];
     let mut rss = 0.0;
-    for (row, &t) in x.iter().zip(y) {
+    for (row_i, (row, &t)) in x.iter().zip(y).enumerate() {
+        let sw = w.get(row_i).copied().unwrap_or(1.0);
+        if !sw.is_finite() || sw < 0.0 {
+            return None;
+        }
+        if sw == 0.0 {
+            continue;
+        }
         eval_row(&f, row, &c, &mut v);
         let r = v[f.root] - t;
         if !r.is_finite() {
@@ -761,17 +851,17 @@ pub fn constant_errors(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> Option<Constan
                 return None;
             }
             for j in 0..=i {
-                jtj[i][j] += gi * grad[j];
+                jtj[i][j] += sw * gi * grad[j];
             }
         }
-        rss += r * r;
+        rss += sw * r * r;
     }
     for i in 0..k {
         for j in 0..i {
             jtj[j][i] = jtj[i][j];
         }
     }
-    let dof = n - k;
+    let dof = npos - k;
     // Scale to a correlation-like matrix so collinearity is judged
     // independently of each constant's magnitude. A constant with no gradient
     // at all (e.g. inside an untaken branch) is never determined.
