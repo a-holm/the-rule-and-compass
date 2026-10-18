@@ -173,10 +173,11 @@ complexity cap of 80, seed 2. It used all 150 generations:
 
 The easy run is comfortably inside the converged range and the hard run is not.
 The hard run's maturity is high because some forms do survive; its low
-confidence and churning front are what keep the headline down. An even easier
-noiseless case can find the exact law in two generations and stop on the
-search's solved floor; confidence is then 1 by definition, stability is 1 and
-maturity is only `(2-1)/2 = 0.5`, giving `percent_converged = 0.9`. The tests in
+confidence and churning front are what keep the headline down. On a noiseless
+problem the search can also find the exact law in two generations and stop on
+the search's solved floor; confidence is then 1 by definition, stability is 1
+and maturity is only `(2-1)/2 = 0.5`, giving `percent_converged = 0.9`. The
+tests in
 [`my-version/tests/progress_stats.rs`](../my-version/tests/progress_stats.rs)
 run an easy and a hard problem with the same shape of configuration and assert
 that the first lands in the converged range and the second does not (the numbers
