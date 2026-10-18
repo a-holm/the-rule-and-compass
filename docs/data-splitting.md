@@ -85,6 +85,53 @@ contributes to both the training and the test side — so the test set still ask
 "predict the future", but now over many series at once, which is far more data
 than a single series gives you.
 
+## Assigning rows by expression
+
+Sometimes you know exactly which rows are training and which are validation: a
+date range, a set of machines, a flag column. Say so directly.
+
+```sh
+# explicit sides
+rcsr --data d.csv --target y --vars x1,x2 \
+     --train-select "year < 2020" --test-select "year >= 2020"
+
+# drop the commissioning rows first, then split the rest as usual
+rcsr --data d.csv --target y --vars x1,x2 \
+     --exclude "warmup == 1"
+```
+
+Any expression the model language accepts works, and it may name any numeric
+column — not just the inputs. Rows are assigned by the same truth rule
+everywhere: **a value greater than zero is true**.
+
+| situation | rule | reported as |
+|---|---|---|
+| matches `--train-select` only | training | `train_rows` |
+| matches `--test-select` only | test | `test_rows` |
+| matches **both** | **training** | `overlap`, plus a note |
+| matches **neither** (both given) | unused | `unassigned`, plus a note |
+| only one selection given | the other side is the complement | — |
+
+Two consequences worth stating plainly:
+
+* **A selection overrides `--split`.** If you say which rows belong where, a
+  positional mode cannot also say it, so the mode is ignored and the report
+  says `mode=select` with a note naming the mode it replaced. `--exclude` is
+  different: it only removes rows, so it composes with any mode — the population
+  shrinks and the chosen mode splits what remains.
+* **Nothing is discarded silently.** Overlap and unused counts are printed and
+  appear in `--json` as `split.overlap` and `split.unassigned`, and the excluded
+  count as `split.excluded`.
+
+```
+# row selection assigned 8 train / 4 test row(s)
+# 1 row(s) matched both selections; they were assigned to training
+# row selection replaced the random split
+```
+
+Selection is deterministic: the same table and the same expressions always give
+the same sides, independent of `--seed`.
+
 ## Normalisation must not peek either
 
 `rcsr` standardises each input column to zero mean and unit variance before

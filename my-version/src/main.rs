@@ -64,6 +64,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --scale <how>              divide by std (default), iqr, range or none
   --filter <expr>            keep only rows where the expression is > 0; may
                              use any numeric column name, e.g. \"x > 0.5 and y < 3\"
+  --exclude <expr>           drop rows where the expression is > 0, before any
+                             split or filter
+  --train-select <expr>      rows where true go to training (overrides --split)
+  --test-select <expr>       rows where true go to test (overrides --split);
+                             a row matching both goes to training and is
+                             counted, one matching neither is reported unused
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
   --split random|temporal|group|temporal-group|auto   (default random)
@@ -179,6 +185,9 @@ fn schema() -> String {
         ("--center", "enum", "mean", "subtract mean | median | min | max | none before the search"),
         ("--scale", "enum", "std", "divide by std | iqr | range | none before the search"),
         ("--filter", "string", "none", "keep rows where this expression is > 0"),
+        ("--exclude", "string", "none", "drop rows where this expression is > 0"),
+        ("--train-select", "string", "none", "rows where this expression is > 0 go to training (overrides --split)"),
+        ("--test-select", "string", "none", "rows where this expression is > 0 go to test (overrides --split)"),
         ("--split", "enum", "random", "random | temporal | group | temporal-group | auto"),
         ("--time", "string", "none", "time/ordering column (implies temporal)"),
         ("--group-by", "string", "none", "group column (implies group)"),
@@ -260,6 +269,32 @@ fn jnum(v: f64) -> String {
         format!("{}", v)
     } else {
         "null".to_string()
+    }
+}
+
+/// Parse a boolean row expression (`--filter`, `--exclude`, `--train-select`,
+/// `--test-select`) against every numeric column of the table.
+///
+/// The expressions are parsed before lag columns are added, so they see the
+/// columns as they appear in the file. A syntax error is a usage error and
+/// keeps the parser's 1-based column number.
+fn parse_filter(flag: &str, src: Option<&str>, table: &data::Table) -> Option<data::Filter> {
+    let src = src?;
+    let filter_vars: Vec<String> = (0..table.names.len())
+        .filter(|&j| table.numeric[j])
+        .map(|j| table.names[j].clone())
+        .collect();
+    match expr::parse(src, &filter_vars) {
+        Ok(tree) => Some(data::Filter {
+            tree,
+            vars: filter_vars,
+            expression: src.to_string(),
+        }),
+        Err(e) => {
+            eprintln!("error: cannot parse {}: {}", flag, e);
+            eprintln!("  expression: {}", src);
+            std::process::exit(EXIT_USAGE);
+        }
     }
 }
 
@@ -381,6 +416,9 @@ fn main() {
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
+    let mut exclude_src: Option<String> = None;
+    let mut train_select_src: Option<String> = None;
+    let mut test_select_src: Option<String> = None;
 
     let mut i = 0;
     macro_rules! val {
@@ -467,6 +505,9 @@ fn main() {
                 }
             }
             "--filter" => filter_src = Some(val!()),
+            "--exclude" => exclude_src = Some(val!()),
+            "--train-select" => train_select_src = Some(val!()),
+            "--test-select" => test_select_src = Some(val!()),
             "--split" => split_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
@@ -564,27 +605,11 @@ fn main() {
 
     // Parse the row filter against every numeric column. A syntax error is a
     // usage error (exit 2) and keeps the parser's column number.
-    let filter = match filter_src.as_deref() {
-        Some(src) => {
-            let filter_vars: Vec<String> = (0..table.names.len())
-                .filter(|&j| table.numeric[j])
-                .map(|j| table.names[j].clone())
-                .collect();
-            match expr::parse(src, &filter_vars) {
-                Ok(tree) => Some(data::Filter {
-                    tree,
-                    vars: filter_vars,
-                    expression: src.to_string(),
-                }),
-                Err(e) => {
-                    eprintln!("error: cannot parse --filter: {}", e);
-                    eprintln!("  expression: {}", src);
-                    std::process::exit(EXIT_USAGE);
-                }
-            }
-        }
-        None => None,
-    };
+    let filter = parse_filter("--filter", filter_src.as_deref(), &table);
+    // Row selection (issue #3).
+    let exclude = parse_filter("--exclude", exclude_src.as_deref(), &table);
+    let train_select = parse_filter("--train-select", train_select_src.as_deref(), &table);
+    let test_select = parse_filter("--test-select", test_select_src.as_deref(), &table);
 
     // Resolve the two split-only columns (never used as model inputs).
     let mut time_col = match &time_name {
@@ -781,6 +806,9 @@ fn main() {
         test_frac,
         gap,
         folds,
+        train_select,
+        test_select,
+        exclude,
     };
     let prep = data::PrepSpec {
         fill,
@@ -1300,7 +1328,7 @@ fn main() {
         }
         Format::Json => {
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -1312,6 +1340,9 @@ fn main() {
                     .collect::<Vec<_>>()
                     .join(","),
                 prepared.report.gap,
+                prepared.report.excluded_rows,
+                prepared.report.overlap_rows,
+                prepared.report.unassigned_rows,
                 prepared.report.groups_total,
                 prepared.report.groups_train,
                 prepared.report.groups_test,
