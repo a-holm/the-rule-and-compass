@@ -148,6 +148,10 @@ Canonical `--ops` names:
 
 ```text
 mean, std, median, iqr, sum, amin, amax, count
+
+They are ordinary operators for `--op-complexity` too (`--op-complexity "mean=2"`),
+and the aggregate's column is its single child, so it is charged like any other
+unary node.
 ```
 
 `std` also accepts `stddev`; `amin`/`amax` also accept `agg_min`/`agg_max` and

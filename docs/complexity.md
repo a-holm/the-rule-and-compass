@@ -42,7 +42,12 @@ finite; the depth weight may also be zero. A malformed pair, an unknown operator
 or key, or a non-positive weight is a usage error (exit code `2`) and the
 message names the token that was wrong. A user-defined block (`--function`) is
 priced by its name or `customN` slot; its body's internal nodes are not charged
-again, because the block is one primitive of the configured cost.
+again, because the block is one primitive of the configured cost. A dataset
+aggregate (`mean`, `std`, `median`, `iqr`, `sum`, `amin`, `amax`, `count`) is an
+ordinary operator for pricing purposes: it costs its own entry (default `1`)
+plus its input child, and `--op-complexity "mean=2"` works. Its *value* is a
+training-set statistic, not a node, so reading a column does not make the
+expression look cheaper or dearer than it is.
 
 The configured value is what the search prunes on, what the Pareto front is
 sorted and dominated on, and what every solution reports as `complexity=`
