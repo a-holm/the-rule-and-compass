@@ -2527,24 +2527,28 @@ pub fn suggest_split(
     }
     let group_col = find_group_col(t, &exclude);
 
+    // Notes describe the *observation*, never the decision: the caller may be
+    // the `--split auto` path (which adopts the mode) or the warning path
+    // (which does not). Asserting "using a chronological split" here made the
+    // warning contradict the `split=random` line it accompanied.
     let mode = match (time_col, group_col) {
-        (Some(_), Some(_)) => {
-            notes.push(
-                "found both a time-like and a group-like column; using a temporal split inside each group"
-                    .to_string(),
-            );
+        (Some(j), Some(g)) => {
+            notes.push(format!(
+                "found a time-like column '{}' and a group-like column '{}'",
+                t.names[j], t.names[g]
+            ));
             SplitMode::TemporalGroup
         }
-        (Some(_), None) => {
-            notes.push("found a time-like column; using a chronological split".to_string());
+        (Some(j), None) => {
+            notes.push(format!("found a time-like column '{}'", t.names[j]));
             SplitMode::Temporal
         }
-        (None, Some(_)) => {
-            notes.push("found a group-like column; holding out whole groups".to_string());
+        (None, Some(g)) => {
+            notes.push(format!("found a group-like column '{}'", t.names[g]));
             SplitMode::Group
         }
         (None, None) => {
-            notes.push("no time or group column found; using a random split".to_string());
+            notes.push("found no time-like or group-like column".to_string());
             SplitMode::Random
         }
     };

@@ -994,6 +994,7 @@ fn main() {
             group_col = gc;
         }
         notes.extend(nt);
+        notes.push(format!("using the {} split", m.name()));
         m
     } else {
         match (time_col.is_some(), group_col.is_some()) {
@@ -1025,9 +1026,9 @@ fn main() {
                     eprintln!(
                         "warning: the rows do not look exchangeable: {}\n         \
                          a random split would let the model see the future (or the same\n         \
-                         group on both sides). Consider `--split auto` (chosen: {}),\n         \
-                         or pass explicitly:  {}",
-                        nt.join(" "),
+                         group on both sides). Consider `--split auto` (it would\n         \
+                         choose: {}), or pass explicitly:  {}",
+                        nt.join("; "),
                         guess.name(),
                         hint
                     );
