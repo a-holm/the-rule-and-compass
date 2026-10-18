@@ -155,6 +155,9 @@ SEARCH:
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
+  --predictor-samples <N>    score and fit candidates on N training rows per
+                             generation (default: all rows; N >= 2). The archive
+                             and every reported error are always full-data
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
 
@@ -212,6 +215,7 @@ fn schema() -> String {
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
+        ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
         ("--format", "enum", "text", "text | json | ndjson"),
@@ -535,6 +539,19 @@ fn main() {
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
             "--no-dedup" => cfg.dedup = false,
+            "--predictor-samples" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 2 => cfg.predictor_samples = Some(n),
+                    _ => {
+                        eprintln!(
+                            "error: --predictor-samples needs an integer >= 2, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--patience" => cfg.patience = val!().parse().unwrap_or(cfg.patience),
             "--time-budget" => cfg.time_budget = val!().parse().ok(),
             "--format" => {
@@ -981,8 +998,11 @@ fn main() {
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
             let resid_tests = diagnostics::residual_tests(&resid, &pred);
-            let overfit = if s.error > 0.0 {
-                test_error / s.error
+            // The reported training error is always the full-data error, even
+            // when the search scored candidates on `--predictor-samples` rows.
+            let train_error = search::eval_error(&s.tree, &prepared.train, cfg.metric);
+            let overfit = if train_error > 0.0 {
+                test_error / train_error
             } else if test_error > 0.0 {
                 f64::INFINITY
             } else {
@@ -1006,7 +1026,7 @@ fn main() {
                 rank: k + 1,
                 complexity: s.complexity,
                 k_constants: kconst,
-                train_error: s.error,
+                train_error,
                 test_error,
                 aicc,
                 bic,
@@ -1075,13 +1095,14 @@ fn main() {
                 .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal));
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
+                let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
                 let den = expr::simplify(&expr::denormalize(
                     &expr::simplify(&s.tree),
                     &f.means,
                     &f.stds,
                 ));
                 fold_rows.push(CvFoldRow {
-                    train_error: s.error,
+                    train_error,
                     test_error,
                     complexity: s.complexity,
                     expression: expr::to_string(&den, &vars),
