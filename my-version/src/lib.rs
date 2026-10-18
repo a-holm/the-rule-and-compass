@@ -7,3 +7,4 @@ pub mod expr;
 pub mod metrics;
 pub mod pareto;
 pub mod data;
+pub mod search;
