@@ -18,7 +18,7 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
-use rcsr::{data, diagnostics, search, stability};
+use rcsr::{data, diagnostics, multi, search, stability};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -61,16 +61,19 @@ fn usage() -> String {
         "rcsr {VERSION} — symbolic regression (rule-and-compass)
 
 USAGE:
-  rcsr --data <file|-> --target <col> [options]
+  rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
 INPUT:
   --data <file|->            CSV/TSV/whitespace table, header row required
                              ('-' reads the table from standard input)
-  --target <col>             name of the target column
+  --target <col>[,<col>..]   target column; a comma-separated list enables
+                             multi-output regression (one shared shape, one
+                             fitted constant vector per output). See
+                             docs/multi-output.md
   --vars <a,b,..>            input columns (default: all numeric columns except
-                             the target and any --time/--group-by column)
+                             the targets and any --time/--group-by column)
   --dtype <col>=<kind>,..    per-variable datatype: continuous (default),
                              boolean (0/1, never standardised) or categorical
                              (expanded to one-hot columns named col=value).
@@ -184,6 +187,15 @@ MODE:
                              and cost 1 by default; set a cost with
                              --op-complexity. Constants inside a body are shared
                              by every call. See docs/building-blocks.md.
+
+MULTI-OUTPUT (--target y1,y2):
+  Candidates share one tree shape; each target gets its own fitted constants.
+  The combined error is the mean of the per-target errors, and the Pareto front
+  ranks on that mean and the shape's complexity. Text prints one line per
+  target; --json carries a targets array with each expression, constants and
+  error plus the combined error. k_constants is the total across outputs.
+  Not available with --ndjson, --cv, --null-runs, --bootstrap-error,
+  --stability, --report, --save/--resume, or seed expressions.
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
@@ -1100,6 +1112,53 @@ fn main() {
         }
     };
 
+    // #15: `--target` accepts a comma-separated list. One name is the historical
+    // single-output path, byte for byte; two or more enable the shared-shape
+    // multi-output mode.
+    let target_names: Vec<String> = target
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if target_names.is_empty() {
+        eprintln!("error: --target needs at least one column name");
+        std::process::exit(EXIT_USAGE);
+    }
+    for (i, name) in target_names.iter().enumerate() {
+        if target_names[..i].iter().any(|n| n == name) {
+            eprintln!("error: --target names column '{}' more than once", name);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+    let target_refs: Vec<&str> = target_names.iter().map(|s| s.as_str()).collect();
+    let multi_output = target_names.len() > 1;
+    if multi_output {
+        // Honest limits: the single-target diagnostics and report builders
+        // assume one target column. Refusing is better than a half-filled report.
+        let unsupported = [
+            (eval_expr.is_some(), "--eval-expr"),
+            (!seed_exprs.is_empty() || !seed_files.is_empty(), "--seed-expr/--seed-file"),
+            (save_path.is_some(), "--save"),
+            (resume_path.is_some(), "--resume"),
+            (cv_mode.is_some(), "--cv"),
+            (null_runs > 0, "--null-runs"),
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (report.is_some(), "--report"),
+            (format == Format::Ndjson, "--ndjson"),
+        ];
+        for (present, flag) in unsupported {
+            if present {
+                eprintln!(
+                    "error: {} is not supported with multiple targets (--target y1,y2); \
+                     see docs/multi-output.md",
+                    flag
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+
     let table = if data_path == "-" {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
@@ -1141,13 +1200,32 @@ fn main() {
         std::process::exit(EXIT_USAGE);
     }
 
-    let target_idx = match table.index_of(&target) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+    // #15: resolve every target up front. The single-target branch keeps the
+    // historical error text exactly; the multi branch names the bad target.
+    let target_indices: Vec<usize> = if multi_output {
+        target_names
+            .iter()
+            .map(|name| match table.index_of(name) {
+                Ok(j) => j,
+                Err(_) => {
+                    eprintln!(
+                        "error: target column '{}' not found (columns: {:?})",
+                        name, table.names
+                    );
+                    std::process::exit(EXIT_INPUT);
+                }
+            })
+            .collect()
+    } else {
+        match table.index_of(&target) {
+            Ok(j) => vec![j],
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
         }
     };
+    let target_idx = target_indices[0];
 
     // Resolve the weight column by name here so it can be excluded from the
     // default inputs; numeric/value validation happens in `data`.
@@ -1195,14 +1273,14 @@ fn main() {
         None => None,
     };
 
-    // Default inputs: numeric columns that are neither the target nor a
+    // Default inputs: numeric columns that are neither a target nor a
     // split-only column.
     let vars_explicit = !vars.is_empty();
     if vars.is_empty() {
         vars = (0..table.names.len())
             .filter(|&j| {
                 table.numeric[j]
-                    && table.names[j] != target
+                    && !target_names.iter().any(|t| t == &table.names[j]) // #15
                     && Some(j) != time_col
                     && Some(j) != group_col
                     && Some(j) != weight_col
@@ -1227,10 +1305,11 @@ fn main() {
         None => Vec::new(),
     };
     for (name, _) in &dtype_spec {
-        if name == &target {
+        if target_names.iter().any(|t| t == name) {
             eprintln!(
-                "error: column '{}' is the target; --dtype applies to input variables",
-                name
+                "error: column '{}' is {}target; --dtype applies to input variables",
+                name,
+                if multi_output { "a " } else { "the " }
             );
             std::process::exit(EXIT_USAGE);
         }
@@ -1269,7 +1348,8 @@ fn main() {
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
     let exclusion = |a: Option<usize>, b: Option<usize>| -> Vec<usize> {
-        let mut e = vec![target_idx];
+        // #15: every target is a split-only column, never a model input.
+        let mut e = target_indices.clone();
         e.extend_from_slice(&known_vars);
         if let Some(j) = a {
             e.push(j);
@@ -1487,10 +1567,10 @@ fn main() {
         dtypes: dtypes.clone(),
     };
     let mut rng = Mt::new(cfg.seed);
-    let mut prepared = match data::prepare_full_weighted_with(
+    let mut prepared = match data::prepare_full_targets_weighted_with(
         &table,
         &vars,
-        &target,
+        &target_refs,
         weight_name.as_deref(),
         &spec,
         &mut rng,
@@ -1668,12 +1748,22 @@ fn main() {
             cfg.metric.name(),
             cfg.seed
         );
-        eprintln!(
-            "# target: {} = f({}) | {}",
-            target,
-            vars.join(","),
-            split_line
-        );
+        if multi_output {
+            // #15: one shared shape, one fitted constant vector per output.
+            eprintln!(
+                "# targets: {} = f({}) | {}",
+                target_names.join(","),
+                vars.join(","),
+                split_line
+            );
+        } else {
+            eprintln!(
+                "# target: {} = f({}) | {}",
+                target,
+                vars.join(","),
+                split_line
+            );
+        }
         let type_line: Vec<String> = variable_types
             .iter()
             .map(|v| format!("{} ({})", v.name, v.dtype.name()))
@@ -1698,6 +1788,23 @@ fn main() {
         } else {
             eprintln!("# checkpoint: resumed from {} at generation {}", path, gen);
         }
+    }
+
+    // #15: multi-output reporting has its own shape (one entry per target);
+    // the single-output path below is untouched.
+    if multi_output {
+        run_multi_output(
+            &cfg,
+            &prepared,
+            &target_names,
+            &vars,
+            format,
+            quiet,
+            top,
+            out_path,
+            start,
+        );
+        std::process::exit(EXIT_OK);
     }
 
     if let Some(src) = eval_expr.as_deref() {
@@ -2024,6 +2131,7 @@ fn main() {
                 x: prepared.train.x.clone(),
                 y,
                 w: prepared.train.w.clone(),
+                ys: Vec::new(),
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -2669,6 +2777,271 @@ fn main() {
             None => {
                 eprintln!("{}", md);
             }
+        }
+    }
+
+    std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
+}
+
+// ---------------------------------------------------------------------------
+// Multi-output reporting (issue #15)
+// ---------------------------------------------------------------------------
+
+struct MultiTargetRow {
+    name: String,
+    expression: String,
+    constants: Vec<f64>,
+    train_error: f64,
+    test_error: f64,
+    fold_errors: Vec<f64>,
+    constant_errors: Option<fit::ConstantErrors>,
+}
+
+struct MultiParetoRow {
+    rank: usize,
+    complexity: f64,
+    k_constants: usize,
+    train_error: f64,
+    test_error: f64,
+    targets: Vec<MultiTargetRow>,
+}
+
+/// Run the shared-shape search and report one expression per target.
+///
+/// `k_constants` is the **total** across outputs (`shape constants x targets`).
+/// `constant_errors`, the printed formula and each target's error are per
+/// output; `train_error`/`test_error` on the row are the combined (mean) error
+/// the archive was ranked on. Shape complexity is counted once.
+#[allow(clippy::too_many_arguments)]
+fn run_multi_output(
+    cfg: &search::Config,
+    prepared: &data::Prepared,
+    target_names: &[String],
+    vars: &[String],
+    format: Format,
+    quiet: bool,
+    top: usize,
+    out_path: Option<String>,
+    start: std::time::Instant,
+) {
+    let outcome = search::run(cfg, &prepared.train, &prepared.test);
+    let elapsed = start.elapsed().as_secs_f64();
+    let sorted = outcome.archive.sorted();
+    let fold_samples: Vec<data::Sample> = if prepared.fold_samples.is_empty() {
+        vec![prepared.test.clone()]
+    } else {
+        prepared.fold_samples.clone()
+    };
+    let n_targets = target_names.len();
+
+    let mut rows: Vec<MultiParetoRow> = sorted
+        .iter()
+        .enumerate()
+        .map(|(k, s)| {
+            // Fit one constant vector per output on the training rows, then
+            // score every output on the same fitted trees (no test leakage).
+            let trees = multi::fitted_outputs(&s.tree, &prepared.train, cfg.fit_iters);
+            let train_errors = multi::output_errors(&trees, &prepared.train, cfg.metric);
+            let test_errors = multi::output_errors(&trees, &prepared.test, cfg.metric);
+            let targets = target_names
+                .iter()
+                .enumerate()
+                .map(|(j, name)| {
+                    let den = expr::simplify(&expr::denormalize(
+                        &expr::simplify(&trees[j]),
+                        &prepared.means,
+                        &prepared.stds,
+                    ));
+                    let ce = if prepared.train.w.is_empty() {
+                        fit::constant_errors(&trees[j], &prepared.train.x, prepared.train.target(j))
+                    } else {
+                        fit::constant_errors_weighted(
+                            &trees[j],
+                            &prepared.train.x,
+                            prepared.train.target(j),
+                            &prepared.train.w,
+                        )
+                    };
+                    MultiTargetRow {
+                        name: name.clone(),
+                        expression: expr::to_string(&den, vars),
+                        constants: multi::constants(&trees[j]),
+                        train_error: train_errors[j],
+                        test_error: test_errors[j],
+                        fold_errors: fold_samples
+                            .iter()
+                            .map(|f| multi::eval_target(&trees[j], f, cfg.metric, j))
+                            .collect(),
+                        constant_errors: ce,
+                    }
+                })
+                .collect::<Vec<_>>();
+            MultiParetoRow {
+                rank: k + 1,
+                complexity: s.cost,
+                // Every output carries its own constant vector.
+                k_constants: expr::count_constants(&s.tree) * n_targets,
+                train_error: multi::mean_error(&train_errors),
+                test_error: multi::mean_error(&test_errors),
+                targets,
+            }
+        })
+        .collect();
+    let finite = rows.iter().any(|r| r.train_error.is_finite());
+    if top > 0 && rows.len() > top {
+        rows.truncate(top);
+    }
+
+    match format {
+        Format::Text => {
+            if !quiet {
+                eprintln!(
+                    "# elapsed: {:.2}s | generations: {} | pareto members: {}{} | targets: {}",
+                    elapsed,
+                    outcome.generations,
+                    outcome.archive.items.len(),
+                    if outcome.converged_early {
+                        " (stopped early)"
+                    } else {
+                        ""
+                    },
+                    target_names.join(",")
+                );
+                eprintln!(
+                    "# multi-output: one shared shape, one fitted constant vector per output; \
+                     train_err/test_err are the mean over {} target(s)",
+                    n_targets
+                );
+            }
+            for r in &rows {
+                println!(
+                    "{:>3}  complexity={:<3} combined_train_err={:<13} combined_test_err={:<13}",
+                    r.rank,
+                    r.complexity,
+                    fmt_err(r.train_error),
+                    fmt_err(r.test_error)
+                );
+                for t in &r.targets {
+                    println!(
+                        "     {} = {}  (train_err={} test_err={})",
+                        t.name,
+                        t.expression,
+                        fmt_err(t.train_error),
+                        fmt_err(t.test_error)
+                    );
+                }
+                // Constant uncertainties are per output, like the expressions.
+                for t in &r.targets {
+                    if let Some(ce) = &t.constant_errors {
+                        let parts: Vec<String> = ce
+                            .values
+                            .iter()
+                            .zip(&ce.std_errors)
+                            .zip(&ce.relative)
+                            .map(|((v, se), rel)| {
+                                format!("{:.6}±{:.2e} (rel {:.2e})", v, se, rel)
+                            })
+                            .collect();
+                        eprintln!(
+                            "# constant errors (rank {}, {}): {} | dof={}{}",
+                            r.rank,
+                            t.name,
+                            parts.join(", "),
+                            ce.dof,
+                            if ce.ill_conditioned {
+                                " | ill-conditioned"
+                            } else {
+                                ""
+                            }
+                        );
+                    }
+                }
+            }
+            if let Some(r) = rows.iter().min_by(|a, b| {
+                a.train_error
+                    .partial_cmp(&b.train_error)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                eprintln!("# diagnostics: n={} k={} constants (total across outputs)", prepared.train.len(), r.k_constants);
+            }
+        }
+        Format::Json => {
+            let pareto: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    let targets: Vec<String> = r
+                        .targets
+                        .iter()
+                        .map(|t| {
+                            format!(
+                                "{{\"name\":{},\"expression\":{},\"constants\":[{}],\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}],\"constant_errors\":{}}}",
+                                jstr(&t.name),
+                                jstr(&t.expression),
+                                t.constants.iter().map(|v| jnum(*v)).collect::<Vec<_>>().join(","),
+                                jnum(t.train_error),
+                                jnum(t.test_error),
+                                t.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
+                                constant_errors_json(&t.constant_errors)
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"targets\":[{}]}}",
+                        r.rank,
+                        jnum(r.complexity),
+                        r.k_constants,
+                        jnum(r.train_error),
+                        jnum(r.test_error),
+                        targets.join(",")
+                    )
+                })
+                .collect();
+            println!(
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                jstr(VERSION),
+                cfg.seed,
+                jstr(cfg.metric.name()),
+                jstr(&target_names.join(",")),
+                target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
+                vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                prepared.train.len(),
+                prepared.test.len(),
+                outcome.generations,
+                outcome.converged_early,
+                jnum(elapsed),
+                pareto.join(",")
+            );
+        }
+        Format::Ndjson => {
+            // Refused earlier; kept exhaustive so a future change cannot
+            // silently emit a misleading stream.
+            eprintln!("error: --ndjson is not supported with multiple targets");
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+
+    if let Some(path) = out_path {
+        let mut buf = String::from(
+            "rank\tcomplexity\tcombined_train_error\tcombined_test_error\ttarget\ttrain_error\ttest_error\texpression\n",
+        );
+        for r in &rows {
+            for t in &r.targets {
+                buf.push_str(&format!(
+                    "{}\t{}\t{:.8}\t{:.8}\t{}\t{:.8}\t{:.8}\t{}\n",
+                    r.rank,
+                    r.complexity,
+                    r.train_error,
+                    r.test_error,
+                    t.name,
+                    t.train_error,
+                    t.test_error,
+                    t.expression
+                ));
+            }
+        }
+        if let Err(e) = std::fs::write(&path, buf) {
+            eprintln!("error writing {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
         }
     }
 

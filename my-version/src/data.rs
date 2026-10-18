@@ -46,6 +46,11 @@ pub struct Sample {
     /// finite, non-negative and relative: in the weighted mean
     /// `Σ wᵢ·lossᵢ / Σ wᵢ` only their ratios matter.
     pub w: Vec<f64>,
+    /// Multi-output targets (issue #15). Empty for the historical single-output
+    /// case, where `y` is the only target. When non-empty this holds **one
+    /// column per target**, including the first one; `y` is a copy of
+    /// `ys[0]` so every single-target diagnostic keeps working unchanged.
+    pub ys: Vec<Vec<f64>>,
 }
 
 impl Sample {
@@ -55,6 +60,7 @@ impl Sample {
             x,
             y,
             w: Vec::new(),
+            ys: Vec::new(),
         }
     }
 
@@ -64,7 +70,36 @@ impl Sample {
     /// being finite and non-negative; `prepare_full_weighted_with` validates a
     /// weight column before it gets this far.
     pub fn weighted(x: Vec<Vec<f64>>, y: Vec<f64>, w: Vec<f64>) -> Self {
-        Sample { x, y, w }
+        Sample {
+            x,
+            y,
+            w,
+            ys: Vec::new(),
+        }
+    }
+
+    // ---- multi-output helpers (issue #15) -----------------------------
+    /// True when more than one target column was requested.
+    pub fn is_multi(&self) -> bool {
+        self.ys.len() > 1
+    }
+
+    /// Number of targets: one for the historical single-output sample.
+    pub fn target_count(&self) -> usize {
+        if self.ys.is_empty() {
+            1
+        } else {
+            self.ys.len()
+        }
+    }
+
+    /// Target column `j` (0-based). Target 0 is `y` for a multi sample too.
+    pub fn target(&self, j: usize) -> &[f64] {
+        if self.ys.is_empty() {
+            &self.y
+        } else {
+            &self.ys[j]
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1024,6 +1059,44 @@ fn resolve_columns(t: &Table, vars: &[String], target: &str) -> Result<(Vec<usiz
     Ok((var_idx, tgt_idx))
 }
 
+/// Multi-output variant of [`resolve_columns`] (issue #15): every named target
+/// must be numeric, distinct and none may also be an input.
+fn resolve_columns_multi(
+    t: &Table,
+    vars: &[String],
+    targets: &[&str],
+) -> Result<(Vec<usize>, Vec<usize>), String> {
+    if targets.is_empty() {
+        return Err("no target column was given".to_string());
+    }
+    let mut var_idx = Vec::with_capacity(vars.len());
+    for v in vars {
+        let j = t.index_of(v)?;
+        if !t.numeric[j] {
+            return Err(format!(
+                "column '{}' is not numeric and cannot be used as an input variable",
+                v
+            ));
+        }
+        if targets.iter().any(|t| *t == v.as_str()) {
+            return Err(format!("column '{}' is both a target and an input", v));
+        }
+        var_idx.push(j);
+    }
+    let mut tgt_idx = Vec::with_capacity(targets.len());
+    for target in targets {
+        let j = t.index_of(target)?;
+        if !t.numeric[j] {
+            return Err(format!("target column '{}' is not numeric", target));
+        }
+        if tgt_idx.contains(&j) {
+            return Err(format!("target column '{}' was named more than once", target));
+        }
+        tgt_idx.push(j);
+    }
+    Ok((var_idx, tgt_idx))
+}
+
 /// Resolve and validate the `--weight` column. Returns its index, or `None`
 /// when no weight column was requested.
 fn resolve_weight_column(t: &Table, weight: Option<&str>) -> Result<Option<usize>, String> {
@@ -1128,6 +1201,22 @@ pub fn prepare_full_weighted_with(
     rng: &mut Mt,
     prep: &PrepSpec,
 ) -> Result<Prepared, String> {
+    prepare_full_targets_weighted_with(t, vars, &[target], weight, spec, rng, prep)
+}
+
+/// Multi-target preparation (issue #15). The split, missing-value handling,
+/// outlier bounds, smoothing and input normalisation are computed **once** over
+/// every target, so all outputs stay row-aligned by construction. The single
+/// target wrapper above is the identical code path with a one-element slice.
+pub fn prepare_full_targets_weighted_with(
+    t: &Table,
+    vars: &[String],
+    targets: &[&str],
+    weight: Option<&str>,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+    prep: &PrepSpec,
+) -> Result<Prepared, String> {
     // With an explicit --fill method, a junk token in an otherwise numeric
     // column is treated as a missing value (and then filled or dropped).
     // Without it the column stays non-numeric, exactly as before.
@@ -1137,7 +1226,15 @@ pub fn prepare_full_weighted_with(
         None
     };
     let t = coerced.as_ref().unwrap_or(t);
-    let (var_idx, tgt_idx) = resolve_columns(t, vars, target)?;
+    // Keep the historical single-target resolver (and its error text) exactly;
+    // the multi resolver only runs when there really are several targets.
+    let (var_idx, tgt_idx) = if targets.len() == 1 {
+        let (v, tgt) = resolve_columns(t, vars, targets[0])?;
+        (v, vec![tgt])
+    } else {
+        resolve_columns_multi(t, vars, targets)?
+    };
+    let nt = tgt_idx.len();
     let weight_idx = resolve_weight_column(t, weight)?;
     let nv = var_idx.len();
     if !prep.dtypes.is_empty() && prep.dtypes.len() != nv {
@@ -1226,8 +1323,9 @@ pub fn prepare_full_weighted_with(
     }
 
     let n = filtered.rows.len();
-    // Used columns: every input, then the target.
-    let used_cols: Vec<usize> = var_idx.iter().copied().chain(std::iter::once(tgt_idx)).collect();
+    // Used columns: every input, then every target (one target in the
+    // single-output case; issue #15 keeps all of them row-aligned here).
+    let used_cols: Vec<usize> = var_idx.iter().copied().chain(tgt_idx.iter().copied()).collect();
     let nc = used_cols.len();
     let mut cells: Vec<Vec<f64>> = filtered
         .rows
@@ -1496,7 +1594,11 @@ pub fn prepare_full_weighted_with(
         .iter()
         .map(|r| r[..nv].to_vec())
         .collect();
-    let y_vals: Vec<f64> = cells.iter().map(|r| r[nv]).collect();
+    // One column per target. With a single target this is exactly the old
+    // `y_vals` vector, so the single-output path is bit-for-bit unchanged.
+    let y_vals: Vec<Vec<f64>> = (0..nt)
+        .map(|j| cells.iter().map(|r| r[nv + j]).collect())
+        .collect();
 
     // 5. Centre/scale from the surviving training rows, applied to both sides.
     // The default (mean/std) is the same arithmetic as before issue #2.
@@ -1541,7 +1643,15 @@ pub fn prepare_full_weighted_with(
                     .map(|j| (x_vals[i][j] - means[j]) / stds[j])
                     .collect(),
             );
-            s.y.push(y_vals[i]);
+            // Target 0 lives in `y`; a multi-output sample also keeps every
+            // target (including the first) in `ys` (issue #15).
+            s.y.push(y_vals[0][i]);
+        }
+        if nt > 1 {
+            s.ys = y_vals
+                .iter()
+                .map(|col| idx.iter().map(|&i| col[i]).collect())
+                .collect();
         }
         if let Some(w) = &weights_raw {
             s.w = idx.iter().map(|&i| w[i]).collect();
@@ -1565,6 +1675,14 @@ pub fn prepare_full_weighted_with(
         test.x.extend(f.x.iter().cloned());
         test.y.extend(f.y.iter().copied());
         test.w.extend(f.w.iter().copied());
+        if f.is_multi() {
+            if test.ys.is_empty() {
+                test.ys = vec![Vec::new(); f.ys.len()];
+            }
+            for (dst, src) in test.ys.iter_mut().zip(&f.ys) {
+                dst.extend(src.iter().copied());
+            }
+        }
     }
 
     Ok(Prepared {

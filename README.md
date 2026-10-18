@@ -688,6 +688,9 @@ list and the recorded results.
   smoothing, median/IQR/range scaling and expression row filters (`--filter`) —
   with every statistic computed from the training rows only and a preparation
   report in text, JSON and NDJSON;
+- **multi-output regression** (`--target y1,y2,...`): one shared tree shape,
+  one fitted constant vector per output, combined error = mean per-output
+  error; see [`docs/multi-output.md`](docs/multi-output.md);
 - **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
   overfit index, and per-constant **standard errors** from the Gauss–Newton
   Jacobian that flag constants the data cannot pin down), **null baselines**
@@ -737,6 +740,7 @@ docs/meta-operators.md        structural meta operators and their cache rule
 docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
 docs/building-blocks.md       user-defined reusable sub-formulas (--function)
+docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract

@@ -14,6 +14,7 @@ pub mod gpu;
 pub mod gui;
 pub mod implicit;
 pub mod metrics;
+pub mod multi;
 pub mod pareto;
 pub mod parse;
 pub mod progress_stats;
