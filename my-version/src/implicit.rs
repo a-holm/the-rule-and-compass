@@ -424,6 +424,7 @@ mod tests {
             x,
             y: vec![0.0; 16],
             w: Vec::new(),
+            ys: Vec::new(),
         }
     }
 

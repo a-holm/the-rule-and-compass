@@ -187,6 +187,7 @@ fn standardize_x(s: &Sample) -> Sample {
             .collect(),
         y: s.y.clone(),
         w: s.w.clone(),
+        ys: Vec::new(),
     }
 }
 
@@ -199,7 +200,7 @@ fn easy_sample() -> Sample {
         x.push(vec![a]);
         y.push(2.0 * a + 1.0);
     }
-    Sample { x, y, w: Vec::new() }
+    Sample { x, y, w: Vec::new(), ys: Vec::new() }
 }
 
 /// Noise plus a fast oscillation: no short closed form, and the front keeps
@@ -213,7 +214,7 @@ fn hard_sample() -> Sample {
         x.push(vec![a]);
         y.push((2.0 * a).sin() + 0.4 * (13.0 * a).sin() + noise);
     }
-    Sample { x, y, w: Vec::new() }
+    Sample { x, y, w: Vec::new(), ys: Vec::new() }
 }
 
 fn config(seed: u32, max_complexity: usize) -> Config {

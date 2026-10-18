@@ -19,6 +19,7 @@ fn sample(xs: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
         x: xs,
         y,
         w: Vec::new(),
+        ys: Vec::new(),
     }
 }
 
