@@ -14,7 +14,7 @@
 use rcsr::expr::{self, Op};
 use rcsr::metrics::Metric;
 use rcsr::rng::Mt;
-use rcsr::{data, search};
+use rcsr::{data, diagnostics, search};
 use std::io::Read;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -71,6 +71,15 @@ HISTORY AND DELAYED VARIABLES (lags, for forecasting):
   --gap-break <f>            start a new series when the time step exceeds f x the
                              median step (so lags cannot jump across a gap)
 
+OVERFITTING DIAGNOSTICS (always on):
+  AICc, BIC                   fit vs. number of fitted constants
+  Durbin-Watson               residual autocorrelation in row order (~2 is clean)
+  overfit index               test_error / train_error
+  --null-runs <n>            rerun the identical search on n shuffled targets
+                             (y-randomisation control) and report the null error
+                             distribution and a p-value; inferential, costs n
+                             extra searches
+
 SEARCH:
   --metric absolute|squared|correlation  (default absolute)
   --generations <N>          (default 200)
@@ -114,6 +123,7 @@ fn schema() -> String {
         ("--lags", "int", "0", "delayed copies per input (time-delay embedding)"),
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
+        ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
@@ -184,8 +194,18 @@ fn jnum(v: f64) -> String {
 struct Row {
     rank: usize,
     complexity: usize,
+    /// Fitted constants: the free parameters of the model.
+    k_constants: usize,
     train_error: f64,
     test_error: f64,
+    /// Small-sample-corrected AIC (fit vs. constants), lower is better.
+    aicc: f64,
+    /// Bayesian information criterion, lower is better.
+    bic: f64,
+    /// Durbin–Watson residual autocorrelation, in row order (≈2 is clean).
+    dw: f64,
+    /// test_error / train_error: how much worse the model gets off-sample.
+    overfit: f64,
     /// Per-block test errors (`--folds`); one entry when folds == 1.
     fold_errors: Vec<f64>,
     expression: String,
@@ -224,6 +244,7 @@ fn main() {
     let mut lags = 0usize;
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
+    let mut null_runs = 0usize;
 
     let mut i = 0;
     macro_rules! val {
@@ -262,6 +283,7 @@ fn main() {
             "--lags" => lags = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
+            "--null-runs" => null_runs = val!().parse().unwrap_or(0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
@@ -657,11 +679,39 @@ fn main() {
             } else {
                 fold_errors.iter().sum::<f64>() / fold_errors.len() as f64
             };
+            let pred: Vec<f64> = prepared
+                .train
+                .x
+                .iter()
+                .map(|row| expr::eval(&s.tree, row))
+                .collect();
+            let resid: Vec<f64> = pred
+                .iter()
+                .zip(&prepared.train.y)
+                .map(|(p, t)| p - t)
+                .collect();
+            let rss: f64 = resid.iter().map(|e| e * e).sum();
+            let kconst = expr::count_constants(&s.tree);
+            let (_, aicc, bic) =
+                diagnostics::information_criteria(prepared.train.len(), rss, kconst);
+            let dw = diagnostics::durbin_watson(&resid);
+            let overfit = if s.error > 0.0 {
+                test_error / s.error
+            } else if test_error > 0.0 {
+                f64::INFINITY
+            } else {
+                1.0
+            };
             Row {
                 rank: k + 1,
                 complexity: s.complexity,
+                k_constants: kconst,
                 train_error: s.error,
                 test_error,
+                aicc,
+                bic,
+                dw,
+                overfit,
                 fold_errors,
                 expression: expr::to_string(&den, &vars),
             }
@@ -669,6 +719,46 @@ fn main() {
         .collect();
     if top > 0 && rows.len() > top {
         rows.truncate(top);
+    }
+
+    // Permutation (y-randomisation) control: run the *same* search on a shuffled
+    // target. If it reaches a comparable error, the real fit is what the search
+    // can manufacture from noise, not evidence of a law.
+    let mut null_control: Option<diagnostics::NullControl> = None;
+    if null_runs > 0 {
+        let observed = outcome
+            .archive
+            .items
+            .iter()
+            .map(|s| s.error)
+            .fold(f64::INFINITY, f64::min);
+        let saved_progress = cfg.progress.take();
+        let mut best_null = Vec::with_capacity(null_runs);
+        for r in 0..null_runs {
+            let mut rng = Mt::new(cfg.seed ^ (0x51ED_2701u32.wrapping_mul(r as u32 + 1)));
+            let mut y = prepared.train.y.clone();
+            for j in (1..y.len()).rev() {
+                let t = rng.usize_below(j + 1);
+                y.swap(j, t);
+            }
+            let shuffled = data::Sample {
+                x: prepared.train.x.clone(),
+                y,
+            };
+            let out = search::run(&cfg, &shuffled, &shuffled);
+            let b = out
+                .archive
+                .items
+                .iter()
+                .map(|s| s.error)
+                .fold(f64::INFINITY, f64::min);
+            if !quiet {
+                eprintln!("# null run {}/{}: best train error {:.6}", r + 1, null_runs, b);
+            }
+            best_null.push(b);
+        }
+        cfg.progress = saved_progress;
+        null_control = Some(diagnostics::NullControl::summarise(observed, best_null));
     }
 
     let finite = rows.iter().any(|r| r.train_error.is_finite());
@@ -690,13 +780,44 @@ fn main() {
             }
             for r in &rows {
                 println!(
-                    "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13}  {} = {}",
+                    "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
                     r.rank,
                     r.complexity,
                     fmt_err(r.train_error),
                     fmt_err(r.test_error),
+                    fmt_err(r.aicc),
                     target,
                     r.expression
+                );
+            }
+            if let Some(r) = rows.iter().min_by(|a, b| {
+                a.train_error
+                    .partial_cmp(&b.train_error)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
+                eprintln!(
+                    "# diagnostics: n={} k={} constants | overfit index (test/train)={:.3} | Durbin-Watson={:.3}{}",
+                    prepared.train.len(),
+                    r.k_constants,
+                    r.overfit,
+                    r.dw,
+                    if mode == data::SplitMode::Temporal
+                        || mode == data::SplitMode::TemporalGroup
+                    {
+                        ""
+                    } else {
+                        " (row order is arbitrary here)"
+                    }
+                );
+            }
+            if let Some(c) = &null_control {
+                eprintln!(
+                    "# null control ({} shuffled-target runs): best={:.6} median={:.6} p={:.3} — {}",
+                    c.runs,
+                    c.null_min,
+                    c.null_median,
+                    c.p_value,
+                    c.verdict()
                 );
             }
         }
@@ -726,18 +847,35 @@ fn main() {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}],\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"expression\":{}}}",
                         r.rank,
                         r.complexity,
+                        r.k_constants,
                         jnum(r.train_error),
                         jnum(r.test_error),
+                        jnum(r.aicc),
+                        jnum(r.bic),
+                        jnum(r.dw),
+                        jnum(r.overfit),
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         jstr(&r.expression)
                     )
                 })
                 .collect();
+            let null_json = match &null_control {
+                Some(c) => format!(
+                    "{{\"runs\":{},\"best\":[{}],\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    c.runs,
+                    c.best.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
+                    jnum(c.null_min),
+                    jnum(c.null_median),
+                    jnum(c.p_value),
+                    jstr(c.verdict())
+                ),
+                None => "null".to_string(),
+            };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -749,19 +887,35 @@ fn main() {
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                null_json,
                 pareto.join(",")
             );
         }
         Format::Ndjson => {
             for r in &rows {
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}],\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"expression\":{}}}",
                     r.rank,
                     r.complexity,
+                    r.k_constants,
                     jnum(r.train_error),
                     jnum(r.test_error),
+                    jnum(r.aicc),
+                    jnum(r.bic),
+                    jnum(r.dw),
+                    jnum(r.overfit),
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     jstr(&r.expression)
+                );
+            }
+            if let Some(c) = &null_control {
+                println!(
+                    "{{\"event\":\"null_control\",\"runs\":{},\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    c.runs,
+                    jnum(c.null_min),
+                    jnum(c.null_median),
+                    jnum(c.p_value),
+                    jstr(c.verdict())
                 );
             }
             println!(

@@ -117,7 +117,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--gap-break f]
+     [--gap-break f] [--null-runs N]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
@@ -193,6 +193,36 @@ start of a series never reaches before it. `--gap-break f` cuts a series when
 the time step exceeds `f` times the median step, which stops a lag from jumping
 a hole in the data.
 
+## Is it real, or is it overfitting?
+
+A symbolic search can fit noise, so a small error proves nothing on its own.
+Every solution therefore comes with the checks below, and `--null-runs` adds the
+decisive one:
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
+#  3  complexity=4  train_err=0.0004  test_err=0.0009  aicc=-402.1
+# diagnostics: n=90 k=3 constants | overfit index (test/train)=2.25 | Durbin-Watson=2.01
+# null control (19 shuffled-target runs): best=0.61 median=0.72 p=0.05 — the real fit beats the noise control
+```
+
+| check | question it answers |
+|---|---|
+| `train_error` vs `test_error` | does it survive data it never saw? |
+| `overfit_index` | how much worse does it get off-sample? |
+| `fold_errors` | is the fit stable across blocks of the test set? |
+| `k_constants` | how many free parameters did it really earn? |
+| `aicc`, `bic` | is the extra complexity paid for by the fit? |
+| `durbin_watson` | did anything get left in the residuals? |
+| `null_control` | could the search have produced this from noise? |
+
+The null control shuffles the target, runs the *identical* search, and repeats:
+if shuffled targets fit as well as the real one, the "law" is manufactured. With
+`r` runs the smallest attainable p-value is `1/(r+1)`, so use at least 19.
+
+See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
+formulas, what is still missing, and the literature.
+
 ## Features
 
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
@@ -212,6 +242,9 @@ a hole in the data.
   `temporal-group`, `auto`) with an embargo gap, per-block test errors and
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
   forecast is never scored on data it has already seen;
+- **overfitting diagnostics** on every solution (AICc, BIC, Durbin–Watson,
+  overfit index) and a `--null-runs` permutation control that runs the identical
+  search on shuffled targets;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 
@@ -225,6 +258,7 @@ SPEC.md                       behaviour specification
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
+docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/
   Cargo.toml

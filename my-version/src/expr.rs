@@ -269,6 +269,13 @@ pub fn complexity(n: &Node) -> usize {
     1 + n.kids.iter().map(complexity).sum::<usize>()
 }
 
+/// Number of constant nodes: the free parameters the fitter tunes. Used by the
+/// information criteria in [`crate::diagnostics`].
+pub fn count_constants(n: &Node) -> usize {
+    let me = if n.op == Op::Const { 1 } else { 0 };
+    me + n.kids.iter().map(count_constants).sum::<usize>()
+}
+
 pub fn nth<'a>(n: &'a Node, i: usize) -> Option<&'a Node> {
     if i == 0 {
         return Some(n);

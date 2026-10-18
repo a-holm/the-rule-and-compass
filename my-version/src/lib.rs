@@ -3,6 +3,7 @@
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
 pub mod data;
+pub mod diagnostics;
 pub mod expr;
 pub mod fit;
 #[cfg(feature = "cuda")]
