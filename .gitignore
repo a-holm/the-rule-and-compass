@@ -3,6 +3,9 @@
 my-version/target/
 **/*.rs.bk
 
+# Per-issue worktrees (see docs/issue-workflow.md)
+/worktrees/
+
 # Editor / OS
 .DS_Store
 *.swp
