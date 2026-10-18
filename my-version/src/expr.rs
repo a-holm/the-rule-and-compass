@@ -460,85 +460,178 @@ fn is_val(n: &Node, v: f64) -> bool {
     cval(n).map(|c| (c - v).abs() < 1e-12).unwrap_or(false)
 }
 
-/// Bottom-up constant folding and algebraic identities. [C flags / I algorithm]
+/// Relative comparison against a "nice" value (0, 1). Constants of a fitted
+/// model differ from the ideal by more than machine epsilon whenever the data
+/// is rounded, so multiplicative identity rules need a relative tolerance.
+fn near_val(n: &Node, v: f64, rel: f64) -> bool {
+    cval(n)
+        .map(|c| (c - v).abs() <= rel * (1.0 + v.abs()))
+        .unwrap_or(false)
+}
+
+/// Structural equality (exact shape and constant values).
+pub fn same(a: &Node, b: &Node) -> bool {
+    a.op == b.op
+        && a.val.to_bits() == b.val.to_bits()
+        && a.kids.len() == b.kids.len()
+        && a.kids.iter().zip(&b.kids).all(|(x, y)| same(x, y))
+}
+
+/// FNV-1a structural hash, for de-duplicating equivalent candidates before
+/// they are evaluated.
+pub fn structural_hash(n: &Node) -> u64 {
+    fn mix(h: &mut u64, x: u64) {
+        *h ^= x;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    fn go(n: &Node, h: &mut u64) {
+        mix(h, n.op as u64);
+        mix(h, n.val.to_bits());
+        mix(h, n.kids.len() as u64);
+        for k in &n.kids {
+            go(k, h);
+        }
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    go(n, &mut h);
+    h
+}
+
+/// `k * u`, pulled into canonical form by absorbing any constant factor that
+/// already sits at the top of `u`. Keeps `0.8447*(x)` rather than `x/1.1839`.
+fn mul_const(k: f64, u: Node) -> Node {
+    if k == 0.0 {
+        return constant(0.0);
+    }
+    if (k - 1.0).abs() <= 1e-8 {
+        return u;
+    }
+    if u.op == Op::Const {
+        return constant(k * u.val);
+    }
+    if u.op == Op::Mul && u.kids[0].op == Op::Const {
+        return mul_const(k * u.kids[0].val, u.kids[1].clone());
+    }
+    if u.op == Op::Div && u.kids[1].op == Op::Const {
+        return mul_const(k / u.kids[1].val, u.kids[0].clone());
+    }
+    node(Op::Mul, vec![constant(k), u])
+}
+
+/// `k + u`, the additive counterpart of [`mul_const`].
+fn add_const(k: f64, u: Node) -> Node {
+    if k.abs() <= 1e-12 {
+        return u;
+    }
+    if u.op == Op::Const {
+        return constant(k + u.val);
+    }
+    if u.op == Op::Add && u.kids[0].op == Op::Const {
+        return add_const(k + u.kids[0].val, u.kids[1].clone());
+    }
+    if u.op == Op::Sub && u.kids[1].op == Op::Const {
+        return add_const(k - u.kids[1].val, u.kids[0].clone());
+    }
+    node(Op::Add, vec![constant(k), u])
+}
+
+/// Bottom-up constant folding, algebraic identities, and affine normalisation.
+///
+/// Equivalent expressions evaluate identically, so collapsing them removes work
+/// that buys nothing (see `docs/optimisation.md`, "the kernel of evaluation").
+/// Normalising constant factors also makes the printed equation readable:
+/// `x/1.1839` becomes `0.8447*x`, and `(x/c1)/c2` becomes `1.6894*x`.
 pub fn simplify(n: &Node) -> Node {
     use Op::*;
-    let kids: Vec<Node> = n.kids.iter().map(simplify).collect();
     let m = Node {
         op: n.op,
         val: n.val,
-        kids,
+        kids: n.kids.iter().map(simplify).collect(),
     };
+    if m.op == Const || m.op == Input {
+        return m;
+    }
+    // Fold any operator whose children are all constants.
+    if m.kids.iter().all(|k| k.op == Const) {
+        let v = eval(&m, &[]);
+        if v.is_finite() {
+            return constant(v);
+        }
+    }
     match m.op {
-        Const | Input => m,
         Neg => {
-            if let Some(a) = cval(&m.kids[0]) {
-                constant(-a)
-            } else if m.kids[0].op == Neg {
-                m.kids[0].kids[0].clone()
-            } else {
-                m
+            if m.kids[0].op == Neg && m.kids[0].kids.len() == 1 {
+                return m.kids[0].kids[0].clone();
             }
         }
         Add => {
             if is_val(&m.kids[0], 0.0) {
-                m.kids[1].clone()
-            } else if is_val(&m.kids[1], 0.0) {
-                m.kids[0].clone()
-            } else if let (Some(a), Some(b)) = (cval(&m.kids[0]), cval(&m.kids[1])) {
-                constant(a + b)
-            } else {
-                m
+                return m.kids[1].clone();
+            }
+            if is_val(&m.kids[1], 0.0) {
+                return m.kids[0].clone();
+            }
+            if m.kids[0].op == Const {
+                return add_const(m.kids[0].val, m.kids[1].clone());
+            }
+            if m.kids[1].op == Const {
+                return add_const(m.kids[1].val, m.kids[0].clone());
             }
         }
         Sub => {
             if is_val(&m.kids[1], 0.0) {
-                m.kids[0].clone()
-            } else if let (Some(a), Some(b)) = (cval(&m.kids[0]), cval(&m.kids[1])) {
-                constant(a - b)
-            } else {
-                m
+                return m.kids[0].clone();
+            }
+            if same(&m.kids[0], &m.kids[1]) {
+                return constant(0.0);
+            }
+            if m.kids[1].op == Const {
+                return add_const(-m.kids[1].val, m.kids[0].clone());
             }
         }
         Mul => {
             if is_val(&m.kids[0], 0.0) || is_val(&m.kids[1], 0.0) {
-                constant(0.0)
-            } else if is_val(&m.kids[0], 1.0) {
-                m.kids[1].clone()
-            } else if is_val(&m.kids[1], 1.0) {
-                m.kids[0].clone()
-            } else if let (Some(a), Some(b)) = (cval(&m.kids[0]), cval(&m.kids[1])) {
-                constant(a * b)
-            } else {
-                m
+                return constant(0.0);
+            }
+            if m.kids[0].op == Const {
+                return mul_const(m.kids[0].val, m.kids[1].clone());
+            }
+            if m.kids[1].op == Const {
+                return mul_const(m.kids[1].val, m.kids[0].clone());
             }
         }
         Div => {
-            if is_val(&m.kids[1], 1.0) {
-                m.kids[0].clone()
-            } else if let (Some(a), Some(b)) = (cval(&m.kids[0]), cval(&m.kids[1])) {
-                if b.abs() > 1e-12 {
-                    constant(a / b)
-                } else {
-                    m
-                }
-            } else {
-                m
+            if near_val(&m.kids[1], 1.0, 1e-12) {
+                return m.kids[0].clone();
+            }
+            if same(&m.kids[0], &m.kids[1]) && m.kids[0].op != Const {
+                return constant(1.0);
+            }
+            if m.kids[1].op == Const {
+                return mul_const(1.0 / m.kids[1].val, m.kids[0].clone());
             }
         }
         Pow => {
             if is_val(&m.kids[1], 1.0) {
-                m.kids[0].clone()
-            } else if is_val(&m.kids[1], 0.0) {
-                constant(1.0)
-            } else if let (Some(a), Some(b)) = (cval(&m.kids[0]), cval(&m.kids[1])) {
-                constant(a.powf(b))
-            } else {
-                m
+                return m.kids[0].clone();
+            }
+            if is_val(&m.kids[1], 0.0) {
+                return constant(1.0);
             }
         }
-        _ => m,
+        If => {
+            // A constant condition makes one branch dead code.
+            if m.kids[0].op == Const {
+                return if m.kids[0].val > 0.0 {
+                    m.kids[1].clone()
+                } else {
+                    m.kids[2].clone()
+                };
+            }
+        }
+        _ => {}
     }
+    m
 }
 
 /// Rewrite `Input(i)` from normalised space back to original units:
