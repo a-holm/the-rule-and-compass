@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod complexity;
 pub mod data;
 pub mod diagnostics;
+pub mod eval_soa;
 pub mod expr;
 pub mod fit;
 #[cfg(feature = "cuda")]
