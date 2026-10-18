@@ -18,6 +18,7 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
+use rcsr::units::{Unit, Units};
 use rcsr::{data, diagnostics, multi, search, stability};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -54,6 +55,32 @@ impl ReportKind {
             _ => None,
         }
     }
+}
+
+/// Parse one `--units` value: `name=unit[,name=unit...]` (issue #25).
+///
+/// The unit expression is parsed immediately; names are resolved against the
+/// prepared input list once `--vars`, `--dtype` and `--lags` are known.
+fn parse_unit_assignments(src: &str) -> Result<Vec<(String, Unit)>, String> {
+    let mut out = Vec::new();
+    for item in src.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let (name, expr) = item
+            .split_once('=')
+            .ok_or_else(|| format!("expected name=unit, got '{}'", item))?;
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("missing name in '{}'", item));
+        }
+        out.push((name.to_string(), Unit::parse(expr.trim())?));
+    }
+    if out.is_empty() {
+        return Err("no units given".to_string());
+    }
+    Ok(out)
 }
 
 fn usage() -> String {
@@ -154,6 +181,8 @@ OVERFITTING DIAGNOSTICS (always on):
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
                               (J^T J); flags constants the data cannot pin down
+  constant dimensions         with --units, the apparent dimension each fitted
+                              constant needs (a value:dimension plausibility check)
   --cv <mode>                cross-validation: rerun the search on k folds and
                              report the mean and spread of the held-out errors.
                              k-fold  shuffled partition (i.i.d. data)
@@ -241,6 +270,18 @@ SEARCH:
                              count (training-column statistics; min(x1) and
                              max(x1) with one argument also work)
                              (full set: `rcsr schema` -> operators list)
+  --units <name=dim,..>      declare dimensions of inputs and the target, e.g.
+                             \"x=m,t=s,y=m/s\"; m,s,kg,A,K,mol,cd are SI names,
+                             any other identifier is its own base dimension
+                             (price=USD). Model dimensions, not unit symbols
+                             (volume=m^3, not litre). *, /, ^integer, (...);
+                             repeatable; an undeclared name is dimensionless.
+                             Alone it reports constant dimensions and never
+                             rejects a candidate
+  --require-dimensions       reject a candidate whose dimensions cannot be made
+                             consistent with the target's (infinite error);
+                             requires --units (usage error without it). Without
+                             this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -410,6 +451,13 @@ struct Row {
     /// Standard errors of the fitted constants (issue #22); `None` when they
     /// are not defined (no constants, or no residual degrees of freedom).
     constant_errors: Option<fit::ConstantErrors>,
+    /// #25: constant values and their apparent dimensions, in tree order.
+    /// Empty when `--units` is not active; `None` means undetermined.
+    constant_values: Vec<f64>,
+    constant_units: Vec<Option<Unit>>,
+    /// #25: `None` when units are inactive. `Some(false)` means the archived
+    /// candidate would be rejected if `--require-dimensions` were on.
+    dimensionally_consistent: Option<bool>,
     /// Structural form of the (normalised) tree, with constants collapsed; the
     /// key stability selection counts.
     shape: String,
@@ -538,6 +586,10 @@ fn main() {
     let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
+    // #25: `--units` is resolved against the prepared input list later; the
+    // expressions themselves are parsed here so a typo is a usage error.
+    let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
+    let mut require_dimensions = false;
     let mut op_complexity_spec: Option<String> = None;
     let mut complexity_weights_spec: Option<String> = None;
     let mut depth_weight_spec: Option<f64> = None;
@@ -763,6 +815,16 @@ fn main() {
                     }
                 }
             }
+            "--units" => {
+                match parse_unit_assignments(&val!()) {
+                    Ok(mut entries) => unit_assignments.append(&mut entries),
+                    Err(e) => {
+                        eprintln!("error: --units: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--require-dimensions" => require_dimensions = true,
             "--patience" => {
                 cfg.patience = val!().parse().unwrap_or(cfg.patience);
                 patience_set = true;
@@ -858,6 +920,11 @@ fn main() {
     }
     if report.is_some() && eval_expr.is_some() {
         eprintln!("error: --report cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+    // #25: the filter needs a declaration, unless a checkpoint saved one.
+    if require_dimensions && unit_assignments.is_empty() && resume_path.is_none() {
+        eprintln!("error: --require-dimensions needs --units");
         std::process::exit(EXIT_USAGE);
     }
     if save_every_set && save_path.is_none() {
@@ -1611,6 +1678,67 @@ fn main() {
             );
         }
     }
+    // #25: resolve --units names against the prepared input list. A lagged
+    // copy (`x_lag1`) inherits the unit declared for its source (`x`); every
+    // other undeclared name, including the target, is dimensionless.
+    if !unit_assignments.is_empty() {
+        for (i, (name, _)) in unit_assignments.iter().enumerate() {
+            if unit_assignments[..i].iter().any(|(n, _)| n == name) {
+                eprintln!("error: --units declares '{}' more than once", name);
+                std::process::exit(EXIT_USAGE);
+            }
+            let is_target = name == &target;
+            let is_input = vars.iter().any(|v| v == name);
+            let is_lag_source = vars.iter().any(|v| {
+                v.rsplit_once("_lag")
+                    .map(|(base, n)| base == name && n.parse::<usize>().is_ok())
+                    .unwrap_or(false)
+            });
+            if !is_target && !is_input && !is_lag_source {
+                eprintln!(
+                    "error: --units names '{}', which is neither the target nor an input \
+                     (inputs: {})",
+                    name,
+                    vars.join(", ")
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        let declared = |name: &str| {
+            unit_assignments
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, u)| u.clone())
+        };
+        let target_unit = declared(&target).unwrap_or(Unit::DIMENSIONLESS);
+        let mut var_units = Vec::with_capacity(vars.len());
+        for v in &vars {
+            let unit = declared(v).or_else(|| {
+                v.rsplit_once("_lag")
+                    .filter(|(_, n)| n.parse::<usize>().is_ok())
+                    .and_then(|(base, _)| declared(base))
+            });
+            var_units.push(unit.unwrap_or(Unit::DIMENSIONLESS));
+        }
+        cfg.units = Some(Units::new(var_units, target_unit.clone()));
+        notes.push(format!(
+            "units: target '{}' is {}{}",
+            target,
+            target_unit,
+            if require_dimensions || cfg.require_dimensions {
+                " — dimensional filter on"
+            } else {
+                " — not filtering; pass --require-dimensions to reject mismatches"
+            }
+        ));
+    }
+    if require_dimensions {
+        cfg.require_dimensions = true;
+    }
+    if cfg.require_dimensions && cfg.units.is_none() {
+        eprintln!("error: --require-dimensions needs --units (or a checkpoint that saved them)");
+        std::process::exit(EXIT_USAGE);
+    }
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.
@@ -1626,9 +1754,30 @@ fn main() {
     // population. A syntax error is a usage error and keeps the parser's
     // 1-based column.
     let mut seeds: Vec<expr::Node> = Vec::new();
+    // Layer 3 only: check the seed in original units, before normalisation
+    // inserts constants that could otherwise absorb a mismatch.
+    let seed_dimensions_ok = |tree: &expr::Node| -> bool {
+        match (&cfg.units, cfg.require_dimensions) {
+            (Some(units), true) => units.accepts(tree),
+            _ => true,
+        }
+    };
     for src in &seed_exprs {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: --seed-expr '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        src
+                    );
+                    // Keep it so the search records the infinite error; it can
+                    // never enter the archive.
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: --seed-expr '{}': {}", src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1637,7 +1786,18 @@ fn main() {
     }
     for (origin, src) in &seed_lines {
         match expr::parse(src, &vars) {
-            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Ok(tree) => {
+                if !seed_dimensions_ok(&tree) {
+                    eprintln!(
+                        "# seed rejected: {}: '{}' is not dimensionally consistent \
+                         with the declared target (--require-dimensions)",
+                        origin, src
+                    );
+                    seeds.push(tree);
+                    continue;
+                }
+                seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds));
+            }
             Err(e) => {
                 eprintln!("error: {}: '{}': {}", origin, src, e);
                 std::process::exit(EXIT_USAGE);
@@ -1966,6 +2126,18 @@ fn main() {
                 .collect();
             let rss: f64 = resid.iter().map(|e| e * e).sum();
             let kconst = expr::count_constants(&s.tree);
+            // #25: dimensions of the fitted constants in the search tree. This
+            // is the same tree `constant_errors` uses, so values and units
+            // line up; the printed law is the denormalised form of it.
+            let (constant_values, constant_units) = match &cfg.units {
+                Some(units) => (
+                    rcsr::units::constant_values(&s.tree),
+                    rcsr::units::constant_dimensions(&s.tree, &units.vars, &units.target),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            let dimensionally_consistent =
+                cfg.units.as_ref().map(|units| units.accepts(&s.tree));
             let (_, aicc, bic) =
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
@@ -2019,6 +2191,9 @@ fn main() {
                         &prepared.train.w,
                     )
                 },
+                constant_values,
+                constant_units,
+                dimensionally_consistent,
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
@@ -2322,6 +2497,32 @@ fn main() {
                     );
                 }
             }
+            // #25: a cheap plausibility check for the constants in the law.
+            for r in &rows {
+                if !r.constant_units.is_empty() {
+                    eprintln!(
+                        "# constant dimensions (rank {}): {} (value:dimension, tree order)",
+                        r.rank,
+                        constant_units_text(&r.constant_values, &r.constant_units)
+                    );
+                }
+            }
+            // Layer 2: units alone never filter, but say how many archived
+            // solutions the Layer 3 flag would reject.
+            if cfg.units.is_some() && !cfg.require_dimensions {
+                let inconsistent = rows
+                    .iter()
+                    .filter(|r| r.dimensionally_consistent == Some(false))
+                    .count();
+                if inconsistent > 0 {
+                    eprintln!(
+                        "# dimensional note: {} of {} archived solution(s) would be rejected by \
+                         --require-dimensions (units are not filtering)",
+                        inconsistent,
+                        rows.len()
+                    );
+                }
+            }
             eprintln!(
                 "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
                 cfg.metric.name(),
@@ -2448,8 +2649,17 @@ fn main() {
             let pareto: Vec<String> = rows
                 .iter()
                 .map(|r| {
+                    // Layer 1: no `--units` means no new output field at all.
+                    let dimensions = if cfg.units.is_some() {
+                        format!(
+                            ",\"constant_dimensions\":{}",
+                            constant_units_json(&r.constant_values, &r.constant_units)
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -2462,6 +2672,7 @@ fn main() {
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
                         constant_errors_json(&r.constant_errors),
+                        dimensions,
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
                     )
@@ -2629,8 +2840,17 @@ fn main() {
                 );
             }
             for r in &rows {
+                // Layer 1: no `--units` means no new output field at all.
+                let dimensions = if cfg.units.is_some() {
+                    format!(
+                        ",\"constant_dimensions\":{}",
+                        constant_units_json(&r.constant_values, &r.constant_units)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -2643,6 +2863,7 @@ fn main() {
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
                     constant_errors_json(&r.constant_errors),
+                    dimensions,
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
                 );
@@ -3448,6 +3669,16 @@ fn summary_markdown(
                     );
                 }
             }
+            // #25: the units are inferred from the printed law, not from the
+            // fitted values, so they are a plausibility check rather than an
+            // uncertainty estimate.
+            if !r.constant_units.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "Apparent constant dimensions (value:dimension, tree order): {}.\n",
+                    constant_units_text(&r.constant_values, &r.constant_units)
+                );
+            }
         }
         None => {
             let _ = writeln!(
@@ -4244,6 +4475,47 @@ fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
         ),
         None => "null".to_string(),
     }
+}
+
+/// #25: `value:dimension` pairs in tree order, with `?` for undetermined.
+fn constant_units_text(values: &[f64], units: &[Option<Unit>]) -> String {
+    units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| format!("{}", v))
+                .unwrap_or_else(|| "?".to_string());
+            let dimension = u
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}:{}", value, dimension)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// #25: JSON array of `{value, dimension}` objects in tree order. An empty
+/// array means `--units` was not active; `null` dimensions are undetermined.
+fn constant_units_json(values: &[f64], units: &[Option<Unit>]) -> String {
+    let items: Vec<String> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| jnum(*v))
+                .unwrap_or_else(|| "null".to_string());
+            let dimension = match u {
+                Some(u) => jstr(&u.to_string()),
+                None => "null".to_string(),
+            };
+            format!("{{\"value\":{},\"dimension\":{}}}", value, dimension)
+        })
+        .collect();
+    format!("[{}]", items.join(","))
 }
 
 /// JSON for one solution's fitted-constant standard errors, or `null` when

@@ -184,6 +184,24 @@ Pareto front is ranked on, what `--max-complexity` limits, and what every row
 reports; the defaults reproduce the node count exactly. See
 [`docs/complexity.md`](docs/complexity.md) for the formula and worked examples.
 
+## Dimensional constraints
+
+`--units 'x=m,t=s,y=m/s'` declares the dimensions of the inputs and the target;
+`--require-dimensions` then rejects every candidate whose dimensions cannot be
+reconciled with the target's with an infinite error. The algebra knows the SI
+names `m`, `s`, `kg`, `A`, `K`, `mol` and `cd`, and **any other identifier is
+its own base dimension**, so `price=USD,volume=shares` catches `price + volume`.
+It models dimensions only, not unit identity or scale: declare `volume=m^3`, not
+`litre`. Fitted constants are allowed to carry dimensions (a coefficient absorbs
+a unit ratio, an intercept absorbs the target's), and each solution reports their
+apparent dimensions as a plausibility check. Undeclared names are dimensionless
+and column names are never inspected. Units are strictly optional in three
+layers: no `--units` changes nothing and adds no output fields; `--units` alone
+only reports and never rejects; `--require-dimensions` turns the hard filter on
+and is a usage error without `--units`. See
+[`docs/units.md`](docs/units.md) for the operator table, the radian/degree and
+dB/pH caveats, a worked example and the limitations of a hard filter.
+
 ## Meta operators
 
 `complexity(e)`, `variables(e)`, `constants(e)`, `contains(e)` and
@@ -312,6 +330,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
+     [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]

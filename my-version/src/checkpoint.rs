@@ -45,6 +45,9 @@ use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use crate::search::Config;
+// #25: units are part of the saved search settings, so a resumed run keeps the
+// same dimensional filter.
+use crate::units::{Unit, Units};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -848,21 +851,22 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "patience",
         "predictor_samples",
     ];
+    // #25: optional so a checkpoint written before units existed still loads,
+    // and so a units-free run writes exactly the old checkpoint bytes.
+    const OPTIONAL_KEYS: &[&str] = &["units", "units.target", "require_dimensions"];
     for key in KEYS {
         required(fields, key)?;
     }
-    if fields.len() != KEYS.len() {
-        let extras: Vec<&str> = fields
-            .keys()
-            .map(|s| s.as_str())
-            .filter(|k| !KEYS.contains(k))
-            .collect();
-        if !extras.is_empty() {
-            return Err(format!(
-                "checkpoint has unknown config field(s): {}",
-                extras.join(", ")
-            ));
-        }
+    let extras: Vec<&str> = fields
+        .keys()
+        .map(|s| s.as_str())
+        .filter(|k| !KEYS.contains(k) && !OPTIONAL_KEYS.contains(k))
+        .collect();
+    if !extras.is_empty() {
+        return Err(format!(
+            "checkpoint has unknown config field(s): {}",
+            extras.join(", ")
+        ));
     }
 
     let num_usize = |key: &str| -> Result<usize, String> {
@@ -965,6 +969,46 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         ));
     }
 
+    // #25: optional fields. Missing means "no units, no filter", which is
+    // bit-identical to a checkpoint written before this feature existed.
+    if fields.contains_key("units.target") && !fields.contains_key("units") {
+        return Err(
+            "checkpoint has 'units.target' without 'units'; both or neither are expected"
+                .to_string(),
+        );
+    }
+    let units = match fields.get("units").map(|s| s.as_str()) {
+        None | Some("none") => None,
+        Some(raw) => {
+            let vars = Units::decode_vars(raw)
+                .map_err(|e| format!("bad config value for 'units': {}", e))?;
+            let target = Unit::parse(
+                fields
+                    .get("units.target")
+                    .ok_or_else(|| "checkpoint has 'units' without 'units.target'".to_string())?,
+            )
+            .map_err(|e| format!("bad config value for 'units.target': {}", e))?;
+            Some(Units::new(vars, target))
+        }
+    };
+    let require_dimensions = match fields.get("require_dimensions").map(|s| s.as_str()) {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(format!(
+                "config 'require_dimensions' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
+    if require_dimensions && units.is_none() {
+        return Err(
+            "config 'require_dimensions' is true but 'units' is none; \
+             the filter needs declared units"
+                .to_string(),
+        );
+    }
+
     Ok(Config {
         generations: num_usize("generations")?,
         islands: num_usize("islands")?,
@@ -982,6 +1026,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         time_budget,
         patience: num_usize("patience")?,
         predictor_samples,
+        units,
+        require_dimensions,
         progress: None,
     })
 }
@@ -1041,6 +1087,13 @@ fn write_config(cfg: &Config, out: &mut String) {
         }
     )
     .unwrap();
+    // #25: only write these when units are active, so a units-free checkpoint
+    // is byte-identical to one written before this feature existed.
+    if let Some(u) = &cfg.units {
+        writeln!(out, "config units {}", u.encode_vars()).unwrap();
+        writeln!(out, "config units.target {}", u.target).unwrap();
+        writeln!(out, "config require_dimensions {}", cfg.require_dimensions).unwrap();
+    }
 }
 
 #[cfg(test)]
