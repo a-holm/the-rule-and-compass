@@ -99,9 +99,11 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
 - **Selection** is by tournament within an island.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
-    constant/input perturb, 40 % subtree grow/shrink) and the site is chosen
-    among nodes that the edit can actually change, so a mutation never returns
-    the parent unchanged;
+    constant/input perturb, 25 % subtree grow/shrink, 15 % wrap) and the site
+    is chosen among nodes that the edit can actually change, so a mutation
+    never returns the parent unchanged. A **wrap** inserts a unary operator
+    above the chosen subtree, keeping it (and its fitted constants) intact —
+    `x1² + x2²` becomes `√(x1² + x2²)` in one edit;
   - *crossover* — swap subtrees between two parents.
 - **Constant fitting** tunes the numeric constants of a candidate by local
   search. Without it, `y = a·sin(b·x) + c` would almost never be found, because

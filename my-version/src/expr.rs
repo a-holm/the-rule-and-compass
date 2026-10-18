@@ -1495,11 +1495,22 @@ fn perturb_changed(rng: &mut Mt, v: f64) -> f64 {
     }
 }
 
+/// Share of mutations that insert a unary operator above an existing subtree.
+///
+/// Standard GP variation gives node insertion (wrap) roughly 10-15 %; the top
+/// of that band, 15 %, is taken out of the subtree-replacement band
+/// (40 % -> 25 %) so the total variation budget and the number of RNG draws
+/// stay unchanged, and fewer edits discard a shape that wrap could have reused.
+/// Kept as a constant rather than a `Config` field: the operator mix is part of
+/// the algorithm, not a setting.
+const WRAP_PROBABILITY: f64 = 0.15;
+
 #[derive(Clone, Copy)]
 enum EditKind {
     Point,
     Terminal,
     Subtree,
+    Wrap,
 }
 
 /// Whether a point change can actually change this node: it must be an
@@ -1518,6 +1529,42 @@ fn terminal_changeable(t: &Node, nvars: usize) -> bool {
     t.op == Op::Const || (t.op == Op::Input && nvars > 1)
 }
 
+/// Unary operators in `ops` that can wrap `t`.
+///
+/// The wrapper must take exactly one argument. Aggregates are excluded: their
+/// single child is a bare input column, so `mean(t)` over an arbitrary subtree
+/// would be repaired by [`refresh_aggregates`] and lose the subtree. `neg` is
+/// excluded above another `neg` because [`simplify`] folds the pair straight
+/// back to `t`, which would waste the edit; every other unary wrapper is
+/// allowed, including the merely redundant `abs(abs(t))`.
+fn wrap_candidates(t: &Node, ops: &[Op]) -> Vec<Op> {
+    ops.iter()
+        .copied()
+        .filter(|o| block_arity_of(*o) == 1 && !o.is_agg())
+        .filter(|o| !(*o == Op::Neg && t.op == Op::Neg))
+        .collect()
+}
+
+/// Whether a wrap edit can change this node at all.
+fn wrap_changeable(t: &Node, ops: &[Op]) -> bool {
+    ops.iter().any(|&o| {
+        block_arity_of(o) == 1 && !o.is_agg() && !(o == Op::Neg && t.op == Op::Neg)
+    })
+}
+
+/// Insert a unary operator above `t`, keeping the old subtree (and any fitted
+/// constants in it) intact. [`wrap_changeable`] guarantees a candidate exists.
+fn wrap_node(t: &mut Node, rng: &mut Mt, ops: &[Op]) {
+    let cands = wrap_candidates(t, ops);
+    debug_assert!(!cands.is_empty(), "wrap site without a unary operator");
+    if cands.is_empty() {
+        return;
+    }
+    let op = cands[rng.usize_below(cands.len())];
+    let old = std::mem::replace(t, constant(0.0));
+    *t = node(op, vec![old]);
+}
+
 /// Pre-order positions of the nodes `kind` can edit, in one pass. `mutate_with`
 /// therefore still costs O(nodes), like [`nth_mut`].
 fn mutation_sites(n: &Node, kind: EditKind, nvars: usize, ops: &[Op]) -> Vec<usize> {
@@ -1533,6 +1580,7 @@ fn mutation_sites(n: &Node, kind: EditKind, nvars: usize, ops: &[Op]) -> Vec<usi
             EditKind::Point => point_changeable(n, nvars, ops),
             EditKind::Terminal => terminal_changeable(n, nvars),
             EditKind::Subtree => true,
+            EditKind::Wrap => wrap_changeable(n, ops),
         };
         if editable {
             out.push(*i);
@@ -1640,8 +1688,8 @@ fn replace_subtree(
     *t = different_leaf(t);
 }
 
-/// In-place mutation: point-change an operator, perturb a constant, or replace a
-/// subtree (grow / shrink). [I]
+/// In-place mutation: point-change an operator, perturb a constant, replace a
+/// subtree (grow / shrink), or wrap a subtree in a unary operator. [I]
 pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
     mutate_with(n, rng, nvars, ops, None)
 }
@@ -1650,11 +1698,13 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
 /// [`Op::Agg`] (or an input column changed under one) gets the right cached
 /// value immediately.
 ///
-/// The edit kind is drawn first — point change (25 %), terminal perturb (35 %)
-/// or subtree replacement (40 %) — and only nodes that kind can actually edit
-/// are candidate sites, so a mutation never returns the parent unchanged. If a
-/// kind has no compatible site, a fixed fallback order is used; subtree
-/// replacement covers every non-empty tree.
+/// The edit kind is drawn first — point change (25 %), terminal perturb (35 %),
+/// subtree replacement (25 %) or wrap (15 %, [`WRAP_PROBABILITY`]) — and only
+/// nodes that kind can actually edit are candidate sites, so a mutation never
+/// returns the parent unchanged. If a kind has no compatible site, a fixed
+/// fallback order is used; subtree replacement covers every non-empty tree.
+/// Wrap falls back to a point change first, as required when `ops` has no
+/// unary operator (or the only site is `neg` under `neg`).
 pub fn mutate_with(
     n: &mut Node,
     rng: &mut Mt,
@@ -1670,15 +1720,23 @@ pub fn mutate_with(
     let r = rng.next_f64();
     let drawn = if r < 0.25 {
         EditKind::Point
-    } else if r < 0.6 {
+    } else if r < 0.60 {
         EditKind::Terminal
-    } else {
+    } else if r < 1.0 - WRAP_PROBABILITY {
         EditKind::Subtree
+    } else {
+        EditKind::Wrap
     };
     let order: &[EditKind] = match drawn {
         EditKind::Point => &[EditKind::Point, EditKind::Subtree],
         EditKind::Terminal => &[EditKind::Terminal, EditKind::Point, EditKind::Subtree],
         EditKind::Subtree => &[EditKind::Subtree, EditKind::Point, EditKind::Terminal],
+        EditKind::Wrap => &[
+            EditKind::Wrap,
+            EditKind::Point,
+            EditKind::Subtree,
+            EditKind::Terminal,
+        ],
     };
     for &kind in order {
         let sites = mutation_sites(n, kind, nvars, ops);
@@ -1691,6 +1749,7 @@ pub fn mutate_with(
                 EditKind::Point => change_operator(t, rng, nvars, ops, aggs),
                 EditKind::Terminal => change_terminal(t, rng, nvars),
                 EditKind::Subtree => replace_subtree(t, rng, nvars, ops, aggs),
+                EditKind::Wrap => wrap_node(t, rng, ops),
             }
         }
         // A structural edit anywhere below a meta node invalidates its cache.
@@ -2393,5 +2452,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The wrap move keeps the inner subtree (and its constants) and adds
+    /// exactly one unary node. `sqrt` of the two-term sum is the shape
+    /// `pythagoras` needs.
+    #[test]
+    fn wrap_preserves_inner_semantics() {
+        let old = node(
+            Op::Add,
+            vec![
+                node(Op::Square, vec![input(0)]),
+                node(Op::Square, vec![input(1)]),
+            ],
+        );
+        let mut wrapped = old.clone();
+        let mut rng = crate::rng::Mt::new(75);
+        wrap_node(&mut wrapped, &mut rng, &[Op::Sqrt]);
+
+        assert_eq!(wrapped.op, Op::Sqrt);
+        assert_eq!(wrapped.kids.len(), 1);
+        assert_eq!(wrapped.kids[0], old, "the inner subtree must be intact");
+        assert_eq!(complexity(&wrapped), complexity(&old) + 1);
+
+        // 40 rows over the benchmark's input range: wrapping is exactly
+        // `sqrt` of the old value at every row.
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for row in 0..40 {
+            let a = -3.0 + 6.0 * (row as f64) / 39.0;
+            let b = 3.0 - 6.0 * ((row * 7 % 40) as f64) / 39.0;
+            let v = eval(&old, &[a, b]);
+            assert_eq!(eval(&wrapped, &[a, b]), v.sqrt());
+            x.push(vec![a, b]);
+            y.push(v.sqrt());
+        }
+        // Simplification keeps the wrapper and does not fold it away.
+        let simple = simplify(&wrapped);
+        assert_eq!(simple.op, Op::Sqrt);
+        assert_eq!(simple.kids.len(), 1);
+
+        // There are no constants to fit; the fit leaves the error at zero.
+        let err = crate::fit::fit(&mut wrapped, &x, &y, 8);
+        assert!(err < 1e-20, "fit error {err}");
+    }
+
+    /// The wrap band is reachable through the public entry point. A bare input
+    /// is the only site, so a wrap lands at the root; with `sqrt` as the only
+    /// operator, the result is `sqrt(input)` over the untouched original.
+    #[test]
+    fn wrap_is_reachable() {
+        let original = input(0);
+        let mut wraps = 0;
+        for seed in 0..64u32 {
+            let mut tree = original.clone();
+            let mut rng = crate::rng::Mt::new(seed.wrapping_mul(0x9E37_79B9) ^ 75);
+            mutate_with(&mut tree, &mut rng, 2, &[Op::Sqrt], None);
+            if tree.op == Op::Sqrt && tree.kids.len() == 1 && tree.kids[0] == original {
+                wraps += 1;
+            }
+        }
+        assert!(wraps >= 4, "wrap reached the root only {wraps}/64 times");
+    }
+
+    /// A wrapper that simplification would undo is not offered. `neg(neg(t))`
+    /// folds back to `t`, so a `neg` site is never wrapped in another `neg`.
+    #[test]
+    fn wrap_skips_no_op_wrappers() {
+        let neg = node(Op::Neg, vec![input(0)]);
+        assert!(!wrap_changeable(&neg, &[Op::Neg]));
+        assert!(wrap_changeable(&neg, &[Op::Sqrt]));
+        assert!(wrap_changeable(&input(0), &[Op::Neg]));
+
+        // With no legal wrap (the only operator is the same `neg`), the draw
+        // falls back to another kind and still changes the tree.
+        let mut tree = neg.clone();
+        let mut rng = crate::rng::Mt::new(1);
+        mutate_with(&mut tree, &mut rng, 2, &[Op::Neg], None);
+        assert_ne!(structural_hash(&tree), structural_hash(&neg));
     }
 }

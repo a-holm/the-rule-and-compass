@@ -251,7 +251,9 @@ Ordered by expected gain per unit effort **[planned]**:
    column), which is the practical, incremental version of "quotient by the
    kernel".
 5. **Semantic backpropagation mutation** (replace a sub-tree with the library
-   member whose semantics is closest to the desired one).
+   member whose semantics is closest to the desired one). Plain node
+   insertion — wrapping a subtree in a unary operator — is already implemented
+   as the fourth mutation kind (issue #75); this item is the semantic version.
 6. **Warm starts**: persist the front and restart from it.
 
 ### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
