@@ -2,9 +2,10 @@
 //!
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
-pub mod rng;
+pub mod data;
 pub mod expr;
+pub mod fit;
 pub mod metrics;
 pub mod pareto;
-pub mod data;
+pub mod rng;
 pub mod search;

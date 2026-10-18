@@ -2,6 +2,7 @@
 //!
 //! A deterministic RNG so that runs are exactly reproducible from a seed.
 
+#[derive(Clone)]
 pub struct Mt {
     mt: [u32; 624],
     idx: usize,
