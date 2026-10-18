@@ -59,6 +59,28 @@ cargo run --release -- --data examples/sine.csv --target y --vars x \
   --generations 300 --islands 4 --pop 300 --metric squared
 ```
 
+### Score a formula without searching
+
+`--eval-expr` parses a formula, scores it on the split and exits — no search. It
+is the inverse of the printed output, so a printed right-hand side can be pasted
+straight back in to re-check it:
+
+```sh
+# original units: variables by name, *, ^, sin(...), if(...), ...
+cargo run --release -- --data examples/line.csv --target y --vars x \
+  --eval-expr "2*x + 1"
+#   1  complexity=5   k_constants=2   train_err=0.000000      test_err=0.000000      y = ((2 * x) + 1)
+```
+
+A syntax error names the offending column:
+`--eval-expr "2 * (x + )"` fails with
+`expected a number, variable, function or '(' (column 10)` and exit code 2.
+
+Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
+minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
+parentheses, the constants `pi` and `e`, and variable names from your table (the
+`x0`, `x1`, … fallback also works).
+
 `cargo test` runs the unit tests and the end-to-end recovery tests
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
 reaches machine precision.
@@ -129,7 +151,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--gap-break f] [--null-runs N] [--bootstrap-error N]
+     [--gap-break f] [--null-runs N] [--bootstrap-error N] [--eval-expr expr]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]

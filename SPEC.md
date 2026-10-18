@@ -66,6 +66,28 @@ out-of-domain operations yield a non-finite value (treated as a hard failure):
 
 Evaluation is done **column-wise over all training rows**.
 
+### 4.1 Textual expression language
+
+`expr::to_string` prints a tree; `expr::parse` (module `parse`, re-exported as
+`expr::parse`) reads one back:
+
+```
+expr    := term (('+' | '-') term)*
+term    := unary (('*' | '/') unary)*
+unary   := ('-' | '+') unary | power
+power   := primary ('^' unary)?          // right associative
+primary := number | name '(' expr (',' expr)* ')' | name | '(' expr ')'
+```
+
+Precedence, tightest first: `^`, unary `-`/`+`, `*`/`/`, `+`/`-`. So `-x^2` is
+`-(x^2)` and `2^3^2` is `2^(3^2)`. Function names are the primitives above, via
+`Op::from_name`, sharing the alias table with `--ops` (`log` = `ln`,
+`sig` = `logistic`). Variable names resolve against the table's column names,
+then the `x0`, `x1`, … fallback; `pi` and `e` are constants when they are not
+declared variables. Unknown names, unmatched parentheses and wrong argument
+counts produce a `ParseError` carrying the **1-based column**. `--eval-expr`
+exposes the parser on the command line.
+
 ## 5. Complexity
 
 - Per-operator cost table; default **1.0 per node** (configurable).

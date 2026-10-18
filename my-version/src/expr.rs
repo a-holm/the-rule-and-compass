@@ -5,6 +5,9 @@
 
 use crate::rng::Mt;
 
+/// The expression parser, re-exported so callers can write [`crate::expr::parse`].
+pub use crate::parse::{parse, ParseError};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
     Const,
@@ -127,55 +130,65 @@ impl Op {
     }
 
     pub fn parse_list(s: &str) -> Vec<Op> {
-        use Op::*;
         let mut out = Vec::new();
         for tok in s.split(|c| c == ',' || c == ' ') {
-            let t = tok.trim().to_ascii_lowercase();
-            let op = match t.as_str() {
-                "neg" | "-" => Neg,
-                "exp" => Exp,
-                "ln" | "log" => Ln,
-                "abs" => Abs,
-                "sqrt" => Sqrt,
-                "sin" => Sin,
-                "cos" => Cos,
-                "tan" => Tan,
-                "sinh" => Sinh,
-                "cosh" => Cosh,
-                "tanh" => Tanh,
-                "logistic" | "sig" => Logistic,
-                "step" => Step,
-                "gauss" => Gauss,
-                "square" => Square,
-                "cube" => Cube,
-                "floor" => Floor,
-                "ceil" => Ceil,
-                "round" => Round,
-                "sign" => Sign,
-                "erf" => Erf,
-                "erfc" => Erfc,
-                "asinh" => Asinh,
-                "acosh" => Acosh,
-                "atanh" => Atanh,
-                "add" | "+" => Add,
-                "sub" => Sub,
-                "mul" | "*" => Mul,
-                "div" | "/" => Div,
-                "pow" | "^" => Pow,
-                "mod" => Mod,
-                "min" => Min,
-                "max" => Max,
-                "atan2" => Atan2,
-                "if" => If,
-                _ => continue,
-            };
-            out.push(op);
+            if let Some(op) = Op::from_name(tok) {
+                out.push(op);
+            }
         }
         if out.is_empty() {
             Op::default_set()
         } else {
             out
         }
+    }
+
+    /// Map a primitive name (canonical name or an accepted alias) to an [`Op`].
+    ///
+    /// The inverse of [`Op::symbol`] for the alphabetic primitives, plus the
+    /// short aliases (`log`, `sig`, `-`, `+`, …) that `--ops` has always taken.
+    /// Used by [`Op::parse_list`] and by the expression parser, so the two
+    /// never disagree about what a name means.
+    pub fn from_name(s: &str) -> Option<Op> {
+        use Op::*;
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "neg" | "-" => Neg,
+            "exp" => Exp,
+            "ln" | "log" => Ln,
+            "abs" => Abs,
+            "sqrt" => Sqrt,
+            "sin" => Sin,
+            "cos" => Cos,
+            "tan" => Tan,
+            "sinh" => Sinh,
+            "cosh" => Cosh,
+            "tanh" => Tanh,
+            "logistic" | "sig" => Logistic,
+            "step" => Step,
+            "gauss" => Gauss,
+            "square" => Square,
+            "cube" => Cube,
+            "floor" => Floor,
+            "ceil" => Ceil,
+            "round" => Round,
+            "sign" => Sign,
+            "erf" => Erf,
+            "erfc" => Erfc,
+            "asinh" => Asinh,
+            "acosh" => Acosh,
+            "atanh" => Atanh,
+            "add" | "+" => Add,
+            "sub" => Sub,
+            "mul" | "*" => Mul,
+            "div" | "/" => Div,
+            "pow" | "^" => Pow,
+            "mod" => Mod,
+            "min" => Min,
+            "max" => Max,
+            "atan2" => Atan2,
+            "if" => If,
+            _ => return None,
+        })
     }
 }
 

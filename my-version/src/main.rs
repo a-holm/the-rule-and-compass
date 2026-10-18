@@ -12,7 +12,7 @@
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
 use rcsr::expr::{self, Op};
-use rcsr::metrics::Metric;
+use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::{data, diagnostics, search};
 use std::io::Read;
@@ -92,6 +92,12 @@ OVERFITTING DIAGNOSTICS (always on):
                              .632+ error estimates (Efron & Tibshirani 1997);
                              costs n constant refits per reported solution
 
+MODE:
+  --eval-expr <expr>         do not search: parse this formula, score it on the
+                             split, print the result and exit. Write variables
+                             by name in original units, e.g. \"2.5*x + sin(y)\";
+                             operators as in --ops. `x0,x1,..` also work.
+
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
                              absolute  squared  correlation  median  maximum
@@ -150,6 +156,7 @@ fn schema() -> String {
         ("--max-complexity", "int", "30", "max nodes per expression"),
         ("--seed", "int", "0", "RNG seed"),
         ("--ops", "csv", "builtin-set", "operator names (see \"operators\")"),
+        ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
@@ -272,6 +279,7 @@ fn main() {
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
     let mut bootstrap_resamples = 0usize;
+    let mut eval_expr: Option<String> = None;
 
     let mut i = 0;
     macro_rules! val {
@@ -323,6 +331,7 @@ fn main() {
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
+            "--eval-expr" => eval_expr = Some(val!()),
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
             "--no-dedup" => cfg.dedup = false,
@@ -686,6 +695,11 @@ fn main() {
                 prepared.report.groups_test, prepared.report.groups_total
             );
         }
+    }
+
+    if let Some(src) = eval_expr.as_deref() {
+        run_eval(src, &vars, &target, &prepared, cfg.metric, format, quiet, start);
+        std::process::exit(EXIT_OK);
     }
 
     let outcome = search::run(&cfg, &prepared.train, &prepared.test);
@@ -1121,6 +1135,105 @@ fn main() {
     }
 
     std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
+}
+
+/// `--eval-expr`: score a user-written formula instead of searching.
+///
+/// The formula is written in **original units** (the same form a search run
+/// prints as `y = ...`). Inputs are un-normalised per row before evaluation,
+/// and the target is compared un-normalised too, so re-scoring a printed
+/// right-hand side reproduces the run's numbers.
+fn run_eval(
+    src: &str,
+    vars: &[String],
+    target: &str,
+    prepared: &data::Prepared,
+    metric: Metric,
+    format: Format,
+    quiet: bool,
+    started: std::time::Instant,
+) {
+    let tree = match expr::parse(src, vars) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: cannot parse --eval-expr: {}", e);
+            eprintln!("  expression: {}", src);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    let k = expr::count_constants(&tree);
+    let complexity = expr::complexity(&tree);
+    let shown = expr::to_string(&tree, vars);
+
+    let raw_row = |row: &[f64]| -> Vec<f64> {
+        row.iter()
+            .enumerate()
+            .map(|(j, v)| {
+                v * prepared.stds.get(j).copied().unwrap_or(1.0)
+                    + prepared.means.get(j).copied().unwrap_or(0.0)
+            })
+            .collect()
+    };
+    let score = |s: &data::Sample| -> f64 {
+        let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
+        metrics::score_with_constants(&pred, &s.y, metric, k)
+    };
+    let train_error = score(&prepared.train);
+    let fold_errors: Vec<f64> = prepared.fold_samples.iter().map(score).collect();
+    let test_error = if fold_errors.is_empty() {
+        f64::INFINITY
+    } else {
+        fold_errors.iter().sum::<f64>() / fold_errors.len() as f64
+    };
+
+    match format {
+        Format::Json => {
+            let folds: Vec<String> = fold_errors.iter().map(|e| jnum(*e)).collect();
+            println!(
+                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
+                jstr(VERSION),
+                jstr(metric.name()),
+                jstr(target),
+                vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
+                prepared.train.len(),
+                prepared.test.len(),
+                jstr(&shown),
+                complexity,
+                k,
+                jnum(train_error),
+                jnum(test_error),
+                folds.join(",")
+            );
+        }
+        Format::Ndjson => println!(
+            "{{\"event\":\"eval\",\"metric\":{},\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{}}}",
+            jstr(metric.name()),
+            jstr(&shown),
+            complexity,
+            k,
+            jnum(train_error),
+            jnum(test_error)
+        ),
+        Format::Text => {
+            if !quiet {
+                eprintln!(
+                    "# eval-expr | metric={} | train rows: {} | test rows: {} | {:.3}s",
+                    metric.name(),
+                    prepared.train.len(),
+                    prepared.test.len(),
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            println!(
+                "  1  complexity={}   k_constants={}   train_err={}      test_err={}      y = {}",
+                complexity,
+                k,
+                fmt_err(train_error),
+                fmt_err(test_error),
+                shown
+            );
+        }
+    }
 }
 
 fn fmt_err(v: f64) -> String {
