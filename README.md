@@ -183,6 +183,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
+     [--report summary|sensitivity|benchmark] [--report-out file.md]
+     [--report-repeats N]
 ```
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
@@ -375,6 +377,38 @@ noise the search only sometimes needed. Cost: `B` extra searches.
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
 
+## Reports for other people
+
+`--report` turns a completed run into a Markdown document. One report per run;
+a later flag replaces an earlier one. Use `--report-out` for a file, or let a
+text run print it to stdout. In `--json`/`--ndjson` the report goes to stderr so
+the machine-readable stream is never corrupted.
+
+```sh
+# everything a reader needs: command, data, law, constants + errors, diagnostics,
+# baselines, the whole Pareto front and a trust verdict
+rcsr --data data.csv --target y --report summary --report-out summary.md
+
+# which input actually moves the prediction? analytic d f / d x per row
+rcsr --data data.csv --target y --report sensitivity --report-out sensitivity.md
+
+# repeat the search N times and report median/IQR error and wall-clock time
+rcsr --data data.csv --target y --report benchmark --report-repeats 9 \
+     --report-out benchmark.md
+```
+
+The summary's closing paragraph is derived from the statistics in the document
+(it counts the baselines beaten, reads the overfit index, the permutation
+p-value and the residual tests), so it states what the run does *not* establish
+as well as what it does. The sensitivity report uses the **analytic** adjoint
+derivative and ranks inputs by `mean(|∂f/∂x_i| · σ_x_i / σ_f)`, which is
+scale-free and therefore comparable across columns with different units. The
+benchmark honours the same `--generations`, `--pop` and `--time-budget`, derives
+its seeds from `--seed`, and reports Hyndman–Fan type-7 quartiles.
+
+See [`docs/reports.md`](docs/reports.md) for one worked example of each report,
+with real output, the seed derivation and the stdout/stderr rules.
+
 ## Known-truth benchmarks
 
 To check that the engine *recovers* laws rather than overfitting samples, a
@@ -448,6 +482,11 @@ list and the recorded results.
   `rolling`, `purged`) that reports the mean and spread of the held-out error,
   and `--stability` bootstrap selection that ranks forms and variables by how
   often they are rediscovered;
+- **Markdown reports** (`--report summary|sensitivity|benchmark`): a
+  self-contained model summary with a statistics-driven trust verdict, an
+  analytic per-input sensitivity ranking (`mean(|∂f/∂x_i| · σ_x_i / σ_f)`, no
+  finite differences), and a repeated-search benchmark with per-complexity
+  median/IQR error and wall-clock time;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 

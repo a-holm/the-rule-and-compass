@@ -275,11 +275,37 @@ fn eval_row(f: &Flat, x: &[f64], c: &[f64], v: &mut [f64]) {
 
 /// Set the gradient of `out` w.r.t. the constants into `g`.
 fn backward(f: &Flat, v: &[f64], adj: &mut [f64], g: &mut [f64]) {
+    backward_impl(f, v, adj, Some(g), None);
+}
+
+/// The adjoint (reverse-mode) sweep shared by the constant fit and the
+/// variable-sensitivity report.
+///
+/// Seeded with `adj[root] = 1`, it accumulates the derivative of the root into
+/// either the constant slots (`const_grad`) or the input leaves (`input_grad`).
+/// Passing only one of the two keeps the fitter's cost unchanged; passing both
+/// would give the full Jacobian in one pass.
+fn backward_impl(
+    f: &Flat,
+    v: &[f64],
+    adj: &mut [f64],
+    const_grad: Option<&mut [f64]>,
+    input_grad: Option<&mut [f64]>,
+) {
+    let mut const_grad = const_grad;
+    let mut input_grad = input_grad;
     for a in adj.iter_mut() {
         *a = 0.0;
     }
-    for x in g.iter_mut() {
-        *x = 0.0;
+    if let Some(g) = const_grad.as_deref_mut() {
+        for x in g.iter_mut() {
+            *x = 0.0;
+        }
+    }
+    if let Some(g) = input_grad.as_deref_mut() {
+        for x in g.iter_mut() {
+            *x = 0.0;
+        }
     }
     adj[f.root] = 1.0;
     for i in (0..f.op.len()).rev() {
@@ -288,7 +314,19 @@ fn backward(f: &Flat, v: &[f64], adj: &mut [f64], g: &mut [f64]) {
             continue;
         }
         if f.op[i] == Op::Const {
-            g[f.cslot[i] as usize] += a;
+            if let Some(g) = const_grad.as_deref_mut() {
+                if let Some(slot) = g.get_mut(f.cslot[i] as usize) {
+                    *slot += a;
+                }
+            }
+            continue;
+        }
+        if f.op[i] == Op::Input {
+            if let Some(g) = input_grad.as_deref_mut() {
+                if let Some(slot) = g.get_mut(f.val[i] as usize) {
+                    *slot += a;
+                }
+            }
             continue;
         }
         let ks = &f.kids[i];
@@ -863,6 +901,34 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
     xp[var] += h;
     xm[var] -= h;
     (expr::eval(tree, &xp) - expr::eval(tree, &xm)) / (2.0 * h)
+}
+
+/// Analytic derivative of the model output w.r.t. **every input** at `x`.
+///
+/// This is the same adjoint (reverse-mode) sweep the fitter uses for constants
+/// ([`fit`], [`constant_errors`]), seeded at the root but accumulated at the
+/// `Input` leaves instead. One backward pass gives every input's derivative at
+/// once, so a sensitivity analysis over `n` rows costs `O(n · nodes)` rather
+/// than `2 · vars · n · nodes` for central differences.
+///
+/// The returned vector has one entry per element of `x`. An input that does not
+/// occur in `tree` receives `0`; an input index outside `x` is ignored (the
+/// same row would evaluate to `NaN`).
+pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
+    let f = flatten(tree);
+    let n = f.op.len();
+    let mut c = vec![0.0; f.nconst];
+    for i in 0..n {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut v = vec![0.0; n];
+    eval_row(&f, x, &c, &mut v);
+    let mut adj = vec![0.0; n];
+    let mut grad = vec![0.0; x.len()];
+    backward_impl(&f, &v, &mut adj, None, Some(&mut grad));
+    grad
 }
 
 #[cfg(test)]

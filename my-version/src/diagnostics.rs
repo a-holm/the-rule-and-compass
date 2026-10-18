@@ -839,9 +839,370 @@ pub fn bootstrap_error(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Variable sensitivity (issue #29)
+// ---------------------------------------------------------------------------
+
+/// How much one input moves the fitted law, measured over the training rows.
+///
+/// The derivative is analytic (the same adjoint sweep as the constant fit), not
+/// a finite difference. `mean_abs_elasticity` is
+/// `mean(|∂f/∂x_i| · σ_x_i / σ_f)`: the standardised, unit-free change in the
+/// prediction for a one-standard-deviation change in the input. It is directly
+/// comparable across inputs even when their units differ.
+#[derive(Clone, Copy, Debug)]
+pub struct SensitivityRow {
+    /// Index into the input vector.
+    pub input: usize,
+    /// `mean(|∂f/∂x_i| · σ_x_i / σ_f)`, the ranking statistic.
+    pub mean_abs_elasticity: f64,
+    /// Smallest signed standardised contribution over the rows.
+    pub min_contribution: f64,
+    /// Largest signed standardised contribution over the rows.
+    pub max_contribution: f64,
+    /// Fraction of rows with a positive derivative.
+    pub positive_fraction: f64,
+    /// Fraction of rows with a negative derivative.
+    pub negative_fraction: f64,
+    /// Rows with a finite derivative (the fractions use this denominator).
+    pub rows_used: usize,
+}
+
+/// Per-input sensitivity of `tree` over the training rows.
+#[derive(Clone, Debug)]
+pub struct SensitivityReport {
+    /// One entry per input, ranked by `mean_abs_elasticity`, descending.
+    pub rows: Vec<SensitivityRow>,
+    /// Training rows used.
+    pub n: usize,
+    /// Standard deviation of the model's predictions (`σ_f`).
+    pub output_std: f64,
+}
+
+/// Compute the analytic sensitivity of `tree` to each input over `train`.
+///
+/// `tree` is the search's model in normalised input space, and `stds[j]` is the
+/// scaling applied to input `j` during preparation. The derivative with respect
+/// to the original input is `∂f/∂x_j = (∂f/∂x_norm_j) / stds[j]`; the actual
+/// original-scale standard deviation is `stds[j] · sd(x_norm_j)`, so the two
+/// factors cancel in the elasticity and the result is scale-free even with
+/// `--scale iqr` or `--scale range`.
+pub fn sensitivity(tree: &Node, train: &Sample, stds: &[f64]) -> SensitivityReport {
+    let n = train.len();
+    let nv = train.x.first().map(|r| r.len()).unwrap_or(0);
+    let pred: Vec<f64> = train.x.iter().map(|r| crate::expr::eval(tree, r)).collect();
+    let output_std = std_dev(&pred);
+
+    // Standard deviation of each normalised input column.
+    let mut sd_norm = vec![0.0; nv];
+    for (j, slot) in sd_norm.iter_mut().enumerate() {
+        let vals: Vec<f64> = train
+            .x
+            .iter()
+            .map(|r| r.get(j).copied().unwrap_or(f64::NAN))
+            .collect();
+        *slot = std_dev(&vals);
+    }
+
+    let mut sum_abs = vec![0.0; nv];
+    let mut min_contrib = vec![f64::INFINITY; nv];
+    let mut max_contrib = vec![f64::NEG_INFINITY; nv];
+    let mut positive = vec![0usize; nv];
+    let mut negative = vec![0usize; nv];
+    let mut used = vec![0usize; nv];
+    let scale_ok = output_std.is_finite() && output_std > 0.0;
+
+    for row in &train.x {
+        let grad = crate::fit::input_gradients(tree, row);
+        for j in 0..nv {
+            let d = grad.get(j).copied().unwrap_or(0.0);
+            let scale = stds.get(j).copied().unwrap_or(1.0);
+            let d_orig = if scale.abs() >= 1e-12 { d / scale } else { d };
+            let contribution = if scale_ok {
+                d_orig * (scale.abs() * sd_norm[j]) / output_std
+            } else {
+                0.0
+            };
+            if !contribution.is_finite() {
+                continue;
+            }
+            used[j] += 1;
+            sum_abs[j] += contribution.abs();
+            min_contrib[j] = min_contrib[j].min(contribution);
+            max_contrib[j] = max_contrib[j].max(contribution);
+            if contribution > 0.0 {
+                positive[j] += 1;
+            } else if contribution < 0.0 {
+                negative[j] += 1;
+            }
+        }
+    }
+
+    let mut rows: Vec<SensitivityRow> = (0..nv)
+        .map(|j| {
+            let denom = used[j] as f64;
+            SensitivityRow {
+                input: j,
+                mean_abs_elasticity: if used[j] > 0 {
+                    sum_abs[j] / denom
+                } else {
+                    0.0
+                },
+                min_contribution: if used[j] > 0 {
+                    min_contrib[j]
+                } else {
+                    0.0
+                },
+                max_contribution: if used[j] > 0 {
+                    max_contrib[j]
+                } else {
+                    0.0
+                },
+                positive_fraction: if used[j] > 0 {
+                    positive[j] as f64 / denom
+                } else {
+                    0.0
+                },
+                negative_fraction: if used[j] > 0 {
+                    negative[j] as f64 / denom
+                } else {
+                    0.0
+                },
+                rows_used: used[j],
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.mean_abs_elasticity
+            .partial_cmp(&a.mean_abs_elasticity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.input.cmp(&b.input))
+    });
+    SensitivityReport {
+        rows,
+        n,
+        output_std,
+    }
+}
+
+/// Population standard deviation, ignoring non-finite values.
+fn std_dev(values: &[f64]) -> f64 {
+    let mut n = 0usize;
+    let mut sum = 0.0;
+    for &v in values {
+        if v.is_finite() {
+            n += 1;
+            sum += v;
+        }
+    }
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mean = sum / n as f64;
+    let var = values
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|v| (v - mean) * (v - mean))
+        .sum::<f64>()
+        / n as f64;
+    var.sqrt()
+}
+
+// ---------------------------------------------------------------------------
+// Median / IQR statistics (issue #29 benchmark)
+// ---------------------------------------------------------------------------
+
+/// Linear-interpolation quantile (Hyndman–Fan type 7) of unsorted values.
+///
+/// Non-finite values are ignored. Returns `NaN` for an empty slice. This is the
+/// same definition `data` uses for preparation quantiles, so a report's IQR
+/// means the same thing as an `--outlier-iqr` bound.
+pub fn quantile(values: &[f64], p: f64) -> f64 {
+    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.is_empty() {
+        return f64::NAN;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if v.len() == 1 {
+        return v[0];
+    }
+    let h = (v.len() - 1) as f64 * p.clamp(0.0, 1.0);
+    let lo = h.floor() as usize;
+    let hi = h.ceil() as usize;
+    if lo == hi {
+        v[lo]
+    } else {
+        v[lo] + (h - lo as f64) * (v[hi] - v[lo])
+    }
+}
+
+/// Median (the 0.5 quantile). `NaN` for an empty or all-non-finite slice.
+pub fn median(values: &[f64]) -> f64 {
+    quantile(values, 0.5)
+}
+
+/// Interquartile range, `Q3 − Q1` (the 0.75 minus the 0.25 quantile).
+pub fn iqr(values: &[f64]) -> f64 {
+    quantile(values, 0.75) - quantile(values, 0.25)
+}
+
+/// One repeat's best result at one complexity level.
+#[derive(Clone, Copy, Debug)]
+pub struct BenchmarkPoint {
+    pub complexity: usize,
+    pub train_error: f64,
+    pub test_error: f64,
+}
+
+/// Median and IQR of the best errors at one complexity, over repeats.
+#[derive(Clone, Copy, Debug)]
+pub struct BenchmarkRow {
+    pub complexity: usize,
+    /// Repeats that produced a solution at this complexity.
+    pub runs: usize,
+    pub train_median: f64,
+    pub train_iqr: f64,
+    pub test_median: f64,
+    pub test_iqr: f64,
+}
+
+/// Aggregate repeated Pareto fronts by complexity.
+///
+/// Within one repeat, if several solutions share a complexity the one with the
+/// lowest training error represents that repeat (its test error is reported
+/// alongside). Across repeats, each complexity gets the median and IQR of those
+/// per-repeat bests, so a single lucky search cannot move the summary.
+pub fn benchmark_by_complexity(repeats: &[Vec<BenchmarkPoint>]) -> Vec<BenchmarkRow> {
+    use std::collections::BTreeMap;
+    let mut train: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut test: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    for rep in repeats {
+        let mut best: BTreeMap<usize, BenchmarkPoint> = BTreeMap::new();
+        for p in rep {
+            match best.get(&p.complexity) {
+                Some(old) if old.train_error <= p.train_error => {}
+                _ => {
+                    best.insert(p.complexity, *p);
+                }
+            }
+        }
+        for (complexity, p) in best {
+            train.entry(complexity).or_default().push(p.train_error);
+            test.entry(complexity).or_default().push(p.test_error);
+        }
+    }
+    train
+        .into_iter()
+        .map(|(complexity, train_errs)| {
+            let test_errs = test.remove(&complexity).unwrap_or_default();
+            BenchmarkRow {
+                complexity,
+                runs: train_errs.len(),
+                train_median: median(&train_errs),
+                train_iqr: iqr(&train_errs),
+                test_median: median(&test_errs),
+                test_iqr: iqr(&test_errs),
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn median_iqr_and_quantile_use_linear_interpolation() {
+        assert_eq!(median(&[3.0, 1.0, 2.0]), 2.0);
+        assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
+        assert_eq!(quantile(&[1.0, 2.0, 3.0, 4.0], 0.0), 1.0);
+        assert_eq!(quantile(&[1.0, 2.0, 3.0, 4.0], 1.0), 4.0);
+        assert!((quantile(&[1.0, 2.0, 3.0, 4.0], 0.25) - 1.75).abs() < 1e-12);
+        assert!((iqr(&[1.0, 2.0, 3.0, 4.0]) - 1.5).abs() < 1e-12);
+        assert!(median(&[]).is_nan());
+        // Non-finite entries are ignored, not propagated.
+        assert_eq!(median(&[1.0, f64::NAN, 3.0]), 2.0);
+    }
+
+    #[test]
+    fn benchmark_aggregates_per_repeat_bests_by_complexity() {
+        let repeats = vec![
+            vec![
+                BenchmarkPoint {
+                    complexity: 2,
+                    train_error: 1.0,
+                    test_error: 2.0,
+                },
+                BenchmarkPoint {
+                    complexity: 4,
+                    train_error: 5.0,
+                    test_error: 7.0,
+                },
+                // A second entry at complexity 2 must not double-count the
+                // repeat; the lower training error wins.
+                BenchmarkPoint {
+                    complexity: 2,
+                    train_error: 0.5,
+                    test_error: 1.5,
+                },
+            ],
+            vec![BenchmarkPoint {
+                complexity: 2,
+                train_error: 2.0,
+                test_error: 4.0,
+            }],
+            vec![BenchmarkPoint {
+                complexity: 2,
+                train_error: 3.0,
+                test_error: 6.0,
+            }],
+        ];
+        let rows = benchmark_by_complexity(&repeats);
+        assert_eq!(rows.len(), 2);
+        let c2 = &rows[0];
+        assert_eq!(c2.complexity, 2);
+        assert_eq!(c2.runs, 3);
+        assert!((c2.train_median - 2.0).abs() < 1e-12, "median {:?}", c2);
+        assert!((c2.train_iqr - 1.25).abs() < 1e-12, "iqr {:?}", c2);
+        assert!((c2.test_median - 4.0).abs() < 1e-12, "test {:?}", c2);
+        assert!((c2.test_iqr - 2.25).abs() < 1e-12, "test iqr {:?}", c2);
+        let c4 = &rows[1];
+        assert_eq!(c4.runs, 1);
+        assert!((c4.train_iqr - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sensitivity_ranks_the_driving_input_over_noise() {
+        use crate::expr::{constant, input, node, Op};
+        // y = 3*x1; x2 has the same spread but no influence.
+        let tree = node(
+            Op::Mul,
+            vec![constant(3.0), input(0)],
+        );
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..40 {
+            let x1 = -2.0 + 4.0 * i as f64 / 39.0;
+            let x2 = ((i * 37 % 40) as f64 - 20.0) / 10.0;
+            x.push(vec![x1, x2]);
+            y.push(3.0 * x1);
+        }
+        let report = sensitivity(&tree, &Sample { x, y }, &[1.0, 1.0]);
+        assert_eq!(report.rows.len(), 2);
+        assert_eq!(report.rows[0].input, 0, "x1 must rank first");
+        assert!(
+            report.rows[0].mean_abs_elasticity > 100.0 * report.rows[1].mean_abs_elasticity,
+            "x1 {:?} vs x2 {:?}",
+            report.rows[0],
+            report.rows[1]
+        );
+        // For a linear law the standardised elasticity is exactly 1.
+        assert!(
+            (report.rows[0].mean_abs_elasticity - 1.0).abs() < 1e-9,
+            "{:?}",
+            report.rows[0]
+        );
+    }
 
     #[test]
     fn aicc_punishes_extra_constants() {
