@@ -295,6 +295,12 @@ SEARCH:
   --predictor-samples <N>    score and fit candidates on N training rows per
                              generation (default: all rows; N >= 2). The archive
                              and every reported error are always full-data
+  --fit-samples <N>          screen constants on N training rows per generation
+                             (default: 0 = off; N >= 2). All offspring are
+                             fitted and scored on the subset; the top 1/16 are
+                             refit and scored on all training rows before
+                             selection and archiving. Independent of
+                             --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
   --no-gpu                   force CPU evaluation even when built with
@@ -602,6 +608,9 @@ fn main() {
     let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
+    // #85: remember an explicit --fit-samples so a resume can refuse a
+    // contradiction with the saved configuration.
+    let mut fit_samples_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -835,6 +844,28 @@ fn main() {
                     _ => {
                         eprintln!(
                             "error: --predictor-samples needs an integer >= 2, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            // #85: opt-in constant-fitting screen. 0 means off (the historical
+            // path); 1 cannot define a subset.
+            "--fit-samples" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(0) => {
+                        cfg.fit_samples = 0;
+                        fit_samples_set = true;
+                    }
+                    Ok(n) if n >= 2 => {
+                        cfg.fit_samples = n;
+                        fit_samples_set = true;
+                    }
+                    _ => {
+                        eprintln!(
+                            "error: --fit-samples needs 0 (off) or an integer >= 2, got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -1099,6 +1130,14 @@ fn main() {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
                 cfg.predictor_samples, saved.predictor_samples
+            ));
+        }
+        // #85: screening is saved search state, so an explicit contradiction is
+        // refused just like --predictor-samples.
+        if fit_samples_set && cfg.fit_samples != saved.fit_samples {
+            conflicts.push(format!(
+                "--fit-samples {} (saved {})",
+                cfg.fit_samples, saved.fit_samples
             ));
         }
         if let Some(spec) = &op_complexity_spec {
@@ -1955,6 +1994,18 @@ fn main() {
             .map(|v| format!("{} ({})", v.name, v.dtype.name()))
             .collect();
         eprintln!("# variables: {}", type_line.join(", "));
+        // #85: say how many rows the fitter screened and that the reported
+        // archive was refit on every training row.
+        if cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < prepared.train.len() {
+            let n = cfg.fit_samples;
+            eprintln!(
+                "# fit: constants screened on {} of {} training rows per generation; \
+                 survivors refit on all {} rows",
+                n,
+                prepared.train.len(),
+                prepared.train.len()
+            );
+        }
         if prepared.report.groups_total > 1 && mode == data::SplitMode::Group {
             eprintln!(
                 "# groups held out whole: {}/{} (never on both sides)",
@@ -2821,6 +2872,18 @@ fn main() {
                 }
                 None => "null".to_string(),
             };
+            // #85: only emitted when screening is on, so an off run's JSON is
+            // byte-identical to the historical output.
+            let fit_json = if outcome.fit_samples > 0 {
+                format!(
+                    "\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}},",
+                    outcome.fit_samples,
+                    prepared.train.len(),
+                    outcome.archive_refit
+                )
+            } else {
+                String::new()
+            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -2834,7 +2897,8 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                fit_json, // #85
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -2987,14 +3051,27 @@ fn main() {
                     variables.join(",")
                 );
             }
+            // #85: the closing event carries the screening note only when the
+            // flag is on, so the off path keeps its exact bytes.
+            let fit_ndjson = if outcome.fit_samples > 0 {
+                format!(
+                    ",\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}}",
+                    outcome.fit_samples,
+                    prepared.train.len(),
+                    outcome.archive_refit
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
-                outcome.archive.items.len()
+                outcome.archive.items.len(),
+                fit_ndjson
             );
         }
     }

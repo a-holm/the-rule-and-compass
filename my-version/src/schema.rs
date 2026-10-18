@@ -65,6 +65,8 @@ pub fn json() -> String {
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
+        // #85: fit-only screening; survivors are refit on the full training sample.
+        ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
         ("--no-gpu", "flag", "false", "force CPU evaluation even when built with --features cuda (alias --cpu); the GPU only guides the search, reported errors are always CPU f64"),
