@@ -157,14 +157,14 @@ input and picks a mode:
 
 It prints what it decided and why. If you do *not* pass `--split auto`, `rcsr`
 still runs this check, but only warns — it will not silently change the split
-you asked for:
+you asked for. The warning describes what it *observed*, never a split it did
+not apply:
 
 ```
-warning: the rows do not look exchangeable: found both a time-like and a
-         group-like column; using a temporal split inside each group
+warning: the rows do not look exchangeable: found a time-like column 'date' and a group-like column 'stock'
          a random split would let the model see the future (or the same
-         group on both sides). Consider `--split auto` (chosen: temporal-group),
-         or pass explicitly:  --time date --group-by stock
+         group on both sides). Consider `--split auto` (it would
+         choose: temporal-group), or pass explicitly:  --time date --group-by stock
 ```
 
 `--vars` defaults to every numeric column except the target and any
