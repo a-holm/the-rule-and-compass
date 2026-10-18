@@ -5,6 +5,8 @@
 pub mod data;
 pub mod expr;
 pub mod fit;
+#[cfg(feature = "cuda")]
+pub mod gpu;
 pub mod metrics;
 pub mod pareto;
 pub mod rng;
