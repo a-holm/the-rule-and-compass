@@ -180,6 +180,77 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 a(2)
             }
         }
+        Equal => cmp_f(a(0), a(1), |x, y| x == y),
+        Less => cmp_f(a(0), a(1), |x, y| x < y),
+        LessOrEqual => cmp_f(a(0), a(1), |x, y| x <= y),
+        Greater => cmp_f(a(0), a(1), |x, y| x > y),
+        GreaterOrEqual => cmp_f(a(0), a(1), |x, y| x >= y),
+        And => logical(a(0), a(1), |x, y| x && y),
+        Or => logical(a(0), a(1), |x, y| x || y),
+        Xor => logical(a(0), a(1), |x, y| x != y),
+        Not => match truth(a(0)) {
+            Some(t) => {
+                if t {
+                    0.0
+                } else {
+                    1.0
+                }
+            }
+            None => f64::NAN,
+        },
+        Require | Constrain => {
+            if a(0) > 0.0 {
+                a(0)
+            } else {
+                f64::NAN
+            }
+        }
+        Between => {
+            let (v, lo, hi) = (a(0), a(1), a(2));
+            if lo <= v && v <= hi {
+                v
+            } else {
+                f64::NAN
+            }
+        }
+    }
+}
+
+/// Truthiness of a value for the logical operators: `None` for `NaN`, otherwise
+/// whether it is strictly positive.
+#[inline]
+fn truth(v: f64) -> Option<bool> {
+    if v.is_nan() {
+        None
+    } else {
+        Some(v > 0.0)
+    }
+}
+
+/// 0/1 comparison, `NaN` if an operand is `NaN` (mirrors `expr::eval`).
+#[inline]
+fn cmp_f(a: f64, b: f64, f: impl Fn(f64, f64) -> bool) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if f(a, b) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 0/1 logical operator on the truthiness of its arguments.
+#[inline]
+fn logical(a: f64, b: f64, f: impl Fn(bool, bool) -> bool) -> f64 {
+    match (truth(a), truth(b)) {
+        (Some(x), Some(y)) => {
+            if f(x, y) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => f64::NAN,
     }
 }
 
@@ -343,8 +414,59 @@ fn backward(f: &Flat, v: &[f64], adj: &mut [f64], g: &mut [f64]) {
                     adj[ks[2]] += a;
                 }
             }
+            // Comparisons are piecewise constant (0/1), so flat a.e.: the
+            // subgradient is 0, like `step`. Same for `not`.
+            Equal | Less | LessOrEqual | Greater | GreaterOrEqual | Not => {}
+            // `and`/`or`/`xor` are flat a.e. too. Their documented subgradients
+            // are the partials of the product surrogate over the truth values
+            // `[a>0]`, `[b>0]`:
+            //   and: [a>0][b>0]            -> d/da = [b>0], d/db = [a>0]
+            //   or:  [a>0]+[b>0]-[a>0][b>0] -> d/da = 1-[b>0], d/db = 1-[a>0]
+            //   xor: [a>0]+[b>0]-2[a>0][b>0] -> d/da = 1-2[b>0], d/db = 1-2[a>0]
+            // These are bounded (|g| <= 2) and symmetric in the two arguments,
+            // matching the min/max convention above.
+            And => {
+                adj[ks[0]] += a * ind(get(1));
+                adj[ks[1]] += a * ind(get(0));
+            }
+            Or => {
+                adj[ks[0]] += a * (1.0 - ind(get(1)));
+                adj[ks[1]] += a * (1.0 - ind(get(0)));
+            }
+            Xor => {
+                adj[ks[0]] += a * (1.0 - 2.0 * ind(get(1)));
+                adj[ks[1]] += a * (1.0 - 2.0 * ind(get(0)));
+            }
+            // A constraint returns its argument while feasible, so the gradient
+            // passes through with weight 1; once violated it is `NaN` and the
+            // row is already rejected, so nothing is added.
+            Require | Constrain => {
+                if get(0) > 0.0 {
+                    adj[ks[0]] += a;
+                }
+            }
+            // `between(v, lo, hi)` returns `v` when `lo <= v <= hi`; the bounds
+            // are not part of the returned value, so they get no gradient.
+            Between => {
+                let (v, lo, hi) = (get(0), get(1), get(2));
+                if lo <= v && v <= hi {
+                    adj[ks[0]] += a;
+                }
+            }
             Const | Input => {}
         }
+    }
+}
+
+/// Indicator `[x > 0]` as 0/1, `NaN` when `x` is `NaN` (a rejected row).
+#[inline]
+fn ind(x: f64) -> f64 {
+    if x.is_nan() {
+        f64::NAN
+    } else if x > 0.0 {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -857,6 +979,97 @@ mod tests {
             let tree = node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
             assert_eq!(analytic_grad(&tree, &[1.7]), vec![0.0]);
         }
+    }
+
+    #[test]
+    fn comparisons_and_not_have_zero_gradient() {
+        // Comparisons are piecewise constant (0/1) and `not` is too, so their
+        // subgradient is 0 a.e., exactly like `step`.
+        for op in [
+            Op::Equal,
+            Op::Less,
+            Op::LessOrEqual,
+            Op::Greater,
+            Op::GreaterOrEqual,
+        ] {
+            let tree = node(op, vec![constant(1.3), input(0)]);
+            assert_eq!(analytic_grad(&tree, &[1.7]), vec![0.0], "{op:?}");
+        }
+        let not = node(Op::Not, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert_eq!(analytic_grad(&not, &[1.7]), vec![0.0]);
+    }
+
+    #[test]
+    fn logical_subgradients_match_the_documented_surrogate() {
+        let g = |op: Op, a: f64, b: f64| {
+            analytic_grad(&node(op, vec![constant(a), constant(b)]), &[0.0])
+        };
+        // and: d/da = [b>0], d/db = [a>0].
+        assert_eq!(g(Op::And, 1.0, 1.0), vec![1.0, 1.0]);
+        assert_eq!(g(Op::And, 1.0, -1.0), vec![0.0, 1.0]);
+        assert_eq!(g(Op::And, -1.0, -1.0), vec![0.0, 0.0]);
+        // or: d/da = 1-[b>0], d/db = 1-[a>0].
+        assert_eq!(g(Op::Or, 1.0, 1.0), vec![0.0, 0.0]);
+        assert_eq!(g(Op::Or, 1.0, -1.0), vec![1.0, 0.0]);
+        assert_eq!(g(Op::Or, -1.0, -1.0), vec![1.0, 1.0]);
+        // xor: d/da = 1-2[b>0], d/db = 1-2[a>0].
+        assert_eq!(g(Op::Xor, 1.0, 1.0), vec![-1.0, -1.0]);
+        assert_eq!(g(Op::Xor, 1.0, -1.0), vec![1.0, -1.0]);
+        assert_eq!(g(Op::Xor, -1.0, -1.0), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn constraint_gradients_pass_through_while_feasible() {
+        // require/constrain return their argument, so d/da = 1 while feasible.
+        assert_eq!(analytic_grad(&node(Op::Require, vec![constant(2.0)]), &[0.0]), vec![1.0]);
+        assert_eq!(analytic_grad(&node(Op::Constrain, vec![constant(2.0)]), &[0.0]), vec![1.0]);
+        // Violated: the value is NaN, so no gradient flows.
+        assert_eq!(analytic_grad(&node(Op::Require, vec![constant(-1.0)]), &[0.0]), vec![0.0]);
+        assert_eq!(analytic_grad(&node(Op::Constrain, vec![constant(0.0)]), &[0.0]), vec![0.0]);
+        // between(v, lo, hi) returns v; the bounds get no gradient.
+        let feasible =
+            node(Op::Between, vec![constant(1.0), constant(0.0), constant(2.0)]);
+        assert_eq!(analytic_grad(&feasible, &[0.0]), vec![1.0, 0.0, 0.0]);
+        let violated =
+            node(Op::Between, vec![constant(3.0), constant(0.0), constant(2.0)]);
+        assert_eq!(analytic_grad(&violated, &[0.0]), vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn fit_value_of_matches_the_public_evaluator() {
+        // The flat evaluator used by the fitter must agree with `expr::eval`
+        // on every new primitive.
+        let check = |tree: Node, x: &[f64]| {
+            let f = flatten(&tree);
+            let mut c = vec![0.0; f.nconst];
+            for i in 0..f.op.len() {
+                if f.cslot[i] >= 0 {
+                    c[f.cslot[i] as usize] = f.val[i];
+                }
+            }
+            let mut v = vec![0.0; f.op.len()];
+            eval_row(&f, x, &c, &mut v);
+            let got = v[f.root];
+            let want = expr::eval(&tree, x);
+            assert!(
+                (got.is_nan() && want.is_nan()) || got == want,
+                "flat {got} vs eval {want} for {tree:?}"
+            );
+        };
+        check(node(Op::Equal, vec![constant(2.0), constant(2.0)]), &[0.0]);
+        check(node(Op::Less, vec![constant(1.0), constant(2.0)]), &[0.0]);
+        check(node(Op::LessOrEqual, vec![constant(2.0), constant(2.0)]), &[0.0]);
+        check(node(Op::Greater, vec![constant(3.0), constant(2.0)]), &[0.0]);
+        check(node(Op::GreaterOrEqual, vec![constant(2.0), constant(2.0)]), &[0.0]);
+        check(node(Op::And, vec![constant(1.0), constant(-1.0)]), &[0.0]);
+        check(node(Op::Or, vec![constant(1.0), constant(-1.0)]), &[0.0]);
+        check(node(Op::Xor, vec![constant(1.0), constant(-1.0)]), &[0.0]);
+        check(node(Op::Not, vec![constant(0.0)]), &[0.0]);
+        check(node(Op::Require, vec![input(0)]), &[2.0]);
+        check(node(Op::Require, vec![input(0)]), &[-2.0]);
+        check(node(Op::Constrain, vec![input(0)]), &[2.0]);
+        check(node(Op::Between, vec![input(0), constant(-1.0), constant(1.0)]), &[0.5]);
+        check(node(Op::Between, vec![input(0), constant(-1.0), constant(1.0)]), &[2.0]);
     }
 
     /// Wrap scalars as single-input rows.

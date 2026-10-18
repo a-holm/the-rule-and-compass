@@ -78,8 +78,12 @@ A syntax error names the offending column:
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
-parentheses, the constants `pi` and `e`, and variable names from your table (the
-`x0`, `x1`, … fallback also works).
+comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
+`and`/`or`/`xor`/`not`, the positional constraint `between(x, lo, hi)`, and
+`require`/`constrain` (a violated constraint makes the candidate infeasible
+rather than merely wrong), parentheses, the constants `pi` and `e`, and variable
+names from your table (the `x0`, `x1`, … fallback also works). Comparisons are
+non-associative, so write `(a < b) and (b < c)`.
 
 `cargo test` runs the unit tests and the end-to-end recovery tests
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
@@ -321,7 +325,9 @@ list and the recorded results.
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
   sin cos tan sinh cosh tanh logistic gauss square cube`, `if`), plus the
   opt-in `floor ceil round mod min max sign step erf erfc atan2 asinh acosh
-  atanh` selected with `--ops` (all with domain guards);
+  atanh` and the conditional family
+  `equal less less_or_equal greater greater_or_equal and or xor not require
+  between constrain` selected with `--ops` (all with domain guards);
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
@@ -329,7 +335,8 @@ list and the recorded results.
   derivatives — one backward sweep gives every constant's gradient, with
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
-  `mod`/`min`/`max`);
+  `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant
+  `floor`/`ceil`/`round`/`sign`/`step`, the comparisons and `not`);
 - an **island-model, multi-objective** evolutionary search over an
   error/complexity **Pareto front**, with mutation, crossover, migration and
   restarts, run in parallel across islands;

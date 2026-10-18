@@ -45,6 +45,17 @@ Primitives (grouped as the UI groups them):
 - **logical** — `if(c, a, b)`, `= < <= > >= and or xor not`
 - **history** (optional) — delayed variables, moving averages
 
+In this engine the conditional family is **opt-in** (`--ops`): the comparisons
+`equal less less_or_equal greater greater_or_equal`, the logical operators
+`and or xor not`, and the positional constraints `require constrain between`.
+A comparison evaluates to `0`/`1`; a value counts as *true* when it is strictly
+positive. A **constraint** is different from a wrong prediction: `require(cond)`
+and `constrain(x)` return their (positive) argument when satisfied and a
+non-finite value when violated, and `between(x, lo, hi)` returns `x` only on the
+closed interval. Because a non-finite prediction makes the error metric infinite
+(§5), a violated constraint marks the candidate **infeasible** and removes it
+from the search rather than scoring it as a merely large error.
+
 ## 4. Complexity
 
 The second objective is a size measure of the expression. The simplest choice is

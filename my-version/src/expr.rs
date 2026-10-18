@@ -47,6 +47,19 @@ pub enum Op {
     Max,
     Atan2,
     If,
+    // Comparisons (0/1), logical operators and feasibility constraints.
+    Equal,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+    And,
+    Or,
+    Xor,
+    Not,
+    Require,
+    Between,
+    Constrain,
 }
 
 impl Op {
@@ -56,9 +69,10 @@ impl Op {
             Const | Input => 0,
             Neg | Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step
             | Gauss | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Asinh | Acosh
-            | Atanh => 1,
-            Add | Sub | Mul | Div | Pow | Mod | Min | Max | Atan2 => 2,
-            If => 3,
+            | Atanh | Not | Require | Constrain => 1,
+            Add | Sub | Mul | Div | Pow | Mod | Min | Max | Atan2 | Equal | Less | LessOrEqual
+            | Greater | GreaterOrEqual | And | Or | Xor => 2,
+            If | Between => 3,
         }
     }
 
@@ -102,14 +116,28 @@ impl Op {
             Max => "max",
             Atan2 => "atan2",
             If => "if",
+            Equal => "==",
+            Less => "<",
+            LessOrEqual => "<=",
+            Greater => ">",
+            GreaterOrEqual => ">=",
+            And => "and",
+            Or => "or",
+            Xor => "xor",
+            Not => "not",
+            Require => "require",
+            Between => "between",
+            Constrain => "constrain",
         }
     }
 
     /// Default operator set for a search (all non-terminal primitives).
     ///
-    /// The extended primitives (`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`) are
-    /// not in the default set: they are opt-in through `--ops` so that broad
-    /// searches are not diluted by them. Use [`Op::names`] for the full vocabulary.
+    /// The extended primitives (`Floor`…`Atanh`, `Mod`/`Min`/`Max`/`Atan2`) and
+    /// the conditional family (comparisons, `and`/`or`/`xor`/`not`, and the
+    /// constraints `require`/`between`/`constrain`) are not in the default set:
+    /// they are opt-in through `--ops` so that broad searches are not diluted by
+    /// them. Use [`Op::names`] for the full vocabulary.
     pub fn default_set() -> Vec<Op> {
         use Op::*;
         vec![
@@ -125,7 +153,8 @@ impl Op {
             "neg", "exp", "ln", "abs", "sqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh",
             "logistic", "step", "gauss", "square", "cube", "floor", "ceil", "round", "sign",
             "erf", "erfc", "asinh", "acosh", "atanh", "mod", "min", "max", "atan2", "add", "sub",
-            "mul", "div", "pow", "if",
+            "mul", "div", "pow", "if", "equal", "less", "less_or_equal", "greater",
+            "greater_or_equal", "and", "or", "xor", "not", "require", "between", "constrain",
         ]
     }
 
@@ -187,6 +216,18 @@ impl Op {
             "max" => Max,
             "atan2" => Atan2,
             "if" => If,
+            "equal" | "eq" | "==" => Equal,
+            "less" | "lt" | "<" => Less,
+            "less_or_equal" | "le" | "<=" => LessOrEqual,
+            "greater" | "gt" | ">" => Greater,
+            "greater_or_equal" | "ge" | ">=" => GreaterOrEqual,
+            "and" | "&&" => And,
+            "or" | "||" => Or,
+            "xor" => Xor,
+            "not" | "!" => Not,
+            "require" => Require,
+            "between" => Between,
+            "constrain" => Constrain,
             _ => return None,
         })
     }
@@ -333,6 +374,19 @@ pub fn erfc(x: f64) -> f64 {
         2.0 - q
     } else {
         q
+    }
+}
+
+/// Comparison helper for the `equal`…`greater_or_equal` primitives: `1.0` when
+/// `f(a, b)` holds, `0.0` otherwise, and `NaN` when either operand is `NaN`
+/// (which the search treats as a hard failure).
+fn cmp(a: f64, b: f64, f: impl Fn(f64, f64) -> bool) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else if f(a, b) {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -508,6 +562,77 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
                 eval(&n.kids[1], x)
             } else {
                 eval(&n.kids[2], x)
+            }
+        }
+        // Comparisons: 1/0, `NaN` if an operand is `NaN`.
+        Equal => cmp(eval(&n.kids[0], x), eval(&n.kids[1], x), |a, b| a == b),
+        Less => cmp(eval(&n.kids[0], x), eval(&n.kids[1], x), |a, b| a < b),
+        LessOrEqual => cmp(eval(&n.kids[0], x), eval(&n.kids[1], x), |a, b| a <= b),
+        Greater => cmp(eval(&n.kids[0], x), eval(&n.kids[1], x), |a, b| a > b),
+        GreaterOrEqual => cmp(eval(&n.kids[0], x), eval(&n.kids[1], x), |a, b| a >= b),
+        // Logical: a value is true when it is strictly positive (`0` is false,
+        // `NaN` propagates). `and`/`or`/`xor` return `1.0`/`0.0`.
+        And => {
+            let (a, b) = (eval(&n.kids[0], x), eval(&n.kids[1], x));
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else if a > 0.0 && b > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Or => {
+            let (a, b) = (eval(&n.kids[0], x), eval(&n.kids[1], x));
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else if a > 0.0 || b > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Xor => {
+            let (a, b) = (eval(&n.kids[0], x), eval(&n.kids[1], x));
+            if a.is_nan() || b.is_nan() {
+                f64::NAN
+            } else if (a > 0.0) != (b > 0.0) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        Not => {
+            let a = eval(&n.kids[0], x);
+            if a.is_nan() {
+                f64::NAN
+            } else if a > 0.0 {
+                0.0
+            } else {
+                1.0
+            }
+        }
+        // Constraints: return their argument when the condition holds, and a
+        // non-finite value (a hard failure for the whole candidate) when it is
+        // violated. See the module docs / SPEC.md 4.1 for the exact contract.
+        Require | Constrain => {
+            let a = eval(&n.kids[0], x);
+            if a > 0.0 {
+                a
+            } else {
+                f64::NAN
+            }
+        }
+        Between => {
+            let (v, lo, hi) = (
+                eval(&n.kids[0], x),
+                eval(&n.kids[1], x),
+                eval(&n.kids[2], x),
+            );
+            if lo <= v && v <= hi {
+                v
+            } else {
+                f64::NAN
             }
         }
     }
@@ -706,6 +831,33 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
             n.op.symbol(),
             to_string(&n.kids[0], vars),
             to_string(&n.kids[1], vars)
+        ),
+        // Comparisons and the binary logical operators print infix inside
+        // parentheses, so the printed form parses back unambiguously.
+        Equal | Less | LessOrEqual | Greater | GreaterOrEqual | And | Or | Xor => {
+            let s = match n.op {
+                Equal => " == ",
+                Less => " < ",
+                LessOrEqual => " <= ",
+                Greater => " > ",
+                GreaterOrEqual => " >= ",
+                And => " and ",
+                Or => " or ",
+                _ => " xor ",
+            };
+            format!(
+                "({}{}{})",
+                to_string(&n.kids[0], vars),
+                s,
+                to_string(&n.kids[1], vars)
+            )
+        }
+        Not => format!("(not {})", to_string(&n.kids[0], vars)),
+        Between => format!(
+            "between({}, {}, {})",
+            to_string(&n.kids[0], vars),
+            to_string(&n.kids[1], vars),
+            to_string(&n.kids[2], vars)
         ),
         _ => format!("{}({})", n.op.symbol(), to_string(&n.kids[0], vars)),
     }
