@@ -175,6 +175,14 @@ MODE:
                              split, print the result and exit. Write variables
                              by name in original units, e.g. \"2.5*x + sin(y)\";
                              operators as in --ops. `x0,x1,..` also work.
+  --function <def>           define a reusable building block (repeatable, up to
+                             four): \"name(a,b)=sin(a)*cos(b)\" or
+                             \"name=<expr>\" (parameters are the free variables
+                             in order of first appearance). Blocks are searched
+                             as operators of their own arity, named in output,
+                             and cost 1 by default; set a cost with
+                             --op-complexity. Constants inside a body are shared
+                             by every call. See docs/building-blocks.md.
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
@@ -187,7 +195,9 @@ SEARCH:
   --pop <P>                  population per island (default 200)
   --max-complexity <K>       max configured complexity per expression (default 30)
   --op-complexity <spec>     per-operator costs, e.g. \"pow=2,sin=1.5,if=3\";
-                             operators not listed keep the default cost of 1
+                             operators not listed keep the default cost of 1.
+                             A block costs 1 unless set here, by its --function
+                             name or its custom0..custom3 slot
   --complexity-weights <s>   terminal weights, e.g. \"var=1,const=1\"; keys
                              var, const and depth (default: 1, 1 and 0)
   --depth-weight <w>         cost per nesting level, i.e. edge below the root
@@ -260,6 +270,19 @@ EXIT CODES:
     )
 }
 
+
+fn expand_block_aliases(spec: &str, blocks: &[expr::Block]) -> String {
+    spec.split(',')
+        .map(|token| match token.split_once('=') {
+            Some((name, cost)) => match blocks.iter().position(|b| b.name == name.trim()) {
+                Some(slot) => format!("{}={}", Op::Custom(slot).symbol(), cost),
+                None => token.to_string(),
+            },
+            None => token.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
 
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
@@ -454,6 +477,7 @@ fn main() {
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
     let mut seed_files: Vec<String> = Vec::new();
+    let mut function_defs: Vec<String> = Vec::new();
     let mut stability_runs = 0usize;
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
@@ -554,12 +578,9 @@ fn main() {
                 max_complexity_set = true;
             }
             "--op-complexity" => {
-                let v = val!();
-                if let Err(e) = cfg.complexity_model.apply_op_costs(&v) {
-                    eprintln!("error: {}", e);
-                    std::process::exit(EXIT_USAGE);
-                }
-                op_complexity_spec = Some(v);
+                // Applied after --function definitions are known, so a user's
+                // block name can be resolved to its slot.
+                op_complexity_spec = Some(val!());
             }
             "--complexity-weights" => {
                 let v = val!();
@@ -664,6 +685,7 @@ fn main() {
                 ops_set = true;
             }
             "--eval-expr" => eval_expr = Some(val!()),
+            "--function" => function_defs.push(val!()),
             "--seed-expr" => seed_exprs.push(val!()),
             "--seed-file" => seed_files.push(val!()),
             "--stability" => stability_runs = val!().parse().unwrap_or(0),
@@ -784,6 +806,13 @@ fn main() {
         i += 1;
     }
 
+    if !function_defs.is_empty() && (save_path.is_some() || resume_path.is_some()) {
+        eprintln!(
+            "error: --function cannot be combined with --save or --resume \
+             (a checkpoint does not store block definitions)"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     if report_out.is_some() && report.is_none() {
         eprintln!("error: --report-out requires --report summary|sensitivity|benchmark");
         std::process::exit(EXIT_USAGE);
@@ -967,6 +996,40 @@ fn main() {
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
+    }
+
+    // User-defined building blocks (issue #10). The definitions are parsed
+    // before the data so a syntax error is reported as a usage error; the
+    // thread-local registry makes them visible to the parser, the evaluator,
+    // the fitter and every search island.
+    let blocks = match expr::parse_blocks(&function_defs) {
+        Ok(blocks) => blocks,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
+    };
+    if blocks.is_empty() && cfg.ops.iter().any(|op| op.is_custom()) {
+        eprintln!(
+            "error: --ops names a custom slot but no --function was supplied"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if !blocks.is_empty() {
+        expr::set_blocks(blocks.clone());
+        for slot in 0..blocks.len() {
+            let op = Op::Custom(slot);
+            if !cfg.ops.contains(&op) {
+                cfg.ops.push(op);
+            }
+        }
+    }
+    if let Some(spec) = &op_complexity_spec {
+        let spec = expand_block_aliases(spec, &blocks);
+        if let Err(e) = cfg.complexity_model.apply_op_costs(&spec) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
     }
 
     let data_path = match data_path {
@@ -2553,6 +2616,8 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
                 .iter()
                 .map(|k| normalise_inputs(k, means, stds))
                 .collect(),
+            // A block body is in parameter space and must not be rewritten.
+            block: n.block.clone(),
         },
     }
 }

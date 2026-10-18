@@ -593,6 +593,10 @@ fn run_search(
 ) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
     let t0 = std::time::Instant::now();
+    // #10: user-defined blocks are thread-local. Snapshot the registry here so
+    // every island thread (and the initial population below) sees the same
+    // definitions; the list is empty unless --function was supplied.
+    let blocks = expr::current_blocks();
 
     let mut rng: Mt;
     let mut archive: Archive;
@@ -770,7 +774,14 @@ fn run_search(
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
-                    .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
+                    .map(|(isl, r)| {
+                        // #10: carry the block registry into the island thread.
+                        let blocks = blocks.clone();
+                        s.spawn(move || {
+                            expr::set_blocks(blocks);
+                            evolve_island(isl, r, cfg, gen_train, nvars)
+                        })
+                    })
                     .collect();
                 for h in handles {
                     let _ = h.join();

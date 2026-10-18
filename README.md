@@ -144,6 +144,24 @@ input error (exit 3). `--json` reports a `seeds` array and `--ndjson` a `seed`
 event per seed. See [`docs/seeds.md`](docs/seeds.md) for the processing order,
 the elite rule, the file format and the measured before/after numbers.
 
+## Building blocks
+
+`--function` (repeatable, up to four) supplies a sub-formula the search may
+reuse as an operator of its own:
+
+```sh
+cargo run --release -- --data examples/sine.csv --target y --vars x \
+  --function "wave(a)=sin(a)" --generations 100
+```
+
+A definition is `name(a,b)=<expr>` or `name=<expr>` (parameters inferred from
+the free variables). The recovered model prints the name, e.g. `y = wave(x)`,
+and the definition's constants are shared by every call.
+A block costs 1 by default and can be priced with
+`--op-complexity "wave=2"` (or `custom0=2`); the Pareto front ranks on that
+cost. See [`docs/building-blocks.md`](docs/building-blocks.md) for the syntax,
+parameter inference, shared-constant fitting and limits.
+
 ## Choosing what "complexity" means
 
 By default complexity is the node count. `--op-complexity "pow=2,sin=1.5"`,
@@ -677,6 +695,7 @@ docs/weights.md               per-row weights, weighted metrics and weighted lea
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/meta-operators.md        structural meta operators and their cache rule
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
+docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan

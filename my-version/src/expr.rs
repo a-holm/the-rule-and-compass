@@ -6,7 +6,7 @@
 use crate::rng::Mt;
 
 /// The expression parser, re-exported so callers can write [`crate::expr::parse`].
-pub use crate::parse::{parse, ParseError};
+pub use crate::parse::{parse, parse_block, parse_blocks, parse_with, ParseError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
@@ -67,13 +67,53 @@ pub enum Op {
     Constants,
     Contains,
     ContainsOp,
+    // User-defined building blocks (issue #10). The four slots are appended
+    // last so every historical discriminant, and therefore every saved
+    // checkpoint, keeps its meaning. Use [`Op::Custom`] to name one.
+    Custom0,
+    Custom1,
+    Custom2,
+    Custom3,
 }
 
 impl Op {
     /// Number of operator variants. `Op` is a fieldless enum, so a discriminant
     /// is a valid dense index into a cost table; `complexity::ComplexityModel`
     /// relies on this. A new variant must bump the count (a test guards it).
-    pub const COUNT: usize = 54;
+    pub const COUNT: usize = 58;
+
+    /// The `Op::Custom(slot)` spelling used throughout the code for a
+    /// user-defined building block. `Op` stays a fieldless enum (so it remains
+    /// `Copy` and a valid cost-table index); the slot is one of `0..=3`.
+    ///
+    /// The **arity** of a custom operator comes from the thread-local block
+    /// registry installed with [`set_blocks`], because it is a property of the
+    /// user's definition, not of the variant. A custom operator with no
+    /// installed block has arity `0` and evaluates to `NaN`.
+    #[allow(non_snake_case)]
+    pub const fn Custom(slot: usize) -> Op {
+        match slot {
+            0 => Op::Custom0,
+            1 => Op::Custom1,
+            2 => Op::Custom2,
+            _ => Op::Custom3,
+        }
+    }
+
+    /// The slot of a user-defined block, or `None` for a primitive.
+    pub fn custom_slot(self) -> Option<usize> {
+        match self {
+            Op::Custom0 => Some(0),
+            Op::Custom1 => Some(1),
+            Op::Custom2 => Some(2),
+            Op::Custom3 => Some(3),
+            _ => None,
+        }
+    }
+
+    pub fn is_custom(self) -> bool {
+        self.custom_slot().is_some()
+    }
 
     /// Whether this operator inspects its argument's structure instead of
     /// evaluating it per row. Meta nodes cache their result in [`Node::val`];
@@ -90,6 +130,11 @@ impl Op {
         use Op::*;
         match self {
             Const | Input => 0,
+            Custom0 | Custom1 | Custom2 | Custom3 => {
+                block_for_slot(self.custom_slot().unwrap())
+                    .map(|b| b.params.len())
+                    .unwrap_or(0)
+            }
             Neg | Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step
             | Gauss | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Asinh | Acosh
             | Atanh | Not | Require | Constrain | Complexity | Variables | Constants | Contains
@@ -157,6 +202,10 @@ impl Op {
             Constants => "constants",
             Contains => "contains",
             ContainsOp => "contains_op",
+            Custom0 => "custom0",
+            Custom1 => "custom1",
+            Custom2 => "custom2",
+            Custom3 => "custom3",
         }
     }
 
@@ -178,6 +227,10 @@ impl Op {
 
     /// Canonical names accepted by [`Op::parse_list`], in a stable order. Used by
     /// the `schema` output so callers can discover the full primitive set.
+    ///
+    /// The four `custom0..custom3` slots are deliberately absent: they are
+    /// enabled by `--function` and their arity comes from the supplied
+    /// definition, so they are not part of the static vocabulary.
     pub fn names() -> &'static [&'static str] {
         &[
             "neg", "exp", "ln", "abs", "sqrt", "sin", "cos", "tan", "sinh", "cosh", "tanh",
@@ -285,12 +338,16 @@ impl Op {
             "constants" => Constants,
             "contains" => Contains,
             "contains_op" => ContainsOp,
+            "custom0" => Custom0,
+            "custom1" => Custom1,
+            "custom2" => Custom2,
+            "custom3" => Custom3,
             _ => return None,
         })
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Node {
     pub op: Op,
     /// `Const` -> value; `Input` -> variable index; a meta operator -> its
@@ -298,6 +355,65 @@ pub struct Node {
     /// [`node`], never from a literal.
     pub val: f64,
     pub kids: Vec<Node>,
+    /// For `Op::Custom(slot)` only: the user's definition. Every use of the
+    /// block carries its own copy so a candidate can hold fitted constants
+    /// without mutating a process-wide table; the fitter keeps the copies of
+    /// one slot in step (see `docs/building-blocks.md`).
+    pub block: Option<Box<Block>>,
+}
+
+/// A user-defined building block (`--function`).
+///
+/// `params` are the names used inside `body`; the body refers to them through
+/// [`Op::Input`] with the parameter's index, exactly like a compiled function.
+/// A use of the block is an [`Op::Custom`] node whose children are the argument
+/// expressions; [`eval`] substitutes their values for the parameters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Block {
+    /// The name the user wrote (or `customN` when the definition had no name).
+    pub name: String,
+    /// Parameter names, in order of first appearance for `name=expr`.
+    pub params: Vec<String>,
+    /// Body in parameter space (`Input(i)` is `params[i]`).
+    pub body: Node,
+}
+
+impl Block {
+    /// The canonical slot name, used when a definition omits a parameter list.
+    pub fn slot_name(slot: usize) -> String {
+        format!("custom{slot}")
+    }
+}
+
+thread_local! {
+    /// The blocks visible to the current thread. Search islands inherit a copy
+    /// explicitly (they are new threads); the CLI installs the command-line
+    /// definitions before the run. Empty means "no `--function`", which keeps
+    /// every historical code path unchanged.
+    static BLOCKS: std::cell::RefCell<Vec<Block>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Install the process's user-defined blocks on the current thread.
+pub fn set_blocks(blocks: Vec<Block>) {
+    BLOCKS.with(|cell| *cell.borrow_mut() = blocks);
+}
+
+/// A copy of the blocks visible on the current thread.
+pub fn current_blocks() -> Vec<Block> {
+    BLOCKS.with(|cell| cell.borrow().clone())
+}
+
+fn block_for_slot(slot: usize) -> Option<Block> {
+    BLOCKS.with(|cell| cell.borrow().get(slot).cloned())
+}
+
+/// Arity of the custom operator in `slot` under the current thread's blocks.
+pub fn block_arity(slot: usize) -> usize {
+    block_for_slot(slot).map(|b| b.params.len()).unwrap_or(0)
+}
+
+fn block_arity_of(op: Op) -> usize {
+    op.arity()
 }
 
 pub fn constant(v: f64) -> Node {
@@ -305,6 +421,7 @@ pub fn constant(v: f64) -> Node {
         op: Op::Const,
         val: v,
         kids: Vec::new(),
+        block: None,
     }
 }
 
@@ -313,12 +430,15 @@ pub fn input(i: usize) -> Node {
         op: Op::Input,
         val: i as f64,
         kids: Vec::new(),
+        block: None,
     }
 }
 
 /// Build an operator node. For a meta operator the structural value is
 /// computed immediately and stored in `val`, so every constructor path (the
 /// parser, `random_tree`, mutation and crossover) produces a consistent node.
+/// A [`Op::Custom`] node automatically carries a copy of the current thread's
+/// block definition, which is what makes a generated call evaluable.
 pub fn node(op: Op, kids: Vec<Node>) -> Node {
     let val = if op.is_meta() {
         debug_assert_eq!(kids.len(), 1, "meta operators are unary");
@@ -326,7 +446,28 @@ pub fn node(op: Op, kids: Vec<Node>) -> Node {
     } else {
         0.0
     };
-    Node { op, val, kids }
+    let block = op
+        .custom_slot()
+        .and_then(block_for_slot)
+        .map(Box::new);
+    Node {
+        op,
+        val,
+        kids,
+        block,
+    }
+}
+
+/// Build a custom call with an explicit definition, for the parser while it
+/// validates a new `--function` (the new block is not yet on the thread).
+pub fn custom_node(op: Op, kids: Vec<Node>, block: Block) -> Node {
+    debug_assert!(op.is_custom(), "{op:?} is not a custom operator");
+    Node {
+        op,
+        val: 0.0,
+        kids,
+        block: Some(Box::new(block)),
+    }
 }
 
 /// Build a meta operator node from `kind` and its one child.
@@ -543,6 +684,16 @@ pub fn eval(n: &Node, x: &[f64]) -> f64 {
     use Op::*;
     match n.op {
         Const => n.val,
+        // A block call: evaluate the arguments, then evaluate the body with
+        // `Input(i)` bound to argument `i`. The body is parameter space, so no
+        // row is involved beyond the arguments' own inputs.
+        Custom0 | Custom1 | Custom2 | Custom3 => {
+            let Some(block) = &n.block else {
+                return f64::NAN;
+            };
+            let args: Vec<f64> = n.kids.iter().map(|k| eval(k, x)).collect();
+            eval(&block.body, &args)
+        }
         Input => {
             let i = n.val as usize;
             if i < x.len() {
@@ -812,9 +963,30 @@ pub fn complexity(n: &Node) -> usize {
 /// A meta operator is never counted itself. Constant leaves *inside* its
 /// argument are real leaves and stay counted, but the zero gradient through a
 /// meta node means the fitter cannot identify them from the model output.
+///
+/// Constants inside a block body are **shared** by every use of that block, so
+/// they are counted once per distinct slot no matter how many calls appear.
 pub fn count_constants(n: &Node) -> usize {
-    let me = if n.op == Op::Const { 1 } else { 0 };
-    me + n.kids.iter().map(count_constants).sum::<usize>()
+    let mut seen = [false; 4];
+    count_constants_seen(n, &mut seen)
+}
+
+fn count_constants_seen(n: &Node, seen: &mut [bool; 4]) -> usize {
+    let mut total = usize::from(n.op == Op::Const);
+    total += n
+        .kids
+        .iter()
+        .map(|k| count_constants_seen(k, seen))
+        .sum::<usize>();
+    if let Some(slot) = n.op.custom_slot() {
+        if !seen[slot] {
+            seen[slot] = true;
+            if let Some(block) = &n.block {
+                total += count_constants_seen(&block.body, seen);
+            }
+        }
+    }
+    total
 }
 
 pub fn nth<'a>(n: &'a Node, i: usize) -> Option<&'a Node> {
@@ -899,20 +1071,23 @@ pub fn mutate(n: &mut Node, rng: &mut Mt, nvars: usize, ops: &[Op]) {
                 // flip terminal kind, or re-value
                 if t.op == Op::Const {
                     t.val = perturb(rng, t.val);
-                } else if nvars > 0 {
+                } else if t.op == Op::Input && nvars > 0 {
                     t.val = rng.usize_below(nvars) as f64;
                 }
+                // A zero-arity custom block is a named constant: leave it.
             } else {
                 let cands: Vec<Op> = ops
                     .iter()
                     .copied()
-                    .filter(|o| o.arity() == ar && *o != t.op)
+                    .filter(|o| block_arity_of(*o) == ar && *o != t.op)
                     .collect();
                 if !cands.is_empty() {
                     t.op = cands[rng.usize_below(cands.len())];
                     // `val` belongs to the old operator; meta operators get a
                     // fresh structural value in the refresh below.
                     t.val = 0.0;
+                    // #10: a custom operator carries its block definition.
+                    t.block = t.op.custom_slot().and_then(block_for_slot).map(Box::new);
                     t.kids.truncate(t.op.arity());
                     while t.kids.len() < t.op.arity() {
                         t.kids.push(constant(1.0));
@@ -972,6 +1147,16 @@ pub fn to_string(n: &Node, vars: &[String]) -> String {
     use Op::*;
     match n.op {
         Const => fmt_f(n.val),
+        // A block prints by the user's name (or `customN`), with its arguments.
+        Custom0 | Custom1 | Custom2 | Custom3 => {
+            let name = n
+                .block
+                .as_ref()
+                .map(|b| b.name.clone())
+                .unwrap_or_else(|| n.op.symbol().to_string());
+            let args: Vec<String> = n.kids.iter().map(|k| to_string(k, vars)).collect();
+            format!("{}({})", name, args.join(", "))
+        }
         Input => {
             let i = n.val as usize;
             vars.get(i)
@@ -1058,12 +1243,14 @@ fn near_val(n: &Node, v: f64, rel: f64) -> bool {
         .unwrap_or(false)
 }
 
-/// Structural equality (exact shape and constant values).
+/// Structural equality (exact shape, constant values and a custom block's
+/// definition).
 pub fn same(a: &Node, b: &Node) -> bool {
     a.op == b.op
         && a.val.to_bits() == b.val.to_bits()
         && a.kids.len() == b.kids.len()
         && a.kids.iter().zip(&b.kids).all(|(x, y)| same(x, y))
+        && a.block == b.block
 }
 
 /// FNV-1a structural hash, for de-duplicating equivalent candidates before
@@ -1079,6 +1266,17 @@ pub fn structural_hash(n: &Node) -> u64 {
         mix(h, n.kids.len() as u64);
         for k in &n.kids {
             go(k, h);
+        }
+        // A custom call's fitted body constants are part of its structure.
+        if let Some(block) = &n.block {
+            mix(h, 1);
+            for b in block.name.bytes() {
+                mix(h, b as u64);
+            }
+            mix(h, block.params.len() as u64);
+            go(&block.body, h);
+        } else {
+            mix(h, 0);
         }
     }
     let mut h = 0xcbf2_9ce4_8422_2325u64;
@@ -1136,8 +1334,18 @@ pub fn simplify(n: &Node) -> Node {
         op: n.op,
         val: n.val,
         kids: n.kids.iter().map(simplify).collect(),
+        block: n.block.clone(),
     };
     if m.op == Const || m.op == Input {
+        return m;
+    }
+    // A block call is kept named (that is the point of supplying it), but its
+    // body is simplified in parameter space. Its constants stay shared by every
+    // use; the fitter synchronises the copies (see `docs/building-blocks.md`).
+    if m.op.is_custom() {
+        if let Some(block) = &mut m.block {
+            block.body = simplify(&block.body);
+        }
         return m;
     }
     // Simplifying the argument can change its shape, so a meta node must take
@@ -1236,11 +1444,23 @@ pub fn simplify(n: &Node) -> Node {
 /// that argument's node count and make the printed value disagree with the
 /// model. `to_string` still prints input names for the untouched argument.
 pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
+    // A block body is in parameter space: parameter `Input(i)` is bound to an
+    // argument, not to a data column, so only the calls' arguments are
+    // rewritten. The definition is carried over unchanged.
+    if n.op.is_custom() {
+        return Node {
+            op: n.op,
+            val: n.val,
+            kids: n.kids.iter().map(|k| denormalize(k, means, stds)).collect(),
+            block: n.block.clone(),
+        };
+    }
     if n.op.is_meta() {
         return Node {
             op: n.op,
             val: n.val,
             kids: n.kids.clone(),
+            block: None,
         };
     }
     match n.op {
@@ -1257,6 +1477,7 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
             op: n.op,
             val: n.val,
             kids: n.kids.iter().map(|k| denormalize(k, means, stds)).collect(),
+            block: n.block.clone(),
         },
     }
 }

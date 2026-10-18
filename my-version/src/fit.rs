@@ -28,9 +28,36 @@ struct Flat {
     cslot: Vec<i32>,
     root: usize,
     nconst: usize,
+    /// Shared constant nodes inside block bodies, keyed by (block slot,
+    /// constant ordinal in that body). Every use of a block maps its body
+    /// constants to the same flat node, so one constant is fitted once and all
+    /// uses follow.
+    shared: std::collections::HashMap<(usize, usize), usize>,
+    /// The constant slots of ordinary (non-body) constants, in the same order
+    /// as `const_positions` visits them. Body constants are omitted.
+    normal_order: Vec<usize>,
+}
+
+fn push_flat(f: &mut Flat, op: Op, val: f64, kids: Vec<usize>, cslot: i32) -> usize {
+    f.op.push(op);
+    f.val.push(val);
+    f.kids.push(kids);
+    f.cslot.push(cslot);
+    f.op.len() - 1
 }
 
 fn build(n: &Node, f: &mut Flat) -> usize {
+    // A block call is inlined for the fit: the body is built in parameter
+    // space, its parameter leaves are replaced by the argument sub-trees, and
+    // its constants are shared (see `Flat::shared`).
+    if let Some(slot) = n.op.custom_slot() {
+        let args: Vec<usize> = n.kids.iter().map(|k| build(k, f)).collect();
+        if let Some(block) = &n.block {
+            let mut ordinal = 0;
+            return build_body(&block.body, f, slot, &args, &mut ordinal);
+        }
+        return push_flat(f, Op::Const, f64::NAN, Vec::new(), -1);
+    }
     let mut kids = Vec::with_capacity(n.kids.len());
     for k in &n.kids {
         kids.push(build(k, f));
@@ -38,15 +65,62 @@ fn build(n: &Node, f: &mut Flat) -> usize {
     let slot = if n.op == Op::Const {
         let s = f.nconst as i32;
         f.nconst += 1;
+        f.normal_order.push(s as usize);
         s
     } else {
         -1
     };
-    f.op.push(n.op);
-    f.val.push(n.val);
-    f.kids.push(kids);
-    f.cslot.push(slot);
-    f.op.len() - 1
+    push_flat(f, n.op, n.val, kids, slot)
+}
+
+/// Build one block body. `slot` identifies the block whose constants are
+/// shared, `args` are the flat indices of the call's argument sub-trees (for
+/// `Input(i)`) and `ordinal` counts the body's constants in traversal order.
+fn build_body(
+    n: &Node,
+    f: &mut Flat,
+    slot: usize,
+    args: &[usize],
+    ordinal: &mut usize,
+) -> usize {
+    if n.op == Op::Input {
+        let i = n.val as usize;
+        return args.get(i).copied().unwrap_or_else(|| {
+            push_flat(f, Op::Const, f64::NAN, Vec::new(), -1)
+        });
+    }
+    if n.op == Op::Const {
+        let ord = *ordinal;
+        *ordinal += 1;
+        if let Some(&ix) = f.shared.get(&(slot, ord)) {
+            return ix;
+        }
+        let s = f.nconst as i32;
+        f.nconst += 1;
+        let ix = push_flat(f, Op::Const, n.val, Vec::new(), s);
+        f.shared.insert((slot, ord), ix);
+        return ix;
+    }
+    if let Some(inner) = n.op.custom_slot() {
+        // A block used inside another block: its arguments are in the outer
+        // body's parameter space, then its own body gets a fresh ordinal.
+        let arg_ix: Vec<usize> = n
+            .kids
+            .iter()
+            .map(|k| build_body(k, f, slot, args, ordinal))
+            .collect();
+        if let Some(block) = &n.block {
+            let mut inner_ord = 0;
+            return build_body(&block.body, f, inner, &arg_ix, &mut inner_ord);
+        }
+        return push_flat(f, Op::Const, f64::NAN, Vec::new(), -1);
+    }
+    let kids: Vec<usize> = n
+        .kids
+        .iter()
+        .map(|k| build_body(k, f, slot, args, ordinal))
+        .collect();
+    push_flat(f, n.op, n.val, kids, -1)
 }
 
 fn flatten(root: &Node) -> Flat {
@@ -57,6 +131,8 @@ fn flatten(root: &Node) -> Flat {
         cslot: Vec::new(),
         root: 0,
         nconst: 0,
+        shared: std::collections::HashMap::new(),
+        normal_order: Vec::new(),
     };
     f.root = build(root, &mut f);
     f
@@ -217,6 +293,9 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         // row-independent by construction; the flat copy keeps it so a fitted
         // constant inside the argument cannot change it.
         Complexity | Variables | Constants | Contains | ContainsOp => node_val,
+        // Block calls are inlined by `build`, so no custom operator reaches
+        // the flat representation.
+        Custom0 | Custom1 | Custom2 | Custom3 => f64::NAN,
     }
 }
 
@@ -499,6 +578,8 @@ fn backward_impl(
             // move them, so their gradient is zero (like `floor`/`step`).
             // Nothing flows into the argument either.
             Complexity | Variables | Constants | Contains | ContainsOp => {}
+            // Block calls are inlined by `build`, so this is unreachable.
+            Custom0 | Custom1 | Custom2 | Custom3 => {}
             Const | Input => {}
         }
     }
@@ -750,12 +831,71 @@ pub fn fit_weighted(
     let mut positions = Vec::new();
     let mut counter = 0;
     const_positions(tree, &mut positions, &mut counter);
-    for (slot, &pos) in positions.iter().enumerate() {
-        if let Some(t) = expr::nth_mut(tree, pos) {
+    for (pos, &slot) in positions.iter().zip(&f.normal_order) {
+        if let Some(t) = expr::nth_mut(tree, *pos) {
             t.val = best_c[slot];
         }
     }
+    // Shared constants live in block bodies, which `nth` does not traverse;
+    // every use of a slot gets the same fitted value. `Flat::shared` holds the
+    // reused *flat node* index, so translate it to the constant slot first.
+    let shared_slots: std::collections::HashMap<(usize, usize), usize> = f
+        .shared
+        .iter()
+        .map(|(key, &ix)| (*key, f.cslot[ix].max(0) as usize))
+        .collect();
+    apply_shared_constants(tree, &shared_slots, &best_c);
     best_sse
+}
+
+/// Write the fitted shared constants back into every block body in `tree`.
+fn apply_shared_constants(
+    n: &mut Node,
+    shared: &std::collections::HashMap<(usize, usize), usize>,
+    best: &[f64],
+) {
+    if let Some(slot) = n.op.custom_slot() {
+        if let Some(block) = &mut n.block {
+            let mut ordinal = 0;
+            apply_shared_body(&mut block.body, slot, shared, best, &mut ordinal);
+        }
+    }
+    for k in &mut n.kids {
+        apply_shared_constants(k, shared, best);
+    }
+}
+
+fn apply_shared_body(
+    n: &mut Node,
+    slot: usize,
+    shared: &std::collections::HashMap<(usize, usize), usize>,
+    best: &[f64],
+    ordinal: &mut usize,
+) {
+    if n.op == Op::Input {
+        return;
+    }
+    if n.op == Op::Const {
+        let ord = *ordinal;
+        *ordinal += 1;
+        if let Some(&cs) = shared.get(&(slot, ord)) {
+            n.val = best[cs];
+        }
+        return;
+    }
+    if let Some(inner) = n.op.custom_slot() {
+        for k in &mut n.kids {
+            apply_shared_body(k, slot, shared, best, ordinal);
+        }
+        if let Some(block) = &mut n.block {
+            let mut inner_ord = 0;
+            apply_shared_body(&mut block.body, inner, shared, best, &mut inner_ord);
+        }
+        return;
+    }
+    for k in &mut n.kids {
+        apply_shared_body(k, slot, shared, best, ordinal);
+    }
 }
 
 /// Standard errors of the fitted constants, from the Gauss–Newton Jacobian at

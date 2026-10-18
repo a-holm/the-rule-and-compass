@@ -154,6 +154,35 @@ operators are ordinary unary calls in this grammar
 (`complexity(x1 * x2)`), and the parsed node caches the structural value.
 `--eval-expr` exposes the parser on the command line.
 
+### 4.2 User-defined building blocks (`--function`)
+
+Up to four `--function` definitions make a sub-formula available as an operator
+of its own arity. The syntax is `name(a,b)=<expr>` or `name=<expr>`; in the
+latter form the parameters are the free variables in order of first appearance.
+A body is parsed with the same grammar and may call only blocks defined before
+it, so recursion and forward references are rejected. Names must be unique and
+must not shadow a primitive or a canonical slot name (`custom0`..`custom3`).
+Each definition occupies the slot matching its position. A block has 0 to 4
+parameters.
+
+A call `name(e1, e2)` is an expression node with two children. Evaluation
+substitutes the argument values for the body's parameters and evaluates the
+body. The printed form uses the user's name (`name(e1, e2)`) and parses back
+when the same definitions are supplied. Constants inside a body are **shared**
+by every call in a candidate: the constant fitter maps them to one parameter
+per `(block slot, constant ordinal)`, writes the fitted value back into every
+use, and `count_constants` counts them once per block, not once per call.
+
+A block costs its configured operator cost (default `1`) plus the cost of its
+arguments; the body's internal nodes are not charged again. `--op-complexity`
+accepts either the user's name or the canonical slot. Supplying a block adds its
+slot to the run's operator set. Without `--function` no custom operator exists
+and behaviour is unchanged. `--function` is incompatible with `--save` and
+`--resume`, because the checkpoint format does not store definitions.
+
+See [`docs/building-blocks.md`](docs/building-blocks.md) for examples and the
+shared-constant fitting rule.
+
 ## 5. Complexity
 
 Every candidate has a **configured complexity**
@@ -175,7 +204,9 @@ complexity(f) = sum(op_cost)              # over operator nodes only
   `depth_weight = 0`. The value is then exactly the number of nodes, bit for
   bit, which is the historical behaviour.
 - `--op-complexity "pow=2,sin=1.5,if=3"` sets per-operator costs. Names use the
-  same table as `--ops`; any operator not listed keeps the cost `1`.
+  same table as `--ops`; any operator not listed keeps the cost `1`. A
+  user-defined block is priced by its name or `customN`; its body is not
+  re-priced, so the cost is the price of the block as one primitive.
 - `--complexity-weights "var=1,const=1"` sets terminal weights. The keys are
   `var` (aliases `variable`, `input`) and `const` (alias `constant`); `depth`
   is also accepted as a synonym for `--depth-weight`.

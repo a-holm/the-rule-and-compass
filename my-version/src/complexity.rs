@@ -237,8 +237,8 @@ mod tests {
     #[test]
     fn op_count_covers_every_variant() {
         // `Op::COUNT` indexes a table by discriminant; a new variant at the end
-        // must bump it. `Op::ContainsOp` is the last variant today.
-        assert_eq!(Op::ContainsOp as usize + 1, Op::COUNT);
+        // must bump it. `Op::Custom(3)` is the last variant today.
+        assert_eq!(Op::Custom(3) as usize + 1, Op::COUNT);
     }
 
     #[test]
