@@ -169,7 +169,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
-     [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
+     [--fit-iters N] [--no-fit] [--no-dedup] [--predictor-samples N]
+     [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
 ```
@@ -411,6 +412,9 @@ list and the recorded results.
 - **structural de-duplication** and **convergence/time-budget stopping**, so the
   same expression is never evaluated twice and the search stops when there is
   nothing left to gain;
+- **subsampled fitness** (`--predictor-samples N`): each generation scores and
+  fits candidates on `N` training rows drawn without replacement, while the
+  archive and every reported error are re-scored on the full training set;
 - **split modes for time series and panel data** (`random`, `temporal`, `group`,
   `temporal-group`, `auto`) with an embargo gap, per-block test errors and
   **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a

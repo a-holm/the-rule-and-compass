@@ -41,6 +41,10 @@ pub struct Config {
     pub time_budget: Option<f64>,
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
+    /// Number of training rows used to score and fit candidates in a
+    /// generation. `None`, or any value at least the training size, scores the
+    /// full training sample. Values below 2 are rejected by the CLI.
+    pub predictor_samples: Option<usize>,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
 }
@@ -74,6 +78,7 @@ impl Default for Config {
             dedup: true,
             time_budget: None,
             patience: 40,
+            predictor_samples: None,
             progress: None,
         }
     }
@@ -113,6 +118,96 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric.
     score_with_constants(&pred, &s.y, metric, expr::count_constants(tree))
+}
+
+/// True when candidate scoring should use a per-generation subset of the
+/// training rows. A request at least as large as the training sample is a
+/// no-op: the full sample is used, in its original order, so the search is
+/// bit-for-bit identical to leaving the option unset.
+fn subsampling_active(cfg: &Config, train: &Sample) -> bool {
+    matches!(cfg.predictor_samples, Some(n) if n < train.len())
+}
+
+/// Seed of the dedicated RNG stream for one generation's row subset.
+///
+/// Kept separate from every other RNG in the engine: turning subsampling on or
+/// off therefore changes only how candidates are scored, never the search's own
+/// mutation, crossover or restart decisions.
+fn subset_seed(seed: u32, generation: usize) -> u32 {
+    seed ^ 0x9E37_79B9u32.wrapping_mul((generation as u32).wrapping_add(0x7F4A_7C15))
+}
+
+/// Draw `n` distinct row indices from `0 .. rows` without replacement.
+///
+/// The subset is a pure function of `(seed, generation)`: the same arguments
+/// always return the same sorted indices, and consecutive generations draw a
+/// fresh subset. A partial Fisher–Yates shuffle keeps the cost at O(n) in the
+/// number of rows actually scored.
+///
+/// This is public so the sampling contract (distinct rows, deterministic for a
+/// given seed and generation) can be tested directly.
+pub fn generation_subset(rows: usize, n: usize, seed: u32, generation: usize) -> Vec<usize> {
+    let n = n.min(rows);
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut idx: Vec<usize> = (0..rows).collect();
+    let mut rng = Mt::new(subset_seed(seed, generation));
+    for i in (rows - n..rows).rev() {
+        let j = rng.usize_below(i + 1);
+        idx.swap(i, j);
+    }
+    let mut chosen = idx[rows - n..].to_vec();
+    chosen.sort_unstable();
+    chosen
+}
+
+/// Build the sample a generation evolves on, or `None` when the full training
+/// sample must be used. The caller passes the full sample in that case, which
+/// preserves the original row order and floating-point summation.
+fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> Option<Sample> {
+    if !subsampling_active(cfg, train) {
+        return None;
+    }
+    let n = cfg.predictor_samples.unwrap_or(train.len());
+    let idx = generation_subset(train.len(), n, cfg.seed, generation);
+    Some(Sample {
+        x: idx.iter().map(|&i| train.x[i].clone()).collect(),
+        y: idx.iter().map(|&i| train.y[i]).collect(),
+    })
+}
+
+/// Rebuild an archive from its members and the final populations, scoring every
+/// expression on the **full** training sample. Used only when the generations
+/// ran on subsets, so the returned front and every error derived from it are
+/// full-data even though fitness was estimated.
+fn full_data_archive(
+    archive: &Archive,
+    islands: &[Vec<Ind>],
+    train: &Sample,
+    metric: Metric,
+) -> Archive {
+    let trees: Vec<&Node> = archive
+        .items
+        .iter()
+        .map(|s| &s.tree)
+        .chain(islands.iter().flat_map(|pop| pop.iter().map(|ind| &ind.tree)))
+        .collect();
+    let mut out = Archive::new(archive.cap);
+    let mut seen: HashSet<u64> = HashSet::new();
+    for tree in trees {
+        if !seen.insert(expr::structural_hash(tree)) {
+            continue;
+        }
+        let tree = expr::simplify(tree);
+        let error = eval_error(&tree, train, metric);
+        out.try_insert(Sol {
+            complexity: complexity(&tree),
+            tree,
+            error,
+        });
+    }
+    out
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
@@ -237,13 +332,17 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
 
     let mut islands: Vec<Vec<Ind>> = Vec::with_capacity(cfg.islands.max(1));
     let mut stagnant: Vec<usize> = vec![0; cfg.islands.max(1)];
+    // Generation 0's subset also scores the initial population, so nothing is
+    // evaluated on the full table before the first generation.
+    let init_sample = training_for_generation(cfg, train, 0);
+    let init_train = init_sample.as_ref().unwrap_or(train);
     for isl in 0..cfg.islands.max(1) {
         let depth = cfg.init_depth.min(1 + isl % 3);
         let mut pop = Vec::with_capacity(cfg.pop);
         for _ in 0..cfg.pop {
             pop.push(Ind::evaluated(
                 random_tree(&mut rng, nvars, &cfg.ops, depth),
-                train,
+                init_train,
                 cfg.metric,
             ));
         }
@@ -258,12 +357,28 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
     for gen in 0..cfg.generations {
         gens_done = gen + 1;
 
+        // One fixed subset for the whole generation; a fresh draw next time.
+        // `None` means the full training sample, exactly as before.
+        let gen_sample = training_for_generation(cfg, train, gen);
+        let gen_train = gen_sample.as_ref().unwrap_or(train);
+
+        // With subsampling active, re-score the carried-over population on this
+        // generation's subset so every individual competes on the same rows.
+        // (Inactive runs keep the original errors untouched.)
+        if gen > 0 && gen_sample.is_some() {
+            for pop in islands.iter_mut() {
+                for ind in pop.iter_mut() {
+                    ind.reeval(gen_train, cfg.metric);
+                }
+            }
+        }
+
         // ---- parallel generation across islands -------------------------
         std::thread::scope(|s| {
             let handles: Vec<_> = islands
                 .iter_mut()
                 .zip(rngs.iter_mut())
-                .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, train, nvars)))
+                .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
                 .collect();
             for h in handles {
                 let _ = h.join();
@@ -338,7 +453,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
                         a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
                     }) {
-                        *worst = Ind::evaluated(t.clone(), train, cfg.metric);
+                        *worst = Ind::evaluated(t.clone(), gen_train, cfg.metric);
                     }
                 }
             }
@@ -366,9 +481,9 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     for ind in islands[ii].iter_mut() {
                         let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
                         if cfg.fit_iters > 0 {
-                            crate::fit::fit(&mut t, &train.x, &train.y, cfg.fit_iters);
+                            crate::fit::fit(&mut t, &gen_train.x, &gen_train.y, cfg.fit_iters);
                         }
-                        *ind = Ind::evaluated(t, train, cfg.metric);
+                        *ind = Ind::evaluated(t, gen_train, cfg.metric);
                     }
                     rngs[ii] = r;
                     stagnant[ii] = 0;
@@ -377,13 +492,20 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
         }
     }
 
-    for pop in &islands {
-        for ind in pop {
-            archive.try_insert(Sol {
-                tree: ind.tree.clone(),
-                error: ind.error,
-                complexity: ind.complexity,
-            });
+    if subsampling_active(cfg, train) {
+        // Generation fitness was estimated on subsets, so the front is rebuilt
+        // from the surviving trees and scored on every training row. From here
+        // on the archive and every number derived from it are full-data.
+        archive = full_data_archive(&archive, &islands, train, cfg.metric);
+    } else {
+        for pop in &islands {
+            for ind in pop {
+                archive.try_insert(Sol {
+                    tree: ind.tree.clone(),
+                    error: ind.error,
+                    complexity: ind.complexity,
+                });
+            }
         }
     }
     let sorted = archive.sorted();
