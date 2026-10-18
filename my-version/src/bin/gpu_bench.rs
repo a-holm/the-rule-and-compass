@@ -5,7 +5,7 @@
 //! speed-up and the agreement between the two. Requires `--features cuda`.
 
 use rcsr::expr::{self, complexity, random_tree, Op};
-use rcsr::gpu::{compile, cpu_sse, GpuEvaluator};
+use rcsr::gpu::{cpu_sse, GpuEvaluator, Population};
 use rcsr::rng::Mt;
 use rcsr::data;
 fn main() {
@@ -91,25 +91,20 @@ fn main() {
     }
     let y32: Vec<f32> = train.y.iter().map(|v| *v as f32).collect();
 
-    // Build a batch of random expressions and compile them to bytecode.
-    let mut prog: Vec<u32> = Vec::new();
-    let mut offsets: Vec<u32> = vec![0];
+    // Build a batch of random expressions and compile them into one population.
+    let mut population = Population::new();
     let mut trees = Vec::new();
-    let mut bytes_missing = 0usize;
     while trees.len() < batch {
         let t = expr::simplify(&random_tree(&mut rng, nv, &ops, depth));
         if complexity(&t) > 40 {
             continue;
         }
-        let mut buf = Vec::new();
-        if !compile(&t, &mut buf) {
-            bytes_missing += 1;
+        if !population.add(&t) {
             continue;
         }
-        prog.extend_from_slice(&buf);
-        offsets.push(prog.len() as u32);
         trees.push(t);
     }
+    let bytes_missing = population.unsupported();
 
     let device = GpuEvaluator::device_name();
     let mut ev = match GpuEvaluator::new(&cols, n, nv, &y32) {
@@ -121,13 +116,14 @@ fn main() {
     };
 
     // Warm up, then time the GPU batch (averaged over several runs to hide the
-    // single-launch overhead).
-    let _ = ev.eval_batch(&prog, &offsets);
+    // single-launch overhead). `eval_population` scores every program in the
+    // population in one call and one kernel launch.
+    let _ = ev.eval_population(&population);
     let reps = 25;
     let t_gpu = std::time::Instant::now();
     let mut gpu_err = Vec::new();
     for _ in 0..reps {
-        let (e, _ms) = ev.eval_batch(&prog, &offsets);
+        let (e, _ms) = ev.eval_population(&population);
         gpu_err = e;
     }
     let ms = t_gpu.elapsed().as_secs_f64() * 1000.0 / reps as f64;
@@ -162,12 +158,25 @@ fn main() {
 
     let evals = (trees.len() * n) as f64;
     println!("device           : {}", device);
+    println!(
+        "memory           : {}",
+        if GpuEvaluator::unified_memory() {
+            "unified (cudaMallocManaged)"
+        } else {
+            "device (cudaMalloc)"
+        }
+    );
     println!("dataset          : {} ({} rows x {} vars)", path, n, nv);
     println!(
         "expressions      : {} (depth {}, avg complexity {:.1})",
         trees.len(),
         depth,
         trees.iter().map(|t| complexity(t) as f64).sum::<f64>() / trees.len() as f64
+    );
+    println!(
+        "population       : {} programs, {} code words, one kernel launch per evaluation",
+        population.len(),
+        population.programs().0.len()
     );
     if bytes_missing > 0 {
         println!("skipped (no GPU): {} (branchy `if` nodes)", bytes_missing);
