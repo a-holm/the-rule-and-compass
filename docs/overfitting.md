@@ -258,6 +258,41 @@ choice. `--metric` selects one of sixteen objectives:
 AICc and BIC are printed for every solution regardless of the search metric, so
 you can compare them without changing the objective.
 
+### 3.9 The .632+ bootstrap error — implemented
+
+Hold-out and cross-validation need data to spare, and on a small sample both the
+in-sample error (optimistic: the model saw every row) and a single hold-out
+(pessimistic: it uses only part of the data) mislead. The **.632+ bootstrap**
+(Efron & Tibshirani 1997) corrects both.
+
+Write `err_app` for the model's error on the rows it was fit to. Draw `B`
+bootstrap samples of the rows (sample `n` rows **with replacement**), refit the
+model's **constants** on each sample, and score it on the rows that were left
+out — the *out-of-bag* rows. Let `err_oob` be the mean of those scores. Let `γ`
+be the *no-information* error rate, the score the model would get if its
+predictions carried no information about the responses: pair the fitted values
+with a random permutation of the targets and average.
+
+```
+R̂         = (err_oob − err_app) / (γ − err_app)     clamped to [0, 1]
+ŵ         = 0.632 / (1 − 0.368·R̂)                   so 0.632 ≤ ŵ ≤ 1
+err_.632+ = (1 − ŵ)·err_app + ŵ·err_oob
+```
+
+`R̂ = 0` (no extra overfitting beyond the apparent error) gives `ŵ = 0.632`;
+`R̂ = 1` gives `ŵ = 1`, the fully pessimistic out-of-bag error. Because `ŵ`
+never leaves `[0.632, 1]`, `err_.632+` is a convex combination of `err_app` and
+`err_oob` and therefore always lies **between** them.
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2 --bootstrap-error 200
+# bootstrap error (rank 1): apparent=0.407152 out-of-bag=0.413428 .632+=0.411133 (200 resamples, 200 used, weight=0.634)
+```
+
+The flag costs `B` constant refits per reported solution; `B = 0` (the default)
+switches it off. The three numbers are reported per solution in the text output,
+in each JSON row's `bootstrap_error` object, and in the ndjson `solution` events.
+
 ## 4. What `rcsr` reports today
 
 Every solution carries:
@@ -274,7 +309,9 @@ Every solution carries:
 
 and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
-verdict.
+verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
+`bootstrap_error` object with the `apparent`, `oob`, `no_information`,
+`relative_overfitting`, `weight` and `estimate` values of §3.9.
 
 Alongside the front, `rcsr` reports:
 
@@ -298,7 +335,6 @@ Alongside the front, `rcsr` reports:
   whole search, not just per-block reporting).
 * **Bootstrap and seed stability** — how often the same form reappears
   (stability selection).
-* **.632 / .632+ bootstrap error** for small samples (Efron & Tibshirani 1997).
 * **Parameter uncertainty** — standard errors of the constants from the
   Gauss–Newton Jacobian (`JᵀJ`), to flag constants the data does not pin down.
 * **Units / dimensional consistency** as a structural constraint.

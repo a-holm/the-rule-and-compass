@@ -129,7 +129,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--gap-break f] [--null-runs N]
+     [--gap-break f] [--null-runs N] [--bootstrap-error N]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
@@ -231,6 +231,7 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 | `baselines` | does it beat the mean, a straight line and a 5-NN learner? |
 | `residual_tests` | Ljung–Box autocorrelation, Breusch–Pagan changing variance, residual skew/kurtosis |
 | `null_control` | could the search have produced this from noise? |
+| `bootstrap_error` | apparent, out-of-bag and .632+ error estimates (`--bootstrap-error`) |
 
 The null baselines are fit on the training rows and scored on the training rows
 and the test folds in the search's own metric: a model that does not beat the
@@ -242,6 +243,12 @@ left autocorrelation or changing variance behind.
 The null control shuffles the target, runs the *identical* search, and repeats:
 if shuffled targets fit as well as the real one, the "law" is manufactured. With
 `r` runs the smallest attainable p-value is `1/(r+1)`, so use at least 19.
+
+On a small sample, `--bootstrap-error n` refits each solution's constants on `n`
+bootstrap resamples of the training rows and reports the **apparent**, the
+**out-of-bag** and the **.632+** error (Efron & Tibshirani 1997) per solution;
+the `.632+` estimate interpolates the optimistic and pessimistic numbers and
+always lies between them.
 
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
@@ -272,7 +279,8 @@ formulas, what is still missing, and the literature.
   overfit index), **null baselines** (mean, least-squares line, 5-NN) and
   **residual tests** (Ljung–Box, Breusch–Pagan, skewness/kurtosis) reported
   automatically, plus a `--null-runs` permutation control that runs the
-  identical search on shuffled targets;
+  identical search on shuffled targets and a `--bootstrap-error` `.632+`
+  bootstrap estimate that refits each solution's constants on resamples;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
 
