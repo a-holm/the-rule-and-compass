@@ -192,6 +192,13 @@ SEARCH:
   --depth-weight <w>         cost per nesting level, i.e. edge below the root
                              (default 0); a single node has depth 0
   --seed <S>                 RNG seed, echoed in output (default 0)
+  --seed-expr <expr>         start from a known formula (repeatable); variables
+                             are the --vars names, written in original units,
+                             simplified, constants fitted, then inserted into
+                             every island and the archive. A seed is an elite:
+                             it is kept even above --max-complexity
+  --seed-file <path>         one seed expression per line; '#' comments and
+                             blank lines are skipped (combine with --seed-expr)
   --ops <list>               comma/space-separated operators, e.g.
                              add,sub,mul,div,sin,exp,floor,min,max
                              conditions: less,equal,greater,and,or,xor,not
@@ -292,6 +299,8 @@ fn schema() -> String {
         ("--complexity-weights", "csv", "var=1,const=1", "terminal weights name=weight; keys var, const and depth (depth defaults to 0)"),
         ("--depth-weight", "float", "0", "extra cost per nesting level (edges below the root)"),
         ("--seed", "int", "0", "RNG seed"),
+        ("--seed-expr", "string", "none", "seed expression in original units (repeatable); parsed, simplified, constants fitted, then inserted into every island and the archive; kept even above --max-complexity"),
+        ("--seed-file", "string", "none", "file of seed expressions, one per line ('#' comments and blank lines skipped; repeatable)"),
         ("--ops", "csv", "builtin-set", "operator names: primitives, comparisons, logical operators, constraints and meta operators (see \"operators\")"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
@@ -529,6 +538,8 @@ fn main() {
     let mut null_runs = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
+    let mut seed_exprs: Vec<String> = Vec::new();
+    let mut seed_files: Vec<String> = Vec::new();
     let mut stability_runs = 0usize;
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
@@ -739,6 +750,8 @@ fn main() {
                 ops_set = true;
             }
             "--eval-expr" => eval_expr = Some(val!()),
+            "--seed-expr" => seed_exprs.push(val!()),
+            "--seed-file" => seed_files.push(val!()),
             "--stability" => stability_runs = val!().parse().unwrap_or(0),
             "--cv" => {
                 let v = val!();
@@ -876,6 +889,42 @@ fn main() {
     if eval_expr.is_some() && (save_path.is_some() || resume_path.is_some()) {
         eprintln!("error: --save and --resume cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
+    }
+    if eval_expr.is_some() && (!seed_exprs.is_empty() || !seed_files.is_empty()) {
+        eprintln!("error: --seed-expr and --seed-file cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+    if resume_path.is_some() && (!seed_exprs.is_empty() || !seed_files.is_empty()) {
+        eprintln!(
+            "error: --seed-expr and --seed-file cannot be combined with --resume \
+             (seeds are inserted at the start of a fresh run; the checkpoint already \
+             contains them)"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+
+    // Seed files are plain text: one expression per line, with `#` comment
+    // lines and blank lines skipped. An unreadable file is an input error, not
+    // a usage error, because the command line itself is well formed.
+    let mut seed_lines: Vec<(String, String)> = Vec::new();
+    for path in &seed_files {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: --seed-file '{}': {}", path, e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        for (line_no, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            seed_lines.push((
+                format!("--seed-file {} line {}", path, line_no + 1),
+                trimmed.to_string(),
+            ));
+        }
     }
 
     // A resume loads the saved search settings *before* the data is prepared:
@@ -1434,6 +1483,30 @@ fn main() {
         }
     }
 
+    // Seed expressions are written in original units, like `--eval-expr`, and
+    // rewritten into the search's normalised-input space before they enter the
+    // population. A syntax error is a usage error and keeps the parser's
+    // 1-based column.
+    let mut seeds: Vec<expr::Node> = Vec::new();
+    for src in &seed_exprs {
+        match expr::parse(src, &vars) {
+            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Err(e) => {
+                eprintln!("error: --seed-expr '{}': {}", src, e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+    for (origin, src) in &seed_lines {
+        match expr::parse(src, &vars) {
+            Ok(tree) => seeds.push(normalise_inputs(&tree, &prepared.means, &prepared.stds)),
+            Err(e) => {
+                eprintln!("error: {}: '{}': {}", origin, src, e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+
     // Streaming progress: ndjson goes to stdout, other formats to stderr.
     if progress {
         let to_stdout = format == Format::Ndjson;
@@ -1586,12 +1659,13 @@ fn main() {
     let mut last_saved: Option<(usize, String)> = None;
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
-        search::run_resumable(
+        search::run_resumable_seeded(
             &cfg,
             &prepared.train,
             &prepared.test,
             resumed,
             save_every,
+            &seeds,
             |cp| {
                 if let Err(e) = cp.save(&path) {
                     eprintln!("error: {}", e);
@@ -1616,15 +1690,21 @@ fn main() {
     } else if resume_checkpoint.is_none() {
         // A fresh run with no save does not need any snapshot at all: keep the
         // historical path (and avoid hashing the data on exit).
-        Ok(search::run(&cfg, &prepared.train, &prepared.test))
+        Ok(search::run_seeded(
+            &cfg,
+            &prepared.train,
+            &prepared.test,
+            &seeds,
+        ))
     } else {
         let resumed = resume_checkpoint.take();
-        search::run_resumable(
+        search::run_resumable_seeded(
             &cfg,
             &prepared.train,
             &prepared.test,
             resumed,
             0,
+            &seeds,
             |_| {},
         )
     };
@@ -1636,6 +1716,42 @@ fn main() {
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
+
+    // Seeded solutions, reported once each. The search holds them in
+    // normalised-input space; show the original-units form, exactly like a
+    // Pareto row. A seed above --max-complexity is still kept, and saying so
+    // here means the rule is never a surprise.
+    let seed_rows: Vec<(String, f64, f64)> = outcome
+        .seeds
+        .iter()
+        .map(|s| {
+            let tree = expr::simplify(&expr::denormalize(
+                &expr::simplify(&s.tree),
+                &prepared.means,
+                &prepared.stds,
+            ));
+            (expr::to_string(&tree, &vars), s.complexity, s.error)
+        })
+        .collect();
+    for (expression, complexity, _) in &seed_rows {
+        if *complexity > cfg.max_complexity as f64 {
+            eprintln!(
+                "# note: seeded expression '{}' has complexity {} above --max-complexity {}; \
+                 kept as an elite",
+                expression, complexity, cfg.max_complexity
+            );
+        }
+    }
+    if format == Format::Text {
+        for (expression, complexity, error) in &seed_rows {
+            eprintln!(
+                "# seeded: complexity={} train_error={}  y = {}",
+                complexity,
+                fmt_err(*error),
+                expression
+            );
+        }
+    }
 
     // Test error is reported per block, then averaged, so an unstable model
     // cannot hide behind a lucky pooled number.
@@ -2144,6 +2260,17 @@ fn main() {
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(",")
             );
+            let seeds_json: Vec<String> = seed_rows
+                .iter()
+                .map(|(expression, complexity, error)| {
+                    format!(
+                        "{{\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
+                        jstr(expression),
+                        jnum(*complexity),
+                        jnum(*error)
+                    )
+                })
+                .collect();
             let pareto: Vec<String> = rows
                 .iter()
                 .map(|r| {
@@ -2288,7 +2415,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -2312,10 +2439,19 @@ fn main() {
                 resid_json,
                 cv_json,
                 stability_json,
+                seeds_json.join(","),
                 pareto.join(",")
             );
         }
         Format::Ndjson => {
+            for (expression, complexity, error) in &seed_rows {
+                println!(
+                    "{{\"event\":\"seed\",\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
+                    jstr(expression),
+                    jnum(*complexity),
+                    jnum(*error)
+                );
+            }
             for r in &rows {
                 println!(
                     "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
@@ -2467,6 +2603,44 @@ fn main() {
     }
 
     std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
+}
+
+/// Rewrite a formula written in **original units** into the search's
+/// normalised-input space: every `Input(i)` standing for the raw variable
+/// `x_i` becomes `x_i * std_i + mean_i`, so the search's normalised input
+/// evaluates it correctly.
+///
+/// This is the reverse of [`rcsr::expr::denormalize`], used for `--seed-expr`
+/// and `--seed-file`. A variable whose affine transform is the identity (a
+/// boolean column, or `--center none --scale none`) is left as a bare input.
+fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
+    match n.op {
+        Op::Input => {
+            let i = n.val as usize;
+            let m = means.get(i).copied().unwrap_or(0.0);
+            let s = stds.get(i).copied().unwrap_or(1.0);
+            if m == 0.0 && s == 1.0 {
+                expr::input(i)
+            } else {
+                expr::node(
+                    Op::Add,
+                    vec![
+                        expr::node(Op::Mul, vec![expr::input(i), expr::constant(s)]),
+                        expr::constant(m),
+                    ],
+                )
+            }
+        }
+        _ => expr::Node {
+            op: n.op,
+            val: n.val,
+            kids: n
+                .kids
+                .iter()
+                .map(|k| normalise_inputs(k, means, stds))
+                .collect(),
+        },
+    }
 }
 
 /// `--eval-expr`: score a user-written formula instead of searching.
