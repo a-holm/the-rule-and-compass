@@ -1291,11 +1291,12 @@ impl RunPlan {
             emit(
                 &progress_writer,
                 &format!(
-                    "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{}}}",
+                    "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{},\"convergence\":{}}}",
                     p.generation,
                     p.total_generations,
                     jnum(p.best_error),
-                    p.pareto_members
+                    p.pareto_members,
+                    p.convergence.json()
                 ),
             );
         });

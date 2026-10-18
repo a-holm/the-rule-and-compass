@@ -229,7 +229,10 @@ OUTPUT:
   --format text|json|ndjson  (default text)
   --json                     shorthand for --format json
   --ndjson                   shorthand for --format ndjson
-  --progress                 emit per-generation progress (stderr, or stdout in ndjson)
+  --progress                 emit per-generation progress, including
+                             convergence statistics (confidence, stability,
+                             maturity, percent_converged); stderr, or stdout in
+                             ndjson. See docs/convergence.md
   --top <N>                  report at most N Pareto rows (default: all)
   --quiet                    suppress the human-readable header
   --out <file>               also write the Pareto front as TSV
@@ -1426,11 +1429,13 @@ fn main() {
         let to_stdout = format == Format::Ndjson;
         cfg.progress = Some(std::sync::Arc::new(move |p: search::Progress| {
             let line = format!(
-                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"progress\",\"generation\":{},\"total\":{},\"best_error\":{},\"pareto_members\":{},\"convergence\":{}}}",
                 p.generation,
                 p.total_generations,
                 jnum(p.best_error),
-                p.pareto_members
+                p.pareto_members,
+                // #18: confidence, stability, maturity, percent_converged.
+                p.convergence.json()
             );
             if to_stdout {
                 println!("{}", line);
@@ -2329,7 +2334,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -2346,6 +2351,8 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.converged_early,
+                // #18: the four convergence numbers.
+                outcome.convergence.json(),
                 jnum(elapsed),
                 checkpoint_json,
                 null_json,
@@ -2471,9 +2478,11 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
                 outcome.generations,
                 outcome.converged_early,
+                // #18: the final reading also closes the NDJSON stream.
+                outcome.convergence.json(),
                 jnum(elapsed),
                 outcome.archive.items.len()
             );
