@@ -158,13 +158,44 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         Const => node_val,
         Input => node_val, // unused: inputs are folded in below
         Neg => -a(0),
-        Exp => a(0).exp(),
-        Ln => a(0).ln(),
+        // #87: these guards mirror `expr::eval` exactly. The fitter must not
+        // produce a finite value where the scorer produces NaN or infinity,
+        // otherwise the fitted SSE is not the score and cannot be reused.
+        Exp => {
+            let x = a(0);
+            if x > 700.0 {
+                f64::INFINITY
+            } else {
+                x.exp()
+            }
+        }
+        Ln => {
+            let x = a(0);
+            if x > 0.0 {
+                x.ln()
+            } else {
+                f64::NAN
+            }
+        }
         Abs => a(0).abs(),
-        Sqrt => a(0).sqrt(),
+        Sqrt => {
+            let x = a(0);
+            if x >= 0.0 {
+                x.sqrt()
+            } else {
+                f64::NAN
+            }
+        }
         Sin => a(0).sin(),
         Cos => a(0).cos(),
-        Tan => a(0).tan(),
+        Tan => {
+            let t = a(0).tan();
+            if t.is_finite() {
+                t
+            } else {
+                f64::NAN
+            }
+        }
         Sinh => a(0).sinh(),
         Cosh => a(0).cosh(),
         Tanh => a(0).tanh(),
@@ -222,8 +253,22 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         Add => a(0) + a(1),
         Sub => a(0) - a(1),
         Mul => a(0) * a(1),
-        Div => a(0) / a(1),
-        Pow => a(0).powf(a(1)),
+        Div => {
+            let b = a(1);
+            if b.abs() < 1e-12 {
+                f64::NAN
+            } else {
+                a(0) / b
+            }
+        }
+        Pow => {
+            let (x, p) = (a(0), a(1));
+            if x < 0.0 && (p - p.round()).abs() > 1e-9 {
+                f64::NAN
+            } else {
+                x.powf(p)
+            }
+        }
         Mod => {
             let (x, b) = (a(0), a(1));
             if !x.is_finite() || !b.is_finite() || b.abs() < 1e-12 {
@@ -248,7 +293,14 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 x.max(y)
             }
         }
-        Atan2 => a(0).atan2(a(1)),
+        Atan2 => {
+            let (y, x) = (a(0), a(1));
+            if y.is_nan() || x.is_nan() {
+                f64::NAN
+            } else {
+                y.atan2(x)
+            }
+        }
         If => {
             if a(0) > 0.0 {
                 a(1)
@@ -658,7 +710,12 @@ fn sse(
     c: &[f64],
     v: &mut [f64],
 ) -> f64 {
-    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+    // #87: the scorer rejects a prediction/target length mismatch; the fitter
+    // must not silently fit only the shorter of the two.
+    if x.len() != y.len() {
+        return f64::INFINITY;
+    }
+    if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
     let mut s = 0.0;
@@ -677,8 +734,10 @@ fn sse(
     s
 }
 
-/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
-/// their sum of squared errors, or `None` if the normal equations are singular.
+/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants,
+/// their sum of squared errors, and the SSE at the **current** constants (which
+/// the same row loop forms for free), or `None` if the normal equations are
+/// singular.
 #[allow(clippy::too_many_arguments)]
 fn gn_step(
     f: &Flat,
@@ -691,12 +750,17 @@ fn gn_step(
     v: &mut [f64],
     adj: &mut [f64],
     grad: &mut [f64],
-) -> Option<(Vec<f64>, f64)> {
-    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+) -> Option<(Vec<f64>, f64, f64)> {
+    // #87: mirror the scorer's length contract.
+    if x.len() != y.len() {
+        return None;
+    }
+    if !w.is_empty() && w.len() != x.len() {
         return None;
     }
     let mut jtj = vec![vec![0.0; k]; k];
     let mut jtr = vec![0.0; k];
+    let mut cur_sse = 0.0;
     for (i, (row, &t)) in x.iter().zip(y).enumerate() {
         let sw = w.get(i).copied().unwrap_or(1.0);
         if sw == 0.0 {
@@ -709,6 +773,9 @@ fn gn_step(
         if !r.is_finite() {
             return None;
         }
+        // #87: the same residual that builds the normal equations also gives
+        // the current SSE, in exactly the order `sse` would sum it.
+        cur_sse += r * r;
         backward(f, v, adj, grad);
         for i in 0..k {
             let gi = grad[i];
@@ -732,7 +799,7 @@ fn gn_step(
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
     let s = sse(f, x, y, w, &trial, v);
-    Some((trial, s))
+    Some((trial, s, cur_sse))
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -763,7 +830,12 @@ pub fn fit_weighted(
     w: &[f64],
     iters: usize,
 ) -> f64 {
-    if !w.is_empty() && w.len() != x.len().min(y.len()) {
+    // #87: the scorer rejects a prediction/target length mismatch; the fitter
+    // must not silently fit only the shorter of the two.
+    if x.len() != y.len() {
+        return f64::INFINITY;
+    }
+    if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
     let f = flatten(tree);
@@ -783,18 +855,23 @@ pub fn fit_weighted(
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
-    let mut best_sse = sse(&f, x, y, w, &c, &mut v);
+    // #87: the first `gn_step` forms the SSE at the current constants while it
+    // builds the normal equations, so the standalone sweep is not repeated.
+    // `None` means "not known yet"; the fallback below covers the singular and
+    // zero-iteration cases.
+    let mut best_sse: Option<f64> = None;
     let mut lambda = 1e-3;
 
     for _ in 0..iters.max(1) {
         match gn_step(&f, x, y, w, &c, lambda, k, &mut v, &mut adj, &mut grad) {
-            Some((trial, tsse)) => {
-                if tsse < best_sse {
+            Some((trial, tsse, cur_sse)) => {
+                let best = *best_sse.get_or_insert(cur_sse);
+                if tsse < best {
                     c = trial;
-                    best_sse = tsse;
+                    best_sse = Some(tsse);
                     best_c = c.clone();
                     lambda = (lambda / 8.0).max(1e-12);
-                    if best_sse == 0.0 {
+                    if tsse == 0.0 {
                         break;
                     }
                 } else {
@@ -807,6 +884,7 @@ pub fn fit_weighted(
             None => break,
         }
     }
+    let mut best_sse = best_sse.unwrap_or_else(|| sse(&f, x, y, w, &c, &mut v));
 
     // Undamped Gauss–Newton polish: quadratic convergence to the optimum.
     for _ in 0..4 {
@@ -825,7 +903,7 @@ pub fn fit_weighted(
             &mut adj,
             &mut grad,
         ) {
-            Some((trial, tsse)) if tsse < best_sse => {
+            Some((trial, tsse, _)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
             }
@@ -1463,5 +1541,111 @@ mod tests {
         // No residual degrees of freedom (n <= k).
         let two = node(Op::Add, vec![constant(1.0), constant(2.0)]);
         assert!(constant_errors(&two, &rows(&[0.0]), &[1.0]).is_none());
+    }
+
+    /// Evaluate a tree through the fitter's flat representation, including the
+    /// constants stored on its nodes.
+    fn flat_value(tree: &Node, x: &[f64]) -> f64 {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        let mut v = vec![0.0; n];
+        eval_row(&f, x, &c, &mut v);
+        v[f.root]
+    }
+
+    fn flat_sse(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        let mut v = vec![0.0; n];
+        sse(&f, x, y, &[], &c, &mut v)
+    }
+
+    /// #87: the fitter's guarded operators must produce the same value as
+    /// `expr::eval`, bit for bit. A finite fitter value where the scorer says
+    /// NaN/infinity would make the reused SSE wrong.
+    #[test]
+    fn value_of_matches_expr_eval_on_guarded_operators() {
+        let div = || {
+            node(
+                Op::Div,
+                vec![
+                    constant(1.0),
+                    node(Op::Sub, vec![input(0), constant(0.5)]),
+                ],
+            )
+        };
+        let cases = vec![
+            // Div: denominator exactly zero and just inside the guard.
+            (div(), vec![0.5]),
+            (div(), vec![0.5 + 1e-13]),
+            // Exp: > 700 is +inf in `expr::eval`; 700 is still finite.
+            (
+                node(Op::Exp, vec![node(Op::Mul, vec![constant(701.0), input(0)])]),
+                vec![1.0],
+            ),
+            (
+                node(Op::Exp, vec![node(Op::Mul, vec![constant(700.0), input(0)])]),
+                vec![1.0],
+            ),
+            // Ln(0) is NaN, not -inf; Sqrt(-1) is NaN.
+            (node(Op::Ln, vec![input(0)]), vec![0.0]),
+            (node(Op::Sqrt, vec![input(0)]), vec![-1.0]),
+            // (-2)^0.5 is NaN.
+            (node(Op::Pow, vec![constant(-2.0), constant(0.5)]), vec![0.0]),
+            // tan(inf) is NaN.
+            (node(Op::Tan, vec![input(0)]), vec![f64::INFINITY]),
+        ];
+        for (tree, x) in cases {
+            let want = expr::eval(&tree, &x);
+            let got = flat_value(&tree, &x);
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "flat value {got} vs expr::eval {want} for {tree:?}"
+            );
+        }
+    }
+
+    /// #87: a guard that fires makes the fitter's SSE infinite, exactly as the
+    /// scorer rejects the candidate, so no finite SSE can be reused.
+    #[test]
+    fn sse_is_infinite_when_a_guard_fires() {
+        let x = vec![vec![0.5]];
+        let y = vec![0.0];
+        let div = node(
+            Op::Div,
+            vec![
+                constant(1.0),
+                node(Op::Sub, vec![input(0), constant(0.5)]),
+            ],
+        );
+        assert!(flat_sse(&div, &x, &y).is_infinite());
+
+        let x = vec![vec![1.0]];
+        let exp = node(Op::Exp, vec![node(Op::Mul, vec![constant(701.0), input(0)])]);
+        assert!(flat_sse(&exp, &x, &y).is_infinite());
+    }
+
+    /// #87: the fitter must reject a prediction/target length mismatch instead
+    /// of silently fitting the shorter of the two.
+    #[test]
+    fn fit_rejects_a_length_mismatch() {
+        let x = vec![vec![0.0], vec![1.0]];
+        let y = vec![0.0];
+        let mut tree = node(Op::Mul, vec![constant(2.0), input(0)]);
+        assert!(fit_weighted(&mut tree, &x, &y, &[], 4).is_infinite());
+        assert!(flat_sse(&tree, &x, &y).is_infinite());
     }
 }

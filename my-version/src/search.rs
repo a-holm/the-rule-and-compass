@@ -60,6 +60,13 @@ pub struct Config {
     /// generation. `None`, or any value at least the training size, scores the
     /// full training sample. Values below 2 are rejected by the CLI.
     pub predictor_samples: Option<usize>,
+    /// #85: number of rows used to **fit** constants in a generation. `0`
+    /// disables screening (today's behaviour); any value at least the
+    /// generation's sample size is a no-op. Candidates are still scored on the
+    /// generation's full sample and the surviving archive is refit on every
+    /// training row before it is reported. Values below 2 are rejected by the
+    /// CLI.
+    pub fit_samples: usize,
     /// #25: declared units for the inputs (in input order) and the target.
     /// `None` disables dimensional analysis entirely.
     pub units: Option<Units>,
@@ -115,6 +122,7 @@ impl Default for Config {
             time_budget: None,
             patience: 40,
             predictor_samples: None,
+            fit_samples: 0, // #85: off by default
             units: None,
             require_dimensions: false,
             progress: None,
@@ -161,6 +169,7 @@ impl Config {
         }
         compare!(patience, "patience");
         compare!(predictor_samples, "predictor_samples");
+        compare!(fit_samples, "fit_samples"); // #85
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -201,10 +210,32 @@ impl Ind {
     // when units are required (the predicate is a no-op otherwise).
     // #27: `train` carries the sample and its cached SoA columns.
     fn evaluated(tree: Node, train: &EvalSample, cfg: &Config) -> Self {
+        Ind::evaluated_fitted(tree, None, train, cfg)
+    }
+
+    /// #87: [`Ind::evaluated`] with the fitter's own SSE available.
+    ///
+    /// When the metric is `squared`, the fit ran on the same rows that score
+    /// the candidate, and simplification folded nothing, the fitted SSE *is*
+    /// the score (divided by the row count, exactly as `mean_sq` does), so the
+    /// separate scoring sweep is skipped. Every other case keeps the ordinary
+    /// evaluation path bit for bit.
+    fn evaluated_fitted(
+        tree: Node,
+        fitted: Option<FitResult>,
+        train: &EvalSample,
+        cfg: &Config,
+    ) -> Self {
         let tree = expr::simplify(&tree);
+        let hash = expr::structural_hash(&tree);
         let complexity = cfg.complexity_model.complexity(&tree);
         let error = if cfg.accepts_dimensions(&tree) {
-            score_tree(&tree, train, cfg) // #27
+            match fitted {
+                Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
+                    fit.sse / train.sample.len() as f64
+                }
+                _ => score_tree(&tree, train, cfg), // #27
+            }
         } else {
             f64::INFINITY
         };
@@ -447,6 +478,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
     }
+    // #85: the screened path scores offspring on a per-generation subset, which
+    // the resident full-sample GPU evaluator cannot represent.
+    if cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < train.len() {
+        return Some("--fit-samples scores offspring on a screening subset");
+    }
     None
 }
 
@@ -546,12 +582,58 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
 /// minimises the signed geometric residual `f / ||grad f||` instead. Every
 /// other metric (including `implicit_residual`, which by definition scores
 /// `|f|`) keeps the historical `fit_weighted` path bit for bit.
-fn fit_constants(tree: &mut Node, cfg: &Config, train: &Sample) {
+///
+/// #85: `fit` is the (possibly screening) sample the constants are fitted on;
+/// `score` is the sample that will score the candidate. They are the same
+/// reference in the default path.
+fn fit_constants(
+    tree: &mut Node,
+    cfg: &Config,
+    fit: &Sample,
+    score: &Sample,
+) -> Option<FitResult> {
     if cfg.metric.is_implicit_derivative() {
-        crate::implicit::fit(tree, &train.x, &train.w, cfg.fit_iters);
+        crate::implicit::fit(tree, &fit.x, &fit.w, cfg.fit_iters);
+        None
     } else {
-        crate::fit::fit_weighted(tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+        let sse = crate::fit::fit_weighted(tree, &fit.x, &fit.y, &fit.w, cfg.fit_iters);
+        // #87: remember the tree the SSE belongs to. Simplification after the
+        // fit may fold constants, in which case the SSE is stale and the
+        // caller must score normally.
+        Some(FitResult {
+            sse,
+            hash: expr::structural_hash(tree),
+            // #85: an SSE fitted on a screening subset is not the score of the
+            // full sample, so the reuse below must stay off.
+            same_rows: std::ptr::eq(fit, score),
+        })
     }
+}
+
+/// #87: the fitter's own residual sum of squares at the constants it wrote
+/// back, plus the structural hash of the tree at that moment.
+struct FitResult {
+    sse: f64,
+    hash: u64,
+    /// #85: whether the fit used the same rows that will score the candidate.
+    same_rows: bool,
+}
+
+/// #87: whether `fit`'s SSE is provably the score of `tree` on `train`.
+///
+/// The fitter sums `Σ (f(xᵢ) − yᵢ)²` in row order; `Metric::Squared` on an
+/// unweighted, single-output sample divides the same sum by the row count. A
+/// different metric, weights (whose `sqrt(w)` residual squares differently),
+/// a multi-output objective, an empty sample, or a simplification that folded
+/// anything all keep the ordinary evaluation path.
+fn can_reuse_sse(cfg: &Config, train: &EvalSample, fit: &FitResult, hash: u64) -> bool {
+    cfg.metric == Metric::Squared
+        && fit.same_rows // #85
+        && fit.hash == hash
+        && fit.sse.is_finite()
+        && !train.sample.is_multi()
+        && train.sample.w.is_empty()
+        && !train.sample.is_empty()
 }
 
 /// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
@@ -610,16 +692,9 @@ pub fn generation_subset(rows: usize, n: usize, seed: u32, generation: usize) ->
     chosen
 }
 
-/// Build the sample a generation evolves on, or `None` when the full training
-/// sample must be used. The caller passes the full sample in that case, which
-/// preserves the original row order and floating-point summation.
-fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> Option<Sample> {
-    if !subsampling_active(cfg, train) {
-        return None;
-    }
-    let n = cfg.predictor_samples.unwrap_or(train.len());
-    let idx = generation_subset(train.len(), n, cfg.seed, generation);
-    Some(Sample {
+/// Copy the rows named by `idx` into a fresh sample, preserving their order.
+fn subset_sample(train: &Sample, idx: &[usize]) -> Sample {
+    Sample {
         x: idx.iter().map(|&i| train.x[i].clone()).collect(),
         y: idx.iter().map(|&i| train.y[i]).collect(),
         w: if train.w.is_empty() {
@@ -638,7 +713,98 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
                 .map(|col| idx.iter().map(|&i| col[i]).collect())
                 .collect()
         },
-    })
+    }
+}
+
+/// Build the sample a generation evolves on, or `None` when the full training
+/// sample must be used. The caller passes the full sample in that case, which
+/// preserves the original row order and floating-point summation.
+fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> Option<Sample> {
+    if !subsampling_active(cfg, train) {
+        return None;
+    }
+    let n = cfg.predictor_samples.unwrap_or(train.len());
+    let idx = generation_subset(train.len(), n, cfg.seed, generation);
+    Some(subset_sample(train, &idx))
+}
+
+/// #85: salt that separates the screening stream from `--predictor-samples`
+/// (and from every other RNG), so asking for a fit subset never changes which
+/// rows a generation is scored on.
+const FIT_SUBSET_SALT: u32 = 0x85F1_7A5B;
+
+/// #85: true when constants are fitted on fewer rows than the generation's
+/// scoring sample. A request at least as large as the sample is a no-op.
+fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
+    cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < sample.len()
+}
+
+/// #85: the rows used to fit constants in one generation.
+///
+/// The subset is drawn fresh per generation from the current generation's
+/// sample with [`generation_subset`], using a salted seed so it is independent
+/// of `--predictor-samples`. `None` means "fit on the whole sample", which
+/// keeps the default path bit for bit.
+fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Option<Sample> {
+    if !fit_sampling_active(cfg, sample) {
+        return None;
+    }
+    let idx = generation_subset(
+        sample.len(),
+        cfg.fit_samples,
+        cfg.seed ^ FIT_SUBSET_SALT,
+        generation,
+    );
+    Some(subset_sample(sample, &idx))
+}
+
+/// #85: refit one screening survivor on the full training sample and score it
+/// there, ready to enter the archive.
+fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
+    let mut tree = expr::simplify(tree);
+    if cfg.fit_iters > 0 && !train.sample.is_multi() {
+        fit_constants(&mut tree, cfg, train.sample, train.sample);
+        tree = expr::simplify(&tree);
+    }
+    let error = if cfg.accepts_dimensions(&tree) {
+        score_tree(&tree, train, cfg)
+    } else {
+        f64::INFINITY
+    };
+    Sol {
+        complexity: expr::complexity(&tree),
+        cost: cfg.complexity_model.complexity(&tree),
+        tree,
+        error,
+    }
+}
+
+/// #85: successive halving promotes one offspring in this many. With the
+/// default `--pop 100` that is the top quarter; the fraction is deliberately
+/// fixed (no Hyperband-style schedule across generations, because candidates
+/// are replaced rather than trained longer).
+const PROMOTE_ONE_IN: usize = 16;
+
+/// #85: how many of `pop` screened offspring advance to a full-data refit.
+fn promoted_count(pop: usize) -> usize {
+    (pop / PROMOTE_ONE_IN).max(1).min(pop)
+}
+
+/// #85: keep the best `pop` full-data candidates. The population keeps its
+/// fixed size (checkpoints and the next generation assume `pop`); structural
+/// duplicates are removed by the archive, not here.
+fn select_population(candidates: &mut Vec<Ind>, pop: usize) {
+    candidates.sort_by(|a, b| {
+        a.error
+            .partial_cmp(&b.error)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(
+                a.complexity
+                    .partial_cmp(&b.complexity)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+    candidates.truncate(pop);
 }
 
 /// Rebuild an archive from its members and the final populations, scoring every
@@ -726,26 +892,39 @@ fn evolve_island(
     rng: &mut Mt,
     cfg: &Config,
     train: &EvalSample, // #27 sample + cached SoA columns
+    // #85: the rows constants are fitted on (the screening subset, or the
+    // whole scoring sample when screening is off).
+    fit_sample: &Sample,
     nvars: usize,
     aggs: &AggTable,
+    // #85: successive-halving phase one. Generate `pop` offspring and score
+    // them on `train` (the screening sample); the caller promotes the top
+    // fraction and selects against the full-data parents.
+    screened: bool,
     // #26: leave the fitness pending when the caller will batch it on the GPU.
     defer_gpu: bool,
 ) {
-    for ind in isl.iter_mut() {
-        if !ind.error.is_finite() {
-            ind.reeval(train, cfg); // #25
+    if !screened {
+        for ind in isl.iter_mut() {
+            if !ind.error.is_finite() {
+                ind.reeval(train, cfg); // #25
+            }
         }
     }
 
     let pop = cfg.pop;
     let mut next: Vec<Ind> = Vec::with_capacity(pop);
 
-    // Elitism: carry the best individual over unchanged.
-    if let Some(best) = isl
-        .iter()
-        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
-    {
-        next.push(best.clone());
+    // Elitism: carry the best individual over unchanged. In the screened phase
+    // the full-data parents are kept by the caller and compete at selection, so
+    // the offspring vector stays a full `pop`.
+    if !screened {
+        if let Some(best) = isl
+            .iter()
+            .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            next.push(best.clone());
+        }
     }
 
     let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
@@ -780,8 +959,9 @@ fn evolve_island(
         // #15: a multi-output shape keeps the constant slots that only some
         // outputs need; it is fitted per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
         // #26: with the GPU batch active the fitness is filled in after every
@@ -790,7 +970,7 @@ fn evolve_island(
         let ind = if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated(tree, train, cfg) // #25
+            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         };
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
@@ -809,15 +989,16 @@ fn evolve_island(
         ));
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
         // #26: same deferral for the random fill.
         next.push(if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated(tree, train, cfg) // #25
+            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         });
     }
 
@@ -849,6 +1030,11 @@ pub struct Outcome {
     pub seeds: Vec<SeedResult>,
     // #18: convergence statistics at the end of the run.
     pub convergence: Convergence,
+    /// #85: effective rows per generation used to fit constants, or `0` when
+    /// screening is off. Never larger than the training sample.
+    pub fit_samples: usize,
+    /// #85: whether the reported archive was refit on the full training sample.
+    pub archive_refit: bool,
 }
 
 /// Run a search once, from a fresh start.
@@ -1012,14 +1198,15 @@ fn prepare_seeds(
         }
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
+        let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() {
-            fit_constants(&mut tree, cfg, train.sample);
+            fitted = fit_constants(&mut tree, cfg, train.sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
         if !seen_fitted.insert(expr::structural_hash(&tree)) {
             continue;
         }
-        out.push(Ind::evaluated(tree, train, cfg)); // #25
+        out.push(Ind::evaluated_fitted(tree, fitted, train, cfg)); // #25 #87
     }
     out
 }
@@ -1105,6 +1292,13 @@ fn run_search(
     let mut converged_early: bool;
     let mut best_prev: f64;
     let mut no_improve: usize;
+    // #85: did any generation fit on a screening subset? Only then may the
+    // final archive be refit; a request at least as large as the sample, or
+    // `--no-fit`, stays an exact no-op.
+    let mut fit_screened = resumed && fit_sampling_active(cfg, train);
+    // #27/#85: the full-data view is needed by the seeds, the screened
+    // generation's promotion step and the final rebuild. Build it once.
+    let train_data = EvalSample::new(train, cfg);
 
     if let Some(cp) = resume {
         cp.check_data(train, test)?;
@@ -1184,6 +1378,13 @@ fn run_search(
         let init_sample = training_for_generation(cfg, train, 0);
         let init_train = init_sample.as_ref().unwrap_or(train);
         let init_data = EvalSample::new(init_train, cfg); // #27
+        // #85: with screening on, the initial population is the first set of
+        // full-data parents, so it must not start on a predictor subset.
+        let init_eval = if fit_sampling_active(cfg, train) {
+            &train_data
+        } else {
+            &init_data
+        };
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
             let mut pop = Vec::with_capacity(cfg.pop);
@@ -1195,7 +1396,7 @@ fn run_search(
                 pop.push(if defer_gpu {
                     Ind::pending(tree, cfg)
                 } else {
-                    Ind::evaluated(tree, &init_data, cfg) // #25
+                    Ind::evaluated(tree, init_eval, cfg) // #25 #85
                 });
             }
             islands.push(pop);
@@ -1229,7 +1430,6 @@ fn run_search(
     let mut seed_results: Vec<SeedResult> = Vec::new();
     // #27: seeds are fitted on the full training sample and re-scored (when a
     // generation-0 subset exists) on the same rows as the initial population.
-    let train_data = EvalSample::new(train, cfg);
     if !seeds.is_empty() {
         // The population is being inserted before generation 0, whose subset
         // (if any) already scores the initial individuals; use the same sample
@@ -1292,11 +1492,28 @@ fn run_search(
             let gen_sample = training_for_generation(cfg, train, gen);
             let gen_train = gen_sample.as_ref().unwrap_or(train);
             let gen_data = EvalSample::new(gen_train, cfg); // #27
+            // #85: a fresh screening subset for constant fitting, drawn from
+            // this generation's sample. `None` keeps the whole sample.
+            let fit_sample = fit_for_generation(cfg, gen_train, gen);
+            let fit_train = fit_sample.as_ref().unwrap_or(gen_train);
+            let screened = fit_sample.is_some();
+            if screened {
+                fit_screened = true;
+            }
+            // #85: successive halving phase one scores offspring on the
+            // screening sample; phase two promotes the top fraction to a
+            // full-data refit and selects against the full-data parents.
+            let screen_data = if screened {
+                Some(EvalSample::new(fit_train, cfg))
+            } else {
+                None
+            };
+            let eval_data = screen_data.as_ref().unwrap_or(&gen_data);
 
-            // With subsampling active, re-score the carried-over population on
-            // this generation's subset so every individual competes on the same
-            // rows. (Inactive runs keep the original errors untouched.)
-            if gen > 0 && gen_sample.is_some() {
+            // With predictor subsampling active (and no screening), re-score the
+            // carried-over population on this generation's subset. In the
+            // screened path the parents are already full-data and stay so.
+            if gen > 0 && gen_sample.is_some() && !screened {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
                         ind.reeval(&gen_data, cfg); // #25
@@ -1304,9 +1521,16 @@ fn run_search(
                 }
             }
 
+            // #85: keep the full-data parents for the selection step.
+            let parents: Option<Vec<Vec<Ind>>> = if screened {
+                Some(islands.clone())
+            } else {
+                None
+            };
+
             // ---- parallel generation across islands ---------------------
             let aggs_ref = &aggs;
-            let gen_view = &gen_data; // #27
+            let eval_view = eval_data; // #27
             std::thread::scope(|s| {
                 let handles: Vec<_> = islands
                     .iter_mut()
@@ -1316,7 +1540,17 @@ fn run_search(
                         let blocks = blocks.clone();
                         s.spawn(move || {
                             expr::set_blocks(blocks);
-                            evolve_island(isl, r, cfg, &gen_view, nvars, aggs_ref, defer_gpu)
+                            evolve_island(
+                                isl,
+                                r,
+                                cfg,
+                                &eval_view,
+                                fit_train,
+                                nvars,
+                                aggs_ref,
+                                screened,
+                                defer_gpu && !screened,
+                            ) // #85
                         })
                     })
                     .collect();
@@ -1328,8 +1562,38 @@ fn run_search(
             // #26: one batched call covers every candidate of the generation.
             #[cfg(feature = "cuda")]
             {
-                defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                if !screened {
+                    defer_gpu =
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                }
+            }
+
+            // #85: successive halving phase two. Promote the top fraction of
+            // the screening offspring, refit and re-score them on every
+            // training row, then select the next population against the
+            // full-data parents. The archive only ever sees full-data scores.
+            if let Some(parents) = parents {
+                let promote = promoted_count(cfg.pop);
+                for (pop, parents) in islands.iter_mut().zip(parents) {
+                    let mut offspring = std::mem::take(pop);
+                    offspring.sort_by(|a, b| {
+                        a.error
+                            .partial_cmp(&b.error)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    let mut promoted: Vec<Ind> = Vec::with_capacity(promote);
+                    for mut ind in offspring.into_iter().take(promote) {
+                        let sol = refit_survivor(&ind.tree, &train_data, cfg);
+                        ind.tree = sol.tree;
+                        ind.error = sol.error;
+                        ind.complexity = sol.cost;
+                        promoted.push(ind);
+                    }
+                    let mut combined = parents;
+                    combined.extend(promoted);
+                    select_population(&mut combined, cfg.pop);
+                    *pop = combined;
+                }
             }
 
             // ---- archive + convergence bookkeeping ----------------------
@@ -1452,15 +1716,16 @@ fn run_search(
                                 Some(&aggs),
                             );
                             // #15: multi-output fits per output inside the evaluator.
+                            let mut fitted = None;
                             if cfg.fit_iters > 0 && !gen_train.is_multi() {
-                                fit_constants(&mut t, cfg, gen_train);
+                                fitted = fit_constants(&mut t, cfg, fit_train, gen_train); // #85 #87
                             }
                             // #26: restart trees are batched with the next GPU
                             // call too, before the checkpoint is taken.
                             *ind = if defer_gpu {
                                 Ind::pending(t, cfg)
                             } else {
-                                Ind::evaluated(t, &gen_data, cfg)
+                                Ind::evaluated_fitted(t, fitted, &gen_data, cfg) // #87
                             };
                         }
                         rngs[ii] = r;
@@ -1520,12 +1785,12 @@ fn run_search(
         emit(&mut on_checkpoint, &cp);
     }
 
-    if subsampling_active(cfg, train) || gpu_used || resumed {
+    if subsampling_active(cfg, train) || gpu_used || resumed || fit_screened {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
         // training row with the CPU in f64. From here on the archive and every
         // number derived from it are full-data and match the CPU backend.
-        archive = full_data_archive(&archive, &islands, &train_data, cfg); // #25
+        archive = full_data_archive(&archive, &islands, &train_data, cfg); // #25 #85
     } else {
         for pop in &islands {
             for ind in pop {
@@ -1580,6 +1845,13 @@ fn run_search(
         seeds: seed_results,
         // #18: the four convergence numbers for the final --json output.
         convergence,
+        // #85: the CLI states both numbers; `0` keeps the old output.
+        fit_samples: if fit_screened {
+            cfg.fit_samples.min(train.len())
+        } else {
+            0
+        },
+        archive_refit: fit_screened,
     })
 }
 
@@ -1634,6 +1906,160 @@ mod tests {
         let data = EvalSample::new(&s, &cfg);
         let accepted = prepare_seeds(&cfg, &data, &[seed], &aggs);
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
+    }
+
+    /// #87: on an unweighted `squared` fit the fitter's SSE is the score, bit
+    /// for bit, so the separate scoring sweep can be skipped.
+    #[test]
+    fn fitted_sse_matches_the_squared_score() {
+        // 200 rows, as in the issue's measurement.
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..200 {
+            let a = -1.0 + 2.0 * i as f64 / 199.0;
+            x.push(vec![a]);
+            y.push(0.7 * a);
+        }
+        let s = Sample {
+            x,
+            y,
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let mut cfg = Config::default();
+        cfg.metric = Metric::Squared;
+        cfg.fit_iters = 8;
+        let data = EvalSample::new(&s, &cfg);
+
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("the ordinary fit path");
+        let hash = expr::structural_hash(&tree);
+        assert!(
+            can_reuse_sse(&cfg, &data, &fit, hash),
+            "a squared fit on the scoring rows with nothing folded must be reusable"
+        );
+        let fitted_error = fit.sse / s.len() as f64;
+
+        let reused = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(
+            reused.error.to_bits(),
+            scored.error.to_bits(),
+            "the reused SSE must equal the fresh score bit for bit"
+        );
+        assert_eq!(fitted_error.to_bits(), scored.error.to_bits());
+    }
+
+    /// #87: when simplification folds a fitted constant, the stored SSE no
+    /// longer describes the tree that is scored, so evaluation is used.
+    #[test]
+    fn folded_constants_fall_back_to_evaluation() {
+        let s = sample(); // y = x0, so the additive constant fits to 0
+        let mut cfg = Config::default();
+        cfg.metric = Metric::Squared;
+        cfg.fit_iters = 8;
+        let data = EvalSample::new(&s, &cfg);
+
+        let mut tree = node(Op::Add, vec![input(0), constant(3.0)]);
+        let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("the ordinary fit path");
+        let simplified = expr::simplify(&tree);
+        assert!(
+            !can_reuse_sse(&cfg, &data, &fit, expr::structural_hash(&simplified)),
+            "a simplification that folded the constant must force a fresh score"
+        );
+
+        let fitted = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(fitted.error.to_bits(), scored.error.to_bits());
+    }
+
+    /// #85: the screening subset is redrawn every generation, not reused.
+    #[test]
+    fn fit_screen_is_redrawn_each_generation() {
+        let s = sample();
+        let cfg = Config {
+            fit_samples: 5,
+            ..Default::default()
+        };
+        let a = fit_for_generation(&cfg, &s, 0).expect("generation 0 screens");
+        let b = fit_for_generation(&cfg, &s, 1).expect("generation 1 screens");
+        assert_eq!(a.len(), 5);
+        assert_ne!(a.x, b.x, "consecutive generations must draw fresh rows");
+    }
+
+    /// #85: a survivor is refitted and scored on the full sample before it can
+    /// enter the archive.
+    #[test]
+    fn refit_survivor_scores_on_the_full_sample() {
+        let s = sample(); // y = x0
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            ..Default::default()
+        };
+        // Fit on the first five rows only; the full-data refit must recover
+        // the exact constant.
+        let screening = subset_sample(&s, &[0, 1, 2, 3, 4]);
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        fit_constants(&mut tree, &cfg, &screening, &screening);
+        let view = EvalSample::new(&s, &cfg);
+        let sol = refit_survivor(&tree, &view, &cfg);
+        let full = eval_error_with(&sol.tree, &s, Metric::Squared, true);
+        assert_eq!(sol.error.to_bits(), full.to_bits());
+        assert!(sol.error < 1e-12, "full-data error = {}", sol.error);
+    }
+
+    /// #87: guarded operators must not leave a finite fit SSE behind. The
+    /// fitted value is infinite exactly when the scorer rejects the tree, so
+    /// the reuse is refused and both paths agree bit for bit.
+    #[test]
+    fn guarded_trees_do_not_reuse_a_finite_fit_sse() {
+        let cfg = Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            ..Default::default()
+        };
+
+        // 1/(x-c) at the data row: the denominator is zero.
+        let s = Sample {
+            x: vec![vec![0.5]],
+            y: vec![0.0],
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let data = EvalSample::new(&s, &cfg);
+        let mut tree = node(
+            Op::Div,
+            vec![
+                constant(1.0),
+                node(Op::Sub, vec![input(0), constant(0.5)]),
+            ],
+        );
+        let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("ordinary fit path");
+        assert!(!fit.sse.is_finite(), "the guard must fire in the fitter");
+        let reused = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(reused.error.to_bits(), scored.error.to_bits());
+        assert!(reused.error.is_infinite());
+
+        // exp(701*x) at x=1: `expr::eval` says infinity, not exp(701).
+        let s = Sample {
+            x: vec![vec![1.0]],
+            y: vec![0.0],
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let data = EvalSample::new(&s, &cfg);
+        let mut tree = node(
+            Op::Exp,
+            vec![node(Op::Mul, vec![constant(701.0), input(0)])],
+        );
+        let fit = fit_constants(&mut tree, &cfg, &s, &s).expect("ordinary fit path");
+        assert!(!fit.sse.is_finite(), "the guard must fire in the fitter");
+        let reused = Ind::evaluated_fitted(tree.clone(), Some(fit), &data, &cfg);
+        let scored = Ind::evaluated(tree, &data, &cfg);
+        assert_eq!(reused.error.to_bits(), scored.error.to_bits());
+        assert!(reused.error.is_infinite());
     }
 
     /// #77: a child identical to a parent must be caught by the dedup set, not
