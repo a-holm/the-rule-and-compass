@@ -275,6 +275,28 @@ always lies between them.
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
 
+## Known-truth benchmarks
+
+To check that the engine *recovers* laws rather than overfitting samples, a
+separate harness runs it on a suite of **25 problems whose true formula is
+known** — small Feynman-style physics laws and elementary dynamical systems —
+with and without noise:
+
+```sh
+cd my-version
+cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1
+cargo run --release --bin rcsr-bench -- --tiny          # fast CI subset, seconds
+cargo run --release --bin rcsr-bench -- --tiny --json   # machine-readable
+cargo run --release --bin rcsr-bench -- --list          # the problem table
+```
+
+A problem counts as **recovered** when the engine's Pareto front contains an
+expression reaching test R² ≥ 0.99 on fresh *noiseless* data. The harness prints
+a per-run table and a summary (recovery rate overall and per noise level, median
+complexity) in text or with `--json`, and a run is reproducible from `--seed`.
+See [`docs/benchmarks.md`](docs/benchmarks.md) for the criterion, the problem
+list and the recorded results.
+
 ## Features
 
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
@@ -321,6 +343,7 @@ docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/overfitting.md           avoiding and detecting overfitting, with references
+docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/
   Cargo.toml
@@ -332,15 +355,18 @@ my-version/
     metrics.rs    error metrics
     pareto.rs     the error/complexity Pareto front
     data.rs       table loading, split modes, normalisation
+    bench.rs      known-truth benchmark suite: problems, generators, scoring
     search.rs     island-model GP loop
     gpu.rs        bytecode compiler + FFI for the optional GPU evaluator
     cuda/eval.cu  the CUDA kernel
     main.rs       the `rcsr` CLI
     bin/
       gpu_bench.rs  GPU vs CPU evaluation benchmark (--features cuda)
+      rcsr_bench.rs the `rcsr-bench` known-truth benchmark harness
   tests/
     recover.rs    end-to-end recovery tests + unit tests
     split.rs      split-mode tests (temporal, group, panel, folds)
+    bench.rs      known-truth benchmark harness tests
   examples/
     line.csv, sine.csv
 ```
