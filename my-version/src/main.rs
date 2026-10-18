@@ -15,7 +15,7 @@ use rcsr::expr::{self, Op};
 use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
-use rcsr::{data, diagnostics, search};
+use rcsr::{data, diagnostics, search, stability};
 use std::io::Read;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -102,6 +102,10 @@ OVERFITTING DIAGNOSTICS (always on):
                              resamples and report the apparent, out-of-bag and
                              .632+ error estimates (Efron & Tibshirani 1997);
                              costs n constant refits per reported solution
+  --stability <B>            bootstrap the training rows B times, re-run the
+                             identical search and rank the structural forms and
+                             input variables by how often they are selected;
+                             costs B extra searches
 
 MODE:
   --eval-expr <expr>         do not search: parse this formula, score it on the
@@ -164,6 +168,7 @@ fn schema() -> String {
         ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),
+        ("--stability", "int", "0", "bootstrap resamples for stability selection (0 = off)"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | auc | log_loss | hinge | aic | aicc | bic"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
@@ -259,6 +264,11 @@ struct Row {
     /// Standard errors of the fitted constants (issue #22); `None` when they
     /// are not defined (no constants, or no residual degrees of freedom).
     constant_errors: Option<fit::ConstantErrors>,
+    /// Structural form of the (normalised) tree, with constants collapsed; the
+    /// key stability selection counts.
+    shape: String,
+    /// Fraction of `--stability` resamples that selected this same form.
+    stability: Option<f64>,
     expression: String,
 }
 
@@ -339,6 +349,7 @@ fn main() {
     let mut null_runs = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
+    let mut stability_runs = 0usize;
     let mut cv_mode: Option<data::CvMode> = None;
     let mut cv_k = 5usize;
 
@@ -393,6 +404,7 @@ fn main() {
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
             "--eval-expr" => eval_expr = Some(val!()),
+            "--stability" => stability_runs = val!().parse().unwrap_or(0),
             "--cv" => {
                 let v = val!();
                 match data::CvMode::parse(&v) {
@@ -860,6 +872,8 @@ fn main() {
                 // Parameter uncertainty at the fitted solution (issue #22):
                 // reuse the fitter's Jacobian on the training rows.
                 constant_errors: fit::constant_errors(&s.tree, &prepared.train.x, &prepared.train.y),
+                shape: stability::shape(&expr::simplify(&s.tree)),
+                stability: None,
                 expression: expr::to_string(&den, &vars),
             }
         })
@@ -877,6 +891,20 @@ fn main() {
 
     // Null baselines: the trivial models a real fit must beat (issue #23).
     let baselines = diagnostics::Baselines::fit(&prepared.train, &fold_samples, cfg.metric);
+
+    // Stability selection (issue #20): bootstrap the training rows, re-run the
+    // identical search, and count how often each structural form and each input
+    // variable is selected. A form that wins most resamples is what the data
+    // supports; one that wins once is a coincidence.
+    let stab: Option<stability::Stability> = if stability_runs > 0 {
+        let st = stability::run(&cfg, &prepared.train, &prepared.test, stability_runs, &vars);
+        for r in rows.iter_mut() {
+            r.stability = Some(st.frequency(&r.shape));
+        }
+        Some(st)
+    } else {
+        None
+    };
 
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
@@ -1116,6 +1144,41 @@ fn main() {
                     );
                 }
             }
+            if let Some(st) = &stab {
+                let top = st.forms.first();
+                eprintln!(
+                    "# stability ({} resamples, {} found a solution): modal form {:.0}%{}",
+                    st.runs,
+                    st.found,
+                    top.map(|f| f.frequency * 100.0).unwrap_or(0.0),
+                    top.map(|f| format!("  y = {}", f.example)).unwrap_or_default()
+                );
+                let names: Vec<String> = st
+                    .variables
+                    .iter()
+                    .map(|(i, c)| {
+                        format!(
+                            "{} {}/{} ({:.0}%)",
+                            vars.get(*i).cloned().unwrap_or_else(|| format!("x{}", i)),
+                            c,
+                            st.runs,
+                            if st.runs > 0 {
+                                *c as f64 * 100.0 / st.runs as f64
+                            } else {
+                                0.0
+                            }
+                        )
+                    })
+                    .collect();
+                eprintln!("#   variable selection: {}", names.join(" | "));
+                let forms: Vec<String> = st
+                    .forms
+                    .iter()
+                    .take(5)
+                    .map(|f| format!("{}/{} ({:.0}%) {}", f.count, st.runs, f.frequency * 100.0, f.example))
+                    .collect();
+                eprintln!("#   forms: {}", forms.join(" | "));
+            }
         }
         Format::Json => {
             let split_json = format!(
@@ -1143,7 +1206,7 @@ fn main() {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -1156,6 +1219,7 @@ fn main() {
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
                         constant_errors_json(&r.constant_errors),
+                        r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
                     )
                 })
@@ -1226,8 +1290,51 @@ fn main() {
                 }
                 None => "null".to_string(),
             };
+            let stability_json = match &stab {
+                Some(st) => {
+                    let forms: Vec<String> = st
+                        .forms
+                        .iter()
+                        .map(|f| {
+                            format!(
+                                "{{\"shape\":{},\"count\":{},\"frequency\":{},\"complexity\":{},\"example\":{}}}",
+                                jstr(&f.shape),
+                                f.count,
+                                jnum(f.frequency),
+                                f.complexity,
+                                jstr(&f.example)
+                            )
+                        })
+                        .collect();
+                    let variables: Vec<String> = st
+                        .variables
+                        .iter()
+                        .map(|(i, c)| {
+                            format!(
+                                "{{\"index\":{},\"name\":{},\"count\":{},\"frequency\":{}}}",
+                                i,
+                                jstr(vars.get(*i).map(|s| s.as_str()).unwrap_or("")),
+                                c,
+                                jnum(if st.runs > 0 {
+                                    *c as f64 / st.runs as f64
+                                } else {
+                                    0.0
+                                })
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "{{\"runs\":{},\"found\":{},\"forms\":[{}],\"variables\":[{}]}}",
+                        st.runs,
+                        st.found,
+                        forms.join(","),
+                        variables.join(",")
+                    )
+                }
+                None => "null".to_string(),
+            };
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"split\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -1243,13 +1350,14 @@ fn main() {
                 baselines_json,
                 resid_json,
                 cv_json,
+                stability_json,
                 pareto.join(",")
             );
         }
         Format::Ndjson => {
             for r in &rows {
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -1262,6 +1370,7 @@ fn main() {
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
                     constant_errors_json(&r.constant_errors),
+                    r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
                 );
             }
@@ -1309,6 +1418,45 @@ fn main() {
                     jnum(rt.breusch_pagan.p_value),
                     jnum(rt.skewness),
                     jnum(rt.kurtosis)
+                );
+            }
+            if let Some(st) = &stab {
+                let forms: Vec<String> = st
+                    .forms
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{{\"shape\":{},\"count\":{},\"frequency\":{},\"example\":{}}}",
+                            jstr(&f.shape),
+                            f.count,
+                            jnum(f.frequency),
+                            jstr(&f.example)
+                        )
+                    })
+                    .collect();
+                let variables: Vec<String> = st
+                    .variables
+                    .iter()
+                    .map(|(i, c)| {
+                        format!(
+                            "{{\"index\":{},\"name\":{},\"count\":{},\"frequency\":{}}}",
+                            i,
+                            jstr(vars.get(*i).map(|s| s.as_str()).unwrap_or("")),
+                            c,
+                            jnum(if st.runs > 0 {
+                                *c as f64 / st.runs as f64
+                            } else {
+                                0.0
+                            })
+                        )
+                    })
+                    .collect();
+                println!(
+                    "{{\"event\":\"stability\",\"runs\":{},\"found\":{},\"forms\":[{}],\"variables\":[{}]}}",
+                    st.runs,
+                    st.found,
+                    forms.join(","),
+                    variables.join(",")
                 );
             }
             println!(
