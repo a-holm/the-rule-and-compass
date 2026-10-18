@@ -94,25 +94,24 @@ pub struct Baselines {
     /// k-nearest-neighbour regression; `knn_k` is the `k` actually used.
     pub knn: BaselineError,
     pub knn_k: usize,
-    /// #69: training rows the k-NN baseline searched for neighbours. Equal to
-    /// the training size when the run was exact; otherwise the cap.
+    /// #69: training rows searched for neighbours. **Always the full training
+    /// size**: the reference set is never subsampled.
     pub knn_reference_rows: usize,
-    /// #69: true when the exact all-rows search was replaced by deterministic
-    /// reference and query subsamples.
+    /// #69: query rows actually scored (training rows plus all test folds).
+    pub knn_query_rows: usize,
+    /// #69: standard error of the k-NN **training** error when the query rows
+    /// were sampled; `NaN` when every query row was scored (or when the metric
+    /// is not a plain mean of per-row losses).
+    pub knn_query_sem: f64,
+    /// #69: true when the query rows were subsampled. The reference set is
+    /// always exact.
     pub knn_capped: bool,
 }
 
-/// #69: default cap on the k-NN baseline's reference set (and on the scored
-/// query rows). At `n <= cap` the baseline is the exact all-rows algorithm.
-///
-/// The cost is `O(cap² log cap)` instead of `O(n² log n)`. 4096 is the knee of
-/// the measured curve: on 6 inputs, 200 000 rows and `--generations 0`, the
-/// whole run takes 3.5 s at 4096 versus 10.4 s at 8192 (and 19 s for the exact
-/// 15 000-row training set at 20 000 rows). The cap trades some density for
-/// that speed: above it the k-NN error is an estimate on the subsample and is
-/// somewhat larger (a weaker, easier-to-beat baseline) than the exact one. Pass
-/// `--baseline-samples` higher when a tighter baseline matters more than time.
-pub const KNN_REFERENCE_CAP: usize = 4096;
+/// #69: k-d trees answer exact k-NN queries for up to this many inputs. Above
+/// it the exact brute-force path is used, with a reused distance buffer and
+/// `select_nth_unstable` instead of a fresh allocation and a full sort.
+pub const KNN_KD_MAX_DIM: usize = 8;
 
 /// Number of neighbours used by the baseline k-NN learner.
 ///
@@ -128,25 +127,21 @@ impl Baselines {
     /// block; the reported test error is the mean over blocks, exactly as for a
     /// searched model. An empty `test_folds` yields an infinite test error.
     ///
-    /// #69: the k-NN baseline uses at most [`KNN_REFERENCE_CAP`] reference rows
-    /// (seed 0). For larger data use [`Baselines::fit_sampled`] to pass the
-    /// run's seed, or `0` for the exact all-rows path.
+    /// The k-NN baseline is exact: all training rows are neighbours and every
+    /// training/test row is scored. Use [`Baselines::fit_sampled`] only when
+    /// the exact query cost is unaffordable.
     pub fn fit(train: &Sample, test_folds: &[Sample], metric: Metric) -> Baselines {
-        Baselines::fit_sampled(train, test_folds, metric, KNN_REFERENCE_CAP, 0)
+        Baselines::fit_sampled(train, test_folds, metric, 0, 0)
     }
 
-    /// #69: as [`Baselines::fit`], but with an explicit cap on the k-NN
-    /// baseline and the seed that chooses its deterministic subsamples.
+    /// #69: as [`Baselines::fit`], but optionally samples the **query** rows.
     ///
-    /// `baseline_samples = 0` means "exact": every training row is a neighbour
-    /// and every training/test row is scored, which is the behaviour before
-    /// issue #69. At `train.len() <= baseline_samples` the exact algorithm is
-    /// used too, so small-data numbers are bit-identical.
-    ///
-    /// Above the cap, the reference set (the rows neighbours are drawn from)
-    /// and the scored query rows are both deterministic subsamples of size
-    /// `min(cap, rows)`, drawn from `seed`. The reported train/test error is
-    /// then an estimate on those subsamples rather than on every row.
+    /// `baseline_samples = 0` means "no caps at all": the exact reference set
+    /// (every training row) and every query row. A positive value scores at
+    /// most that many deterministic query rows per set (training and each test
+    /// fold), drawn from `seed`. The reference set stays exact in both cases,
+    /// so a sampled result is an unbiased estimate of the same 5-NN error; its
+    /// standard error is reported when the metric is a mean of per-row losses.
     pub fn fit_sampled(
         train: &Sample,
         test_folds: &[Sample],
@@ -172,100 +167,145 @@ impl Baselines {
             },
         };
 
-        // k-NN.
+        // k-NN. The index is built once over the full training set and reused
+        // for the training queries and every test fold.
         let k = knn_k(train.len());
-        let capped = baseline_samples > 0 && train.len() > baseline_samples;
-        let knn_err = if capped {
-            knn_sampled(train, test_folds, metric, k, baseline_samples, seed)
+        let mut index = KnnIndex::new(train);
+        let train_q = score_knn_queries(
+            &mut index,
+            train,
+            metric,
+            k,
+            baseline_samples,
+            seed ^ 0x7472_6169,
+        );
+        let mut test_rows = 0usize;
+        let mut sampled = train_q.rows < train.len();
+        let test_error = if test_folds.is_empty() {
+            f64::INFINITY
         } else {
-            score_folds(train, test_folds, metric, &|x| knn_predict(train, x, k))
-        };
-        let knn_reference_rows = if capped {
-            baseline_samples.min(train.len())
-        } else {
-            train.len()
+            let mut acc = 0.0;
+            for (f, fold) in test_folds.iter().enumerate() {
+                let fold_seed = seed
+                    ^ 0x666f_6c64u32
+                    ^ (0x9e37_79b9u32.wrapping_mul(f as u32 + 1));
+                let q = score_knn_queries(&mut index, fold, metric, k, baseline_samples, fold_seed);
+                test_rows += q.rows;
+                sampled |= q.rows < fold.len();
+                acc += q.error;
+            }
+            acc / test_folds.len() as f64
         };
 
         Baselines {
             mean: mean_err,
             linear: linear_err,
-            knn: knn_err,
+            knn: BaselineError {
+                train_error: train_q.error,
+                test_error,
+            },
             knn_k: k,
-            knn_reference_rows,
-            knn_capped: capped,
+            knn_reference_rows: train.len(),
+            knn_query_rows: train_q.rows + test_rows,
+            knn_query_sem: train_q.sem,
+            knn_capped: sampled,
         }
     }
 
     /// #69: the extra fields of the `baselines.knn` object in `--json` /
     /// `--ndjson`, so the text and machine-readable surfaces cannot drift.
     pub fn knn_json_extra(&self) -> String {
+        let sem = if self.knn_query_sem.is_finite() {
+            format!("{:.6e}", self.knn_query_sem)
+        } else {
+            "null".to_string()
+        };
         format!(
-            "\"reference_rows\":{},\"capped\":{}",
-            self.knn_reference_rows, self.knn_capped
+            "\"reference_rows\":{},\"query_rows\":{},\"query_sem\":{},\"capped\":{}",
+            self.knn_reference_rows, self.knn_query_rows, sem, self.knn_capped
         )
     }
 }
 
-/// #69: exact k-NN scoring on deterministic reference and query subsamples.
-///
-/// The reference set is sorted by original row index, so ties in
-/// [`knn_predict`] break exactly as they would on the full sample (the lower
-/// original row wins). Each test fold draws its own query subsample.
-fn knn_sampled(
-    train: &Sample,
-    test_folds: &[Sample],
+/// One scored query set: its error, how many rows it used, and the standard
+/// error of the mean when it was sampled.
+struct QueryScore {
+    error: f64,
+    rows: usize,
+    sem: f64,
+}
+
+/// Score `query` against the fixed reference index, sampling only the query
+/// rows when `sample > 0`.
+fn score_knn_queries(
+    index: &mut KnnIndex<'_>,
+    query: &Sample,
     metric: Metric,
     k: usize,
-    cap: usize,
+    sample: usize,
     seed: u32,
-) -> BaselineError {
-    let take = cap.min(train.len());
-    let ref_idx = sample_indices(train.len(), take, seed ^ 0x6b6e_6e01);
-    let reference = subset_sample(train, &ref_idx);
-
-    let train_error = score_query_subset(train, &reference, metric, k, take, seed ^ 0x7175_6572);
-    let test_error = if test_folds.is_empty() {
-        f64::INFINITY
+) -> QueryScore {
+    if query.is_empty() {
+        return QueryScore {
+            error: metrics::score(&[], &[], metric),
+            rows: 0,
+            sem: f64::NAN,
+        };
+    }
+    let take = if sample == 0 {
+        query.len()
     } else {
-        let mut acc = 0.0;
-        for (f, fold) in test_folds.iter().enumerate() {
-            let fold_seed = seed
-                ^ 0x666f_6c64u32
-                ^ (0x9e37_79b9u32.wrapping_mul(f as u32 + 1));
-            acc += score_query_subset(fold, &reference, metric, k, take, fold_seed);
-        }
-        acc / test_folds.len() as f64
+        sample.min(query.len())
     };
-    BaselineError {
-        train_error,
-        test_error,
+    let idx = sample_indices(query.len(), take, seed);
+    let mut pred = Vec::with_capacity(take);
+    for &i in &idx {
+        pred.push(index.predict(&query.x[i], k));
+    }
+    let y: Vec<f64> = idx.iter().map(|&i| query.y[i]).collect();
+    let error = metrics::score(&pred, &y, metric);
+    let sem = if take < query.len() {
+        mean_sem(metric, &pred, &y)
+    } else {
+        f64::NAN
+    };
+    QueryScore {
+        error,
+        rows: take,
+        sem,
     }
 }
 
-/// Score `query` on `take` deterministic rows against the fixed `reference`.
-fn score_query_subset(
-    query: &Sample,
-    reference: &Sample,
-    metric: Metric,
-    k: usize,
-    take: usize,
-    seed: u32,
-) -> f64 {
-    if query.is_empty() {
-        return metrics::score(&[], &[], metric);
+/// Standard error of the mean for metrics that are a plain mean of per-row
+/// losses. `NaN` for every other metric (its sampling error is not a simple
+/// `s/√n`).
+fn mean_sem(metric: Metric, pred: &[f64], y: &[f64]) -> f64 {
+    let n = pred.len();
+    if n < 2 {
+        return f64::NAN;
     }
-    let take = take.min(query.len());
-    let idx = sample_indices(query.len(), take, seed);
-    let pred: Vec<f64> = idx
+    let mut losses = Vec::with_capacity(n);
+    for (&p, &t) in pred.iter().zip(y) {
+        let e = p - t;
+        let loss = match metric {
+            Metric::Absolute => e.abs(),
+            Metric::Squared => e * e,
+            Metric::LogSquashed => (1.0 + e * e).ln(),
+            _ => return f64::NAN,
+        };
+        losses.push(loss);
+    }
+    let mean = losses.iter().sum::<f64>() / n as f64;
+    let var = losses
         .iter()
-        .map(|&i| knn_predict(reference, &query.x[i], k))
-        .collect();
-    let y: Vec<f64> = idx.iter().map(|&i| query.y[i]).collect();
-    metrics::score(&pred, &y, metric)
+        .map(|v| (v - mean) * (v - mean))
+        .sum::<f64>()
+        / (n - 1) as f64;
+    (var / n as f64).sqrt()
 }
 
 /// `take` distinct row indices from `0..n`, deterministic in `seed` and
-/// returned in ascending order (so neighbour tie-breaking is stable).
+/// returned in ascending order.
 fn sample_indices(n: usize, take: usize, seed: u32) -> Vec<usize> {
     let take = take.min(n);
     if take == n {
@@ -283,11 +323,267 @@ fn sample_indices(n: usize, take: usize, seed: u32) -> Vec<usize> {
     idx
 }
 
-/// Copy the selected rows into a fresh unweighted sample.
-fn subset_sample(s: &Sample, idx: &[usize]) -> Sample {
-    let x: Vec<Vec<f64>> = idx.iter().map(|&i| s.x[i].clone()).collect();
-    let y: Vec<f64> = idx.iter().map(|&i| s.y[i]).collect();
-    Sample::new(x, y)
+// ---------------------------------------------------------------------------
+// #69: exact k-NN index
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Neighbor {
+    dist: f64,
+    idx: usize,
+}
+
+impl Eq for Neighbor {}
+
+impl Ord for Neighbor {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dist
+            .partial_cmp(&other.dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+impl PartialOrd for Neighbor {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Squared Euclidean distance, summed in input order (the same arithmetic as
+/// [`knn_predict`], so exact ties agree).
+fn sqdist(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = x - y;
+            d * d
+        })
+        .sum()
+}
+
+struct KdNode {
+    point: usize,
+    axis: usize,
+    left: Option<usize>,
+    right: Option<usize>,
+    /// Bounding box of the subtree, used to prune whole subtrees. Only the
+    /// first `dim` entries are meaningful.
+    min: [f64; KNN_KD_MAX_DIM],
+    max: [f64; KNN_KD_MAX_DIM],
+}
+
+/// An exact k-NN index over every training row.
+///
+/// A balanced k-d tree is built for `1 <= d <= KNN_KD_MAX_DIM`; otherwise the
+/// brute-force path reuses one distance buffer and selects the k smallest with
+/// `select_nth_unstable` rather than allocating and sorting per query.
+struct KnnIndex<'a> {
+    train: &'a Sample,
+    nodes: Vec<KdNode>,
+    root: Option<usize>,
+    buf: Vec<(f64, usize)>,
+    best: Vec<Neighbor>,
+}
+
+impl<'a> KnnIndex<'a> {
+    fn new(train: &'a Sample) -> Self {
+        let dim = train.x.first().map(|r| r.len()).unwrap_or(0);
+        let mut nodes = Vec::new();
+        let root = if !train.is_empty() && dim > 0 && dim <= KNN_KD_MAX_DIM {
+            let mut idx: Vec<usize> = (0..train.len()).collect();
+            build_kd(train, &mut idx, 0, &mut nodes)
+        } else {
+            None
+        };
+        KnnIndex {
+            train,
+            nodes,
+            root,
+            buf: Vec::new(),
+            best: Vec::new(),
+        }
+    }
+
+    fn predict(&mut self, x: &[f64], k: usize) -> f64 {
+        if self.train.is_empty() {
+            return f64::NAN;
+        }
+        let kk = k.clamp(1, self.train.len());
+        if let Some(root) = self.root {
+            self.best.clear();
+            search_kd(&self.nodes, self.train, root, x, kk, &mut self.best);
+            self.best.sort_unstable();
+            self.best
+                .iter()
+                .map(|n| self.train.y[n.idx])
+                .sum::<f64>()
+                / kk as f64
+        } else {
+            self.buf.clear();
+            self.buf.extend(
+                self.train
+                    .x
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| (sqdist(r, x), i)),
+            );
+            if kk < self.buf.len() {
+                self.buf.select_nth_unstable_by(kk - 1, cmp_dist);
+            }
+            self.buf[..kk].sort_unstable_by(cmp_dist);
+            self.buf[..kk]
+                .iter()
+                .map(|&(_, i)| self.train.y[i])
+                .sum::<f64>()
+                / kk as f64
+        }
+    }
+}
+
+fn cmp_dist(a: &(f64, usize), b: &(f64, usize)) -> std::cmp::Ordering {
+    a.0.partial_cmp(&b.0)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| a.1.cmp(&b.1))
+}
+
+fn build_kd(
+    sample: &Sample,
+    idx: &mut [usize],
+    depth: usize,
+    nodes: &mut Vec<KdNode>,
+) -> Option<usize> {
+    if idx.is_empty() {
+        return None;
+    }
+    let dim = sample.x[0].len();
+    // Bounding box and widest axis, both in one pass over the node's rows.
+    let mut min = [f64::INFINITY; KNN_KD_MAX_DIM];
+    let mut max = [f64::NEG_INFINITY; KNN_KD_MAX_DIM];
+    for &i in idx.iter() {
+        for j in 0..dim {
+            let v = sample.x[i][j];
+            if v < min[j] {
+                min[j] = v;
+            }
+            if v > max[j] {
+                max[j] = v;
+            }
+        }
+    }
+    let axis = (0..dim)
+        .max_by(|&a, &b| {
+            (max[a] - min[a])
+                .partial_cmp(&(max[b] - min[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .unwrap_or(depth % dim);
+    let mid = idx.len() / 2;
+    idx.select_nth_unstable_by(mid, |&a, &b| {
+        sample.x[a][axis]
+            .partial_cmp(&sample.x[b][axis])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
+    let point = idx[mid];
+    let (left_idx, rest) = idx.split_at_mut(mid);
+    let right_idx = &mut rest[1..];
+    let left = build_kd(sample, left_idx, depth + 1, nodes);
+    let right = build_kd(sample, right_idx, depth + 1, nodes);
+    let id = nodes.len();
+    nodes.push(KdNode {
+        point,
+        axis,
+        left,
+        right,
+        min,
+        max,
+    });
+    Some(id)
+}
+
+fn search_kd(
+    nodes: &[KdNode],
+    train: &Sample,
+    node: usize,
+    x: &[f64],
+    k: usize,
+    best: &mut Vec<Neighbor>,
+) {
+    let nd = &nodes[node];
+    if best.len() >= k {
+        // The box lower bound is conservative: only prune when it clearly
+        // exceeds the current worst distance (the small relative slack keeps
+        // floating-point summation from ever pruning an exact tie).
+        let worst = worst_dist(best, k);
+        if bbox_dist2(nd, x) > worst + worst.abs() * 1e-12 + 1e-12 {
+            return;
+        }
+    }
+    let p = &train.x[nd.point];
+    offer(best, Neighbor {
+        dist: sqdist(p, x),
+        idx: nd.point,
+    }, k);
+
+    let diff = x[nd.axis] - p[nd.axis];
+    let (near, far) = if diff <= 0.0 {
+        (nd.left, nd.right)
+    } else {
+        (nd.right, nd.left)
+    };
+    if let Some(child) = near {
+        search_kd(nodes, train, child, x, k, best);
+    }
+    // `diff²` is a lower bound on every point in the far subtree; visit it
+    // when it can still contain a neighbour (ties included, for row-order
+    // tie-breaking).
+    let worst = worst_dist(best, k);
+    if diff * diff <= worst {
+        if let Some(child) = far {
+            search_kd(nodes, train, child, x, k, best);
+        }
+    }
+}
+
+fn offer(best: &mut Vec<Neighbor>, cand: Neighbor, k: usize) {
+    if best.len() < k {
+        best.push(cand);
+        return;
+    }
+    let mut worst = 0;
+    for i in 1..best.len() {
+        if best[i] > best[worst] {
+            worst = i;
+        }
+    }
+    if cand < best[worst] {
+        best[worst] = cand;
+    }
+}
+
+fn worst_dist(best: &[Neighbor], k: usize) -> f64 {
+    if best.len() < k {
+        f64::INFINITY
+    } else {
+        best.iter().map(|n| n.dist).fold(f64::NEG_INFINITY, f64::max)
+    }
+}
+
+/// Squared distance from `x` to the node's bounding box (a lower bound on the
+/// distance to every point in the subtree).
+fn bbox_dist2(nd: &KdNode, x: &[f64]) -> f64 {
+    let mut s = 0.0;
+    for (j, &v) in x.iter().enumerate().take(KNN_KD_MAX_DIM) {
+        if v < nd.min[j] {
+            let d = nd.min[j] - v;
+            s += d * d;
+        } else if v > nd.max[j] {
+            let d = v - nd.max[j];
+            s += d * d;
+        }
+    }
+    s
 }
 
 /// Score one predictor on the training sample and on each test fold. The test

@@ -181,10 +181,10 @@ OVERFITTING DIAGNOSTICS (always on):
                               straight line and a 5-nearest-neighbour learner,
                               in the same metric as the search: a model must
                               beat them to earn its complexity
-  --baseline-samples <N>      rows searched by the k-NN baseline (default 4096);
-                              above N, deterministic reference and query
-                              subsamples keep its cost independent of n.
-                              0 = exact all-rows behaviour (#69)
+  --baseline-samples <N>      score at most N query rows for the k-NN baseline
+                              (default 0 = every row). The reference set is
+                              always all training rows, so sampling queries is
+                              an unbiased estimate of the same 5-NN error (#69)
   overfit index               test_error / train_error
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
@@ -567,8 +567,8 @@ fn main() {
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
-    // #69: cap on the k-NN null baseline; 0 keeps the exact all-rows path.
-    let mut baseline_samples = diagnostics::KNN_REFERENCE_CAP;
+    // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
+    let mut baseline_samples = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -783,7 +783,7 @@ fn main() {
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
-            // #69: 0 = exact all-rows k-NN baseline.
+            // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
@@ -2254,8 +2254,8 @@ fn main() {
         .map(|r| r.resid_tests);
 
     // Null baselines: the trivial models a real fit must beat (issue #23).
-    // #69: the k-NN baseline is exact up to `--baseline-samples` rows and uses
-    // deterministic reference/query subsamples above it.
+    // #69: the k-NN reference set is always all training rows; only the query
+    // rows are optionally sampled by `--baseline-samples`.
     let baselines = diagnostics::Baselines::fit_sampled(
         &prepared.train,
         &fold_samples,
@@ -2584,11 +2584,20 @@ fn main() {
                 baselines.knn.train_error,
                 baselines.knn.test_error
             );
-            // #69: state the cap and the reference-set size actually used.
-            eprintln!(
-                "# knn baseline: cap={} reference_rows={} capped={}",
-                baseline_samples, baselines.knn_reference_rows, baselines.knn_capped
-            );
+            // #69: state whether queries were sampled and the SEM if so.
+            if baselines.knn_capped {
+                eprintln!(
+                    "# knn baseline: reference_rows={} query_rows={} sampled=true sem={:.3e}",
+                    baselines.knn_reference_rows,
+                    baselines.knn_query_rows,
+                    baselines.knn_query_sem
+                );
+            } else {
+                eprintln!(
+                    "# knn baseline: reference_rows={} query_rows={} sampled=false",
+                    baselines.knn_reference_rows, baselines.knn_query_rows
+                );
+            }
             if let Some(cv) = &cv {
                 eprintln!(
                     "# cross-validation ({}, k={}): mean test={:.6} +/- {:.6} | mean train={:.6}",

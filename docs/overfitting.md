@@ -230,19 +230,29 @@ data did not already contain.
 ```sh
 rcsr --data data.csv --target y --vars x1,x2
 # null baselines (absolute): mean train=2.003 test=2.250 | linear train=0.000 test=0.000 | 5-NN train=0.130 test=0.250
-# knn baseline: cap=4096 reference_rows=2500 capped=false
+# knn baseline: reference_rows=2500 query_rows=2500 sampled=false
 ```
 
-**Cost and cap.** The exact k-NN baseline searches and sorts every training row
-for every scored row, which is `O(n² log n)`. Up to `--baseline-samples` rows
-(default **4096**) that is what `rcsr` does, so small-data numbers are exactly
-the ones from before issue #69. Above the cap it draws a deterministic
-reference subsample of `cap` rows (seeded from `--seed`) for the neighbours and
-scores a deterministic subsample of `cap` query rows, both for training and for
-each test fold; ties still break by original row order. The reported error is
-then an estimate on those subsamples, but its cost no longer grows with `n`.
-`--baseline-samples 0` restores the exact all-rows path (slow on large data);
-`--json` carries `baselines.knn.reference_rows` and `baselines.knn.capped`.
+**Cost.** The baseline's **reference set is always every training row**, at
+every `n`: it is never subsampled, because that would change the estimator.
+What changes is how the queries are answered. For up to eight inputs `rcsr`
+builds a balanced k-d tree once over the training rows and answers exact
+k-nearest-neighbour queries in average `O(log n)`; above eight inputs it uses
+the exact brute-force path with a reused distance buffer and
+`select_nth_unstable`, so it does not allocate and fully sort per query. Ties
+break by original row order either way, and the 20 000-row number matches the
+pre-#69 all-rows value bit for bit.
+
+Only when the exact query cost is unaffordable can the **query rows** be
+sampled: `--baseline-samples N` scores at most `N` deterministic query rows per
+set (training and each test fold), seeded from `--seed`. That is an unbiased
+estimate of the same 5-NN error, not a weaker baseline. When it happens the
+text line says `sampled=true sem=...`, and `--json` carries
+`baselines.knn.query_rows` and `baselines.knn.query_sem` (the standard error of
+the mean training error; `null` when the metric is not a plain mean of per-row
+losses). The default `--baseline-samples 0` means no caps at all: every query
+row is scored. `baselines.knn.reference_rows` is reported too and is always the
+training size.
 
 ### 3.6 Out-of-distribution / extrapolation test
 Train on part of the input range and test outside it, or hold out an entire

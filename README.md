@@ -291,7 +291,8 @@ cat examples/line.csv | rcsr --data - --target y --top 3
     "mean":   { "train_error": 2.0034, "test_error": 2.2496 },
     "linear": { "train_error": 4.8e-7, "test_error": 7.6e-7 },
     "knn":    { "k": 5, "train_error": 0.1299, "test_error": 0.2503,
-                "reference_rows": 30, "capped": false }
+                "reference_rows": 30, "query_rows": 40,
+                "query_sem": null, "capped": false }
   },
   "residual_tests": {
     "n": 30, "lags": 6, "durbin_watson": 2.0,
@@ -579,10 +580,12 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 The null baselines are fit on the training rows and scored on the training rows
 and the test folds in the search's own metric: a model that does not beat the
 5-nearest-neighbour learner has found no structure the data did not already
-contain. The k-NN baseline is exact up to `--baseline-samples` rows (default
-4096); above that it uses deterministic reference and query subsamples, so its
-cost stops growing with `n` (`--baseline-samples 0` restores the exact path).
-The residual tests (Ljung–Box, Breusch–Pagan, skewness, excess kurtosis) are
+contain. The k-NN baseline's reference set is always all training rows; for up
+to eight inputs a k-d tree answers exact queries, and above that the exact
+brute-force path reuses one buffer. Only the query rows can be sampled, with
+`--baseline-samples N` (default `0` = every row), which is an unbiased estimate
+of the same error and reports `query_rows` and `query_sem` in `--json`. The
+residual tests (Ljung–Box, Breusch–Pagan, skewness, excess kurtosis) are
 reported for the best solution; a small p-value means the model left
 autocorrelation or changing variance behind.
 
