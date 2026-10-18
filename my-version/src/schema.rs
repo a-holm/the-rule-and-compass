@@ -63,6 +63,7 @@ pub fn json() -> String {
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
+        ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),

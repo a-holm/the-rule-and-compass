@@ -243,9 +243,9 @@ Ordered by expected gain per unit effort **[planned]**:
 2. **Column-oriented (SoA) evaluation with cached sub-terms.** Move the data
    matrix to one contiguous array per variable and evaluate node-by-node over
    whole columns, caching each node's column. Re-evaluation after a local
-   mutation then touches only the path to the root. The evaluator itself is
-   implemented and measured in §3.3; caching sub-term columns and wiring it into
-   the search are stage 2.
+   mutation then touches only the path to the root. The evaluator is implemented,
+   wired into the search and measured in §3.3; caching sub-term columns is the
+   remaining step.
 3. **Crowding distance** on top of ε-dominance, for a better-spread front.
 4. **Node-level memoisation** across generations (a hash map from sub-term to
    column), which is the practical, incremental version of "quotient by the
@@ -254,27 +254,38 @@ Ordered by expected gain per unit effort **[planned]**:
    member whose semantics is closest to the desired one).
 6. **Warm starts**: persist the front and restart from it.
 
-### 3.3 Structure-of-arrays CPU evaluator (stage 1 of 2)
+### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
 
-**[implemented and benchmarked; not yet wired into the search]** —
-`src/eval_soa.rs` compiles one expression to a flat postfix program and
-evaluates that program over whole columns. It is the CPU counterpart of the
-postfix bytecode in `src/gpu.rs`: the per-row pointer walk becomes one linear
-instruction stream over a structure-of-arrays (SoA) buffer.
+**[implemented, wired into the search and measured]** — `src/eval_soa.rs`
+compiles one expression to a flat postfix program and evaluates that program
+over whole columns. It is the CPU counterpart of the postfix bytecode in
+`src/gpu.rs`: the per-row pointer walk becomes one linear instruction stream
+over a structure-of-arrays (SoA) buffer.
 
-**Stage 1 of 2.** The search still calls `expr::eval` through
-`search::eval_error`; `src/search.rs` is untouched. Stage 2, after #8 lands,
-will compile each candidate once, evaluate the batch, and fall back to the
-scalar walk whenever `compile` returns `None` (unsupported operator). The
-numbers below therefore measure the evaluator in isolation, not the search's
-wall-clock time.
+**Stage 2 wiring.** `search::eval_error` now compiles each candidate once and
+evaluates its rows in batches. The sample is transposed to `cols[var][row]`
+**once per sample** (per generation, and once for the test set), not once per
+candidate, and the transpose is shared by every individual scored on it.
+`Config::simd` selects the path; `--no-simd` forces the historical per-row
+`expr::eval` walk. The flag is an escape hatch for debugging and A/B runs, not a
+search setting: it is not saved in a checkpoint and a checkpoint written by one
+path resumes under the other. Both paths are required to produce bit-identical
+errors, so the choice cannot move the archive.
+
+A tree with any operator outside the supported set below makes `compile` return
+`None`, and **that tree** transparently falls back to the scalar walk. The
+aggregates, meta operators, constraints, comparisons and user-defined blocks all
+take this fallback. Multi-output samples (`Sample::ys`) and the implicit metrics
+keep their own per-output fit/metric paths unchanged and do not use the SoA
+kernel; the search's single-output, non-implicit fitness path does.
 
 The API is deliberately small:
 
 ```rust
-use rcsr::eval_soa::{compile, eval_batch, eval_batch_scalar, sse};
+use rcsr::eval_soa::{columns, compile, eval_batch, eval_batch_scalar, sse};
 
 // cols[var][row], row-major inside each column.
+let cols = columns(&x);                            // x[row][var] -> cols[var][row]
 let program = compile(&tree).expect("supported tree"); // None => fall back
 let mut out = vec![0.0; rows];
 eval_batch(&program, &cols, rows, &mut out);        // AVX if available
@@ -362,6 +373,43 @@ The 200 000-row cases are memory-bound and noisier than the smaller ones; the
 trend that matters is the AVX speed-up over the existing walk, which grows with
 the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
 less because AVX alone cannot vectorise those functions.
+
+#### Measured: search-level effect
+
+The kernel table measures one evaluation. In a real search the same candidate is
+also fitted with Levenberg–Marquardt: with the default `--fit-iters 8`, every
+offspring is walked roughly eight more times (value and adjoint gradient per
+row) before its fitness is taken once. Simplification, structural hashing,
+archive bookkeeping, RNG draws and migration add work that neither evaluator
+touches. The end-to-end gain is therefore much smaller than the kernel gain.
+
+Two reproducible tables, three inputs, `--islands 2 --seed 42 --patience 0`,
+scalar (`--no-simd`) alternated with the SoA path, five runs each. The host was
+shared (load average ~12 on 8 cores), so **wall-clock is noisy**; the table
+reports median wall-clock and median user+sys CPU time, and the CPU ratio is the
+stable number. Archives were byte-identical between the paths in every pair
+(bit-for-bit `error`, `cost`, tree and test error are asserted by
+`tests/search_simd.rs`).
+
+| rows | generations × pop | fit | scalar wall | SoA wall | scalar CPU | SoA CPU | CPU speed-up |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 800 | 30 × 120 | off | 0.81 s | 0.64 s | 0.43 s | 0.33 s | **1.30×** |
+| 5 000 | 15 × 100 | off | 1.61 s | 1.43 s | 1.67 s | 1.45 s | **1.15×** |
+| 800 | 30 × 120 | 8 | 4.10 s | 4.55 s | 6.32 s | 6.28 s | **1.01×** |
+| 5 000 | 15 × 100 | 8 | 9.23 s | 9.20 s | 14.34 s | 14.03 s | **1.02×** |
+
+The first two rows are `--no-fit`, which isolates the part of the search the
+evaluator actually owns: a **1.15–1.30×** end-to-end gain. The last two keep
+the default LM fitter, and the gain collapses to **1.01–1.02×**. Archive
+complexities were 1–12 (800 rows) and 1–10 (5 000 rows); stage-1 trees of 9–25
+nodes gained 1.5–1.8× in isolation, but the search's small candidates carry more
+constant-per-tree overhead and the fitter dwarfs the scored evaluation. The
+5 000-row case gains less than the 800-row one because its columns no longer fit
+in the same cache level.
+
+Wiring the LM fitter's value/Jacobian passes onto the same SoA layout is the
+next real win; it is deliberately out of scope here, where the requirement is
+that every existing fit and metric path keeps its exact behaviour.
 
 #### Opt-in codegen: `target-cpu=native` and PGO
 
@@ -462,9 +510,10 @@ GPU path must be FP32, with FP64 reserved for final verification of survivors).
    speed-up over the reference `f64` tree walk on the RTX 3060 (**done**;
    see `docs/gpu-backend.md`). Wiring it into the generation loop is the next
    step.
-5. SoA data + column-oriented evaluation: the standalone evaluator with explicit
-   4-wide `f64` AVX is implemented and measured in §3.3; wiring it into the
-   search and caching sub-term columns is stage 2. **[stage 1 done]**
+5. SoA data + column-oriented evaluation: the evaluator with explicit 4-wide
+   `f64` AVX is implemented, wired into the search (`--no-simd` to disable) and
+   measured in §3.3; caching sub-term columns is the remaining step.
+   **[wired]**
 6. `-C target-cpu=native` and PGO recipes are documented and measured once in
    §3.3; neither is forced in the repository. **[recipes documented]**
 

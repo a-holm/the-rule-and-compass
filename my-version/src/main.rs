@@ -289,6 +289,9 @@ SEARCH:
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
+  --no-simd                  force the scalar tree walk instead of the
+                             SoA/AVX evaluator (same results, slower; an
+                             escape hatch for debugging and A/B runs)
   --predictor-samples <N>    score and fit candidates on N training rows per
                              generation (default: all rows; N >= 2). The archive
                              and every reported error are always full-data
@@ -805,6 +808,9 @@ fn main() {
                 cfg.dedup = false;
                 dedup_set = true;
             }
+            // #27: evaluator path only; deliberately not a saved search
+            // setting, because both paths produce identical errors.
+            "--no-simd" => cfg.simd = false,
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {

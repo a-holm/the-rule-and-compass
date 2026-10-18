@@ -1,8 +1,9 @@
 //! Agreement and edge-case tests for the structure-of-arrays evaluator.
 //!
-//! The evaluator is stage 1 of issue #27: it is not wired into the search yet,
-//! so these tests compare it directly with [`rcsr::expr::eval`], the reference
-//! scalar walk that the search uses today.
+//! Stage 2 of issue #27 wires the evaluator into the search; these tests pin
+//! the kernel itself against [`rcsr::expr::eval`], the reference scalar walk
+//! that `--no-simd` still uses. [`rcsr::eval_soa::columns`] is the transpose the
+//! search pays once per candidate.
 
 use rcsr::eval_soa::{self, compile};
 use rcsr::expr::{self, Node, Op};
@@ -299,6 +300,87 @@ fn empty_input_and_zero_rows_do_not_panic() {
     eval_soa::eval_batch(&p, &[vec![1.0]], 5, &mut out);
     assert_eq!(out[0], 1.0);
     assert!(out[1..].iter().all(|v| v.is_nan()));
+}
+
+#[test]
+fn columns_transpose_row_major_inputs() {
+    let rows = vec![
+        vec![1.0, 2.0, 3.0],
+        vec![4.0, 5.0, 6.0],
+        // A short row is padded with NaN, like `expr::eval`'s Input rule.
+        vec![7.0],
+    ];
+    let cols = eval_soa::columns(&rows);
+    assert_eq!(cols.len(), 3);
+    assert_eq!(cols[0], [1.0, 4.0, 7.0]);
+    assert_eq!(&cols[1][..2], [2.0, 5.0]);
+    assert_eq!(&cols[2][..2], [3.0, 6.0]);
+    assert!(cols[1][2].is_nan());
+    assert!(cols[2][2].is_nan());
+
+    // Empty input has no columns and is still a valid (zero-width) dataset.
+    assert!(eval_soa::columns(&[]).is_empty());
+
+    // A tree evaluated over the transposed columns agrees row for row.
+    let tree = expr::node(
+        Op::Add,
+        vec![
+            expr::node(Op::Mul, vec![expr::input(0), expr::constant(2.0)]),
+            expr::input(1),
+        ],
+    );
+    let program = compile(&tree).unwrap();
+    let full = vec![
+        vec![1.0, 2.0],
+        vec![4.0, 5.0],
+        vec![7.0, 8.0],
+    ];
+    let cols = eval_soa::columns(&full);
+    let mut out = vec![0.0; 3];
+    eval_soa::eval_batch(&program, &cols, 3, &mut out);
+    for (r, row) in full.iter().enumerate() {
+        assert_eq!(out[r], expr::eval(&tree, row));
+    }
+}
+
+/// On a corpus of supported trees, both SoA paths are not merely close to the
+/// scalar walk but bit-identical (NaN payloads excepted). This is what lets the
+/// search switch paths without moving a single archive entry.
+#[test]
+fn supported_corpus_is_bit_identical_to_expr_eval() {
+    fn same(a: f64, b: f64) -> bool {
+        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())
+    }
+
+    let ops = supported_ops();
+    let mut rng = Mt::new(27_002);
+    let (cols, aos) = sample(73, 4);
+    for &depth in &[1usize, 2, 3, 4] {
+        for _ in 0..8 {
+            let tree = expr::random_tree(&mut rng, 4, &ops, depth);
+            let program = match compile(&tree) {
+                Some(p) => p,
+                None => panic!("a supported tree must compile: {tree:?}"),
+            };
+            let mut scalar = vec![0.0; 73];
+            let mut simd = vec![0.0; 73];
+            eval_soa::eval_batch_scalar(&program, &cols, 73, &mut scalar);
+            eval_soa::eval_batch(&program, &cols, 73, &mut simd);
+            for r in 0..73 {
+                let want = expr::eval(&tree, &aos[r]);
+                assert!(
+                    same(want, scalar[r]),
+                    "SoA scalar row {r}: {want:?} vs {:?}",
+                    scalar[r]
+                );
+                assert!(
+                    same(want, simd[r]),
+                    "SoA AVX row {r}: {want:?} vs {:?}",
+                    simd[r]
+                );
+            }
+        }
+    }
 }
 
 #[test]
