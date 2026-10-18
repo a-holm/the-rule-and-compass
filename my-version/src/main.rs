@@ -81,7 +81,11 @@ OVERFITTING DIAGNOSTICS (always on):
                              extra searches
 
 SEARCH:
-  --metric absolute|squared|correlation  (default absolute)
+  --metric <name>            error to minimise, lower is better (default absolute)
+                             absolute  squared  correlation  median  maximum
+                             signed  log_squashed  rank_correlation  interquartile
+                             slope  auc  log_loss  hinge  aic  aicc  bic
+                             (auc/log_loss/hinge treat the target as two classes)
   --generations <N>          (default 200)
   --islands <I>              (default 1)
   --pop <P>                  population per island (default 200)
@@ -124,7 +128,7 @@ fn schema() -> String {
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
-        ("--metric", "enum", "absolute", "absolute | squared | correlation"),
+        ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | auc | log_loss | hinge | aic | aicc | bic"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
         ("--pop", "int", "200", "population per island"),
@@ -268,7 +272,17 @@ fn main() {
                     .filter(|x| !x.is_empty())
                     .collect();
             }
-            "--metric" => cfg.metric = Metric::parse(&val!()),
+            "--metric" => {
+                let v = val!();
+                match Metric::parse_opt(&v) {
+                    Some(m) => cfg.metric = m,
+                    None => {
+                        eprintln!("error: unknown --metric '{}'", v);
+                        eprintln!("known metrics: {}", metric_names());
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--generations" => cfg.generations = val!().parse().unwrap_or(cfg.generations),
             "--islands" => cfg.islands = val!().parse().unwrap_or(cfg.islands),
             "--pop" => cfg.pop = val!().parse().unwrap_or(cfg.pop),
@@ -950,5 +964,39 @@ fn fmt_err(v: f64) -> String {
         format!("{:.6}", v)
     } else {
         "inf".to_string()
+    }
+}
+
+/// Comma-separated list of every metric name, for error messages.
+fn metric_names() -> String {
+    Metric::all()
+        .iter()
+        .map(|m| m.name())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--help` and `schema` are hand-written; this keeps them in step with the
+    /// metric enum so a new metric cannot ship undocumented.
+    #[test]
+    fn help_and_schema_list_every_metric() {
+        let help = usage();
+        let schema_text = schema();
+        for m in Metric::all() {
+            assert!(
+                help.contains(m.name()),
+                "usage() is missing metric '{}'",
+                m.name()
+            );
+            assert!(
+                schema_text.contains(m.name()),
+                "schema() is missing metric '{}'",
+                m.name()
+            );
+        }
     }
 }

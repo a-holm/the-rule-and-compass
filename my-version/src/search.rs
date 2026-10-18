@@ -16,7 +16,7 @@
 
 use crate::data::Sample;
 use crate::expr::{self, complexity, crossover, eval, mutate, random_tree, Node, Op};
-use crate::metrics::{score, Metric};
+use crate::metrics::{score_with_constants, Metric};
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
 use std::collections::HashSet;
@@ -110,7 +110,9 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
         return f64::INFINITY;
     }
     let pred: Vec<f64> = s.x.iter().map(|row| eval(tree, row)).collect();
-    score(&pred, &s.y, metric)
+    // The parameter count lets the information criteria (AIC/AICc/BIC) work as
+    // search metrics; it is ignored by every other metric.
+    score_with_constants(&pred, &s.y, metric, expr::count_constants(tree))
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
