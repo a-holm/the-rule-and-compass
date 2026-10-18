@@ -92,6 +92,32 @@ also works). Comparisons are non-associative, so write
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
 reaches machine precision.
 
+## GUI
+
+A local web front end ships as a second binary. It is a self-contained
+single-page app embedded in the executable, so it has no CDN, framework or
+network dependency at runtime and binds loopback only:
+
+```sh
+cd my-version
+cargo build --release
+./target/release/rcsr_serve --port 8080 --open
+# open http://127.0.0.1:8080
+```
+
+The tour: paste or open a CSV/TSV and give each column a role (input, target,
+time, group, weight, ignore); the Search pane is generated from `rcsr schema`,
+with metric, generations, population, islands, complexity cap and seed pinned
+and every other flag under **More options**; Run streams NDJSON and grows a
+log-scale Pareto chart as solutions arrive; Solutions lists the front and the
+selected row shows the formula, constants ± standard errors, train/test error,
+AICc/BIC, Durbin–Watson, residual checks, baselines, bootstrap and
+cross-validation; **Copy as CLI** emits the exact `rcsr` invocation (including a
+here-document when the table was pasted). The page consumes only the JSON
+contract: `/api/schema`, `/api/example` and the `/api/run` event stream. See
+[`docs/gui.md`](docs/gui.md) for the as-built notes, the event shapes and what
+is deferred.
+
 ## Choosing what "complexity" means
 
 By default complexity is the node count. `--op-complexity "pow=2,sin=1.5"`,
