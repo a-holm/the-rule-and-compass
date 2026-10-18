@@ -181,6 +181,12 @@ OVERFITTING DIAGNOSTICS (always on):
                               straight line and a 5-nearest-neighbour learner,
                               in the same metric as the search: a model must
                               beat them to earn its complexity
+  --baseline-samples <N>      score at most N query rows for the k-NN baseline
+                              (default 0 = every row; absolute/squared/
+                              log_squashed only). The reference set is always
+                              all training rows; sampled results report their
+                              standard error with the finite-population
+                              correction (#69)
   overfit index               test_error / train_error
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
@@ -563,6 +569,8 @@ fn main() {
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
+    // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
+    let mut baseline_samples = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -777,6 +785,8 @@ fn main() {
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
+            // #69: 0 = no caps; a positive N samples only the query rows.
+            "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
                 match Op::parse_list_checked(&val!()) {
@@ -982,6 +992,18 @@ fn main() {
         );
         eprintln!(
             "  --implicit appends the target as an input and searches f(inputs, target) = 0"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // #69: query sampling is an unbiased estimate only for mean-loss metrics.
+    // Refuse the flag elsewhere rather than silently reporting a subsample of a
+    // median/correlation/AIC as if it were the full-sample value.
+    if baseline_samples > 0 && !diagnostics::knn_sampling_supported(cfg.metric) {
+        eprintln!(
+            "error: --baseline-samples {} only supports mean-loss metrics \
+             (absolute, squared, log_squashed), not {}",
+            baseline_samples,
+            cfg.metric.name()
         );
         std::process::exit(EXIT_USAGE);
     }
@@ -2246,7 +2268,15 @@ fn main() {
         .map(|r| r.resid_tests);
 
     // Null baselines: the trivial models a real fit must beat (issue #23).
-    let baselines = diagnostics::Baselines::fit(&prepared.train, &fold_samples, cfg.metric);
+    // #69: the k-NN reference set is always all training rows; only the query
+    // rows are optionally sampled by `--baseline-samples`.
+    let baselines = diagnostics::Baselines::fit_sampled(
+        &prepared.train,
+        &fold_samples,
+        cfg.metric,
+        baseline_samples,
+        cfg.seed,
+    );
 
     // Stability selection (issue #20): bootstrap the training rows, re-run the
     // identical search, and count how often each structural form and each input
@@ -2568,6 +2598,24 @@ fn main() {
                 baselines.knn.train_error,
                 baselines.knn.test_error
             );
+            // #69: state whether queries were sampled and the train/test SEMs.
+            if baselines.knn_capped {
+                eprintln!(
+                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true",
+                    baselines.knn_reference_rows,
+                    baselines.knn_train_query_rows,
+                    baselines.knn_train_query_sem,
+                    baselines.knn_test_query_rows,
+                    baselines.knn_test_query_sem
+                );
+            } else {
+                eprintln!(
+                    "# knn baseline: reference_rows={} train_query_rows={} test_query_rows={} sampled=false",
+                    baselines.knn_reference_rows,
+                    baselines.knn_train_query_rows,
+                    baselines.knn_test_query_rows
+                );
+            }
             if let Some(cv) = &cv {
                 eprintln!(
                     "# cross-validation ({}, k={}): mean test={:.6} +/- {:.6} | mean train={:.6}",
@@ -2725,14 +2773,15 @@ fn main() {
                 None => "null".to_string(),
             };
             let baselines_json = format!(
-                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
                 jnum(baselines.linear.train_error),
                 jnum(baselines.linear.test_error),
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
-                jnum(baselines.knn.test_error)
+                jnum(baselines.knn.test_error),
+                baselines.knn_json_extra() // #69
             );
             let resid_json = match &best_resid {
                 Some(rt) => format!(
@@ -2913,7 +2962,7 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
                 jstr(cfg.metric.name()),
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
@@ -2921,7 +2970,8 @@ fn main() {
                 jnum(baselines.linear.test_error),
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
-                jnum(baselines.knn.test_error)
+                jnum(baselines.knn.test_error),
+                baselines.knn_json_extra() // #69
             );
             if let Some(cv) = &cv {
                 println!(
