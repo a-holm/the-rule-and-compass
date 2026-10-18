@@ -36,7 +36,12 @@ the equivalence to `1e-12` for the metrics and for the fitted constants.
 
 A zero weight removes the row from the numerator and adds nothing to the
 denominator, so the row has no influence on the score, the fit or the reported
-constants — changing its target value cannot move anything.
+constants — changing its target value cannot move anything. The row is invisible
+even when its **prediction or target is non-finite**: the scorer's finiteness
+check applies only to rows with `wᵢ > 0`, so an undefined branch (say `ln` of a
+negative value) in a masked row cannot make the candidate infeasible. This
+matches the fitter, which skips `w == 0` rows before forming a residual. The
+unweighted path is unchanged and still rejects any non-finite prediction.
 
 ## Which metrics support weights
 

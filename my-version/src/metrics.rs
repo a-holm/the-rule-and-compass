@@ -292,6 +292,12 @@ pub fn weighted_metric_names() -> &'static [&'static str] {
 /// row's loss and one unit of weight. For an unsupported metric the weights
 /// cannot be applied, so the result is `+inf`; the CLI refuses such a
 /// combination up front.
+///
+/// A zero-weight row is invisible to both the fitter and the scorer: it is
+/// skipped before any arithmetic, and its prediction and target may be
+/// non-finite without making the candidate invalid. The finiteness guard
+/// therefore applies only to rows with `wᵢ > 0` (the unweighted path in
+/// [`score_with_constants`] still requires every prediction to be finite).
 pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -> f64 {
     if w.is_empty() {
         return score_with_constants(pred, y, m, k);
@@ -299,11 +305,6 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
     let n = pred.len();
     if n == 0 || y.len() != n || w.len() != n {
         return f64::INFINITY;
-    }
-    for &p in pred {
-        if !p.is_finite() {
-            return f64::INFINITY;
-        }
     }
     let mut total = 0.0;
     for &wi in w {
@@ -315,7 +316,19 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
     if !(total > 0.0) {
         return f64::INFINITY;
     }
-    let resid: Vec<f64> = pred.iter().zip(y).map(|(p, t)| p - t).collect();
+    for (i, &p) in pred.iter().enumerate() {
+        if w[i] > 0.0 && !p.is_finite() {
+            return f64::INFINITY;
+        }
+    }
+    // A masked row's residual is forced to zero so that no `wᵢ * loss`
+    // product can become `0 * inf = NaN`; the row then contributes nothing.
+    let resid: Vec<f64> = pred
+        .iter()
+        .zip(y)
+        .zip(w)
+        .map(|((p, t), &wi)| if wi > 0.0 { p - t } else { 0.0 })
+        .collect();
     match m {
         Metric::Absolute => resid
             .iter()
@@ -357,25 +370,46 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
 }
 
 fn weighted_rss(v: &[f64], w: &[f64]) -> f64 {
-    v.iter().zip(w).map(|(e, wi)| wi * e * e).sum()
+    v.iter()
+        .zip(w)
+        .filter(|(_, &wi)| wi > 0.0)
+        .map(|(e, wi)| wi * e * e)
+        .sum()
 }
 
 /// Weighted Pearson correlation with weighted means and covariance.
+///
+/// Rows with zero weight are skipped before their values are read, so a
+/// non-finite value in a masked row cannot poison the moments.
 fn weighted_correlation(a: &[f64], b: &[f64], w: &[f64]) -> f64 {
-    let total: f64 = w.iter().sum();
-    if a.len() != b.len() || a.is_empty() || !(total > 0.0) {
+    if a.len() != b.len() || w.len() != a.len() || a.is_empty() {
         return 0.0;
     }
-    let ma = a.iter().zip(w).map(|(v, wi)| wi * v).sum::<f64>() / total;
-    let mb = b.iter().zip(w).map(|(v, wi)| wi * v).sum::<f64>() / total;
+    let total: f64 = w.iter().filter(|&&wi| wi > 0.0).sum();
+    if !(total > 0.0) {
+        return 0.0;
+    }
+    let mut ma = 0.0;
+    let mut mb = 0.0;
+    for i in 0..a.len() {
+        let wi = w[i];
+        if wi > 0.0 {
+            ma += wi * a[i];
+            mb += wi * b[i];
+        }
+    }
+    ma /= total;
+    mb /= total;
     let (mut sab, mut sa, mut sb) = (0.0, 0.0, 0.0);
     for i in 0..a.len() {
-        let da = a[i] - ma;
-        let db = b[i] - mb;
         let wi = w[i];
-        sab += wi * da * db;
-        sa += wi * da * da;
-        sb += wi * db * db;
+        if wi > 0.0 {
+            let da = a[i] - ma;
+            let db = b[i] - mb;
+            sab += wi * da * db;
+            sa += wi * da * da;
+            sb += wi * db * db;
+        }
     }
     if sa <= 0.0 || sb <= 0.0 {
         0.0
