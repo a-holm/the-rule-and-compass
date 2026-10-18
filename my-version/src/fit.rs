@@ -528,6 +528,209 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
     best_sse
 }
 
+/// Standard errors of the fitted constants, from the Gauss–Newton Jacobian at
+/// the solution.
+///
+/// Treating the fitted constants as the parameters of a nonlinear
+/// least-squares problem, the parameter covariance is
+///
+/// ```text
+/// cov = sigma^2 * (JᵀJ)^-1,     sigma^2 = RSS / (n - k)
+/// ```
+///
+/// where `J` is the residual Jacobian w.r.t. the constants (one row per data
+/// point, from the same adjoint sweep the fitter uses), `RSS` the residual sum
+/// of squares and `n - k` the residual degrees of freedom. The square roots of
+/// the diagonal of `cov` are the constants' standard errors; dividing by
+/// `|value|` gives a unit-free relative uncertainty.
+///
+/// `JᵀJ` is scaled to a correlation-like matrix before inversion, so the
+/// conditioning test does not depend on the magnitude of each constant, and
+/// inverted by Gaussian elimination with partial pivoting. When the matrix is
+/// (near-)singular the constants can trade off against one another:
+/// `ill_conditioned` is set and the unidentified ones get infinite errors.
+#[derive(Clone, Debug)]
+pub struct ConstantErrors {
+    /// Fitted value of each constant, left to right (the [`crate::expr::nth`]
+    /// order).
+    pub values: Vec<f64>,
+    /// `sqrt(cov_ii)`; infinite when the constant is not identified.
+    pub std_errors: Vec<f64>,
+    /// `std_errors[i] / |values[i]|`; infinite for a zero or unidentified one.
+    pub relative: Vec<f64>,
+    /// Residual degrees of freedom `n - k`.
+    pub dof: usize,
+    /// `JᵀJ` is (near-)singular: the constants are not separately determined.
+    pub ill_conditioned: bool,
+}
+
+/// Compute each fitted constant's standard error at `tree`'s current values.
+///
+/// Returns `None` when there is nothing to report: no constants, no rows, or no
+/// residual degrees of freedom (`n <= k`, so `sigma^2` is undefined). The
+/// returned values are in left-to-right constant order, matching
+/// [`crate::expr::nth`].
+pub fn constant_errors(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> Option<ConstantErrors> {
+    let f = flatten(tree);
+    let k = f.nconst;
+    let n = x.len().min(y.len());
+    if k == 0 || n == 0 || n <= k {
+        return None;
+    }
+    let mut c = vec![0.0; k];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut v = vec![0.0; f.op.len()];
+    let mut adj = vec![0.0; f.op.len()];
+    let mut grad = vec![0.0; k];
+    let mut jtj = vec![vec![0.0; k]; k];
+    let mut rss = 0.0;
+    for (row, &t) in x.iter().zip(y) {
+        eval_row(&f, row, &c, &mut v);
+        let r = v[f.root] - t;
+        if !r.is_finite() {
+            return None;
+        }
+        backward(&f, &v, &mut adj, &mut grad);
+        for i in 0..k {
+            let gi = grad[i];
+            if !gi.is_finite() {
+                return None;
+            }
+            for j in 0..=i {
+                jtj[i][j] += gi * grad[j];
+            }
+        }
+        rss += r * r;
+    }
+    for i in 0..k {
+        for j in 0..i {
+            jtj[j][i] = jtj[i][j];
+        }
+    }
+    let dof = n - k;
+    // Scale to a correlation-like matrix so collinearity is judged
+    // independently of each constant's magnitude. A constant with no gradient
+    // at all (e.g. inside an untaken branch) is never determined.
+    let mut scale = vec![0.0; k];
+    for i in 0..k {
+        if jtj[i][i] > 0.0 && jtj[i][i].is_finite() {
+            scale[i] = jtj[i][i].sqrt();
+        } else {
+            return Some(unidentified(c, dof));
+        }
+    }
+    let mut corr = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        for j in 0..k {
+            corr[i][j] = jtj[i][j] / (scale[i] * scale[j]);
+        }
+    }
+    let (inv, pivot_ratio) = match invert(&corr, k) {
+        Some(r) => r,
+        None => return Some(unidentified(c, dof)),
+    };
+    // Below this pivot ratio the columns of `J` are nearly collinear: the
+    // constants can trade off and the standard errors are not meaningful.
+    const ILL_CONDITIONED: f64 = 1e-12;
+    let ill_conditioned = pivot_ratio < ILL_CONDITIONED;
+    let sigma2 = rss / dof as f64;
+    let mut std_errors = vec![0.0; k];
+    let mut relative = vec![0.0; k];
+    for i in 0..k {
+        let cov_ii = sigma2 * inv[i][i] / (scale[i] * scale[i]);
+        let se = if cov_ii >= 0.0 {
+            cov_ii.sqrt()
+        } else {
+            f64::INFINITY
+        };
+        std_errors[i] = se;
+        relative[i] = if c[i] == 0.0 {
+            f64::INFINITY
+        } else {
+            se / c[i].abs()
+        };
+    }
+    Some(ConstantErrors {
+        values: c,
+        std_errors,
+        relative,
+        dof,
+        ill_conditioned,
+    })
+}
+
+/// Fallback for an unidentified system: values kept, every error infinite.
+fn unidentified(values: Vec<f64>, dof: usize) -> ConstantErrors {
+    let k = values.len();
+    ConstantErrors {
+        values,
+        std_errors: vec![f64::INFINITY; k],
+        relative: vec![f64::INFINITY; k],
+        dof,
+        ill_conditioned: true,
+    }
+}
+
+/// Invert a `k x k` matrix by Gauss–Jordan elimination with partial pivoting.
+///
+/// Returns the inverse together with `min|pivot| / max|pivot|`, a cheap
+/// conditioning heuristic (near zero means nearly singular), or `None` when a
+/// pivot is numerically zero.
+fn invert(a: &[Vec<f64>], k: usize) -> Option<(Vec<Vec<f64>>, f64)> {
+    let mut m = vec![vec![0.0; 2 * k]; k];
+    for i in 0..k {
+        for j in 0..k {
+            m[i][j] = a[i][j];
+        }
+        m[i][k + i] = 1.0;
+    }
+    let mut max_pivot = 0.0f64;
+    let mut min_pivot = f64::INFINITY;
+    for col in 0..k {
+        let mut piv = col;
+        for r in (col + 1)..k {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        let p = m[piv][col].abs();
+        if p < 1e-300 {
+            return None;
+        }
+        max_pivot = max_pivot.max(p);
+        min_pivot = min_pivot.min(p);
+        m.swap(col, piv);
+        let d = m[col][col];
+        for j in 0..2 * k {
+            m[col][j] /= d;
+        }
+        for r in 0..k {
+            if r == col {
+                continue;
+            }
+            let factor = m[r][col];
+            if factor != 0.0 {
+                for j in 0..2 * k {
+                    m[r][j] -= factor * m[col][j];
+                }
+            }
+        }
+    }
+    let ratio = if max_pivot > 0.0 {
+        min_pivot / max_pivot
+    } else {
+        0.0
+    };
+    let inv: Vec<Vec<f64>> = (0..k)
+        .map(|i| (0..k).map(|j| m[i][k + j]).collect())
+        .collect();
+    Some((inv, ratio))
+}
+
 /// Analytic derivative of the whole expression w.r.t. one input variable,
 /// evaluated over `x` (used for implicit/derivative objectives and for
 /// checking candidate solutions). Kept simple: central finite differences.
@@ -654,5 +857,88 @@ mod tests {
             let tree = node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
             assert_eq!(analytic_grad(&tree, &[1.7]), vec![0.0]);
         }
+    }
+
+    /// Wrap scalars as single-input rows.
+    fn rows(xs: &[f64]) -> Vec<Vec<f64>> {
+        xs.iter().map(|&v| vec![v]).collect()
+    }
+
+    #[test]
+    fn clean_law_has_small_relative_errors() {
+        // y = a*x + b on well-spread x with a little noise: both constants are
+        // pinned down tightly.
+        let x = rows(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let noise = [0.01, -0.015, 0.008, -0.012, 0.02, -0.005, 0.006, -0.02, 0.011, -0.003];
+        let y: Vec<f64> = x.iter().zip(noise).map(|(r, e)| 2.0 * r[0] + 1.0 + e).collect();
+
+        let mut tree = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)],
+        );
+        fit(&mut tree, &x, &y, 25);
+
+        let e = constant_errors(&tree, &x, &y).expect("errors for a definite fit");
+        assert!(!e.ill_conditioned, "a linear law is well conditioned");
+        assert_eq!(e.std_errors.len(), 2);
+        assert_eq!(e.dof, y.len() - 2);
+        for r in &e.relative {
+            assert!(
+                r.is_finite() && *r < 0.05,
+                "relative uncertainty should be small: {:?}",
+                e.relative
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_constants_are_flagged() {
+        // a + b: both gradients are identically 1, so the two constants can
+        // trade off and the data cannot tell them apart.
+        let x = rows(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let y = vec![3.0, 2.7, 3.2, 2.9, 3.1, 3.05, 2.95, 3.0];
+        let tree = node(Op::Add, vec![constant(2.0), constant(1.0)]);
+
+        let e = constant_errors(&tree, &x, &y).expect("still reports the values");
+        assert!(e.ill_conditioned, "a + b is unidentified");
+        assert!(
+            e.relative.iter().all(|r| !r.is_finite() || *r > 1.0),
+            "unidentified constants have large/infinite relative uncertainty: {:?}",
+            e.relative
+        );
+    }
+
+    #[test]
+    fn nearly_degenerate_model_reports_large_uncertainty() {
+        // y = a*x + b with x almost constant: the design is nearly singular, so
+        // at least one constant is very poorly determined.
+        let x = rows(&[1.0, 1.0 + 1e-6, 1.0 + 2e-6, 1.0 + 3e-6, 1.0 + 4e-6, 1.0 + 5e-6]);
+        let y = vec![3.0, 2.9, 3.1, 3.0, 2.95, 3.05];
+        let tree = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(2.0)],
+        );
+
+        let e = constant_errors(&tree, &x, &y).expect("reports the values");
+        assert!(
+            e.ill_conditioned || e.relative.iter().any(|r| *r > 1.0),
+            "nearly collinear gradients must be flagged or show a large relative uncertainty: {:?}",
+            e.relative
+        );
+    }
+
+    #[test]
+    fn constant_errors_returns_none_without_enough_information() {
+        let x = rows(&[0.0, 1.0, 2.0, 3.0]);
+        let y = vec![1.0, 2.0, 3.0, 4.0];
+
+        // No constants at all.
+        assert!(constant_errors(&input(0), &x, &y).is_none());
+        // No data rows.
+        let tree = node(Op::Add, vec![constant(1.0), input(0)]);
+        assert!(constant_errors(&tree, &[], &[]).is_none());
+        // No residual degrees of freedom (n <= k).
+        let two = node(Op::Add, vec![constant(1.0), constant(2.0)]);
+        assert!(constant_errors(&two, &rows(&[0.0]), &[1.0]).is_none());
     }
 }

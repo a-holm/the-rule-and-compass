@@ -293,6 +293,50 @@ The flag costs `B` constant refits per reported solution; `B = 0` (the default)
 switches it off. The three numbers are reported per solution in the text output,
 in each JSON row's `bootstrap_error` object, and in the ndjson `solution` events.
 
+### 3.10 Constant standard errors — implemented
+
+A model can fit perfectly and still rest on constants the data does not
+determine. The **standard error** of a fitted constant says how tightly the data
+pins it down; the **relative uncertainty** `se / |value|` makes that comparable
+between constants of different size.
+
+The constants are the parameters of a nonlinear least-squares problem, so the
+usual linearised theory applies at the solution. Write `J` for the residual
+Jacobian — one row per training point, one column per constant, from the same
+adjoint sweep the fitter already uses — and let `RSS` be the residual sum of
+squares. Then
+
+```
+cov     = sigma^2 · (JᵀJ)^-1
+sigma^2 = RSS / (n − k)          # residual variance, n − k degrees of freedom
+se_i    = sqrt(cov_ii)
+rel_i   = se_i / |value_i|
+```
+
+with `k` the number of fitted constants. The standard errors are in the model's
+own (normalised) units, so quote the relative uncertainty when comparing.
+
+How to read it:
+
+* **small `rel_i`** — the constant is determined by the data;
+* **large `rel_i`** (order 1 or more) — the constant is barely constrained, and
+  a different value fits about as well;
+* **`ill_conditioned: true`** — `JᵀJ` is (near-)singular because two or more
+  constants can trade off (for example `a + b`, or a coefficient pair the data
+  cannot separate). The errors are then meaningless and reported as `inf`; treat
+  those constants as **unidentified** and drop the model or fix one of them.
+
+`JᵀJ` is scaled to a correlation-like matrix before inversion so the conditioning
+test does not depend on the magnitude of each constant, and inverted by Gaussian
+elimination with partial pivoting. The errors are only defined when `n > k`;
+with no residual degrees of freedom (or no constants at all) the field is
+`null` rather than a made-up number.
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2
+# constant errors (rank 5): 1.013675±1.33e-7 (rel 1.31e-7), 2.495876±1.33e-7 (rel 5.32e-8) | dof=28
+```
+
 ## 4. What `rcsr` reports today
 
 Every solution carries:
@@ -306,6 +350,7 @@ Every solution carries:
 | `aicc`, `bic` | fit vs. constants (lower is better) |
 | `durbin_watson` | residual autocorrelation in row order (≈2 clean) |
 | `overfit_index` | `test_error / train_error` |
+| `constant_errors` | per-constant standard error and relative uncertainty, plus an `ill_conditioned` flag for unidentified constants (§3.10) |
 
 and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
@@ -335,8 +380,6 @@ Alongside the front, `rcsr` reports:
   whole search, not just per-block reporting).
 * **Bootstrap and seed stability** — how often the same form reappears
   (stability selection).
-* **Parameter uncertainty** — standard errors of the constants from the
-  Gauss–Newton Jacobian (`JᵀJ`), to flag constants the data does not pin down.
 * **Units / dimensional consistency** as a structural constraint.
 * **Beta / variance-ratio drift tests**, and a **White** general
   heteroscedasticity test (more regressors than just the fitted value).
@@ -363,3 +406,5 @@ Alongside the front, `rcsr` reports:
 * Laumanns et al. 2002 — ε-dominance.
 * Efron & Tibshirani 1997 — the .632+ bootstrap error estimate.
 * Schmidt & Lipson 2009 — distilling laws with noise-robust objectives.
+* Bates & Watts 1988; Seber & Wild 2003 — nonlinear least squares: parameter
+  standard errors and conditioning from the Jacobian.
