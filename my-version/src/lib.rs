@@ -5,3 +5,4 @@
 pub mod rng;
 pub mod expr;
 pub mod metrics;
+pub mod pareto;
