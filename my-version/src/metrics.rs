@@ -16,7 +16,14 @@
 //! * **information criteria** — fit measured against the number of fitted
 //!   constants, for model selection ([`Metric::is_parameter_aware`]).
 //!
-//! See `docs/overfitting.md` for when to prefer which.
+//! Two **implicit** metrics ([`Metric::is_implicit`], issue #14) score a
+//! candidate `f(x1..xn, y)` that should vanish on the data rather than predict
+//! `y`: the plain residual `|f|` and the distance to the level set
+//! `|f| / ||∇f||`. Both are computed from the tree and a row by
+//! [`crate::implicit`], not from a prediction vector.
+//!
+//! See `docs/overfitting.md` for when to prefer which and `docs/implicit.md`
+//! for the implicit model.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metric {
@@ -46,6 +53,11 @@ pub enum Metric {
     Hinge,
     /// Mean absolute error of the first difference: how well slopes match.
     Slope,
+    /// Mean distance from each point to the candidate's zero level set,
+    /// `|f(p)| / ||∇f(p)||` (implicit model, issue #14).
+    ImplicitDerivative,
+    /// Mean `|f(p)|` for an implicit model `f(inputs, y) = 0` (issue #14).
+    ImplicitResidual,
     /// Akaike information criterion.
     Aic,
     /// Small-sample-corrected AIC.
@@ -69,6 +81,8 @@ impl Metric {
             RankCorrelation,
             Interquartile,
             Slope,
+            ImplicitDerivative,
+            ImplicitResidual,
             Auc,
             LogLoss,
             Hinge,
@@ -96,6 +110,11 @@ impl Metric {
             "log_loss" | "logloss" | "cross_entropy" => LogLoss,
             "hinge" => Hinge,
             "slope" | "derivative" => Slope,
+            "implicit" | "implicit_derivative" | "implicit_deriv" | "level_set"
+            | "levelset" => ImplicitDerivative,
+            "implicit_residual" | "implicit_resid" | "implicit_abs" | "implicit_l1" => {
+                ImplicitResidual
+            }
             "aic" => Aic,
             "aicc" => Aicc,
             "bic" => Bic,
@@ -126,6 +145,8 @@ impl Metric {
             LogLoss => "log_loss",
             Hinge => "hinge",
             Slope => "slope",
+            ImplicitDerivative => "implicit",
+            ImplicitResidual => "implicit_residual",
             Aic => "aic",
             Aicc => "aicc",
             Bic => "bic",
@@ -141,6 +162,19 @@ impl Metric {
     /// True for metrics that depend on the number of fitted constants.
     pub fn is_parameter_aware(self) -> bool {
         matches!(self, Metric::Aic | Metric::Aicc | Metric::Bic)
+    }
+
+    /// True for the implicit metrics (issue #14). They are scored from the tree
+    /// and a row by [`crate::implicit`], because they need `f` and its gradient
+    /// rather than a prediction vector.
+    pub fn is_implicit(self) -> bool {
+        matches!(self, Metric::ImplicitDerivative | Metric::ImplicitResidual)
+    }
+
+    /// True for the level-set distance `|f| / ||∇f||`. Only this metric changes
+    /// how the search fits constants (see [`crate::implicit::fit`]).
+    pub fn is_implicit_derivative(self) -> bool {
+        self == Metric::ImplicitDerivative
     }
 }
 
@@ -191,6 +225,11 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
         Metric::Aic => aic(n, rss(&resid), k),
         Metric::Aicc => aicc(n, rss(&resid), k),
         Metric::Bic => bic(n, rss(&resid), k),
+        // Implicit metrics need the expression tree (for ∇f), not a prediction
+        // vector. [`crate::search::eval_error`] routes them to
+        // `crate::implicit::score` before this function is called; reaching
+        // here means the caller has no tree, which is unusable.
+        Metric::ImplicitDerivative | Metric::ImplicitResidual => f64::INFINITY,
     }
 }
 
@@ -198,9 +237,9 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
 /// every other metric rather than silently ignoring the weights.
 ///
 /// Supported: `absolute`, `squared`, `correlation`, `signed`, `log_squashed`,
-/// `aic`, `aicc` and `bic`. The order-statistic, classification, rank and
-/// first-difference metrics have no standard weighted definition (see
-/// `docs/weights.md`).
+/// `implicit`, `implicit_residual`, `aic`, `aicc` and `bic`. The order-statistic,
+/// classification, rank and first-difference metrics have no standard weighted
+/// definition (see `docs/weights.md`).
 pub fn weights_supported(m: Metric) -> bool {
     matches!(
         m,
@@ -209,6 +248,8 @@ pub fn weights_supported(m: Metric) -> bool {
             | Metric::Correlation
             | Metric::Signed
             | Metric::LogSquashed
+            | Metric::ImplicitDerivative
+            | Metric::ImplicitResidual
             | Metric::Aic
             | Metric::Aicc
             | Metric::Bic
@@ -223,6 +264,8 @@ pub fn weighted_metric_names() -> &'static [&'static str] {
         "correlation",
         "signed",
         "log_squashed",
+        "implicit",
+        "implicit_residual",
         "aic",
         "aicc",
         "bic",

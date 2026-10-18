@@ -1,0 +1,490 @@
+//! Implicit relations `f(x1, …, xn, y) = 0` (issue #14).
+//!
+//! In an explicit fit the search models `y = g(x)`. An implicit relation is a
+//! level set: the law is `f(p) = 0`, and the data are points `p` that should lie
+//! on it. A circle `x² + y² = 1` is the canonical example — no single-valued
+//! `y = g(x)` can express it, while `f(x, y) = x² + y² − 1` can.
+//!
+//! The CLI implements the model by **extending the input list with the target
+//! column** (`data::make_implicit`) and setting the target to the constant 0.
+//! The expression tree, evaluator, mutation, crossover and archive are
+//! untouched; the search simply fits `f(all inputs) = 0`.
+//!
+//! Two metrics score such a candidate:
+//!
+//! | metric | value |
+//! |---|---|
+//! | `implicit` (alias `implicit_derivative`) | mean over rows of `|f(p)| / ||∇f(p)||` |
+//! | `implicit_residual` | mean over rows of `|f(p)|` |
+//!
+//! The first is the **first-order distance from a point to the level set**:
+//! moving from `p` along the gradient by `t` changes `f` by about `t·||∇f(p)||`,
+//! so the step that reaches `f = 0` is `t = |f(p)| / ||∇f(p)||` (the
+//! Newton step). It is scale-free: multiplying `f` by any non-zero constant
+//! leaves the metric unchanged, and it prefers a steep, well-defined level set
+//! to a flat function that happens to be small at the data.
+//!
+//! `∇f` comes from the existing adjoint (reverse-mode) sweep in
+//! [`crate::fit::input_gradients`]: one backward pass at each row, seeded at the
+//! root and accumulated at every `Input` leaf, so all partial derivatives cost
+//! `O(nodes)` per row and no finite differences are involved.
+//!
+//! # The guard
+//!
+//! If `||∇f(p)||` is zero, not finite, or the row evaluates to a non-finite
+//! value, the distance is undefined. Such a row makes the whole candidate
+//! **infeasible** (`+inf`), never a lucky zero: `f ≡ 0` has `|f| = 0` but no
+//! level set to speak of, and would otherwise score a perfect fit.
+//!
+//! # Constant fitting
+//!
+//! The implicit-derivative metric changes how constants are fitted. The
+//! ordinary least-squares fit of `f` against the zero target would shrink every
+//! multiplicative constant towards zero (the trivial `f ≡ 0`), collapsing the
+//! level set. Instead [`fit`] minimises the **signed** geometric residual
+//! `f(p) / ||∇f(p)||` in a small Levenberg–Marquardt loop, the same quantity
+//! the metric scores (squared instead of absolute, as least squares requires).
+//! The plain `implicit_residual` metric keeps the historical fit against the
+//! zero target, i.e. `Σ w·f²`; it has the trivial solution `f ≡ 0` by
+//! construction, which is why the derivative metric is the recommended one.
+
+use crate::data::Sample;
+use crate::expr::{self, Node};
+use crate::fit;
+use crate::metrics::Metric;
+
+/// A level-set distance is rejected when this many evaluations/derivatives are
+/// non-finite, or when the gradient norm is not strictly positive.
+#[inline]
+fn finite_positive(v: f64) -> bool {
+    v.is_finite() && v > 0.0
+}
+
+/// The signed first-order distance from `p` to the level set `f = 0`:
+/// `f(p) / ||∇f(p)||`. `None` when the candidate is undefined or the gradient
+/// vanishes at `p` (the guard). The sign is the direction in which `f` grows,
+/// which is what the least-squares fitter needs; the metric uses the absolute
+/// value.
+pub fn signed_distance(tree: &Node, row: &[f64]) -> Option<f64> {
+    let f = expr::eval(tree, row);
+    if !f.is_finite() {
+        return None;
+    }
+    let grad = fit::input_gradients(tree, row);
+    let mut norm_sq = 0.0;
+    for g in &grad {
+        if !g.is_finite() {
+            return None;
+        }
+        norm_sq += g * g;
+    }
+    let norm = norm_sq.sqrt();
+    // Guard ||∇f|| = 0 (and the non-finite cases above): a constant candidate
+    // has no level set, so it must be infeasible rather than perfect.
+    if !finite_positive(norm) {
+        return None;
+    }
+    let d = f / norm;
+    if d.is_finite() {
+        Some(d)
+    } else {
+        None
+    }
+}
+
+/// The distance from `p` to the level set `f = 0`: `|f(p)| / ||∇f(p)||`.
+///
+/// `+inf` when the candidate is undefined or the guard rejects the row.
+pub fn distance(tree: &Node, row: &[f64]) -> f64 {
+    match signed_distance(tree, row) {
+        Some(d) => d.abs(),
+        None => f64::INFINITY,
+    }
+}
+
+/// The plain implicit residual `|f(p)|`; `+inf` when `f` is not finite.
+pub fn residual(tree: &Node, row: &[f64]) -> f64 {
+    let f = expr::eval(tree, row);
+    if f.is_finite() {
+        f.abs()
+    } else {
+        f64::INFINITY
+    }
+}
+
+/// Score a candidate on an implicit sample.
+///
+/// `metric` must be one of the implicit metrics. The result is the weighted
+/// mean `Σ wᵢ·dᵢ / Σ wᵢ` of the per-row distance `dᵢ` (an empty weight vector
+/// means every row weighs 1, exactly as elsewhere in the engine). A
+/// non-finite distance on any positive-weight row makes the whole candidate
+/// `+inf`.
+pub fn score(tree: &Node, s: &Sample, metric: Metric) -> f64 {
+    if s.is_empty() {
+        return f64::INFINITY;
+    }
+    let mut total = 0.0;
+    let mut sum = 0.0;
+    for (i, row) in s.x.iter().enumerate() {
+        let w = s.weight(i);
+        if !w.is_finite() || w < 0.0 {
+            return f64::INFINITY;
+        }
+        if w == 0.0 {
+            continue;
+        }
+        let d = match metric {
+            Metric::ImplicitDerivative => distance(tree, row),
+            Metric::ImplicitResidual => residual(tree, row),
+            _ => return f64::INFINITY,
+        };
+        if !d.is_finite() {
+            return f64::INFINITY;
+        }
+        total += w;
+        sum += w * d;
+    }
+    if !finite_positive(total) {
+        // Every row had weight zero: no information, not a free zero.
+        return f64::INFINITY;
+    }
+    sum / total
+}
+
+/// The per-row signed residuals used by [`fit`]; a zero-weight row contributes
+/// `0` and never influences the constants.
+fn residuals(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
+    if !w.is_empty() && w.len() != x.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(x.len());
+    for (i, row) in x.iter().enumerate() {
+        let wi = w.get(i).copied().unwrap_or(1.0);
+        if !wi.is_finite() || wi < 0.0 {
+            return None;
+        }
+        if wi == 0.0 {
+            out.push(0.0);
+            continue;
+        }
+        let d = signed_distance(tree, row)?;
+        out.push(wi.sqrt() * d);
+    }
+    Some(out)
+}
+
+fn cost(r: &[f64]) -> f64 {
+    r.iter().map(|v| v * v).sum()
+}
+
+/// Pre-order node indices of the constant leaves, matching [`expr::nth`].
+fn const_positions(n: &Node, out: &mut Vec<usize>, counter: &mut usize) {
+    let mine = *counter;
+    *counter += 1;
+    if n.op == expr::Op::Const {
+        out.push(mine);
+    }
+    for k in &n.kids {
+        const_positions(k, out, counter);
+    }
+}
+
+fn constants(tree: &Node) -> Vec<f64> {
+    let mut positions = Vec::new();
+    let mut counter = 0;
+    const_positions(tree, &mut positions, &mut counter);
+    positions
+        .iter()
+        .filter_map(|&pos| expr::nth(tree, pos).map(|n| n.val))
+        .collect()
+}
+
+fn set_constants(tree: &mut Node, values: &[f64]) {
+    let mut positions = Vec::new();
+    let mut counter = 0;
+    const_positions(tree, &mut positions, &mut counter);
+    for (slot, &pos) in positions.iter().enumerate() {
+        if let Some(n) = expr::nth_mut(tree, pos) {
+            n.val = values[slot];
+        }
+    }
+}
+
+/// Solve `(A + λ·diag(A) + 1e-12·I) δ = b` by Gaussian elimination with partial
+/// pivoting. `None` when the system is numerically singular.
+fn solve(a: &[Vec<f64>], b: &[f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
+    let mut m = vec![vec![0.0; k + 1]; k];
+    for i in 0..k {
+        for j in 0..k {
+            m[i][j] = a[i][j];
+        }
+        m[i][i] = m[i][i] * (1.0 + lambda) + 1e-12;
+        m[i][k] = b[i];
+    }
+    for col in 0..k {
+        let mut piv = col;
+        for r in (col + 1)..k {
+            if m[r][col].abs() > m[piv][col].abs() {
+                piv = r;
+            }
+        }
+        if m[piv][col].abs() < 1e-300 {
+            return None;
+        }
+        m.swap(col, piv);
+        for r in (col + 1)..k {
+            let factor = m[r][col] / m[col][col];
+            if factor != 0.0 {
+                for c in col..=k {
+                    m[r][c] -= factor * m[col][c];
+                }
+            }
+        }
+    }
+    let mut d = vec![0.0; k];
+    for i in (0..k).rev() {
+        let mut s = m[i][k];
+        for j in (i + 1)..k {
+            s -= m[i][j] * d[j];
+        }
+        d[i] = s / m[i][i];
+    }
+    Some(d)
+}
+
+fn rss_of(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> f64 {
+    match residuals(tree, x, w) {
+        Some(r) => cost(&r),
+        None => f64::INFINITY,
+    }
+}
+
+/// Fit the constants of `tree` to minimise `Σ wᵢ·(f(pᵢ)/||∇f(pᵢ)||)²`.
+///
+/// This is the constant-fitting companion of the implicit-derivative metric:
+/// the same signed geometric residual the metric measures, squared so that the
+/// existing Levenberg–Marquardt idea applies. The Jacobian with respect to the
+/// constants is obtained by central differences of that residual (one perturbed
+/// evaluation per side per constant), which also covers the derivative of
+/// `||∇f||` without a second-order adjoint.
+///
+/// The fit is scale-free: multiplying the whole expression by a constant does
+/// not change the residual, so the fitter does not shrink the level set to the
+/// trivial `f ≡ 0`. A candidate that is infeasible under the guard in
+/// [`signed_distance`] is left unchanged and reports `+inf`.
+///
+/// Returns the final sum of squared geometric residuals.
+pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
+    if x.is_empty() {
+        return f64::INFINITY;
+    }
+    let initial = constants(tree);
+    let k = initial.len();
+    if k == 0 {
+        return rss_of(tree, x, w);
+    }
+    let base = tree.clone();
+    let base_r = match residuals(&base, x, w) {
+        Some(r) => r,
+        None => return f64::INFINITY,
+    };
+    let mut best_c = initial;
+    let mut best_sse = cost(&base_r);
+    let mut c = best_c.clone();
+    let mut lambda = 1e-3;
+    let n = x.len();
+
+    for _ in 0..iters.max(1) {
+        let r = match residuals(&base_with(&base, &c), x, w) {
+            Some(r) => r,
+            None => break,
+        };
+        // Central-difference Jacobian of the geometric residual w.r.t. each
+        // constant. A row that is undefined under a perturbation gives no
+        // usable step: stop rather than fit a discontinuous model.
+        let mut jac = vec![vec![0.0; k]; n];
+        let mut ok = true;
+        for j in 0..k {
+            let h = 1e-6 * (1.0 + c[j].abs());
+            let mut cp = c.clone();
+            let mut cm = c.clone();
+            cp[j] += h;
+            cm[j] -= h;
+            match (
+                residuals(&base_with(&base, &cp), x, w),
+                residuals(&base_with(&base, &cm), x, w),
+            ) {
+                (Some(rp), Some(rm)) => {
+                    for i in 0..n {
+                        jac[i][j] = (rp[i] - rm[i]) / (2.0 * h);
+                    }
+                }
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if !ok {
+            break;
+        }
+        let mut jtj = vec![vec![0.0; k]; k];
+        let mut jtr = vec![0.0; k];
+        for i in 0..n {
+            for a in 0..k {
+                let ga = jac[i][a];
+                if !ga.is_finite() {
+                    ok = false;
+                    break;
+                }
+                jtr[a] += ga * r[i];
+                for b in 0..=a {
+                    jtj[a][b] += ga * jac[i][b];
+                }
+            }
+            if !ok {
+                break;
+            }
+        }
+        if !ok {
+            break;
+        }
+        for a in 0..k {
+            for b in 0..a {
+                jtj[b][a] = jtj[a][b];
+            }
+        }
+        let rhs: Vec<f64> = jtr.iter().map(|v| -v).collect();
+        let step = match solve(&jtj, &rhs, lambda, k) {
+            Some(s) => s,
+            None => {
+                lambda *= 6.0;
+                if lambda > 1e9 {
+                    break;
+                }
+                continue;
+            }
+        };
+        let trial: Vec<f64> = c
+            .iter()
+            .zip(&step)
+            .map(|(v, d)| (v + d).clamp(-1e6, 1e6))
+            .collect();
+        match residuals(&base_with(&base, &trial), x, w) {
+            Some(rt) => {
+                let sse = cost(&rt);
+                if sse < best_sse {
+                    best_sse = sse;
+                    best_c = trial.clone();
+                    c = trial;
+                    lambda = (lambda / 8.0).max(1e-12);
+                    if best_sse == 0.0 {
+                        break;
+                    }
+                } else {
+                    lambda *= 6.0;
+                    if lambda > 1e9 {
+                        break;
+                    }
+                }
+            }
+            None => {
+                lambda *= 6.0;
+                if lambda > 1e9 {
+                    break;
+                }
+            }
+        }
+    }
+
+    if best_sse < rss_of(tree, x, w) {
+        set_constants(tree, &best_c);
+    }
+    best_sse
+}
+
+fn base_with(base: &Node, c: &[f64]) -> Node {
+    let mut t = base.clone();
+    set_constants(&mut t, c);
+    t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{constant, input, node, Op};
+
+    fn circle() -> Sample {
+        let mut x = Vec::new();
+        for i in 0..16 {
+            let a = 2.0 * std::f64::consts::PI * i as f64 / 16.0;
+            x.push(vec![a.cos(), a.sin()]);
+        }
+        Sample {
+            x,
+            y: vec![0.0; 16],
+            w: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn level_set_distance_is_the_newton_step_and_scale_free() {
+        let s = circle();
+        let f = node(
+            Op::Sub,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Square, vec![input(0)]),
+                        node(Op::Square, vec![input(1)]),
+                    ],
+                ),
+                constant(1.0),
+            ],
+        );
+        for row in &s.x {
+            assert!(distance(&f, row) < 1e-12, "on the circle");
+        }
+        let scaled = node(Op::Mul, vec![constant(7.0), f.clone()]);
+        for row in &s.x {
+            assert_eq!(
+                distance(&f, row).to_bits(),
+                distance(&scaled, row).to_bits(),
+                "the metric is scale-free"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_gradient_is_infeasible_not_perfect() {
+        let s = circle();
+        let zero = constant(0.0);
+        assert_eq!(score(&zero, &s, Metric::ImplicitDerivative), f64::INFINITY);
+        assert_eq!(score(&constant(3.0), &s, Metric::ImplicitDerivative), f64::INFINITY);
+        // The plain residual does call f = 0 perfect: documented, and why the
+        // derivative metric is the recommended choice.
+        assert_eq!(score(&zero, &s, Metric::ImplicitResidual), 0.0);
+    }
+
+    #[test]
+    fn fit_recovers_the_radius_without_collapsing_the_scale() {
+        let s = circle();
+        let mut f = node(
+            Op::Sub,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Square, vec![input(0)]),
+                        node(Op::Square, vec![input(1)]),
+                    ],
+                ),
+                constant(4.0),
+            ],
+        );
+        fit(&mut f, &s.x, &s.w, 20);
+        let c = -expr::eval(&f, &[0.0, 0.0]);
+        assert!((c - 1.0).abs() < 1e-6, "radius = {c}");
+    }
+}

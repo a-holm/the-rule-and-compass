@@ -82,11 +82,12 @@ INPUT:
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
                              positive. A weight of 2 means \"this row twice\":
-                             absolute, squared, correlation, signed and
-                             log_squashed become weighted means, and aic/aicc/bic
-                             use the weighted RSS. Refused for metrics with no
-                             weighted definition (median, maximum, interquartile,
-                             slope, rank_correlation, auc, log_loss, hinge).
+                             absolute, squared, correlation, signed,
+                             log_squashed, implicit, implicit_residual become
+                             weighted means, and aic/aicc/bic use the weighted
+                             RSS. Refused for metrics with no weighted definition
+                             (median, maximum, interquartile, slope,
+                             rank_correlation, auc, log_loss, hinge).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
@@ -181,7 +182,15 @@ SEARCH:
                              absolute  squared  correlation  median  maximum
                              signed  log_squashed  rank_correlation  interquartile
                              slope  auc  log_loss  hinge  aic  aicc  bic
+                             implicit  implicit_residual  (implicit model)
                              (auc/log_loss/hinge treat the target as two classes)
+  --implicit                 fit an implicit relation f(inputs, target) = 0: the
+                             target becomes one extra input (normalised with its
+                             training mean/std) and the fit target is 0. Plain
+                             metrics then score |f|; --smooth first is recommended
+  --implicit-derivative      shorthand for --implicit --metric implicit: score
+                             the level-set distance |f| / ||grad f||, the
+                             recommended implicit objective
   --generations <N>          (default 200)
   --islands <I>              (default 1)
   --pop <P>                  population per island (default 200)
@@ -467,6 +476,7 @@ fn main() {
     let mut train_select_src: Option<String> = None;
     let mut test_select_src: Option<String> = None;
     let mut weight_name: Option<String> = None;
+    let mut implicit_mode = false;
     let mut save_path: Option<String> = None;
     let mut save_every = 25usize;
     let mut save_every_set = false;
@@ -536,6 +546,13 @@ fn main() {
                         std::process::exit(EXIT_USAGE);
                     }
                 }
+            }
+            "--implicit" => implicit_mode = true,
+            "--implicit-derivative" => {
+                // #14: the recommended implicit objective, as one flag.
+                implicit_mode = true;
+                cfg.metric = Metric::ImplicitDerivative;
+                metric_set = true;
             }
             "--generations" => {
                 cfg.generations = val!().parse().unwrap_or(cfg.generations);
@@ -814,6 +831,36 @@ fn main() {
              (seeds are inserted at the start of a fresh run; the checkpoint already \
              contains them)"
         );
+        std::process::exit(EXIT_USAGE);
+    }
+    // #14: the implicit metrics need the target as an input. Refuse the metric
+    // on its own rather than silently fitting a different model.
+    if cfg.metric.is_implicit() && !implicit_mode {
+        eprintln!(
+            "error: --metric {} requires --implicit (or use --implicit-derivative)",
+            cfg.metric.name()
+        );
+        eprintln!(
+            "  --implicit appends the target as an input and searches f(inputs, target) = 0"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // A y-randomisation control shuffles the target. In implicit mode the target
+    // is an input and the scored target is all zeros, so every null run would be
+    // the real run: refuse rather than report a meaningless p-value.
+    if implicit_mode && null_runs > 0 {
+        eprintln!("error: --implicit cannot be combined with --null-runs");
+        eprintln!("  the null control shuffles the target, which is an input here");
+        std::process::exit(EXIT_USAGE);
+    }
+    if implicit_mode && cv_mode.is_some() {
+        eprintln!("error: --implicit cannot be combined with --cv (not implemented yet)");
+        eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
+        std::process::exit(EXIT_USAGE);
+    }
+    if implicit_mode && bootstrap_resamples > 0 {
+        eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
+        eprintln!("  the bootstrap refits constants on |f|, not on the geometric residual");
         std::process::exit(EXIT_USAGE);
     }
 
@@ -1371,7 +1418,7 @@ fn main() {
         dtypes: dtypes.clone(),
     };
     let mut rng = Mt::new(cfg.seed);
-    let prepared = match data::prepare_full_weighted_with(
+    let mut prepared = match data::prepare_full_weighted_with(
         &table,
         &vars,
         &target,
@@ -1387,6 +1434,34 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #14: implicit relations. The target becomes one more input (normalised
+    // with its training mean/std, so denormalisation prints original units) and
+    // the target itself becomes the constant 0. From here on every search,
+    // diagnostic and report sees an ordinary sample with one extra input; the
+    // tree machinery is unchanged.
+    if implicit_mode {
+        let (mean, std) = data::make_implicit(&mut prepared);
+        vars.push(target.clone());
+        notes.push(format!(
+            "implicit: target '{}' is input {} (mean {:.6}, std {:.6}); searching \
+             f({}) = 0 with metric {}",
+            target,
+            vars.len(),
+            mean,
+            std,
+            vars.join(", "),
+            cfg.metric.name()
+        ));
+        if smooth < 2 {
+            notes.push(
+                "warning: --implicit on unsmoothed data: the level-set distance divides by a \
+                 gradient estimated from row-to-row noise. Smooth the series first (for \
+                 example --smooth 5); see docs/implicit.md"
+                    .to_string(),
+            );
+        }
+    }
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.
@@ -1563,6 +1638,7 @@ fn main() {
             &variable_types,
             cfg.metric,
             &cfg.complexity_model,
+            implicit_mode,
             format,
             quiet,
             start,
@@ -1657,11 +1733,14 @@ fn main() {
         }
     }
     if format == Format::Text {
+        // #14: an implicit model is printed as `0 = f(...)`.
+        let lhs = if implicit_mode { "0" } else { target.as_str() };
         for (expression, complexity, error) in &seed_rows {
             eprintln!(
-                "# seeded: complexity={} train_error={}  y = {}",
+                "# seeded: complexity={} train_error={}  {} = {}",
                 complexity,
                 fmt_err(*error),
+                lhs,
                 expression
             );
         }
@@ -1961,6 +2040,8 @@ fn main() {
                 );
             }
             for r in &rows {
+                // #14: an implicit model is printed as 0 = f(...).
+                let lhs = if implicit_mode { "0" } else { target.as_str() };
                 println!(
                     "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
                     r.rank,
@@ -1968,7 +2049,7 @@ fn main() {
                     fmt_err(r.train_error),
                     fmt_err(r.test_error),
                     fmt_err(r.aicc),
-                    target,
+                    lhs,
                     r.expression
                 );
             }
@@ -2571,6 +2652,7 @@ fn run_eval(
     variable_types: &[data::VariableDType],
     metric: Metric,
     model: &ComplexityModel,
+    implicit: bool,
     format: Format,
     quiet: bool,
     started: std::time::Instant,
@@ -2649,11 +2731,12 @@ fn run_eval(
                 );
             }
             println!(
-                "  1  complexity={}   k_constants={}   train_err={}      test_err={}      y = {}",
+                "  1  complexity={}   k_constants={}   train_err={}      test_err={}      {} = {}",
                 complexity,
                 k,
                 fmt_err(train_error),
                 fmt_err(test_error),
+                if implicit { "0" } else { target },
                 shown
             );
         }

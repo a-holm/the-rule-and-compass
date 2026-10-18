@@ -98,6 +98,69 @@ impl Sample {
             self.w.iter().filter(|&&v| v > 0.0).count()
         }
     }
+
+    /// #14: turn an explicit sample into an implicit one.
+    ///
+    /// Every row gains the (normalised) target as one more input, and the target
+    /// itself becomes the constant `0`: the search then fits
+    /// `f(x1..xn, y) = 0`, the level set that the data should lie on. `mean` and
+    /// `std` are the training target's normalisation constants (see
+    /// [`implicit_target_stats`]), applied to both sides so the appended input
+    /// lives on the same scale as the other inputs and denormalises back to the
+    /// original units.
+    pub fn with_target_as_input(&self, mean: f64, std: f64) -> Sample {
+        let mut out = Sample::default();
+        out.x = self
+            .x
+            .iter()
+            .zip(&self.y)
+            .map(|(row, &y)| {
+                let mut r = row.clone();
+                r.push((y - mean) / std);
+                r
+            })
+            .collect();
+        out.y = vec![0.0; self.len()];
+        out.w = self.w.clone();
+        out
+    }
+}
+
+/// #14: the training-row mean and standard deviation of the target, used to
+/// normalise it when it becomes an implicit input. A degenerate (zero-variance)
+/// target gets `std = 1`, exactly like [`prepare_full_weighted_with`] for an
+/// input column.
+pub fn implicit_target_stats(train: &Sample) -> (f64, f64) {
+    if train.y.is_empty() {
+        return (0.0, 1.0);
+    }
+    let n = train.y.len() as f64;
+    let mean = train.y.iter().sum::<f64>() / n;
+    let var = train.y.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n;
+    let std = var.sqrt();
+    (mean, if std.abs() >= 1e-12 { std } else { 1.0 })
+}
+
+/// #14: rewrite prepared train/test/folds in place for `--implicit`.
+///
+/// The target column is appended as an extra input to every sample and every
+/// target becomes `0`; `means`/`stds` grow by the target's normalisation
+/// constants so the printed formula is in original units. Returns
+/// `(mean, std)` for the report. Nothing else in the pipeline changes: the
+/// search, the tree machinery and the archive see an ordinary sample with one
+/// more input.
+pub fn make_implicit(p: &mut Prepared) -> (f64, f64) {
+    let (mean, std) = implicit_target_stats(&p.train);
+    p.train = p.train.with_target_as_input(mean, std);
+    p.test = p.test.with_target_as_input(mean, std);
+    p.fold_samples = p
+        .fold_samples
+        .iter()
+        .map(|f| f.with_target_as_input(mean, std))
+        .collect();
+    p.means.push(mean);
+    p.stds.push(std);
+    (mean, std)
 }
 
 /// A parsed table. Numeric cells appear in `rows`; the original text of every

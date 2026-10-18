@@ -26,6 +26,16 @@ for a plain-language walkthrough,
 [`docs/optimisation.md`](docs/optimisation.md) for the theory and measurements
 behind the search strategy, and [`SPEC.md`](SPEC.md) for the precise behaviour.
 
+### Implicit relations
+
+Some laws are level sets rather than functions: a circle `x² + y² = 1` has no
+single-valued `y = g(x)`. `--implicit` appends the target as one more input and
+searches `f(x1, …, xn, y) = 0`. `--metric implicit` (or the shorthand
+`--implicit-derivative`) scores the distance to the level set,
+`|f| / ||∇f||`, using the adjoint gradient the fitter already computes. See
+[`docs/implicit.md`](docs/implicit.md) for the model, both implicit metrics, the
+zero-gradient guard and a worked unit-circle example.
+
 ## Build & run
 
 Requires a Rust toolchain (`rustup` recommended). No third-party crates are used.
@@ -674,6 +684,7 @@ docs/data-splitting.md        train/test splitting for time series and panel dat
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
+docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
 docs/overfitting.md           avoiding and detecting overfitting, with references
 docs/meta-operators.md        structural meta operators and their cache rule
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)

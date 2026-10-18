@@ -180,11 +180,37 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     if s.is_empty() {
         return f64::INFINITY;
     }
+    // #14: an implicit metric measures the distance to the level set
+    // |f| / ||grad f||. That needs f and its gradient at each row, so it is
+    // scored from the tree and the row instead of a prediction vector. Every
+    // other metric takes the original path, bit for bit.
+    if metric.is_implicit() {
+        return crate::implicit::score(tree, s, metric);
+    }
     let pred: Vec<f64> = s.x.iter().map(|row| eval(tree, row)).collect();
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
     score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
+}
+
+/// #14: fit a candidate's constants on the objective its metric actually
+/// scores.
+///
+/// The implicit-derivative metric is scale-free. Fitting `f` against the zero
+/// target with ordinary least squares would shrink every multiplicative
+/// constant towards zero, collapsing the level set into the trivial `f == 0`;
+/// the guard rightly rejects that candidate, so a good shape would be destroyed
+/// before it could be scored. In this one case [`crate::implicit::fit`]
+/// minimises the signed geometric residual `f / ||grad f||` instead. Every
+/// other metric (including `implicit_residual`, which by definition scores
+/// `|f|`) keeps the historical `fit_weighted` path bit for bit.
+fn fit_constants(tree: &mut Node, cfg: &Config, train: &Sample) {
+    if cfg.metric.is_implicit_derivative() {
+        crate::implicit::fit(tree, &train.x, &train.w, cfg.fit_iters);
+    } else {
+        crate::fit::fit_weighted(tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+    }
 }
 
 /// True when candidate scoring should use a per-generation subset of the
@@ -363,7 +389,8 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
         }
 
         if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+            // #14: metric-aware fitting (see `fit_constants`).
+            fit_constants(&mut tree, cfg, train);
             tree = expr::simplify(&tree);
         }
         let ind = Ind::evaluated(tree, train, cfg.metric, &cfg.complexity_model);
@@ -377,7 +404,8 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
     while next.len() < pop {
         let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
         if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+            // #14: metric-aware fitting (see `fit_constants`).
+            fit_constants(&mut tree, cfg, train);
             tree = expr::simplify(&tree);
         }
         next.push(Ind::evaluated(
@@ -566,7 +594,8 @@ fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
             continue;
         }
         if cfg.fit_iters > 0 {
-            crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
+            // #14: metric-aware fitting (see `fit_constants`).
+            fit_constants(&mut tree, cfg, train);
             tree = expr::simplify(&tree);
         }
         if !seen_fitted.insert(expr::structural_hash(&tree)) {
@@ -885,13 +914,8 @@ fn run_search(
                         for ind in islands[ii].iter_mut() {
                             let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
                             if cfg.fit_iters > 0 {
-                                crate::fit::fit_weighted(
-                                    &mut t,
-                                    &gen_train.x,
-                                    &gen_train.y,
-                                    &gen_train.w,
-                                    cfg.fit_iters,
-                                );
+                                // #14: metric-aware fitting (see `fit_constants`).
+                                fit_constants(&mut t, cfg, gen_train);
                             }
                             *ind = Ind::evaluated(
                                 t,

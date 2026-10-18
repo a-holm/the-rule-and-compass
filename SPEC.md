@@ -202,6 +202,22 @@ For training pairs `(x_k, y_k)`, prediction `p_k = f(x_k)`:
 
 Any non-finite `p_k` makes the metric `+inf`.
 
+### Implicit metrics (issue #14)
+
+`--implicit` appends the target as one more input (normalised with its training
+mean/std) and sets the fitting target to `0`, so the model is
+`f(x1..xn, y) = 0`. Two metrics score it:
+
+- **implicit** (alias `implicit_derivative`): `mean_k |f(p_k)| / ||∇f(p_k)||`,
+  the first-order distance to the zero level set;
+- **implicit_residual**: `mean_k |f(p_k)|`, the plain residual.
+
+Both use the adjoint sweep for `∇f`. A row with `||∇f|| = 0`, a non-finite
+`f`/gradient component, or an overflowing distance makes the candidate `+inf`.
+The implicit-derivative metric fits constants on the signed geometric residual
+`f / ||∇f||`; the plain residual keeps the ordinary least-squares fit against
+the zero target. See [`docs/implicit.md`](docs/implicit.md).
+
 ## 7. Search algorithm
 
 **Island-model, multi-objective evolutionary search.**
