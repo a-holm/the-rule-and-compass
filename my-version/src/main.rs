@@ -177,6 +177,8 @@ OVERFITTING DIAGNOSTICS (always on):
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
                               (J^T J); flags constants the data cannot pin down
+  constant dimensions         with --units, the apparent dimension each fitted
+                              constant needs (a value:dimension plausibility check)
   --cv <mode>                cross-validation: rerun the search on k folds and
                              report the mean and spread of the held-out errors.
                              k-fold  shuffled partition (i.i.d. data)
@@ -234,13 +236,16 @@ SEARCH:
                              meta: complexity,variables,constants,contains,
                              contains_op (describe the argument's structure)
                              (full set: `rcsr schema` -> operators list)
-  --units <name=unit,..>     declare SI units of inputs and the target, e.g.
-                             \"x=m,t=s,y=m/s\"; base dimensions m,s,kg,A,K,mol,cd
-                             with *, /, ^integer and parentheses. Repeatable.
-                             An undeclared name is dimensionless (opt-in)
-  --require-dimensions       reject a candidate whose inferred root dimension
-                             differs from the target's (infinite error); needs
-                             --units. Without it, units only produce a summary note
+  --units <name=dim,..>      declare dimensions of inputs and the target, e.g.
+                             \"x=m,t=s,y=m/s\"; m,s,kg,A,K,mol,cd are SI names,
+                             any other identifier is its own base dimension
+                             (price=USD). Model dimensions, not unit symbols
+                             (volume=m^3, not litre). *, /, ^integer, (...);
+                             repeatable; an undeclared name is dimensionless
+  --require-dimensions       reject a candidate whose dimensions cannot be made
+                             consistent with the target's (infinite error);
+                             needs --units. Without it, units only add a note
+                             and fitted constants absorb unit ratios/offsets
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
@@ -394,6 +399,10 @@ struct Row {
     /// Standard errors of the fitted constants (issue #22); `None` when they
     /// are not defined (no constants, or no residual degrees of freedom).
     constant_errors: Option<fit::ConstantErrors>,
+    /// #25: constant values and their apparent dimensions, in tree order.
+    /// Empty when `--units` is not active; `None` means undetermined.
+    constant_values: Vec<f64>,
+    constant_units: Vec<Option<Unit>>,
     /// Structural form of the (normalised) tree, with constants collapsed; the
     /// key stability selection counts.
     shape: String,
@@ -1471,7 +1480,7 @@ fn main() {
             unit_assignments
                 .iter()
                 .find(|(n, _)| n == name)
-                .map(|(_, u)| *u)
+                .map(|(_, u)| u.clone())
         };
         let target_unit = declared(&target).unwrap_or(Unit::DIMENSIONLESS);
         let mut var_units = Vec::with_capacity(vars.len());
@@ -1483,7 +1492,7 @@ fn main() {
             });
             var_units.push(unit.unwrap_or(Unit::DIMENSIONLESS));
         }
-        cfg.units = Some(Units::new(var_units, target_unit));
+        cfg.units = Some(Units::new(var_units, target_unit.clone()));
         notes.push(format!(
             "units: target '{}' is {}{}",
             target,
@@ -1824,6 +1833,16 @@ fn main() {
                 .collect();
             let rss: f64 = resid.iter().map(|e| e * e).sum();
             let kconst = expr::count_constants(&s.tree);
+            // #25: dimensions of the constants the reader actually sees in the
+            // printed law. `den` already includes the denormalisation
+            // constants, so the report matches the displayed expression.
+            let (constant_values, constant_units) = match &cfg.units {
+                Some(units) => (
+                    rcsr::units::constant_values(&den),
+                    rcsr::units::constant_dimensions(&den, &units.vars, &units.target),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
             let (_, aicc, bic) =
                 diagnostics::information_criteria(prepared.train.len(), rss, kconst);
             let dw = diagnostics::durbin_watson(&resid);
@@ -1877,6 +1896,8 @@ fn main() {
                         &prepared.train.w,
                     )
                 },
+                constant_values,
+                constant_units,
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
@@ -2177,6 +2198,16 @@ fn main() {
                     );
                 }
             }
+            // #25: a cheap plausibility check for the constants in the law.
+            for r in &rows {
+                if !r.constant_units.is_empty() {
+                    eprintln!(
+                        "# constant dimensions (rank {}): {} (value:dimension, tree order)",
+                        r.rank,
+                        constant_units_text(&r.constant_values, &r.constant_units)
+                    );
+                }
+            }
             eprintln!(
                 "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
                 cfg.metric.name(),
@@ -2304,7 +2335,7 @@ fn main() {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"constant_dimensions\":{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -2317,6 +2348,7 @@ fn main() {
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
                         constant_errors_json(&r.constant_errors),
+                        constant_units_json(&r.constant_values, &r.constant_units),
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
                     )
@@ -2483,7 +2515,7 @@ fn main() {
             }
             for r in &rows {
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{},\"constant_dimensions\":{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -2496,6 +2528,7 @@ fn main() {
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
                     constant_errors_json(&r.constant_errors),
+                    constant_units_json(&r.constant_values, &r.constant_units),
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
                 );
@@ -3013,6 +3046,16 @@ fn summary_markdown(
                         "Standard errors are undefined (too few residual degrees of freedom).\n"
                     );
                 }
+            }
+            // #25: the units are inferred from the printed law, not from the
+            // fitted values, so they are a plausibility check rather than an
+            // uncertainty estimate.
+            if !r.constant_units.is_empty() {
+                let _ = writeln!(
+                    s,
+                    "Apparent constant dimensions (value:dimension, tree order): {}.\n",
+                    constant_units_text(&r.constant_values, &r.constant_units)
+                );
             }
         }
         None => {
@@ -3810,6 +3853,47 @@ fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
         ),
         None => "null".to_string(),
     }
+}
+
+/// #25: `value:dimension` pairs in tree order, with `?` for undetermined.
+fn constant_units_text(values: &[f64], units: &[Option<Unit>]) -> String {
+    units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| format!("{}", v))
+                .unwrap_or_else(|| "?".to_string());
+            let dimension = u
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            format!("{}:{}", value, dimension)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// #25: JSON array of `{value, dimension}` objects in tree order. An empty
+/// array means `--units` was not active; `null` dimensions are undetermined.
+fn constant_units_json(values: &[f64], units: &[Option<Unit>]) -> String {
+    let items: Vec<String> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            let value = values
+                .get(i)
+                .map(|v| jnum(*v))
+                .unwrap_or_else(|| "null".to_string());
+            let dimension = match u {
+                Some(u) => jstr(&u.to_string()),
+                None => "null".to_string(),
+            };
+            format!("{{\"value\":{},\"dimension\":{}}}", value, dimension)
+        })
+        .collect();
+    format!("[{}]", items.join(","))
 }
 
 /// JSON for one solution's fitted-constant standard errors, or `null` when

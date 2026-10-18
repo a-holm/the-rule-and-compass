@@ -9,7 +9,7 @@ use rcsr::data::Sample;
 use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::metrics::Metric;
 use rcsr::search::{self, Config, Outcome};
-use rcsr::units::{infer, Inconsistency, Unit, Units};
+use rcsr::units::{constant_dimensions, infer, Inconsistency, Unit, Units};
 
 fn dims(e: [i32; 7]) -> Unit {
     Unit::from_exponents(e)
@@ -81,13 +81,103 @@ fn the_empty_unit_is_one() {
 }
 
 #[test]
-fn the_parser_rejects_malformed_units() {
-    for bad in ["", "bogus", "m^", "m^x", "m^x^2", "(m/s", "m//s", "m s"] {
+fn any_unknown_name_becomes_its_own_base_dimension() {
+    let usd = Unit::parse("USD").unwrap();
+    let shares = Unit::parse("shares").unwrap();
+    assert_ne!(usd, shares);
+    assert_eq!(Unit::parse("USD*USD/USD").unwrap(), usd);
+
+    // The point of dynamic dimensions: tabular quantities are not forced into
+    // the seven SI names, so `price + volume` is caught.
+    let vars = vec![usd, shares];
+    let bad = node(Op::Add, vec![input(0), input(1)]);
+    assert!(matches!(
+        infer(&bad, &vars),
+        Err(Inconsistency::Mismatch { op: Op::Add, .. })
+    ));
+
+    // Dimensions only: `m*m*m` and `m^3` are the same dimension, with no unit
+    // identity or scale factor in between.
+    assert_eq!(Unit::parse("m*m*m").unwrap(), Unit::parse("m^3").unwrap());
+    assert_eq!(Unit::parse("m/m").unwrap(), Unit::DIMENSIONLESS);
+}
+
+#[test]
+fn the_parser_rejects_malformed_syntax() {
+    for bad in ["", "m^", "m^x", "m^x^2", "(m/s", "m//s", "m s", "m^^2"] {
         assert!(
             Unit::parse(bad).is_err(),
-            "'{bad}' must not parse as a unit"
+            "'{bad}' must not parse as a dimension expression"
         );
     }
+}
+
+#[test]
+fn constant_dimensions_are_derived_from_the_printed_law() {
+    let vars = vec![m(), s()];
+
+    // y = a*x + b with x in m and y in m: a is dimensionless, b is m.
+    let linear = node(
+        Op::Add,
+        vec![
+            node(Op::Mul, vec![constant(2.0), input(0)]),
+            constant(1.0),
+        ],
+    );
+    assert_eq!(
+        constant_dimensions(&linear, &vars, &m()),
+        vec![Some(Unit::DIMENSIONLESS), Some(m())]
+    );
+
+    // y = a*x/t with x in m, t in s, y in m/s: a is dimensionless.
+    let speed = node(
+        Op::Div,
+        vec![
+            node(Op::Mul, vec![constant(2.0), input(0)]),
+            input(1),
+        ],
+    );
+    assert_eq!(
+        constant_dimensions(&speed, &vars, &m().div(s())),
+        vec![Some(Unit::DIMENSIONLESS)]
+    );
+
+    // y = a*sin(x) + b with a dimensionless x and y in m: both constants are m.
+    let wave = node(
+        Op::Add,
+        vec![
+            node(
+                Op::Mul,
+                vec![constant(2.0), node(Op::Sin, vec![input(0)])],
+            ),
+            constant(1.0),
+        ],
+    );
+    assert_eq!(
+        constant_dimensions(&wave, &[Unit::DIMENSIONLESS], &m()),
+        vec![Some(m()), Some(m())]
+    );
+
+    // An unsatisfiable case: `c^3 = m` needs `c = m^(1/3)`, which is not an
+    // integer exponent vector, so no constant assignment exists.
+    let unknown = node(Op::Pow, vec![constant(2.0), constant(3.0)]);
+    assert_eq!(
+        constant_dimensions(&unknown, &[], &m()),
+        vec![None, None]
+    );
+
+    // sqrt(c*x) with x in m and y in m is satisfiable: c is an area (m^2),
+    // so the root is a length. sqrt(x) alone is not (m^(1/2)).
+    let root_law = node(
+        Op::Sqrt,
+        vec![node(Op::Mul, vec![constant(4.0), input(0)])],
+    );
+    assert!(Units::new(vec![m()], m()).accepts(&root_law));
+    assert_eq!(
+        constant_dimensions(&root_law, &[m()], &m()),
+        vec![Some(m())]
+    );
+    assert!(!Units::new(vec![m()], m()).accepts(&node(Op::Sqrt, vec![input(0)])));
 }
 
 // ---- inference ------------------------------------------------------------
@@ -296,6 +386,34 @@ fn a_dimensionally_correct_law_is_accepted() {
 }
 
 #[test]
+fn a_fitted_intercept_absorbs_the_target_dimension() {
+    // y = 2*x + 1 with x in m and y in m. The intercept's dimension is m;
+    // a strict "constants are dimensionless" pass would wrongly reject this.
+    let train = sample(
+        vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0]],
+        vec![3.0, 5.0, 7.0, 9.0],
+    );
+    let test = train.clone();
+    let law = node(
+        Op::Add,
+        vec![
+            node(Op::Mul, vec![constant(2.0), input(0)]),
+            constant(1.0),
+        ],
+    );
+    let mut cfg = base_config();
+    cfg.units = Some(Units::new(vec![m()], m()));
+    cfg.require_dimensions = true;
+    let out = search::run_seeded(&cfg, &train, &test, std::slice::from_ref(&law));
+    assert_eq!(out.seeds[0].error, 0.0);
+    assert_eq!(out.archive.items.len(), 1);
+    assert_eq!(
+        constant_dimensions(&law, &[m()], &m()),
+        vec![Some(Unit::DIMENSIONLESS), Some(m())]
+    );
+}
+
+#[test]
 fn the_full_data_rebuild_does_not_resurrect_a_rejected_candidate() {
     let train = sample(
         vec![vec![1.0], vec![2.0], vec![3.0]],
@@ -379,14 +497,56 @@ fn rcsr(args: &[&str]) -> std::process::Output {
         .expect("run rcsr")
 }
 
+fn rcsr_stdin(args: &[&str], table: &str) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run rcsr");
+    use std::io::Write as _;
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(table.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for rcsr")
+}
+
 #[test]
-fn cli_rejects_a_malformed_unit() {
+fn cli_unknown_names_are_separate_dimensions() {
+    let table = "price,volume,y\n10,5,10\n20,3,20\n";
+    let out = rcsr_stdin(
+        &[
+            "--data", "-", "--target", "y", "--vars", "price,volume",
+            "--units", "price=USD,volume=shares,y=USD",
+            "--require-dimensions", "--seed-expr", "price + volume",
+            "--generations", "0", "--pop", "1", "--fit-iters", "0",
+            "--test-frac", "0",
+        ],
+        table,
+    );
+    assert_eq!(out.status.code(), Some(4), "no finite solution expected");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("train_error=inf"),
+        "price + volume must be rejected: {stderr}"
+    );
+}
+
+#[test]
+fn cli_rejects_malformed_unit_syntax() {
     let out = rcsr(&[
-        "--data", "-", "--target", "y", "--units", "x=bogus", "--generations", "0",
+        "--data", "-", "--target", "y", "--units", "x=m^", "--generations", "0",
     ]);
     assert_eq!(out.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("unknown unit 'bogus'"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("expected an integer exponent"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
@@ -442,6 +602,56 @@ fn cli_resolves_units_and_reports_them() {
     );
 }
 
+/// The fitted constants carry dimensions: the intercept is metres and the
+/// coefficient is dimensionless, and the CLI says so.
+#[test]
+fn cli_reports_constant_dimensions() {
+    let table = "x,y\n1,3\n2,5\n3,7\n4,9\n";
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "--data", "-", "--target", "y", "--vars", "x", "--units", "x=m,y=m",
+            "--require-dimensions", "--seed-expr", "2*x + 1", "--generations", "0",
+            "--pop", "1", "--fit-iters", "0", "--test-frac", "0", "--center",
+            "none", "--scale", "none",
+        ];
+        args.extend_from_slice(extra);
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+            .args(&args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("run rcsr");
+        use std::io::Write as _;
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(table.as_bytes())
+            .expect("write stdin");
+        child.wait_with_output().expect("wait for rcsr")
+    };
+
+    let out = run(&[]);
+    assert_eq!(out.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("constant dimensions (rank 1): 1:m, 2:1"),
+        "stderr: {stderr}"
+    );
+
+    let out = run(&["--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "\"constant_dimensions\":[{\"value\":1,\"dimension\":\"m\"},\
+             {\"value\":2,\"dimension\":\"1\"}]"
+        ),
+        "stdout: {stdout}"
+    );
+}
+
 /// A hand-built tree with no inputs lets the CLI test the filter without a
 /// dataset search: this pins the reported seeded error, not the summary text.
 #[test]
@@ -449,15 +659,18 @@ fn units_module_exposes_the_target_predicate() {
     let units = Units::new(vec![m()], s());
     assert!(!units.accepts(&input(0)), "m is not s");
     assert!(
-        !units.accepts(&node(Op::Div, vec![input(0), constant(2.0)])),
-        "m is still not s"
+        !units.accepts(&node(Op::Div, vec![input(0), input(0)])),
+        "m/m is dimensionless, not s"
     );
-    assert!(
-        !units.accepts(&Node {
-            op: Op::Const,
-            val: 1.0,
-            kids: Vec::new(),
-        }),
-        "a constant is dimensionless, not s"
-    );
+    // A fitted constant can absorb the difference: x/c with c = m/s is s.
+    assert!(units.accepts(&node(
+        Op::Div,
+        vec![input(0), constant(2.0)]
+    )));
+    // A bare constant can be assigned the target's dimension.
+    assert!(units.accepts(&Node {
+        op: Op::Const,
+        val: 1.0,
+        kids: Vec::new(),
+    }));
 }

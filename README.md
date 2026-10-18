@@ -155,14 +155,19 @@ reports; the defaults reproduce the node count exactly. See
 
 ## Dimensional constraints
 
-`--units 'x=m,t=s,y=m/s'` declares the SI dimensions of the inputs and the
-target; `--require-dimensions` then rejects every candidate whose inferred root
-dimension differs from the target's with an infinite error. The algebra knows
-`m`, `s`, `kg`, `A`, `K`, `mol` and `cd`, products, quotients and integer powers.
-Undeclared names are dimensionless, so the feature is opt-in: without
-`--require-dimensions`, declaring units only adds a summary note and the search
-is unchanged. See [`docs/units.md`](docs/units.md) for the operator table, a
-worked example and the limitations of a hard filter.
+`--units 'x=m,t=s,y=m/s'` declares the dimensions of the inputs and the target;
+`--require-dimensions` then rejects every candidate whose dimensions cannot be
+reconciled with the target's with an infinite error. The algebra knows the SI
+names `m`, `s`, `kg`, `A`, `K`, `mol` and `cd`, and **any other identifier is
+its own base dimension**, so `price=USD,volume=shares` catches `price + volume`.
+It models dimensions only, not unit identity or scale: declare `volume=m^3`, not
+`litre`. Fitted constants are allowed to carry dimensions (a coefficient absorbs
+a unit ratio, an intercept absorbs the target's), and each solution reports their
+apparent dimensions as a plausibility check. Undeclared names are dimensionless,
+so the feature is opt-in: without `--require-dimensions`, declaring units only
+adds a summary note and the search is unchanged. See
+[`docs/units.md`](docs/units.md) for the operator table, the radian/degree and
+dB/pH caveats, a worked example and the limitations of a hard filter.
 
 ## Meta operators
 
