@@ -24,7 +24,7 @@ RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 ./target/release/rcsr-gpu-bench --data examples/sine.csv --target y --vars x \
     --batch 8000 --depth 5 --seed 5
 
-# the search uses the GPU automatically when a device is present
+# opt in to GPU-guided search when a device is present
 ./target/release/rcsr --data examples/sine.csv --target y --vars x \
     --generations 200 --pop 200 --islands 4 --seed 7 --metric squared
 
@@ -176,7 +176,7 @@ measured here**.
 
 When the crate is built with `--features cuda` and a device opens, `run_search`
 creates one resident `GpuSearch` context for the full training sample. The
-`rcsr` CLI (and the web front end) opts in automatically; library callers set
+`rcsr` CLI and the web front end require `--gpu`; library callers set
 `Config::gpu = true`, whose default stays `false` so an embedded search keeps
 the CPU trajectory unless it asks for the GPU. Each generation then runs as:
 

@@ -297,9 +297,12 @@ SEARCH:
                              and every reported error are always full-data
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
-  --no-gpu                   force CPU evaluation even when built with
-                             --features cuda (alias --cpu). Reported errors are
-                             always CPU f64; the GPU only guides the search
+  --gpu                      let the GPU guide the search when built with
+                             --features cuda and a device is present. Reported
+                             errors stay CPU f64, but f32 fitness can change the
+                             trajectory, so this is opt-in
+  --no-gpu                   force CPU evaluation (alias --cpu); this is the
+                             default, so the flag is only for explicitness
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -534,11 +537,9 @@ fn main() {
     }
 
     let mut cfg = search::Config::default();
-    // #26: the CLI uses a device automatically in a CUDA build. The library
-    // default stays CPU so embedders and tests are unaffected; --no-gpu / --cpu
-    // turns the CLI path off again.
-    cfg.gpu = true;
-    let mut force_cpu = false;
+    // #91: the GPU path is opt-in. A default run is CPU, so the same command
+    // produces the same archive whether or not the binary was built with
+    // `--features cuda`. Pass `--gpu` to let f32 fitness guide the search.
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -821,10 +822,8 @@ fn main() {
             "--no-simd" => cfg.simd = false,
             // #26: force the CPU evaluator even in a CUDA build. A
             // performance choice, not saved search state.
-            "--no-gpu" | "--cpu" => {
-                cfg.gpu = false;
-                force_cpu = true;
-            }
+            "--gpu" => cfg.gpu = true,
+            "--no-gpu" | "--cpu" => cfg.gpu = false,
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -1976,13 +1975,9 @@ fn main() {
         }
     }
 
-    // #26: the forced-CPU note belongs to the CLI, not to the library, so it is
-    // printed here once and only when the flag was written. `--quiet` promises
-    // an empty stderr for machine-readable output, so it suppresses every note.
+    // #26: the backend note belongs to the CLI, not to the library. `--quiet`
+    // promises an empty stderr for machine-readable output, so it suppresses it.
     cfg.gpu_notes = !quiet;
-    if force_cpu && !quiet {
-        eprintln!("# gpu: off (--no-gpu)");
-    }
 
     // #15: multi-output reporting has its own shape (one entry per target);
     // the single-output path below is untouched.
@@ -4593,6 +4588,16 @@ fn metric_names() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #91: a default run must be CPU regardless of build features, so the
+    /// same command yields the same archive in a CUDA and a non-CUDA build.
+    #[test]
+    fn the_gpu_path_is_opt_in() {
+        assert!(!search::Config::default().gpu);
+        assert!(usage().contains("--gpu"));
+        assert!(schema::json().contains("\"--gpu\""));
+        assert!(usage().contains("--no-gpu"));
+    }
+
     use super::*;
 
     /// `--help` and `schema` are hand-written; this keeps them in step with the
