@@ -17,6 +17,8 @@ use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::{data, diagnostics, search, stability};
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::io::Read;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -30,6 +32,26 @@ enum Format {
     Text,
     Json,
     Ndjson,
+}
+
+/// The optional Markdown report (issue #29). A single report per run; a later
+/// `--report` replaces an earlier one, as with the other single-valued flags.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReportKind {
+    Summary,
+    Sensitivity,
+    Benchmark,
+}
+
+impl ReportKind {
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "summary" => Some(ReportKind::Summary),
+            "sensitivity" => Some(ReportKind::Sensitivity),
+            "benchmark" => Some(ReportKind::Benchmark),
+            _ => None,
+        }
+    }
 }
 
 fn usage() -> String {
@@ -176,6 +198,26 @@ OUTPUT:
   --top <N>                  report at most N Pareto rows (default: all)
   --quiet                    suppress the human-readable header
   --out <file>               also write the Pareto front as TSV
+
+REPORTS (Markdown, issue #29):
+  --report <type>            emit a Markdown report after the run. One type per
+                             run; a later --report replaces an earlier one:
+                             summary      data, chosen law, constants + standard
+                                          errors, diagnostics, baselines, the
+                                          whole Pareto front and a plain-language
+                                          trust verdict
+                             sensitivity  analytic d f / d x for every input,
+                                          ranked by mean |d f/d x| sigma_x/sigma_f
+                             benchmark    repeat the search N times at the same
+                                          budget and report per-complexity
+                                          median/IQR error and wall-clock time
+  --report-out <file>        write the report to this path. Without it, text
+                             prints the report to stdout; --json/--ndjson send
+                             it to stderr so the machine-readable stream stays
+                             valid JSON/NDJSON. Use --report-out for a clean file.
+  --report-repeats <N>       searches for --report benchmark (default 5); seeds
+                             are derived from --seed. Each repeat honours
+                             --time-budget, --generations and --pop.
   -h, --help                 show this help
 
 EXIT CODES:
@@ -231,6 +273,9 @@ fn schema() -> String {
         ("--format", "enum", "text", "text | json | ndjson"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
+        ("--report", "enum", "none", "Markdown report: summary | sensitivity | benchmark (single value; last wins)"),
+        ("--report-out", "string", "none", "write the Markdown report to this path (otherwise text=stdout, json/ndjson=stderr)"),
+        ("--report-repeats", "int", "5", "independent searches for --report benchmark"),
     ];
     let mut items = String::new();
     for (i, (name, ty, default, desc)) in opts.iter().enumerate() {
@@ -313,6 +358,7 @@ fn parse_filter(flag: &str, src: Option<&str>, table: &data::Table) -> Option<da
     }
 }
 
+#[derive(Clone)]
 struct Row {
     rank: usize,
     complexity: f64,
@@ -388,6 +434,7 @@ fn mean_of(it: impl Iterator<Item = f64>) -> f64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let command = format!("rcsr {}", args.join(" "));
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
         std::process::exit(EXIT_OK);
@@ -411,6 +458,10 @@ fn main() {
     let mut progress = false;
     let mut quiet = false;
     let mut top = 0usize;
+    let mut report: Option<ReportKind> = None;
+    let mut report_out: Option<String> = None;
+    let mut report_repeats = 5usize;
+    let mut report_repeats_set = false;
     let mut split_arg: Option<String> = None;
     let mut time_name: Option<String> = None;
     let mut group_name: Option<String> = None;
@@ -614,12 +665,55 @@ fn main() {
             "--top" => top = val!().parse().unwrap_or(0),
             "--quiet" => quiet = true,
             "--out" => out_path = Some(val!()),
+            "--report" => {
+                let v = val!();
+                match ReportKind::parse(&v) {
+                    Some(k) => report = Some(k),
+                    None => {
+                        eprintln!(
+                            "error: unknown --report '{}' (expected summary, sensitivity or benchmark)",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--report-out" => report_out = Some(val!()),
+            "--report-repeats" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => {
+                        report_repeats = n;
+                        report_repeats_set = true;
+                    }
+                    _ => {
+                        eprintln!(
+                            "error: --report-repeats needs an integer >= 1, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             other => {
                 eprintln!("error: unknown argument '{}'\nrun 'rcsr --help'", other);
                 std::process::exit(EXIT_USAGE);
             }
         }
         i += 1;
+    }
+
+    if report_out.is_some() && report.is_none() {
+        eprintln!("error: --report-out requires --report summary|sensitivity|benchmark");
+        std::process::exit(EXIT_USAGE);
+    }
+    if report_repeats_set && report != Some(ReportKind::Benchmark) {
+        eprintln!("error: --report-repeats only applies to --report benchmark");
+        std::process::exit(EXIT_USAGE);
+    }
+    if report.is_some() && eval_expr.is_some() {
+        eprintln!("error: --report cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
     }
 
     let data_path = match data_path {
@@ -1169,10 +1263,6 @@ fn main() {
         }
     });
 
-    if top > 0 && rows.len() > top {
-        rows.truncate(top);
-    }
-
     // Permutation (y-randomisation) control: run the *same* search on a shuffled
     // target. If it reaches a comparable error, the real fit is what the search
     // can manufacture from noise, not evidence of a law.
@@ -1214,6 +1304,57 @@ fn main() {
     }
 
     let finite = rows.iter().any(|r| r.train_error.is_finite());
+    let full_rows = rows.clone();
+
+    // Optional Markdown report (issue #29), built from the full Pareto front so
+    // `--top` only trims the ordinary table/TSV output below.
+    let report_md = report.map(|kind| match kind {
+        ReportKind::Summary => summary_markdown(
+            &command,
+            &prepared,
+            &target,
+            &vars,
+            &cfg,
+            &outcome,
+            &full_rows,
+            &baselines,
+            &best_resid,
+            &null_control,
+            &cv,
+            &stab,
+            &lag_report,
+            elapsed,
+            outlier_iqr,
+            smooth,
+            &notes,
+        ),
+        ReportKind::Sensitivity => {
+            let selected = full_rows.iter().min_by(|a, b| {
+                a.train_error
+                    .partial_cmp(&b.train_error)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let sorted = outcome.archive.sorted();
+            let tree = selected
+                .and_then(|r| r.rank.checked_sub(1).and_then(|i| sorted.get(i)))
+                .map(|s| &s.tree);
+            sensitivity_markdown(selected, tree, &prepared, &vars, &target)
+        }
+        ReportKind::Benchmark => benchmark_markdown(
+            &cfg,
+            &prepared,
+            &vars,
+            &target,
+            &outcome,
+            elapsed,
+            report_repeats,
+            quiet,
+        ),
+    });
+
+    if top > 0 && rows.len() > top {
+        rows.truncate(top);
+    }
 
     match format {
         Format::Text => {
@@ -1707,6 +1848,28 @@ fn main() {
         }
     }
 
+    // The Markdown report never shares stdout with a machine-readable stream:
+    // `--json`/`--ndjson` put it on stderr unless `--report-out` names a file.
+    if let Some(md) = report_md {
+        match &report_out {
+            Some(path) => {
+                if let Err(e) = std::fs::write(path, &md) {
+                    eprintln!("error writing {}: {}", path, e);
+                    std::process::exit(EXIT_INPUT);
+                }
+                if !quiet {
+                    eprintln!("# report written to {}", path);
+                }
+            }
+            None if format == Format::Text => {
+                println!("\n{}", md);
+            }
+            None => {
+                eprintln!("{}", md);
+            }
+        }
+    }
+
     std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
 }
 
@@ -1819,6 +1982,1007 @@ fn fmt_err(v: f64) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Markdown reports (issue #29)
+// ---------------------------------------------------------------------------
+
+fn md_num(v: f64) -> String {
+    if v.is_nan() {
+        "n/a".to_string()
+    } else if v == f64::INFINITY {
+        "inf".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-inf".to_string()
+    } else {
+        format!("{:.6}", v)
+    }
+}
+
+fn md_pct(v: f64) -> String {
+    if v.is_finite() {
+        format!("{:.1}%", 100.0 * v)
+    } else {
+        "n/a".to_string()
+    }
+}
+
+/// Uncertainty ratios are often tiny or huge; four decimals plus scientific
+/// notation for small values keeps them readable without losing the signal.
+fn md_rel(v: f64) -> String {
+    if !v.is_finite() {
+        md_num(v)
+    } else if v != 0.0 && v.abs() < 1e-3 {
+        format!("{:.2e}", v)
+    } else {
+        format!("{:.4}", v)
+    }
+}
+
+fn md_esc(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+/// The "hand this to someone else" report: provenance, data, the law, every
+/// diagnostic already computed, the whole Pareto front and a trust verdict that
+/// cites the numbers rather than asserting confidence.
+#[allow(clippy::too_many_arguments)]
+fn summary_markdown(
+    command: &str,
+    prepared: &data::Prepared,
+    target: &str,
+    vars: &[String],
+    cfg: &search::Config,
+    outcome: &search::Outcome,
+    rows: &[Row],
+    baselines: &diagnostics::Baselines,
+    best_resid: &Option<diagnostics::ResidualTests>,
+    null_control: &Option<diagnostics::NullControl>,
+    cv: &Option<CvReport>,
+    stab: &Option<stability::Stability>,
+    lag_report: &data::LagReport,
+    elapsed: f64,
+    outlier_iqr: Option<f64>,
+    smooth: usize,
+    notes: &[String],
+) -> String {
+    let mut s = String::new();
+    let chosen = rows.iter().min_by(|a, b| {
+        a.train_error
+            .partial_cmp(&b.train_error)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let _ = writeln!(s, "# rcsr model summary\n");
+    let _ = writeln!(s, "## What produced this\n");
+    let _ = writeln!(s, "```sh\n{}\n```\n", command);
+    let _ = writeln!(
+        s,
+        "Generated by `rcsr {}` in {:.2} s. Metric `{}`, seed `{}`, {} generation(s){}.\n",
+        VERSION,
+        elapsed,
+        cfg.metric.name(),
+        cfg.seed,
+        outcome.generations,
+        if outcome.converged_early {
+            " (stopped early)"
+        } else {
+            ""
+        }
+    );
+
+    let _ = writeln!(s, "## Data\n");
+    let _ = writeln!(s, "| item | value |");
+    let _ = writeln!(s, "|---|---|");
+    let _ = writeln!(s, "| rows read | {} |", prepared.report.rows_total);
+    let _ = writeln!(s, "| training rows | {} |", prepared.train.len());
+    let _ = writeln!(s, "| test rows | {} |", prepared.test.len());
+    let _ = writeln!(
+        s,
+        "| split | `{}` (gap {}, {} fold(s)) |",
+        prepared.report.mode, prepared.report.gap, prepared.report.folds
+    );
+    if prepared.report.groups_total > 0 {
+        let _ = writeln!(
+            s,
+            "| groups | {}/{} in train, {}/{} in test |",
+            prepared.report.groups_train,
+            prepared.report.groups_total,
+            prepared.report.groups_test,
+            prepared.report.groups_total
+        );
+    }
+    let _ = writeln!(s, "| target | `{}` |", md_esc(target));
+    let _ = writeln!(
+        s,
+        "| inputs | {} |",
+        vars.iter()
+            .map(|v| format!("`{}`", md_esc(v)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let _ = writeln!(
+        s,
+        "| normalisation | centre=`{}`, scale=`{}` |",
+        prepared.prep.center, prepared.prep.scale
+    );
+    if lag_report.lags > 0 || lag_report.history_rows > 0 {
+        let _ = writeln!(
+            s,
+            "| lags / history | {} lag(s), {} series, {} history row(s) |",
+            lag_report.lags, lag_report.series, lag_report.history_rows
+        );
+    }
+    let _ = writeln!(s);
+
+    let prep_lines = prepared.prep.text_lines(outlier_iqr, smooth);
+    let _ = writeln!(s, "### Preparation\n");
+    if prep_lines.is_empty() {
+        let _ = writeln!(
+            s,
+            "No opt-in preparation ran (missing values left alone, mean/std scaling).\n"
+        );
+    } else {
+        for line in prep_lines {
+            let _ = writeln!(s, "- {}", line.trim_start_matches("# "));
+        }
+        let _ = writeln!(s);
+    }
+    if !notes.is_empty() {
+        let _ = writeln!(s, "### Run notes\n");
+        for n in notes {
+            let _ = writeln!(s, "- {}", n);
+        }
+        let _ = writeln!(s);
+    }
+
+    let _ = writeln!(s, "## Chosen law\n");
+    match chosen {
+        Some(r) => {
+            let _ = writeln!(
+                s,
+                "Selected by lowest full-data training error; the Pareto table below\n\
+                 lists every non-dominated trade-off.\n"
+            );
+            let _ = writeln!(s, "```text\n{} = {}\n```\n", target, r.expression);
+            let _ = writeln!(s, "| quantity | value |");
+            let _ = writeln!(s, "|---|---|");
+            let _ = writeln!(s, "| complexity (nodes) | {} |", r.complexity);
+            let _ = writeln!(s, "| fitted constants (k) | {} |", r.k_constants);
+            let _ = writeln!(s, "| train error ({}) | {} |", cfg.metric.name(), md_num(r.train_error));
+            let _ = writeln!(s, "| test error ({}) | {} |", cfg.metric.name(), md_num(r.test_error));
+            let _ = writeln!(s, "| overfit index (test/train) | {} |", md_num(r.overfit));
+            let _ = writeln!(s, "| AICc | {} |", md_num(r.aicc));
+            let _ = writeln!(s, "| BIC | {} |", md_num(r.bic));
+            let _ = writeln!(s, "| Durbin–Watson | {} |", md_num(r.dw));
+            let _ = writeln!(s);
+
+            let _ = writeln!(s, "### Fitted constants and standard errors\n");
+            match &r.constant_errors {
+                Some(ce) => {
+                    let _ = writeln!(
+                        s,
+                        "Constants are listed in left-to-right order of the fitted\n\
+                         (normalised-input) model; the printed law above is the same\n\
+                         model denormalised to original units.\n"
+                    );
+                    let _ = writeln!(s, "| # | value | std. error | relative |");
+                    let _ = writeln!(s, "|---:|---:|---:|---:|");
+                    for (i, ((v, se), rel)) in ce
+                        .values
+                        .iter()
+                        .zip(&ce.std_errors)
+                        .zip(&ce.relative)
+                        .enumerate()
+                    {
+                        let _ = writeln!(
+                            s,
+                            "| {} | {} | {} | {} |",
+                            i + 1,
+                            md_num(*v),
+                            md_num(*se),
+                            md_rel(*rel)
+                        );
+                    }
+                    let _ = writeln!(s, "\nResidual degrees of freedom: {}.", ce.dof);
+                    if ce.ill_conditioned {
+                        let _ = writeln!(
+                            s,
+                            "**Warning:** JᵀJ is near-singular; the constants are not\n\
+                             separately identified by the data."
+                        );
+                    }
+                    let _ = writeln!(s);
+                }
+                None if r.k_constants == 0 => {
+                    let _ = writeln!(s, "This law has no fitted constants.\n");
+                }
+                None => {
+                    let _ = writeln!(
+                        s,
+                        "Standard errors are undefined (too few residual degrees of freedom).\n"
+                    );
+                }
+            }
+        }
+        None => {
+            let _ = writeln!(
+                s,
+                "No finite solution was found within the budget. Lower `--max-complexity`,\n\
+                 raise `--generations`/`--time-budget`, or check the data.\n"
+            );
+        }
+    }
+
+    if let Some(r) = chosen {
+        let _ = writeln!(s, "## Residual tests\n");
+        match best_resid {
+            Some(rt) => {
+                let lb = if rt.ljung_box.p_value < 0.05 {
+                    "autocorrelation left"
+                } else {
+                    "no evidence of autocorrelation"
+                };
+                let bp = if rt.breusch_pagan.p_value < 0.05 {
+                    "variance changes with fitted value"
+                } else {
+                    "no evidence of changing variance"
+                };
+                let _ = writeln!(s, "| test | statistic | df | p-value | reading |");
+                let _ = writeln!(s, "|---|---:|---:|---:|---|");
+                let _ = writeln!(
+                    s,
+                    "| Ljung–Box | {} | {} | {} | {} |",
+                    md_num(rt.ljung_box.statistic),
+                    rt.ljung_box.lags,
+                    md_num(rt.ljung_box.p_value),
+                    lb
+                );
+                let _ = writeln!(
+                    s,
+                    "| Breusch–Pagan | {} | {} | {} | {} |",
+                    md_num(rt.breusch_pagan.statistic),
+                    rt.breusch_pagan.df,
+                    md_num(rt.breusch_pagan.p_value),
+                    bp
+                );
+                let _ = writeln!(s, "| residual skewness | {} | – | – | 0 is symmetric |", md_num(rt.skewness));
+                let _ = writeln!(
+                    s,
+                    "| excess kurtosis | {} | – | – | 0 is Gaussian |",
+                    md_num(rt.kurtosis)
+                );
+                let _ = writeln!(s);
+            }
+            None => {
+                let _ = writeln!(s, "Residual tests are not available for this run.\n");
+            }
+        }
+
+        let _ = writeln!(s, "## Baselines\n");
+        let baseline_items = [
+            ("constant mean", baselines.mean),
+            ("least-squares line", baselines.linear),
+            (
+                "k-nearest-neighbour",
+                diagnostics::BaselineError {
+                    train_error: baselines.knn.train_error,
+                    test_error: baselines.knn.test_error,
+                },
+            ),
+        ];
+        let _ = writeln!(s, "| baseline | train error | test error | chosen law beats it on test? |");
+        let _ = writeln!(s, "|---|---:|---:|---|");
+        for (name, b) in baseline_items {
+            let label = if name == "k-nearest-neighbour" {
+                format!("{name} (k={})", baselines.knn_k)
+            } else {
+                name.to_string()
+            };
+            let beats = if r.test_error < b.test_error { "yes" } else { "no" };
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} |",
+                label,
+                md_num(b.train_error),
+                md_num(b.test_error),
+                beats
+            );
+        }
+        let _ = writeln!(s);
+
+        let _ = writeln!(s, "## Null control\n");
+        match null_control {
+            Some(c) => {
+                let _ = writeln!(s, "| shuffled runs | best null error | median null error | p-value | verdict |");
+                let _ = writeln!(s, "|---:|---:|---:|---:|---|");
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {} | {} | {} |\n",
+                    c.runs,
+                    md_num(c.null_min),
+                    md_num(c.null_median),
+                    md_num(c.p_value),
+                    c.verdict()
+                );
+            }
+            None => {
+                let _ = writeln!(
+                    s,
+                    "_Not run. Add `--null-runs 19` (or more) to compare the real fit\n\
+                     against the identical search on shuffled targets._\n"
+                );
+            }
+        }
+
+        let bootstrap_rows: Vec<&Row> = rows.iter().filter(|x| x.bootstrap.is_some()).collect();
+        if !bootstrap_rows.is_empty() {
+            let _ = writeln!(s, "## Bootstrap error (.632+)\n");
+            let _ = writeln!(s, "| rank | apparent | out-of-bag | .632+ | resamples | weight |");
+            let _ = writeln!(s, "|---:|---:|---:|---:|---:|---:|");
+            for x in bootstrap_rows {
+                if let Some(b) = &x.bootstrap {
+                    let _ = writeln!(
+                        s,
+                        "| {} | {} | {} | {} | {} | {} |",
+                        x.rank,
+                        md_num(b.apparent),
+                        md_num(b.oob),
+                        md_num(b.estimate),
+                        b.used,
+                        md_num(b.weight)
+                    );
+                }
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(c) = cv {
+            let _ = writeln!(s, "## Cross-validation\n");
+            let _ = writeln!(
+                s,
+                "| scheme | folds | mean test | std test | mean train |"
+            );
+            let _ = writeln!(s, "|---|---:|---:|---:|---:|");
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} |\n",
+                c.mode,
+                c.k,
+                md_num(c.mean_test()),
+                md_num(c.std_test()),
+                md_num(c.mean_train())
+            );
+            let _ = writeln!(s, "| fold | train error | test error | complexity | law |");
+            let _ = writeln!(s, "|---:|---:|---:|---:|---|");
+            for (i, r) in c.folds.iter().enumerate() {
+                let _ = writeln!(
+                    s,
+                    "| {} | {} | {} | {} | `{} = {}` |",
+                    i + 1,
+                    md_num(r.train_error),
+                    md_num(r.test_error),
+                    r.complexity,
+                    md_esc(target),
+                    md_esc(&r.expression)
+                );
+            }
+            let _ = writeln!(s);
+        }
+
+        if let Some(st) = stab {
+            let _ = writeln!(s, "## Stability selection\n");
+            if let Some(top) = st.forms.first() {
+                let _ = writeln!(
+                    s,
+                    "{} resamples, {} found a solution. Modal form selected in {:.1}% of runs:\n",
+                    st.runs,
+                    st.found,
+                    100.0 * top.frequency
+                );
+                let _ = writeln!(s, "```text\n{} = {}\n```\n", target, top.example);
+            }
+            let _ = writeln!(s, "| input | selected in | frequency |");
+            let _ = writeln!(s, "|---|---:|---:|");
+            for (i, count) in &st.variables {
+                let name = vars.get(*i).cloned().unwrap_or_else(|| format!("x{i}"));
+                let freq = if st.runs > 0 {
+                    *count as f64 / st.runs as f64
+                } else {
+                    0.0
+                };
+                let _ = writeln!(s, "| `{}` | {}/{} | {} |", name, count, st.runs, md_pct(freq));
+            }
+            let _ = writeln!(s);
+        }
+    }
+
+    let _ = writeln!(s, "## Pareto front\n");
+    let _ = writeln!(s, "| rank | complexity | constants | train | test | AICc | BIC | law |");
+    let _ = writeln!(s, "|---:|---:|---:|---:|---:|---:|---:|---|");
+    for r in rows {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | `{} = {}` |",
+            r.rank,
+            r.complexity,
+            r.k_constants,
+            md_num(r.train_error),
+            md_num(r.test_error),
+            md_num(r.aicc),
+            md_num(r.bic),
+            md_esc(target),
+            md_esc(&r.expression)
+        );
+    }
+    let _ = writeln!(s);
+
+    let _ = writeln!(s, "## How much should you trust this?\n");
+    let _ = writeln!(s, "{}\n", trust_paragraph(prepared, cfg, rows, chosen, baselines, best_resid, null_control, cv));
+    s
+}
+
+/// Plain-language verdict assembled from the diagnostics. Each sentence cites
+/// the statistic that drove it, so a reader can check the reasoning.
+#[allow(clippy::too_many_arguments)]
+fn trust_paragraph(
+    prepared: &data::Prepared,
+    cfg: &search::Config,
+    rows: &[Row],
+    chosen: Option<&Row>,
+    baselines: &diagnostics::Baselines,
+    best_resid: &Option<diagnostics::ResidualTests>,
+    null_control: &Option<diagnostics::NullControl>,
+    cv: &Option<CvReport>,
+) -> String {
+    let Some(r) = chosen else {
+        return "There is no finite solution to judge. Treat this run as inconclusive \
+                and adjust the search budget or the data before drawing a conclusion."
+            .to_string();
+    };
+
+    let mut out = String::new();
+    let mut strong = 0usize;
+    let mut weak = 0usize;
+
+    let baseline_items = [
+        ("constant mean", baselines.mean),
+        ("least-squares line", baselines.linear),
+        ("k-nearest-neighbour", baselines.knn),
+    ];
+    let mut beats = 0usize;
+    let mut best_name = "none";
+    let mut best_test = f64::INFINITY;
+    for (name, b) in baseline_items {
+        if r.test_error < b.test_error {
+            beats += 1;
+        }
+        if b.test_error < best_test {
+            best_test = b.test_error;
+            best_name = name;
+        }
+    }
+    let beat_phrase = match beats {
+        3 => "all three baselines".to_string(),
+        0 => "none of the three baselines".to_string(),
+        n => format!("{} of the three baselines", n),
+    };
+    let _ = write!(
+        out,
+        "The selected law's held-out {} error is {} against {} for the best trivial \
+         baseline ({}); it beats {} on the test rows. ",
+        cfg.metric.name(),
+        md_num(r.test_error),
+        md_num(best_test),
+        best_name,
+        beat_phrase
+    );
+    if beats == 3 {
+        strong += 1;
+    } else {
+        weak += 1;
+    }
+
+    if r.overfit.is_finite() {
+        let _ = write!(
+            out,
+            "The overfit index (test/train) is {}, so ",
+            md_num(r.overfit)
+        );
+        if r.overfit <= 1.5 {
+            let _ = write!(out, "the fit is essentially as good off-sample as on it. ");
+            strong += 1;
+        } else if r.overfit > 2.0 {
+            let _ = write!(
+                out,
+                "it degrades materially on rows the search never saw. "
+            );
+            weak += 1;
+        } else {
+            let _ = write!(out, "it degrades somewhat off-sample. ");
+        }
+    } else {
+        let _ = write!(
+            out,
+            "The test error is infinite, so the model does not generalise to the held-out rows. "
+        );
+        weak += 1;
+    }
+
+    match null_control {
+        Some(c) => {
+            let _ = write!(
+                out,
+                "Across {} shuffled-target runs the search reached a best error of {} \
+                 (median {}); the permutation p-value is {}, which means ",
+                c.runs,
+                md_num(c.null_min),
+                md_num(c.null_median),
+                md_num(c.p_value)
+            );
+            if c.p_value <= 0.05 {
+                let _ = write!(out, "the real fit is unlikely to be chance. ");
+                strong += 1;
+            } else if c.p_value <= 0.2 {
+                let _ = write!(
+                    out,
+                    "it is only weakly better than what the search manufactures from noise. "
+                );
+            } else {
+                let _ = write!(
+                    out,
+                    "the search fits shuffled targets about as well, so this is likely overfitting. "
+                );
+                weak += 1;
+            }
+        }
+        None => {
+            let _ = write!(
+                out,
+                "No permutation control was run, so this report cannot rule out the \
+                 search fitting noise; add `--null-runs 19` or more. "
+            );
+            weak += 1;
+        }
+    }
+
+    match best_resid {
+        Some(rt) => {
+            let lb = rt.ljung_box.p_value;
+            let bp = rt.breusch_pagan.p_value;
+            let _ = write!(
+                out,
+                "The residual checks give Ljung–Box p={} and Breusch–Pagan p={}, i.e. ",
+                md_num(lb),
+                md_num(bp)
+            );
+            if lb >= 0.05 && bp >= 0.05 {
+                let _ = write!(
+                    out,
+                    "no significant leftover autocorrelation or changing variance. "
+                );
+                strong += 1;
+            } else if lb < 0.01 || bp < 0.01 {
+                let _ = write!(
+                    out,
+                    "the residuals still carry structure the law does not explain. "
+                );
+                weak += 1;
+            } else {
+                let _ = write!(out, "the evidence is borderline. ");
+            }
+        }
+        None => {
+            let _ = write!(out, "Residual tests were not available. ");
+        }
+    }
+
+    match &r.constant_errors {
+        Some(ce) if ce.ill_conditioned => {
+            let _ = write!(
+                out,
+                "JᵀJ is near-singular, so at least one constant is not separately identified. "
+            );
+            weak += 1;
+        }
+        Some(ce) => {
+            let worst = ce
+                .relative
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .fold(0.0_f64, f64::max);
+            let _ = write!(
+                out,
+                "The worst relative standard error among the {} constant(s) is {}",
+                ce.values.len(),
+                md_rel(worst)
+            );
+            if worst <= 0.25 {
+                let _ = write!(out, ", so the fitted values are pinned down well. ");
+                strong += 1;
+            } else if worst > 0.5 {
+                let _ = write!(out, ", so the data do not pin every constant down well. ");
+                weak += 1;
+            } else {
+                let _ = write!(out, ". ");
+            }
+        }
+        None => {}
+    }
+
+    if let Some(c) = cv {
+        let mean = c.mean_test();
+        let sd = c.std_test();
+        let _ = write!(
+            out,
+            "Cross-validation over {} folds gives a mean held-out error of {} with a \
+             fold standard deviation of {}. ",
+            c.k,
+            md_num(mean),
+            md_num(sd)
+        );
+        if mean > 0.0 && mean.is_finite() {
+            let rel = sd / mean;
+            if rel <= 0.5 {
+                strong += 1;
+            } else if rel > 1.0 {
+                weak += 1;
+            }
+        }
+    }
+
+    let n_finite = rows.iter().filter(|r| r.train_error.is_finite()).count();
+    let verdict = if n_finite == 0 || strong == 0 {
+        "weak"
+    } else if weak >= 2 {
+        "weak"
+    } else if weak == 0 && strong >= 3 {
+        "strong"
+    } else {
+        "moderate"
+    };
+    let _ = write!(
+        out,
+        "Overall: **{} evidence** from {} training rows and {} test rows in a `{}` split. ",
+        verdict,
+        prepared.train.len(),
+        prepared.test.len(),
+        prepared.report.mode
+    );
+    match verdict {
+        "strong" => {
+            let _ = write!(
+                out,
+                "The model beats every trivial baseline, survives the permutation \
+                 control and leaves clean residuals; quote the test error, not the \
+                 training error."
+            );
+        }
+        "moderate" => {
+            let _ = write!(
+                out,
+                "Some checks pass and some do not; treat the law as a candidate, not \
+                 a result, and run more controls (`--null-runs`, `--cv`, `--stability`) \
+                 before relying on it."
+            );
+        }
+        _ => {
+            let _ = write!(
+                out,
+                "At least two independent checks failed, so the fit should not be \
+                 presented as a discovered law without further evidence."
+            );
+        }
+    }
+    out
+}
+
+/// Analytic variable sensitivity, ranked so the input that actually moves the
+/// prediction is at the top.
+fn sensitivity_markdown(
+    selected: Option<&Row>,
+    tree: Option<&expr::Node>,
+    prepared: &data::Prepared,
+    vars: &[String],
+    target: &str,
+) -> String {
+    let mut s = String::new();
+    let _ = writeln!(s, "# Variable sensitivity\n");
+    let (Some(row), Some(tree)) = (selected, tree) else {
+        let _ = writeln!(
+            s,
+            "No finite solution was found, so there is no law to differentiate.\n"
+        );
+        return s;
+    };
+
+    let report = diagnostics::sensitivity(tree, &prepared.train, &prepared.stds);
+    let _ = writeln!(
+        s,
+        "Selected solution (lowest training error):\n\n```text\n{} = {}\n```\n",
+        target, row.expression
+    );
+    let _ = writeln!(
+        s,
+        "The derivative below is **analytic** — the same adjoint (reverse-mode)\n\
+         sweep the fitter uses for constants, seeded at the model output and\n\
+         accumulated at each input leaf. It is evaluated at all {} training rows;\n\
+         no finite differences are involved. The elasticity\n\n\
+         `mean(|∂f/∂x_i| · σ_x_i / σ_f)`\n\n\
+         is scale-free, so inputs with different units are directly comparable.\n\
+         Here `σ_f = {}` on the training rows.\n",
+        report.n,
+        md_num(report.output_std)
+    );
+    let _ = writeln!(
+        s,
+        "| rank | input | mean abs elasticity | min contribution | max contribution | positive rows | negative rows |"
+    );
+    let _ = writeln!(s, "|---:|---|---:|---:|---:|---:|---:|");
+    for (i, r) in report.rows.iter().enumerate() {
+        let name = vars.get(r.input).cloned().unwrap_or_else(|| format!("x{}", r.input));
+        let _ = writeln!(
+            s,
+            "| {} | `{}` | {} | {} | {} | {} | {} |",
+            i + 1,
+            md_esc(&name),
+            md_num(r.mean_abs_elasticity),
+            md_num(r.min_contribution),
+            md_num(r.max_contribution),
+            md_pct(r.positive_fraction),
+            md_pct(r.negative_fraction)
+        );
+    }
+    let _ = writeln!(s);
+
+    if let (Some(first), Some(second)) = (report.rows.first(), report.rows.get(1)) {
+        let a = vars
+            .get(first.input)
+            .cloned()
+            .unwrap_or_else(|| format!("x{}", first.input));
+        let b = vars
+            .get(second.input)
+            .cloned()
+            .unwrap_or_else(|| format!("x{}", second.input));
+        if second.mean_abs_elasticity > 0.0 {
+            let ratio = first.mean_abs_elasticity / second.mean_abs_elasticity;
+            let _ = writeln!(
+                s,
+                "**`{}` matters most:** its elasticity is {:.1}× that of `{}` ({} vs {}).",
+                a,
+                ratio,
+                b,
+                md_num(first.mean_abs_elasticity),
+                md_num(second.mean_abs_elasticity)
+            );
+        } else {
+            let _ = writeln!(
+                s,
+                "**`{}` is the only input with a non-zero derivative** (elasticity {}); \
+                 the remaining inputs never enter the fitted law.",
+                a,
+                md_num(first.mean_abs_elasticity)
+            );
+        }
+    }
+    let _ = writeln!(
+        s,
+        "\nA positive fraction means the input pushes the prediction up; a negative\n\
+         fraction means it pushes it down. The sign can change across rows, which is\n\
+         exactly what a single correlation coefficient cannot show."
+    );
+    s
+}
+
+struct BenchmarkRun {
+    seed: u32,
+    seconds: f64,
+    best_train: f64,
+    best_test: f64,
+    expression: String,
+    points: Vec<diagnostics::BenchmarkPoint>,
+}
+
+/// One repeat: its per-complexity Pareto errors and its overall best law.
+fn benchmark_run(
+    cfg: &search::Config,
+    prepared: &data::Prepared,
+    vars: &[String],
+    seed: u32,
+    seconds: f64,
+    outcome: &search::Outcome,
+) -> BenchmarkRun {
+    let fold_samples: &[data::Sample] = if prepared.fold_samples.is_empty() {
+        std::slice::from_ref(&prepared.test)
+    } else {
+        &prepared.fold_samples
+    };
+    let mut best_map: BTreeMap<usize, diagnostics::BenchmarkPoint> = BTreeMap::new();
+    let mut best: Option<(f64, f64, String)> = None;
+    for sol in outcome.archive.sorted() {
+        let train_error = search::eval_error(&sol.tree, &prepared.train, cfg.metric);
+        if !train_error.is_finite() {
+            continue;
+        }
+        let test_error = if fold_samples.is_empty() {
+            f64::INFINITY
+        } else {
+            fold_samples
+                .iter()
+                .map(|f| search::eval_error(&sol.tree, f, cfg.metric))
+                .sum::<f64>()
+                / fold_samples.len() as f64
+        };
+        match best_map.get(&sol.complexity) {
+            Some(old) if old.train_error <= train_error => {}
+            _ => {
+                best_map.insert(
+                    sol.complexity,
+                    diagnostics::BenchmarkPoint {
+                        complexity: sol.complexity,
+                        train_error,
+                        test_error,
+                    },
+                );
+            }
+        }
+        if best
+            .as_ref()
+            .map(|(e, _, _)| train_error < *e)
+            .unwrap_or(true)
+        {
+            let den = expr::simplify(&expr::denormalize(
+                &expr::simplify(&sol.tree),
+                &prepared.means,
+                &prepared.stds,
+            ));
+            best = Some((train_error, test_error, expr::to_string(&den, vars)));
+        }
+    }
+    let (best_train, best_test, expression) =
+        best.unwrap_or((f64::INFINITY, f64::INFINITY, "(no finite solution)".to_string()));
+    BenchmarkRun {
+        seed,
+        seconds,
+        best_train,
+        best_test,
+        expression,
+        points: best_map.into_values().collect(),
+    }
+}
+
+/// Repeated-search benchmark: per-complexity median/IQR error, wall-clock
+/// median/IQR and the best law from each repeat.
+fn benchmark_markdown(
+    cfg: &search::Config,
+    prepared: &data::Prepared,
+    vars: &[String],
+    target: &str,
+    first_outcome: &search::Outcome,
+    first_elapsed: f64,
+    repeats: usize,
+    quiet: bool,
+) -> String {
+    let repeats = repeats.max(1);
+    let mut runs = Vec::with_capacity(repeats);
+    runs.push(benchmark_run(
+        cfg,
+        prepared,
+        vars,
+        cfg.seed,
+        first_elapsed,
+        first_outcome,
+    ));
+
+    let mut extra = cfg.clone();
+    extra.progress = None;
+    for r in 1..repeats {
+        extra.seed = cfg
+            .seed
+            .wrapping_add(0x9E37_79B9u32.wrapping_mul(r as u32));
+        let start = std::time::Instant::now();
+        let outcome = search::run(&extra, &prepared.train, &prepared.test);
+        let seconds = start.elapsed().as_secs_f64();
+        if !quiet {
+            eprintln!(
+                "# benchmark repeat {}/{}: seed={} ({:.2}s)",
+                r + 1,
+                repeats,
+                extra.seed,
+                seconds
+            );
+        }
+        runs.push(benchmark_run(
+            &extra, prepared, vars, extra.seed, seconds, &outcome,
+        ));
+    }
+
+    let points: Vec<Vec<diagnostics::BenchmarkPoint>> =
+        runs.iter().map(|r| r.points.clone()).collect();
+    let cells = diagnostics::benchmark_by_complexity(&points);
+    let seconds: Vec<f64> = runs.iter().map(|r| r.seconds).collect();
+
+    let mut s = String::new();
+    let _ = writeln!(s, "# Search benchmark\n");
+    let _ = writeln!(
+        s,
+        "{} independent searches at the same budget: generations={}, islands={}, \
+         pop={}, max-complexity={}, metric=`{}`. Seeds derive from `--seed {}` \
+         (repeat 1 uses the seed itself, repeat r uses `seed + 0x9E3779B9·(r−1)`). \
+         Each repeat honours `--time-budget`.\n",
+        repeats,
+        cfg.generations,
+        cfg.islands,
+        cfg.pop,
+        cfg.max_complexity,
+        cfg.metric.name(),
+        cfg.seed
+    );
+
+    let _ = writeln!(s, "## Per-complexity Pareto error\n");
+    if cells.is_empty() {
+        let _ = writeln!(s, "The repeats produced no finite solution.\n");
+    } else {
+        let _ = writeln!(s, "| complexity | runs | train median | train IQR | test median | test IQR |");
+        let _ = writeln!(s, "|---:|---:|---:|---:|---:|---:|");
+        for c in &cells {
+            let _ = writeln!(
+                s,
+                "| {} | {} | {} | {} | {} | {} |",
+                c.complexity,
+                c.runs,
+                md_num(c.train_median),
+                md_num(c.train_iqr),
+                md_num(c.test_median),
+                md_num(c.test_iqr)
+            );
+        }
+        let _ = writeln!(s);
+    }
+
+    let _ = writeln!(s, "## Wall clock\n");
+    let _ = writeln!(s, "| statistic | seconds |");
+    let _ = writeln!(s, "|---|---:|");
+    let _ = writeln!(s, "| median | {} |", md_num(diagnostics::median(&seconds)));
+    let _ = writeln!(s, "| IQR | {} |", md_num(diagnostics::iqr(&seconds)));
+    let _ = writeln!(
+        s,
+        "| min | {} |",
+        md_num(seconds.iter().copied().fold(f64::INFINITY, f64::min))
+    );
+    let _ = writeln!(
+        s,
+        "| max | {} |\n",
+        md_num(seconds.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+    );
+
+    let _ = writeln!(s, "## Best result per repeat\n");
+    let _ = writeln!(s, "| repeat | seed | train error | test error | seconds | law |");
+    let _ = writeln!(s, "|---:|---:|---:|---:|---:|---|");
+    for (i, r) in runs.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | `{} = {}` |",
+            i + 1,
+            r.seed,
+            md_num(r.best_train),
+            md_num(r.best_test),
+            md_num(r.seconds),
+            md_esc(target),
+            md_esc(&r.expression)
+        );
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(
+        s,
+        "A per-complexity cell uses each repeat's best training error at that\n\
+         complexity; `runs` is how many repeats produced a solution there. Median\n\
+         and IQR are Hyndman–Fan type-7 quantiles (the same definition the data\n\
+         preparation uses)."
+    );
+    s
+}
+
 /// JSON for one `.632+` bootstrap estimate, or `null` when it is off.
 fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
     match b {
@@ -1896,6 +3060,22 @@ mod tests {
                 schema_text.contains(m.name()),
                 "schema() is missing metric '{}'",
                 m.name()
+            );
+        }
+    }
+
+    /// Every report flag and type must stay documented in `--help` and `schema`.
+    #[test]
+    fn help_and_schema_document_reports() {
+        for flag in ["--report", "--report-out", "--report-repeats"] {
+            assert!(usage().contains(flag), "usage() is missing {flag}");
+            assert!(schema().contains(flag), "schema() is missing {flag}");
+        }
+        for kind in ["summary", "sensitivity", "benchmark"] {
+            assert!(usage().contains(kind), "usage() is missing report '{kind}'");
+            assert!(
+                schema().contains(kind),
+                "schema() is missing report '{kind}'"
             );
         }
     }
