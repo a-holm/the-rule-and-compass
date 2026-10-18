@@ -87,6 +87,10 @@ OVERFITTING DIAGNOSTICS (always on):
                              (y-randomisation control) and report the null error
                              distribution and a p-value; inferential, costs n
                              extra searches
+  --bootstrap-error <n>      refit each solution's constants on n bootstrap
+                             resamples and report the apparent, out-of-bag and
+                             .632+ error estimates (Efron & Tibshirani 1997);
+                             costs n constant refits per reported solution
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
@@ -138,6 +142,7 @@ fn schema() -> String {
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
+        ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | auc | log_loss | hinge | aic | aicc | bic"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
@@ -223,6 +228,8 @@ struct Row {
     dw: f64,
     /// Ljung–Box, Breusch–Pagan and residual shape for this solution.
     resid_tests: diagnostics::ResidualTests,
+    /// `.632+` bootstrap error estimate, when `--bootstrap-error` is set.
+    bootstrap: Option<diagnostics::BootstrapError>,
     /// test_error / train_error: how much worse the model gets off-sample.
     overfit: f64,
     /// Per-block test errors (`--folds`); one entry when folds == 1.
@@ -264,6 +271,7 @@ fn main() {
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
+    let mut bootstrap_resamples = 0usize;
 
     let mut i = 0;
     macro_rules! val {
@@ -313,6 +321,7 @@ fn main() {
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
+            "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
@@ -690,6 +699,9 @@ fn main() {
         prepared.fold_samples.clone()
     };
     let sorted = outcome.archive.sorted();
+    // A dedicated RNG stream so bootstrap resampling never perturbs the search
+    // or the permutation control.
+    let mut boot_rng = Mt::new(cfg.seed ^ 0xB007_57AA);
     let mut rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -732,6 +744,20 @@ fn main() {
             } else {
                 1.0
             };
+            // `.632+` bootstrap error: refit constants on resamples of the
+            // training rows and score the out-of-bag rows (issue #21).
+            let bootstrap = if bootstrap_resamples > 0 {
+                Some(diagnostics::bootstrap_error(
+                    &s.tree,
+                    &prepared.train,
+                    cfg.metric,
+                    bootstrap_resamples,
+                    cfg.fit_iters,
+                    &mut boot_rng,
+                ))
+            } else {
+                None
+            };
             Row {
                 rank: k + 1,
                 complexity: s.complexity,
@@ -742,6 +768,7 @@ fn main() {
                 bic,
                 dw,
                 resid_tests,
+                bootstrap,
                 overfit,
                 fold_errors,
                 expression: expr::to_string(&den, &vars),
@@ -888,6 +915,21 @@ fn main() {
                     rt.kurtosis
                 );
             }
+            for r in &rows {
+                if let Some(b) = &r.bootstrap {
+                    eprintln!(
+                        "# bootstrap error (rank {}): apparent={:.6} out-of-bag={:.6} .632+={:.6} \
+                         ({} resamples, {} used, weight={:.3})",
+                        r.rank,
+                        b.apparent,
+                        b.oob,
+                        b.estimate,
+                        b.resamples,
+                        b.used,
+                        b.weight
+                    );
+                }
+            }
             eprintln!(
                 "# null baselines ({}): mean train={:.6} test={:.6} | linear train={:.6} test={:.6} | {}-NN train={:.6} test={:.6}",
                 cfg.metric.name(),
@@ -926,7 +968,7 @@ fn main() {
                 .iter()
                 .map(|r| {
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"expression\":{}}}",
+                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"expression\":{}}}",
                         r.rank,
                         r.complexity,
                         r.k_constants,
@@ -937,6 +979,7 @@ fn main() {
                         jnum(r.dw),
                         jnum(r.overfit),
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
+                        bootstrap_json(&r.bootstrap),
                         jstr(&r.expression)
                     )
                 })
@@ -1002,7 +1045,7 @@ fn main() {
         Format::Ndjson => {
             for r in &rows {
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"expression\":{}}}",
                     r.rank,
                     r.complexity,
                     r.k_constants,
@@ -1013,6 +1056,7 @@ fn main() {
                     jnum(r.dw),
                     jnum(r.overfit),
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
+                    bootstrap_json(&r.bootstrap),
                     jstr(&r.expression)
                 );
             }
@@ -1087,6 +1131,24 @@ fn fmt_err(v: f64) -> String {
     }
 }
 
+/// JSON for one `.632+` bootstrap estimate, or `null` when it is off.
+fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
+    match b {
+        Some(b) => format!(
+            "{{\"resamples\":{},\"used\":{},\"apparent\":{},\"oob\":{},\"no_information\":{},\"relative_overfitting\":{},\"weight\":{},\"estimate\":{}}}",
+            b.resamples,
+            b.used,
+            jnum(b.apparent),
+            jnum(b.oob),
+            jnum(b.no_information),
+            jnum(b.relative_overfitting),
+            jnum(b.weight),
+            jnum(b.estimate)
+        ),
+        None => "null".to_string(),
+    }
+}
+
 /// Comma-separated list of every metric name, for error messages.
 fn metric_names() -> String {
     Metric::all()
@@ -1118,5 +1180,18 @@ mod tests {
                 m.name()
             );
         }
+    }
+
+    /// The `.632+` bootstrap flag must stay documented in `--help` and `schema`.
+    #[test]
+    fn help_and_schema_document_bootstrap_error() {
+        assert!(
+            usage().contains("--bootstrap-error"),
+            "usage() is missing --bootstrap-error"
+        );
+        assert!(
+            schema().contains("--bootstrap-error"),
+            "schema() is missing --bootstrap-error"
+        );
     }
 }

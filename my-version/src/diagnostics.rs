@@ -26,7 +26,9 @@
 //! falsifiable.
 
 use crate::data::Sample;
+use crate::expr::Node;
 use crate::metrics::{self, Metric};
+use crate::rng::Mt;
 
 /// Least-squares information criteria for a model with `k` free constants fit
 /// to `n` points with residual sum of squares `rss`.
@@ -654,6 +656,189 @@ impl NullControl {
     }
 }
 
+// ---------------------------------------------------------------------------
+// .632+ bootstrap error estimate
+// ---------------------------------------------------------------------------
+
+/// The `.632+` bootstrap error estimate of Efron & Tibshirani (1997).
+///
+/// Three numbers describe how much of a model's apparent accuracy is optimism:
+///
+/// * `apparent` — the error of the fitted model on the very rows it was fit to
+///   (optimistic);
+/// * `oob` — the mean error on the *out-of-bag* rows over bootstrap resamples
+///   in which the model's **constants only** are refit (pessimistic);
+/// * `estimate` — the `.632+` combination of the two, which lies between them.
+#[derive(Clone, Copy, Debug)]
+pub struct BootstrapError {
+    /// Bootstrap resamples requested.
+    pub resamples: usize,
+    /// Resamples that yielded a finite out-of-bag error (the rest were skipped,
+    /// e.g. because the resample left no out-of-bag row).
+    pub used: usize,
+    /// Error of the model on the full training set.
+    pub apparent: f64,
+    /// Mean out-of-bag error over the resamples.
+    pub oob: f64,
+    /// No-information error rate `γ` estimated from the data.
+    pub no_information: f64,
+    /// Relative overfitting rate `R̂ = (oob − apparent)/(γ − apparent)`, clamped
+    /// to `[0, 1]`.
+    pub relative_overfitting: f64,
+    /// The `.632+` weight `ŵ = 0.632/(1 − 0.368·R̂)`, in `[0.632, 1]`.
+    pub weight: f64,
+    /// `(1 − ŵ)·apparent + ŵ·oob`.
+    pub estimate: f64,
+}
+
+/// `1 − e^{−1}`, the `.632` of the method's name.
+const BOOTSTRAP_632: f64 = 0.632;
+
+/// Permutations used to estimate the no-information error rate.
+const NO_INFO_PERMUTATIONS: usize = 32;
+
+/// Estimate the `.632+` error of `tree` on `train` by bootstrap resampling.
+///
+/// For each of `resamples` draws, `n = train.len()` rows are sampled **with
+/// replacement**; the tree's constants are refit on that resample alone with
+/// [`crate::fit::fit`] and the model is scored on the rows left out (the
+/// out-of-bag rows) in the search's own metric. The out-of-bag error is the mean
+/// of those scores.
+///
+/// The no-information error rate `γ` is what the model would score if its
+/// predictions carried no information about the responses: the fitted values
+/// are paired with a random permutation of the targets and averaged over
+/// [`NO_INFO_PERMUTATIONS`] permutations.
+///
+/// Then, writing `err_app` for the apparent error:
+///
+/// ```text
+/// R̂        = (oob − err_app) / (γ − err_app)      clamped to [0, 1]
+/// ŵ        = 0.632 / (1 − 0.368·R̂)                so 0.632 ≤ ŵ ≤ 1
+/// err_.632+ = (1 − ŵ)·err_app + ŵ·oob
+/// ```
+///
+/// `R̂ = 0` (no extra overfitting beyond the apparent error) gives `ŵ = 0.632`;
+/// `R̂ = 1` gives `ŵ = 1` and the fully pessimistic out-of-bag error. Because
+/// `ŵ ∈ [0.632, 1]`, the estimate is a convex combination of the apparent and
+/// out-of-bag errors and therefore always lies between them.
+pub fn bootstrap_error(
+    tree: &Node,
+    train: &Sample,
+    metric: Metric,
+    resamples: usize,
+    fit_iters: usize,
+    rng: &mut Mt,
+) -> BootstrapError {
+    let n = train.len();
+
+    // Apparent error: the model scored on the full training set. The fitted
+    // values are kept for the no-information estimate below.
+    let apparent_pred: Vec<f64> = train.x.iter().map(|row| crate::expr::eval(tree, row)).collect();
+    let apparent = if n == 0 {
+        f64::INFINITY
+    } else {
+        crate::search::eval_error(tree, train, metric)
+    };
+
+    // Out-of-bag error: refit constants on each bootstrap resample, score the
+    // rows that did not make it into the resample.
+    let mut oob_sum = 0.0;
+    let mut oob_used = 0usize;
+    if n > 0 && resamples > 0 {
+        let mut in_bag = vec![false; n];
+        let mut bx: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut by: Vec<f64> = Vec::with_capacity(n);
+        for _ in 0..resamples {
+            for f in in_bag.iter_mut() {
+                *f = false;
+            }
+            bx.clear();
+            by.clear();
+            for _ in 0..n {
+                let j = rng.usize_below(n);
+                in_bag[j] = true;
+                bx.push(train.x[j].clone());
+                by.push(train.y[j]);
+            }
+            let oob: Vec<usize> = (0..n).filter(|&j| !in_bag[j]).collect();
+            if oob.is_empty() {
+                continue;
+            }
+            // Constants-only refit on the resample (the shape is fixed).
+            let mut t = tree.clone();
+            crate::fit::fit(&mut t, &bx, &by, fit_iters);
+            let scored = Sample {
+                x: oob.iter().map(|&j| train.x[j].clone()).collect(),
+                y: oob.iter().map(|&j| train.y[j]).collect(),
+            };
+            let e = crate::search::eval_error(&t, &scored, metric);
+            if e.is_finite() {
+                oob_sum += e;
+                oob_used += 1;
+            }
+        }
+    }
+    let oob = if oob_used > 0 {
+        oob_sum / oob_used as f64
+    } else {
+        f64::INFINITY
+    };
+
+    // No-information error rate: predictions paired with permuted responses.
+    let no_information = if n >= 2 && !apparent_pred.is_empty() {
+        let mut shuffled = train.y.clone();
+        let mut acc = 0.0;
+        for _ in 0..NO_INFO_PERMUTATIONS {
+            for j in (1..n).rev() {
+                let t = rng.usize_below(j + 1);
+                shuffled.swap(j, t);
+            }
+            acc += metrics::score_with_constants(
+                &apparent_pred,
+                &shuffled,
+                metric,
+                crate::expr::count_constants(tree),
+            );
+        }
+        acc / NO_INFO_PERMUTATIONS as f64
+    } else {
+        f64::NAN
+    };
+
+    // Relative overfitting rate, clamped as Efron & Tibshirani prescribe.
+    let denom = no_information - apparent;
+    let relative_overfitting = if apparent.is_finite()
+        && oob.is_finite()
+        && denom.is_finite()
+        && denom > 0.0
+        && oob > apparent
+    {
+        ((oob - apparent) / denom).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let weight = BOOTSTRAP_632 / (1.0 - (1.0 - BOOTSTRAP_632) * relative_overfitting);
+    let estimate = if apparent.is_finite() && oob.is_finite() {
+        (1.0 - weight) * apparent + weight * oob
+    } else if apparent.is_finite() {
+        apparent
+    } else {
+        f64::INFINITY
+    };
+
+    BootstrapError {
+        resamples,
+        used: oob_used,
+        apparent,
+        oob,
+        no_information,
+        relative_overfitting,
+        weight,
+        estimate,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +1052,108 @@ mod tests {
         assert!(rt.ljung_box.statistic.is_finite());
         assert!(rt.breusch_pagan.p_value.is_finite());
         assert!(rt.skewness.is_finite() && rt.kurtosis.is_finite());
+    }
+
+    /// `c0 + c1·x + c2·x²`, a shape with three free constants.
+    fn poly2_tree() -> Node {
+        use crate::expr::{constant, input, node, Op};
+        let x = || input(0);
+        let add = |a, b| node(Op::Add, vec![a, b]);
+        let mul = |a, b| node(Op::Mul, vec![a, b]);
+        let x2 = mul(x(), x());
+        add(add(constant(0.0), mul(constant(1.0), x())), mul(constant(2.0), x2))
+    }
+
+    #[test]
+    fn bootstrap_632_plus_lies_between_apparent_and_oob() {
+        // A quadratic fit to noisy data: the constants are refit on each
+        // resample, so the out-of-bag error is at least as large as the
+        // apparent (in-sample) error.
+        let n = 30;
+        let mut noise_rng = crate::rng::Mt::new(12345);
+        let xs: Vec<f64> = (0..n).map(|i| i as f64 * 0.5 - 7.0).collect();
+        let ys: Vec<f64> = xs
+            .iter()
+            .map(|&x| 2.0 + 3.0 * x - 0.5 * x * x + (noise_rng.next_f64() - 0.5) * 8.0)
+            .collect();
+        let train = Sample {
+            x: xs.iter().map(|&v| vec![v]).collect(),
+            y: ys,
+        };
+        let mut tree = poly2_tree();
+        crate::fit::fit(&mut tree, &train.x, &train.y, 16);
+
+        let mut rng = crate::rng::Mt::new(7);
+        let b = bootstrap_error(&tree, &train, Metric::Absolute, 200, 16, &mut rng);
+
+        assert!(b.resamples == 200 && b.used > 0, "used={}", b.used);
+        assert!(b.apparent.is_finite(), "apparent={}", b.apparent);
+        assert!(b.oob.is_finite(), "oob={}", b.oob);
+        assert!(b.no_information.is_finite(), "γ={}", b.no_information);
+        // The whole point: the .632+ estimate is a convex combination of the
+        // apparent and out-of-bag errors, so it cannot leave that interval.
+        let lo = b.apparent.min(b.oob);
+        let hi = b.apparent.max(b.oob);
+        assert!(
+            b.estimate >= lo - 1e-9 && b.estimate <= hi + 1e-9,
+            ".632+={} not in [{}, {}]",
+            b.estimate,
+            lo,
+            hi
+        );
+        assert!(
+            (0.632 - 1e-12..=1.0 + 1e-12).contains(&b.weight),
+            "weight={}",
+            b.weight
+        );
+        assert!(
+            (0.0..=1.0).contains(&b.relative_overfitting),
+            "R={}",
+            b.relative_overfitting
+        );
+        // No-information error is larger than an in-sample fit that tracks the
+        // target, so `γ − apparent` is positive here.
+        assert!(b.no_information > b.apparent);
+    }
+
+    #[test]
+    fn bootstrap_weight_is_0632_without_overfitting() {
+        // A constant model on a constant target has no overfitting to correct:
+        // the out-of-bag error equals the apparent one, so R = 0 and the weight
+        // is exactly 0.632.
+        let train = Sample {
+            x: (0..20).map(|i| vec![i as f64]).collect(),
+            y: vec![5.0; 20],
+        };
+        let mut tree = crate::expr::constant(5.0);
+        crate::fit::fit(&mut tree, &train.x, &train.y, 8);
+        let mut rng = crate::rng::Mt::new(3);
+        let b = bootstrap_error(&tree, &train, Metric::Absolute, 50, 8, &mut rng);
+        assert!(b.apparent.abs() < 1e-12, "apparent={}", b.apparent);
+        assert!(b.oob.abs() < 1e-12, "oob={}", b.oob);
+        assert_eq!(b.relative_overfitting, 0.0);
+        assert!((b.weight - BOOTSTRAP_632).abs() < 1e-12, "w={}", b.weight);
+        assert!(b.estimate.abs() < 1e-12, "est={}", b.estimate);
+    }
+
+    #[test]
+    fn bootstrap_handles_zero_resamples_and_zero_constants() {
+        let train = Sample {
+            x: (0..10).map(|i| vec![i as f64]).collect(),
+            y: (0..10).map(|i| 2.0 * i as f64 + 1.0).collect(),
+        };
+        // A tree with no constants: the refit is a no-op, but the estimator
+        // still fits and scores.
+        let tree = crate::expr::input(0);
+        let mut rng = crate::rng::Mt::new(1);
+        let b = bootstrap_error(&tree, &train, Metric::Squared, 0, 8, &mut rng);
+        assert_eq!(b.resamples, 0);
+        assert_eq!(b.used, 0);
+        assert!(!b.oob.is_finite(), "oob={}", b.oob);
+
+        let mut rng = crate::rng::Mt::new(1);
+        let b = bootstrap_error(&tree, &train, Metric::Squared, 20, 8, &mut rng);
+        assert!(b.used > 0);
+        assert!(b.oob.is_finite());
     }
 }
