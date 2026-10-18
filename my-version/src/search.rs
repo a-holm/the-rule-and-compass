@@ -3,12 +3,23 @@
 //! A population of expression individuals evolves on separate islands, tracked
 //! against a global Pareto front over (error, complexity), with generations,
 //! migration and restarts.
+//!
+//! Optimisation notes (see `docs/optimisation.md`):
+//! * offspring constants are fitted with Levenberg–Marquardt, not perturbed
+//!   randomly, so a good *shape* is immediately usable;
+//! * each island evolves on its own thread, so islands scale across cores;
+//! * structurally identical offspring are discarded before evaluation, so the
+//!   engine never pays twice for the same expression;
+//! * selection uses lexicographic parsimony pressure (error first, size as a
+//!   tie-break) so bloat is controlled without a hand-tuned penalty;
+//! * the loop stops early when it has converged, or when a time budget is hit.
 
 use crate::data::Sample;
 use crate::expr::{self, complexity, crossover, eval, mutate, random_tree, Node, Op};
 use crate::metrics::{score, Metric};
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub struct Config {
@@ -22,7 +33,29 @@ pub struct Config {
     pub migration_interval: usize,
     pub restart_interval: usize,
     pub init_depth: usize,
+    /// Levenberg–Marquardt iterations for constant fitting (0 disables).
+    pub fit_iters: usize,
+    /// Discard structurally duplicated offspring before evaluating them.
+    pub dedup: bool,
+    /// Wall-clock budget in seconds; `None` means no limit.
+    pub time_budget: Option<f64>,
+    /// Stop after this many generations with no improvement (0 disables).
+    pub patience: usize,
+    /// Optional progress callback, invoked once per generation.
+    pub progress: Option<ProgressFn>,
 }
+
+/// A per-generation progress report.
+#[derive(Clone, Debug)]
+pub struct Progress {
+    pub generation: usize,
+    pub total_generations: usize,
+    pub best_error: f64,
+    pub pareto_members: usize,
+}
+
+/// Progress callback type. `Send + Sync` so islands can report concurrently.
+pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
 impl Default for Config {
     fn default() -> Self {
@@ -37,6 +70,11 @@ impl Default for Config {
             migration_interval: 25,
             restart_interval: 60,
             init_depth: 3,
+            fit_iters: 8,
+            dedup: true,
+            time_budget: None,
+            patience: 40,
+            progress: None,
         }
     }
 }
@@ -49,14 +87,17 @@ struct Ind {
 }
 
 impl Ind {
-    fn new(tree: Node) -> Self {
-        let c = complexity(&tree);
+    fn evaluated(tree: Node, train: &Sample, metric: Metric) -> Self {
+        let tree = expr::simplify(&tree);
+        let complexity = complexity(&tree);
+        let error = eval_error(&tree, train, metric);
         Ind {
             tree,
-            error: f64::INFINITY,
-            complexity: c,
+            error,
+            complexity,
         }
     }
+
     fn reeval(&mut self, train: &Sample, metric: Metric) {
         self.tree = expr::simplify(&self.tree);
         self.complexity = complexity(&self.tree);
@@ -72,8 +113,18 @@ pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     score(&pred, &s.y, metric)
 }
 
-fn dominates(ae: f64, ac: usize, be: f64, bc: usize) -> bool {
-    ae <= be && ac <= bc && (ae < be || ac < bc)
+/// Lexicographic parsimony pressure: better error wins; if the errors are equal
+/// to within a relative tolerance, the smaller expression wins. This controls
+/// bloat without a tunable penalty coefficient (Luke & Panait 2006).
+fn better(a: &Ind, b: &Ind) -> bool {
+    let tol = 1e-9 * (1.0 + a.error.abs().max(b.error.abs()));
+    if a.error < b.error - tol {
+        return true;
+    }
+    if b.error < a.error - tol {
+        return false;
+    }
+    a.complexity < b.complexity
 }
 
 fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
@@ -84,171 +135,214 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
     let mut best = rng.usize_below(n);
     for _ in 1..k {
         let c = rng.usize_below(n);
-        let better = if dominates(island[c].error, island[c].complexity, island[best].error, island[best].complexity) {
-            true
-        } else if dominates(island[best].error, island[best].complexity, island[c].error, island[c].complexity) {
-            false
-        } else {
-            rng.bool(0.5)
-        };
-        if better {
+        if better(&island[c], &island[best]) {
             best = c;
         }
     }
     best
 }
 
-/// Coordinate-descent fitting of constant leaves. [I]
-fn fit_constants(tree: &mut Node, rng: &mut Mt, train: &Sample, metric: Metric, passes: usize) {
-    if !eval_error(tree, train, metric).is_finite() {
-        return;
-    }
-    for _ in 0..passes {
-        let n = complexity(tree);
-        for i in 0..n {
-            let old = match expr::nth(tree, i) {
-                Some(t) if t.op == Op::Const => t.val,
-                _ => continue,
-            };
-            let mut best_v = old;
-            let mut best_e = eval_error(tree, train, metric);
-            let cands = [
-                old * 0.5,
-                old * 0.8,
-                old * 1.25,
-                old * 2.0,
-                old + 0.1,
-                old - 0.1,
-                old + 0.5,
-                old - 0.5,
-                old + 1.0,
-                old - 1.0,
-                rng.range(-3.0, 3.0),
-            ];
-            for c in cands {
-                if let Some(t) = expr::nth_mut(tree, i) {
-                    if t.op == Op::Const {
-                        t.val = c;
-                    }
-                }
-                let e = eval_error(tree, train, metric);
-                if e < best_e {
-                    best_e = e;
-                    best_v = c;
-                }
-            }
-            if let Some(t) = expr::nth_mut(tree, i) {
-                if t.op == Op::Const {
-                    t.val = best_v;
-                }
-            }
+/// Evolve one island by a single generation. Pure with respect to the rest of
+/// the world, so it can run on its own thread.
+fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample, nvars: usize) {
+    for ind in isl.iter_mut() {
+        if !ind.error.is_finite() {
+            ind.reeval(train, cfg.metric);
         }
     }
+
+    let pop = cfg.pop;
+    let mut next: Vec<Ind> = Vec::with_capacity(pop);
+
+    // Elitism: carry the best individual over unchanged.
+    if let Some(best) = isl
+        .iter()
+        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal))
+    {
+        next.push(best.clone());
+    }
+
+    let mut seen: HashSet<u64> = HashSet::with_capacity(pop * 2);
+    next.iter().for_each(|i| {
+        seen.insert(expr::structural_hash(&i.tree));
+    });
+    let mut attempts = 0usize;
+    let max_attempts = pop * 50 + 50;
+
+    while next.len() < pop && attempts < max_attempts {
+        attempts += 1;
+        let p1 = tournament(isl, rng, 4);
+        let mut child = isl[p1].tree.clone();
+        if rng.bool(0.5) {
+            let p2 = tournament(isl, rng, 4);
+            let parent2 = isl[p2].tree.clone();
+            crossover(&mut child, &parent2, rng);
+        }
+        mutate(&mut child, rng, nvars, &cfg.ops);
+        if rng.bool(0.5) {
+            mutate(&mut child, rng, nvars, &cfg.ops);
+        }
+
+        let mut tree = expr::simplify(&child);
+        if complexity(&tree) > cfg.max_complexity {
+            continue;
+        }
+        if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
+            continue;
+        }
+
+        if cfg.fit_iters > 0 {
+            crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
+            tree = expr::simplify(&tree);
+        }
+        let ind = Ind::evaluated(tree, train, cfg.metric);
+        if ind.complexity > cfg.max_complexity {
+            continue;
+        }
+        next.push(ind);
+    }
+
+    // Fill any remainder with fresh random trees.
+    while next.len() < pop {
+        let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
+        if cfg.fit_iters > 0 {
+            crate::fit::fit(&mut tree, &train.x, &train.y, cfg.fit_iters);
+            tree = expr::simplify(&tree);
+        }
+        next.push(Ind::evaluated(tree, train, cfg.metric));
+    }
+
+    *isl = next;
 }
 
 pub struct Outcome {
     pub archive: Archive,
     pub test_errors: Vec<f64>,
     pub generations: usize,
+    pub converged_early: bool,
 }
 
 pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
     let mut rng = Mt::new(cfg.seed);
     let mut archive = Archive::new(4000);
+    let t0 = std::time::Instant::now();
 
-    let mut islands: Vec<Vec<Ind>> = Vec::with_capacity(cfg.islands);
-    let mut stagnant: Vec<usize> = vec![0; cfg.islands];
-    for isl in 0..cfg.islands {
+    // Distinct, reproducible streams per island.
+    let mut rngs: Vec<Mt> = (0..cfg.islands.max(1))
+        .map(|i| Mt::new(cfg.seed ^ (0x9E37_79B9u32.wrapping_mul(i as u32 + 1))))
+        .collect();
+
+    let mut islands: Vec<Vec<Ind>> = Vec::with_capacity(cfg.islands.max(1));
+    let mut stagnant: Vec<usize> = vec![0; cfg.islands.max(1)];
+    for isl in 0..cfg.islands.max(1) {
         let depth = cfg.init_depth.min(1 + isl % 3);
         let mut pop = Vec::with_capacity(cfg.pop);
         for _ in 0..cfg.pop {
-            pop.push(Ind::new(random_tree(&mut rng, nvars, &cfg.ops, depth)));
+            pop.push(Ind::evaluated(
+                random_tree(&mut rng, nvars, &cfg.ops, depth),
+                train,
+                cfg.metric,
+            ));
         }
         islands.push(pop);
     }
 
+    let mut gens_done = 0usize;
+    let mut converged_early = false;
+    let mut best_prev = f64::INFINITY;
+    let mut no_improve = 0usize;
+
     for gen in 0..cfg.generations {
-        for ii in 0..islands.len() {
-            for ind in islands[ii].iter_mut() {
-                if !ind.error.is_finite() {
-                    ind.reeval(train, cfg.metric);
-                }
-            }
-            let snapshot: Vec<(Node, f64, usize)> = islands[ii]
-                .iter()
-                .map(|i| (i.tree.clone(), i.error, i.complexity))
+        gens_done = gen + 1;
+
+        // ---- parallel generation across islands -------------------------
+        std::thread::scope(|s| {
+            let handles: Vec<_> = islands
+                .iter_mut()
+                .zip(rngs.iter_mut())
+                .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, train, nvars)))
                 .collect();
-            for (tree, error, complexity) in snapshot {
+            for h in handles {
+                let _ = h.join();
+            }
+        });
+
+        // ---- archive + convergence bookkeeping --------------------------
+        let mut gen_best = f64::INFINITY;
+        for pop in &islands {
+            for ind in pop {
+                if ind.error < gen_best {
+                    gen_best = ind.error;
+                }
                 archive.try_insert(Sol {
-                    tree,
-                    error,
-                    complexity,
+                    tree: ind.tree.clone(),
+                    error: ind.error,
+                    complexity: ind.complexity,
                 });
             }
-
-            let mut next: Vec<Ind> = Vec::with_capacity(cfg.pop);
-            if let Some(best) = islands[ii]
-                .iter()
-                .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-            {
-                next.push(best.clone());
-            }
-            while next.len() < cfg.pop {
-                let p1 = tournament(&islands[ii], &mut rng, 4);
-                let mut child = islands[ii][p1].tree.clone();
-                if rng.bool(0.5) {
-                    let p2 = tournament(&islands[ii], &mut rng, 4);
-                    let parent2 = islands[ii][p2].tree.clone();
-                    crossover(&mut child, &parent2, &mut rng);
-                }
-                mutate(&mut child, &mut rng, nvars, &cfg.ops);
-                if rng.bool(0.5) {
-                    mutate(&mut child, &mut rng, nvars, &cfg.ops);
-                }
-                let mut ind = Ind::new(expr::simplify(&child));
-                if ind.complexity > cfg.max_complexity {
-                    continue;
-                }
-                ind.reeval(train, cfg.metric);
-                fit_constants(&mut ind.tree, &mut rng, train, cfg.metric, 1);
-                ind.reeval(train, cfg.metric);
-                if ind.complexity <= cfg.max_complexity {
-                    next.push(ind);
-                }
-            }
-            while next.len() < cfg.pop {
-                let t = random_tree(&mut rng, nvars, &cfg.ops, cfg.init_depth);
-                let mut ind = Ind::new(t);
-                ind.reeval(train, cfg.metric);
-                next.push(ind);
-            }
-            islands[ii] = next;
         }
 
-        if cfg.islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0 {
+        if let Some(budget) = cfg.time_budget {
+            if t0.elapsed().as_secs_f64() >= budget {
+                converged_early = true;
+                break;
+            }
+        }
+
+        if let Some(report) = &cfg.progress {
+            report(Progress {
+                generation: gens_done,
+                total_generations: cfg.generations,
+                best_error: gen_best,
+                pareto_members: archive.items.len(),
+            });
+        }
+
+        if gen_best.is_finite() {
+            if gen_best <= 1e-24 {
+                converged_early = true;
+                break;
+            }
+            let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
+            if rel <= 1e-9 {
+                no_improve += 1;
+            } else {
+                no_improve = 0;
+            }
+            best_prev = best_prev.min(gen_best);
+            if cfg.patience > 0 && no_improve >= cfg.patience {
+                converged_early = true;
+                break;
+            }
+        }
+
+        // ---- migration between islands ----------------------------------
+        if cfg.islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
+        {
             let bests: Vec<Option<Node>> = islands
                 .iter()
                 .map(|pop| {
                     pop.iter()
-                        .min_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
+                        .min_by(|a, b| {
+                            a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
+                        })
                         .map(|i| i.tree.clone())
                 })
                 .collect();
             for ii in 0..islands.len() {
                 let src = (ii + 1) % islands.len();
                 if let Some(t) = &bests[src] {
-                    if let Some(worst) = islands[ii]
-                        .iter_mut()
-                        .max_by(|a, b| a.error.partial_cmp(&b.error).unwrap())
-                    {
-                        *worst = Ind::new(t.clone());
-                        worst.reeval(train, cfg.metric);
+                    if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
+                        a.error.partial_cmp(&b.error).unwrap_or(std::cmp::Ordering::Equal)
+                    }) {
+                        *worst = Ind::evaluated(t.clone(), train, cfg.metric);
                     }
                 }
             }
         }
 
+        // ---- restart stagnant islands -----------------------------------
         if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
             let arch_best = archive
                 .items
@@ -266,10 +360,15 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
                     stagnant[ii] = 0;
                 }
                 if stagnant[ii] >= 2 {
+                    let mut r = rngs[ii].clone();
                     for ind in islands[ii].iter_mut() {
-                        *ind = Ind::new(random_tree(&mut rng, nvars, &cfg.ops, cfg.init_depth));
-                        ind.reeval(train, cfg.metric);
+                        let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
+                        if cfg.fit_iters > 0 {
+                            crate::fit::fit(&mut t, &train.x, &train.y, cfg.fit_iters);
+                        }
+                        *ind = Ind::evaluated(t, train, cfg.metric);
                     }
+                    rngs[ii] = r;
                     stagnant[ii] = 0;
                 }
             }
@@ -295,6 +394,7 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample) -> Outcome {
     Outcome {
         archive: final_archive,
         test_errors,
-        generations: cfg.generations,
+        generations: gens_done,
+        converged_early,
     }
 }

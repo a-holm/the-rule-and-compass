@@ -22,8 +22,20 @@ impl Archive {
         }
     }
 
+    /// ε-dominance (Laumanns et al. 2002): errors within a relative tolerance
+    /// count as equal, so a marginally smaller error no longer justifies a much
+    /// larger expression. This keeps the front small, well-spread and readable
+    /// instead of filling it with numerically-equivalent, bloated variants.
     fn dominates(a_e: f64, a_c: usize, b_e: f64, b_c: usize) -> bool {
-        a_e <= b_e && a_c <= b_c && (a_e < b_e || a_c < b_c)
+        if a_c > b_c {
+            return false;
+        }
+        let tol = 1e-6 * (1.0 + a_e.abs().max(b_e.abs()));
+        if a_c < b_c {
+            a_e <= b_e + tol
+        } else {
+            a_e < b_e
+        }
     }
 
     pub fn try_insert(&mut self, s: Sol) {
