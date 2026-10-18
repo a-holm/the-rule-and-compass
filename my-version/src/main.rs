@@ -206,6 +206,9 @@ SEARCH:
                              constraints: between,require,constrain
                              meta: complexity,variables,constants,contains,
                              contains_op (describe the argument's structure)
+                             aggregates: mean,std,median,iqr,sum,amin,amax,
+                             count (training-column statistics; min(x1) and
+                             max(x1) with one argument also work)
                              (full set: `rcsr schema` -> operators list)
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
@@ -2528,6 +2531,13 @@ fn main() {
 /// and `--seed-file`. A variable whose affine transform is the identity (a
 /// boolean column, or `--center none --scale none`) is left as a bare input.
 fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
+    // A meta operator describes the searched tree, and an aggregate names a
+    // dataset column: rewriting an input inside either would change its
+    // meaning. They are carried over verbatim (the aggregate is bound to the
+    // training sample later, in `search`).
+    if n.op.is_meta() || n.op.is_agg() {
+        return n.clone();
+    }
     match n.op {
         Op::Input => {
             let i = n.val as usize;
@@ -2575,7 +2585,7 @@ fn run_eval(
     quiet: bool,
     started: std::time::Instant,
 ) {
-    let tree = match expr::parse(src, vars) {
+    let mut tree = match expr::parse(src, vars) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: cannot parse --eval-expr: {}", e);
@@ -2583,10 +2593,8 @@ fn run_eval(
             std::process::exit(EXIT_USAGE);
         }
     };
-    let k = expr::count_constants(&tree);
-    let complexity = model.complexity(&tree);
-    let shown = expr::to_string(&tree, vars);
-
+    // `--eval-expr` evaluates in original units, so an aggregate is the
+    // statistic of the raw training column, not the normalised one.
     let raw_row = |row: &[f64]| -> Vec<f64> {
         row.iter()
             .enumerate()
@@ -2596,6 +2604,17 @@ fn run_eval(
             })
             .collect()
     };
+    let raw_train: Vec<Vec<f64>> = prepared.train.x.iter().map(|r| raw_row(r)).collect();
+    let aggs = expr::AggTable::from_rows(&raw_train);
+    if let Err(e) = expr::bind_aggregates(&mut tree, &aggs) {
+        eprintln!("error: cannot evaluate --eval-expr: {}", e);
+        eprintln!("  expression: {}", src);
+        std::process::exit(EXIT_USAGE);
+    }
+    let k = expr::count_constants(&tree);
+    let complexity = model.complexity(&tree);
+    let shown = expr::to_string(&tree, vars);
+
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
         metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
@@ -3853,5 +3872,23 @@ mod tests {
         }
         assert!(usage().contains("between"), "usage() is missing 'between'");
         assert!(usage().contains("constrain"), "usage() is missing 'constrain'");
+    }
+
+    /// Dataset aggregates must be discoverable from `schema`, named in
+    /// `--ops`, and listed in the help text.
+    #[test]
+    fn help_and_schema_list_dataset_aggregates() {
+        let schema_text = schema::json();
+        for name in [
+            "mean", "std", "median", "iqr", "sum", "amin", "amax", "count",
+        ] {
+            assert!(
+                schema_text.contains(&format!("\"{name}\"")),
+                "schema::json() is missing operator '{name}'"
+            );
+            assert!(usage().contains(name), "usage() is missing '{name}'");
+        }
+        assert!(usage().contains("aggregates:"));
+        assert!(Op::parse_list_checked("mean,count").is_ok());
     }
 }

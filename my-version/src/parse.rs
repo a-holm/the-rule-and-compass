@@ -20,12 +20,24 @@
 //! power   := primary ('^' unary)?          // right associative
 //! primary := number
 //!          | meta '(' expr ')'              // structural meta operator
+//!          | agg '(' expr? ')'              // dataset aggregate (count is empty)
 //!          | name '(' expr (',' expr)* ')' // function call, any arity
 //!          | name                          // variable
 //!          | '(' expr ')'
 //! meta    := 'complexity' | 'variables' | 'constants' | 'contains'
 //!          | 'contains_op'
+//! agg     := 'mean' | 'std' | 'median' | 'iqr' | 'sum' | 'amin' | 'amax'
+//!          | 'count'
 //! ```
+//!
+//! An aggregate is a reduction over one **input column**, so its argument must
+//! be a bare variable (`mean(x1)`), not an expression. `count()` takes no
+//! argument. Because `min`/`max` are also the binary primitives, the parser
+//! accepts `min(x1)`/`max(x1)` with one argument as the column reduction and
+//! keeps `min(a, b)` for the binary form; the canonical `--ops` names are
+//! `amin`/`amax`. An aggregate parsed from text has no data yet: its value is
+//! `NaN` until [`crate::expr::bind_aggregates`] resolves it against an
+//! [`crate::expr::AggTable`].
 //!
 //! Operator precedence, loosest to tightest:
 //! `or` < `xor` < `and` < comparisons `< <= > >= ==` < `+`/`-` < `*`/`/` <
@@ -53,6 +65,12 @@
 //!   rather than evaluating it, so the call is built through
 //!   [`crate::expr::node`], which caches the structural value on the node.
 //!   `complexity(x * x)` prints back and re-parses to the same tree.
+//! * The aggregates `mean`, `std`, `median`, `iqr`, `sum`, `amin`/`amax`
+//!   (also `min(x)`/`max(x)` with one argument) take exactly one input column,
+//!   and `count` takes none. They are recognised as calls, so a column called
+//!   `mean` is still available without parentheses. A parsed aggregate has
+//!   `val = NaN` until it is bound to an
+//!   [`crate::expr::AggTable`](crate::expr::AggTable).
 //!
 //! # Errors
 //!
@@ -436,8 +454,19 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        let op = match Op::from_name(&name) {
-            Some(op) if op.arity() > 0 => op,
+        // Aggregate names share the `--ops` table. `min`/`max` with exactly one
+        // argument are the column reductions; with two they stay binary.
+        let agg_override = if args.len() == 1 {
+            match name.to_ascii_lowercase().as_str() {
+                "min" => Some(Op::Agg(crate::expr::AggKind::Min)),
+                "max" => Some(Op::Agg(crate::expr::AggKind::Max)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let op = match agg_override.or_else(|| Op::from_name(&name)) {
+            Some(op) if op.arity() > 0 || op.is_agg() => op,
             Some(_) => {
                 return Err(ParseError {
                     message: format!("'{name}' is not a function"),
@@ -461,6 +490,21 @@ impl<'a> Parser<'a> {
                 ),
                 column: start + 1,
             });
+        }
+        if op.is_agg() {
+            if let Op::Agg(kind) = op {
+                if kind.arity() == 1 {
+                    let ok = args.first().map(|a| a.op == Op::Input).unwrap_or(false);
+                    if !ok {
+                        return Err(ParseError {
+                            message: format!(
+                                "'{name}' reduces one input column (for example {name}(x1)), not an expression"
+                            ),
+                            column: start + 1,
+                        });
+                    }
+                }
+            }
         }
         Ok(node(op, args))
     }
@@ -612,6 +656,67 @@ mod tests {
                 same(&tree, &again),
                 "'{s}' printed as '{printed}' did not round-trip"
             );
+        }
+    }
+
+    #[test]
+    fn aggregates_parse_as_column_reductions() {
+        use crate::expr::AggKind;
+        let v = vars();
+        for (src, kind) in [
+            ("mean(x)", AggKind::Mean),
+            ("std(x)", AggKind::Std),
+            ("stddev(x)", AggKind::Std),
+            ("median(x)", AggKind::Median),
+            ("iqr(x)", AggKind::Iqr),
+            ("sum(x)", AggKind::Sum),
+            ("amin(x)", AggKind::Min),
+            ("amax(x)", AggKind::Max),
+            ("min(x)", AggKind::Min),
+            ("max(x)", AggKind::Max),
+        ] {
+            let n = p(src);
+            assert_eq!(n.op, Op::Agg(kind), "{src}");
+            assert_eq!(n.kids.len(), 1, "{src}");
+            assert_eq!(n.kids[0].op, Op::Input, "{src}");
+            assert!(n.val.is_nan(), "{src} is unresolved until bound");
+        }
+        let c = p("count()");
+        assert_eq!(c.op, Op::Agg(AggKind::Count));
+        assert!(c.kids.is_empty());
+
+        // `min`/`max` keep the binary form with two arguments.
+        assert_eq!(p("min(x, y)").op, Op::Min);
+        assert_eq!(p("max(x, y)").op, Op::Max);
+
+        // An aggregate reduces a column, not an expression.
+        assert!(parse("mean(x + 1)", &v).is_err());
+        assert!(parse("mean()", &v).is_err());
+        assert!(parse("count(x)", &v).is_err());
+    }
+
+    #[test]
+    fn aggregates_round_trip_through_to_string() {
+        let v = vars();
+        for s in [
+            "mean(x)",
+            "std(y)",
+            "median(x)",
+            "iqr(y)",
+            "sum(z)",
+            "amin(x)",
+            "amax(y)",
+            "min(x)",
+            "max(z)",
+            "count()",
+            "x / mean(x)",
+            "(x - median(x)) / iqr(x)",
+        ] {
+            let tree = p(s);
+            let printed = crate::expr::to_string(&tree, &v);
+            let again = parse(&printed, &v)
+                .unwrap_or_else(|e| panic!("re-parsing '{printed}' (from '{s}'): {e}"));
+            assert!(same(&tree, &again), "'{s}' printed as '{printed}' did not round-trip");
         }
     }
 

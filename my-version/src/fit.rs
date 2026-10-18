@@ -217,6 +217,9 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         // row-independent by construction; the flat copy keeps it so a fitted
         // constant inside the argument cannot change it.
         Complexity | Variables | Constants | Contains | ContainsOp => node_val,
+        // An aggregate's cached dataset value, likewise copied into the flat
+        // representation and never recomputed per row.
+        Agg(_) => node_val,
     }
 }
 
@@ -499,6 +502,9 @@ fn backward_impl(
             // move them, so their gradient is zero (like `floor`/`step`).
             // Nothing flows into the argument either.
             Complexity | Variables | Constants | Contains | ContainsOp => {}
+            // An aggregate is a dataset fact, not a fitted parameter: zero
+            // gradient, and nothing flows into its column child.
+            Agg(_) => {}
             Const | Input => {}
         }
     }

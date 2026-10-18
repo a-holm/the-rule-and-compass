@@ -17,7 +17,9 @@
 use crate::checkpoint::{Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
-use crate::expr::{self, crossover, eval, mutate, random_tree, Node, Op};
+use crate::expr::{
+    self, crossover_with, eval, mutate_with, random_tree_with, AggTable, Node, Op,
+};
 use crate::metrics::{score_weighted, Metric};
 use crate::pareto::{Archive, Sol};
 use crate::rng::Mt;
@@ -315,7 +317,14 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
 
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
-fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample, nvars: usize) {
+fn evolve_island(
+    isl: &mut Vec<Ind>,
+    rng: &mut Mt,
+    cfg: &Config,
+    train: &Sample,
+    nvars: usize,
+    aggs: &AggTable,
+) {
     for ind in isl.iter_mut() {
         if !ind.error.is_finite() {
             ind.reeval(train, cfg.metric, &cfg.complexity_model);
@@ -347,11 +356,11 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
         if rng.bool(0.5) {
             let p2 = tournament(isl, rng, 4);
             let parent2 = isl[p2].tree.clone();
-            crossover(&mut child, &parent2, rng);
+            crossover_with(&mut child, &parent2, rng, Some(aggs));
         }
-        mutate(&mut child, rng, nvars, &cfg.ops);
+        mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
         if rng.bool(0.5) {
-            mutate(&mut child, rng, nvars, &cfg.ops);
+            mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
         }
 
         let mut tree = expr::simplify(&child);
@@ -375,7 +384,13 @@ fn evolve_island(isl: &mut Vec<Ind>, rng: &mut Mt, cfg: &Config, train: &Sample,
 
     // Fill any remainder with fresh random trees.
     while next.len() < pop {
-        let mut tree = expr::simplify(&random_tree(rng, nvars, &cfg.ops, cfg.init_depth));
+        let mut tree = expr::simplify(&random_tree_with(
+            rng,
+            nvars,
+            &cfg.ops,
+            cfg.init_depth,
+            Some(aggs),
+        ));
         if cfg.fit_iters > 0 {
             crate::fit::fit_weighted(&mut tree, &train.x, &train.y, &train.w, cfg.fit_iters);
             tree = expr::simplify(&tree);
@@ -553,7 +568,7 @@ fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
 /// it, in that order. A seed that is structurally identical to an earlier one
 /// (after simplification and again after fitting) is dropped: the archive and
 /// every island need it once.
-fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
+fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node], aggs: &AggTable) -> Vec<Ind> {
     let mut out: Vec<Ind> = Vec::new();
     // Two sets: one for the simplified input form (so a repeated line is
     // dropped even before fitting) and one for the fitted tree (so two
@@ -562,6 +577,11 @@ fn prepare_seeds(cfg: &Config, train: &Sample, seeds: &[Node]) -> Vec<Ind> {
     let mut seen_fitted: HashSet<u64> = HashSet::new();
     for seed in seeds {
         let mut tree = expr::simplify(seed);
+        // A parsed seed carries unresolved aggregates (`val = NaN`); resolve
+        // them against the training sample before anything evaluates it.
+        if expr::bind_aggregates(&mut tree, aggs).is_err() {
+            continue;
+        }
         if !seen_input.insert(expr::structural_hash(&tree)) {
             continue;
         }
@@ -592,6 +612,11 @@ fn run_search(
     mut on_checkpoint: Option<CheckpointFn<'_>>,
 ) -> Result<Outcome, String> {
     let nvars = train.x.first().map(|r| r.len()).unwrap_or(0);
+    // The aggregates are a property of the training rows, computed once. They
+    // are deliberately **not** rebuilt for a generation's row subset and never
+    // read the test sample: a subset changes which rows score a candidate, not
+    // what the dataset's statistics are.
+    let aggs = AggTable::from_sample(train);
     let t0 = std::time::Instant::now();
 
     let mut rng: Mt;
@@ -686,7 +711,7 @@ fn run_search(
             let mut pop = Vec::with_capacity(cfg.pop);
             for _ in 0..cfg.pop {
                 pop.push(Ind::evaluated(
-                    random_tree(&mut rng, nvars, &cfg.ops, depth),
+                    random_tree_with(&mut rng, nvars, &cfg.ops, depth, Some(&aggs)),
                     init_train,
                     cfg.metric,
                     &cfg.complexity_model,
@@ -713,7 +738,10 @@ fn run_search(
         // so every individual competes on identical rows.
         let init_sample = training_for_generation(cfg, train, 0);
         let init_train = init_sample.as_ref().unwrap_or(train);
-        for (k, ind) in prepare_seeds(cfg, train, seeds).into_iter().enumerate() {
+        for (k, ind) in prepare_seeds(cfg, train, seeds, &aggs)
+            .into_iter()
+            .enumerate()
+        {
             archive.try_insert(Sol {
                 complexity: expr::complexity(&ind.tree),
                 cost: ind.complexity,
@@ -766,11 +794,14 @@ fn run_search(
             }
 
             // ---- parallel generation across islands ---------------------
+            let aggs_ref = &aggs;
             std::thread::scope(|s| {
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
-                    .map(|(isl, r)| s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars)))
+                    .map(|(isl, r)| {
+                        s.spawn(move || evolve_island(isl, r, cfg, gen_train, nvars, aggs_ref))
+                    })
                     .collect();
                 for h in handles {
                     let _ = h.join();
@@ -883,7 +914,13 @@ fn run_search(
                     if stagnant[ii] >= 2 {
                         let mut r = rngs[ii].clone();
                         for ind in islands[ii].iter_mut() {
-                            let mut t = random_tree(&mut r, nvars, &cfg.ops, cfg.init_depth);
+                            let mut t = random_tree_with(
+                                &mut r,
+                                nvars,
+                                &cfg.ops,
+                                cfg.init_depth,
+                                Some(&aggs),
+                            );
                             if cfg.fit_iters > 0 {
                                 crate::fit::fit_weighted(
                                     &mut t,
@@ -1012,7 +1049,8 @@ mod tests {
         cfg.fit_iters = 8;
         // A deliberately wrong constant on the right shape.
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
-        let accepted = prepare_seeds(&cfg, &s, &[seed.clone(), seed]);
+        let aggs = AggTable::from_sample(&s);
+        let accepted = prepare_seeds(&cfg, &s, &[seed.clone(), seed], &aggs);
         assert_eq!(accepted.len(), 1, "a repeated seed is inserted once");
         assert!(
             accepted[0].error < 1e-12,
@@ -1033,7 +1071,8 @@ mod tests {
         let mut cfg = Config::default();
         cfg.fit_iters = 0;
         let seed = node(Op::Mul, vec![constant(3.0), input(0)]);
-        let accepted = prepare_seeds(&cfg, &s, &[seed]);
+        let aggs = AggTable::from_sample(&s);
+        let accepted = prepare_seeds(&cfg, &s, &[seed], &aggs);
         assert!(accepted[0].error > 1e-3, "an unfitted 3*x is not exact");
     }
 }
