@@ -113,7 +113,7 @@ fn the_parser_rejects_malformed_syntax() {
 }
 
 #[test]
-fn constant_dimensions_are_derived_from_the_printed_law() {
+fn constant_dimensions_are_derived_from_the_fitted_tree() {
     let vars = vec![m(), s()];
 
     // y = a*x + b with x in m and y in m: a is dimensionless, b is m.
