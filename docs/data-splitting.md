@@ -144,21 +144,48 @@ test day was visible during training, and no stock is missing from either side.
 If instead the goal were "a model for a stock we have never traded", you would
 use `--group-by stock` alone: whole stocks are held out.
 
-## What is not (yet) here
+## History and delayed variables
 
-A forecast usually needs **history**: `y_t` may depend on `x_{t-1}`, `x_{t-2}`,
-or on a moving average. The clean way to express that is as *operators over the
-series* — `delay(x, k)`, a moving average, a derivative — evaluated per row with
-access to the previous rows. `rcsr`'s evaluator is currently row-local, so the
-planned route is:
+A forecast needs the past. `rcsr` supplies it explicitly:
 
-1. an optional "history" reserve at the start of each series (rows kept for
-   their past values but not scored), and
-2. a `delay` / moving-average / derivative operator family that indexes the
-   series, with a maximum history offset.
+* **`--lags K`** appends `x_lag1 … x_lagK` for every input variable. A lag is
+  taken from the *previous row of the same series*, so nothing crosses a group
+  boundary or a hole in the time axis.
+* **`--history-frac f`** reserves the first `f` share of each series as
+  *history*. Those rows are dropped from the scored data — they exist only so the
+  rows just after them have a past. (With 100 rows and `--history-frac 0.05 --lags 3`,
+  the first 5 rows of each series are history and row 6 onward is scored.)
+* **`--gap-break f`** starts a new series whenever the step in `--time` is more
+  than `f` times the median step. This is how a gap in a time series is handled:
+  the lag chain stops at the gap, so a "yesterday" that is actually three months
+  ago is never used as yesterday.
 
-These are semantic extensions of the same split machinery: the series is the
-unit of order, and the split decides which part of each series is the future.
-A cheaper stop-gap that already works today is to feed **lagged columns**
-explicitly (`close_lag1`, `close_lag2`, …) as ordinary inputs and let the split
-handle the rest.
+The series is the same unit the split works on, so `--lags` composes with every
+split mode:
+
+```sh
+# AR-style model: predict tomorrow from today and yesterday, per stock,
+# trained on the past and tested on the future.
+rcsr --data panel.csv --target next_close --split temporal-group \
+     --time date --group-by stock --lags 2 --history-frac 0.05 --gap-break 3
+```
+
+The engine's report says what it did:
+
+```
+# 1 series, 2 history row(s) dropped, 2 delayed column(s) added
+# target: next_close = f(close,volume,close_lag1,volume_lag1,...) | split=temporal-group
+```
+
+`tests/split.rs` checks that a lag equals the previous row, that it never crosses
+a group or a gap, and that history rows supply the first lags.
+
+### Operator form (planned)
+
+Today the delays are *columns*. The richer form is a `delay(x, k)` operator
+inside expressions, alongside moving averages, a moving median and a derivative
+— which would also allow things like `mavg(x, 5) * y`. That needs a row-aware
+evaluator (each evaluation carrying the series position), so it is planned
+rather than done. Materialised lags cover the common case today at no extra
+evaluation cost.
+

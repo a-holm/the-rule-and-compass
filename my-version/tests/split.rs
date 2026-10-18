@@ -199,3 +199,96 @@ fn dates_parse_and_order_correctly() {
     assert_eq!(data::parse_time("42.5"), Some(42.5));
     assert!(data::parse_time("not-a-date").is_none());
 }
+
+#[test]
+fn delayed_columns_look_back_one_row() {
+    let t = data::parse_table("t,x,y\n0,10,1\n1,20,2\n2,30,3\n3,40,4\n").unwrap();
+    let (t2, vars, rep) = data::add_lags(
+        &t,
+        &["x".into()],
+        &data::LagSpec {
+            lags: 1,
+            ..Default::default()
+        },
+        Some(0),
+        None,
+    )
+    .unwrap();
+    assert_eq!(vars, vec!["x".to_string(), "x_lag1".to_string()]);
+    assert_eq!(rep.rows_kept, 3); // the first row is history only
+    let x = t2.index_of("x").unwrap();
+    let lag = t2.index_of("x_lag1").unwrap();
+    assert_eq!(t2.rows[0][x], 20.0);
+    assert_eq!(t2.rows[0][lag], 10.0);
+    assert_eq!(t2.rows[1][lag], 20.0);
+    assert_eq!(t2.rows[2][lag], 30.0);
+}
+
+#[test]
+fn delays_do_not_cross_group_boundaries() {
+    let t = data::parse_table("g,x\nA,1\nA,2\nB,100\nB,200\n").unwrap();
+    let (t2, _v, rep) = data::add_lags(
+        &t,
+        &["x".into()],
+        &data::LagSpec {
+            lags: 1,
+            ..Default::default()
+        },
+        None,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(rep.series, 2);
+    assert_eq!(rep.rows_kept, 2);
+    let lag = t2.index_of("x_lag1").unwrap();
+    assert_eq!(t2.rows[0][lag], 1.0, "A's second row looks back inside A");
+    assert_eq!(t2.rows[1][lag], 100.0, "B must not see A's last value");
+}
+
+#[test]
+fn delays_do_not_cross_time_gaps() {
+    let t = data::parse_table("t,x\n0,1\n1,2\n100,3\n101,4\n").unwrap();
+    let (t2, _v, rep) = data::add_lags(
+        &t,
+        &["x".into()],
+        &data::LagSpec {
+            lags: 1,
+            gap_break: 2.0,
+            ..Default::default()
+        },
+        Some(0),
+        None,
+    )
+    .unwrap();
+    assert_eq!(rep.breaks, 1);
+    assert_eq!(rep.series, 2);
+    let lag = t2.index_of("x_lag1").unwrap();
+    assert_eq!(t2.rows[0][lag], 1.0); // t=1 looks back to t=0
+    assert_eq!(t2.rows[1][lag], 3.0, "the lag must not jump the gap");
+}
+
+#[test]
+fn history_fraction_drops_leading_rows_but_still_supplies_lags() {
+    let mut s = String::from("t,x\n");
+    for i in 0..10 {
+        s.push_str(&format!("{},{}\n", i, i * 10));
+    }
+    let t = data::parse_table(&s).unwrap();
+    let (t2, _v, rep) = data::add_lags(
+        &t,
+        &["x".into()],
+        &data::LagSpec {
+            lags: 1,
+            history_frac: 0.3,
+            ..Default::default()
+        },
+        Some(0),
+        None,
+    )
+    .unwrap();
+    assert_eq!(rep.history_rows, 3);
+    assert_eq!(rep.rows_kept, 7);
+    let lag = t2.index_of("x_lag1").unwrap();
+    // first scored row is t=3 (x=30); its lag comes from the history row t=2.
+    assert_eq!(t2.rows[0][lag], 20.0);
+}

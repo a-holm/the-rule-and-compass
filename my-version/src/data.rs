@@ -42,6 +42,7 @@ impl Sample {
 
 /// A parsed table. Numeric cells appear in `rows`; the original text of every
 /// cell is kept in `raw` so date and label columns remain usable.
+#[derive(Clone)]
 pub struct Table {
     pub names: Vec<String>,
     /// `numeric[j]` is true when every non-empty cell in column `j` parses as a
@@ -663,6 +664,210 @@ pub fn group_ids(t: &Table, col: usize) -> (Vec<usize>, Vec<String>) {
         ids.push(id);
     }
     (ids, names)
+}
+
+// ---------------------------------------------------------------------------
+// History and delayed variables (time-delay embedding)
+// ---------------------------------------------------------------------------
+
+/// Options for turning a table into a time-delay embedding.
+#[derive(Clone, Default)]
+pub struct LagSpec {
+    /// Number of delayed copies added per input variable (`x_lag1 .. x_lagN`).
+    pub lags: usize,
+    /// Fraction of each series kept as *history*: its leading rows are dropped
+    /// from the scored data but still supply the past for later rows.
+    pub history_frac: f64,
+    /// Start a new series when the time step exceeds this multiple of the
+    /// series' median step (`0` disables gap splitting).
+    pub gap_break: f64,
+}
+
+#[derive(Clone, Default)]
+pub struct LagReport {
+    pub lags: usize,
+    pub series: usize,
+    pub rows_in: usize,
+    pub rows_kept: usize,
+    pub history_rows: usize,
+    pub breaks: usize,
+    pub notes: Vec<String>,
+}
+
+/// Append `x_lag1 .. x_lagK` columns for every input variable.
+///
+/// The past of a row is its predecessor **inside the same series**, where a
+/// series is a group (when `--group-by` is set) broken further at time gaps.
+/// The first `max(K, history_frac · series_length)` rows of every series are
+/// dropped: they cannot be scored without looking before the start of the
+/// series, and the rest of the history reserve is exactly the "Maximum History
+/// Data" idea — rows that only exist to give later rows a past.
+pub fn add_lags(
+    t: &Table,
+    vars: &[String],
+    lag: &LagSpec,
+    time_col: Option<usize>,
+    group_col: Option<usize>,
+) -> Result<(Table, Vec<String>, LagReport), String> {
+    let n = t.rows.len();
+    let mut report = LagReport {
+        lags: lag.lags,
+        rows_in: n,
+        ..Default::default()
+    };
+    if lag.lags == 0 && lag.history_frac <= 0.0 {
+        report.rows_kept = n;
+        return Ok((t.clone(), vars.to_vec(), report));
+    }
+    let var_idx: Vec<usize> = vars
+        .iter()
+        .map(|v| t.index_of(v))
+        .collect::<Result<_, _>>()?;
+
+    // Series id per row, and the ordering key used inside a series.
+    let (gid, group_count) = match group_col {
+        Some(c) => {
+            let (ids, names) = group_ids(t, c);
+            (ids, names.len())
+        }
+        None => (vec![0usize; n], 1),
+    };
+    let keys: Vec<f64> = match time_col {
+        Some(c) => time_keys(t, c),
+        None => (0..n).map(|i| i as f64).collect(),
+    };
+
+    let mut by_series: Vec<Vec<usize>> = vec![Vec::new(); group_count];
+    for i in 0..n {
+        by_series[gid[i]].push(i);
+    }
+
+    // Walk each series in time order, cutting it into segments at big steps,
+    // and record each row's segment and position inside it.
+    let mut seg_id = vec![usize::MAX; n];
+    let mut seg_pos = vec![0usize; n];
+    let mut seg_rows: Vec<Vec<usize>> = Vec::new();
+    for rows in by_series.iter_mut() {
+        rows.sort_by(|&a, &b| {
+            keys[a]
+                .partial_cmp(&keys[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        if rows.is_empty() {
+            continue;
+        }
+        let dts: Vec<f64> = if lag.gap_break > 0.0 && rows.len() > 1 {
+            rows.windows(2).map(|w| keys[w[1]] - keys[w[0]]).collect()
+        } else {
+            Vec::new()
+        };
+        let threshold = {
+            let mut sorted = dts.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            match sorted.get(sorted.len() / 2) {
+                Some(&med) if med > 0.0 => Some(lag.gap_break * med),
+                _ => None,
+            }
+        };
+        let mut cur = usize::MAX;
+        for (k, &r) in rows.iter().enumerate() {
+            let starts = k == 0
+                || match threshold {
+                    Some(th) if dts[k - 1] > th => {
+                        report.breaks += 1;
+                        true
+                    }
+                    _ => false,
+                };
+            if starts {
+                cur = seg_rows.len();
+                seg_rows.push(Vec::new());
+            }
+            seg_id[r] = cur;
+            seg_pos[r] = seg_rows[cur].len();
+            seg_rows[cur].push(r);
+        }
+    }
+    report.series = seg_rows.len();
+
+    // Keep a row only once its segment has enough past for every lag and the
+    // requested history reserve.
+    let mut keep = vec![false; n];
+    for i in 0..n {
+        let len = seg_rows[seg_id[i]].len() as f64;
+        let reserve = lag.lags.max((lag.history_frac * len).ceil() as usize);
+        if seg_pos[i] >= reserve {
+            keep[i] = true;
+        } else {
+            report.history_rows += 1;
+        }
+    }
+
+    // Names for the new columns, in the same variable order.
+    let mut names = t.names.clone();
+    let mut new_vars = vars.to_vec();
+    for v in vars {
+        for k in 1..=lag.lags {
+            let name = format!("{}_lag{}", v, k);
+            names.push(name.clone());
+            new_vars.push(name);
+        }
+    }
+    let mut numeric = t.numeric.clone();
+    numeric.extend(std::iter::repeat(true).take(names.len() - numeric.len()));
+
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    let mut raw: Vec<Vec<String>> = Vec::new();
+    for i in 0..n {
+        if !keep[i] {
+            continue;
+        }
+        let mut r = t.rows[i].clone();
+        let mut rr = t.raw[i].clone();
+        for &j in &var_idx {
+            for k in 1..=lag.lags {
+                let v = if seg_pos[i] >= k {
+                    let src = seg_rows[seg_id[i]][seg_pos[i] - k];
+                    t.rows[src][j]
+                } else {
+                    f64::NAN
+                };
+                r.push(v);
+                rr.push(format!("{}", v));
+            }
+        }
+        rows.push(r);
+        raw.push(rr);
+    }
+
+    report.rows_kept = rows.len();
+    if report.rows_kept == 0 {
+        return Err("history/delays removed every row (reduce --lags/--history-frac)".to_string());
+    }
+    if report.breaks > 0 {
+        report.notes.push(format!(
+            "{} time gap(s) treated as series boundaries",
+            report.breaks
+        ));
+    }
+    report.notes.push(format!(
+        "{} series, {} history row(s) dropped, {} delayed column(s) added",
+        report.series,
+        report.history_rows,
+        lag.lags * vars.len()
+    ));
+
+    Ok((
+        Table {
+            names,
+            numeric,
+            rows,
+            raw,
+        },
+        new_vars,
+        report,
+    ))
 }
 
 fn hash_str(s: &str, seed: u64) -> u64 {

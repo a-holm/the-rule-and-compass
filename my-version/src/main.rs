@@ -63,6 +63,14 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
   --folds <k>                split the test region into k contiguous blocks and
                              report per-block error as well as the mean (default 1)
 
+HISTORY AND DELAYED VARIABLES (lags, for forecasting):
+  --lags <k>                 add x_lag1..x_lagk as inputs per variable, computed
+                             inside each series (group + time order + gaps)
+  --history-frac <f>         keep the first fraction of each series as history:
+                             those rows supply the past but are not scored
+  --gap-break <f>            start a new series when the time step exceeds f x the
+                             median step (so lags cannot jump across a gap)
+
 SEARCH:
   --metric absolute|squared|correlation  (default absolute)
   --generations <N>          (default 200)
@@ -103,6 +111,9 @@ fn schema() -> String {
         ("--group-by", "string", "none", "group column (implies group)"),
         ("--gap", "int", "0", "embargo rows between train and test"),
         ("--folds", "int", "1", "contiguous test blocks to report"),
+        ("--lags", "int", "0", "delayed copies per input (time-delay embedding)"),
+        ("--history-frac", "float", "0", "fraction of each series kept as history"),
+        ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation"),
         ("--generations", "int", "200", "max generations"),
         ("--islands", "int", "1", "number of islands"),
@@ -210,6 +221,9 @@ fn main() {
     let mut group_name: Option<String> = None;
     let mut gap = 0usize;
     let mut folds = 1usize;
+    let mut lags = 0usize;
+    let mut history_frac = 0.0f64;
+    let mut gap_break = 0.0f64;
 
     let mut i = 0;
     macro_rules! val {
@@ -245,6 +259,9 @@ fn main() {
             "--group-by" => group_name = Some(val!()),
             "--gap" => gap = val!().parse().unwrap_or(0),
             "--folds" => folds = val!().parse().unwrap_or(1).max(1),
+            "--lags" => lags = val!().parse().unwrap_or(0),
+            "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
+            "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--ops" => cfg.ops = Op::parse_list(&val!()),
             "--fit-iters" => cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters),
             "--no-fit" => cfg.fit_iters = 0,
@@ -479,6 +496,32 @@ fn main() {
         notes.push("--gap only applies to temporal splits; ignored".to_string());
     }
 
+    // Time-delay embedding. New columns are only appended, so the indices in
+    // `time_col`/`group_col` stay valid. The leading rows of each series become
+    // history: they supply the past for later rows but are not scored.
+    let mut lag_report = data::LagReport::default();
+    let table = if lags > 0 || history_frac > 0.0 {
+        let lag_spec = data::LagSpec {
+            lags,
+            history_frac,
+            gap_break,
+        };
+        match data::add_lags(&table, &vars, &lag_spec, time_col, group_col) {
+            Ok((t2, v2, rep)) => {
+                lag_report = rep;
+                vars = v2;
+                t2
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    } else {
+        table
+    };
+    notes.extend(lag_report.notes.iter().cloned());
+
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -659,7 +702,7 @@ fn main() {
         }
         Format::Json => {
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"notes\":[{}]}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -674,6 +717,9 @@ fn main() {
                 prepared.report.groups_total,
                 prepared.report.groups_train,
                 prepared.report.groups_test,
+                lag_report.lags,
+                lag_report.series,
+                lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(",")
             );
             let pareto: Vec<String> = rows

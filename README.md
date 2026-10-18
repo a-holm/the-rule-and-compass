@@ -116,7 +116,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--metric absolute|squared|correlation] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--split random|temporal|group|temporal-group|auto] [--time col]
-     [--group-by col] [--gap N] [--folds K]
+     [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--gap-break f]
      [--fit-iters N] [--no-fit] [--no-dedup] [--patience N]
      [--time-budget seconds] [--format text|json|ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
@@ -174,6 +175,24 @@ rcsr --data panel.csv --target next_close --split auto
 See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
 worked examples.
 
+### Forecasting: history and delayed variables
+
+A forecast usually needs *history*: today's value may depend on yesterday's.
+`--lags K` materialises `x_lag1 … x_lagK` for every input, computed inside each
+series (group boundary, time order and time gaps respected), so the search can
+use them like any other column:
+
+```sh
+# y_t = 1 + 3·x_{t-1}:  let the engine look one step back
+rcsr --data lag.csv --target y --vars x --split temporal --time t --lags 1
+```
+
+`--history-frac f` keeps the first share of every series as *history*: those
+rows provide the past for later rows but are not scored, so a delay near the
+start of a series never reaches before it. `--gap-break f` cuts a series when
+the time step exceeds `f` times the median step, which stops a lag from jumping
+a hole in the data.
+
 ## Features
 
 - expression trees over a broad primitive set (`+ - * / ^`, `exp ln sqrt abs
@@ -190,7 +209,8 @@ worked examples.
   same expression is never evaluated twice and the search stops when there is
   nothing left to gain;
 - **split modes for time series and panel data** (`random`, `temporal`, `group`,
-  `temporal-group`, `auto`) with an embargo gap and per-block test errors, so a
+  `temporal-group`, `auto`) with an embargo gap, per-block test errors and
+  **delayed variables** (`--lags`, `--history-frac`, `--gap-break`), so a
   forecast is never scored on data it has already seen;
 - bottom-up simplification with affine normalisation, and denormalisation back
   to original units.
