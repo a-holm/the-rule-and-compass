@@ -21,6 +21,7 @@
 //! ordering, so the split is still well defined. Group columns may be text
 //! (ticker symbols) — they are never used as model inputs, only for splitting.
 
+use crate::column::RowSelector;
 use crate::expr::{self, Node};
 use crate::rng::Mt;
 use std::collections::{BTreeSet, HashMap};
@@ -198,23 +199,66 @@ pub fn make_implicit(p: &mut Prepared) -> (f64, f64) {
     (mean, std)
 }
 
-/// A parsed table. Numeric cells appear in `rows`; the original text of every
-/// cell is kept in `raw` so date and label columns remain usable.
-#[derive(Clone, Debug)]
+/// Dictionary encoding for a text/categorical column: `u32` codes into one
+/// level table. The per-row cost is 4 bytes, independent of the label length.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DictColumn {
+    pub codes: Vec<u32>,
+    pub levels: Vec<String>,
+}
+
+impl DictColumn {
+    pub fn text(&self, row: usize) -> &str {
+        &self.levels[self.codes[row] as usize]
+    }
+
+    pub fn len(&self) -> usize {
+        self.codes.len()
+    }
+}
+
+/// One column of a [`Table`].
+///
+/// Numeric columns keep one contiguous `f64` block (`values`). Text/categorical
+/// columns keep `u32` codes and one label table (`dict`) and do **not** keep a
+/// per-row `String`. A low-cardinality numeric column keeps both: the values
+/// are the search's view, the dictionary preserves the exact source text for
+/// dates, group labels and categorical levels.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Column {
+    pub values: Vec<f64>,
+    pub dict: Option<DictColumn>,
+}
+
+impl Column {
+    pub fn text(&self, row: usize) -> Option<&str> {
+        self.dict.as_ref().map(|d| d.text(row))
+    }
+}
+
+/// A parsed table, stored column-major.
+///
+/// There is no `raw: Vec<Vec<String>>` copy: non-numeric cells are dictionary
+/// codes, and numeric cells keep the source text only when the column has few
+/// distinct values (where it is needed for dates/labels and costs 4 B/row).
+#[derive(Clone, Debug, Default)]
 pub struct Table {
     pub names: Vec<String>,
     /// `numeric[j]` is true when every non-empty cell in column `j` parses as a
     /// number.
     pub numeric: Vec<bool>,
-    /// Numeric view; non-numeric cells are `NaN`.
-    pub rows: Vec<Vec<f64>>,
-    /// Text view of every cell.
-    pub raw: Vec<Vec<String>>,
+    columns: Vec<Column>,
+    n_rows: usize,
     /// Data rows dropped because their field count differed from the header.
     /// Non-zero only when the loader was explicitly asked to skip them
     /// (`--skip-malformed`); the default refuses the file instead.
     pub skipped_malformed: usize,
 }
+
+/// A numeric column keeps its exact source text in the dictionary up to this
+/// many distinct values. Above it the column is high-cardinality and the text
+/// is dropped: nothing in the pipeline needs it, and it would dominate memory.
+pub const NUMERIC_DICT_MAX: usize = 4096;
 
 impl Table {
     pub fn index_of(&self, name: &str) -> Result<usize, String> {
@@ -225,23 +269,133 @@ impl Table {
     }
 
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.n_rows
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.n_rows == 0
+    }
+
+    pub fn n_cols(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// The whole contiguous `f64` column (empty for a text column).
+    pub fn col(&self, j: usize) -> &[f64] {
+        &self.columns[j].values
+    }
+
+    pub fn col_mut(&mut self, j: usize) -> &mut [f64] {
+        &mut self.columns[j].values
+    }
+
+    pub fn value(&self, row: usize, col: usize) -> f64 {
+        self.columns
+            .get(col)
+            .and_then(|c| c.values.get(row))
+            .copied()
+            .unwrap_or(f64::NAN)
+    }
+
+    /// The exact source text of a cell, when the column retained it.
+    pub fn text(&self, row: usize, col: usize) -> Option<&str> {
+        self.columns.get(col).and_then(|c| c.text(row))
+    }
+
+    /// Source text as an owned string, formatting a high-cardinality numeric
+    /// column when it no longer carries a dictionary. Only reporting and dtype
+    /// validation use this; hot paths read [`Table::col`].
+    pub fn cell_text(&self, row: usize, col: usize) -> String {
+        if let Some(s) = self.text(row, col) {
+            return s.to_string();
+        }
+        let v = self.value(row, col);
+        if v.is_nan() {
+            String::new()
+        } else {
+            format!("{}", v)
+        }
+    }
+
+    pub fn dict(&self, col: usize) -> Option<&DictColumn> {
+        self.columns.get(col).and_then(|c| c.dict.as_ref())
+    }
+
+    /// Copy one row out. Hot loops use [`Table::col`] instead.
+    pub fn row(&self, row: usize) -> Vec<f64> {
+        self.columns.iter().map(|c| c.values.get(row).copied().unwrap_or(f64::NAN)).collect()
+    }
+
+    pub(crate) fn from_parts(
+        names: Vec<String>,
+        numeric: Vec<bool>,
+        columns: Vec<Column>,
+        n_rows: usize,
+        skipped_malformed: usize,
+    ) -> Self {
+        Table {
+            names,
+            numeric,
+            columns,
+            n_rows,
+            skipped_malformed,
+        }
+    }
+
+    pub fn push_column(&mut self, name: String, numeric: bool, column: Column) {
+        self.names.push(name);
+        self.numeric.push(numeric);
+        self.columns.push(column);
+    }
+
+    /// A new table with only the rows where `keep[r]` is true, preserving
+    /// order. Columns stay contiguous; nothing is transposed.
+    pub fn select(&self, keep: &[bool]) -> Table {
+        let idx: Vec<usize> = (0..self.n_rows).filter(|&r| keep[r]).collect();
+        self.select_indices(&idx)
+    }
+
+    pub fn select_indices(&self, idx: &[usize]) -> Table {
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| Column {
+                values: if c.values.is_empty() {
+                    Vec::new()
+                } else {
+                    idx.iter().map(|&r| c.values[r]).collect()
+                },
+                dict: c.dict.as_ref().map(|d| DictColumn {
+                    codes: idx.iter().map(|&r| d.codes[r]).collect(),
+                    levels: d.levels.clone(),
+                }),
+            })
+            .collect();
+        Table {
+            names: self.names.clone(),
+            numeric: self.numeric.clone(),
+            columns,
+            n_rows: idx.len(),
+            skipped_malformed: self.skipped_malformed,
+        }
     }
 
     /// Number of distinct values in a column (used by auto-detection).
     pub fn distinct_count(&self, col: usize) -> usize {
-        let mut seen: Vec<&str> = Vec::new();
-        for r in &self.raw {
-            let s = r[col].trim();
-            if !seen.contains(&s) {
-                seen.push(s);
-            }
+        if let Some(d) = self.dict(col) {
+            return d.levels.len();
         }
-        seen.len()
+        if self.numeric.get(col).copied().unwrap_or(false) {
+            let mut seen: Vec<u64> = self
+                .col(col)
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            seen.sort_unstable();
+            seen.dedup();
+            return seen.len();
+        }
+        0
     }
 }
 
@@ -449,18 +603,30 @@ pub fn apply_dtypes(
                             v, name
                         )));
                     }
-                    for (r, raw) in t.raw.iter().enumerate() {
-                        let cell = raw[j].trim();
+                    let mut values = Vec::with_capacity(t.len());
+                    let mut codes = Vec::with_capacity(t.len());
+                    for r in 0..t.len() {
+                        let cell = t.cell_text(r, j);
+                        let cell = cell.trim();
                         let hit = if is_missing_token(cell) {
                             level == MISSING_LEVEL
                         } else {
                             cell == level
                         };
-                        table.rows[r].push(if hit { 1.0 } else { 0.0 });
-                        table.raw[r].push(if hit { "1" } else { "0" }.to_string());
+                        values.push(if hit { 1.0 } else { 0.0 });
+                        codes.push(if hit { 0 } else { 1 });
                     }
-                    table.names.push(name.clone());
-                    table.numeric.push(true);
+                    table.push_column(
+                        name.clone(),
+                        true,
+                        Column {
+                            values,
+                            dict: Some(DictColumn {
+                                codes,
+                                levels: vec!["1".to_string(), "0".to_string()],
+                            }),
+                        },
+                    );
                     new_vars.push(name.clone());
                     dtypes.push(DType::Boolean);
                     variables.push(VariableDType {
@@ -486,8 +652,9 @@ pub fn apply_dtypes(
 /// fill that would produce a fraction later).
 fn validate_boolean(t: &Table, j: usize) -> Result<(), DTypeError> {
     let name = &t.names[j];
-    for (r, raw) in t.raw.iter().enumerate() {
-        let cell = raw[j].trim();
+    for r in 0..t.len() {
+        let cell = t.cell_text(r, j);
+        let cell = cell.trim();
         if is_missing_token(cell) {
             continue;
         }
@@ -516,8 +683,9 @@ fn categorical_levels(
     max_levels: usize,
 ) -> Result<Vec<String>, DTypeError> {
     let mut set: BTreeSet<String> = BTreeSet::new();
-    for raw in &t.raw {
-        let cell = raw[j].trim();
+    for r in 0..t.len() {
+        let cell = t.cell_text(r, j);
+        let cell = cell.trim();
         if is_missing_token(cell) {
             set.insert(MISSING_LEVEL.to_string());
         } else if cell == MISSING_LEVEL {
@@ -596,12 +764,13 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     let mut header: Option<&str> = None;
     let mut nfields = 0usize;
     let mut delim = ',';
-    let mut raw: Vec<Vec<String>> = Vec::new();
     let mut skipped_malformed = 0usize;
+    let mut data_rows = 0usize;
+
+    // Pass 1: header and delimiter, and reject (or count) ragged rows. Only one
+    // line at a time is resident; there is no `Vec<Vec<String>>` staging copy.
     for (i, l) in text.lines().enumerate() {
         let trimmed = l.trim();
-        // Blank lines and comment lines are not data rows. A `#` comment may
-        // appear anywhere, including before the header.
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
@@ -631,58 +800,123 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
                 parts.len()
             ));
         }
-        raw.push(parts);
+        data_rows += 1;
     }
     let header = header.ok_or_else(|| "empty input".to_string())?;
-    let names = split_fields(header, delim);
-    if raw.is_empty() {
+    if data_rows == 0 {
         return Err("no data rows".to_string());
     }
+    let names = split_fields(header, delim);
 
     // A column is numeric when every non-missing cell parses as a number.
     // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
-    // here and become `NaN` in the numeric view.
-    let mut numeric = vec![false; names.len()];
-    for (j, slot) in numeric.iter_mut().enumerate() {
-        let mut any = false;
-        let mut all = true;
-        for r in &raw {
-            let cell = r[j].trim();
+    // and become `NaN` in the numeric view.
+    let mut any = vec![false; nfields];
+    let mut all = vec![true; nfields];
+    let mut seen_header = false;
+    for l in text.lines() {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !seen_header {
+            seen_header = true;
+            continue;
+        }
+        let parts = split_fields(l, delim);
+        if parts.len() != nfields {
+            continue; // accepted by pass 1 (skipped or none)
+        }
+        for (j, cell) in parts.iter().enumerate() {
+            let cell = cell.trim();
             if is_missing_token(cell) {
                 continue;
             }
-            any = true;
+            any[j] = true;
             if cell.parse::<f64>().is_err() {
-                all = false;
-                break;
+                all[j] = false;
             }
         }
-        *slot = any && all;
+    }
+    let numeric: Vec<bool> = any.iter().zip(&all).map(|(&a, &b)| a && b).collect();
+
+    // Pass 2: one contiguous `f64` block per numeric column and, where the
+    // source text is worth keeping, one `u32` code per row plus a level table.
+    let mut columns: Vec<Column> = (0..nfields).map(|_| Column::default()).collect();
+    for (j, col) in columns.iter_mut().enumerate() {
+        if numeric[j] {
+            col.values.reserve(data_rows);
+        }
+    }
+    let mut maps: Vec<HashMap<String, u32>> = (0..nfields).map(|_| HashMap::new()).collect();
+    let mut level_lists: Vec<Vec<String>> = (0..nfields).map(|_| Vec::new()).collect();
+    let mut codes: Vec<Vec<u32>> = (0..nfields).map(|_| Vec::with_capacity(data_rows)).collect();
+    // A numeric column only keeps its dictionary while it stays low-cardinality.
+    // Once it crosses the cap the map is dropped immediately, so a large random
+    // column never builds one `String` key per distinct value.
+    let mut dict_live: Vec<bool> = (0..nfields).map(|_| true).collect();
+    seen_header = false;
+    for l in text.lines() {
+        let trimmed = l.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !seen_header {
+            seen_header = true;
+            continue;
+        }
+        let parts = split_fields(l, delim);
+        if parts.len() != nfields {
+            continue;
+        }
+        for (j, cell) in parts.iter().enumerate() {
+            let cell = cell.trim();
+            if numeric[j] {
+                columns[j].values.push(if is_missing_token(cell) {
+                    f64::NAN
+                } else {
+                    cell.parse::<f64>().unwrap_or(f64::NAN)
+                });
+            }
+            if !dict_live[j] {
+                continue;
+            }
+            let code = match maps[j].get(cell) {
+                Some(&c) => c,
+                None => {
+                    if maps[j].len() >= NUMERIC_DICT_MAX && numeric[j] {
+                        dict_live[j] = false;
+                        maps[j] = HashMap::new();
+                        level_lists[j] = Vec::new();
+                        codes[j] = Vec::new();
+                        continue;
+                    }
+                    let c = level_lists[j].len() as u32;
+                    maps[j].insert(cell.to_string(), c);
+                    level_lists[j].push(cell.to_string());
+                    c
+                }
+            };
+            codes[j].push(code);
+        }
     }
 
-    let rows: Vec<Vec<f64>> = raw
-        .iter()
-        .map(|r| {
-            r.iter()
-                .enumerate()
-                .map(|(j, c)| {
-                    if numeric[j] && !is_missing_token(c) {
-                        c.trim().parse::<f64>().unwrap_or(f64::NAN)
-                    } else {
-                        f64::NAN
-                    }
-                })
-                .collect()
-        })
-        .collect();
+    for (j, col) in columns.iter_mut().enumerate() {
+        if dict_live[j] {
+            col.dict = Some(DictColumn {
+                codes: std::mem::take(&mut codes[j]),
+                levels: std::mem::take(&mut level_lists[j]),
+            });
+        }
+    }
 
-    Ok(Table {
+    Ok(Table::from_parts(
         names,
         numeric,
-        rows,
-        raw,
+        columns,
+        data_rows,
         skipped_malformed,
-    })
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -778,6 +1012,10 @@ pub struct SplitReport {
     pub overlap_rows: usize,
     /// Rows matching neither selection; unused (#3).
     pub unassigned_rows: usize,
+    /// Which [`RowSelector`] representation the train/fold rows use (#70):
+    /// `all`, `range`, `hash` or `set`. Reported so a reader can see whether
+    /// evaluation is a scan or a gather.
+    pub selector: String,
     pub notes: Vec<String>,
 }
 
@@ -1310,30 +1548,26 @@ pub fn prepare_full_targets_weighted_with(
 
     // 0. Explicit exclusions remove rows from the population (issue #3). They
     // run before the row filter, so `--exclude` can never be undone by it.
+    // The population is a boolean view over the column-major table: no second
+    // copy of the cells (and no text copy) is made while filtering.
     let mut excluded_count = 0usize;
-    let mut filtered = t.clone();
+    let mut keep_row = vec![true; t.len()];
     if let Some(x) = &spec.exclude {
         let cols: Vec<usize> = x
             .vars
             .iter()
-            .map(|v| filtered.index_of(v))
+            .map(|v| t.index_of(v))
             .collect::<Result<_, _>>()?;
-        let mut rows = Vec::new();
-        let mut raw = Vec::new();
-        for r in 0..filtered.rows.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| filtered.rows[r][c]).collect();
+        for r in 0..t.len() {
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
             if expr::eval(&x.tree, &vals) > 0.0 {
                 excluded_count += 1;
-            } else {
-                rows.push(filtered.rows[r].clone());
-                raw.push(filtered.raw[r].clone());
+                keep_row[r] = false;
             }
         }
-        if rows.is_empty() {
+        if !keep_row.iter().any(|&b| b) {
             return Err("--exclude removed every row".to_string());
         }
-        filtered.rows = rows;
-        filtered.raw = raw;
     }
 
     // 1. The row filter defines the population the split is drawn from.
@@ -1342,57 +1576,62 @@ pub fn prepare_full_targets_weighted_with(
         let cols: Vec<usize> = f
             .vars
             .iter()
-            .map(|v| filtered.index_of(v))
+            .map(|v| t.index_of(v))
             .collect::<Result<_, _>>()?;
-        let mut rows = Vec::new();
-        let mut raw = Vec::new();
-        for r in 0..filtered.rows.len() {
-            let vals: Vec<f64> = cols.iter().map(|&c| filtered.rows[r][c]).collect();
+        for r in 0..t.len() {
+            if !keep_row[r] {
+                continue;
+            }
+            let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
             if expr::eval(&f.tree, &vals) > 0.0 {
-                rows.push(filtered.rows[r].clone());
-                raw.push(filtered.raw[r].clone());
+                // kept
             } else {
+                keep_row[r] = false;
                 filtered_count += 1;
             }
         }
-        if rows.is_empty() {
+        if !keep_row.iter().any(|&b| b) {
             return Err("--filter kept no rows".to_string());
         }
-        filtered.rows = rows;
-        filtered.raw = raw;
     }
+    // With no `--exclude`/`--filter` the population is the whole table: borrow
+    // it rather than copy a second columnar image.
+    let filtered_owned;
+    let filtered: &Table = if keep_row.iter().all(|&b| b) {
+        t
+    } else {
+        filtered_owned = t.select(&keep_row);
+        &filtered_owned
+    };
 
-    let x_raw: Vec<Vec<f64>> = filtered
-        .rows
-        .iter()
-        .map(|r| var_idx.iter().map(|&i| r[i]).collect())
+    let x_raw: Vec<Vec<f64>> = (0..filtered.len())
+        .map(|r| var_idx.iter().map(|&i| filtered.col(i)[r]).collect())
         .collect();
     // Weights follow the rows through the split; validate them on the surviving
     // population (after --exclude / --filter) rather than on discarded rows.
     let weights_raw: Option<Vec<f64>> = match weight_idx {
         Some(j) => {
             let name = weight.unwrap_or("");
-            let w: Vec<f64> = filtered.rows.iter().map(|r| r[j]).collect();
+            let w: Vec<f64> = filtered.col(j).to_vec();
             validate_weights(name, &w)?;
             Some(w)
         }
         None => None,
     };
-    let (mut train_idx, mut fold_idx, mut report) = build_split(&filtered, spec, rng, &x_raw)?;
+    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng, &x_raw)?;
+    drop(x_raw);
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
     }
 
-    let n = filtered.rows.len();
+    let n = filtered.len();
     // Used columns: every input, then every target (one target in the
     // single-output case; issue #15 keeps all of them row-aligned here).
     let used_cols: Vec<usize> = var_idx.iter().copied().chain(tgt_idx.iter().copied()).collect();
     let nc = used_cols.len();
-    let mut cells: Vec<Vec<f64>> = filtered
-        .rows
-        .iter()
-        .map(|r| used_cols.iter().map(|&c| r[c]).collect())
+    let mut cells: Vec<Vec<f64>> = (0..filtered.len())
+        .map(|r| used_cols.iter().map(|&c| filtered.value(r, c)).collect())
         .collect();
     let mut keep = vec![true; n];
     let mut row_filled = vec![false; n];
@@ -1652,15 +1891,9 @@ pub fn prepare_full_targets_weighted_with(
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len().max(1);
 
-    let x_vals: Vec<Vec<f64>> = cells
-        .iter()
-        .map(|r| r[..nv].to_vec())
-        .collect();
-    // One column per target. With a single target this is exactly the old
-    // `y_vals` vector, so the single-output path is bit-for-bit unchanged.
-    let y_vals: Vec<Vec<f64>> = (0..nt)
-        .map(|j| cells.iter().map(|r| r[nv + j]).collect())
-        .collect();
+    // `cells` is the single prepared copy: inputs in `0..nv`, targets after.
+    // The samples below normalise out of it directly instead of keeping another
+    // row-major copy (the old `x_vals`/`y_vals`).
 
     // 5. Centre/scale from the surviving training rows, applied to both sides.
     // The default (mean/std) is the same arithmetic as before issue #2.
@@ -1675,7 +1908,7 @@ pub fn prepare_full_targets_weighted_with(
             stds[j] = 1.0;
             continue;
         }
-        let vals: Vec<f64> = train_idx.iter().map(|&i| x_vals[i][j]).collect();
+        let vals: Vec<f64> = train_idx.iter().map(|&i| cells[i][j]).collect();
         let m = vals.iter().sum::<f64>() / vals.len() as f64;
         let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
         let s = var.sqrt();
@@ -1702,17 +1935,16 @@ pub fn prepare_full_targets_weighted_with(
         for &i in idx {
             s.x.push(
                 (0..nv)
-                    .map(|j| (x_vals[i][j] - means[j]) / stds[j])
+                    .map(|j| (cells[i][j] - means[j]) / stds[j])
                     .collect(),
             );
             // Target 0 lives in `y`; a multi-output sample also keeps every
             // target (including the first) in `ys` (issue #15).
-            s.y.push(y_vals[0][i]);
+            s.y.push(cells[i][nv]);
         }
         if nt > 1 {
-            s.ys = y_vals
-                .iter()
-                .map(|col| idx.iter().map(|&i| col[i]).collect())
+            s.ys = (0..nt)
+                .map(|j| idx.iter().map(|&i| cells[i][nv + j]).collect())
                 .collect();
         }
         if let Some(w) = &weights_raw {
@@ -1779,8 +2011,9 @@ fn coerce_numeric(t: &Table) -> Table {
             continue;
         }
         let mut any_number = false;
-        for r in &t.raw {
-            let cell = r[j].trim();
+        for r in 0..t.len() {
+            let cell = t.cell_text(r, j);
+            let cell = cell.trim();
             if !is_missing_token(cell) && cell.parse::<f64>().is_ok() {
                 any_number = true;
                 break;
@@ -1790,13 +2023,16 @@ fn coerce_numeric(t: &Table) -> Table {
             continue;
         }
         out.numeric[j] = true;
-        for (r, row) in out.rows.iter_mut().enumerate() {
-            let cell = t.raw[r][j].trim();
-            row[j] = if is_missing_token(cell) {
+        let values = &mut out.columns[j].values;
+        values.reserve(t.len());
+        for r in 0..t.len() {
+            let cell = t.cell_text(r, j);
+            let cell = cell.trim();
+            values.push(if is_missing_token(cell) {
                 f64::NAN
             } else {
                 cell.parse::<f64>().unwrap_or(f64::NAN)
-            };
+            });
         }
     }
     out
@@ -1972,13 +2208,13 @@ pub fn cv_folds_typed(
     let weights_raw: Option<Vec<f64>> = match weight_idx {
         Some(j) => {
             let name = weight.unwrap_or("");
-            let w: Vec<f64> = t.rows.iter().map(|r| r[j]).collect();
+            let w: Vec<f64> = t.col(j).to_vec();
             validate_weights(name, &w)?;
             Some(w)
         }
         None => None,
     };
-    let n = t.rows.len();
+    let n = t.len();
     let k = k.max(2);
     if n < k + 1 {
         return Err(format!(
@@ -1986,12 +2222,10 @@ pub fn cv_folds_typed(
             k, n
         ));
     }
-    let x_raw: Vec<Vec<f64>> = t
-        .rows
-        .iter()
-        .map(|r| var_idx.iter().map(|&i| r[i]).collect())
+    let x_raw: Vec<Vec<f64>> = (0..n)
+        .map(|r| var_idx.iter().map(|&i| t.value(r, i)).collect())
         .collect();
-    let y: Vec<f64> = t.rows.iter().map(|r| r[tgt_idx]).collect();
+    let y: Vec<f64> = t.col(tgt_idx).to_vec();
 
     // (train indices, test indices) per fold.
     let splits: Vec<(Vec<usize>, Vec<usize>)> = match mode {
@@ -2096,6 +2330,19 @@ pub fn cv_folds_typed(
     Ok(folds)
 }
 
+/// A compact description of the selectors a split is stored as (#70).
+fn describe_selector(n: usize, train: &[usize], test: &[usize]) -> String {
+    let train_ids: Vec<u32> = train.iter().map(|&i| i as u32).collect();
+    let test_ids: Vec<u32> = test.iter().map(|&i| i as u32).collect();
+    let tr = RowSelector::from_rows(n, &train_ids);
+    let te = RowSelector::from_rows(n, &test_ids);
+    format!(
+        "train {} | test {}",
+        tr.describe(n),
+        te.describe(n)
+    )
+}
+
 /// Decide where each row goes. Returns `(train indices, test fold indices, report)`.
 fn build_split(
     t: &Table,
@@ -2103,7 +2350,7 @@ fn build_split(
     rng: &mut Mt,
     x_raw: &[Vec<f64>],
 ) -> Result<(Vec<usize>, Vec<Vec<usize>>, SplitReport), String> {
-    let n = t.rows.len();
+    let n = t.len();
     let folds = spec.folds.max(1);
     let mut notes: Vec<String> = Vec::new();
     let mut report = SplitReport {
@@ -2126,7 +2373,7 @@ fn build_split(
                 .collect::<Result<_, _>>()?;
             Ok((0..n)
                 .map(|r| {
-                    let vals: Vec<f64> = cols.iter().map(|&c| t.rows[r][c]).collect();
+                    let vals: Vec<f64> = cols.iter().map(|&c| t.value(r, c)).collect();
                     expr::eval(&f.tree, &vals) > 0.0
                 })
                 .collect())
@@ -2205,6 +2452,7 @@ fn build_split(
             notes.push("the embargo gap does not apply to a row selection".to_string());
         }
         report.notes = notes;
+        report.selector = describe_selector(n, &train, &test);
         return Ok((train, split_blocks(&test, folds), report));
     }
 
@@ -2357,6 +2605,8 @@ fn build_split(
     report.folds = fold_idx.len();
     report.notes = notes;
     let _ = x_raw;
+    let all_folds: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+    report.selector = describe_selector(n, &train, &all_folds);
     Ok((train, fold_idx, report))
 }
 
@@ -2412,20 +2662,33 @@ fn sorted_by(keys: &[f64]) -> Vec<usize> {
 /// whole column falls back to lexicographic order, which is still a valid total
 /// order (and the right one for zero-padded `YYYY-MM-DD`).
 pub fn time_keys(t: &Table, col: usize) -> Vec<f64> {
-    let n = t.rows.len();
-    let parsed: Option<Vec<f64>> = (0..n).map(|r| parse_time(&t.raw[r][col])).collect();
-    if let Some(v) = parsed {
-        return v;
+    let n = t.len();
+    // A numeric column without gaps is already in seconds: parsing its text
+    // would only round-trip the same `f64`.
+    if t.numeric[col] && !t.col(col).iter().any(|v| v.is_nan()) {
+        return t.col(col).to_vec();
     }
-    let mut pairs: Vec<(String, usize)> = (0..n)
-        .map(|r| (t.raw[r][col].trim().to_string(), r))
-        .collect();
-    pairs.sort();
-    let mut key = vec![0.0; n];
-    for (rank, (_s, r)) in pairs.into_iter().enumerate() {
-        key[r] = rank as f64;
+    if let Some(d) = t.dict(col) {
+        let parsed: Option<Vec<f64>> = (0..n).map(|r| parse_time(d.text(r))).collect();
+        if let Some(v) = parsed {
+            return v;
+        }
+        let mut pairs: Vec<(String, usize)> = (0..n)
+            .map(|r| (d.text(r).trim().to_string(), r))
+            .collect();
+        pairs.sort();
+        let mut key = vec![0.0; n];
+        for (rank, (_s, r)) in pairs.into_iter().enumerate() {
+            key[r] = rank as f64;
+        }
+        return key;
     }
-    key
+    // High-cardinality numeric column with missing cells: compare the values
+    // directly and sort gaps last.
+    t.col(col)
+        .iter()
+        .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
+        .collect()
 }
 
 /// Parse a timestamp to seconds: accepts plain numbers, `YYYY-MM-DD`,
@@ -2480,16 +2743,35 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 /// Stable group ids (0..g) from a label or numeric column, plus the group names.
 pub fn group_ids(t: &Table, col: usize) -> (Vec<usize>, Vec<String>) {
-    let mut map: HashMap<&str, usize> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
-    let mut ids = Vec::with_capacity(t.rows.len());
-    for r in &t.raw {
-        let key = r[col].trim();
-        let id = match map.get(key) {
+    let mut ids = Vec::with_capacity(t.len());
+    if let Some(d) = t.dict(col) {
+        let mut map: HashMap<&str, usize> = HashMap::new();
+        for r in 0..t.len() {
+            let key = d.text(r).trim();
+            let id = match map.get(key) {
+                Some(&i) => i,
+                None => {
+                    let i = names.len();
+                    names.push(key.to_string());
+                    map.insert(key, i);
+                    i
+                }
+            };
+            ids.push(id);
+        }
+        return (ids, names);
+    }
+    // A high-cardinality numeric group column: the value itself is the key.
+    let mut map: HashMap<u64, usize> = HashMap::new();
+    for r in 0..t.len() {
+        let v = t.value(r, col);
+        let key = v.to_bits();
+        let id = match map.get(&key) {
             Some(&i) => i,
             None => {
                 let i = names.len();
-                names.push(key.to_string());
+                names.push(format!("{}", v));
                 map.insert(key, i);
                 i
             }
@@ -2542,7 +2824,7 @@ pub fn add_lags(
     time_col: Option<usize>,
     group_col: Option<usize>,
 ) -> Result<(Table, Vec<String>, LagReport), String> {
-    let n = t.rows.len();
+    let n = t.len();
     let mut report = LagReport {
         lags: lag.lags,
         rows_in: n,
@@ -2638,45 +2920,49 @@ pub fn add_lags(
     }
 
     // Names for the new columns, in the same variable order.
-    let mut names = t.names.clone();
     let mut new_vars = vars.to_vec();
+    let mut lag_names = Vec::new();
     for v in vars {
         for k in 1..=lag.lags {
             let name = format!("{}_lag{}", v, k);
-            names.push(name.clone());
+            lag_names.push(name.clone());
             new_vars.push(name);
         }
     }
-    let mut numeric = t.numeric.clone();
-    numeric.extend(std::iter::repeat(true).take(names.len() - numeric.len()));
 
-    let mut rows: Vec<Vec<f64>> = Vec::new();
-    let mut raw: Vec<Vec<String>> = Vec::new();
-    for i in 0..n {
-        if !keep[i] {
-            continue;
-        }
-        let mut r = t.rows[i].clone();
-        let mut rr = t.raw[i].clone();
+    let kept: Vec<usize> = (0..n).filter(|&i| keep[i]).collect();
+    let mut out = t.select_indices(&kept);
+    report.rows_kept = kept.len();
+    if report.rows_kept == 0 {
+        return Err("history/delays removed every row (reduce --lags/--history-frac)".to_string());
+    }
+    // Delayed copies are numeric and high-cardinality: values only, no text.
+    let mut lag_values: Vec<Vec<f64>> = vec![Vec::with_capacity(kept.len()); lag_names.len()];
+    for (r, &i) in kept.iter().enumerate() {
+        let mut c = 0usize;
         for &j in &var_idx {
             for k in 1..=lag.lags {
                 let v = if seg_pos[i] >= k {
                     let src = seg_rows[seg_id[i]][seg_pos[i] - k];
-                    t.rows[src][j]
+                    t.value(src, j)
                 } else {
                     f64::NAN
                 };
-                r.push(v);
-                rr.push(format!("{}", v));
+                lag_values[c].push(v);
+                c += 1;
             }
         }
-        rows.push(r);
-        raw.push(rr);
+        let _ = r;
     }
-
-    report.rows_kept = rows.len();
-    if report.rows_kept == 0 {
-        return Err("history/delays removed every row (reduce --lags/--history-frac)".to_string());
+    for (name, values) in lag_names.into_iter().zip(lag_values) {
+        out.push_column(
+            name,
+            true,
+            Column {
+                values,
+                dict: None,
+            },
+        );
     }
     if report.breaks > 0 {
         report.notes.push(format!(
@@ -2691,17 +2977,7 @@ pub fn add_lags(
         lag.lags * vars.len()
     ));
 
-    Ok((
-        Table {
-            names,
-            numeric,
-            rows,
-            raw,
-            skipped_malformed: t.skipped_malformed,
-        },
-        new_vars,
-        report,
-    ))
+    Ok((out, new_vars, report))
 }
 
 fn hash_str(s: &str, seed: u64) -> u64 {
@@ -2726,7 +3002,7 @@ pub fn is_time_like(t: &Table, j: usize) -> bool {
     if !t.numeric[j] {
         return false;
     }
-    let col: Vec<f64> = t.rows.iter().map(|r| r[j]).collect();
+    let col: Vec<f64> = t.col(j).to_vec();
     let mono = col.windows(2).all(|w| w[0] <= w[1]);
     mono && t.distinct_count(j) * 5 >= col.len() * 4
 }
@@ -2738,7 +3014,7 @@ pub fn is_group_like(t: &Table, j: usize) -> bool {
     if !t.numeric[j] {
         return d >= 2;
     }
-    d >= 2 && d * 5 <= t.rows.len().max(5) + 1
+    d >= 2 && d * 5 <= t.len().max(5) + 1
 }
 
 /// First column (excluding `exclude`) that looks like a time axis.
@@ -2821,9 +3097,9 @@ mod tests {
     fn missing_markers_are_parsed_as_gaps() {
         let t = table("x,y\n1,2\nNA,3\n,4\nnull,5\nNaN,6\n");
         assert!(t.numeric[0] && t.numeric[1]);
-        assert_eq!(t.rows[0][0], 1.0);
+        assert_eq!(t.value(0, 0), 1.0);
         for r in 1..5 {
-            assert!(t.rows[r][0].is_nan());
+            assert!(t.value(r, 0).is_nan());
         }
         // A genuinely unparseable cell still makes the column non-numeric.
         let bad = table("x\n1\nnot-a-number\n");
@@ -2865,7 +3141,7 @@ mod tests {
         assert_eq!(typed.variables[1].source.as_deref(), Some("symbol"));
         let a = typed.table.index_of("symbol=A").unwrap();
         assert_eq!(
-            typed.table.rows.iter().map(|r| r[a]).collect::<Vec<_>>(),
+            typed.table.col(a).to_vec(),
             vec![0.0, 1.0, 0.0]
         );
     }

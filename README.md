@@ -776,6 +776,7 @@ docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
+docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric

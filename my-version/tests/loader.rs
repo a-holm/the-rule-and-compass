@@ -23,23 +23,23 @@ fn a_row_with_the_wrong_field_count_is_refused_not_dropped() {
 
     // The well-formed control is unchanged: all three rows survive in order.
     let t = data::parse_table("x,y\n1,2\n3,4\n5,6\n").unwrap();
-    assert_eq!(t.rows.len(), 3);
-    assert_eq!(t.rows[1], vec![3.0, 4.0]);
+    assert_eq!(t.len(), 3);
+    assert_eq!((0..t.n_cols()).map(|j| t.value(1, j)).collect::<Vec<_>>(), vec![3.0, 4.0]);
     assert_eq!(t.skipped_malformed, 0);
 }
 
 #[test]
 fn blank_and_comment_lines_are_not_data_rows() {
     let t = data::parse_table("# exported by a sheet\n\nx,y\n1,2\n\n# a note\n3,4\n").unwrap();
-    assert_eq!(t.rows.len(), 2);
-    assert_eq!(t.rows[1], vec![3.0, 4.0]);
+    assert_eq!(t.len(), 2);
+    assert_eq!((0..t.n_cols()).map(|j| t.value(1, j)).collect::<Vec<_>>(), vec![3.0, 4.0]);
     assert_eq!(t.skipped_malformed, 0);
 }
 
 #[test]
 fn skip_malformed_drops_exactly_one_row_and_reports_it() {
     let t = data::parse_table_with(RAGGED, true).unwrap();
-    assert_eq!(t.rows.len(), 3, "one of four data rows is ragged");
+    assert_eq!(t.len(), 3, "one of four data rows is ragged");
     assert_eq!(t.skipped_malformed, 1);
 
     let vars = ["x".to_string()];
@@ -129,4 +129,32 @@ fn the_cli_skip_malformed_flag_reports_the_skipped_count() {
         err.contains("--skip-malformed dropped 1 ragged row(s)"),
         "stderr: {err}"
     );
+}
+
+/// Issue #70: the parser fills one contiguous column-major image, and text
+/// columns are dictionary codes rather than a `String` per cell.
+#[test]
+fn column_major_layout_matches_the_parser() {
+    let t = data::parse_table("x,label,y\n1,A,10\n2,B,20\n3,A,30\n").unwrap();
+    assert_eq!(t.numeric, vec![true, false, true]);
+    assert_eq!(t.col(0), &[1.0, 2.0, 3.0]);
+    assert_eq!(t.col(2), &[10.0, 20.0, 30.0]);
+    assert!(t.col(1).is_empty(), "a text column keeps no f64 copy");
+    assert!(t.value(0, 1).is_nan());
+    let dict = t.dict(1).expect("text column is dictionary encoded");
+    assert_eq!(dict.levels, vec!["A", "B"]);
+    assert_eq!(dict.codes, vec![0, 1, 0]);
+    assert_eq!(t.text(2, 1), Some("A"));
+
+    // A low-cardinality numeric column keeps the exact source text; a
+    // high-cardinality one does not (the text would dominate memory).
+    let lo = data::parse_table("flag,y\n1,0\n0,1\n1,1\n").unwrap();
+    assert_eq!(lo.dict(0).unwrap().levels, vec!["1", "0"]);
+    let mut csv = String::from("x,y\n");
+    for i in 0..(data::NUMERIC_DICT_MAX + 10) {
+        csv.push_str(&format!("{},{}\n", i, i));
+    }
+    let hi = data::parse_table(&csv).unwrap();
+    assert!(hi.dict(0).is_none(), "high-cardinality numeric text is dropped");
+    assert_eq!(hi.col(0).len(), hi.len());
 }
