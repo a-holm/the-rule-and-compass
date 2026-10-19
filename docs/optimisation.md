@@ -252,7 +252,10 @@ Ordered by expected gain per unit effort **[planned]**:
    kernel".
 5. **Semantic backpropagation mutation** (replace a sub-tree with the library
    member whose semantics is closest to the desired one).
-6. **Warm starts**: persist the front and restart from it.
+6. **Warm starts from a persisted front**: save the archive and restart from
+   it, so later runs begin with the best shapes found so far, rather than
+   rediscovering them. (Pareto-front parent feedback *within* a run is
+   implemented and measured in §3.2.1.)
 
 ### 3.2.1 Pareto-front parent feedback (#76)
 

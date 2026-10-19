@@ -96,7 +96,11 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
   most accurate equation found so far.
 - The loop advances in **generations**. Each generation: evaluate the
   population, update the front, then breed the next generation.
-- **Selection** is by tournament within an island.
+- **Selection** is by tournament within an island. With probability 15 %, a
+  parent is instead drawn uniformly from the global Pareto front: the front is
+  non-dominated, so each member is the best shape found at some complexity, and
+  this lets a building block found on another island or generations earlier
+  re-enter the population. `--no-front-parents` disables the feedback.
 - **Variation** has two parts:
   - *mutation* — the edit kind is drawn first (25 % point change, 35 %
     constant/input perturb, 40 % subtree grow/shrink) and the site is chosen

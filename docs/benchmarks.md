@@ -229,6 +229,49 @@ reachable — a run of an earlier build found it at complexity 7 — so this is 
 stochastic limit of the search at this budget, not an impossibility. That is
 exactly the kind of information the suite exists to produce.
 
+### 5.3 Pareto-front parent feedback (#76)
+
+From #76 the search draws 15 % of parents uniformly from the global Pareto
+front (`--no-front-parents` restores the old trajectory exactly). The full
+suite was run with the feature on and off for three seeds, same budget and same
+machine, one run after another:
+
+```sh
+rcsr-bench --suite known-truth --noise 0.0,0.01,0.1 --seed <S> [--no-front-parents]
+```
+
+| seed | policy | recovered | median cx | wall (s) | `pythagoras` R² @ 0 / 0.01 / 0.10 |
+|---:|---|---:|---:|---:|---|
+| 1 | off | 72/75 | 3 | 271.67 | 0.987 / 0.721 / 0.987 |
+| 1 | **on** | **74/75** | 3 | 287.52 | **0.993** / 0.987 / **1.000** |
+| 7 | off | 72/75 | 4 | 262.65 | 0.955 / 0.962 / 0.957 |
+| 7 | **on** | **75/75** | **3** | 278.43 | **0.998** / **1.000** / **1.000** |
+| 42 | off | 72/75 | 3 | 285.97 | 0.942 / 0.766 / 0.952 |
+| 42 | **on** | **74/75** | 3 | 289.21 | **0.996** / **1.000** / 0.981 |
+
+The gain is consistent across seeds: **+2, +3 and +2** recovered, entirely on
+`pythagoras`, which is recovered at 0 % noise for all three seeds (0.993, 0.998,
+0.996) and at every noise level for seed 7. No problem that was recovered with
+the feature off is lost with it on, and median complexity does not rise (seed 7
+falls from 4 to 3). Wall-clock is 1–6 % higher, which is within the
+run-to-run noise seen on this machine; it is not a speed claim.
+
+At a smaller budget (`--generations 60 --pop 100 --islands 1 --seed 1`) the
+total is **neutral**: 71/75 both ways, median complexity 3 both ways, 48.70 s
+off versus 46.68 s on. The composition differs. Without feedback all 25
+noiseless problems are recovered and `pythagoras` is exact (R² 1.000); with
+feedback 23 are recovered at 0 % but 24 at each noise level, and `pythagoras`
+is not recovered at any noise level (0.961 / 0.651 / 0.962 versus
+1.000 / 0.833 / 0.675 off). So the full-budget gain does not transfer to this
+smaller budget; the feature is kept on because the recorded full suite improves
+consistently across three seeds, but the budget sensitivity is real.
+
+Bloat is bounded by the existing machinery: the child of a front parent goes
+through `simplify`, the `max_complexity` check (before and after constant
+fitting) and structural de-duplication, and only the tree is taken — the front
+member's stored error is never used as fitness. The median complexity numbers
+above confirm there is no size drift at this budget.
+
 ## 6. Reproducing and limitations
 
 * Reproduce a run by reusing the same `--seed`; the data and the noise
