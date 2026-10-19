@@ -710,7 +710,13 @@ list and the recorded results.
   nothing left to gain;
 - **subsampled fitness** (`--predictor-samples N`): each generation scores and
   fits candidates on `N` training rows drawn without replacement, while the
-  archive and every reported error are re-scored on the full training set;
+  archive and every reported error are re-scored on the full training set.
+  Carried individuals are refitted on the generation's subset before they are
+  scored, so everyone is compared as `fit(S_g) -> score(S_g)` rather than with
+  stale constants. A request at least the training size is an exact no-op, and
+  a request above the measured break-even (3/5 of the rows) is widened to the
+  full sample, because rebuilding the sample and refitting the carried
+  population cost more than the rows saved;
 - **screened constant fitting** (`--fit-samples N`): within each generation,
   all offspring are fitted and scored on a fresh deterministic `N`-row subset,
   the top 1/16 are promoted to a full-data refit and re-score, and the next
