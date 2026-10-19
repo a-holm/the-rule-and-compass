@@ -19,7 +19,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability};
+use rcsr::{data, diagnostics, multi, search, stability, store};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -89,12 +89,22 @@ fn usage() -> String {
 
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
+  rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
 INPUT:
-  --data <file|->            CSV/TSV/whitespace table, header row required
-                             ('-' reads the table from standard input)
+  --data <file|->            CSV/TSV/whitespace table, or a `.rcsb` column
+                             store made by `rcsr import`; header row required
+                             for CSV ('-' reads the table from standard input)
+  --max-memory <size>        refuse when the estimated resident footprint is
+                             larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
+                             512MB, 2GiB). Exit 3 with an actionable message
+                             instead of SIGABRT/SIGKILL. A `.rcsb` store that
+                             does not fit is searched from a hash sample with
+                             bounded RSS; a CSV is refused before parsing.
+  --force                    override --max-memory and try the resident path
+                             anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -535,6 +545,10 @@ fn mean_of(it: impl Iterator<Item = f64>) -> f64 {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let command = format!("rcsr {}", args.join(" "));
+    // #71: `import` is a subcommand, handled before the search option parser.
+    if args.first().map(|s| s.as_str()) == Some("import") {
+        run_import(&args[1..]);
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
         std::process::exit(EXIT_OK);
@@ -588,6 +602,10 @@ fn main() {
     let mut cv_k = 5usize;
     let mut fill = data::FillMethod::None;
     let mut skip_malformed = false;
+    // #71: memory guard. `--max-memory` is an explicit byte budget; `--force`
+    // is the deliberate override.
+    let mut max_memory: Option<u64> = None;
+    let mut force = false;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
     let mut center = data::Center::Mean;
@@ -642,6 +660,21 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--data" => data_path = Some(val!()),
+            // #71: refuse before the resident Table is built.
+            "--max-memory" => {
+                let v = val!();
+                match parse_memory_bytes(&v) {
+                    Ok(n) if n > 0 => max_memory = Some(n),
+                    _ => {
+                        eprintln!(
+                            "error: --max-memory needs a positive size (bytes, KiB/MiB/GiB/GB), got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--force" => force = true,
             "--skip-malformed" => skip_malformed = true,
             "--target" => target = Some(val!()),
             "--vars" => {
@@ -1312,14 +1345,69 @@ fn main() {
         }
     }
 
+    // #71: the guard and the backing choice happen before any resident Table
+    // or search sample is built.
+    let detected_budget = store::detected_memory_budget();
+    let budget = max_memory.or(detected_budget);
+    // A CSV refusal uses only a hard wall (`--max-memory`, `ulimit -v` or a
+    // cgroup limit), never the soft MemAvailable figure: the 33x estimate is
+    // deliberately conservative.
+    let guard_budget = max_memory.or_else(store::detected_hard_budget);
+    let mut out_of_core_note: Option<String> = None;
     let table = if data_path == "-" {
         let mut buf = String::new();
         if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
             eprintln!("error reading stdin: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        if let Some(limit) = guard_budget {
+            let estimate = (buf.len() as u64).saturating_mul(33);
+            if estimate > limit && !force {
+                refuse_for_memory("<stdin>", buf.len() as u64, estimate, limit);
+            }
+        }
         data::parse_table_with(&buf, skip_malformed)
+    } else if store::is_store_path(&data_path) {
+        match store::FileStore::open(&data_path) {
+            Ok(fs) => {
+                let estimate = fs.estimated_resident_bytes();
+                let resident = force || budget.map_or(true, |limit| estimate <= limit);
+                if resident {
+                    fs.to_table()
+                } else {
+                    let limit = budget.unwrap_or(estimate);
+                    let cap = store::sample_row_cap(limit, fs.n_cols());
+                    let rows = fs.n_rows();
+                    match fs.sample_table(cap, cfg.seed as u64) {
+                        Ok(t) => {
+                            out_of_core_note = Some(format!(
+                                "out of core: '{}' has {} rows x {} cols (estimated resident \
+                                 footprint {}); searched a {}-row hash sample (seed {}), \
+                                 scanned group by group with RSS bounded by one group",
+                                data_path,
+                                rows,
+                                fs.n_cols(),
+                                human_bytes(estimate),
+                                t.len(),
+                                cfg.seed
+                            ));
+                            Ok(t)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        }
     } else {
+        if let Ok(meta) = std::fs::metadata(&data_path) {
+            if let Some(limit) = guard_budget {
+                let estimate = meta.len().saturating_mul(33);
+                if estimate > limit && !force {
+                    refuse_for_memory(&data_path, meta.len(), estimate, limit);
+                }
+            }
+        }
         data::read_table_with(&data_path, skip_malformed)
     };
     let table = match table {
@@ -1517,6 +1605,11 @@ fn main() {
     };
 
     let mut notes: Vec<String> = Vec::new();
+    // #71: the out-of-core note belongs to the run report. It is deliberately
+    // explicit that a sampled run is not a full-data run.
+    if let Some(note) = out_of_core_note {
+        notes.push(note);
+    }
 
     // Pick the split mode: explicit flag > columns named on the command line >
     // inference from the data.
@@ -4715,6 +4808,228 @@ fn metric_names() -> String {
         .join(", ")
 }
 
+// ---------------------------------------------------------------------------
+// #71: memory guard and `import`
+// ---------------------------------------------------------------------------
+
+/// Parse `bytes`, `KB`/`KiB`, `MB`/`MiB`, `GB`/`GiB` (case-insensitive).
+/// Bare numbers are bytes. Decimal suffixes use 1000, binary suffixes 1024.
+fn parse_memory_bytes(src: &str) -> Result<u64, String> {
+    let s = src.trim();
+    if s.is_empty() {
+        return Err("empty size".to_string());
+    }
+    let split = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (num, unit) = s.split_at(split);
+    let value: f64 = num.parse().map_err(|_| format!("'{}' is not a number", num))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err("size must be positive".to_string());
+    }
+    let unit = unit.trim().to_ascii_lowercase();
+    let factor: f64 = match unit.as_str() {
+        "" | "b" | "byte" | "bytes" => 1.0,
+        "k" | "kb" => 1_000.0,
+        "m" | "mb" => 1_000_000.0,
+        "g" | "gb" => 1_000_000_000.0,
+        "t" | "tb" => 1_000_000_000_000.0,
+        "ki" | "kib" => 1_024.0,
+        "mi" | "mib" => 1_048_576.0,
+        "gi" | "gib" => 1_073_741_824.0,
+        "ti" | "tib" => 1_099_511_627_776.0,
+        other => return Err(format!("unknown size unit '{}'", other)),
+    };
+    Ok((value * factor) as u64)
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = bytes as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i + 1 < UNITS.len() {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{} {}", bytes, UNITS[0])
+    } else {
+        format!("{:.2} {}", v, UNITS[i])
+    }
+}
+
+fn refuse_for_memory(path: &str, file_bytes: u64, estimate: u64, limit: u64) -> ! {
+    eprintln!("error: input would exceed the memory budget");
+    eprintln!(
+        "  {}: {} on disk; estimated resident footprint {} (~33x, measured 1.75 KiB/row)",
+        path,
+        human_bytes(file_bytes),
+        human_bytes(estimate)
+    );
+    eprintln!(
+        "  memory budget is {} ({} bytes; set it with --max-memory)",
+        human_bytes(limit),
+        limit
+    );
+    eprintln!("  re-run with a larger budget, pass --force to attempt it anyway, or");
+    eprintln!("  convert it once and search out of core:");
+    eprintln!("    rcsr import <input.csv> <store.rcsb>");
+    eprintln!("    rcsr --data <store.rcsb> --target <col> --max-memory {}", human_bytes(limit));
+    std::process::exit(EXIT_INPUT);
+}
+
+fn import_usage() -> String {
+    format!(
+        "rcsr {VERSION} — import a CSV into a versioned column store
+
+USAGE:
+  rcsr import <input.csv> [<store.rcsb>] [options]
+
+  The output defaults to the input path with its extension replaced by `.rcsb`.
+  The store is deterministic: the same input and --group-rows produce the same
+  bytes. It is searched with `rcsr --data <store.rcsb> ...`; when it does not
+  fit the memory budget the run scans it group by group and searches a hash
+  sample with bounded RSS.
+
+OPTIONS:
+  --data <input.csv>       input table (alternative to the positional path)
+  --out <store.rcsb>       output store
+  --group-rows <N>         rows per I/O group (default {})
+  --skip-malformed         drop ragged rows instead of refusing the input
+  --max-memory <size>      refuse before parsing when ~33x the CSV exceeds this
+  --force                  override --max-memory
+  --quiet                  do not print the summary
+  -h, --help               show this help
+",
+        store::DEFAULT_GROUP_ROWS
+    )
+}
+
+fn run_import(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", import_usage());
+        std::process::exit(EXIT_OK);
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("rcsr {}", VERSION);
+        std::process::exit(EXIT_OK);
+    }
+    let mut input: Option<String> = None;
+    let mut output: Option<String> = None;
+    let mut group_rows = store::DEFAULT_GROUP_ROWS;
+    let mut skip_malformed = false;
+    let mut max_memory: Option<u64> = None;
+    let mut force = false;
+    let mut quiet = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data" | "-d" => {
+                i += 1;
+                input = args.get(i).cloned();
+                if input.is_none() {
+                    eprintln!("error: {} requires a value", args[i - 1]);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+            "--out" | "-o" => {
+                i += 1;
+                output = args.get(i).cloned();
+                if output.is_none() {
+                    eprintln!("error: {} requires a value", args[i - 1]);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+            "--group-rows" => {
+                i += 1;
+                match args.get(i).and_then(|v| v.parse::<usize>().ok()) {
+                    Some(n) if n >= 1 => group_rows = n,
+                    _ => {
+                        eprintln!("error: --group-rows needs an integer >= 1");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--skip-malformed" => skip_malformed = true,
+            "--max-memory" => {
+                i += 1;
+                match args.get(i).map(|s| parse_memory_bytes(s)) {
+                    Some(Ok(n)) if n > 0 => max_memory = Some(n),
+                    _ => {
+                        eprintln!("error: --max-memory needs a positive size");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--force" => force = true,
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown import option '{}'\n\n{}", other, import_usage());
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                } else if output.is_none() {
+                    output = Some(other.to_string());
+                } else {
+                    eprintln!("error: unexpected argument '{}'", other);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+        i += 1;
+    }
+    let input = input.unwrap_or_else(|| {
+        eprintln!("error: import needs an input CSV\n\n{}", import_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let output = output.unwrap_or_else(|| {
+        std::path::Path::new(&input)
+            .with_extension("rcsb")
+            .to_string_lossy()
+            .into_owned()
+    });
+    if store::is_store_path(&input) {
+        eprintln!("error: '{}' is already a column store", input);
+        std::process::exit(EXIT_USAGE);
+    }
+    let meta = match std::fs::metadata(&input) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("error: {}: {}", input, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    if let Some(limit) = max_memory.or_else(store::detected_hard_budget) {
+        let estimate = meta.len().saturating_mul(33);
+        if estimate > limit && !force {
+            refuse_for_memory(&input, meta.len(), estimate, limit);
+        }
+    }
+    let table = match data::read_table_with(&input, skip_malformed) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    if let Err(e) = store::write_store(&output, &table, group_rows) {
+        eprintln!("error: {}", e);
+        std::process::exit(EXIT_INPUT);
+    }
+    if !quiet {
+        println!(
+            "imported {} rows x {} columns to {} (group_rows={})",
+            table.len(),
+            table.n_cols(),
+            output,
+            group_rows
+        );
+    }
+    std::process::exit(EXIT_OK);
+}
+
 #[cfg(test)]
 mod tests {
     /// #91: a default run must be CPU regardless of build features, so the
@@ -4728,6 +5043,24 @@ mod tests {
     }
 
     use super::*;
+
+    /// #71: the guard and the import command must be discoverable.
+    #[test]
+    fn help_and_schema_document_the_memory_guard_and_import() {
+        for flag in ["--max-memory", "--force"] {
+            assert!(usage().contains(flag), "usage() is missing {flag}");
+            assert!(
+                schema::json().contains(&format!("\"{}\"", flag)),
+                "schema::json() is missing {flag}"
+            );
+        }
+        assert!(usage().contains("rcsr import"));
+        assert!(import_usage().contains("--group-rows"));
+        assert_eq!(parse_memory_bytes("512MB").unwrap(), 512_000_000);
+        assert_eq!(parse_memory_bytes("2GiB").unwrap(), 2 * 1_073_741_824);
+        assert_eq!(parse_memory_bytes("4096").unwrap(), 4096);
+        assert!(parse_memory_bytes("12 quatloos").is_err());
+    }
 
     /// `--help` and `schema` are hand-written; this keeps them in step with the
     /// metric enum so a new metric cannot ship undocumented.

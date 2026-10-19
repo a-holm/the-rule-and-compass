@@ -205,6 +205,21 @@ impl GroupBuf {
         Self::default()
     }
 
+    // #71: the file backing fills a `GroupBuf` in place; these are crate-only
+    // so the public shape stays exactly the one #70 documented.
+    pub(crate) fn prepare(&mut self, len: usize, n_cols: usize) {
+        self.resize(len, n_cols);
+    }
+
+    pub(crate) fn col_mut(&mut self, c: usize) -> &mut [f64] {
+        &mut self.cols[c]
+    }
+
+    /// #71: borrow the filled buffer as a `GroupView`.
+    pub(crate) fn view_ref(&self) -> GroupView<'_> {
+        self.view()
+    }
+
     fn resize(&mut self, len: usize, n_cols: usize) {
         self.cols.resize_with(n_cols, Vec::new);
         for c in &mut self.cols {
