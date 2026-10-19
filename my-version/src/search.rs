@@ -67,6 +67,11 @@ pub struct Config {
     /// training row before it is reported. Values below 2 are rejected by the
     /// CLI.
     pub fit_samples: usize,
+    /// #76: let the global Pareto front supply a fraction of parents. `false`
+    /// is the pre-#76 algorithm, bit for bit; `true` (the default when it is
+    /// measured to help) draws a parent from the front with probability
+    /// [`FRONT_PARENT_P`] instead of the island tournament.
+    pub front_parents: bool,
     /// #25: declared units for the inputs (in input order) and the target.
     /// `None` disables dimensional analysis entirely.
     pub units: Option<Units>,
@@ -123,6 +128,7 @@ impl Default for Config {
             patience: 40,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
+            front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
             progress: None,
@@ -170,6 +176,7 @@ impl Config {
         compare!(patience, "patience");
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
+        compare!(front_parents, "front_parents"); // #76
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -876,6 +883,41 @@ fn tournament(island: &[Ind], rng: &mut Mt, k: usize) -> usize {
     best
 }
 
+// #76: fraction of parent draws that come from the global Pareto front.
+//
+// The front is non-dominated, so every member is the best expression found at
+// some complexity. Drawing uniformly over it keeps that spread: a complex but
+// much more accurate shape is as likely as a small one, and the existing
+// `max_complexity` check, simplification and de-duplication still reject a
+// bloated offspring. Biasing toward low complexity would instead duplicate what
+// the island tournament already does.
+const FRONT_PARENT_P: f64 = 0.15;
+
+/// #76: optionally draw a parent tree from the front.
+///
+/// Returns `None` without touching the RNG when the feature is off (`p == 0`)
+/// or the front is empty, so an off run is bit-identical to the pre-#76 search.
+/// The stored `Sol.error` is deliberately ignored: it may come from a
+/// different row subset (`--predictor-samples`), and the child is always scored
+/// on the generation's own sample anyway.
+fn front_parent<'a>(front: &'a [Sol], rng: &mut Mt, p: f64) -> Option<&'a Node> {
+    if p > 0.0 && !front.is_empty() && rng.bool(p) {
+        Some(&front[rng.usize_below(front.len())].tree)
+    } else {
+        None
+    }
+}
+
+/// #76: one parent, from the front with probability `p`, else the island
+/// tournament. The draw uses the island's own RNG, so a run remains
+/// deterministic for a given seed.
+fn pick_parent<'a>(island: &'a [Ind], front: &'a [Sol], rng: &mut Mt, p: f64) -> &'a Node {
+    match front_parent(front, rng, p) {
+        Some(tree) => tree,
+        None => &island[tournament(island, rng, 4)].tree,
+    }
+}
+
 // #77: seed the per-generation duplicate set with the elite (`next`) and every
 // parent (`isl`), so a child that is an unchanged parent is rejected before the
 // expensive fit and score.
@@ -903,6 +945,11 @@ fn evolve_island(
     screened: bool,
     // #26: leave the fitness pending when the caller will batch it on the GPU.
     defer_gpu: bool,
+    // #76: the previous generation's Pareto front. Read-only and borrowed for
+    // the duration of the island thread; nothing is cloned and the islands
+    // still run in parallel. `front_p == 0.0` makes it a no-op.
+    front: &[Sol],
+    front_p: f64,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -936,11 +983,10 @@ fn evolve_island(
 
     while next.len() < pop && attempts < max_attempts {
         attempts += 1;
-        let p1 = tournament(isl, rng, 4);
-        let mut child = isl[p1].tree.clone();
+        let p1 = pick_parent(isl, front, rng, front_p); // #76
+        let mut child = p1.clone();
         if rng.bool(0.5) {
-            let p2 = tournament(isl, rng, 4);
-            let parent2 = isl[p2].tree.clone();
+            let parent2 = pick_parent(isl, front, rng, front_p).clone(); // #76
             crossover_with(&mut child, &parent2, rng, Some(aggs));
         }
         mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
@@ -1531,6 +1577,16 @@ fn run_search(
             // ---- parallel generation across islands ---------------------
             let aggs_ref = &aggs;
             let eval_view = eval_data; // #27
+            // #76: the front from the previous generation is borrowed, not
+            // copied, and the scope ends before this generation updates the
+            // archive below. At generation 0 (or with the feature off) it is
+            // empty or unused and the search is unchanged.
+            let front: &[Sol] = &archive.items;
+            let front_p = if cfg.front_parents {
+                FRONT_PARENT_P
+            } else {
+                0.0
+            };
             std::thread::scope(|s| {
                 let handles: Vec<_> = islands
                     .iter_mut()
@@ -1550,6 +1606,8 @@ fn run_search(
                                 aggs_ref,
                                 screened,
                                 defer_gpu && !screened,
+                                front,   // #76
+                                front_p, // #76
                             ) // #85
                         })
                     })
@@ -1870,6 +1928,149 @@ mod tests {
             y.push(a);
         }
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    // #76: two distinguishable front members.
+    fn two_member_front() -> Vec<Sol> {
+        vec![
+            Sol {
+                tree: input(0),
+                error: 0.1,
+                complexity: 1,
+                cost: 1.0,
+            },
+            Sol {
+                tree: constant(2.0),
+                error: 0.2,
+                complexity: 1,
+                cost: 1.0,
+            },
+        ]
+    }
+
+    /// #76: at p = 1 every parent comes from the front; at p = 0 every parent
+    /// comes from the island. The front is non-dominated, so the draw is
+    /// uniform and both members must appear.
+    #[test]
+    fn archive_parent_draws_from_front() {
+        let front = two_member_front();
+        // A tree that is in neither front member.
+        let island = vec![Ind {
+            tree: node(Op::Sin, vec![input(0)]),
+            error: 1.0,
+            complexity: 1.0,
+        }];
+
+        let mut rng = Mt::new(11);
+        let mut seen = [0usize; 2];
+        for _ in 0..100 {
+            let t = pick_parent(&island, &front, &mut rng, 1.0);
+            let k = if t == &front[0].tree {
+                0
+            } else if t == &front[1].tree {
+                1
+            } else {
+                panic!("p = 1.0 drew a parent that is not on the front");
+            };
+            seen[k] += 1;
+        }
+        assert!(seen[0] > 0 && seen[1] > 0, "uniform front draw: {seen:?}");
+
+        let mut rng = Mt::new(11);
+        for _ in 0..100 {
+            assert!(
+                pick_parent(&island, &front, &mut rng, 0.0) == &island[0].tree,
+                "p = 0.0 must use the island tournament"
+            );
+        }
+
+        assert!(
+            front_parent(&[], &mut Mt::new(1), 1.0).is_none(),
+            "an empty front is a no-op"
+        );
+    }
+
+    /// #76: with the feature off, a populated front changes nothing — same
+    /// population and same RNG state as an empty front.
+    #[test]
+    fn front_snapshot_is_inert_when_off() {
+        let s = sample();
+        let aggs = AggTable::from_sample(&s);
+        let mut cfg = Config::default();
+        cfg.pop = 8;
+        cfg.fit_iters = 0;
+        let data = EvalSample::new(&s, &cfg);
+
+        let base: Vec<Ind> = (0..8)
+            .map(|i| {
+                Ind::evaluated(
+                    if i % 2 == 0 {
+                        input(0)
+                    } else {
+                        node(Op::Add, vec![input(0), constant(i as f64)])
+                    },
+                    &data,
+                    &cfg,
+                )
+            })
+            .collect();
+
+        let run = |front: &[Sol]| {
+            let mut isl = base.clone();
+            let mut rng = Mt::new(7);
+            evolve_island(
+                &mut isl,
+                &mut rng,
+                &cfg,
+                &data,
+                &s,
+                1,
+                &aggs,
+                false,
+                false,
+                front,
+                0.0,
+            );
+            let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
+            let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
+            (trees, errors, *rng.state().0, rng.state().1)
+        };
+
+        let empty = run(&[]);
+        let filled = run(&two_member_front());
+        assert_eq!(empty.0, filled.0, "the front changed the population");
+        assert_eq!(empty.1, filled.1, "the front changed the errors");
+        assert_eq!(empty.2, filled.2, "the front consumed RNG draws");
+        assert_eq!(empty.3, filled.3, "the front moved the RNG index");
+    }
+
+    /// #76: the feedback path runs end to end and never archives a non-finite
+    /// error.
+    #[test]
+    fn front_feedback_run_is_finite() {
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for i in 0..40 {
+            let v = i as f64 / 39.0;
+            x.push(vec![v]);
+            y.push(2.0 * v + 1.0);
+        }
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let test = train.clone();
+        let cfg = Config {
+            generations: 4,
+            pop: 20,
+            islands: 1,
+            seed: 3,
+            ..Config::default()
+        };
+        assert!(cfg.front_parents, "the feedback path must be on");
+        let out = run(&cfg, &train, &test);
+        assert!(!out.archive.items.is_empty(), "the archive is non-empty");
+        assert!(
+            out.archive.items.iter().all(|s| s.error.is_finite()),
+            "every archived error is finite"
+        );
     }
 
     #[test]

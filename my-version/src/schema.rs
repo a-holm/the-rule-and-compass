@@ -66,6 +66,7 @@ pub fn json() -> String {
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
+        ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         // #85: fit-only screening; survivors are refit on the full training sample.

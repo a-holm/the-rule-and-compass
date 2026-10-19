@@ -335,6 +335,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--no-front-parents]
      [--fit-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
@@ -702,6 +703,13 @@ list and the recorded results.
   restarts, run in parallel across islands;
 - **ε-dominance** archiving and **lexicographic parsimony pressure**, so the
   front stays small and expressions stay short;
+- **Pareto-front parent feedback** (15%): one parent in six is drawn from the
+  global archive instead of the island tournament, so a shape found on another
+  island or generations earlier can be recombined rather than lost.
+  Measured on the known-truth suite at three seeds: **72 → 74/75**, **72 → 75/75**
+  and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
+  **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
+  restores the previous trajectory exactly;
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
