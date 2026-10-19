@@ -606,7 +606,9 @@ On a small sample, `--bootstrap-error n` refits each solution's constants on `n`
 bootstrap resamples of the training rows and reports the **apparent**, the
 **out-of-bag** and the **.632+** error (Efron & Tibshirani 1997) per solution;
 the `.632+` estimate interpolates the optimistic and pessimistic numbers and
-always lies between them.
+always lies between them. Above `n^0.7 >= 1000` rows (about 19 300) the draw is
+bounded with a bag-of-little-bootstraps subsample of `b = n^0.7` rows, and the
+resample size is reported in text and `--json`.
 
 `--cv k-fold|rolling|purged` goes further: it rebuilds the split as `k` folds,
 re-runs the whole search on each fold's training rows (normalised on those rows
@@ -619,7 +621,9 @@ costs about `k` extra searches.
 back?** It bootstraps the training rows `B` times, re-runs the identical search
 on each resample and ranks the structural forms and input variables by how often
 they are selected. A variable at 100% is one the data insists on; one near 0% is
-noise the search only sometimes needed. Cost: `B` extra searches.
+noise the search only sometimes needed. Cost: `B` extra searches. The same BLB
+cap as `--bootstrap-error` applies above about 19 300 rows, and the resample size
+is reported.
 
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.

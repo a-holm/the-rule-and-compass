@@ -16,6 +16,11 @@ use crate::expr::{self, Node, Op};
 use crate::rng::Mt;
 use crate::search::{self, Config};
 
+// #92: resampling is an index draw in `crate::resample`, shared with the
+// bootstrap diagnostic. It stays bit-identical to the old row-clone draw below
+// the BLB cap; `stability::resample` remains the public entry point.
+pub use crate::resample::resample;
+
 /// The structural form of a tree: the expression with every fitted constant
 /// collapsed to `c` and every input to `x0`, `x1`, ….
 ///
@@ -159,24 +164,9 @@ fn collect(n: &Node, out: &mut Vec<usize>) {
     }
 }
 
-/// A bootstrap resample of `s`: `s.len()` rows drawn **with replacement**.
-///
-/// When `s` is weighted the weights are drawn along with their rows, so the
-/// resampled search solves the same weighted problem on the resampled rows. An
-/// unweighted sample stays unweighted (empty `w`), preserving the old results.
-pub fn resample(s: &Sample, rng: &mut Mt) -> Sample {
-    let n = s.len();
-    let mut out = Sample::default();
-    for _ in 0..n {
-        let i = rng.usize_below(n);
-        out.x.push(s.x[i].clone());
-        out.y.push(s.y[i]);
-        if !s.w.is_empty() {
-            out.w.push(s.w[i]);
-        }
-    }
-    out
-}
+// #92: `resample` moved to `crate::resample`; it draws indices and gathers
+// only the selected rows. Below the BLB cap it reproduces the old row-clone
+// draw exactly, and above it the resample is `b = n^0.7` rows.
 
 /// One structural form that the search selected, and how often.
 #[derive(Clone, Debug)]
@@ -196,6 +186,12 @@ pub struct Stability {
     pub runs: usize,
     /// Resamples in which the search returned at least one solution.
     pub found: usize,
+    /// #92: training rows in the source sample.
+    pub source_rows: usize,
+    /// #92: rows searched in each resample (`n`, or `n^0.7` when capped).
+    pub resample_rows: usize,
+    /// #92: true when the BLB cap subsampled the source rows.
+    pub capped: bool,
     /// Structural forms, most frequent first.
     pub forms: Vec<Form>,
     /// `(variable index, count)` for every input, most frequent first.
@@ -229,6 +225,8 @@ impl Stability {
 /// result is a deterministic function of `cfg.seed`. Progress callbacks are
 /// cleared on the sub-searches so a stability run never pollutes a stream.
 pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[String]) -> Stability {
+    // #92: decide the resample size once; report it so a capped run is visible.
+    let plan = crate::resample::plan(train.len());
     let mut rng = Mt::new(cfg.seed ^ 0x5741_4c49);
     let mut counts: Vec<Form> = Vec::new();
     let mut var_counts = vec![0usize; vars.len()];
@@ -289,6 +287,9 @@ pub fn run(cfg: &Config, train: &Sample, test: &Sample, runs: usize, vars: &[Str
     Stability {
         runs: effective,
         found,
+        source_rows: plan.source_rows,
+        resample_rows: plan.rows,
+        capped: plan.capped,
         forms: counts,
         variables: vs,
     }
@@ -412,6 +413,9 @@ mod tests {
         let st = Stability {
             runs: 0,
             found: 0,
+            source_rows: 0,
+            resample_rows: 0,
+            capped: false,
             forms: Vec::new(),
             variables: Vec::new(),
         };

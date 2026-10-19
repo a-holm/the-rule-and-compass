@@ -217,11 +217,15 @@ OVERFITTING DIAGNOSTICS (always on):
   --bootstrap-error <n>      refit each solution's constants on n bootstrap
                              resamples and report the apparent, out-of-bag and
                              .632+ error estimates (Efron & Tibshirani 1997);
-                             costs n constant refits per reported solution
+                             costs n constant refits per reported solution.
+                             Above n^0.7 >= 1000 rows the draw is a bounded BLB
+                             subsample of b = n^0.7 rows (Kleiner et al. 2014)
+                             and the resample size is reported
   --stability <B>            bootstrap the training rows B times, re-run the
                              identical search and rank the structural forms and
                              input variables by how often they are selected;
-                             costs B extra searches
+                             costs B extra searches. The same BLB cap and
+                             resample-size report apply
 
 MODE:
   --eval-expr <expr>         do not search: parse this formula, score it on the
@@ -2668,14 +2672,21 @@ fn main() {
                 if let Some(b) = &r.bootstrap {
                     eprintln!(
                         "# bootstrap error (rank {}): apparent={:.6} out-of-bag={:.6} .632+={:.6} \
-                         ({} resamples, {} used, weight={:.3})",
+                         ({} resamples, {} used, weight={:.3}, rows={}{})",
                         r.rank,
                         b.apparent,
                         b.oob,
                         b.estimate,
                         b.resamples,
                         b.used,
-                        b.weight
+                        b.weight,
+                        b.resample_rows,
+                        // #92: make a capped estimator explicit.
+                        if b.capped {
+                            format!(" of {} (BLB cap b=n^0.7)", b.source_rows)
+                        } else {
+                            String::new()
+                        }
                     );
                 }
             }
@@ -2780,9 +2791,16 @@ fn main() {
             if let Some(st) = &stab {
                 let top = st.forms.first();
                 eprintln!(
-                    "# stability ({} resamples, {} found a solution): modal form {:.0}%{}",
+                    "# stability ({} resamples, {} found a solution, rows={}{}): modal form {:.0}%{}",
                     st.runs,
                     st.found,
+                    st.resample_rows,
+                    // #92: report the bounded BLB resample size.
+                    if st.capped {
+                        format!(" of {} (BLB cap b=n^0.7)", st.source_rows)
+                    } else {
+                        String::new()
+                    },
                     top.map(|f| f.frequency * 100.0).unwrap_or(0.0),
                     top.map(|f| format!("  y = {}", f.example)).unwrap_or_default()
                 );
@@ -3001,9 +3019,13 @@ fn main() {
                         })
                         .collect();
                     format!(
-                        "{{\"runs\":{},\"found\":{},\"forms\":[{}],\"variables\":[{}]}}",
+                        "{{\"runs\":{},\"found\":{},\"source_rows\":{},\"resample_rows\":{},\"capped\":{},\"forms\":[{}],\"variables\":[{}]}}",
                         st.runs,
                         st.found,
+                        // #92: the resample size and whether the BLB cap ran.
+                        st.source_rows,
+                        st.resample_rows,
+                        st.capped,
                         forms.join(","),
                         variables.join(",")
                     )
@@ -3183,9 +3205,13 @@ fn main() {
                     })
                     .collect();
                 println!(
-                    "{{\"event\":\"stability\",\"runs\":{},\"found\":{},\"forms\":[{}],\"variables\":[{}]}}",
+                    "{{\"event\":\"stability\",\"runs\":{},\"found\":{},\"source_rows\":{},\"resample_rows\":{},\"capped\":{},\"forms\":[{}],\"variables\":[{}]}}",
                     st.runs,
                     st.found,
+                    // #92: the resample size and whether the BLB cap ran.
+                    st.source_rows,
+                    st.resample_rows,
+                    st.capped,
                     forms.join(","),
                     variables.join(",")
                 );
@@ -4714,9 +4740,13 @@ fn benchmark_markdown(
 fn bootstrap_json(b: &Option<diagnostics::BootstrapError>) -> String {
     match b {
         Some(b) => format!(
-            "{{\"resamples\":{},\"used\":{},\"apparent\":{},\"oob\":{},\"no_information\":{},\"relative_overfitting\":{},\"weight\":{},\"estimate\":{}}}",
+            "{{\"resamples\":{},\"used\":{},\"source_rows\":{},\"resample_rows\":{},\"capped\":{},\"apparent\":{},\"oob\":{},\"no_information\":{},\"relative_overfitting\":{},\"weight\":{},\"estimate\":{}}}",
             b.resamples,
             b.used,
+            // #92: the resample size and whether the BLB cap ran.
+            b.source_rows,
+            b.resample_rows,
+            b.capped,
             jnum(b.apparent),
             jnum(b.oob),
             jnum(b.no_information),

@@ -97,6 +97,53 @@ fn the_summary_is_reproducible_from_the_seed() {
     assert_eq!(shapes_a, shapes_b, "the same seed must give the same forms");
 }
 
+/// The pre-#92 resampler, kept verbatim as the bit-exactness oracle.
+fn row_clone_resample(s: &data::Sample, rng: &mut Mt) -> data::Sample {
+    let n = s.len();
+    let mut out = data::Sample::default();
+    for _ in 0..n {
+        let i = rng.usize_below(n);
+        out.x.push(s.x[i].clone());
+        out.y.push(s.y[i]);
+        if !s.w.is_empty() {
+            out.w.push(s.w[i]);
+        }
+    }
+    out
+}
+
+#[test]
+fn index_resampling_is_bit_identical_to_row_cloning_below_the_cap() {
+    // #92: 100 rows is well below the BLB threshold; the draw must match the
+    // old per-row clone exactly, including order, duplicates and weights.
+    let n = 100;
+    let sample = data::Sample::weighted(
+        (0..n)
+            .map(|i| {
+                vec![
+                    i as f64 * 0.25,
+                    (i as f64 * 0.7).cos(),
+                    (i % 11) as f64 / 3.0,
+                ]
+            })
+            .collect(),
+        (0..n).map(|i| 3.0 - 0.5 * i as f64).collect(),
+        (0..n).map(|i| 1.0 + (i % 5) as f64).collect(),
+    );
+
+    let plan = rcsr::resample::plan(sample.len());
+    assert_eq!(plan.rows, n);
+    assert!(!plan.capped);
+
+    let new = stability::resample(&sample, &mut Mt::new(2024));
+    let old = row_clone_resample(&sample, &mut Mt::new(2024));
+
+    assert_eq!(new.len(), old.len());
+    assert_eq!(new.x, old.x, "row order or values changed");
+    assert_eq!(new.y, old.y);
+    assert_eq!(new.w, old.w);
+}
+
 #[test]
 fn frequency_of_an_unseen_form_is_zero() {
     let vars = vec!["x1".to_string()];

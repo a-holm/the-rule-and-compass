@@ -1198,6 +1198,12 @@ pub struct BootstrapError {
     /// Resamples that yielded a finite out-of-bag error (the rest were skipped,
     /// e.g. because the resample left no out-of-bag row).
     pub used: usize,
+    /// #92: training rows in the source sample.
+    pub source_rows: usize,
+    /// #92: rows drawn per resample: `n`, or `n^0.7` under the BLB cap.
+    pub resample_rows: usize,
+    /// #92: true when the BLB cap subsampled the source rows.
+    pub capped: bool,
     /// Error of the model on the full training set.
     pub apparent: f64,
     /// Mean out-of-bag error over the resamples.
@@ -1226,6 +1232,12 @@ const NO_INFO_PERMUTATIONS: usize = 32;
 /// [`crate::fit::fit`] and the model is scored on the rows left out (the
 /// out-of-bag rows) in the search's own metric. The out-of-bag error is the mean
 /// of those scores.
+///
+/// #92: when `n^0.7 >= 1_000` the draw is bounded with the bag of little
+/// bootstraps (Kleiner et al. 2014): a `b = n^0.7`-row subsample is drawn first
+/// and the resample is taken within it. `source_rows`, `resample_rows` and
+/// `capped` report which estimator ran. Below the threshold the result is
+/// bit-for-bit the exact bootstrap above.
 ///
 /// The no-information error rate `γ` is what the model would score if its
 /// predictions carried no information about the responses: the fitted values
@@ -1265,25 +1277,40 @@ pub fn bootstrap_error(
 
     // Out-of-bag error: refit constants on each bootstrap resample, score the
     // rows that did not make it into the resample.
+    //
+    // #92: the resample is an index draw; only the `b` selected rows are
+    // materialised. Above the BLB cap (`b = n^0.7`) the out-of-bag rows are the
+    // subsample rows not drawn. Below it the draw is exactly the old one.
+    let plan = crate::resample::plan(n);
     let mut oob_sum = 0.0;
     let mut oob_used = 0usize;
     if n > 0 && resamples > 0 {
-        let mut in_bag = vec![false; n];
-        let mut bx: Vec<Vec<f64>> = Vec::with_capacity(n);
-        let mut by: Vec<f64> = Vec::with_capacity(n);
+        let b = plan.rows;
+        let mut in_bag = vec![false; b];
+        let mut bx: Vec<Vec<f64>> = Vec::with_capacity(b);
+        let mut by: Vec<f64> = Vec::with_capacity(b);
         for _ in 0..resamples {
             for f in in_bag.iter_mut() {
                 *f = false;
             }
             bx.clear();
             by.clear();
-            for _ in 0..n {
-                let j = rng.usize_below(n);
+            let base = if plan.capped {
+                Some(crate::resample::subsample_indices(n, b, rng))
+            } else {
+                None
+            };
+            let draws = crate::resample::draw_indices(b, b, rng);
+            for &j in &draws {
+                let src = base.as_ref().map(|v| v[j]).unwrap_or(j);
                 in_bag[j] = true;
-                bx.push(train.x[j].clone());
-                by.push(train.y[j]);
+                bx.push(train.x[src].clone());
+                by.push(train.y[src]);
             }
-            let oob: Vec<usize> = (0..n).filter(|&j| !in_bag[j]).collect();
+            let oob: Vec<usize> = (0..b)
+                .filter(|&j| !in_bag[j])
+                .map(|j| base.as_ref().map(|v| v[j]).unwrap_or(j))
+                .collect();
             if oob.is_empty() {
                 continue;
             }
@@ -1354,6 +1381,9 @@ pub fn bootstrap_error(
     BootstrapError {
         resamples,
         used: oob_used,
+        source_rows: plan.source_rows,
+        resample_rows: plan.rows,
+        capped: plan.capped,
         apparent,
         oob,
         no_information,
@@ -1961,6 +1991,190 @@ mod tests {
         let mul = |a, b| node(Op::Mul, vec![a, b]);
         let x2 = mul(x(), x());
         add(add(constant(0.0), mul(constant(1.0), x())), mul(constant(2.0), x2))
+    }
+
+    /// #92: the pre-index implementation, kept verbatim as the exactness oracle.
+    fn legacy_bootstrap_error(
+        tree: &Node,
+        train: &Sample,
+        metric: Metric,
+        resamples: usize,
+        fit_iters: usize,
+        rng: &mut crate::rng::Mt,
+    ) -> BootstrapError {
+        let n = train.len();
+        let apparent_pred: Vec<f64> =
+            train.x.iter().map(|row| crate::expr::eval(tree, row)).collect();
+        let apparent = if n == 0 {
+            f64::INFINITY
+        } else {
+            crate::search::eval_error(tree, train, metric)
+        };
+        let mut oob_sum = 0.0;
+        let mut oob_used = 0usize;
+        if n > 0 && resamples > 0 {
+            let mut in_bag = vec![false; n];
+            let mut bx: Vec<Vec<f64>> = Vec::with_capacity(n);
+            let mut by: Vec<f64> = Vec::with_capacity(n);
+            for _ in 0..resamples {
+                for f in in_bag.iter_mut() {
+                    *f = false;
+                }
+                bx.clear();
+                by.clear();
+                for _ in 0..n {
+                    let j = rng.usize_below(n);
+                    in_bag[j] = true;
+                    bx.push(train.x[j].clone());
+                    by.push(train.y[j]);
+                }
+                let oob: Vec<usize> = (0..n).filter(|&j| !in_bag[j]).collect();
+                if oob.is_empty() {
+                    continue;
+                }
+                let mut t = tree.clone();
+                crate::fit::fit(&mut t, &bx, &by, fit_iters);
+                let scored = Sample {
+                    x: oob.iter().map(|&j| train.x[j].clone()).collect(),
+                    y: oob.iter().map(|&j| train.y[j]).collect(),
+                    w: Vec::new(),
+                    ys: Vec::new(),
+                };
+                let e = crate::search::eval_error(&t, &scored, metric);
+                if e.is_finite() {
+                    oob_sum += e;
+                    oob_used += 1;
+                }
+            }
+        }
+        let oob = if oob_used > 0 {
+            oob_sum / oob_used as f64
+        } else {
+            f64::INFINITY
+        };
+        let no_information = if n >= 2 && !apparent_pred.is_empty() {
+            let mut shuffled = train.y.clone();
+            let mut acc = 0.0;
+            for _ in 0..NO_INFO_PERMUTATIONS {
+                for j in (1..n).rev() {
+                    let t = rng.usize_below(j + 1);
+                    shuffled.swap(j, t);
+                }
+                acc += metrics::score_with_constants(
+                    &apparent_pred,
+                    &shuffled,
+                    metric,
+                    crate::expr::count_constants(tree),
+                );
+            }
+            acc / NO_INFO_PERMUTATIONS as f64
+        } else {
+            f64::NAN
+        };
+        let denom = no_information - apparent;
+        let relative_overfitting = if apparent.is_finite()
+            && oob.is_finite()
+            && denom.is_finite()
+            && denom > 0.0
+            && oob > apparent
+        {
+            ((oob - apparent) / denom).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let weight = BOOTSTRAP_632 / (1.0 - (1.0 - BOOTSTRAP_632) * relative_overfitting);
+        let estimate = if apparent.is_finite() && oob.is_finite() {
+            (1.0 - weight) * apparent + weight * oob
+        } else if apparent.is_finite() {
+            apparent
+        } else {
+            f64::INFINITY
+        };
+        BootstrapError {
+            resamples,
+            used: oob_used,
+            source_rows: n,
+            resample_rows: n,
+            capped: false,
+            apparent,
+            oob,
+            no_information,
+            relative_overfitting,
+            weight,
+            estimate,
+        }
+    }
+
+    #[test]
+    fn index_resampling_is_bit_identical_to_row_cloning_below_the_cap() {
+        // #92: 100 rows is well below the BLB threshold.
+        let n = 100;
+        let train = Sample {
+            x: (0..n)
+                .map(|i| vec![i as f64 * 0.1, (i as f64 * 0.37).sin(), i as f64 % 7.0])
+                .collect(),
+            y: (0..n).map(|i| 1.5 + 0.25 * i as f64).collect(),
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let mut tree = poly2_tree();
+        crate::fit::fit(&mut tree, &train.x, &train.y, 8);
+
+        let new = bootstrap_error(
+            &tree,
+            &train,
+            Metric::Squared,
+            20,
+            8,
+            &mut crate::rng::Mt::new(4242),
+        );
+        let old = legacy_bootstrap_error(
+            &tree,
+            &train,
+            Metric::Squared,
+            20,
+            8,
+            &mut crate::rng::Mt::new(4242),
+        );
+        assert!(!new.capped, "100 rows must stay on the exact bootstrap");
+        assert_eq!(new.resample_rows, n);
+        assert_eq!(new.source_rows, n);
+        assert_eq!(new.resamples, old.resamples);
+        assert_eq!(new.used, old.used);
+        for (a, b, what) in [
+            (new.apparent, old.apparent, "apparent"),
+            (new.oob, old.oob, "oob"),
+            (new.no_information, old.no_information, "no_information"),
+            (
+                new.relative_overfitting,
+                old.relative_overfitting,
+                "relative_overfitting",
+            ),
+            (new.weight, old.weight, "weight"),
+            (new.estimate, old.estimate, "estimate"),
+        ] {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}: {a:?} vs {b:?}");
+        }
+    }
+
+    #[test]
+    fn bootstrap_reports_the_blb_resample_size_above_the_cap() {
+        // 20 000 rows puts n^0.7 just above the 1 000-row BLB floor.
+        let n = 20_000;
+        let train = Sample {
+            x: (0..n).map(|i| vec![i as f64]).collect(),
+            y: (0..n).map(|i| 2.0 + 0.001 * i as f64).collect(),
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let tree = crate::expr::constant(2.0);
+        let mut rng = crate::rng::Mt::new(5);
+        let b = bootstrap_error(&tree, &train, Metric::Absolute, 1, 0, &mut rng);
+        let expected = (n as f64).powf(crate::resample::BLB_GAMMA).floor() as usize;
+        assert!(b.capped, "20k rows must engage the BLB cap");
+        assert_eq!(b.source_rows, n);
+        assert_eq!(b.resample_rows, expected);
+        assert!(b.resample_rows < b.source_rows);
     }
 
     #[test]

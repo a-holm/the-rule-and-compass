@@ -357,6 +357,18 @@ The flag costs `B` constant refits per reported solution; `B = 0` (the default)
 switches it off. The three numbers are reported per solution in the text output,
 in each JSON row's `bootstrap_error` object, and in the ndjson `solution` events.
 
+**Resample size and the BLB cap.** Each draw is an index selection over the
+training rows; only the selected rows are materialised, so the per-resample
+memory is `O(b·d)` rather than `O(n·d)`. When `n^0.7 >= 1000` (about 19 300
+training rows) the draw is bounded with the **bag of little bootstraps**
+(Kleiner, Talwalkar, Sarkar & Jordan 2014): draw a subsample of `b = n^0.7`
+distinct rows and resample within it. A 200 000-row file with the default 25 %
+test split has 150 000 training rows, so `b = 4200`; the cap follows the
+*training* size, not the file size. Below the threshold the exact bootstrap runs
+unchanged and is bit-identical to the pre-#92 results. The text output and the
+`bootstrap_error` object report `resample_rows`, `source_rows` and `capped`;
+above the cap the text says `rows=4200 of 150000 (BLB cap b=n^0.7)`.
+
 ### 3.10 Constant standard errors — implemented
 
 A model can fit perfectly and still rest on constants the data does not
@@ -440,6 +452,15 @@ How to read it:
 Cost: `B` extra searches, so it is opt-in and best used on the final candidate
 set rather than inside a tuning loop.
 
+**Resample size and the BLB cap.** As in §3.9, the resample is an index draw and
+the per-resample search sees only the selected rows. Above the threshold
+(`n^0.7 >= 1000`, about 19 300 rows) each run searches a subsample of
+`b = n^0.7` distinct rows (Kleiner et al. 2014). This changes the stability
+estimator above the cap — the review on #85 notes that a search inside each
+resample is not covered by BLB's differentiability theorem — so the summary
+reports `resample_rows`, `source_rows` and `capped`. Below the threshold the
+summary is bit-identical to the pre-#92 result.
+
 ## 4. What `rcsr` reports today
 
 Every solution carries:
@@ -460,12 +481,15 @@ and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
 verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
 `bootstrap_error` object with the `apparent`, `oob`, `no_information`,
-`relative_overfitting`, `weight` and `estimate` values of §3.9. With `--cv
-<scheme>`, a top-level `cross_validation` object reports the scheme, `k`, the
-`mean_train_error`, `mean_test_error` and `std_test_error`, and the per-fold
-`train_error` / `test_error` / `complexity` / `expression`. With `--stability
-B`, a top-level `stability` object carries the runs, how many found a solution,
-and the ranked `forms` and `variables` with their counts and frequencies.
+`relative_overfitting`, `weight` and `estimate` values of §3.9, plus
+`source_rows`, `resample_rows` and `capped`, so a BLB-bounded resample is never
+mistaken for an exact one. With `--cv <scheme>`, a top-level
+`cross_validation` object reports the scheme, `k`, the `mean_train_error`,
+`mean_test_error` and `std_test_error`, and the per-fold `train_error` /
+`test_error` / `complexity` / `expression`. With `--stability B`, a top-level
+`stability` object carries the runs, how many found a solution, the same three
+resample fields, and the ranked `forms` and `variables` with their counts and
+frequencies.
 
 Alongside the front, `rcsr` reports:
 
