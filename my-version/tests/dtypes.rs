@@ -160,7 +160,7 @@ fn categorical_expands_to_sorted_one_hot_indicators() {
     // Indicator columns are appended after the original table, in level order.
     let at = |row: usize, name: &str| -> f64 {
         let j = typed.table.index_of(name).unwrap();
-        typed.table.rows[row][j]
+        typed.table.value(row, j)
     };
     assert_eq!(
         (0..5)
@@ -212,7 +212,7 @@ fn numeric_levels_and_missing_use_a_stable_order() {
     assert_eq!(typed.dtypes, vec![DType::Boolean; 4]);
     let last = typed.table.index_of("k=<missing>").unwrap();
     assert_eq!(
-        typed.table.rows.iter().map(|r| r[last]).collect::<Vec<_>>(),
+        typed.table.col(last).to_vec(),
         vec![0.0, 0.0, 0.0, 1.0]
     );
 }

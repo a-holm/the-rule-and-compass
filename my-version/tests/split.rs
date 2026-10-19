@@ -27,8 +27,8 @@ fn label_columns_are_kept_as_text() {
     assert_eq!(t.len(), 2);
     assert!(t.numeric[2] && t.numeric[3]);
     assert!(!t.numeric[0] && !t.numeric[1], "date/stock must not be numeric");
-    assert!(t.rows[0][0].is_nan());
-    assert_eq!(t.raw[0][1], "AAPL");
+    assert!(t.value(0, 0).is_nan());
+    assert_eq!(t.text(0, 1), Some("AAPL"));
     assert_eq!(t.distinct_count(1), 2);
 }
 
@@ -218,10 +218,10 @@ fn delayed_columns_look_back_one_row() {
     assert_eq!(rep.rows_kept, 3); // the first row is history only
     let x = t2.index_of("x").unwrap();
     let lag = t2.index_of("x_lag1").unwrap();
-    assert_eq!(t2.rows[0][x], 20.0);
-    assert_eq!(t2.rows[0][lag], 10.0);
-    assert_eq!(t2.rows[1][lag], 20.0);
-    assert_eq!(t2.rows[2][lag], 30.0);
+    assert_eq!(t2.value(0, x), 20.0);
+    assert_eq!(t2.value(0, lag), 10.0);
+    assert_eq!(t2.value(1, lag), 20.0);
+    assert_eq!(t2.value(2, lag), 30.0);
 }
 
 #[test]
@@ -241,8 +241,8 @@ fn delays_do_not_cross_group_boundaries() {
     assert_eq!(rep.series, 2);
     assert_eq!(rep.rows_kept, 2);
     let lag = t2.index_of("x_lag1").unwrap();
-    assert_eq!(t2.rows[0][lag], 1.0, "A's second row looks back inside A");
-    assert_eq!(t2.rows[1][lag], 100.0, "B must not see A's last value");
+    assert_eq!(t2.value(0, lag), 1.0, "A's second row looks back inside A");
+    assert_eq!(t2.value(1, lag), 100.0, "B must not see A's last value");
 }
 
 #[test]
@@ -263,8 +263,8 @@ fn delays_do_not_cross_time_gaps() {
     assert_eq!(rep.breaks, 1);
     assert_eq!(rep.series, 2);
     let lag = t2.index_of("x_lag1").unwrap();
-    assert_eq!(t2.rows[0][lag], 1.0); // t=1 looks back to t=0
-    assert_eq!(t2.rows[1][lag], 3.0, "the lag must not jump the gap");
+    assert_eq!(t2.value(0, lag), 1.0); // t=1 looks back to t=0
+    assert_eq!(t2.value(1, lag), 3.0, "the lag must not jump the gap");
 }
 
 #[test]
@@ -290,5 +290,43 @@ fn history_fraction_drops_leading_rows_but_still_supplies_lags() {
     assert_eq!(rep.rows_kept, 7);
     let lag = t2.index_of("x_lag1").unwrap();
     // first scored row is t=3 (x=30); its lag comes from the history row t=2.
-    assert_eq!(t2.rows[0][lag], 20.0);
+    assert_eq!(t2.value(0, lag), 20.0);
+}
+
+/// Issue #70: the report says which row selector the split is stored as.
+#[test]
+fn split_report_names_the_row_selector() {
+    let t = data::parse_table(
+        "t,x,y\n0,1,1\n1,2,2\n2,3,3\n3,4,4\n4,5,5\n5,6,6\n6,7,7\n7,8,8\n",
+    )
+    .unwrap();
+    let p = data::prepare_full_with(
+        &t,
+        &["x".into()],
+        "y",
+        &SplitSpec {
+            mode: SplitMode::Temporal,
+            time_col: Some(0),
+            test_frac: 0.25,
+            ..Default::default()
+        },
+        &mut Mt::new(1),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(p.report.selector.contains("range"), "{}", p.report.selector);
+
+    let p = data::prepare_full_with(
+        &t,
+        &["x".into()],
+        "y",
+        &SplitSpec {
+            test_frac: 0.25,
+            ..Default::default()
+        },
+        &mut Mt::new(1),
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(p.report.selector.contains("set"), "{}", p.report.selector);
 }
