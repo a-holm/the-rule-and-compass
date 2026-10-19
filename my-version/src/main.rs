@@ -1914,8 +1914,9 @@ fn main() {
 
     let start = std::time::Instant::now();
     let split_line = format!(
-        "split={} | train rows: {} | test rows: {}{}{}{}",
+        "split={} | selector: {} | train rows: {} | test rows: {}{}{}{}",
         prepared.report.mode,
+        prepared.report.selector,
         prepared.train.len(),
         prepared.test.len(),
         if prepared.report.folds > 1 {
@@ -3694,6 +3695,7 @@ fn summary_markdown(
         "| split | `{}` (gap {}, {} fold(s)) |",
         prepared.report.mode, prepared.report.gap, prepared.report.folds
     );
+    let _ = writeln!(s, "| selector | {} |", prepared.report.selector);
     if prepared.report.groups_total > 0 {
         let _ = writeln!(
             s,

@@ -236,3 +236,19 @@ evaluator (each evaluation carrying the series position), so it is planned
 rather than done. Materialised lags cover the common case today at no extra
 evaluation cost.
 
+
+## Row selectors (issue #70)
+
+The split is stored as a **selector** over the one column-major table, not as a
+second copy of the rows: `All`, a contiguous `Range`, a pinned `Hash { seed,
+pct }` predicate, or an explicit `Set`. The text report names the selector that ran, for example:
+
+```
+split=temporal | selector: train range 0..600 (600 rows) | test range 600..800 (200 rows)
+```
+
+`RowSelector::auto` follows the measured policy: contiguous rows are a `Range`;
+a **reused, resident** `Set` is used only up to ~7 % of the rows (and at most
+1 000 000 rows); a one-shot `Set` never wins; everything else is a `Hash`
+predicate. See [`memory-model.md`](memory-model.md) for the thresholds and the
+bytes-per-cell table.

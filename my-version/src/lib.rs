@@ -4,6 +4,7 @@
 
 pub mod bench;
 pub mod checkpoint;
+pub mod column;
 pub mod complexity;
 pub mod data;
 pub mod diagnostics;

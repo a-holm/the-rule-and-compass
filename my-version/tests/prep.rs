@@ -42,9 +42,9 @@ fn prepare<'a>(
 fn loader_accepts_missing_markers() {
     let t = data::parse_table("x,y\n1,2\nNA,3\n,4\nnull,5\nNaN,6\n").unwrap();
     assert!(t.numeric[0] && t.numeric[1], "a gap must not make a column text");
-    assert_eq!(t.rows[0][0], 1.0);
+    assert_eq!(t.value(0, 0), 1.0);
     for r in 1..5 {
-        assert!(t.rows[r][0].is_nan(), "row {r} should be missing");
+        assert!(t.value(r, 0).is_nan(), "row {r} should be missing");
     }
     assert!(data::is_missing_token("Na"));
     assert!(data::is_missing_token("NULL"));
