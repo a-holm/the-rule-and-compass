@@ -626,7 +626,7 @@ fn ind(x: f64) -> f64 {
 }
 
 /// Solve `(A + λ·diag(A)) δ = b` for small symmetric `A` (Cholesky).
-fn solve(a: &mut [Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
+fn solve(a: &[Vec<f64>], b: &mut [f64], lambda: f64, k: usize) -> Option<Vec<f64>> {
     let mut m = a.to_vec();
     for i in 0..k {
         m[i][i] = m[i][i] * (1.0 + lambda) + 1e-12;
@@ -704,21 +704,27 @@ fn sse(
     s
 }
 
-/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
-/// their sum of squared errors, or `None` if the normal equations are singular.
+/// The weighted normal equations at one set of constants: `JᵀWJ` and `JᵀWr`.
+/// Neither depends on the damping `λ`, so one build serves every retry at the
+/// same `c` (MINPACK's `lmdif` does the same).
+struct NormalEquations {
+    jtj: Vec<Vec<f64>>,
+    jtr: Vec<f64>,
+}
+
+/// Build `JᵀWJ` and `JᵀWr` at `c`, one row sweep with the adjoint pass.
 #[allow(clippy::too_many_arguments)]
-fn gn_step(
+fn normal_equations(
     f: &Flat,
     x: &[Vec<f64>],
     y: &[f64],
     w: &[f64],
     c: &[f64],
-    lambda: f64,
     k: usize,
     v: &mut [f64],
     adj: &mut [f64],
     grad: &mut [f64],
-) -> Option<(Vec<f64>, f64)> {
+) -> Option<NormalEquations> {
     // #87: mirror the scorer's length contract.
     if x.len() != y.len() {
         return None;
@@ -757,13 +763,49 @@ fn gn_step(
             jtj[j][i] = jtj[i][j];
         }
     }
-    let mut rhs: Vec<f64> = jtr.iter().map(|v| -v).collect();
-    let step = solve(&mut jtj, &mut rhs, lambda, k)?;
+    Some(NormalEquations { jtj, jtr })
+}
+
+/// Solve the cached normal equations for one damping value and score the trial
+/// constants. This is the old `gn_step` without the row sweep.
+#[allow(clippy::too_many_arguments)]
+fn gn_trial(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    c: &[f64],
+    lambda: f64,
+    k: usize,
+    n: &NormalEquations,
+    v: &mut [f64],
+) -> Option<(Vec<f64>, f64)> {
+    let mut rhs: Vec<f64> = n.jtr.iter().map(|v| -v).collect();
+    let step = solve(&n.jtj, &mut rhs, lambda, k)?;
     let trial: Vec<f64> = (0..k)
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
     let s = sse(f, x, y, w, &trial, v);
     Some((trial, s))
+}
+
+/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
+/// their sum of squared errors, or `None` if the normal equations are singular.
+#[allow(clippy::too_many_arguments)]
+fn gn_step(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    c: &[f64],
+    lambda: f64,
+    k: usize,
+    v: &mut [f64],
+    adj: &mut [f64],
+    grad: &mut [f64],
+) -> Option<(Vec<f64>, f64)> {
+    let n = normal_equations(f, x, y, w, c, k, v, adj, grad)?;
+    gn_trial(f, x, y, w, c, lambda, k, &n, v)
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -825,15 +867,25 @@ pub fn fit_weighted(
     // saved sweep. Only the *final* SSE is reused (and only for `squared`).
     let mut best_sse = sse(&f, x, y, w, &c, &mut v);
     let mut lambda = 1e-3;
+    // #95: `JᵀJ`/`Jᵀr` depend on `c`, not on `λ`. Build them once per outer
+    // iteration and reuse the cached matrices for every damping retry; only a
+    // change of `c` (an accepted step) invalidates them.
+    let mut normal: Option<NormalEquations> = None;
 
     for _ in 0..iters.max(1) {
-        match gn_step(&f, x, y, w, &c, lambda, k, &mut v, &mut adj, &mut grad) {
+        if normal.is_none() {
+            normal =
+                normal_equations(&f, x, y, w, &c, k, &mut v, &mut adj, &mut grad);
+        }
+        let Some(n) = normal.as_ref() else { break };
+        match gn_trial(&f, x, y, w, &c, lambda, k, n, &mut v) {
             Some((trial, tsse)) => {
                 if tsse < best_sse {
                     c = trial;
                     best_sse = tsse;
                     best_c = c.clone();
                     lambda = (lambda / 8.0).max(1e-12);
+                    normal = None; // `c` moved: rebuild on the next iteration
                     if best_sse == 0.0 {
                         break;
                     }
@@ -1602,5 +1654,201 @@ mod tests {
         let mut tree = node(Op::Mul, vec![constant(2.0), input(0)]);
         assert!(fit_weighted(&mut tree, &x, &y, &[], 4).is_infinite());
         assert!(flat_sse(&tree, &x, &y).is_infinite());
+    }
+
+    /// Fitted constants in slot order, read back through the flat form so the
+    /// result does not depend on the tree walk used for write-back.
+    fn fitted_constants(tree: &Node) -> Vec<f64> {
+        let f = flatten(tree);
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..f.op.len() {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        c
+    }
+
+    /// #95: caching `JᵀJ`/`Jᵀr` across damping retries must be bit-identical to
+    /// rebuilding them for every λ. These are the constants and SSE recorded
+    /// from the per-retry implementation. The `exp` case starts badly scaled
+    /// and rejects several steps before finding the basin.
+    #[test]
+    fn lm_cached_fit_matches_recorded_baseline() {
+        let lin_x: Vec<Vec<f64>> =
+            (0..41).map(|i| vec![-4.0 + 0.2 * i as f64]).collect();
+        let lin_y: Vec<f64> = lin_x
+            .iter()
+            .map(|r| 2.0 * r[0] + 1.0 + 0.05 * (3.0 * r[0]).sin())
+            .collect();
+
+        let quad_x: Vec<Vec<f64>> =
+            (0..31).map(|i| vec![-3.0 + 0.2 * i as f64]).collect();
+        let quad_y: Vec<f64> = quad_x
+            .iter()
+            .map(|r| 0.5 * r[0] * r[0] - 2.0 * r[0] + 1.0 + 0.02 * (5.0 * r[0]).cos())
+            .collect();
+
+        let exp_x: Vec<Vec<f64>> =
+            (0..41).map(|i| vec![-1.0 + 0.05 * i as f64]).collect();
+        let exp_y: Vec<f64> = exp_x
+            .iter()
+            .map(|r| (1.5 * r[0]).exp() + 0.001 * (10.0 * r[0]).sin())
+            .collect();
+
+        let rat_x: Vec<Vec<f64>> =
+            (0..19).map(|i| vec![0.5 + 0.25 * i as f64]).collect();
+        let rat_y: Vec<f64> = rat_x.iter().map(|r| 2.0 / (r[0] - 0.2) + 0.5).collect();
+
+        let sin_x: Vec<Vec<f64>> =
+            (0..63).map(|i| vec![-3.1 + 0.1 * i as f64]).collect();
+        let sin_y: Vec<f64> = sin_x
+            .iter()
+            .map(|r| 2.5 * (0.7 * r[0]).sin() + 0.3)
+            .collect();
+
+        let weighted_w: Vec<f64> = (0..41)
+            .map(|i| match i % 5 {
+                0 => 0.0,
+                1 | 2 => 0.25,
+                _ => 2.0,
+            })
+            .collect();
+
+        let cases: Vec<(&str, Node, Vec<Vec<f64>>, Vec<f64>, Vec<f64>)> = vec![
+            (
+                "linear",
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(0.0), input(0)]),
+                        constant(0.0),
+                    ],
+                ),
+                lin_x.clone(),
+                lin_y.clone(),
+                vec![],
+            ),
+            (
+                "quadratic",
+                node(
+                    Op::Add,
+                    vec![
+                        node(
+                            Op::Mul,
+                            vec![
+                                constant(0.0),
+                                node(Op::Mul, vec![input(0), input(0)]),
+                            ],
+                        ),
+                        node(
+                            Op::Add,
+                            vec![
+                                node(Op::Mul, vec![constant(0.0), input(0)]),
+                                constant(0.0),
+                            ],
+                        ),
+                    ],
+                ),
+                quad_x,
+                quad_y,
+                vec![],
+            ),
+            (
+                // Badly scaled start: exp(3x) fitted to exp(1.5x). Damping
+                // rejects step after step here, which is the path #95 caches.
+                "exp_bad_scale",
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Exp, vec![node(Op::Mul, vec![constant(3.0), input(0)])]),
+                        constant(0.5),
+                    ],
+                ),
+                exp_x,
+                exp_y,
+                vec![],
+            ),
+            (
+                "rational",
+                node(
+                    Op::Add,
+                    vec![
+                        node(
+                            Op::Div,
+                            vec![
+                                constant(1.0),
+                                node(Op::Sub, vec![input(0), constant(0.0)]),
+                            ],
+                        ),
+                        constant(0.0),
+                    ],
+                ),
+                rat_x,
+                rat_y,
+                vec![],
+            ),
+            (
+                "damped_sine",
+                node(
+                    Op::Add,
+                    vec![
+                        node(
+                            Op::Mul,
+                            vec![
+                                constant(1.0),
+                                node(Op::Sin, vec![node(Op::Mul, vec![
+                                    constant(1.0),
+                                    input(0),
+                                ])]),
+                            ],
+                        ),
+                        constant(0.0),
+                    ],
+                ),
+                sin_x,
+                sin_y,
+                vec![],
+            ),
+            (
+                "weighted_linear",
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(0.0), input(0)]),
+                        constant(0.0),
+                    ],
+                ),
+                lin_x,
+                lin_y,
+                weighted_w,
+            ),
+        ];
+
+        let expected: Vec<(Vec<u64>, u64)> = vec![
+            (vec![0x3ffff3cde812a095, 0x3fefffffffffffff], 0x3fa9c6058c8f6e1a),
+            (
+                vec![0x3fe000441da12855, 0xc000000000000000, 0x3ff000b65a9771ca],
+                0x3f78fdaf8bfef98f,
+            ),
+            (vec![0x3ff8004d303015c9, 0xbf097785fa307cfa], 0x3ef4074508c02711),
+            (
+                vec![0x3ffffffffffffffe, 0x3fc999999999999d, 0x3fe0000000000001],
+                0x39b8400000000000,
+            ),
+            (
+                vec![0x4004000000000000, 0x3fe6666666666666, 0x3fd3333333333333],
+                0x0000000000000000,
+            ),
+            (vec![0x3ffff2bcc0928dba, 0x3feffb7033cf370d], 0x3fab860d9648079f),
+        ];
+        let mut got = Vec::new();
+        for (name, mut tree, x, y, w) in cases {
+            let sse = fit_weighted(&mut tree, &x, &y, &w, 8);
+            let c: Vec<u64> = fitted_constants(&tree).iter().map(|v| v.to_bits()).collect();
+            println!("CASE {name} consts={c:x?} sse={:016x}", sse.to_bits());
+            got.push((c, sse.to_bits()));
+        }
+        assert_eq!(got, expected, "constants/SSE changed");
     }
 }
