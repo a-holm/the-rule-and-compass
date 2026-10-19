@@ -41,10 +41,10 @@ pub fn json() -> String {
         // #69: reference set always exact; only query rows are sampled, and
         // only for mean-loss metrics.
         ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
-        ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
+        ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off); above n^0.7 >= 1000 rows the draw is a BLB subsample of b = n^0.7 rows and the resample size is reported"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),
-        ("--stability", "int", "0", "bootstrap resamples for stability selection (0 = off)"),
+        ("--stability", "int", "0", "bootstrap resamples for stability selection (0 = off); above n^0.7 >= 1000 rows each resample searches a BLB subsample of b = n^0.7 rows and the resample size is reported"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | implicit | implicit_residual | auc | log_loss | hinge | aic | aicc | bic"),
         ("--implicit", "flag", "false", "fit f(inputs, target) = 0: the target becomes an extra (normalised) input and the fit target is 0"),
         ("--implicit-derivative", "flag", "false", "shorthand for --implicit --metric implicit: score the level-set distance |f| / ||grad f||"),
