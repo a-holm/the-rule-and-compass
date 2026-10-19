@@ -860,6 +860,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "units.target",
         "require_dimensions",
         "fit_samples",
+        "front_parents", // #76
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1024,6 +1025,17 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    // #76: missing means on, the default since the feature was introduced.
+    let front_parents = match fields.get("front_parents").map(|s| s.as_str()) {
+        None | Some("true") => true,
+        Some("false") => false,
+        Some(other) => {
+            return Err(format!(
+                "config 'front_parents' must be true or false, got '{}'",
+                other
+            ))
+        }
+    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
@@ -1050,6 +1062,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         patience: num_usize("patience")?,
         predictor_samples,
         fit_samples, // #85
+        front_parents, // #76
         units,
         require_dimensions,
         progress: None,
@@ -1120,6 +1133,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     // checkpoint stays byte-identical to one written before the flag existed.
     if cfg.fit_samples > 0 {
         writeln!(out, "config fit_samples {}", cfg.fit_samples).unwrap();
+    }
+    // #76: only write the field when front feedback is off, so an on run's
+    // checkpoint stays byte-identical to one written before the flag existed.
+    if !cfg.front_parents {
+        writeln!(out, "config front_parents false").unwrap();
     }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.

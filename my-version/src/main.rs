@@ -309,6 +309,9 @@ SEARCH:
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
+  --no-front-parents         draw every parent from the island tournament;
+                             turns off the 15% Pareto-front feedback (#76)
+                             and restores the pre-#76 trajectory exactly
   --no-simd                  force the scalar tree walk instead of the
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
@@ -647,6 +650,9 @@ fn main() {
     // #85: remember an explicit --fit-samples so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_samples_set = false;
+    // #76: remember an explicit --no-front-parents so a resume can refuse a
+    // contradiction with the saved configuration.
+    let mut front_parents_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -877,6 +883,11 @@ fn main() {
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #76: exactness escape hatch; the default is on.
+            "--no-front-parents" => {
+                cfg.front_parents = false;
+                front_parents_set = true;
             }
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
@@ -1201,6 +1212,13 @@ fn main() {
             conflicts.push(format!(
                 "--fit-samples {} (saved {})",
                 cfg.fit_samples, saved.fit_samples
+            ));
+        }
+        // #76: front feedback is saved search state.
+        if front_parents_set && cfg.front_parents != saved.front_parents {
+            conflicts.push(format!(
+                "--no-front-parents (saved front_parents is {})",
+                saved.front_parents
             ));
         }
         if let Some(spec) = &op_complexity_spec {

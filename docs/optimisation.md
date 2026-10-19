@@ -254,6 +254,36 @@ Ordered by expected gain per unit effort **[planned]**:
    member whose semantics is closest to the desired one).
 6. **Warm starts**: persist the front and restart from it.
 
+### 3.2.1 Pareto-front parent feedback (#76)
+
+The archive used to be write-only: updated every generation and read only to
+decide whether an island was stagnant. A shape found on another island, or ten
+generations earlier, survived only if its own lineage did.
+
+Now, with probability **15%**, one of the two parents is drawn uniformly from
+the current Pareto front instead of the island tournament; the other still comes
+from the island. The draw is seeded, so a run remains reproducible. The front is
+copied once per generation into the island threads (a small `Vec` of front
+members), so the islands stay independent.
+
+Measured on the known-truth suite (seed 1/7/42, full documented budget), off vs
+on:
+
+| seed | off | on | `pythagoras` R² at 0% / 1% / 10% (off → on) | wall |
+|---|---:|---:|---|---:|
+| 1 | 72/75 | **74/75** | 0.987 / 0.721 / 0.987 → **0.993 / 0.987 / 1.000** | 272 → 288 s |
+| 7 | 72/75 | **75/75** | 0.955 / 0.962 / 0.957 → **0.998 / 1.000 / 1.000** | 263 → 278 s |
+| 42 | 72/75 | **74/75** | 0.942 / 0.766 / 0.952 → **0.996 / 1.000 / 0.981** | 286 → 289 s |
+
+`pythagoras` was the suite's only miss, and it is recovered in **7 of 9** cells
+with the feedback versus **0 of 9** without. The cost is about 5% wall time.
+
+This changes the default search trajectory, so it is a **quality change, not an
+optimisation**: the exactness hashes from before this feature no longer apply to
+a default run. `--no-front-parents` restores the previous trajectory exactly
+(both pinned hashes hold with it), and a checkpoint records the setting and
+refuses to resume across a change of it.
+
 ### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
 
 **[implemented, wired into the search and measured]** — `src/eval_soa.rs`

@@ -330,6 +330,8 @@ pub struct SuiteConfig {
     pub threshold: f64,
     /// Optional per-run wall-clock budget.
     pub time_budget: Option<f64>,
+    /// #76: let the Pareto front supply 15 % of parents.
+    pub front_parents: bool,
 }
 
 impl Default for SuiteConfig {
@@ -344,6 +346,7 @@ impl Default for SuiteConfig {
             tiny: false,
             threshold: DEFAULT_THRESHOLD,
             time_budget: None,
+            front_parents: true, // #76
         }
     }
 }
@@ -451,6 +454,7 @@ pub fn run_one(p: &Problem, noise: f64, cfg: &SuiteConfig) -> RunResult {
     sc.metric = cfg.metric;
     sc.seed = cfg.seed;
     sc.time_budget = cfg.time_budget;
+    sc.front_parents = cfg.front_parents; // #76
 
     let t0 = Instant::now();
     let out = search::run(&sc, &train, &test);
