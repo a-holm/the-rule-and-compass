@@ -106,7 +106,14 @@ fn predictor_samples_at_least_the_training_size_is_an_exact_no_op() {
     let train = sample(300);
     let test = sample(100);
     let plain = search::run(&config(5), &train, &test);
-    for n in [train.len(), train.len() + 1, 10_000] {
+    // #86: a request above the measured break-even is widened to the full
+    // sample, so it is an exact no-op too (271 of 300 here).
+    for n in [
+        train.len() * 9 / 10 + 1,
+        train.len(),
+        train.len() + 1,
+        10_000,
+    ] {
         let cfg = Config {
             predictor_samples: Some(n),
             ..config(5)
@@ -120,6 +127,37 @@ fn predictor_samples_at_least_the_training_size_is_an_exact_no_op() {
         );
         assert_eq!(plain.test_errors, out.test_errors);
     }
+}
+
+/// #86: the break-even keeps the measured 750/1500 win and widens near-full
+/// requests (1400/1500) to the full sample.
+#[test]
+fn effective_subset_accepts_750_and_rejects_near_full_requests() {
+    let train = sample(1500);
+    let mut cfg = Config::default();
+
+    for n in [750, 900] {
+        cfg.predictor_samples = Some(n);
+        assert_eq!(
+            search::effective_predictor_samples(&cfg, &train),
+            Some(n),
+            "{} of 1500 rows is at or below the break-even",
+            n
+        );
+    }
+
+    for n in [0, 1, 901, 1400, 1401, 1499, 1500, 1501] {
+        cfg.predictor_samples = Some(n);
+        assert_eq!(
+            search::effective_predictor_samples(&cfg, &train),
+            None,
+            "{} of 1500 rows must widen to the full sample",
+            n
+        );
+    }
+
+    cfg.predictor_samples = None;
+    assert_eq!(search::effective_predictor_samples(&cfg, &train), None);
 }
 
 #[test]

@@ -42,6 +42,9 @@ fn documented_baseline_front_is_pinned() {
             "60",
             "--generations",
             "20",
+            // #76: this pin is the pre-front-feedback trajectory, so the
+            // feature is explicitly off here.
+            "--no-front-parents",
             "--out",
             out.to_str().expect("utf-8 path"),
             "--quiet",

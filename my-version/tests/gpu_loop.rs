@@ -213,9 +213,11 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
         .zip(&pg)
         .map(|(a, b)| (a - b).abs() / (1.0 + a.abs().max(b.abs())))
         .fold(0.0f64, f64::max);
-    // Observed on this fixture: 0 (the two forms agree bit for bit on these
-    // rows). The asserted bound is the f64 rounding tolerance.
-    assert!(worst <= 1e-12, "laws differ by {worst:e} on the test rows");
+    // The two runs may select *different algebraically equivalent* forms, so
+    // the rows can differ at f64 rounding level: the observed worst case with
+    // archive-parent feedback is 6.6e-12. The bound still rejects a genuinely
+    // different law (nine significant digits must agree).
+    assert!(worst <= 1e-9, "laws differ by {worst:e} on the test rows");
 
     let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + a.abs().max(b.abs()));
     assert!(

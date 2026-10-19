@@ -57,27 +57,29 @@ fn point_distance(tree: &Node, row: &[f64]) -> f64 {
     rcsr::implicit::distance(tree, row)
 }
 
-/// Zero crossing of `f(r, 0)` on `0.5 .. 1.5`, by bisection. Independent of any
-/// positive scale factor the search may put in front of the circle.
+/// Radius of the level set on the positive x axis, by minimising the
+/// scale-free distance. This is robust to any positive scale *and* to the
+/// search returning an even power of the circle (`g²`), which has the same
+/// level set but never changes sign — a sign-change bisection cannot see it.
 fn radius_on_x_axis(tree: &Node) -> f64 {
-    let mut lo = 0.5;
-    let mut hi = 1.5;
-    let f = |r: f64| expr::eval(tree, &[r, 0.0]);
-    assert!(
-        f(lo).is_finite() && f(hi).is_finite() && f(lo) * f(hi) < 0.0,
-        "the level set must cross the positive x axis: f(0.5)={}, f(1.5)={}",
-        f(lo),
-        f(hi)
-    );
-    for _ in 0..80 {
-        let mid = 0.5 * (lo + hi);
-        if f(lo) * f(mid) <= 0.0 {
-            hi = mid;
+    let dist = |r: f64| point_distance(tree, &[r, 0.0]);
+    let (mut lo, mut hi) = (0.5, 1.5);
+    for _ in 0..200 {
+        let m1 = lo + (hi - lo) / 3.0;
+        let m2 = hi - (hi - lo) / 3.0;
+        if dist(m1) < dist(m2) {
+            hi = m2;
         } else {
-            lo = mid;
+            lo = m1;
         }
     }
-    0.5 * (lo + hi)
+    let r = 0.5 * (lo + hi);
+    let d = dist(r);
+    assert!(
+        d < 0.05,
+        "no zero of the level set on 0.5 .. 1.5 (closest distance {d} at r={r})"
+    );
+    r
 }
 
 fn config(seed: u32) -> Config {

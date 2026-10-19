@@ -44,6 +44,7 @@ OPTIONS:
   --metric <name>           search metric (default squared)
   --threshold <r2>          test R^2 counted as recovered (default 0.99)
   --time-budget <seconds>   wall-clock limit per run (default: none)
+  --no-front-parents        disable the 15% Pareto-front parent feedback (#76)
   --json                    print one JSON object instead of the text table
   --list                    list the suite's problems and exit
   -h, --help                show this help
@@ -71,6 +72,7 @@ struct Args {
     time_budget: Option<f64>,
     json: bool,
     list: bool,
+    front_parents: bool,
 }
 
 impl Default for Args {
@@ -88,6 +90,7 @@ impl Default for Args {
             time_budget: None,
             json: false,
             list: false,
+            front_parents: true, // #76
         }
     }
 }
@@ -168,6 +171,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 )
             }
             "--json" => a.json = true,
+            "--no-front-parents" => a.front_parents = false,
             "--list" => a.list = true,
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown option '{}'", other)),
@@ -194,6 +198,7 @@ fn to_config(a: &Args) -> SuiteConfig {
         tiny: a.tiny,
         threshold: a.threshold,
         time_budget: a.time_budget,
+        front_parents: a.front_parents,
     }
 }
 

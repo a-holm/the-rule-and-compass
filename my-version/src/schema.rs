@@ -12,7 +12,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The schema document, identical for the CLI and the server.
 pub fn json() -> String {
     let opts = [
-        ("--data", "string", "none", "table path, or '-' for stdin"),
+        ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
+        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A .rcsb store that does not fit is searched from a bounded hash sample; a CSV exits 3 before parsing"),
+        ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
         ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
         ("--vars", "csv", "all-except-targets", "input column names"),
         ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),
@@ -41,10 +43,10 @@ pub fn json() -> String {
         // #69: reference set always exact; only query rows are sampled, and
         // only for mean-loss metrics.
         ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
-        ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
+        ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off); above n^0.7 >= 1000 rows the draw is a BLB subsample of b = n^0.7 rows and the resample size is reported"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),
-        ("--stability", "int", "0", "bootstrap resamples for stability selection (0 = off)"),
+        ("--stability", "int", "0", "bootstrap resamples for stability selection (0 = off); above n^0.7 >= 1000 rows each resample searches a BLB subsample of b = n^0.7 rows and the resample size is reported"),
         ("--metric", "enum", "absolute", "absolute | squared | correlation | median | maximum | signed | log_squashed | rank_correlation | interquartile | slope | implicit | implicit_residual | auc | log_loss | hinge | aic | aicc | bic"),
         ("--implicit", "flag", "false", "fit f(inputs, target) = 0: the target becomes an extra (normalised) input and the fit target is 0"),
         ("--implicit-derivative", "flag", "false", "shorthand for --implicit --metric implicit: score the level-set distance |f| / ||grad f||"),
@@ -66,6 +68,7 @@ pub fn json() -> String {
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
+        ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
         // #85: fit-only screening; survivors are refit on the full training sample.

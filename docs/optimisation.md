@@ -254,6 +254,36 @@ Ordered by expected gain per unit effort **[planned]**:
    member whose semantics is closest to the desired one).
 6. **Warm starts**: persist the front and restart from it.
 
+### 3.2.1 Pareto-front parent feedback (#76)
+
+The archive used to be write-only: updated every generation and read only to
+decide whether an island was stagnant. A shape found on another island, or ten
+generations earlier, survived only if its own lineage did.
+
+Now, with probability **15%**, one of the two parents is drawn uniformly from
+the current Pareto front instead of the island tournament; the other still comes
+from the island. The draw is seeded, so a run remains reproducible. The front is
+copied once per generation into the island threads (a small `Vec` of front
+members), so the islands stay independent.
+
+Measured on the known-truth suite (seed 1/7/42, full documented budget), off vs
+on:
+
+| seed | off | on | `pythagoras` R² at 0% / 1% / 10% (off → on) | wall |
+|---|---:|---:|---|---:|
+| 1 | 72/75 | **74/75** | 0.987 / 0.721 / 0.987 → **0.993 / 0.987 / 1.000** | 272 → 288 s |
+| 7 | 72/75 | **75/75** | 0.955 / 0.962 / 0.957 → **0.998 / 1.000 / 1.000** | 263 → 278 s |
+| 42 | 72/75 | **74/75** | 0.942 / 0.766 / 0.952 → **0.996 / 1.000 / 0.981** | 286 → 289 s |
+
+`pythagoras` was the suite's only miss, and it is recovered in **7 of 9** cells
+with the feedback versus **0 of 9** without. The cost is about 5% wall time.
+
+This changes the default search trajectory, so it is a **quality change, not an
+optimisation**: the exactness hashes from before this feature no longer apply to
+a default run. `--no-front-parents` restores the previous trajectory exactly
+(both pinned hashes hold with it), and a checkpoint records the setting and
+refuses to resume across a change of it.
+
 ### 3.3 Structure-of-arrays CPU evaluator (stages 1–2, wired)
 
 **[implemented, wired into the search and measured]** — `src/eval_soa.rs`
@@ -435,6 +465,30 @@ fitter rejects `x.len() != y.len()`. The other operators already produce a
 non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
 `Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
 multi-output search trajectory without fixing a finite-vs-infinite divergence.
+
+#### Subsampled scoring: `--predictor-samples`
+
+`--predictor-samples N` draws a fresh `N`-row subset every generation and uses
+it for both the constant fit and the score. #86 made two changes to the original
+implementation:
+
+* **Carried individuals are refitted before they are scored.** Previously the
+  carried population was only re-scored, so it competed as `fit(S_{g-1}) ->
+  score(S_g)` against offspring on `fit(S_g) -> score(S_g)`, and the elite was
+  never refitted at all. The refit uses one warm-started LM iteration (plus the
+  fitter's four polish iterations) because the constants already come from the
+  previous subset; a cold refit doubled the generation's fit cost and erased
+  the win at 750/1500.
+* **Near-full requests are widened to the full sample.** The fitter-only
+  break-even, `m/n < (24 - 1/G)/25 ~ 0.96`, assumed that only a scoring sweep
+  was saved for carried individuals. With the refit the model is about
+  `(26 + 6) m` against `26 n`, i.e. `m/n < 0.81` before the sample rebuild and
+  the extra final archive pass. On the `w2.csv` workload (1 500 train rows,
+  `--fit-iters 8`, 10 generations, min of three `%U`) `900/1500 = 0.60` still
+  wins but `1000/1500 = 0.67` is slower than full data, so the measured rule is
+  `m <= 3/5 n`. `750/1500` stays active; `1400/1500` is an exact no-op that
+  uses the full sample. The text header and the `--json`/NDJSON output report
+  the requested and effective sizes, and whether the request was widened.
 
 #### Screening the fit rows: `--fit-samples`
 

@@ -263,6 +263,11 @@ the determinism guarantee and its limits.
   echoed in the output.
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
+* **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
+  (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
+  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store
+  that can be scanned group by group and searched from a bounded hash sample
+  when it does not fit; see [`docs/data-format.md`](docs/data-format.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -335,6 +340,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--no-front-parents]
      [--fit-samples N]
      [--patience N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
@@ -601,7 +607,9 @@ On a small sample, `--bootstrap-error n` refits each solution's constants on `n`
 bootstrap resamples of the training rows and reports the **apparent**, the
 **out-of-bag** and the **.632+** error (Efron & Tibshirani 1997) per solution;
 the `.632+` estimate interpolates the optimistic and pessimistic numbers and
-always lies between them.
+always lies between them. Above `n^0.7 >= 1000` rows (about 19 300) the draw is
+bounded with a bag-of-little-bootstraps subsample of `b = n^0.7` rows, and the
+resample size is reported in text and `--json`.
 
 `--cv k-fold|rolling|purged` goes further: it rebuilds the split as `k` folds,
 re-runs the whole search on each fold's training rows (normalised on those rows
@@ -614,7 +622,9 @@ costs about `k` extra searches.
 back?** It bootstraps the training rows `B` times, re-runs the identical search
 on each resample and ranks the structural forms and input variables by how often
 they are selected. A variable at 100% is one the data insists on; one near 0% is
-noise the search only sometimes needed. Cost: `B` extra searches.
+noise the search only sometimes needed. Cost: `B` extra searches. The same BLB
+cap as `--bootstrap-error` applies above about 19 300 rows, and the resample size
+is reported.
 
 See [`docs/overfitting.md`](docs/overfitting.md) for the full checklist, the
 formulas, what is still missing, and the literature.
@@ -702,6 +712,13 @@ list and the recorded results.
   restarts, run in parallel across islands;
 - **ε-dominance** archiving and **lexicographic parsimony pressure**, so the
   front stays small and expressions stay short;
+- **Pareto-front parent feedback** (15%): one parent in six is drawn from the
+  global archive instead of the island tournament, so a shape found on another
+  island or generations earlier can be recombined rather than lost.
+  Measured on the known-truth suite at three seeds: **72 → 74/75**, **72 → 75/75**
+  and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
+  **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
+  restores the previous trajectory exactly;
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
@@ -710,7 +727,13 @@ list and the recorded results.
   nothing left to gain;
 - **subsampled fitness** (`--predictor-samples N`): each generation scores and
   fits candidates on `N` training rows drawn without replacement, while the
-  archive and every reported error are re-scored on the full training set;
+  archive and every reported error are re-scored on the full training set.
+  Carried individuals are refitted on the generation's subset before they are
+  scored, so everyone is compared as `fit(S_g) -> score(S_g)` rather than with
+  stale constants. A request at least the training size is an exact no-op, and
+  a request above the measured break-even (3/5 of the rows) is widened to the
+  full sample, because rebuilding the sample and refitting the carried
+  population cost more than the rows saved;
 - **screened constant fitting** (`--fit-samples N`): within each generation,
   all offspring are fitted and scored on a fresh deterministic `N`-row subset,
   the top 1/16 are promoted to a full-data refit and re-score, and the next
@@ -777,6 +800,7 @@ docs/optimisation.md          theory, literature and measurements behind the sea
 docs/data-splitting.md        train/test splitting for time series and panel data
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
+docs/data-format.md           versioned .rcsb column store, import and the memory guard
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
