@@ -226,6 +226,11 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
         restart_interval: 1,
         fit_iters: 2,
         seed: 1,
+        // #76: the fixture needs a *stagnating* run so `stopped_early`,
+        // `best_prev`, `no_improve` and the per-island counters are live. The
+        // archive-parent feedback keeps this tiny run improving, which is the
+        // feature working; the checkpoint round trip is independent of it.
+        front_parents: false,
         ..Default::default()
     };
     let text = checkpoint_text(&cfg, &train, &test);
