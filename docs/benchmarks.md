@@ -175,16 +175,20 @@ cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1
 ```
 
 All 25 problems at the three default noise levels with the full budget
-(150 generations, 2 islands, 200 individuals). Recorded with engine seed `1` on
-an 8-thread x86-64 machine; the sum of the per-run times was about 365 s
-(≈ 6–7 min wall-clock, one run at a time).
+(150 generations, 2 islands, 200 individuals). Recorded with engine seed `1` at
+commit `d26f2fd` (2026-10-19) on an 8-thread x86-64 machine; wall-clock 5:35.67, peak RSS 4 MB.
+
+The sweep was run **twice** and the two runs matched exactly (75/75 cells), so
+these numbers are reproducible for this commit. They replace an earlier
+recording made before the mutation and fitting changes of #77/#87: the headline
+count is unchanged (72/75) but the per-problem numbers moved.
 
 ```
 recovered 72/75 (96.0%)   median complexity 3
 by noise level:
-  0.000   25 runs   24 recovered ( 96.0%)  median complexity 3
-  0.010   25 runs   24 recovered ( 96.0%)  median complexity 3
-  0.100   25 runs   24 recovered ( 96.0%)  median complexity 3
+  0.000   25 runs   24 recovered (96.0%)  median complexity 3
+  0.010   25 runs   24 recovered (96.0%)  median complexity 3
+  0.100   25 runs   24 recovered (96.0%)  median complexity 4
 ```
 
 | problem | R² @ 0.00 | R² @ 0.01 | R² @ 0.10 |
@@ -204,23 +208,26 @@ by noise level:
 | `tanh_law` | 1.000 | 1.000 | 1.000 |
 | `harmonic_sum` | 1.000 | 1.000 | 0.999 |
 | `reciprocal_sum` | 1.000 | 1.000 | 1.000 |
-| `pythagoras` | 0.954 | 0.989 | 0.986 |
+| `pythagoras` | 0.987 | 0.721 | 0.987 |
 | `kinetic_energy` | 1.000 | 1.000 | 1.000 |
 | `coulomb` | 1.000 | 1.000 | 1.000 |
 | `ideal_gas` | 1.000 | 1.000 | 1.000 |
 | `spring_period` | 1.000 | 1.000 | 1.000 |
-| `velocity_addition` | 0.999 | 1.000 | 1.000 |
+| `velocity_addition` | 0.999 | 0.997 | 0.995 |
 | `damped_oscillator` | 1.000 | 1.000 | 1.000 |
 | `relativistic` | 1.000 | 1.000 | 0.999 |
 | `sine_sum` | 1.000 | 1.000 | 1.000 |
 | `power_law` | 1.000 | 1.000 | 1.000 |
 
 24 of 25 problems are recovered at every noise level. The single miss is
-`pythagoras` (`√(x1² + x2²)`): its best front member reaches R² = 0.954
-(noiseless), 0.989 (1 %) and 0.986 (10 %), so the front came close but never
-carried the exact two-term form within the budget. This is exactly the kind of
-information the suite exists to produce — a place where the search, not the
-noise, is the limiting factor.
+`pythagoras` (`√(x1² + x2²)`): its best front member reaches R² =
+0.987 (noiseless), 0.721 (1 %) and 0.987
+(10 %). At 0 % it is a complexity-13 approximation
+(`ln(cube(((2.2647 / gauss((0.2399 * x1))) - cos((0.6416 * x2)))))`), not the exact two-term form; at 1 % the front falls back
+to a piecewise `if` at complexity 23. The exact form *is*
+reachable — a run of an earlier build found it at complexity 7 — so this is a
+stochastic limit of the search at this budget, not an impossibility. That is
+exactly the kind of information the suite exists to produce.
 
 ## 6. Reproducing and limitations
 
