@@ -38,6 +38,9 @@ pub fn json() -> String {
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
+        // #69: reference set always exact; only query rows are sampled, and
+        // only for mean-loss metrics.
+        ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
         ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off)"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),
@@ -65,9 +68,12 @@ pub fn json() -> String {
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-simd", "flag", "false", "force the scalar tree walk instead of the SoA/AVX evaluator (same results; for debugging and A/B runs)"),
         ("--predictor-samples", "int", "none", "training rows per generation for fitness and constant fitting (>=2; all rows when >= train size)"),
+        // #85: fit-only screening; survivors are refit on the full training sample.
+        ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
-        ("--no-gpu", "flag", "false", "force CPU evaluation even when built with --features cuda (alias --cpu); the GPU only guides the search, reported errors are always CPU f64"),
+        ("--gpu", "flag", "false", "let the GPU guide the search when built with --features cuda (opt-in; reported errors stay CPU f64 but f32 fitness can change the trajectory)"),
+        ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); this is the default"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data must match"),

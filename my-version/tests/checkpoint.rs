@@ -211,6 +211,64 @@ fn the_checkpoint_round_trips_every_search_setting() {
 }
 
 #[test]
+fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
+    let train = sample(40);
+    let test = sample(10);
+    // Non-default patience so `best_prev`/`no_improve` are live. A restart
+    // every generation makes the per-island stagnation counters advance, so
+    // the two islands end with different values rather than the default zeros.
+    let cfg = Config {
+        generations: 3,
+        islands: 2,
+        pop: 8,
+        max_complexity: 8,
+        patience: 1,
+        restart_interval: 1,
+        fit_iters: 2,
+        seed: 1,
+        ..Default::default()
+    };
+    let text = checkpoint_text(&cfg, &train, &test);
+    let cp = Checkpoint::from_text(&text).expect("parse");
+
+    // The fixture must exercise the fields, not just the serialiser: a
+    // checkpoint whose counters are all zero would pass the round trip
+    // vacuously.
+    assert!(cp.stopped_early, "the fixture should stop early");
+    assert!(cp.best_prev.is_finite() && cp.best_prev > 0.0);
+    assert!(cp.no_improve > 0);
+    assert_eq!(cp.stagnant.len(), 2, "one counter per island");
+    assert_ne!(
+        cp.stagnant[0], cp.stagnant[1],
+        "the two islands should have different stagnation counters"
+    );
+
+    assert_eq!(
+        cp.to_text(),
+        text,
+        "serialise -> parse -> serialise changed bytes"
+    );
+
+    // Name the bookkeeping fields explicitly: byte identity alone would still
+    // pass if the writer and the reader both forgot a field.
+    let cp2 = Checkpoint::from_text(&cp.to_text()).expect("reparse");
+    assert_eq!(cp2.stopped_early, cp.stopped_early, "stopped_early");
+    assert_eq!(
+        cp2.best_prev.to_bits(),
+        cp.best_prev.to_bits(),
+        "best_prev"
+    );
+    assert_eq!(cp2.no_improve, cp.no_improve, "no_improve");
+    assert_eq!(cp2.stagnant, cp.stagnant, "stagnant");
+    assert_eq!(
+        cp2.main_rng.state(),
+        cp.main_rng.state(),
+        "main_rng state"
+    );
+    assert_eq!(cp2.generations, cp.generations, "generations");
+}
+
+#[test]
 fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     let train = sample(240);
     let test = sample(80);

@@ -181,6 +181,12 @@ OVERFITTING DIAGNOSTICS (always on):
                               straight line and a 5-nearest-neighbour learner,
                               in the same metric as the search: a model must
                               beat them to earn its complexity
+  --baseline-samples <N>      score at most N query rows for the k-NN baseline
+                              (default 0 = every row; absolute/squared/
+                              log_squashed only). The reference set is always
+                              all training rows; sampled results report their
+                              standard error with the finite-population
+                              correction (#69)
   overfit index               test_error / train_error
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
@@ -295,11 +301,20 @@ SEARCH:
   --predictor-samples <N>    score and fit candidates on N training rows per
                              generation (default: all rows; N >= 2). The archive
                              and every reported error are always full-data
+  --fit-samples <N>          screen constants on N training rows per generation
+                             (default: 0 = off; N >= 2). All offspring are
+                             fitted and scored on the subset; the top 1/16 are
+                             refit and scored on all training rows before
+                             selection and archiving. Independent of
+                             --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
-  --no-gpu                   force CPU evaluation even when built with
-                             --features cuda (alias --cpu). Reported errors are
-                             always CPU f64; the GPU only guides the search
+  --gpu                      let the GPU guide the search when built with
+                             --features cuda and a device is present. Reported
+                             errors stay CPU f64, but f32 fitness can change the
+                             trajectory, so this is opt-in
+  --no-gpu                   force CPU evaluation (alias --cpu); this is the
+                             default, so the flag is only for explicitness
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -534,11 +549,9 @@ fn main() {
     }
 
     let mut cfg = search::Config::default();
-    // #26: the CLI uses a device automatically in a CUDA build. The library
-    // default stays CPU so embedders and tests are unaffected; --no-gpu / --cpu
-    // turns the CLI path off again.
-    cfg.gpu = true;
-    let mut force_cpu = false;
+    // #91: the GPU path is opt-in. A default run is CPU, so the same command
+    // produces the same archive whether or not the binary was built with
+    // `--features cuda`. Pass `--gpu` to let f32 fitness guide the search.
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -563,6 +576,8 @@ fn main() {
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
+    // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
+    let mut baseline_samples = 0usize;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -602,6 +617,9 @@ fn main() {
     let mut patience_set = false;
     let mut time_budget_set = false;
     let mut predictor_samples_set = false;
+    // #85: remember an explicit --fit-samples so a resume can refuse a
+    // contradiction with the saved configuration.
+    let mut fit_samples_set = false;
     // #25: `--units` is resolved against the prepared input list later; the
     // expressions themselves are parsed here so a typo is a usage error.
     let mut unit_assignments: Vec<(String, Unit)> = Vec::new();
@@ -777,6 +795,8 @@ fn main() {
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
+            // #69: 0 = no caps; a positive N samples only the query rows.
+            "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
                 match Op::parse_list_checked(&val!()) {
@@ -821,10 +841,8 @@ fn main() {
             "--no-simd" => cfg.simd = false,
             // #26: force the CPU evaluator even in a CUDA build. A
             // performance choice, not saved search state.
-            "--no-gpu" | "--cpu" => {
-                cfg.gpu = false;
-                force_cpu = true;
-            }
+            "--gpu" => cfg.gpu = true,
+            "--no-gpu" | "--cpu" => cfg.gpu = false,
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -835,6 +853,28 @@ fn main() {
                     _ => {
                         eprintln!(
                             "error: --predictor-samples needs an integer >= 2, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            // #85: opt-in constant-fitting screen. 0 means off (the historical
+            // path); 1 cannot define a subset.
+            "--fit-samples" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(0) => {
+                        cfg.fit_samples = 0;
+                        fit_samples_set = true;
+                    }
+                    Ok(n) if n >= 2 => {
+                        cfg.fit_samples = n;
+                        fit_samples_set = true;
+                    }
+                    _ => {
+                        eprintln!(
+                            "error: --fit-samples needs 0 (off) or an integer >= 2, got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -985,6 +1025,18 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #69: query sampling is an unbiased estimate only for mean-loss metrics.
+    // Refuse the flag elsewhere rather than silently reporting a subsample of a
+    // median/correlation/AIC as if it were the full-sample value.
+    if baseline_samples > 0 && !diagnostics::knn_sampling_supported(cfg.metric) {
+        eprintln!(
+            "error: --baseline-samples {} only supports mean-loss metrics \
+             (absolute, squared, log_squashed), not {}",
+            baseline_samples,
+            cfg.metric.name()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
     // the real run: refuse rather than report a meaningless p-value.
@@ -1099,6 +1151,14 @@ fn main() {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
                 cfg.predictor_samples, saved.predictor_samples
+            ));
+        }
+        // #85: screening is saved search state, so an explicit contradiction is
+        // refused just like --predictor-samples.
+        if fit_samples_set && cfg.fit_samples != saved.fit_samples {
+            conflicts.push(format!(
+                "--fit-samples {} (saved {})",
+                cfg.fit_samples, saved.fit_samples
             ));
         }
         if let Some(spec) = &op_complexity_spec {
@@ -1955,6 +2015,18 @@ fn main() {
             .map(|v| format!("{} ({})", v.name, v.dtype.name()))
             .collect();
         eprintln!("# variables: {}", type_line.join(", "));
+        // #85: say how many rows the fitter screened and that the reported
+        // archive was refit on every training row.
+        if cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < prepared.train.len() {
+            let n = cfg.fit_samples;
+            eprintln!(
+                "# fit: constants screened on {} of {} training rows per generation; \
+                 survivors refit on all {} rows",
+                n,
+                prepared.train.len(),
+                prepared.train.len()
+            );
+        }
         if prepared.report.groups_total > 1 && mode == data::SplitMode::Group {
             eprintln!(
                 "# groups held out whole: {}/{} (never on both sides)",
@@ -1976,13 +2048,9 @@ fn main() {
         }
     }
 
-    // #26: the forced-CPU note belongs to the CLI, not to the library, so it is
-    // printed here once and only when the flag was written. `--quiet` promises
-    // an empty stderr for machine-readable output, so it suppresses every note.
+    // #26: the backend note belongs to the CLI, not to the library. `--quiet`
+    // promises an empty stderr for machine-readable output, so it suppresses it.
     cfg.gpu_notes = !quiet;
-    if force_cpu && !quiet {
-        eprintln!("# gpu: off (--no-gpu)");
-    }
 
     // #15: multi-output reporting has its own shape (one entry per target);
     // the single-output path below is untouched.
@@ -2246,7 +2314,15 @@ fn main() {
         .map(|r| r.resid_tests);
 
     // Null baselines: the trivial models a real fit must beat (issue #23).
-    let baselines = diagnostics::Baselines::fit(&prepared.train, &fold_samples, cfg.metric);
+    // #69: the k-NN reference set is always all training rows; only the query
+    // rows are optionally sampled by `--baseline-samples`.
+    let baselines = diagnostics::Baselines::fit_sampled(
+        &prepared.train,
+        &fold_samples,
+        cfg.metric,
+        baseline_samples,
+        cfg.seed,
+    );
 
     // Stability selection (issue #20): bootstrap the training rows, re-run the
     // identical search, and count how often each structural form and each input
@@ -2568,6 +2644,24 @@ fn main() {
                 baselines.knn.train_error,
                 baselines.knn.test_error
             );
+            // #69: state whether queries were sampled and the train/test SEMs.
+            if baselines.knn_capped {
+                eprintln!(
+                    "# knn baseline: reference_rows={} train_query_rows={} train_sem={:.3e} test_query_rows={} test_sem={:.3e} sampled=true",
+                    baselines.knn_reference_rows,
+                    baselines.knn_train_query_rows,
+                    baselines.knn_train_query_sem,
+                    baselines.knn_test_query_rows,
+                    baselines.knn_test_query_sem
+                );
+            } else {
+                eprintln!(
+                    "# knn baseline: reference_rows={} train_query_rows={} test_query_rows={} sampled=false",
+                    baselines.knn_reference_rows,
+                    baselines.knn_train_query_rows,
+                    baselines.knn_test_query_rows
+                );
+            }
             if let Some(cv) = &cv {
                 eprintln!(
                     "# cross-validation ({}, k={}): mean test={:.6} +/- {:.6} | mean train={:.6}",
@@ -2725,14 +2819,15 @@ fn main() {
                 None => "null".to_string(),
             };
             let baselines_json = format!(
-                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
                 jnum(baselines.linear.train_error),
                 jnum(baselines.linear.test_error),
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
-                jnum(baselines.knn.test_error)
+                jnum(baselines.knn.test_error),
+                baselines.knn_json_extra() // #69
             );
             let resid_json = match &best_resid {
                 Some(rt) => format!(
@@ -2821,6 +2916,18 @@ fn main() {
                 }
                 None => "null".to_string(),
             };
+            // #85: only emitted when screening is on, so an off run's JSON is
+            // byte-identical to the historical output.
+            let fit_json = if outcome.fit_samples > 0 {
+                format!(
+                    "\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}},",
+                    outcome.fit_samples,
+                    prepared.train.len(),
+                    outcome.archive_refit
+                )
+            } else {
+                String::new()
+            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -2834,7 +2941,8 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                fit_json, // #85
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -2913,7 +3021,7 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{}}}}}",
+                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
                 jstr(cfg.metric.name()),
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
@@ -2921,7 +3029,8 @@ fn main() {
                 jnum(baselines.linear.test_error),
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
-                jnum(baselines.knn.test_error)
+                jnum(baselines.knn.test_error),
+                baselines.knn_json_extra() // #69
             );
             if let Some(cv) = &cv {
                 println!(
@@ -2987,14 +3096,27 @@ fn main() {
                     variables.join(",")
                 );
             }
+            // #85: the closing event carries the screening note only when the
+            // flag is on, so the off path keeps its exact bytes.
+            let fit_ndjson = if outcome.fit_samples > 0 {
+                format!(
+                    ",\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}}",
+                    outcome.fit_samples,
+                    prepared.train.len(),
+                    outcome.archive_refit
+                )
+            } else {
+                String::new()
+            };
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
-                outcome.archive.items.len()
+                outcome.archive.items.len(),
+                fit_ndjson
             );
         }
     }
@@ -4593,6 +4715,16 @@ fn metric_names() -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #91: a default run must be CPU regardless of build features, so the
+    /// same command yields the same archive in a CUDA and a non-CUDA build.
+    #[test]
+    fn the_gpu_path_is_opt_in() {
+        assert!(!search::Config::default().gpu);
+        assert!(usage().contains("--gpu"));
+        assert!(schema::json().contains("\"--gpu\""));
+        assert!(usage().contains("--no-gpu"));
+    }
+
     use super::*;
 
     /// `--help` and `schema` are hand-written; this keeps them in step with the

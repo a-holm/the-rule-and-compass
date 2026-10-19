@@ -853,7 +853,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     ];
     // #25: optional so a checkpoint written before units existed still loads,
     // and so a units-free run writes exactly the old checkpoint bytes.
-    const OPTIONAL_KEYS: &[&str] = &["units", "units.target", "require_dimensions"];
+    // #85: `fit_samples` is optional for the same reason: missing means 0 (off),
+    // which is byte-identical to a checkpoint written before screening existed.
+    const OPTIONAL_KEYS: &[&str] = &[
+        "units",
+        "units.target",
+        "require_dimensions",
+        "fit_samples",
+    ];
     for key in KEYS {
         required(fields, key)?;
     }
@@ -968,6 +975,22 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             predictor_samples
         ));
     }
+    // #85: missing means off. A present value must be 0 or at least 2, matching
+    // the CLI; 1 cannot define a screening subset.
+    let fit_samples = match fields.get("fit_samples").map(|s| s.as_str()) {
+        None => 0,
+        Some(raw) => {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| format!("bad config value for 'fit_samples': '{}'", raw))?;
+            if n == 1 {
+                return Err(
+                    "config 'fit_samples' must be 0 (off) or at least 2, got 1".to_string(),
+                );
+            }
+            n
+        }
+    };
 
     // #25: optional fields. Missing means "no units, no filter", which is
     // bit-identical to a checkpoint written before this feature existed.
@@ -1026,6 +1049,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         time_budget,
         patience: num_usize("patience")?,
         predictor_samples,
+        fit_samples, // #85
         units,
         require_dimensions,
         progress: None,
@@ -1092,6 +1116,11 @@ fn write_config(cfg: &Config, out: &mut String) {
         }
     )
     .unwrap();
+    // #85: only write the field when screening is on, so an off run's
+    // checkpoint stays byte-identical to one written before the flag existed.
+    if cfg.fit_samples > 0 {
+        writeln!(out, "config fit_samples {}", cfg.fit_samples).unwrap();
+    }
     // #25: only write these when units are active, so a units-free checkpoint
     // is byte-identical to one written before this feature existed.
     if let Some(u) = &cfg.units {

@@ -3,3 +3,4 @@
 # residual tests (best solution): Ljung-Box h=0 Q=NaN p=NaN | Breusch-Pagan LM=3.876 p=0.049 (variance changes with fitted) | skewness=0.000 excess kurtosis=-1.360
 # constant errors (rank 1): 2.500000±1.94e0 (rel 7.75e-1), 1.118034±1.94e0 (rel 1.73e0) | dof=2
 # null baselines (absolute): mean train=2.000000 test=inf | linear train=0.000000 test=inf | 4-NN train=2.000000 test=inf
+# knn baseline: reference_rows=4 train_query_rows=4 test_query_rows=0 sampled=false
