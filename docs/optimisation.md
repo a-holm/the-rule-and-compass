@@ -266,8 +266,8 @@ generations earlier, survived only if its own lineage did.
 Now, with probability **15%**, one of the two parents is drawn uniformly from
 the current Pareto front instead of the island tournament; the other still comes
 from the island. The draw is seeded, so a run remains reproducible. The front is
-copied once per generation into the island threads (a small `Vec` of front
-members), so the islands stay independent.
+borrowed read-only for the duration of that generation's island threads: nothing
+is cloned, and the islands stay independent.
 
 Measured on the known-truth suite (seed 1/7/42, full documented budget), off vs
 on:
