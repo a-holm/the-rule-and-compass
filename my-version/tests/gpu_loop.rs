@@ -138,10 +138,11 @@ fn forced_cpu_flag_works_with_and_without_the_feature() {
         None,
     );
     assert!(!stdout.is_empty(), "the search still reports solutions");
-    // The flag is accepted by every build and the note names it.
+    // #91: CPU is the default, so `--no-gpu` is accepted but silent — there is
+    // no GPU to report being switched off.
     assert!(
-        stderr.contains("# gpu: off (--no-gpu)"),
-        "expected the forced-CPU note, got: {stderr}"
+        !stderr.contains("# gpu:"),
+        "a CPU run must not print a GPU note, got: {stderr}"
     );
 }
 
@@ -164,6 +165,8 @@ fn cuda_build_without_a_device_falls_back_with_one_note() {
             "5",
             "--metric",
             "squared",
+            // #91: the GPU is opt-in, so the fallback only happens when asked.
+            "--gpu",
         ],
         Some("0"),
     );

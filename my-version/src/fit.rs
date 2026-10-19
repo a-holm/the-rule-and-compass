@@ -158,9 +158,13 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         Const => node_val,
         Input => node_val, // unused: inputs are folded in below
         Neg => -a(0),
-        // #87: these guards mirror `expr::eval` exactly. The fitter must not
-        // produce a finite value where the scorer produces NaN or infinity,
-        // otherwise the fitted SSE is not the score and cannot be reused.
+        // #87: `Exp` and `Div` are the two operators that can leave a
+        // *finite* fitter value where `expr::eval` returns NaN or infinity.
+        // The other operators' Rust implementations already produce a
+        // non-finite value in the same cases (Ln(0) -> -inf, Sqrt(<0) -> NaN,
+        // Tan(inf) -> NaN, Pow -> NaN, Atan2 -> NaN), so they cannot create a
+        // reusable finite SSE. Guarding them too changed the multi-output
+        // search trajectory without fixing a finite-vs-infinite divergence.
         Exp => {
             let x = a(0);
             if x > 700.0 {
@@ -169,33 +173,12 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 x.exp()
             }
         }
-        Ln => {
-            let x = a(0);
-            if x > 0.0 {
-                x.ln()
-            } else {
-                f64::NAN
-            }
-        }
+        Ln => a(0).ln(),
         Abs => a(0).abs(),
-        Sqrt => {
-            let x = a(0);
-            if x >= 0.0 {
-                x.sqrt()
-            } else {
-                f64::NAN
-            }
-        }
+        Sqrt => a(0).sqrt(),
         Sin => a(0).sin(),
         Cos => a(0).cos(),
-        Tan => {
-            let t = a(0).tan();
-            if t.is_finite() {
-                t
-            } else {
-                f64::NAN
-            }
-        }
+        Tan => a(0).tan(),
         Sinh => a(0).sinh(),
         Cosh => a(0).cosh(),
         Tanh => a(0).tanh(),
@@ -253,6 +236,7 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
         Add => a(0) + a(1),
         Sub => a(0) - a(1),
         Mul => a(0) * a(1),
+        // #87: `expr::eval` rejects a near-zero denominator with NaN.
         Div => {
             let b = a(1);
             if b.abs() < 1e-12 {
@@ -261,14 +245,7 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 a(0) / b
             }
         }
-        Pow => {
-            let (x, p) = (a(0), a(1));
-            if x < 0.0 && (p - p.round()).abs() > 1e-9 {
-                f64::NAN
-            } else {
-                x.powf(p)
-            }
-        }
+        Pow => a(0).powf(a(1)),
         Mod => {
             let (x, b) = (a(0), a(1));
             if !x.is_finite() || !b.is_finite() || b.abs() < 1e-12 {
@@ -293,14 +270,7 @@ fn value_of(op: Op, kids: &[usize], v: &[f64], node_val: f64) -> f64 {
                 x.max(y)
             }
         }
-        Atan2 => {
-            let (y, x) = (a(0), a(1));
-            if y.is_nan() || x.is_nan() {
-                f64::NAN
-            } else {
-                y.atan2(x)
-            }
-        }
+        Atan2 => a(0).atan2(a(1)),
         If => {
             if a(0) > 0.0 {
                 a(1)
@@ -734,10 +704,8 @@ fn sse(
     s
 }
 
-/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants,
-/// their sum of squared errors, and the SSE at the **current** constants (which
-/// the same row loop forms for free), or `None` if the normal equations are
-/// singular.
+/// One Gauss–Newton/Levenberg–Marquardt step. Returns the trial constants and
+/// their sum of squared errors, or `None` if the normal equations are singular.
 #[allow(clippy::too_many_arguments)]
 fn gn_step(
     f: &Flat,
@@ -750,7 +718,7 @@ fn gn_step(
     v: &mut [f64],
     adj: &mut [f64],
     grad: &mut [f64],
-) -> Option<(Vec<f64>, f64, f64)> {
+) -> Option<(Vec<f64>, f64)> {
     // #87: mirror the scorer's length contract.
     if x.len() != y.len() {
         return None;
@@ -760,7 +728,6 @@ fn gn_step(
     }
     let mut jtj = vec![vec![0.0; k]; k];
     let mut jtr = vec![0.0; k];
-    let mut cur_sse = 0.0;
     for (i, (row, &t)) in x.iter().zip(y).enumerate() {
         let sw = w.get(i).copied().unwrap_or(1.0);
         if sw == 0.0 {
@@ -773,9 +740,6 @@ fn gn_step(
         if !r.is_finite() {
             return None;
         }
-        // #87: the same residual that builds the normal equations also gives
-        // the current SSE, in exactly the order `sse` would sum it.
-        cur_sse += r * r;
         backward(f, v, adj, grad);
         for i in 0..k {
             let gi = grad[i];
@@ -799,7 +763,7 @@ fn gn_step(
         .map(|i| (c[i] + step[i]).clamp(-1e6, 1e6))
         .collect();
     let s = sse(f, x, y, w, &trial, v);
-    Some((trial, s, cur_sse))
+    Some((trial, s))
 }
 
 /// Fit all constants of `tree` to minimise squared error on `x`/`y`.
@@ -855,23 +819,22 @@ pub fn fit_weighted(
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
-    // #87: the first `gn_step` forms the SSE at the current constants while it
-    // builds the normal equations, so the standalone sweep is not repeated.
-    // `None` means "not known yet"; the fallback below covers the singular and
-    // zero-iteration cases.
-    let mut best_sse: Option<f64> = None;
+    // #87: this standalone SSE is intentionally kept. The first `gn_step`
+    // forms the same residuals, but using them as the acceptance baseline
+    // changed the LM trajectory on guard-free trees; exactness beats the one
+    // saved sweep. Only the *final* SSE is reused (and only for `squared`).
+    let mut best_sse = sse(&f, x, y, w, &c, &mut v);
     let mut lambda = 1e-3;
 
     for _ in 0..iters.max(1) {
         match gn_step(&f, x, y, w, &c, lambda, k, &mut v, &mut adj, &mut grad) {
-            Some((trial, tsse, cur_sse)) => {
-                let best = *best_sse.get_or_insert(cur_sse);
-                if tsse < best {
+            Some((trial, tsse)) => {
+                if tsse < best_sse {
                     c = trial;
-                    best_sse = Some(tsse);
+                    best_sse = tsse;
                     best_c = c.clone();
                     lambda = (lambda / 8.0).max(1e-12);
-                    if tsse == 0.0 {
+                    if best_sse == 0.0 {
                         break;
                     }
                 } else {
@@ -884,7 +847,6 @@ pub fn fit_weighted(
             None => break,
         }
     }
-    let mut best_sse = best_sse.unwrap_or_else(|| sse(&f, x, y, w, &c, &mut v));
 
     // Undamped Gauss–Newton polish: quadratic convergence to the optimum.
     for _ in 0..4 {
@@ -903,7 +865,7 @@ pub fn fit_weighted(
             &mut adj,
             &mut grad,
         ) {
-            Some((trial, tsse, _)) if tsse < best_sse => {
+            Some((trial, tsse)) if tsse < best_sse => {
                 best_c = trial;
                 best_sse = tsse;
             }
@@ -1599,13 +1561,6 @@ mod tests {
                 node(Op::Exp, vec![node(Op::Mul, vec![constant(700.0), input(0)])]),
                 vec![1.0],
             ),
-            // Ln(0) is NaN, not -inf; Sqrt(-1) is NaN.
-            (node(Op::Ln, vec![input(0)]), vec![0.0]),
-            (node(Op::Sqrt, vec![input(0)]), vec![-1.0]),
-            // (-2)^0.5 is NaN.
-            (node(Op::Pow, vec![constant(-2.0), constant(0.5)]), vec![0.0]),
-            // tan(inf) is NaN.
-            (node(Op::Tan, vec![input(0)]), vec![f64::INFINITY]),
         ];
         for (tree, x) in cases {
             let want = expr::eval(&tree, &x);

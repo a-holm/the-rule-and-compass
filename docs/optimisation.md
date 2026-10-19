@@ -411,19 +411,30 @@ Wiring the LM fitter's value/Jacobian passes onto the same SoA layout is the
 next real win; it is deliberately out of scope here, where the requirement is
 that every existing fit and metric path keeps its exact behaviour.
 
-#### Removing the two recomputed SSE sweeps (#87)
+#### The exact final-SSE reuse (#87)
 
-The first Gauss–Newton pass already forms every residual, and the fitter's
-final SSE is the score for a `squared` fit on the same rows. Removing the
-separate initial and final forward sweeps is worth **−2.6 %** on the default
-`absolute` workload and **−4.8 %** on the `squared` workload (G=30, min of five
-`%U` runs), not the ~6.6 % a naive "2 of 26 sweeps" count suggests. The reason
-is that the 12 `gn_step` sweeps also run the adjoint `backward` pass and build
-`JᵀJ`/`Jᵀr`, so each of them costs several times a forward `sse`; the two
-removed sweeps are the cheap kind. The reuse is exact and applies to `squared`
-only — this crate has no `rmse` metric — and is refused when the fit and score
-rows differ, the tree folded constants, the sample is weighted/multi-output, or
-any guard makes the fitted SSE non-finite.
+The fitter's final SSE is the score for a `squared` fit on the same rows, so the
+search reuses it instead of scoring the fitted tree a second time. This changes
+no fit and no trajectory. The **initial** SSE is deliberately still computed by
+the standalone `sse(c)`: using the first `gn_step`'s residual sum as the
+acceptance baseline changed the LM trajectory on guard-free trees, so that
+reuse was reverted. `tests/trajectory.rs` pins the complete front for the
+documented baseline command, so a future shift fails loudly.
+
+The remaining final-reuse saving is small. The 12 `gn_step` sweeps also run the
+adjoint `backward` pass and build `JᵀJ`/`Jᵀr`, so they cost several times a
+forward `sse`; the one removed scoring sweep is the cheap kind. End-to-end it is
+within measurement noise on `w2.csv` (the earlier 2.6–4.8 % figure included the
+now-reverted initial reuse). The reuse is exact and applies to `squared` only —
+this crate has no `rmse` metric — and is refused when the fit and score rows
+differ, the tree folded constants, the sample is weighted/multi-output, or a
+guard makes the fitted SSE non-finite. `fit.rs::value_of` now applies the two
+guards that can leave a *finite* fitter value where the scorer rejects the
+tree — `Exp > 700 → +inf` and `Div |denominator| < 1e-12 → NaN` — and the
+fitter rejects `x.len() != y.len()`. The other operators already produce a
+non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
+`Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
+multi-output search trajectory without fixing a finite-vs-infinite divergence.
 
 #### Screening the fit rows: `--fit-samples`
 
@@ -462,10 +473,10 @@ pop 100, seed 1, min of three `%U` runs on a shared host), with `m = 200` and a
 
 | config | full data | `--fit-samples 200` | speed-up | refitted best error |
 |---|---:|---:|---:|---|
-| G=30, absolute | 5.03 s | **2.09 s** | **2.41×** | 0.1633 → **0.0121** (13.5× better) |
-| G=30, squared | 4.58 s | **1.59 s** | **2.88×** | **0.0259 → 0.0398** (1.54× worse) |
-| G=10, absolute | 1.09 s | **0.53 s** | **2.06×** | 0.1762 → **0.2261** (1.28× worse) |
-| G=10, squared | 1.60 s | **0.38 s** | **4.2×** | **0.0259 → 0.0869** (3.36× worse) |
+| G=30, absolute | 5.03 s | **2.11 s** | **2.38×** | 0.1633 → **0.0121** (13.5× better) |
+| G=30, squared | 4.58 s | **1.65 s** | **2.78×** | **0.0259 → 0.0398** (1.54× worse) |
+| G=10, absolute | 1.09 s | **0.50 s** | **2.18×** | 0.1762 → **0.2261** (1.28× worse) |
+| G=10, squared | 1.60 s | **0.37 s** | **4.32×** | **0.0259 → 0.0869** (3.36× worse) |
 
 The baselines are the full run's own best shapes **refitted** on all rows, not
 their unrefitted errors (the earlier draft compared against the unrefitted
