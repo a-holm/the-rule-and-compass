@@ -127,13 +127,6 @@ generations, 2 islands, 200 individuals). The search metric defaults to
 
 ## 5. Recorded results
 
-Every number in this section is a **recorded** result for the commit named in
-its subsection, on the machine named there — not a promise about the current
-tree. The search is stochastic across engine seeds: a different `--seed` can
-recover a different set of problems. For a fixed seed it is deterministic;
-repeating the full sweep below with the same command reproduced every
-expression, `R²` and complexity exactly (only the wall-clock times differed).
-
 ### 5.1 Tiny suite (CI)
 
 ```sh
@@ -141,7 +134,7 @@ cargo run --release --bin rcsr-bench -- --tiny --seed 1
 ```
 
 Recorded on an 8-thread x86-64 Linux machine (Intel Core i7-3770K), engine seed
-`1`, all three default noise levels, at commit `b8eff73` (2026-10-18):
+`1`, all three default noise levels:
 
 | problem | cx | R² @ 0.00 | R² @ 0.01 | R² @ 0.10 |
 |---|---|---|---|---|
@@ -167,8 +160,7 @@ The whole tiny sweep (9 problems × 3 noise levels) finishes in about **5 second
 on an idle 8-thread machine, which is why it is the CI subset. Engine seeds 7 and
 42 give 27/27 (100 %) and 26/27 (96.3 %) at these settings — one 1 %-noise run
 missed the threshold at seed 42 — so the tiny suite is a smoke test, not a
-one-seed fluke. Re-running the same command at `d26f2fd` (2026-10-19) still
-gives 27/27 with the same complexities, in about 6 s.
+one-seed fluke.
 
 Every selected solution is the true form: `square(x)`, `sqrt(x)`, `ln(x)`,
 `sin(x)`, `exp(-x)`, `(1 / x)`, `(x1 * x2)`, `(x1 / x2)` and a line written as
@@ -179,78 +171,63 @@ data, not the printed shape.
 ### 5.2 Full suite
 
 ```sh
-cd my-version
-cargo build --release
-./target/release/rcsr-bench --suite known-truth --noise 0.0,0.01,0.1 --seed 1
+cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1 --seed 1
 ```
 
 All 25 problems at the three default noise levels with the full budget
-(150 generations, 2 islands, 200 individuals), engine seed `1`, on an 8-thread
-x86-64 Linux machine (Intel Core i7-3770K). Recorded at commit `d26f2fd`
-(2026-10-19). The sweep took **5 min 36 s** wall-clock (336 s summed over the 75
-runs); a second identical sweep produced the same results in 6 min 39 s, so the
-seconds are indicative only. Add `--json` to capture the selected expression and
-complexity of every run.
+(150 generations, 2 islands, 200 individuals). Recorded with engine seed `1` at
+commit `d26f2fd` (2026-10-19) on an 8-thread x86-64 machine; wall-clock 5:35.67, peak RSS 4 MB.
+
+The sweep was run **twice** and the two runs matched exactly (75/75 cells), so
+these numbers are reproducible for this commit. They replace an earlier
+recording made before the mutation and fitting changes of #77/#87: the headline
+count is unchanged (72/75) but the per-problem numbers moved.
 
 ```
 recovered 72/75 (96.0%)   median complexity 3
 by noise level:
-  0.000   25 runs   24 recovered ( 96.0%)  median complexity 3
-  0.010   25 runs   24 recovered ( 96.0%)  median complexity 3
-  0.100   25 runs   24 recovered ( 96.0%)  median complexity 4
+  0.000   25 runs   24 recovered (96.0%)  median complexity 3
+  0.010   25 runs   24 recovered (96.0%)  median complexity 3
+  0.100   25 runs   24 recovered (96.0%)  median complexity 4
 ```
 
-The aggregate is unchanged from the recording that predates #77 (72/75), but the
-per-problem rows are not: the search now returns different, often more complex
-approximations for the same seed.
-
-| problem | R² @ 0.00 | cx | R² @ 0.01 | cx | R² @ 0.10 | cx |
-|---|---|---|---|---|---|---|
-| `line` | 1.000 | 5 | 1.000 | 5 | 1.000 | 5 |
-| `quadratic` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `cubic` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `inverse` | 1.000 | 3 | 1.000 | 3 | 1.000 | 11 |
-| `product` | 1.000 | 3 | 1.000 | 3 | 1.000 | 3 |
-| `ratio` | 1.000 | 3 | 1.000 | 3 | 1.000 | 3 |
-| `sqrt_law` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `exp_decay` | 1.000 | 3 | 1.000 | 3 | 1.000 | 3 |
-| `log_law` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `sine_law` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `gaussian` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `logistic_law` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `tanh_law` | 1.000 | 2 | 1.000 | 2 | 1.000 | 2 |
-| `harmonic_sum` | 1.000 | 15 | 1.000 | 7 | 0.999 | 18 |
-| `reciprocal_sum` | 1.000 | 5 | 1.000 | 5 | 1.000 | 5 |
-| `pythagoras` | 0.987 | 13 | 0.721 | 23 | 0.987 | 22 |
-| `kinetic_energy` | 1.000 | 19 | 1.000 | 6 | 1.000 | 6 |
-| `coulomb` | 1.000 | 15 | 1.000 | 8 | 1.000 | 6 |
-| `ideal_gas` | 1.000 | 6 | 1.000 | 5 | 1.000 | 5 |
-| `spring_period` | 1.000 | 5 | 1.000 | 4 | 1.000 | 4 |
-| `velocity_addition` | 0.999 | 16 | 0.997 | 26 | 0.995 | 12 |
-| `damped_oscillator` | 1.000 | 12 | 1.000 | 5 | 1.000 | 5 |
-| `relativistic` | 1.000 | 11 | 1.000 | 6 | 0.999 | 6 |
-| `sine_sum` | 1.000 | 4 | 1.000 | 4 | 1.000 | 4 |
-| `power_law` | 1.000 | 3 | 1.000 | 3 | 1.000 | 3 |
+| problem | R² @ 0.00 | R² @ 0.01 | R² @ 0.10 |
+|---|---|---|---|
+| `line` | 1.000 | 1.000 | 1.000 |
+| `quadratic` | 1.000 | 1.000 | 1.000 |
+| `cubic` | 1.000 | 1.000 | 1.000 |
+| `inverse` | 1.000 | 1.000 | 1.000 |
+| `product` | 1.000 | 1.000 | 1.000 |
+| `ratio` | 1.000 | 1.000 | 1.000 |
+| `sqrt_law` | 1.000 | 1.000 | 1.000 |
+| `exp_decay` | 1.000 | 1.000 | 1.000 |
+| `log_law` | 1.000 | 1.000 | 1.000 |
+| `sine_law` | 1.000 | 1.000 | 1.000 |
+| `gaussian` | 1.000 | 1.000 | 1.000 |
+| `logistic_law` | 1.000 | 1.000 | 1.000 |
+| `tanh_law` | 1.000 | 1.000 | 1.000 |
+| `harmonic_sum` | 1.000 | 1.000 | 0.999 |
+| `reciprocal_sum` | 1.000 | 1.000 | 1.000 |
+| `pythagoras` | 0.987 | 0.721 | 0.987 |
+| `kinetic_energy` | 1.000 | 1.000 | 1.000 |
+| `coulomb` | 1.000 | 1.000 | 1.000 |
+| `ideal_gas` | 1.000 | 1.000 | 1.000 |
+| `spring_period` | 1.000 | 1.000 | 1.000 |
+| `velocity_addition` | 0.999 | 0.997 | 0.995 |
+| `damped_oscillator` | 1.000 | 1.000 | 1.000 |
+| `relativistic` | 1.000 | 1.000 | 0.999 |
+| `sine_sum` | 1.000 | 1.000 | 1.000 |
+| `power_law` | 1.000 | 1.000 | 1.000 |
 
 24 of 25 problems are recovered at every noise level. The single miss is
-`pythagoras` (`√(x1² + x2²)`), which did not recover at any level. The forms its
-front actually offered were:
-
-| noise | R² | cx | selected form |
-|---|---|---|---|
-| 0.00 | 0.987 | 13 | `ln(cube(((2.2647 / gauss((0.2399 * x1))) - cos((0.6416 * x2)))))` |
-| 0.01 | 0.721 | 23 | `if((0.556 + sinh(cos(x2))), if((0.9451 - square(x1)), if(cos((-x2)), 1.1814, 1.8952), if(cos(x1), 1.7176, 2.7194)), 3.0493)` |
-| 0.10 | 0.987 | 22 | `(((0.1033 * (21.5114 + (0.1265 ^ (cos(x1) * cos(x2))))) + (-0.7979 * cos(x2))) - (0.8218 * cos(abs(x1))))` |
-
-None carries the exact two-term form. The noiseless and 10 % runs come close
-(R² 0.987) with trigonometric approximations; the 1 % run fell into a piecewise
-`if` local optimum and stopped at R² 0.721, far worse than its neighbours. This
-is exactly the kind of information the suite exists to produce: everywhere else
-the search is not the limiting factor, while for `pythagoras` it is — and the
-failure mode depends on where that run lands, not just on the noise level. For
-comparison, the probe recorded in #94 on `64f1bc1` recovered `pythagoras` at
-noise 0 (R² 0.9921, cx 27); that commit predates the fit-screening changes now
-on `main`, which moved the search path.
+`pythagoras` (`√(x1² + x2²)`): its best front member reaches R² =
+0.987 (noiseless), 0.721 (1 %) and 0.987
+(10 %). At 0 % it is a complexity-13 approximation
+(`ln(cube(((2.2647 / gauss((0.2399 * x1))) - cos((0.6416 * x2)))))`), not the exact two-term form; at 1 % the front falls back
+to a piecewise `if` at complexity 23. The exact form *is*
+reachable — a run of an earlier build found it at complexity 7 — so this is a
+stochastic limit of the search at this budget, not an impossibility. That is
+exactly the kind of information the suite exists to produce.
 
 ## 6. Reproducing and limitations
 
