@@ -487,81 +487,7 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 
 // ---- layer 1: no --units --------------------------------------------------
 
-/// #18 deliberately adds a `convergence` object to every `--json`/`--ndjson`
-/// document. That is a change from a *different* feature, not from units, so it
-/// is masked here: the assertion still fails on any other difference, and the
-/// separate checks below still forbid a `constant_dimensions` field.
-fn mask_batch_fields(s: &str) -> String {
-    // #72 adds `rows_skipped_malformed` to the always-present preparation
-    // object. Mask it here for the same reason as `convergence`: it is a
-    // deliberate change from another feature, not from units.
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(at) = rest.find("\"rows_skipped_malformed\":") {
-        out.push_str(&rest[..at]);
-        let mut i = at + "\"rows_skipped_malformed\":".len();
-        let b = rest.as_bytes();
-        while i < b.len() && (b[i] as char).is_ascii_digit() {
-            i += 1;
-        }
-        if rest[i..].starts_with(',') {
-            i += 1;
-        } else if out.ends_with(',') {
-            // The field was last in its object: drop the separator before it.
-            out.pop();
-        }
-        rest = &rest[i..];
-    }
-    out.push_str(rest);
-    mask_convergence(&out)
-}
 
-fn mask_convergence(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(at) = rest.find("\"convergence\":{") {
-        out.push_str(&rest[..at]);
-        // Skip the balanced object that follows the colon.
-        let bytes = rest.as_bytes();
-        let mut depth = 0usize;
-        let mut i = at + "\"convergence\":".len();
-        let mut in_str = false;
-        let mut esc = false;
-        while i < bytes.len() {
-            let c = bytes[i] as char;
-            if in_str {
-                if esc {
-                    esc = false;
-                } else if c == '\\' {
-                    esc = true;
-                } else if c == '"' {
-                    in_str = false;
-                }
-            } else {
-                match c {
-                    '"' => in_str = true,
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            i += 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            i += 1;
-        }
-        // Drop a following comma so the surrounding object stays valid text.
-        if rest[i..].starts_with(',') {
-            i += 1;
-        }
-        rest = &rest[i..];
-    }
-    out.push_str(rest);
-    out
-}
 
 /// The only nondeterministic field in the pre-change JSON output was
 /// `elapsed_seconds`; mask it so the rest of the byte stream can be compared.
@@ -580,10 +506,13 @@ fn mask_elapsed(src: &str) -> String {
     out
 }
 
-/// Layer 1: a units-free run is byte-identical to the pre-change binary,
-/// including the absence of any new JSON/NDJSON field. The text golden is
-/// exact; the JSON/NDJSON goldens mask only `elapsed_seconds`, which was
-/// already nondeterministic before this feature.
+/// Layer 1: a units-free run is byte-identical to the recorded golden,
+/// including the absence of any units field. The text golden is exact; the
+/// JSON/NDJSON goldens are snapshots of this engine's output (regenerated when
+/// another feature deliberately adds a field) and mask only `elapsed_seconds`,
+/// which is nondeterministic by nature. The units-specific assertions - no
+/// `constant_dimensions` field and no filtering - are independent of the
+/// snapshot.
 #[test]
 fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let table = "x,y\n1,2\n2,4\n3,6\n4,8\n";
@@ -611,7 +540,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_batch_fields(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
+    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_json.stdout"));
     assert_eq!(got, want, "--json changed");
     assert!(
@@ -624,7 +553,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_batch_fields(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
+    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_ndjson.stdout"));
     assert_eq!(got, want, "--ndjson changed");
     assert!(

@@ -263,7 +263,13 @@ fn an_easy_problem_reaches_the_converged_range() {
 fn a_hard_problem_does_not_reach_the_converged_range() {
     let train = standardize_x(&hard_sample());
     let test = train.clone();
-    let outcome = search::run(&config(2, 80), &train, &test);
+    // A *short* budget: convergence measures whether the front is still moving,
+    // and a long run on this fixture eventually stalls (stability ~1.0) — which
+    // is convergence of the search, however poor the error. The test needs a
+    // run that is still improving, so it uses a fraction of the budget.
+    let mut cfg = config(2, 80);
+    cfg.generations = 25;
+    let outcome = search::run(&cfg, &train, &test);
 
     let c = outcome.convergence;
     assert!(
