@@ -436,6 +436,30 @@ non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
 `Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
 multi-output search trajectory without fixing a finite-vs-infinite divergence.
 
+#### Subsampled scoring: `--predictor-samples`
+
+`--predictor-samples N` draws a fresh `N`-row subset every generation and uses
+it for both the constant fit and the score. #86 made two changes to the original
+implementation:
+
+* **Carried individuals are refitted before they are scored.** Previously the
+  carried population was only re-scored, so it competed as `fit(S_{g-1}) ->
+  score(S_g)` against offspring on `fit(S_g) -> score(S_g)`, and the elite was
+  never refitted at all. The refit uses one warm-started LM iteration (plus the
+  fitter's four polish iterations) because the constants already come from the
+  previous subset; a cold refit doubled the generation's fit cost and erased
+  the win at 750/1500.
+* **Near-full requests are widened to the full sample.** The fitter-only
+  break-even, `m/n < (24 - 1/G)/25 ~ 0.96`, assumed that only a scoring sweep
+  was saved for carried individuals. With the refit the model is about
+  `(26 + 6) m` against `26 n`, i.e. `m/n < 0.81` before the sample rebuild and
+  the extra final archive pass. On the `w2.csv` workload (1 500 train rows,
+  `--fit-iters 8`, 10 generations, min of three `%U`) `900/1500 = 0.60` still
+  wins but `1000/1500 = 0.67` is slower than full data, so the measured rule is
+  `m <= 3/5 n`. `750/1500` stays active; `1400/1500` is an exact no-op that
+  uses the full sample. The text header and the `--json`/NDJSON output report
+  the requested and effective sizes, and whether the request was widened.
+
 #### Screening the fit rows: `--fit-samples`
 
 The fitter reads every training row on each LM sweep, so the cheapest way to

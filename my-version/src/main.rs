@@ -313,8 +313,13 @@ SEARCH:
                              SoA/AVX evaluator (same results, slower; an
                              escape hatch for debugging and A/B runs)
   --predictor-samples <N>    score and fit candidates on N training rows per
-                             generation (default: all rows; N >= 2). The archive
-                             and every reported error are always full-data
+                             generation (default: all rows; N >= 2). A request
+                             above 3/5 of the training size is widened to all
+                             rows (rebuild and refit cost more than it saves);
+                             N >= train rows is an exact no-op. Carried
+                             individuals are refitted on the same subset before
+                             they are scored. The archive and every reported
+                             error are always full-data
   --fit-samples <N>          screen constants on N training rows per generation
                              (default: 0 = off; N >= 2). All offspring are
                              fitted and scored on the subset; the top 1/16 are
@@ -2125,6 +2130,26 @@ fn main() {
                 prepared.train.len()
             );
         }
+        // #86: state the effective screening size, and say so when a near-full
+        // request was widened to the full sample instead of paying the
+        // per-generation rebuild for a negligible fit saving.
+        if let Some(requested) = cfg.predictor_samples {
+            let rows = prepared.train.len();
+            match search::effective_predictor_samples(&cfg, &prepared.train) {
+                Some(n) => eprintln!(
+                    "# predictor: {} of {} training rows per generation (requested {})",
+                    n, rows, requested
+                ),
+                None if requested >= rows => eprintln!(
+                    "# predictor: requested {} >= {} training rows; using all rows",
+                    requested, rows
+                ),
+                None => eprintln!(
+                    "# predictor: requested {} of {} rows is above the 60% break-even; using all {} rows",
+                    requested, rows, rows
+                ),
+            }
+        }
         if prepared.report.groups_total > 1 && mode == data::SplitMode::Group {
             eprintln!(
                 "# groups held out whole: {}/{} (never on both sides)",
@@ -3032,6 +3057,26 @@ fn main() {
                 }
                 None => "null".to_string(),
             };
+            // #86: emitted only when the flag is set, so an off run's JSON is
+            // byte-identical to the historical output. `effective` is the row
+            // count actually used; `widened` marks a near-full request that
+            // resolved to the full sample (or an exact `n >= rows` no-op).
+            let predictor_json = match cfg.predictor_samples {
+                Some(requested) => {
+                    let effective = if outcome.predictor_samples == 0 {
+                        prepared.train.len()
+                    } else {
+                        outcome.predictor_samples
+                    };
+                    format!(
+                        "\"predictor_samples\":{{\"requested\":{},\"effective\":{},\"widened\":{}}},",
+                        requested,
+                        effective,
+                        effective == prepared.train.len()
+                    )
+                }
+                None => String::new(),
+            };
             // #85: only emitted when screening is on, so an off run's JSON is
             // byte-identical to the historical output.
             let fit_json = if outcome.fit_samples > 0 {
@@ -3044,6 +3089,7 @@ fn main() {
             } else {
                 String::new()
             };
+            let search_meta_json = format!("{}{}", predictor_json, fit_json);
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -3058,7 +3104,7 @@ fn main() {
             );
             println!(
                 "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
-                fit_json, // #85
+                search_meta_json, // #85 #86
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -3228,6 +3274,24 @@ fn main() {
             } else {
                 String::new()
             };
+            // #86: same rule for the effective predictor-sample size.
+            let predictor_ndjson = match cfg.predictor_samples {
+                Some(requested) => {
+                    let effective = if outcome.predictor_samples == 0 {
+                        prepared.train.len()
+                    } else {
+                        outcome.predictor_samples
+                    };
+                    format!(
+                        ",\"predictor_samples\":{{\"requested\":{},\"effective\":{},\"widened\":{}}}",
+                        requested,
+                        effective,
+                        effective == prepared.train.len()
+                    )
+                }
+                None => String::new(),
+            };
+            let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
                 "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
@@ -3236,7 +3300,7 @@ fn main() {
                 outcome.convergence.json(),
                 jnum(elapsed),
                 outcome.archive.items.len(),
-                fit_ndjson
+                search_meta_ndjson
             );
         }
     }

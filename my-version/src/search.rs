@@ -57,8 +57,11 @@ pub struct Config {
     /// Stop after this many generations with no improvement (0 disables).
     pub patience: usize,
     /// Number of training rows used to score and fit candidates in a
-    /// generation. `None`, or any value at least the training size, scores the
-    /// full training sample. Values below 2 are rejected by the CLI.
+    /// generation. `None` scores the full training sample. #86: a request at
+    /// least the training size is an exact no-op, and a request above the
+    /// measured break-even (`3/5` of the rows) is widened to the full sample
+    /// because the per-generation rebuild and carried-individual refit cost
+    /// more than the rows saved. Values below 2 are rejected by the CLI.
     pub predictor_samples: Option<usize>,
     /// #85: number of rows used to **fit** constants in a generation. `0`
     /// disables screening (today's behaviour); any value at least the
@@ -277,6 +280,27 @@ impl Ind {
         } else {
             f64::INFINITY
         };
+    }
+
+    // #86: re-fit the constants on the current generation's fit rows *before*
+    // scoring, so a carried individual follows the same `fit(S_g) -> score(S_g)`
+    // path as an offspring. Re-scoring alone left it as `fit(S_{g-1}) ->
+    // score(S_g)`: stale constants were compared against freshly fitted ones,
+    // and the elite — the longest-lived individual — was never refitted at all.
+    // The fit sample always equals the scoring sample in this path, so the
+    // final-SSE reuse stays exact (see `fit_constants`).
+    fn refit_and_reeval(&mut self, train: &EvalSample, fit_sample: &Sample, cfg: &Config) {
+        let mut tree = expr::simplify(&self.tree);
+        let fitted = if cfg.fit_iters > 0 && !train.sample.is_multi() {
+            // One warm-started LM iteration is enough to move constants that
+            // were already fitted to a different subset; a cold full fit here
+            // would double the generation's fit cost and erase the 750/1500
+            // win. Offspring below keep the full `cfg.fit_iters` budget.
+            fit_constants_with_iters(&mut tree, cfg, fit_sample, train.sample, 1)
+        } else {
+            None
+        };
+        *self = Ind::evaluated_fitted(tree, fitted, train, cfg); // #25 #87
     }
 
     fn to_checkpoint(&self) -> Individual {
@@ -592,11 +616,25 @@ fn fit_constants(
     fit: &Sample,
     score: &Sample,
 ) -> Option<FitResult> {
+    fit_constants_with_iters(tree, cfg, fit, score, cfg.fit_iters)
+}
+
+/// #86: [`fit_constants`] with an explicit iteration budget. Carried
+/// individuals are warm-started from constants already fitted on the previous
+/// subset, so one LM iteration refreshes them on the new rows; offspring keep
+/// the full `--fit-iters` budget.
+fn fit_constants_with_iters(
+    tree: &mut Node,
+    cfg: &Config,
+    fit: &Sample,
+    score: &Sample,
+    iters: usize,
+) -> Option<FitResult> {
     if cfg.metric.is_implicit_derivative() {
-        crate::implicit::fit(tree, &fit.x, &fit.w, cfg.fit_iters);
+        crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
-        let sse = crate::fit::fit_weighted(tree, &fit.x, &fit.y, &fit.w, cfg.fit_iters);
+        let sse = crate::fit::fit_weighted(tree, &fit.x, &fit.y, &fit.w, iters);
         // #87: remember the tree the SSE belongs to. Simplification after the
         // fit may fold constants, in which case the SSE is stale and the
         // caller must score normally.
@@ -650,12 +688,47 @@ fn score_tree(tree: &Node, data: &EvalSample, cfg: &Config) -> f64 {
     }
 }
 
+/// #86: the largest fraction of the training rows a screened generation must
+/// save before the subset is activated, as `NUM / DEN` = 3/5.
+///
+/// The fitter-only break-even `(24 - 1/G) / 25 ~ 0.96` assumed that only the
+/// scoring sweep was saved for the carried population. Refitting those
+/// individuals (one warm-started LM iteration plus the four-iteration polish,
+/// about six sweeps) changes the model to roughly `(26 + 6) m` against `26 n`
+/// per generation, i.e. `m/n < 0.81` before the per-generation sample rebuild
+/// and the extra final archive pass. On `w2.csv` (1500 train rows, 10
+/// generations, `--fit-iters 8`) `900/1500 = 0.60` still wins but `1000/1500 =
+/// 0.67` is slower than full data, so the measured rule is 3/5. `750/1500`
+/// stays active; `1400/1500` is widened to the full sample.
+const PREDICTOR_BREAK_EVEN_NUM: usize = 3;
+const PREDICTOR_BREAK_EVEN_DEN: usize = 5;
+
+/// #86: the effective per-generation subset size, or `None` when the full
+/// training sample must be used.
+///
+/// `n >= train.len()` is an exact no-op (the full sample, original order,
+/// bit-identical to leaving the option unset). A request above the measured
+/// break-even is widened to the full sample for the same reason, with a note
+/// printed by the CLI; this keeps the near-full regime from being a
+/// pessimization while still accepting the measured wins at 750/1500 and below.
+pub fn effective_predictor_samples(cfg: &Config, train: &Sample) -> Option<usize> {
+    let requested = cfg.predictor_samples?;
+    let rows = train.len();
+    // The CLI rejects values below 2; a direct `Config` sees them as "off"
+    // rather than as a one-row sample.
+    if rows == 0 || requested < 2 || requested >= rows {
+        return None;
+    }
+    if requested * PREDICTOR_BREAK_EVEN_DEN > rows * PREDICTOR_BREAK_EVEN_NUM {
+        return None;
+    }
+    Some(requested)
+}
+
 /// True when candidate scoring should use a per-generation subset of the
-/// training rows. A request at least as large as the training sample is a
-/// no-op: the full sample is used, in its original order, so the search is
-/// bit-for-bit identical to leaving the option unset.
+/// training rows.
 fn subsampling_active(cfg: &Config, train: &Sample) -> bool {
-    matches!(cfg.predictor_samples, Some(n) if n < train.len())
+    effective_predictor_samples(cfg, train).is_some()
 }
 
 /// Seed of the dedicated RNG stream for one generation's row subset.
@@ -720,10 +793,9 @@ fn subset_sample(train: &Sample, idx: &[usize]) -> Sample {
 /// sample must be used. The caller passes the full sample in that case, which
 /// preserves the original row order and floating-point summation.
 fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> Option<Sample> {
-    if !subsampling_active(cfg, train) {
-        return None;
-    }
-    let n = cfg.predictor_samples.unwrap_or(train.len());
+    // #86: use the effective size, not the raw request, so a near-full request
+    // resolves to the full sample here as well.
+    let n = effective_predictor_samples(cfg, train)?;
     let idx = generation_subset(train.len(), n, cfg.seed, generation);
     Some(subset_sample(train, &idx))
 }
@@ -1035,6 +1107,10 @@ pub struct Outcome {
     pub fit_samples: usize,
     /// #85: whether the reported archive was refit on the full training sample.
     pub archive_refit: bool,
+    /// #86: effective rows per generation used for scoring and fitting, or `0`
+    /// when the full training sample was used (off, exact no-op, or a request
+    /// widened above the break-even).
+    pub predictor_samples: usize,
 }
 
 /// Run a search once, from a fresh start.
@@ -1510,13 +1586,16 @@ fn run_search(
             };
             let eval_data = screen_data.as_ref().unwrap_or(&gen_data);
 
-            // With predictor subsampling active (and no screening), re-score the
-            // carried-over population on this generation's subset. In the
-            // screened path the parents are already full-data and stay so.
+            // #86: with predictor subsampling active (and no screening), refit
+            // the carried-over population on this generation's fit rows, then
+            // score it on the same rows. Re-scoring alone compared constants
+            // fitted on the previous generation's subset against freshly fitted
+            // offspring and never refitted the elite. In the screened path the
+            // parents are already full-data and stay so.
             if gen > 0 && gen_sample.is_some() && !screened {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.reeval(&gen_data, cfg); // #25
+                        ind.refit_and_reeval(&gen_data, fit_train, cfg); // #25
                     }
                 }
             }
@@ -1852,6 +1931,8 @@ fn run_search(
             0
         },
         archive_refit: fit_screened,
+        // #86: the effective subset actually used, after the break-even rule.
+        predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
     })
 }
 
@@ -1893,6 +1974,48 @@ mod tests {
             !shown.contains("3 *"),
             "the fitted constant must replace 3, got {}",
             shown
+        );
+    }
+
+    /// #86: a carried individual must be refitted on the generation's rows
+    /// before it is scored, not merely re-scored with stale constants.
+    #[test]
+    fn carried_individual_is_refitted_on_the_new_subset() {
+        fn slope_sample(slope: f64, n: usize) -> Sample {
+            let mut x = Vec::new();
+            let mut y = Vec::new();
+            for i in 0..n {
+                let a = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
+                x.push(vec![a]);
+                y.push(slope * a);
+            }
+            Sample { x, y, w: Vec::new(), ys: Vec::new() }
+        }
+
+        let mut cfg = Config::default();
+        cfg.fit_iters = 8;
+        // Slopes deliberately away from 1 so simplification cannot fold the
+        // fitted `c * x` into the bare input between refits.
+        let first = slope_sample(2.0, 40);
+        let second = slope_sample(5.0, 40);
+        let first_data = EvalSample::new(&first, &cfg);
+        let second_data = EvalSample::new(&second, &cfg);
+        let mut ind = Ind {
+            tree: node(Op::Mul, vec![constant(2.0), input(0)]),
+            error: f64::INFINITY,
+            complexity: 0.0,
+        };
+
+        ind.refit_and_reeval(&first_data, &first, &cfg);
+        let text_first = expr::to_string(&ind.tree, &["x".to_string()]);
+        assert!(ind.error < 1e-12, "first refit error = {}", ind.error);
+
+        ind.refit_and_reeval(&second_data, &second, &cfg);
+        let text_second = expr::to_string(&ind.tree, &["x".to_string()]);
+        assert!(ind.error < 1e-12, "second refit error = {}", ind.error);
+        assert_ne!(
+            text_first, text_second,
+            "the carried constants must move with the subset"
         );
     }
 
