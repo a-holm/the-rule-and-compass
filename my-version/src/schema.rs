@@ -12,7 +12,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The schema document, identical for the CLI and the server.
 pub fn json() -> String {
     let opts = [
-        ("--data", "string", "none", "table path, or '-' for stdin"),
+        ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
+        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A .rcsb store that does not fit is searched from a bounded hash sample; a CSV exits 3 before parsing"),
+        ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
         ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
         ("--vars", "csv", "all-except-targets", "input column names"),
         ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),

@@ -36,8 +36,9 @@ This replaces the old representation, which kept both `Vec<Vec<f64>>`
   `f64` (a lossless double codec decodes slower than the DRAM it replaces).
 * **No row groups while resident.** Row groups bound the working set of an
   out-of-core backing; they do not make the data smaller. The in-memory store
-  exposes `load_group`/`group_view` so a `pread`-backed store (issue #71) can
-  slot in without touching call sites, but the resident path hands out slices.
+  exposes `load_group`/`group_view`; the file backing added in #71 uses the same
+  shape with `pread`, so call sites do not branch. See
+  [`data-format.md`](data-format.md).
 * **No `f32`.** Storage stays `f64`; results are the numbers the user supplied.
 
 ## Row selectors
