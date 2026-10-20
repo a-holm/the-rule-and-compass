@@ -453,6 +453,12 @@ impl GpuSearch {
 
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        // #131: record what the batch actually emitted. Several calls can belong
+        // to one generation (initial screening, refit, restarts); merge them.
+        // The counts come from `compile_program`, i.e. from the words that were
+        // uploaded to the device, so an opcode is reported only if it ran.
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
         // #122: one fixed-width slot per genome. A tree whose postfix exceeds
         // the configured bound is scored on the CPU (the existing fallback), so
         // a wide seed can never truncate or corrupt the arena.
@@ -467,27 +473,28 @@ impl GpuSearch {
         let pool = self.pool.as_mut().expect("a pool was just allocated");
         pool.begin_generation();
         for &(i, j) in &pending {
-            let mut buf = Vec::new();
             let meta = crate::genome::GenomeMeta {
                 island: i as u16,
                 tag: j as u32,
                 ..Default::default()
             };
-            if crate::gpu::compile(&islands[i][j].tree, &mut buf)
-                && buf.len() <= width
-                && pool.push(&buf, meta)
-            {
+            // #131: the guarded entry point (lower + stack bound) is the only
+            // way a tree reaches the kernel.
+            let compiled = crate::gpu::compile_program(&islands[i][j].tree).ok();
+            let pushed = compiled
+                .as_ref()
+                .map_or(false, |c| c.words().len() <= width && pool.push(c.words(), meta));
+            if pushed {
+                for (name, n) in compiled.expect("compiled").opcodes() {
+                    *stats.opcodes.entry(name.clone()).or_default() += *n;
+                }
                 slots.push((i, j));
             } else {
                 on_cpu.push((i, j));
             }
         }
 
-        // #131: record what the batch actually used. Several calls can belong
-        // to one generation (initial screening, refit, restarts); merge them.
-        let stats = self.stats.entry(generation).or_default();
-        stats.generation = generation;
-        stats.programs += pool.len();
+        stats.programs += slots.len();
         stats.fallbacks += on_cpu.len();
 
         if !pool.is_empty() {
@@ -656,16 +663,28 @@ fn score_pipeline_batch(
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<f64>>],
     n_rows: usize,
+    generation: usize,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
     let mut pop = crate::gpu::Population::new();
     let mut slots: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
+    let offered = jobs.len();
     for (i, j, tree) in jobs {
         if pop.add(&tree) {
             slots.push((i, j));
         }
+    }
+    // #131: report the opcodes of the programs that were actually uploaded,
+    // and the candidates this batch left to the CPU fallback. `Population::add`
+    // goes through the same guarded compiler as the pool path.
+    let stats = g.stats.entry(generation).or_default();
+    stats.generation = generation;
+    stats.programs += pop.len();
+    stats.fallbacks += offered - pop.len();
+    for (name, n) in pop.opcode_usage() {
+        *stats.opcodes.entry(name).or_default() += n;
     }
     if pop.is_empty() {
         return Ok(());
@@ -1427,8 +1446,9 @@ pub struct SeedResult {
 pub struct GpuGenStats {
     /// Generation number this batch belongs to.
     pub generation: usize,
-    /// Operator occurrences in the programs that ran on the GPU.
-    pub opcodes: Vec<(String, usize)>,
+    /// Operator occurrences in the programs that ran on the GPU, sorted by
+    /// opcode name. Empty only when the batch contained no operator words.
+    pub opcodes: BTreeMap<String, usize>,
     /// Programs compiled into the batch.
     pub programs: usize,
     /// Candidates sent to the CPU fallback in the same batch.
@@ -2119,6 +2139,7 @@ fn run_search(
                             &mut gpu,
                             &mut pipeline_results,
                             gen_train.len(),
+                            gen,
                         )
                     });
                 }
