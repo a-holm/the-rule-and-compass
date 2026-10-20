@@ -1173,6 +1173,7 @@ impl RunPlan {
             group_col,
             test_frac: raw.test_frac,
             gap: raw.gap,
+            validation_frac: 0.0,
             folds: raw.folds.max(1),
             train_select,
             test_select,

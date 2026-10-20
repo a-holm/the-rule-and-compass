@@ -356,6 +356,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--validation-frac f] [--select-by train|validation|aicc]
      [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
@@ -432,6 +433,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
 * `--folds K` splits the test region into `K` contiguous blocks and reports the
   error of each block next to the mean, so an unstable model cannot hide behind
   a lucky pooled number.
+* `--validation-frac f` holds out the last `f` of the training period as a
+  chronological validation slice (with a `--gap` purge either side) and
+  `--select-by train|validation|aicc` chooses the ranking criterion; the test
+  block is a scoring-only lockbox and is never used to select. See
+  [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
