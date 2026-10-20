@@ -417,7 +417,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   unused, and both counts are reported — nothing is discarded silently.
 
 See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
-worked examples.
+worked examples, and [`docs/time-series.md`](docs/time-series.md) for the full
+time-series and panel audit (purge/embargo, overlapping labels, look-ahead
+preparation, lockboxes, per-group reporting, multiple testing and costs).
 
 ## Cleaning and preparing data
 
@@ -798,6 +800,7 @@ SPEC.md                       behaviour specification
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
+docs/time-series.md           time-series/panel checklist: purge, look-ahead, lockbox, costs
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard

@@ -62,7 +62,8 @@ see [`data-splitting.md`](data-splitting.md). Use `--split temporal` or
 (`--gap`) so that near-in-time rows cannot leak across the boundary. The same
 idea is known in the finance literature as **purging and embargo** (López de
 Prado 2018). A random split on a time series is the single most common way to
-fool yourself.
+fool yourself. [`time-series.md`](time-series.md) turns the whole sequence —
+split, purge, preparation, lockbox, trials and costs — into a checklist.
 
 ### 2.3 Keep the model small unless the data pays for it
 Every state-of-the-art method uses some parsimony pressure:
