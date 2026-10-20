@@ -1182,6 +1182,8 @@ impl RunPlan {
             fill: raw.fill,
             outlier_iqr: raw.outlier_iqr,
             smooth: raw.smooth,
+            smooth_centred: false,
+            allow_interpolate: false,
             center: raw.center,
             scale: raw.scale,
             filter,

@@ -166,7 +166,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.xor_expr()?;
         while self.peek_infix_keyword() == Some(Op::Or) {
             self.skip_ws();
-            self.ident();
+            self.infix();
             let rhs = self.xor_expr()?;
             lhs = node(Op::Or, vec![lhs, rhs]);
         }
@@ -177,7 +177,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.and_expr()?;
         while self.peek_infix_keyword() == Some(Op::Xor) {
             self.skip_ws();
-            self.ident();
+            self.infix();
             let rhs = self.and_expr()?;
             lhs = node(Op::Xor, vec![lhs, rhs]);
         }
@@ -188,7 +188,7 @@ impl<'a> Parser<'a> {
         let mut lhs = self.cmp_expr()?;
         while self.peek_infix_keyword() == Some(Op::And) {
             self.skip_ws();
-            self.ident();
+            self.infix();
             let rhs = self.cmp_expr()?;
             lhs = node(Op::And, vec![lhs, rhs]);
         }
@@ -239,9 +239,19 @@ impl<'a> Parser<'a> {
         Ok(n)
     }
 
+    /// Consume the infix operator just peeked: a keyword (`and`) or a symbol
+    /// (`&&`, `||`).
+    fn infix(&mut self) {
+        if matches!(self.peek(), Some(b'&') | Some(b'|')) {
+            self.pos += 2;
+        } else {
+            self.ident();
+        }
+    }
+
     /// If the next token (after whitespace) is one of the infix keyword
-    /// operators `and`, `or`, `xor`, return it; otherwise return `None`. Does
-    /// not consume anything.
+    /// operators `and`, `or`, `xor`, or the symbols `&&`, `||`, return it;
+    /// otherwise return `None`. Does not consume anything.
     fn peek_infix_keyword(&self) -> Option<Op> {
         let mut p = self.pos;
         while matches!(
@@ -249,6 +259,12 @@ impl<'a> Parser<'a> {
             Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
         ) {
             p += 1;
+        }
+        if self.src.get(p) == Some(&b'&') && self.src.get(p + 1) == Some(&b'&') {
+            return Some(Op::And);
+        }
+        if self.src.get(p) == Some(&b'|') && self.src.get(p + 1) == Some(&b'|') {
+            return Some(Op::Or);
         }
         if !matches!(self.src.get(p), Some(c) if is_ident_start(*c)) {
             return None;
