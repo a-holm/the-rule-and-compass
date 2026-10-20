@@ -321,6 +321,11 @@ atomically instead of streaming it. See
   `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
+* **`rcsr prep`** streams Binance/Bitstamp monthly ZIPs or aliased OHLCV CSVs
+  straight into a `.rcsb` store with timestamp normalisation, duplicate
+  aggregation, calendar-aware resampling, verified symbol splices, causal
+  feature/label specs, per-symbol parallelism and a checksummed manifest. No
+  intermediate CSV is written. See [`docs/data-format.md`](docs/data-format.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 

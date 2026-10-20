@@ -27,6 +27,7 @@ pub mod ohlcv;
 pub mod pareto;
 pub mod parse;
 pub mod pipeline; // #119: bounded producer/scorer overlap
+pub mod prep; // #123: raw archives -> column store
 pub mod progress_stats;
 pub mod qd; // #120: quality-diversity descriptor grid
 pub mod resample; // #92: index-based resampling with a BLB cap
@@ -38,3 +39,4 @@ pub mod stability;
 pub mod store;
 pub mod units;
 pub mod walkforward;
+pub mod zip; // #123: minimal stored/deflate ZIP reader
