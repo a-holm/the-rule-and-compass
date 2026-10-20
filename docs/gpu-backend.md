@@ -107,20 +107,70 @@ GPU and CPU agree on which candidates are hopeless.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
-are compiled to native opcodes instead of falling back to the serial CPU
-evaluator. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
+compile to native opcodes instead of falling back to the serial CPU evaluator.
+Both kernels — the packed `eval_kernel` and the fixed-slot `eval_pool_kernel`
+used by the search — call one `rc_exec_row` device function, so an operator has
+exactly one implementation and cannot silently differ between the pipeline and
+pool paths. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
 zero, matching Rust — not `cvt.rni`, which is ties-to-even); `min`/`max` guard
 NaN explicitly so either NaN operand yields NaN like `expr.rs`; `if` evaluates
 both arms but a true select discards the unselected one; `mod` uses the host's
 floored `a - b*floor(a/b)` with the `|b|<1e-12` and finite-quotient guards;
-`atan2`, `erf` and `erfc` call libdevice (2/2/4 ulp documented; `erf(-0)` is
-normalised to `+0` to match the host). The static kernel grew from 1000 to 1312
-SASS (+31%), registers from 26 to 27, and the 288-byte stack frame is unchanged
-on `sm_86`. A CUDA-guided run reports the opcode and fallback counts for each
-generation under `gpu.generations` in `--json`; a CPU run's JSON is unchanged.
-Operators without an opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates)
-still take the CPU fallback, and the final f64 CPU rescore remains the
-exactness guarantee for reported results.
+`atan2`, `erf` and `erfc` call libdevice. `erf(-0)` is normalised to `+0` to
+match the host.
+
+Every tree reaches the device through `gpu::compile_program`, the one guarded
+entry point: it applies the #121 `lower()` rewrites, rejects a postfix program
+that would need more than 56 operand-stack slots, and returns the opcodes that
+were actually emitted. `Population::add` (pipeline path) and the fixed-slot
+batch (synchronous path) both use it, so they agree on `asinh`/`acosh`/`atanh`
+and on the stack limit.
+
+**Exactness limits of the native opcodes (f32).** `floor`, `ceil`, `round`,
+`sign`, `min`, `max`, `if`, comparisons and logicals are exact on the f32 grid
+(0 ULP); `mod` is asserted to 1 ULP, `atan2` to 3 ULP, `erf` to 2 ULP and
+`erfc` to 4 ULP against the f64 CPU reference
+(`per_opcode_ulp_bounds_against_the_f64_reference`). These bounds are
+relative-ULP claims for the normal f32
+range. Outside it the contract is different: `erff` saturates to 1 at
+`|x| >= 3.9196`, `erfcf` reaches the subnormal boundary around `x = 9.19` and
+returns zero at `x = 10.05`, so a relative-ULP bound is meaningless there;
+`native_special_values_are_exact` asserts those cases explicitly: at
+`x = 10.05` libdevice returns the smallest subnormal (1.4e-45) or zero, not a
+relative-accurate tail. A second limit belongs to `mod`: its quotient is f32,
+so above `|a/b| = 2^25` the fractional part of the quotient is not representable
+and the result is not the f64 remainder; a range correction keeps it inside
+`[0,b)` (or `(b,0]` for negative `b`), and the fixture checks that documented
+behaviour instead of a ULP bound. Below `2^25` (which covers the `8 388 608 /
+0.7` case) the correction makes `mod` match the f64 reference to 1 ULP. `mod`
+returns NaN for a non-finite operand, `|b| < 1e-12` or a non-finite f32
+quotient, as the host does, and `atan2` returns NaN if either operand is NaN.
+Discontinuous
+operators (`floor`, `ceil`, `round`, `mod`, `sign`, comparisons, `if`) can jump
+by O(1) on a 1-ULP input change, so they are never approximated in the tree and
+the final archive is always re-scored by the CPU f64 evaluator. The accumulation
+itself is f32 (see the 200 000-row caveat below), so the f32 fitness is a
+search signal, not a reported number.
+
+Static kernel cost measured on `sm_86` (CUDA 12.0, `-O3`), before and after this
+change:
+
+| kernel | SASS before | SASS after | registers | stack |
+|---|---:|---:|---:|---:|
+| `eval_kernel` (packed / pipeline) | 1 312 | 1 336 (+1.8%) | 27 → 27 | 288 B → 288 B |
+| `eval_pool_kernel` (fixed slots / synchronous) | 1 008 | 1 336 (+32.6%) | 28 → 30 | 288 B → 288 B |
+| `predict_kernel` (test fixtures only) | — | 1 296 | 26 | 288 B |
+
+The pool kernel grew because it previously **did not implement** the #131
+opcodes at all (it fell through to `r = 0.0f`); the growth is the cost of the
+operators it now shares with the packed kernel, not a regression in a working
+path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
+and fallback counts for each generation under `gpu.generations` in `--json`,
+aggregated from the emitted programs of both the pipeline batches and the
+synchronous fallback batch; a CPU run's JSON is unchanged. Operators without an
+opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates) still take the CPU
+fallback, and the final f64 CPU rescore remains the exactness guarantee for
+reported results.
 
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
 FP64 runs at **1/64 of FP32**, so an FP64 kernel would throw away the whole
@@ -273,6 +323,23 @@ parallelism; the current search loop uses one thread per island, and a
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.
 
+A GPU-guided run also carries `gpu.generations`, one object per scoring
+generation, aggregated from the programs actually emitted by the guarded
+compiler (pipeline batches and the synchronous fallback batch share a
+generation key):
+
+```json
+"gpu": {"generations": [
+  {"generation": 0, "programs": 200, "fallbacks": 0,
+   "opcodes": {"OP_ADD": 431, "OP_ERF": 12, "OP_FLOOR": 7, "OP_MUL": 260}}
+]}
+```
+
+`programs` counts trees uploaded to the device, `fallbacks` counts candidates
+in the same batch that the guarded compiler rejected, and `opcodes` counts
+operator words in the uploaded programs. The counters describe what ran, not
+what the operator set allowed.
+
 ### Exactness
 
 Cross-backend runs are **not bit-identical by construction**. The GPU scores a
@@ -398,13 +465,15 @@ the GPU at all:
   stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
   implemented with the same positional `(seed, island, generation, slot, draw)`
   contract the full device-variation stage will use.
-* **Unsupported programs no longer serialise the batch.** `if` has no kernel
-  opcode, and the old `GpuSearch::score` scored every such tree one after
-  another on the calling thread. They are now split into contiguous slices and
-  scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
+* **Unsupported programs no longer serialise the batch.** Before #131 `if` had
+  no kernel opcode, and the old `GpuSearch::score` scored every such tree one
+  after another on the calling thread. They are now split into contiguous slices
+  and scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
   `min(cores, 8)`). Each tree is independent, so the result is bit-identical;
   `search::tests::cpu_fallback_is_identical_for_one_and_many_threads` pins the
-  one-thread and four-thread results together.
+  one-thread and four-thread results together. `if` now has a native opcode
+  (#131); the fallback covers `asinh`/`acosh`/`atanh`, constraints, aggregates
+  and programs too deep for the kernel stack.
 * **Archive insertion without a pre-emptive clone.** `Archive::try_insert_view`
   tests dominance on `(cost, error)` first and clones the tree only for a
   candidate that enters the front.
