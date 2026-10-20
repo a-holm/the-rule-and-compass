@@ -20,7 +20,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{backend, data, diagnostics, multi, search, stability, store, walkforward};
+use rcsr::{backend, data, diagnostics, multi, qd, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -391,6 +391,11 @@ SEARCH:
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
+  --qd                       record an opt-in quality-diversity archive over
+                             (variable usage x prediction skewness), passive;
+                             it never changes parents or the Pareto front
+  --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
+  --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -1106,6 +1111,38 @@ fn main() {
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #120: opt-in quality-diversity coverage archive.
+            "--qd" => {
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 16;
+                }
+            }
+            "--qd-cells" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (2..=256).contains(&n) => cfg.qd_bins = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cells needs an integer in 2..=256, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--qd-cell-cap" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=64).contains(&n) => cfg.qd_cell_cap = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cell-cap needs an integer in 1..=64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -3270,6 +3307,7 @@ fn main() {
                     }
                 );
                 eprintln!("# time: {}", timing.text());
+                qd_text(outcome.qd.as_ref());
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -3853,7 +3891,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 gpu_json,         // #131
@@ -3884,6 +3922,7 @@ fn main() {
                 resid_json,
                 cv_json,
                 stability_json,
+                qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")
             );
@@ -4275,6 +4314,7 @@ fn run_multi_output(
                     },
                     target_names.join(",")
                 );
+                qd_text(outcome.qd.as_ref());
                 eprintln!(
                     "# multi-output: one shared shape, one fitted constant vector per output; \
                      train_err/test_err are the mean over {} target(s)",
@@ -4374,7 +4414,7 @@ fn run_multi_output(
                 jnum(best_fit_loss)
             );
             let result_json = format!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -4399,6 +4439,7 @@ fn run_multi_output(
                     .as_deref()
                     .map(jstr)
                     .unwrap_or_else(|| "null".to_string()),
+                qd_json(outcome.qd.as_ref()),
                 pareto.join(",")
             );
             if let Some(path) = &json_out {
