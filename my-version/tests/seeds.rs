@@ -161,11 +161,85 @@ fn seed_is_simplified_fitted_and_present_in_the_final_archive() {
     );
 }
 
+/// Regression for #197: a seed written with neutral terms must reach the same
+/// canonical tree on the CPU and GPU paths, and the archive entry must be the
+/// CPU-refitted seed on both.
+///
+/// GPU fitness is f32 and may therefore choose a different final front, but it
+/// must never change the seed's structure or its reported error: the seed is
+/// fitted and scored on the CPU in f64 before either backend runs. Before the
+/// fix, a domain-safe simplifier left `0 + sqrt(m / k)` in the seed; the GPU
+/// trajectory then found the smaller `sqrt(m / k)` with the same zero error,
+/// which legitimately dominated and removed the seed from the Pareto front.
+#[test]
+fn seed_is_canonical_and_present_on_cpu_and_gpu_paths() {
+    let (vars, train, test) = spring();
+    let seed = expr::parse("2 * sqrt(m / k) + 0", &vars).expect("parse seed");
+    let canonical = expr::simplify(&expr::parse("sqrt(m / k)", &vars).expect("parse canonical"));
+    let expected_hash = expr::structural_hash(&canonical);
+
+    let mut reported = Vec::new();
+    for gpu in [false, true] {
+        let mut cfg = config(1, 8);
+        cfg.gpu = gpu;
+        let out = search::run_seeded(&cfg, &train, &test, &[seed.clone()]);
+
+        assert_eq!(out.seeds.len(), 1, "gpu={}: one accepted seed", gpu);
+        let fitted = &out.seeds[0];
+        assert_eq!(
+            expr::structural_hash(&fitted.tree),
+            expected_hash,
+            "gpu={}: the neutral terms must canonicalise to sqrt(m / k), got {}",
+            gpu,
+            expr::to_string(&fitted.tree, &vars),
+        );
+        assert!(
+            fitted.error < 1e-10,
+            "gpu={}: the fitted seed should explain the data, error = {}",
+            gpu,
+            fitted.error,
+        );
+
+        let archived = out
+            .archive
+            .items
+            .iter()
+            .find(|s| expr::structural_hash(&s.tree) == expected_hash)
+            .unwrap_or_else(|| {
+                panic!(
+                    "gpu={}: the seed must survive in the final archive; front is {:?}",
+                    gpu,
+                    out.archive
+                        .items
+                        .iter()
+                        .map(|s| (expr::to_string(&s.tree, &vars), s.error, s.cost))
+                        .collect::<Vec<_>>(),
+                )
+            });
+        assert_eq!(
+            archived.error.to_bits(),
+            fitted.error.to_bits(),
+            "gpu={}: the archived seed must carry the CPU-refitted error",
+            gpu,
+        );
+        reported.push((
+            expr::structural_hash(&fitted.tree),
+            fitted.error.to_bits(),
+            expr::to_string(&fitted.tree, &vars),
+        ));
+    }
+
+    assert_eq!(
+        reported[0], reported[1],
+        "the CPU and GPU paths must report the same fitted seed",
+    );
+}
+
 #[test]
 fn structurally_duplicate_seeds_are_inserted_once() {
     let (vars, train, test) = spring();
     let a = expr::parse("sqrt(m / k)", &vars).expect("parse");
-    let b = expr::parse("sqrt(m / k) + 0", &vars).expect("parse");
+    let b = expr::parse("sqrt(m / k) * 1", &vars).expect("parse");
     let out = search::run_seeded(&config(2, 3), &train, &test, &[a, b]);
     assert_eq!(out.seeds.len(), 1, "the duplicate must be dropped");
 }

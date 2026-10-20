@@ -107,20 +107,91 @@ GPU and CPU agree on which candidates are hopeless.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
-are compiled to native opcodes instead of falling back to the serial CPU
-evaluator. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
+compile to native opcodes instead of falling back to the serial CPU evaluator.
+Both kernels — the packed `eval_kernel` and the fixed-slot `eval_pool_kernel`
+used by the search — call one `rc_exec_row` device function, so an operator has
+exactly one implementation and cannot silently differ between the pipeline and
+pool paths. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
 zero, matching Rust — not `cvt.rni`, which is ties-to-even); `min`/`max` guard
 NaN explicitly so either NaN operand yields NaN like `expr.rs`; `if` evaluates
 both arms but a true select discards the unselected one; `mod` uses the host's
 floored `a - b*floor(a/b)` with the `|b|<1e-12` and finite-quotient guards;
-`atan2`, `erf` and `erfc` call libdevice (2/2/4 ulp documented; `erf(-0)` is
-normalised to `+0` to match the host). The static kernel grew from 1000 to 1312
-SASS (+31%), registers from 26 to 27, and the 288-byte stack frame is unchanged
-on `sm_86`. A CUDA-guided run reports the opcode and fallback counts for each
-generation under `gpu.generations` in `--json`; a CPU run's JSON is unchanged.
-Operators without an opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates)
-still take the CPU fallback, and the final f64 CPU rescore remains the
-exactness guarantee for reported results.
+`atan2`, `erf` and `erfc` call libdevice. `erf(-0)` is normalised to `+0` to
+match the host.
+
+Every tree reaches the device through `gpu::compile_program`, the one guarded
+entry point: it applies the #121 `lower()` rewrites, rejects a postfix program
+that would need more than 56 operand-stack slots, and returns the opcodes that
+were actually emitted. `Population::add` (pipeline path) and the fixed-slot
+batch (synchronous path) both use it, so they agree on `asinh`/`acosh`/`atanh`
+and on the stack limit.
+
+**Exactness limits of the native opcodes (f32).** `floor`, `ceil`, `round`,
+`sign`, `min`, `max`, `if`, comparisons and logicals are exact on the f32 grid
+(0 ULP); `mod` is asserted to 1 ULP, `atan2` to 3 ULP, `erf` to 2 ULP and
+`erfc` to 4 ULP against the f64 CPU reference
+(`per_opcode_ulp_bounds_against_the_f64_reference`). These bounds are
+relative-ULP claims for the normal f32
+range. Outside it the contract is different: `erff` saturates to 1 at
+`|x| >= 3.9196`, `erfcf` reaches the subnormal boundary around `x = 9.19` and
+returns zero at `x = 10.05`, so a relative-ULP bound is meaningless there;
+`native_special_values_are_exact` asserts those cases explicitly: at
+`x = 10.05` libdevice returns the smallest subnormal (1.4e-45) or zero, not a
+relative-accurate tail. A second limit belongs to `mod`: its quotient is f32,
+so above `|a/b| = 2^25` the fractional part of the quotient is not representable
+and the result is not the f64 remainder; a range correction keeps it inside
+`[0,b)` (or `(b,0]` for negative `b`), and the fixture checks that documented
+behaviour instead of a ULP bound. Below `2^25` (which covers the `8 388 608 /
+0.7` case) the correction makes `mod` match the f64 reference to 1 ULP. `mod`
+returns NaN for a non-finite operand, `|b| < 1e-12` or a non-finite f32
+quotient, as the host does, and `atan2` returns NaN if either operand is NaN.
+Discontinuous
+operators (`floor`, `ceil`, `round`, `mod`, `sign`, comparisons, `if`) can jump
+by O(1) on a 1-ULP input change, so they are never approximated in the tree and
+the final archive is always re-scored by the CPU f64 evaluator. The accumulation
+itself is f32 (see the 200 000-row caveat below), so the f32 fitness is a
+search signal, not a reported number.
+
+Static kernel cost measured on `sm_86` (CUDA 12.0, `-O3`), before and after this
+change:
+
+| kernel | SASS before | SASS after | registers | stack |
+|---|---:|---:|---:|---:|
+| `eval_kernel` (packed / pipeline) | 1 312 | 1 336 (+1.8%) | 27 → 27 | 288 B → 288 B |
+| `eval_pool_kernel` (fixed slots / synchronous) | 1 008 | 1 336 (+32.6%) | 28 → 30 | 288 B → 288 B |
+| `predict_kernel` (test fixtures only) | — | 1 296 | 26 | 288 B |
+
+The pool kernel grew because it previously **did not implement** the #131
+opcodes at all (it fell through to `r = 0.0f`); the growth is the cost of the
+operators it now shares with the packed kernel, not a regression in a working
+path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
+and fallback counts for each generation under `gpu.generations` in `--json`,
+aggregated from the emitted programs of both the pipeline batches and the
+synchronous fallback batch; a CPU run's JSON is unchanged. Operators without an
+opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates) still take the CPU
+fallback, and the final f64 CPU rescore remains the exactness guarantee for
+reported results.
+
+**CPU fallback pool (#121).** Unsupported programs are not scored on the
+scoring thread. Each generation collects them into jobs and hands them to a
+persistent worker pool created with the GPU search (`RCSR_CPU_FALLBACK_THREADS`,
+default `min(cores, 8)`); the `sync_channel` queue holds at most one chunk per
+worker, so a burst cannot grow memory without bound. Results come back tagged
+with their absolute candidate index and are merged in candidate order, so the
+fitness bits and the archive are identical to the serial walk for any worker
+count (`search::tests::cpu_fallback_is_identical_for_one_and_many_threads`, and
+the mixed supported/unsupported integration test). `gpu.generations[]` reports
+`programs`, `native`, `lowered`, `fallbacks`/`unsupported_programs`,
+`fallback_seconds` and `fallback_workers`; `gpu.totals` aggregates the run.
+
+**Static and device stack guards (#121).** The lowering pass can expand a tree,
+so the host computes the postfix peak stack after lowering and rejects anything
+above 56 slots before a word is emitted; that tree goes to the CPU pool. The
+device is still guarded independently: every push checks `RC_MAX_STACK` (64) and
+every operator checks its operand depth, returning NaN (a hard failure) instead
+of writing past the local stack if a malformed or future program ever slips
+through. `gpu::deep_lowered_tree_is_rejected_before_emission` and
+`gpu::device_stack_guard_rejects_an_over_deep_program` pin both halves.
 
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
 FP64 runs at **1/64 of FP32**, so an FP64 kernel would throw away the whole
@@ -273,6 +344,23 @@ parallelism; the current search loop uses one thread per island, and a
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.
 
+A GPU-guided run also carries `gpu.generations`, one object per scoring
+generation, aggregated from the programs actually emitted by the guarded
+compiler (pipeline batches and the synchronous fallback batch share a
+generation key):
+
+```json
+"gpu": {"generations": [
+  {"generation": 0, "programs": 200, "fallbacks": 0,
+   "opcodes": {"OP_ADD": 431, "OP_ERF": 12, "OP_FLOOR": 7, "OP_MUL": 260}}
+]}
+```
+
+`programs` counts trees uploaded to the device, `fallbacks` counts candidates
+in the same batch that the guarded compiler rejected, and `opcodes` counts
+operator words in the uploaded programs. The counters describe what ran, not
+what the operator set allowed.
+
 ### Exactness
 
 Cross-backend runs are **not bit-identical by construction**. The GPU scores a
@@ -333,8 +421,13 @@ only about **2–3 %** of wall time on `d5k` (a 30-generation `--no-fit` run tak
 scoring alone at about 1.03×. The **≥1.1× end-to-end target in #119 is therefore
 not met on this workload**; the gain is 1.08–1.09× only when evaluation, not
 constant fitting, dominates. Closing the gap needs work *inside* the CPU
-generation (fitting on the SoA layout, or the GPU LM in #116), not more overlap
-against a 2 % GPU phase.
+generation (fitting on the SoA layout, or the batched GPU LM), not more overlap
+against a 2 % GPU phase. The batched LM kernel is #169; #116 supplies the
+`BatchedFitter` integration point and the exact `f64` verifier in
+`src/fit/gpu.rs`, so a GPU proposal is accepted only when it is finite, has the
+right shape and scores no worse than the starting constants, and every
+rejection is refit on the CPU. See
+[`optimisation.md`](optimisation.md#batched-gpu-fitting-169).
 
 ### Measured end to end
 
@@ -381,58 +474,205 @@ evaluation, rather than constant fitting, is the bottleneck. Making the fit
 cheaper or moving it to the GPU is a separate workstream; batch size and launch
 overhead are addressed by the fixed-capacity pool below.
 
-### Fixed-capacity genome pool and the unsupported tail (#122)
+### Fixed-capacity genome pool and flat postfix variation (#122)
 
-The first dehosting stage removes two pieces of host work that did not depend on
-the GPU at all:
+The GPU search keeps the historical owned-tree loop for fitting runs and for
+configurations the flat engine cannot reproduce exactly. A second engine removes
+the per-child tree work from the fit-free, large-population path:
 
 * **One persistent program arena.** `genome::GenomePool` is a fixed-capacity,
   double-buffered postfix arena. Every genome occupies exactly
   `width_for(max_complexity) = 2*max_complexity + 4` words (64 words = 256 B at
   the default 30), so a slot never moves and there is no free list. The CUDA
-  context now reserves `d_pool[2]` once; a generation uploads into the back
-  buffer and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is
-  2.6 MB per buffer, bounded by capacity and flat across generations.
+  context reserves `d_pool[2]` once; a generation uploads into the back buffer
+  and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is 2.6 MB per
+  buffer, bounded by capacity and flat across generations.
 * **Device-canonical hash.** `rc_pool_hash` computes the same FNV-1a postfix
   hash as `genome::postfix_hash`, bit for bit; the pool can therefore dedup in
   stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
   implemented with the same positional `(seed, island, generation, slot, draw)`
   contract the full device-variation stage will use.
-* **Unsupported programs no longer serialise the batch.** `if` has no kernel
-  opcode, and the old `GpuSearch::score` scored every such tree one after
-  another on the calling thread. They are now split into contiguous slices and
-  scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
-  `min(cores, 8)`). Each tree is independent, so the result is bit-identical;
-  `search::tests::cpu_fallback_is_identical_for_one_and_many_threads` pins the
-  one-thread and four-thread results together.
+* **Flat variation arena.** `postfix::Arena` holds `islands × pop` fixed-width
+  programs plus SoA length/cost/hash/error arrays. `postfix::Variation` performs
+  tournament selection, subtree crossover, point/terminal/subtree mutation,
+  complexity and width bounds, structural hashing and duplicate rejection
+  directly on the arena. It allocates no tree and calls no simplifier per child.
+  Every random decision comes from Philox4x32-10 keyed by
+  `(seed, island, generation, slot)`.
+* **Survivor-only archive hand-off.** The archive is tested on `(error, cost)`
+  first (`Archive::admits`); a tree is rebuilt from postfix only when the
+  candidate actually enters the front. `Archive::canonicalize` then rebuilds a
+  monotone `(cost, error)` staircase, and `Archive::hash` is the determinism
+  gate. The final reported front is rebuilt from those survivors only and
+  rescored in `f64` on the full training sample.
+* **The full opcode set in the pool kernel.** The fixed-slot kernel used to fall
+  through to `r = 0` for `min`, `max`, `mod`, comparisons, logical operators and
+  `if`; it now calls the same `rc_exec_row`
+  as the packed kernel (`gpu::tests::pool_kernel_implements_every_emitted_opcode`).
+* **Unsupported programs no longer serialise the batch.** Before #131 `if` had
+  no kernel opcode, and the old `GpuSearch::score` scored every such tree one
+  after another on the calling thread. `if` is now a native opcode; the
+  remaining unsupported programs (constraints, aggregates, unlowed blocks) are
+  submitted to a persistent bounded CPU worker pool *before* the kernel launch,
+  so the fallback overlaps the batch instead of forming a tail. Each tree is
+  independent, so the result is bit-identical to the serial walk and merged in
+  candidate order; `search::tests::cpu_fallback_is_identical_for_one_and_many_threads`
+  pins the one-thread and four-thread results together and
+  `fallback_pool_is_bounded_and_merges_in_candidate_order` pins the queue bound
+  and the merge order with a non-contiguous pending set.
 * **Archive insertion without a pre-emptive clone.** `Archive::try_insert_view`
   tests dominance on `(cost, error)` first and clones the tree only for a
   candidate that enters the front.
 
-Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 5 000`,
-`--no-fit --gpu --seed 1`, `P = 10 000`, default operators (including `if`),
-three interleaved runs each, wall for 10 generations:
+The path is selected before generation 0 and recorded in the backend note:
 
-| Run | min / median |
-|---|---:|
-| `origin/main` | 18.3 s / 22.8 s |
-| #122 stage | 8.8 s / 10.7 s (**2.1–2.4×**) |
+```sh
+rcsr ... --no-fit --gpu --variation auto      # flat arena when it qualifies
+rcsr ... --variation node                      # historical owned-tree loop
+rcsr ... --variation postfix                   # require the flat path
+```
 
-The per-generation CPU fallback for 8 521 unsupported trees fell from 2.15 s
-(serial) to 0.73 s on the 8-thread pool (3.0× on 4 physical cores). With the
-operator set that has no unsupported opcode (`--ops` without `if`) the same
-`P = 10 000`, 20-generation cell is unchanged (5.44 s vs 5.34 s): the pool
-removes allocation and clone overhead there, but variation and the startup
-population dominate. The kernel itself stays ~1–3 ms per generation: at the
-`--no-fit` slope this is under 1 % duty, which is why the remaining plan targets
-full device variation and fitting (#116), not the launch path. Exactness: the `P = 2 000`, 5-generation JSON
-report is byte-identical to `origin/main` apart from `elapsed_seconds`, i.e.
-the same constants, expressions and errors.
+`auto` requires a GPU, `--fit-iters 0`, `islands × pop >= 4096`, the default
+complexity model, no aggregates/custom blocks/dimension constraints, no
+screening or predictor subsampling and no QD layer. The flat engine draws parents
+from the island tournament only: the archive-guided `--front-parents` draw is
+not ported, so `auto` can produce a different (but deterministic) trajectory. Everything else stays on the
+owned-tree path, including all constant fitting (#116), simplification of
+reported expressions, checkpoints and exact `f64` reporting. A fitting run can
+therefore never be silently approximated by the flat engine.
+
+### The `if` cell and the worker pool (#121)
+
+The regression in `gpu-search/2` §2.2 was measured as a GPU run with default
+operators (11.16 s) against the same run with `--ops` excluding `if` (1.17 s):
+40 generations, `pop 200`, 4 islands, `--no-fit`, `N = 1 500` training rows,
+seed 1, RTX 3060. Remeasured on the same host with the finished lowering and
+worker pool:
+
+| Run | Wall (three runs) | vs recorded 11.16 s |
+|---|---|---|
+| default operators (includes `if`) | 1.04 / 1.09 / 1.17 s | **9.5–10.7× faster** |
+| `--ops` excluding `if` | 0.87 / 0.90 / 0.93 s | — |
+
+The `if` cell is now within 1.15× of the no-`if` cell, so the serialisation is
+gone rather than merely shortened. `if` is native (#131); the pool covers the
+programs that still have no opcode.
+
+Fallback-only cell, `N = 15 000` training rows, `pop 2 000`, 5 generations,
+`--ops add,mul,div,require`, 5 704 unsupported programs:
+
+| `RCSR_CPU_FALLBACK_THREADS` | fallback s | whole run s |
+|---:|---:|---:|
+| 1 (serial) | 4.77 | 10.44 |
+| 8 (default) | 1.44 (**3.3×**) | 7.48 (1.4×) |
+
+A mixed 40-generation cell (`if` plus `require`, 15 756 fallback programs) gives
+the same Pareto archive at 1, 4 and 8 workers — SHA-256 of
+(expression, train error, test error, complexity) is `06b05c11e491dbf2` for all
+three — with fallback time 2.07 / 1.19 / 0.79 s and wall 3.48 / 2.45 / 1.74 s.
+
+**The 5× fallback-only target is not reachable on this host and is not claimed.**
+The i7-3770K has 4 physical cores (8 hyperthreads); the pool achieves 3.3× of
+the 4× ceiling (83 % parallel efficiency), and Amdahl's law caps the whole
+run at 2.0× because variation and simplification stay serial. Reaching 5× on
+unsupported programs needs either at least 8 physical cores or native opcodes
+for the remaining operators (`require`/`between`/`constrain`, aggregates),
+which is the opcode-request path in `gpu-lowering/C-lowering-pass.md` §6, not a
+scheduling change. The 9.5× `if` cell itself is met at 9.5–10.7× because the
+native `if` opcode removes the fallback rather than parallelising it.
+
+Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 3 750` training rows from
+a 5 000-row two-input sample, `--no-fit --gpu --seed 1`, `P = 10 000`, default
+operators, 10 generations, three interleaved runs each on a busy shared host
+(the absolute numbers are noisy; the ratio is pairwise):
+
+| Run | wall, s | search, s | generations/s |
+|---|---:|---:|---:|
+| `--variation node` (historical default pipeline) | 5.71 / 6.82 / 7.20 | 3.54–7.24 | 1.47 |
+| `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
+| `--variation node --pipeline-depth 0` (best tree setting) | 5.01 / 5.15 / 5.28 | 3.19 | 1.94 |
+
+At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
+of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10
+generations. A 2-D hypervolume over `(complexity, train error)` with reference
+point `(40, 1)` was 34.6 for the 40-generation flat run at 2.2 s against 31.6
+for the 10-generation tree run at 3.5 s. The archive is deterministic for a
+seed, repeats across 1 and 4 islands, and a checkpoint/resume trip reproduces
+the uninterrupted archive hash (`tests/postfix_loop.rs`).
 
 What remains staged: device-side mutation/crossover and a fused device
 selection/archive. The pool, hash and Philox contracts above are the interface
 those stages consume; the CPU variation, simplification, fitting, checkpoints
 and f64 reporting stay authoritative meanwhile.
+
+## Batched constant fitting (issue #169)
+
+Scoring was on the GPU long before fitting was: non-affine candidates still ran
+the scalar CPU Levenberg–Marquardt loop, which dominated wall time at large `N`.
+`--fit-strategy gpu` (opt-in; `exact` remains the default) moves that loop into
+one CUDA block per candidate:
+
+1. The postorder tree is flattened into 4-word records `[op, kid0, kid1, slot]`.
+   Only operators with an analytic value and adjoint are eligible.
+2. The block evaluates the value and the reverse-mode Jacobian for its `p`
+   constants, and accumulates `JᵀJ`, `Jᵀr` and SSE. Each statistic is owned by
+   one thread and summed in fixed chunk order, so the reduction is deterministic
+   and needs no atomics.
+3. Thread 0 solves `(JᵀJ + λ diag) δ = −Jᵀr` in f64 with a Cholesky
+   conditioning gate, then the block scores the trial and accepts/rejects in the
+   same order as the CPU loop. Damping retries reuse the cached normal
+   equations.
+4. After the damped loop, four undamped Gauss–Newton steps polish the constants
+   in f64 on an exact f64 copy of the training rows (uploaded once, only when
+   this arm is selected), so the returned constants are not limited by the f32
+   evaluator copy or by f32 row arithmetic.
+
+**Eligibility and fallback.** A candidate is offered to the kernel only for the
+squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no shared block
+constants, an analytic derivative for every operator, and at least `32p` rows.
+The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
+(the undamped Cholesky diagonal ratio exceeds `1e4` or a pivot hits the
+`1e-12` floor), `2` a non-finite value or residual. Status `1`/`2`, unsupported
+trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
+constants. `--fit-report` and the `gpu.fit` JSON object count
+`attempts`/`gpu`/`fallback`/`refits`; the run manifest records the same ledger.
+
+**Exactness.** Search fitness is still f32 and only guides selection. Every
+finalist is refit by the exact CPU f64 LM on all training rows before the final
+archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
+constants and metrics therefore never come from f32. The unit tests upload the
+same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
+LM to machine precision (median `2e-15` in the p=1..16 test, median relative
+constant error `<= 1e-5` and SSE relative `<= 1e-8` asserted) and every
+ill-conditioned/non-finite candidate carries a fallback status. Without the f64
+copy (a device-allocation failure) the polish runs on f32-rounded inputs and the
+constants differ by roughly `1e-7` relative; the finalist refit still makes the
+reported numbers exact.
+
+**Measurements (RTX 3060, i7-3770K, this host).** Fit stage at `N = 154 000`,
+8-thread CPU wall versus the whole GPU batch (upload + kernel + download):
+
+| p | P | CPU wall | GPU wall | fit speed-up |
+|---:|---:|---:|---:|---:|
+| 4 | 256 | 28.0 s | 1.63 s | 17.1× |
+| 8 | 64 | 20.5 s | 0.82 s | 25.2× |
+
+`P = 256` is a quarter of the issue's `P >= 512` gate (a full run would exceed
+the one-minute benchmark budget); the p=4 cell therefore falls just short of the
+20× gate while p=8 clears it. End-to-end, N=154k, 4 islands, `--pop 64`, two
+generations, `--metric squared`, smooth finite operators: **12.53 s (`exact`) ->
+10.46 s (`gpu`), 1.20x**. The fit kernel itself was 1.38 s, i.e. about 13 % of
+end-to-end wall; 454 candidates were fitted on the device and 306 fell back (the
+random population contains many rank-deficient or non-finite starts), and 235
+finalists were refit exactly on the CPU. The `>= 1.3x` end-to-end and `>= 85 %`
+duty gates are therefore **not met by this first arm**; the measured lever is
+the fit-stage ratio on eligible candidates, and the fallback/refit share is what
+limits Amdahl. A dispatcher that avoids offering degenerate candidates and a
+lower-cost finalist refit are the follow-ups, not a default change.
+
+**Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
+arm yet: it scores a tree as soon as it is offered, before the barrier fit
+batch, so the GPU-fit path uses synchronous generation batches.
 
 ## The DGX Spark path
 
@@ -493,6 +733,113 @@ evaluation is **10–40×** (reported figures for this style of workload range f
 ~18× to ~40×; the 201–1 678× measured above is against a much slower
 single-threaded reference), rising further with row tiling and CUDA graphs.
 
+## Measuring the full GPU path (issue #118)
+
+The older benchmark placed an event pair immediately after the launch, so
+`cudaEventElapsedTime` reported only kernel execution. Sync, the device→host
+copy of the SSEs and the per-generation `cudaMalloc`/`cudaFree` happened outside
+that window — the overhead that made the end-to-end loop look worse than the
+kernel table.
+
+`eval.cu` now records **disjoint host windows** for the whole batch:
+`rc_stats_begin` → allocation (including the synchronising
+`cudaMalloc`/`cudaFree`) → H2D upload → launch → `cudaEventSynchronize` → D2H
+download. `rc_last_stats` exposes them; `GpuStats` (`src/gpu_stats.rs`)
+accumulates them. `kernel_s` is GPU-event time *inside* that wall: it is the
+numerator of duty, never another additive phase.
+
+The `--json`/NDJSON `gpu` block contains:
+
+`kernel_s`, `launch_s`, `sync_s`, `alloc_s`, `h2d_s`, `d2h_s`, `transfer_s`,
+`window_s`, `host_s`, `accounted_s`, `wall_s`, `idle_s`, `residual_fraction`, `h2d_bytes`,
+`d2h_bytes`, `batches`, `failed_batches`, `programs`, `evals`, `row_evals`,
+`evals_per_s`, `row_evals_per_s`, `generations_per_s`, `duty_cycle`,
+`duty_source`, `sm_occupancy`, `occupancy_source`, `quality_per_gpu_hour`, and
+the #131 per-generation `generations` opcode/fallback report. A CPU run reports
+`"gpu": null`.
+
+Definitions that matter:
+
+* **wall** is the whole evaluator path measured by the caller. `window_s` is
+  the five C host windows and `host_s` the Rust glue outside them; their sum
+  `accounted_s` closes to wall, and `residual_fraction` reports any leftover.
+  `tests/gpu_loop.rs` asserts closure within 1 % on a real GPU run.
+* **evals/s** counts candidate evaluations (`programs / wall`); **row-evals/s**
+  counts `programs × rows / wall`. A failed batch contributes wall and bytes but
+  zero evaluations.
+* **duty** is `kernel_s / wall_s`, a kernel-time fraction. It is not
+  `nvidia-smi utilization.gpu` (a 1 Hz sample of "some kernel was resident") and
+  it is not SM occupancy.
+* **quality/GPU-hour** is decades of error reduction against the constant-mean
+  baseline per measured full-path GPU-hour:
+  `-log10(best_sse / mean_baseline_sse) / hours`. A throughput gain is not a
+  search gain: compare quality at matched cumulative evaluations and paired
+  seeds.
+* **`sm_occupancy` is `null`** with `occupancy_source: "ncu (not run)"`.
+  Occupancy requires `ncu` and is never inferred from sampled utilisation.
+
+`rcsr-gpu-bench` prints the ledger, full-path candidate and row throughput,
+duty, quality per GPU-hour, and a comparison against both the interpreted walk
+and the engine's own SoA/AVX evaluator (the baseline the #118 gate names).
+
+How to measure properly:
+
+```sh
+# full-path ledger from the harness itself
+./target/release/rcsr-gpu-bench --data cell5000.csv --target y --vars x1,x2 \
+  --batch 800 --depth 5
+
+# continuous duty/timeline and host gaps: nsys sees the real API sequence
+nsys profile --stats=true -t cuda,nvtx \
+  ./target/release/rcsr-gpu-bench --data cell5000.csv --batch 800 --depth 5
+
+# achieved occupancy / SM throughput: ncu, one diagnostic cell, separate run
+ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed \
+  ./target/release/rcsr-gpu-bench --data cell5000.csv --batch 512 --depth 5
+
+# CUPTI activity tracing (continuous duty, not a 1 Hz sample)
+nsys profile -t cuda --cuda-um-cpu-page-faults=false -o gpu-duty ...
+```
+
+Do not use `nvidia-smi --query-gpu=utilization.gpu` for a sub-10 ms kernel: it
+samples at 1 Hz (or 100 ms at best) and measures "some kernel was resident", not
+occupancy or SM throughput. Use it only as a coarse cross-check.
+
+A/B the evaluator that matters: `--no-simd` (scalar walk), default (SoA/AVX),
+and `--gpu`. A speed-up against the interpreted walk is not the gate.
+
+### Measured on the RTX 3060 cell (issue #118)
+
+Cell: `cell5000.csv`, `N = 5 000`, `V = 2`, `P = 800`, depth 5, seed 7,
+`sm_86`, CUDA 12.0, plain device memory. Three interleaved repeats, 25 batches
+each, on a shared 8-core host with other builds active; absolute times move by
+tens of percent, so medians are quoted.
+
+| | before (event-only timer) | after (full path) |
+|---|---:|---:|
+| GPU batch wall | 0.519 ms (kernel only) | **0.523 ms** (alloc+H2D+launch+sync+D2H) |
+| row-evals/s | 7.70e9 (kernel only) | **7.66e9** (full path) |
+| SoA/AVX CPU batch | not measured | 367.2 ms |
+| speed-up vs SoA/AVX | not measured | **~702×** |
+| speed-up vs interpreted walk | 847–864× | ~1 035× |
+| C-window / host coverage | not measured | **99.1–99.2 % / 0.8–0.9 %** |
+| kernel-time duty | not measured | **70.1–83.5 % (median 80.2 %)** |
+
+The old "8e9 evals/s" was the kernel event only. The new number is the same
+order on this cell because the batch is large enough that copies and sync are
+small; the *reported* number is now the real path and the decomposition is
+visible. On a small cell (`N = 1 000`, `P = 100`, depth 5) the full path was
+0.095–0.221 ms against 5.96–16.52 ms for SoA/AVX, i.e. 27–128× faster in every
+repeat; there is no small-cell regression in evaluator throughput.
+
+Occupancy is **not** verified: `ncu` returns `ERR_NVGPUCTRPERM` (no permission
+to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
+`nsys profile -t cuda` traces the run, but its importer is missing here, so no
+CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
+substitute for either.
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
@@ -508,6 +855,10 @@ single-threaded reference), rising further with row tiling and CUDA graphs.
 | Queue FIFO order and `capacity + batch + 1` memory bound under a forced slow consumer | `src/pipeline.rs` unit tests, any machine | **verified** |
 | ≥1.1× end-to-end with the default fitter at pop 400, N ≥ 5 000 | RTX 3060, `d5k.csv`, shared host | **not met** — 1.02–1.06×; GPU phase is only 2–3 % of wall |
 | Reported law/train/test errors agree with the CPU backend | RTX 3060, `tests/gpu_loop.rs` | **verified** (law predictions within 1e-12; errors within 1e-9, observed 0) |
+| Full-path ledger (alloc/H2D/launch/sync/D2H) and duty | RTX 3060, `src/gpu_stats.rs` tests + `tests/gpu_loop.rs` + `rcsr-gpu-bench` | **verified** (host windows close to wall; kernel-time duty, not occupancy) |
+| Speed-up against the SoA/AVX path (not the interpreted walk) | RTX 3060, `rcsr-gpu-bench` | **measured** (see the PR/issue; the benchmark prints both baselines) |
+| Failed batch is timed but adds no evaluations | RTX 3060, `tests/gpu_loop.rs` | **verified** |
+| SM occupancy / achieved SM throughput | needs `ncu` with counter permission | **unverified here** — reported as `null`, never invented |
 | `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
 | `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |

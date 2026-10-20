@@ -79,6 +79,12 @@ output being scored. `--weight` applies the same row weights to every output.
   output has its own fitted vector. `train_error`/`test_error` on the Pareto
   entry are the combined means; the per-target values sit inside `targets`.
 * `--out` writes one TSV line per target with the combined row repeated.
+* Text, `--json` and `--ndjson` carry the same non-overlapping `timing` ledger
+  as a single-target run (`prep_seconds`, `search_seconds`,
+  `baselines_seconds`, `diagnostics_seconds`, `report_seconds`,
+  `total_seconds`). `elapsed_seconds` remains the search phase; use
+  `total_seconds` for wall time. The baseline and diagnostics phases are not
+  run in multi-output mode, so those two fields are `0`.
 
 Test errors never refit on the test rows: the per-output constants are fitted on
 the training rows and then evaluated on the held-out rows. This is the same
@@ -88,7 +94,8 @@ honesty rule as the single-output path.
 
 Multi-output mode is intentionally narrower than the single-output pipeline:
 
-* `--ndjson` is refused. Use `--json`.
+* `--ndjson` emits a single closing `done` event (there are no progress events
+  in multi-output mode); each event carries the timing ledger.
 * `--cv`, `--null-runs`, `--bootstrap-error`, `--stability` and `--report` are
   refused: their summaries assume a single target.
 * `--save`/`--resume` and `--seed-expr`/`--seed-file` are refused.

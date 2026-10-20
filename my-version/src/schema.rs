@@ -9,11 +9,19 @@ use crate::expr::Op;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The schema document, identical for the CLI and the server.
-pub fn json() -> String {
-    let opts = [
+/// Whether `name` is one of the documented root search options.
+pub fn has_option(name: &str) -> bool {
+    OPTIONS.iter().any(|(n, _, _, _)| *n == name)
+}
+
+/// The one option table used by `rcsr schema`, the GUI and the tests.
+///
+/// Each row is `(name, type, default, description)`. Adding a flag here is the
+/// only edit needed for the document; [`has_option`] lets a surface reject a
+/// known CLI flag explicitly rather than calling it unknown.
+pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
-        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A CSV is estimated from rows x columns (text + table + preparation) once the header and row count are known, and exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
+        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A streaming CSV is estimated from calibrated rows x columns (table + preparation, no resident text) once the header and row count are known; the estimate and basis appear in the preparation block and it exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
         ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
         ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
         ("--vars", "csv", "all-except-targets", "input column names"),
@@ -26,22 +34,22 @@ pub fn json() -> String {
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, implicit, implicit_residual, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
         ("--outlier-iqr", "float", "none", "drop rows beyond k interquartile ranges from the training median"),
-        ("--smooth", "int", "0", "trailing moving-average window in rows (0 = off; a row reads only itself and earlier rows)"),
-        ("--smooth-centred", "int", "0", "CENTRED moving-average window in rows; reads future bars and is reported as look-ahead"),
-        ("--allow-interpolate", "flag", "false", "permit --fill interpolate on time-ordered data (it reads the next bar; refused otherwise)"),
+        ("--smooth", "int", "0", "trailing moving-average window in rows (0 = off; a row reads only itself and earlier rows); causal, see docs/time-series.md"),
+        ("--smooth-centred", "int", "0", "CENTRED moving-average window in rows; reads future bars and is reported as look-ahead (opt-in, see docs/time-series.md)"),
+        ("--allow-interpolate", "flag", "false", "permit --fill interpolate on time-ordered data (it reads the next bar; refused otherwise; see docs/time-series.md)"),
         ("--center", "enum", "mean", "subtract mean | median | min | max | none before the search"),
         ("--scale", "enum", "std", "divide by std | iqr | range | none before the search"),
         ("--filter", "string", "none", "keep rows where this expression is > 0"),
         ("--exclude", "string", "none", "drop rows where this expression is > 0"),
         ("--train-select", "string", "none", "rows where this expression is > 0 go to training (overrides --split)"),
         ("--test-select", "string", "none", "rows where this expression is > 0 go to test (overrides --split)"),
-        ("--split", "enum", "random", "random | temporal | group | temporal-group | auto"),
+        ("--split", "enum", "random", "random | temporal | group | temporal-group | auto; temporal/panel choices and purge rules are in docs/time-series.md"),
         ("--time", "string", "none", "time/ordering column (implies temporal); epoch numbers or ISO 8601 with Z/+-HH:MM offsets"),
         ("--date-only", "enum", "error", "date-only values: error | utc-midnight | session-close (21:00 UTC)"),
         ("--time-unit", "enum", "auto", "numeric time unit: s | ms | us | ns (default auto-detect; mixed/out-of-range refuses)"),
         ("--tz", "string", "UTC", "fixed UTC offset for offset-less timestamps: UTC or +-HH:MM; named zones are refused"),
         ("--group-by", "string", "none", "group column (implies group)"),
-        ("--gap", "int", "0", "embargo rows between train and test"),
+        ("--gap", "rows-or-time", "0", "embargo between train and test; an integer is rows, 90m/1.5h/30s/2d is wall time converted by ceil(seconds/median_dt); dropped with a warning under explicit row selection"),
         ("--folds", "int", "1", "contiguous test blocks to report"),
         ("--lags", "int", "0", "delayed copies per input (time-delay embedding)"),
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
@@ -73,9 +81,10 @@ pub fn json() -> String {
         ("--require-dimensions", "flag", "false", "reject candidates whose dimensions cannot be made consistent with the target's (infinite error; requires --units, a usage error on its own; without this flag units only report and never reject)"),
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--function", "string", "none", "user-defined building block name(a,b)=expr or name=expr (repeatable, at most four; parameters inferred from free variables; constants in a body are shared by every call)"),
-        ("--fit-iters", "int", "8", "LM constant-fitting iterations; 0 disables fitting entirely and leaves constants as generated. Constants are fitted to the configured --metric (squared/aic/aicc/bic exact least squares, absolute/log_squashed IRLS, auc/log_loss/hinge logistic IRLS, rank/order/correlation a deterministic coordinate polish)"),
-        ("--fit-strategy", "enum", "exact", "exact | auto | linear: the exact constant-fitting arm. exact is the historical CPU LM, bit for bit; auto/linear use closed-form QR for trees affine in every constant and fall back to exact otherwise (linear is exact for squared error only)"),
-        ("--fit-report", "flag", "false", "print constant-fitting arm counts after the run (diagnostics only)"),
+        ("--fit-iters", "int", "8", "LM constant-fitting iterations; 0 disables fitting entirely for every metric and fit strategy, leaves constants as generated and takes no least-squares, IRLS, LM or polish step. Constants are fitted to the configured --metric (squared/aic/aicc/bic exact least squares, absolute/log_squashed IRLS, auc/log_loss/hinge logistic IRLS, rank/order/correlation a deterministic coordinate polish)"),
+        ("--fit-strategy", "enum", "exact", "exact | auto | linear | varpro | stream | gpu: the constant-fitting arm. exact is the historical CPU LM, bit for bit; auto dispatches by structure (linear QR when affine in every constant, VarPro for separable models, exact LM otherwise); linear, varpro and stream force one arm with an exact fallback; stream merges f64 sufficient statistics over row blocks for out-of-core data; gpu is the #169 batched kernel with a CPU fallback (direct calls use the exact CPU arms)"),
+        ("--fit-report", "flag", "false", "print constant-fitting arm counts (linear, varpro, stream, exact, GPU fallback/refit) after the run (diagnostics only)"),
+        ("--fit-rows", "int", "0", "fit constants on a deterministic N-row subsample and score/archive on all training rows (0 = off, >=2; N >= train rows is an exact full fit; reported errors and archived constants are refit on all rows)"),
         ("--no-fit", "flag", "false", "disable constant fitting entirely (same as --fit-iters 0)"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),
@@ -85,12 +94,18 @@ pub fn json() -> String {
         ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
-        ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical"),
+        ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical. JSON reports the measured kernel/sync/alloc/copy wall and kernel-time duty; SM occupancy is null unless measured separately with ncu"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
+        ("--cpu", "flag", "false", "alias for --no-gpu: force CPU evaluation"),
         ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
-        ("--qd-cells", "int", "16", "descriptor grid bins per axis (2..=256; enables --qd)"),
+        ("--qd-cells", "int", "16", "descriptor cells: grid bins per axis or CVT K (2..=512; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
+        ("--qd-cvt", "flag", "false", "use CVT-MAP-Elites (K centroids, deterministic Halton initialisation and Lloyd updates) instead of the grid"),
+        ("--qd-policy", "flag", "false", "feed the archive back into parent selection (UCB1 60/25/10/5), stratified migration and least-occupied restarts; implies --qd --qd-cvt"),
+        ("--qd-uniform", "flag", "false", "control: select occupied QD cells uniformly instead of the UCB1 mix"),
+        ("--qd-random", "flag", "false", "control: hash descriptors to random cells, removing behaviour information"),
         ("--pipeline-depth", "int", "2", "bounded CPU/GPU overlap depth in batches (0 = synchronous; only with --gpu); results and archive identical to the synchronous path"),
+        ("--variation", "enum", "auto", "variation engine: auto (flat postfix arena for --no-fit GPU runs with population >= 4096), node (historical owned-tree loop) or postfix (require the flat path; error when the run does not qualify)"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations; the write is atomic and the previous generation is kept as <file>.prev"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),
@@ -99,15 +114,21 @@ pub fn json() -> String {
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
         ("--json-out", "string", "none", "write the final JSON result to this file atomically instead of stdout (implies --json); progress stays on stderr/NDJSON"),
         ("--format", "enum", "text", "text | json | ndjson"),
+        ("--json", "flag", "false", "shorthand for --format json: one JSON result object"),
+        ("--ndjson", "flag", "false", "shorthand for --format ndjson: one event per line"),
         ("--progress", "flag", "false", "emit per-generation progress with convergence statistics (confidence, stability, maturity, percent_converged); see docs/convergence.md"),
+        ("--quiet", "flag", "false", "suppress the human-readable header, the GPU fallback note and the one-line resource summary"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
         ("--report", "enum", "none", "Markdown report: summary | sensitivity | benchmark (single value; last wins)"),
         ("--report-out", "string", "none", "write the Markdown report to this path (otherwise text=stdout, json/ndjson=stderr)"),
         ("--report-repeats", "int", "5", "independent searches for --report benchmark"),
-    ];
+];
+
+/// The schema document, identical for the CLI and the server.
+pub fn json() -> String {
     let mut items = String::new();
-    for (i, (name, ty, default, desc)) in opts.iter().enumerate() {
+    for (i, (name, ty, default, desc)) in OPTIONS.iter().enumerate() {
         if i > 0 {
             items.push(',');
         }
@@ -126,11 +147,30 @@ pub fn json() -> String {
          \"operators\":[{}],\n  \
          \"complexity\":{{\"formula\":\"sum(op_cost) + var_weight*n_vars + const_weight*n_consts + depth_weight*max_depth\",\"defaults\":{{\"op_cost\":1,\"var_weight\":1,\"const_weight\":1,\"depth_weight\":0}},\"operator_nodes_only\":true,\"depth\":\"edges from the root; a single node has depth 0\"}},\n  \
          \"convergence\":{{\"window\":20,\"confidence\":\"exp(-max(0,(e[g-w]-e[g])/(1+|e[g-w]|))/1e-3)\",\"stability\":\"mean Jaccard overlap of the front's structural forms over the last w comparisons\",\"maturity\":\"(g - first_generation_of_oldest_surviving_form) / max(g,1)\",\"percent_converged\":\"0.5*confidence + 0.3*stability + 0.2*maturity\",\"converged_threshold\":0.75,\"doc\":\"docs/convergence.md\"}},\n  \
-         \"backend\":{{\"default\":\"gpu when built with --features cuda and a usable device is probed at startup; cpu otherwise\",\"device_probe\":\"once at startup\",\"override\":\"--no-gpu/--cpu forces cpu; --gpu asserts a device and exits 2 when unavailable\",\"reporting\":\"backend, backend_reason and device are recorded from the probe/outcome, never inferred from flags\",\"exactness\":\"cross-backend runs are not bit-identical; reported metrics and constants are rebuilt from exact CPU f64 and --cpu is the reproducible escape hatch\",\"doc\":\"docs/gpu-backend.md\"}},\n  \
+         \"backend\":{{\"default\":\"gpu when built with --features cuda and a usable device is probed at startup; cpu otherwise\",\"device_probe\":\"once at startup\",\"override\":\"--no-gpu/--cpu forces cpu; --gpu asserts a device and exits 2 when unavailable\",\"reporting\":\"backend, backend_reason and device are recorded from the probe/outcome, never inferred from flags\",\"fallback\":\"a program with no device opcode (or one whose exact lowering would exceed the 56-slot host stack gate) is scored by a persistent bounded CPU worker pool, never on the scoring thread; results merge in candidate order and are bit-identical to the serial walk; RCSR_CPU_FALLBACK_THREADS sets the worker count (default min(cores,8), max 64)\",\"json\":\"gpu.generations[] carries generation, programs, native/supported, lowered, fallbacks, unsupported_programs, fallback_seconds, fallback_workers and opcodes; gpu.totals aggregates them\",\"stack_guard\":\"host peak_stack <= 56 before emission; the device guards RC_MAX_STACK=64 on every push\",\"exactness\":\"cross-backend runs are not bit-identical; reported metrics and constants are rebuilt from exact CPU f64 and --cpu is the reproducible escape hatch\",\"doc\":\"docs/gpu-backend.md\"}},\n  \
+         \"expression_limits\":{{\"nodes\":4096,\"depth\":256,\"depth_definition\":\"nodes on the longest root-to-leaf path; a single node has depth 1\",\"applies_to\":\"text parsing (--eval-expr, filters, seeds, --function, HTTP body) and checkpoint tree decoding\",\"error\":\"a normal parser/checkpoint error naming the limit; never a stack overflow\"}},\n  \
+         \"audit\":{{\"command\":\"rcsr audit\",\"summary\":\"differential leakage audit (D0-D6, D8-D12); exit 5 on any finding\",\"doc\":\"docs/leakage.md\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"CSV/TSV table to audit\"}},\
+{{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"target/label column\"}},\
+{{\"name\":\"--time\",\"type\":\"string\",\"default\":\"row index\",\"description\":\"time/ordering column\"}},\
+{{\"name\":\"--time-unit\",\"type\":\"enum\",\"default\":\"s\",\"description\":\"s | ms | us | ns for a numeric time column\"}},\
+{{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except time\",\"description\":\"feature columns to probe\"}},\
+{{\"name\":\"--horizon\",\"type\":\"int\",\"default\":\"1\",\"description\":\"label horizon in rows (D5/D6)\"}},\
+{{\"name\":\"--join-on\",\"type\":\"string\",\"default\":\"none\",\"description\":\"check this key column for row-multiplying duplicates (D10)\"}},\
+{{\"name\":\"--bars\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OHLCV CSV time,open,high,low,close,volume[,vwap] for D2 resample reconciliation\"}},\
+{{\"name\":\"--resample-small\",\"type\":\"int\",\"default\":\"15\",\"description\":\"small factor for the D2 cascade\"}},\
+{{\"name\":\"--resample-large\",\"type\":\"int\",\"default\":\"60\",\"description\":\"large factor for the D2 cascade\"}},\
+{{\"name\":\"--session-gap\",\"type\":\"float\",\"default\":\"none\",\"description\":\"D2 session fold threshold in time units\"}},\
+{{\"name\":\"--universe\",\"type\":\"string\",\"default\":\"none\",\"description\":\"listing CSV time,symbol,change[,to] for D8\"}},\
+{{\"name\":\"--corporate-actions\",\"type\":\"string\",\"default\":\"none\",\"description\":\"action CSV time,symbol,kind,value for D9\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel symbol column for D8\"}},\
+{{\"name\":\"--price\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel price column for D9\"}},\
+{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"machine-readable report on stdout\"}},\
+{{\"name\":\"--report\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to this path\"}}]}},\n  \
          \"walkforward\":{{\"command\":\"rcsr walkforward\",\"summary\":\"walk-forward evaluation/backtest of one expression over a .rcsb column store or CSV\",\"doc\":\"docs/walkforward.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
-{{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name\"}},\
+{{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
 {{\"name\":\"--group-by\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel group column; costs and positions are per group\"}},\
@@ -141,11 +181,53 @@ pub fn json() -> String {
 {{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"10\",\"description\":\"cost per side in basis points\"}},\
 {{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"training/validation score quantile\"}},\
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
+{{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
-         \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
+         \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
+ {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\
+ {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"rows per I/O group\"}},\
+ {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto-detected\",\"description\":\"store this column as exact i64 timestamps\"}},\
+ {{\"name\":\"--skip-malformed\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"drop ragged rows instead of refusing the input\"}},\
+ {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse before parsing when the estimate exceeds this\"}},\
+ {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory\"}},\
+ {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
+         \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
+         \"prep\":{{\"command\":\"rcsr prep\",\"summary\":\"raw OHLCV CSV/ZIP archives to a .rcsb store with no intermediate CSV\",\"options\":[\
+{{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
+{{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"derived\",\"description\":\"symbol override for a single-file input\"}},\
+{{\"name\":\"--tz\",\"type\":\"string\",\"default\":\"UTC\",\"description\":\"UTC, +HH:MM, America/New_York or Europe/London\"}},\
+{{\"name\":\"--calendar\",\"type\":\"enum\",\"default\":\"24x7\",\"description\":\"24x7 | nyse | lse\"}},\
+{{\"name\":\"--resample\",\"type\":\"enum\",\"default\":\"none\",\"description\":\"1m..1w, calendar-aware; OHLC exact, flows summed\"}},\
+{{\"name\":\"--mtf\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"higher timeframes joined as of their last closed bar\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"ta:core, ta:full, exotic:cheap, candle:geometry, cross:btc, calendar or names\"}},\
+{{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>\"}},\
+{{\"name\":\"--spec\",\"type\":\"path\",\"default\":\"none\",\"description\":\"key=value spec file; its SHA-256 is recorded in the manifest\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol],... with a verified boundary ratio\"}},\
+{{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"parallel symbol workers; output order stays deterministic\"}},\
+{{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"column-store group size\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
+{{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}}]}},\n  \
+         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
+{{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership CSV or panel .rcsb\"}},\
+{{\"name\":\"--top\",\"type\":\"int\",\"default\":\"100\",\"description\":\"names selected per rebalance\"}},\
+{{\"name\":\"--lookback\",\"type\":\"int\",\"default\":\"90\",\"description\":\"trailing liquidity window in days\"}},\
+{{\"name\":\"--min-history\",\"type\":\"int\",\"default\":\"90\",\"description\":\"minimum age before selection\"}},\
+{{\"name\":\"--rebalance\",\"type\":\"int\",\"default\":\"30\",\"description\":\"days between membership decisions\"}},\
+{{\"name\":\"--min-bars\",\"type\":\"int\",\"default\":\"60\",\"description\":\"minimum trailing bars\"}},\
+{{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"86400\",\"description\":\"bar spacing for gap counts (3600 hourly)\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol] verified splice table\"}},\
+{{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
+{{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}}]}},\n  \
+         \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
         jstr("symbolic regression: find an interpretable f(x) ~ y"),

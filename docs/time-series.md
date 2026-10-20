@@ -70,8 +70,8 @@ N >= label horizon h
 
 If the last training label is built from the next `h` bars, those bars must not
 be test rows. For a 5-bar forward return, `--gap 5` is the minimum. Add any
-additional look-ahead introduced by preparation (for example the right half of a
-centred smoothing window; see §4) to `N`.
+additional look-ahead introduced by preparation (for example the right half of
+an opt-in `--smooth-centred` window; see §4) to `N`.
 
 If features only look **backwards** (`--lags`), no extra gap is needed for the
 lookback itself: a lag taken from before the boundary is information the
@@ -97,7 +97,8 @@ selection replaces the positional mode. `--gap` then does **not** apply; the
 report says so:
 
 ```text
-# note: the embargo gap does not apply to a row selection
+# note: --gap is dropped because explicit --train-select/--test-select replace
+# positional splitting; add the embargo to the selection expressions instead
 ```
 
 **What fails.** A user writes `--train-select "date < 2020" --gap 5` and believes
@@ -139,33 +140,47 @@ These flags are correct for i.i.d. tables and dangerous for ordered rows.
 
 | Flag | Why it can look ahead | Safe choice for forecasting |
 |---|---|---|
-| `--smooth k` | a **centred** mean: row `i` uses `i+1`; the right half of the window is future data | leave smoothing off, or smooth the *input* file causally before loading (only past rows), or accept that the model is not a real-time forecast |
-| `--fill interpolate` | linear interpolation uses the **next** non-missing value, which can be a future observation | `--fill previous` or `--fill drop`; use `interpolate` only when the gap is genuinely ignorable and the fill is not a predictor |
+| `--smooth k` | **trailing** mean: row `i` reads only rows `i-k+1..i` and shrinks at the left edge, so the default does not read future bars | leave the default; it is already causal |
+| `--smooth-centred k` | **centred** mean: row `i` uses `i+1`; the right half of the window is future data. It is the explicit opt-in and is reported as look-ahead | leave it off, or accept that the model is not a real-time forecast and say so in the report |
+| `--fill interpolate` | linear interpolation uses the **next** non-missing value, which can be a future observation; on time-ordered data the engine refuses it without `--allow-interpolate` | `--fill previous` or `--fill drop`; use `interpolate` only with `--allow-interpolate` when the gap is genuinely ignorable and the fill is not a predictor |
 | `--outlier-iqr` | bounds are training-only, so this is safe across the split; it can still delete the rare events you are trying to predict | keep `k` large, or exclude outlier-sensitive rows explicitly |
 | `--history-frac` | reserves leading rows for lags and drops them from scoring; it does not read ahead | use it with `--lags`; check the reported history rows |
 | `--lags K` | takes the previous row **inside the same series**; a gap or group boundary stops the chain | pair with `--gap-break` and `--group-by` |
 | `--center` / `--scale` | statistics come from training rows only, then are applied to test | leave the defaults (mean/std) or use robust training statistics |
 
-**Check.** `--smooth`:
+**Check.** `--smooth` is the *trailing* moving average (row `i` reads only
+itself and earlier rows). The old centred window still exists, but only behind
+`--smooth-centred k`, which is opt-in and reported as look-ahead:
 
 ```sh
-# smooth is centred: row i uses i-1, i, i+1 (and shrinks at the edge)
+# Causal default: row i uses rows i-2, i-1, i (and shrinks at the left edge).
 rcsr ... --smooth 3
+
+# Look-ahead opt-in: row i also uses i+1. Only choose this deliberately.
+rcsr ... --smooth-centred 3
 ```
 
-If the target is not observable at prediction time, do not smooth it. If inputs
-are noisy sensors and you need smoothing, build a causal moving average outside
-`rcsr` or use `--lags`.
+If the target is not observable at prediction time, do not smooth it with
+`--smooth-centred`. If inputs are noisy sensors and you need smoothing, the
+trailing `--smooth` is safe for a real-time forecast; `--lags` gives a longer
+causal memory without averaging away the last bar.
 
 **What fails.** The model learns a target that contains its own future
 neighbours; the reported test error is better than any live forecast can be.
 
 **Verify.**
 
-* `tests/prep.rs::smoothing_uses_a_centred_window_and_shrinks_at_the_edges`.
+* `tests/prep.rs::smoothing_is_trailing_by_default_and_shrinks_at_the_edges`
+  pins the causal default.
+* `tests/prep.rs::centred_smoothing_requires_the_explicit_flag_and_is_reported`
+  pins the opt-in and its `look-ahead` report.
+* `tests/ts_hazards.rs` covers the interpolate refusal and
+  `--allow-interpolate` override.
 * `src/data.rs` unit test `interpolate_uses_neighbours_and_drops_edges`.
-* The report's preparation block says which rows/cells were filled or smoothed;
-  `--json` has `preparation.rows_filled` and `preparation.smoothed`.
+* The report's preparation block says which rows/cells were filled or smoothed
+  and names `smooth_mode=trailing|centred`; `--json` has
+  `preparation.rows_filled`, `preparation.smoothed` and
+  `preparation.smooth_mode`.
 
 ---
 

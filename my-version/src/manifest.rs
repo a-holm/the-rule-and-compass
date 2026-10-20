@@ -36,6 +36,9 @@ pub struct Manifest {
     pub cuda_version: String,
     pub resumed_from: Option<String>,
     pub backend_change: Option<(String, String)>,
+    /// #169: batched-GPU fit ledger `(gpu, fallback, exact_refits)`, filled in
+    /// after the search. `None` for a run that never used the GPU.
+    pub fit: Option<(u64, u64, u64)>,
 }
 
 impl Manifest {
@@ -85,6 +88,12 @@ impl Manifest {
             jstr(&self.driver),
             jstr(&self.cuda_version)
         ));
+        if let Some((gpu, fallback, refits)) = self.fit {
+            out.push_str(&format!(
+                "  \"fit\":{{\"gpu\":{},\"fallback\":{},\"refits\":{}}},\n",
+                gpu, fallback, refits
+            ));
+        }
         out.push_str(&format!(
             "  \"resume\":{{\"from\":{},\"backend_change\":{}}},\n",
             self.resumed_from
@@ -162,6 +171,7 @@ pub fn collect(
         cuda_version,
         resumed_from,
         backend_change,
+        fit: None,
     }
 }
 

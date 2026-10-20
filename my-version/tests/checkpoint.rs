@@ -75,6 +75,39 @@ fn checkpoint_text(cfg: &Config, train: &Sample, test: &Sample) -> String {
 }
 
 #[test]
+fn checkpoint_tree_depth_and_node_limits_are_enforced() {
+    use rcsr::parse::Limits;
+    // Depth 256 (255 Neg nodes plus the leaf) is accepted; one more is not.
+    let mut tree = input(0);
+    for _ in 0..(Limits::MAX_DEPTH - 1) {
+        tree = node(Op::Neg, vec![tree]);
+    }
+    let text = encode_tree(&tree);
+    assert!(decode_tree(&text).is_ok(), "depth 256 must round-trip");
+
+    let too_deep = node(Op::Neg, vec![tree]);
+    let e = expect_err(decode_tree(&encode_tree(&too_deep)), "depth 257");
+    assert!(e.contains("depth") && e.contains("256"), "{e}");
+
+    // An exactly-4096-node balanced tree is accepted; 4097 nodes is rejected.
+    // 4095 nodes is a full-ish binary tree (2047 + 2047 + root); one Neg
+    // wrapper makes exactly 4096.
+    fn balanced(nodes: usize) -> expr::Node {
+        if nodes == 1 {
+            return input(0);
+        }
+        let left = (nodes - 1) / 2;
+        let right = nodes - 1 - left;
+        node(Op::Add, vec![balanced(left), balanced(right)])
+    }
+    let chain = node(Op::Neg, vec![balanced(Limits::MAX_NODES - 1)]);
+    assert!(decode_tree(&encode_tree(&chain)).is_ok());
+    let over = node(Op::Neg, vec![chain]);
+    let e = expect_err(decode_tree(&encode_tree(&over)), "4097 nodes");
+    assert!(e.contains("more than 4096 nodes"), "{e}");
+}
+
+#[test]
 fn rng_state_round_trip_produces_the_identical_stream() {
     let mut original = Mt::new(0xDEAD_BEEF);
     // Advance across at least one twist and stop at an arbitrary index.
@@ -226,7 +259,7 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
         patience: 1,
         restart_interval: 1,
         fit_iters: 2,
-        seed: 1,
+        seed: 2,
         // #76: the fixture needs a *stagnating* run so `stopped_early`,
         // `best_prev`, `no_improve` and the per-island counters are live. The
         // archive-parent feedback keeps this tiny run improving, which is the
@@ -276,6 +309,21 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
 }
 
 #[test]
+fn fit_portfolio_settings_round_trip() {
+    use rcsr::fit::FitStrategy;
+    let train = sample(120);
+    let test = sample(40);
+    let mut cfg = config(5);
+    cfg.fit_strategy = FitStrategy::VarPro;
+    cfg.fit_rows = 17;
+    let text = checkpoint_text(&cfg, &train, &test);
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(cp.config.fit_strategy, FitStrategy::VarPro);
+    assert_eq!(cp.config.fit_rows, 17);
+    assert_eq!(cp.to_text(), text, "round trip must preserve the new fields");
+}
+
+#[test]
 fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     let train = sample(240);
     let test = sample(80);
@@ -322,6 +370,58 @@ fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
             .map(|e| e.to_bits())
             .collect::<Vec<_>>(),
         "test errors must be identical"
+    );
+}
+
+/// #140: a GPU-backed checkpoint resumed on the same GPU must reproduce the
+/// uninterrupted archive bit for bit, just like the CPU A/B test above. The
+/// test is hardware-gated: without a usable device it is skipped, not failed.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_gpu_run_and_a_gpu_resume_match_exactly() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("no usable GPU; skipping the GPU->GPU resume A/B test");
+        return;
+    }
+    let train = sample(240);
+    let test = sample(80);
+    let mut full = Config {
+        generations: 20,
+        ..config(17)
+    };
+    full.gpu = true;
+    let uninterrupted = search::run(&full, &train, &test);
+    assert_eq!(uninterrupted.backend, rcsr::backend::Kind::Gpu);
+
+    let mut first = full.clone();
+    first.generations = 10;
+    let text = checkpoint_text(&first, &train, &test);
+    assert!(
+        text.contains("backend gpu\n"),
+        "a GPU checkpoint must record its backend"
+    );
+    let saved = Checkpoint::from_text(&text).expect("parse saved GPU checkpoint");
+
+    let resumed = search::run_resumable(&full, &train, &test, Some(saved), 0, |_| {})
+        .expect("GPU resume");
+    assert_eq!(resumed.backend, rcsr::backend::Kind::Gpu);
+    assert_eq!(
+        describe(&uninterrupted),
+        describe(&resumed),
+        "the GPU-resumed archive must be identical (errors compared by bit pattern)"
+    );
+    assert_eq!(
+        uninterrupted
+            .test_errors
+            .iter()
+            .map(|e| e.to_bits())
+            .collect::<Vec<_>>(),
+        resumed
+            .test_errors
+            .iter()
+            .map(|e| e.to_bits())
+            .collect::<Vec<_>>(),
+        "GPU test errors must be identical"
     );
 }
 

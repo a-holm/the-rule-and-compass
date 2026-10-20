@@ -127,6 +127,13 @@ generations, 2 islands, 200 individuals). The search metric defaults to
 
 ## 5. Recorded results
 
+**These numbers are a recording, not a promise about the current tree.** They are
+pinned to the commit and date named in each subsection. The search is
+stochastic across seeds: a different `--seed` changes the trajectory, and a
+later change to mutation, fitting or parent selection can move the counts even
+at the same commit. Reproduce a row with the stated commit and seed, not by
+assuming `main` still produces it.
+
 ### 5.1 Tiny suite (CI)
 
 ```sh
@@ -176,19 +183,20 @@ cargo run --release --bin rcsr-bench -- --suite known-truth --noise 0.0,0.01,0.1
 
 All 25 problems at the three default noise levels with the full budget
 (150 generations, 2 islands, 200 individuals). Recorded with engine seed `1` at
-commit `d26f2fd` (2026-10-19) on an 8-thread x86-64 machine; wall-clock 5:35.67, peak RSS 4 MB.
+commit `c4c1d9d` (2026-10-20) on an 8-thread x86-64 machine; the 75 runs took
+180.27 s of search time (wall-clock includes process overhead).
 
-The sweep was run **twice** and the two runs matched exactly (75/75 cells), so
-these numbers are reproducible for this commit. They replace an earlier
-recording made before the mutation and fitting changes of #77/#87: the headline
-count is unchanged (72/75) but the per-problem numbers moved.
+This replaces the earlier `d26f2fd` recording. `main` has moved since that
+commit (data preparation, fitting, GPU scheduling and checkpoint work), so the
+old numbers must not be read as a current-tree claim. The table below is the
+fresh recording; it is not a claim that every later commit reproduces it.
 
 ```
-recovered 72/75 (96.0%)   median complexity 3
+recovered 74/75 (98.7%)   median complexity 3
 by noise level:
-  0.000   25 runs   24 recovered (96.0%)  median complexity 3
-  0.010   25 runs   24 recovered (96.0%)  median complexity 3
-  0.100   25 runs   24 recovered (96.0%)  median complexity 4
+  0.000   25 runs   25 recovered (100.0%)  median complexity 3
+  0.010   25 runs   24 recovered (96.0%)   median complexity 3
+  0.100   25 runs   25 recovered (100.0%)  median complexity 3
 ```
 
 | problem | R² @ 0.00 | R² @ 0.01 | R² @ 0.10 |
@@ -208,26 +216,32 @@ by noise level:
 | `tanh_law` | 1.000 | 1.000 | 1.000 |
 | `harmonic_sum` | 1.000 | 1.000 | 0.999 |
 | `reciprocal_sum` | 1.000 | 1.000 | 1.000 |
-| `pythagoras` | 0.987 | 0.721 | 0.987 |
+| `pythagoras` | 0.993 | 0.987 | 1.000 |
 | `kinetic_energy` | 1.000 | 1.000 | 1.000 |
 | `coulomb` | 1.000 | 1.000 | 1.000 |
 | `ideal_gas` | 1.000 | 1.000 | 1.000 |
 | `spring_period` | 1.000 | 1.000 | 1.000 |
-| `velocity_addition` | 0.999 | 0.997 | 0.995 |
+| `velocity_addition` | 1.000 | 1.000 | 1.000 |
 | `damped_oscillator` | 1.000 | 1.000 | 1.000 |
 | `relativistic` | 1.000 | 1.000 | 0.999 |
 | `sine_sum` | 1.000 | 1.000 | 1.000 |
 | `power_law` | 1.000 | 1.000 | 1.000 |
 
-24 of 25 problems are recovered at every noise level. The single miss is
-`pythagoras` (`√(x1² + x2²)`): its best front member reaches R² =
-0.987 (noiseless), 0.721 (1 %) and 0.987
-(10 %). At 0 % it is a complexity-13 approximation
-(`ln(cube(((2.2647 / gauss((0.2399 * x1))) - cos((0.6416 * x2)))))`), not the exact two-term form; at 1 % the front falls back
-to a piecewise `if` at complexity 23. The exact form *is*
-reachable — a run of an earlier build found it at complexity 7 — so this is a
-stochastic limit of the search at this budget, not an impossibility. That is
-exactly the kind of information the suite exists to produce.
+24 of 25 problems are recovered at every noise level; the single miss is
+`pythagoras` at 1 % noise. The three `pythagoras` rows, with the selected form
+and complexity, are:
+
+| noise | R² | complexity | selected form |
+|---|---:|---:|---|
+| 0.00 | 0.993 | 22 | `(6.229 - ((4.4857 - tan(((0.1617 - (-0.0856 * abs(x1))) - cos((1.0596 - cos(x1)))))) ^ gauss((0.2074 * x2))))` |
+| 0.01 | 0.987 | 27 | `((3.1835 / (0.9929 ^ ((0.687 / (0.0181 + abs(x2))) ^ (-1.5532 + cos(x1))))) * ((0.482 / (0.785 ^ abs(x2))) ^ (1.121 + cos(x1))))` |
+| 0.10 | 1.000 | 10 | `(((0.0218 + square(x1)) + abs(square(x2))) ^ 0.4982)` |
+
+At 0 % and 10 % the front clears the 0.99 recovery threshold with an
+approximation; at 1 % its best member (complexity 27) falls just below it
+(R² = 0.9867). The exact two-term form is reachable — an earlier build found it
+at complexity 7 — so this is a stochastic limit of the search at this budget,
+not an impossibility.
 
 ### 5.3 Pareto-front parent feedback (#76)
 
@@ -287,7 +301,7 @@ above confirm there is no size drift at this budget.
   right question for a *generator*, and the recorded numbers should be read that
   way.
 
-## 5. Timing schema (`--json`, `--ndjson`, reports)
+## 7. Timing schema (`--json`, `--ndjson`, reports)
 
 Every search run reports a non-overlapping wall-clock ledger in a `timing`
 object (and text reports print a `# time:` line plus a `## Time` section):
@@ -306,6 +320,11 @@ the test on a real CLI run), so a large baseline or bootstrap cannot hide
 outside the numbers. `elapsed_seconds` is **kept for compatibility and means
 `search_seconds`**; use `total_seconds` for the cost of the whole run. The same
 fields appear in the NDJSON `done` event.
+
+Multi-output runs (`--target y1,y2`) use the same ledger in text, `--json` and
+the NDJSON `done` event. They do not run the single-target baseline or
+diagnostics phases, so `baselines_seconds` and `diagnostics_seconds` are
+reported as `0`, not omitted.
 
 The k-NN baseline reports its own sampling fields (`reference_rows`,
 `query_rows`, `capped`, `sem`, `seconds`); on an uncapped run

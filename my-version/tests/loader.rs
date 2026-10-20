@@ -236,3 +236,96 @@ fn unterminated_quote_names_the_opening_line() {
     let err = data::parse_table("x,y\n1,\"open\n2,3\n").unwrap_err();
     assert!(err.contains("line 2") && err.contains("unterminated"), "{err}");
 }
+
+/// #126: the guard's shape scan uses the same quote-aware records as the
+/// parser, so a quoted newline is one row and a quoted comma is not a column.
+#[test]
+fn streaming_shape_counts_quote_aware_rows_and_columns() {
+    let csv = "x,y,label\r\n1,2,\"a,b\"\r\n3,4,\"two\nlines\"\r\n";
+    let shape = data::csv_shape_stream(|| {
+        Ok(Box::new(std::io::Cursor::new(csv.as_bytes()))
+            as Box<dyn std::io::BufRead>)
+    })
+    .unwrap();
+    assert_eq!(shape.cols, 3, "quoted commas are not columns");
+    assert_eq!(shape.rows, 2, "a quoted newline is one record");
+    assert_eq!(shape.bytes, csv.len() as u64);
+    // And the parser agrees with the scan.
+    let t = data::parse_table(csv).unwrap();
+    assert_eq!((t.n_cols(), t.len()), (shape.cols, shape.rows));
+    assert_eq!(t.text(1, 2), Some("two\nlines"));
+}
+
+/// #126: the CLI `--data <path>` path goes through the streaming reader, not
+/// `read_to_string`. A quoted comma must parse and the run must finish.
+#[test]
+fn the_data_cli_reads_a_quoted_file_from_a_path() {
+    let dir = std::env::temp_dir().join(format!("rcsr-stream-data-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("q.csv");
+    std::fs::write(&csv, "x,y,label\r\n1,2,\"a,b\"\r\n3,4,\"c,d\"\r\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            csv.to_str().unwrap(),
+            "--target",
+            "y",
+            "--generations",
+            "1",
+            "--pop",
+            "8",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"tool\":\"rcsr\""), "{stdout}");
+    assert!(!stdout.contains("ragged"), "{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #126: `rcsr import` streams and stores the exact quoted values.
+#[test]
+fn the_import_cli_streams_quoted_values_from_a_path() {
+    let dir = std::env::temp_dir().join(format!("rcsr-stream-import-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("q.csv");
+    let store = dir.join("q.rcsb");
+    std::fs::write(
+        &csv,
+        concat!(
+            "x,label,y\r\n",
+            "1,\"a,b\",2\r\n",
+            "3,\"c\td\",4\r\n",
+            "5,\"two\nlines\",6\r\n",
+            "7,\"he said \"\"hi\"\"\",8\r\n",
+            "9,\"\",10\r\n",
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["import", csv.to_str().unwrap(), store.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let fs = rcsr::store::FileStore::open(store.to_str().unwrap()).unwrap();
+    let t = fs.to_table().unwrap();
+    assert_eq!(t.len(), 5);
+    assert_eq!(t.text(0, 1), Some("a,b"));
+    assert_eq!(t.text(1, 1), Some("c\td"));
+    assert_eq!(t.text(2, 1), Some("two\nlines"));
+    assert_eq!(t.text(3, 1), Some("he said \"hi\""));
+    assert_eq!(t.text(4, 1), Some(""));
+    let _ = std::fs::remove_dir_all(&dir);
+}

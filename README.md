@@ -21,10 +21,14 @@ Constants inside a candidate are not guessed: each candidate's constants are
 fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
 candidate with the right *shape* is immediately usable even if its numbers
 started out wrong, and the fitted numbers minimise the same loss that ranks the
-front. Candidates affine in every constant can instead use the closed-form
-column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
-error and falls back to the metric-aware path otherwise; the default remains
-the historical LM path bit for bit.
+front. The search may instead use the exact solver portfolio
+(`--fit-strategy auto`): closed-form column-pivoted QR when the candidate is
+affine in every constant, variable projection (Golub–Pereyra) when it is
+separable, and the historical LM path for everything else. `varpro`, `stream`
+(out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
+an exact CPU verifier) can be forced individually. Every arm falls back to the
+default LM path when it cannot prove a safe result, and the default remains the
+historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -110,7 +114,13 @@ rcsr walkforward --data panel_daily_long.rcsb --target fwd1 \
 
 Test windows are defined only by time; the purge gap must be at least the
 horizon, and the threshold comes from training (or an optional trailing
-validation slice), never from the test block. See
+validation slice), never from the test block. Per-window metrics start every
+group flat; pooled P&L carries each group's ending position across a window
+boundary and charges the seam term `|p_end - q_start|` (pass
+`--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
+candidates by their validation error; the test block is never a selection
+input. The fold sign test is reported as not applicable for expanding folds
+because `test_k` lies inside `train_{k+1}`. See
 [`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
 definitions and the reference-agreement check against the Python evaluator.
 
@@ -184,6 +194,14 @@ blank lines; both flags can be combined. A malformed seed is a usage error
 input error (exit 3). `--json` reports a `seeds` array and `--ndjson` a `seed`
 event per seed. See [`docs/seeds.md`](docs/seeds.md) for the processing order,
 the elite rule, the file format and the measured before/after numbers.
+
+Every user-written formula (seeds, `--eval-expr`, filters, `--function` bodies
+and the HTTP body) is bounded to **4096 nodes** and a root-to-leaf **depth of
+256** (a single node has depth 1), and checkpoint tree decoding uses the same
+limits. An over-limit or pathologically nested input is rejected with a normal
+parser/checkpoint error that names the limit and, for text, the 1-based column;
+it never overflows the process stack. `rcsr schema` reports the limits as
+`expression_limits`.
 
 ## Building blocks
 
@@ -306,12 +324,29 @@ atomically instead of streaming it. See
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
-  (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
-  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
+  (rows × columns plus preparation, calibrated on 6- and 90-column runs, not a
+  multiple of the file size) would exceed the budget, with exit 3 and a fix,
+  instead of being SIGABRT/SIGKILL'ed. The estimate and its basis appear in the
+  preparation block. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
   that can be scanned group by group and searched from a bounded hash sample
   when it does not fit; v1 stores still load. See
   [`docs/data-format.md`](docs/data-format.md).
+* **Market data as a typed layer**: `rcsr::ohlcv` resamples OHLCV exactly
+  (open=first, high=max, low=min, close=last, flows summed), keeps gaps and
+  flags zero-volume/partial bars, understands crypto 24/7 and NYSE/LSE
+  sessions with holidays, half-days and DST, applies splits/dividends while
+  keeping raw prices, verifies symbol splices, and joins higher timeframes
+  only after their bucket has closed. `rcsr::features` supplies causal
+  `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
+  a next-open forward label with symmetric cost. See
+  [`docs/ohlcv.md`](docs/ohlcv.md).
+* **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
+  trailing liquidity **as of** each rebalance, keeps delisted names while they
+  trade, never forward-fills across a listing/delisting/migration, verifies
+  splice ratios, charges both sides and the final exit, supplies a
+  matched-exposure random-long benchmark, refuses 2026H2 in every runner and
+  emits a checksummed provenance manifest. See [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -370,32 +405,44 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
+     [--max-memory size] [--force] [--skip-malformed]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
+     [--weight col]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--seed-expr expr] [--seed-file path]
+     [--implicit] [--implicit-derivative] [--function def]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
-     [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
+     [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
+     [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear] [--fit-report] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
-     [--pipeline-depth N]
+     [--pipeline-depth N] [--variation auto|node|postfix]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]
+     [--gpu] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
+     [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
-     [--format text|json|ndjson] [--progress]
+     [--allow-backend-change] [--run-manifest file] [--json-out file]
+     [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
 ```
+
+Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
+their own option lists in `rcsr schema` under `import`, `walkforward` and
+`verify-manifest`; the block above is the root search command.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
@@ -483,7 +530,9 @@ run:
 |---|---|
 | `--fill <method>` | what to do with a missing cell: `none` (default), `drop`, `mean`, `median`, `zero`, `previous`, `interpolate` |
 | `--outlier-iqr k` | drop rows beyond `k` interquartile ranges from the column median |
-| `--smooth k` | `k`-wide centred moving average per column; edges shrink |
+| `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
+| `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
+| `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -594,11 +643,20 @@ and `previous`/`interpolate` never cross the train/test boundary. See
 ### Checking for leakage
 
 Leakage is caught differentially, not by a significance test. The
-[`leakage` module](docs/leakage.md) provides truncation replay (recompute at
-cut points; every completed row must be bit-identical), a future-shift probe,
-canary detection and synthetic leak/no-leak fixtures. They run in
-`cargo test --release --test leakage` and can be pointed at your own panel with
-`Panel::from_csv`; `assert_clean()` panics on a real leak instead of logging it.
+[`leakage` suite](docs/leakage.md) implements the Tier-A auditors D0–D2 and
+D8–D11 (spec/time/resample, universe, corporate actions, join cardinality and
+determinism), the differential D5 learner, truncation replay (recompute at cut
+points; every completed row must be bit-identical), canaries, as-of joins, the
+wall-time `--gap` conversion and `N_eff` for overlapping labels.
+
+```sh
+rcsr audit --data panel.csv --target y --time ts --horizon 24 --json
+```
+
+`rcsr audit` writes a machine-readable report and exits **5** on any finding.
+The same detectors run in `cargo test --release --test leakage` and can be
+pointed at your own panel with `Panel::from_csv`; `assert_clean()` panics on a
+real leak instead of logging it, naming the detector, column and row.
 
 ### Forecasting: history and delayed variables
 
@@ -772,10 +830,14 @@ list and the recorded results.
 fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
 candidate with the right *shape* is immediately usable even if its numbers
 started out wrong, and the fitted numbers minimise the same loss that ranks the
-front. Candidates affine in every constant can instead use the closed-form
-column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
-error and falls back to the metric-aware path otherwise; the default remains
-the historical LM path bit for bit.
+front. The search may instead use the exact solver portfolio
+(`--fit-strategy auto`): closed-form column-pivoted QR when the candidate is
+affine in every constant, variable projection (Golub–Pereyra) when it is
+separable, and the historical LM path for everything else. `varpro`, `stream`
+(out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
+an exact CPU verifier) can be forced individually. Every arm falls back to the
+default LM path when it cannot prove a safe result, and the default remains the
+historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant
@@ -792,11 +854,14 @@ the historical LM path bit for bit.
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
-- **opt-in quality-diversity coverage** (`--qd`, `--qd-cells`, `--qd-cell-cap`):
-  a rectangular descriptor grid over variable usage × prediction skewness, with
-  a bounded local `(error, cost)` front per cell. The layer is passive and
-  reports occupied-cell coverage in text and `--json`; it does not change the
-  Pareto front. See [`docs/qd.md`](docs/qd.md);
+- **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
+  `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
+  prediction skewness, with deterministic Halton initialisation, Lloyd
+  centroid updates, a bounded local `(error, cost)` front per cell, UCB1
+  parent selection, stratified migration and least-occupied restarts. The
+  passive layer reports coverage and hypervolume in text and `--json` without
+  changing the Pareto front; `--qd-policy` is the opt-in search change. See
+  [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
@@ -852,8 +917,10 @@ the historical LM path bit for bit.
   analytic per-input sensitivity ranking (`mean(|∂f/∂x_i| · σ_x_i / σ_f)`, no
   finite differences), and a repeated-search benchmark with per-complexity
   median/IQR error and wall-clock time;
-- bottom-up simplification with affine normalisation, and denormalisation back
-  to original units.
+- a sound, value-preserving bottom-up normal form for scoring/dedup/CSE
+  (`expr::simplify`) plus an aggressive display relation with affine
+  normalisation (`expr::simplify_display`), and denormalisation back to original
+  units.
 
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
@@ -872,7 +939,11 @@ threads and training rows/columns, and `--json` records `backend`,
 Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
 change the search trajectory. Reported metrics, constants and diagnostics are
 always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. See [`docs/gpu-backend.md`](docs/gpu-backend.md).
+reproduction. A GPU run also reports a measured `gpu` block (allocation, H2D,
+launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
+`sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
+sampled utilisation is not occupancy. See
+[`docs/gpu-backend.md`](docs/gpu-backend.md).
 
 ## Is the search converging?
 
@@ -910,7 +981,7 @@ docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
-docs/qd.md                    opt-in quality-diversity coverage archive (--qd)
+docs/qd.md                    opt-in CVT-MAP-Elites quality-diversity layer (--qd/--qd-policy)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

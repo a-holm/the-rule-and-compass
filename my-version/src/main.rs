@@ -20,16 +20,18 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{backend, data, diagnostics, multi, qd, search, stability, store, walkforward};
+use rcsr::{backend, data, diagnostics, leakage, multi, qd, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Read;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
+/// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
+/// a usage (2) or input (3) error.
+const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -91,7 +93,9 @@ fn usage() -> String {
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
+  rcsr prep --input <file|dir> --out <store.rcsb> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
@@ -104,9 +108,12 @@ INPUT:
                              larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
                              512MB, 2GiB). Exit 3 with the rows x columns
                              estimate and an actionable message instead of
-                             SIGABRT/SIGKILL. A `.rcsb` store that does not fit
-                             is searched from a hash sample with bounded RSS;
-                             a CSV is refused before parsing.
+                             SIGABRT/SIGKILL. The CSV reader streams, so the
+                             file text is not resident. The calibrated estimate
+                             and its rows x columns basis are reported in the
+                             preparation block. A `.rcsb` store that does not
+                             fit is searched from a hash sample with bounded
+                             RSS; a CSV is refused before parsing.
   --force                    override --max-memory and try the resident path
                              anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
@@ -146,6 +153,7 @@ ROW WEIGHTS:
                              rank_correlation, auc, log_loss, hinge).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
+  See docs/time-series.md for which preparation steps read ahead.
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
                              null). Default none: leave it, as before.
                              drop        drop the row
@@ -173,6 +181,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              counted, one matching neither is reported unused
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
+  See docs/time-series.md for the full purge/embargo/look-ahead checklist.
   --split random|temporal|group|temporal-group|auto   (default random)
                              random          shuffled i.i.d. holdout
                              temporal        train on the past, test on the future
@@ -192,8 +201,11 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
-  --gap <rows>               embargo: rows dropped between train and test to stop
-                             autocorrelation leaking the future (default 0)
+  --gap <rows|time>          embargo: rows dropped between train and test to stop
+                             autocorrelation leaking the future (default 0).
+                             A suffixed value (90m, 1.5h, 30s, 2d) is wall time,
+                             converted with ceil(seconds / median_dt); it is
+                             dropped with a warning under explicit row selection
   --folds <k>                split the test region into k contiguous blocks and
                              report per-block error as well as the mean (default 1)
 
@@ -273,14 +285,23 @@ MODE:
                              --op-complexity. Constants inside a body are shared
                              by every call. See docs/building-blocks.md.
 
+LIMITS:
+  Every expression read from text (--eval-expr, --filter, --exclude,
+  --train-select, --test-select, --seed-expr, --seed-file, --function and the
+  HTTP body) and every tree decoded from a checkpoint is bounded to 4096 nodes
+  and a root-to-leaf depth of 256 (a single node has depth 1). A deeper or
+  larger tree is a normal usage/input error with a parser column or a
+  checkpoint message; it is never a stack overflow or abort.
+
 MULTI-OUTPUT (--target y1,y2):
   Candidates share one tree shape; each target gets its own fitted constants.
   The combined error is the mean of the per-target errors, and the Pareto front
   ranks on that mean and the shape's complexity. Text prints one line per
   target; --json carries a targets array with each expression, constants and
   error plus the combined error. k_constants is the total across outputs.
-  Not available with --ndjson, --cv, --null-runs, --bootstrap-error,
-  --stability, --report, --save/--resume, or seed expressions.
+  --ndjson emits one closing done event with the timing ledger. Not available
+  with --cv, --null-runs, --bootstrap-error, --stability, --report,
+  --save/--resume, or seed expressions.
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
@@ -344,20 +365,33 @@ SEARCH:
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants
-                             (default 8; 0 = no fitting at all). Constants are
+                             (default 8; 0 = no fitting at all, for every
+                             metric and both fit strategies). Constants are
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
                              log_squashed use IRLS; auc/log_loss/hinge use
                              logistic IRLS; rank/order/correlation losses use a
                              deterministic coordinate polish
-  --fit-strategy <name>      exact | auto | linear (default exact). `exact` is
-                             the historical CPU Levenberg–Marquardt path, bit
-                             for bit. `auto`/`linear` solve trees affine in
-                             every constant by closed-form QR and fall back to
-                             exact otherwise; the linear arm is an exact global
-                             minimiser for squared error only
-  --fit-report               print the constant-fitting arm counts at the end
-                             of the run (diagnostics only)
+  --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
+                             exact). `exact` is the historical CPU
+                             Levenberg–Marquardt path, bit for bit. `auto`
+                             dispatches by structure: closed-form QR for trees
+                             affine in every constant, variable projection for
+                             separable models, exact LM otherwise. `linear`,
+                             `varpro` and `stream` force one arm and fall back
+                             to exact LM when it cannot prove a safe result;
+                             `stream` merges f64 sufficient statistics over row
+                             blocks. `gpu` is the #169 batched kernel with a CPU
+                             fallback; without a batch backend it uses the exact
+                             CPU arms (never a no-op)
+  --fit-report               print the constant-fitting arm counts (linear,
+                             varpro, stream, exact, GPU fallback/refit) at the
+                             end of the run (diagnostics only)
+  --fit-rows <N>             fit constants on a deterministic N-row subsample
+                             and score/archive on all training rows (default 0
+                             = off; N >= train rows is an exact full fit). The
+                             archive and every reported error are refit on all
+                             rows
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -388,19 +422,45 @@ SEARCH:
                              --gpu/--cpu, a CUDA build with a usable device uses
                              the GPU automatically. Reported errors stay CPU
                              f64, but f32 fitness can change the trajectory
-                             (cross-backend runs are not bit-identical)
+                             (cross-backend runs are not bit-identical). JSON
+                             reports the measured kernel/sync/alloc/copy wall
+                             and kernel-time duty; SM occupancy is null unless
+                             measured separately with ncu
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
   --qd                       record an opt-in quality-diversity archive over
                              (variable usage x prediction skewness), passive;
                              it never changes parents or the Pareto front
-  --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
+  --qd-cells <N>             descriptor cells (grid bins per axis or CVT K;
+                             2..=512; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
+  --qd-cvt                   use CVT-MAP-Elites (K centroids, Lloyd updates)
+                             instead of the rectangular grid
+  --qd-policy                feed the archive back into parent selection (UCB1
+                             60/25/10/5), stratified migration and least-
+                             occupied restarts; implies --qd --qd-cvt
+  --qd-uniform               control: the policy selects occupied cells
+                             uniformly instead of the UCB1 mix
+  --qd-random                control: hash descriptors to random cells, so the
+                             partition carries no behaviour information
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
                              only effective with --gpu
+                             Programs with no device opcode (constraints,
+                             aggregates, blocks the lowerer cannot rewrite) are
+                             scored by a bounded CPU worker pool, never on the
+                             scoring thread; RCSR_CPU_FALLBACK_THREADS sets its
+                             size (default min(cores, 8)). --json reports each
+                             generation's native/lowered/unsupported counts and
+                             fallback seconds
+  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -511,16 +571,158 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #118: best reported error and constant-mean baseline error, the two inputs
+/// to quality-per-GPU-hour. Both are on the same full-data f64 scale as the
+/// archive. `inf`/`nan` yields `quality_per_gpu_hour = null` rather than a
+/// fabricated number.
+fn gpu_best_error(outcome: &rcsr::search::Outcome) -> f64 {
+    outcome
+        .archive
+        .items
+        .iter()
+        .map(|s| s.error)
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn gpu_baseline_error(train: &rcsr::data::Sample) -> f64 {
+    let n = train.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mean = train.y.iter().sum::<f64>() / n as f64;
+    train.y.iter().map(|y| (y - mean) * (y - mean)).sum()
+}
+
+/// #118: the GPU block shared by `--json` and the final NDJSON event. It keeps
+/// #131's per-generation opcode/fallback report and adds the measured full-path
+/// accounting. `sm_occupancy` is explicitly `null`: it needs `ncu`, and
+/// `nvidia-smi`'s sampled utilisation is neither occupancy nor duty.
+fn gpu_json(
+    g: &Option<rcsr::search::GpuRunStats>,
+    best_error: f64,
+    baseline_error: f64,
+    fit_strategy: &str,
+) -> String {
+    let Some(g) = g else {
+        return "null".to_string();
+    };
+    let a = &g.accounting;
+    let quality = a
+        .quality_per_gpu_hour(best_error, baseline_error)
+        .map(jnum)
+        .unwrap_or_else(|| "null".to_string());
+    let ops_json = |ops: &std::collections::BTreeMap<String, usize>| -> String {
+        ops.iter()
+            .map(|(name, n)| format!("{}:{}", jstr(name), n))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let gens: Vec<String> = g
+        .generations
+        .iter()
+        .map(|s| {
+            format!(
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"opcodes\":{{{}}}}}",
+                s.generation,
+                s.programs,
+                s.native,
+                s.native + s.lowered,
+                s.lowered,
+                s.fallbacks,
+                s.unsupported_programs,
+                jnum(s.fallback_seconds),
+                s.fallback_workers,
+                s.fit_attempts,
+                s.fit_gpu,
+                s.fit_fallback,
+                ops_json(&s.opcodes)
+            )
+        })
+        .collect();
+    // #121: `gpu.totals` aggregates the per-generation counters over the run.
+    let mut total_ops = std::collections::BTreeMap::new();
+    let (mut t_programs, mut t_native, mut t_lowered, mut t_fallbacks) = (0usize, 0usize, 0usize, 0usize);
+    let (mut t_unsupported, mut t_seconds, mut t_workers) = (0usize, 0.0f64, 0usize);
+    for s in &g.generations {
+        t_programs += s.programs;
+        t_native += s.native;
+        t_lowered += s.lowered;
+        t_fallbacks += s.fallbacks;
+        t_unsupported += s.unsupported_programs;
+        t_seconds += s.fallback_seconds;
+        t_workers = t_workers.max(s.fallback_workers);
+        for (name, n) in &s.opcodes {
+            *total_ops.entry(name.clone()).or_insert(0usize) += *n;
+        }
+    }
+    let totals = format!(
+        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
+        t_programs,
+        t_native,
+        t_native + t_lowered,
+        t_lowered,
+        t_fallbacks,
+        t_unsupported,
+        jnum(t_seconds),
+        t_workers,
+        ops_json(&total_ops)
+    );
+    // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
+    // strategy and its attempt/fallback/refit counts are always auditable.
+    let fit = format!(
+        "\"fit\":{{\"strategy\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"seconds\":{}}}",
+        jstr(fit_strategy),
+        g.fit_attempts,
+        g.fit_gpu,
+        g.fit_fallback,
+        g.fit_refits,
+        jnum(g.fit_ms / 1000.0)
+    );
+    format!(
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
+        jnum(a.kernel_s),
+        jnum(a.launch_s),
+        jnum(a.sync_s),
+        jnum(a.alloc_s),
+        jnum(a.h2d_s),
+        jnum(a.d2h_s),
+        jnum(a.transfer_s()),
+        jnum(a.window_s()),
+        jnum(a.host_s),
+        jnum(a.accounted_s()),
+        jnum(a.wall_s),
+        jnum(a.idle_s()),
+        jnum(a.residual_fraction()),
+        a.h2d_bytes,
+        a.d2h_bytes,
+        a.batches,
+        a.failed_batches,
+        a.programs,
+        a.evals,
+        a.row_evals,
+        jnum(a.evals_per_s()),
+        jnum(a.row_evals_per_s()),
+        jnum(a.generations_per_s()),
+        jnum(a.duty_cycle()),
+        quality,
+        gens.join(","),
+        totals,
+        fit
+    )
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd: {}/{} cells occupied ({:.1}%), {} entries, best error {}",
+            "# qd ({}): {}/{} cells occupied ({:.1}%), {} entries, best error {}, hypervolume {:.4}",
+            q.mode,
             q.occupied,
             q.cells,
             100.0 * q.coverage,
             q.entries,
-            jnum(q.best_error)
+            jnum(q.best_error),
+            q.hypervolume
         );
     }
 }
@@ -530,14 +732,17 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{}}}",
+            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            q.mode,
             q.bins,
             q.cells,
             q.occupied,
             jnum(q.coverage),
             q.entries,
             jnum(q.best_error),
-            q.cell_cap
+            q.cell_cap,
+            jnum(q.hypervolume),
+            q.evaluations
         ),
     }
 }
@@ -555,25 +760,29 @@ struct PhaseTimings {
     diagnostics: f64,
     report: f64,
     total: f64,
+    /// #118: GPU full-path wall measured inside `search`. Informational: it is a
+    /// subset of `search`, not another additive phase.
+    gpu: f64,
 }
 
 impl PhaseTimings {
     fn json(&self) -> String {
         format!(
-            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{}}}",
+            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{},\"gpu_seconds\":{}}}",
             jnum(self.prep),
             jnum(self.search),
             jnum(self.baselines),
             jnum(self.diagnostics),
             jnum(self.report),
-            jnum(self.total)
+            jnum(self.total),
+            jnum(self.gpu)
         )
     }
 
     fn text(&self) -> String {
         format!(
-            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s",
-            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total
+            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s gpu={:.2}s",
+            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total, self.gpu
         )
     }
 
@@ -602,6 +811,81 @@ fn variables_detail_json(types: &[data::VariableDType]) -> String {
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// #129: resolve `--gap`. An integer is rows; `90m`, `1.5h`, `30s` or `2d` is
+/// wall time converted with `ceil(seconds / median_dt)`. A wall-time gap needs
+/// a time column; without one the request is a usage error, never a zero-row
+/// embargo.
+fn parse_gap_spec(
+    src: &str,
+    table: &data::Table,
+    time_col: Option<usize>,
+    unit: Option<data::TimeUnit>,
+) -> Result<(usize, Option<String>), String> {
+    let trimmed = src.trim();
+    if let Ok(rows) = trimmed.parse::<usize>() {
+        return Ok((rows, None));
+    }
+    let (num_src, multiplier) = if let Some(v) = trimmed.strip_suffix(&['s', 'S'][..]) {
+        (v, 1.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['m', 'M'][..]) {
+        (v, 60.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['h', 'H'][..]) {
+        (v, 3600.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['d', 'D'][..]) {
+        (v, 86_400.0)
+    } else {
+        return Err(format!(
+            "--gap '{}' is neither a row count nor a wall time (use 90m, 1.5h, 30s or 2d)",
+            src
+        ));
+    };
+    let value: f64 = num_src
+        .trim()
+        .parse()
+        .map_err(|_| format!("--gap '{}' has no numeric value", src))?;
+    if !(value > 0.0) {
+        return Err("--gap must be positive".to_string());
+    }
+    let Some(tc) = time_col else {
+        return Err(format!(
+            "--gap {} needs --time <col> to convert wall time to rows",
+            src
+        ));
+    };
+    let mut raw: Vec<f64> = data::time_keys(table, tc).to_f64();
+    raw.sort_by(f64::total_cmp);
+    let mut diffs: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0).collect();
+    diffs.sort_by(f64::total_cmp);
+    if diffs.is_empty() {
+        return Err(format!(
+            "--gap {} cannot be converted: the time column has no positive spacing",
+            src
+        ));
+    }
+    let median = diffs[diffs.len() / 2];
+    let to_seconds = match unit.unwrap_or(data::TimeUnit::Seconds) {
+        data::TimeUnit::Seconds => 1.0,
+        data::TimeUnit::Millis => 1e-3,
+        data::TimeUnit::Micros => 1e-6,
+        data::TimeUnit::Nanos => 1e-9,
+    };
+    let median_seconds = median * to_seconds;
+    let seconds = value * multiplier;
+    let rows = leakage::wall_time_gap(seconds, median_seconds).ok_or_else(|| {
+        format!(
+            "--gap {} cannot be converted: median spacing is {} s",
+            src, median_seconds
+        )
+    })?;
+    Ok((
+        rows,
+        Some(format!(
+            "--gap {} = {:.1} s -> {} rows (ceil({:.1}/{:.4}))",
+            src, seconds, rows, seconds, median_seconds
+        )),
+    ))
 }
 
 /// Parse a boolean row expression (`--filter`, `--exclude`, `--train-select`,
@@ -724,6 +1008,14 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
     }
+    // #123: stream raw klines/CSV archives straight to a column store.
+    if args.first().map(|s| s.as_str()) == Some("prep") {
+        rcsr::prep::run(&args[1..]);
+    }
+    // #145: point-in-time membership and the rebuilt panel.
+    if args.first().map(|s| s.as_str()) == Some("panel") {
+        rcsr::panel::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -734,6 +1026,10 @@ fn main() {
     // #140: verify a run manifest without starting a search.
     if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
         run_verify_manifest(&args[1..]);
+    }
+    // #129: differential leakage audit. Exit 5 when any detector fires.
+    if args.first().map(|s| s.as_str()) == Some("audit") {
+        run_audit(&args[1..]);
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
@@ -747,10 +1043,6 @@ fn main() {
         print!("{}", schema::json());
         std::process::exit(EXIT_OK);
     }
-    // #134: everything before the search is `prep`, including argument parsing,
-    // loading and data preparation.
-    let run_start = std::time::Instant::now();
-
     let mut cfg = search::Config::default();
     // #141: whether the user asserted a backend explicitly. `None` means the
     // run follows the build/device default; `Some(true)` is `--gpu` and
@@ -779,7 +1071,9 @@ fn main() {
     let mut split_arg: Option<String> = None;
     let mut time_name: Option<String> = None;
     let mut group_name: Option<String> = None;
-    let mut gap = 0usize;
+    // #129: a bare integer is rows; a suffixed value (90m, 1.5h) is wall
+    // time and is converted after the time column is known.
+    let mut gap_src: Option<String> = None;
     let mut folds = 1usize;
     let mut lags = 0usize;
     let mut history_frac = 0.0f64;
@@ -850,6 +1144,8 @@ fn main() {
     // #85: remember an explicit --fit-samples so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_samples_set = false;
+    // #116: explicit --fit-rows for the resume settings check.
+    let mut fit_rows_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -1051,7 +1347,7 @@ fn main() {
             "--split" => split_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
-            "--gap" => gap = val!().parse().unwrap_or(0),
+            "--gap" => gap_src = Some(val!()),
             "--folds" => folds = val!().parse().unwrap_or(1).max(1),
             "--lags" => lags = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
@@ -1131,6 +1427,16 @@ fn main() {
             }
             // #116: reporting-only arm counts.
             "--fit-report" => cfg.fit_report = true,
+            // #116: fit on a deterministic subsample, score and archive on all rows.
+            "--fit-rows" => {
+                let n: usize = val!().parse().unwrap_or(0);
+                if n == 1 {
+                    eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2");
+                    std::process::exit(EXIT_USAGE);
+                }
+                cfg.fit_rows = if n >= 2 { n } else { 0 };
+                fit_rows_set = true;
+            }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
                 let v = val!();
@@ -1141,8 +1447,8 @@ fn main() {
                     }
                     None => {
                         eprintln!(
-                            "error: --fit-strategy needs exact, auto or linear (cpu is an \
-                             alias for exact), got '{}'",
+                            "error: --fit-strategy needs exact, auto, linear, varpro, \
+                             stream or gpu (cpu is an alias for exact), got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -1156,16 +1462,16 @@ fn main() {
             // #120: opt-in quality-diversity coverage archive.
             "--qd" => {
                 if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 16;
+                    cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
                 }
             }
             "--qd-cells" => {
                 let v = val!();
                 match v.parse::<usize>() {
-                    Ok(n) if (2..=256).contains(&n) => cfg.qd_bins = n,
+                    Ok(n) if (2..=512).contains(&n) => cfg.qd_bins = n,
                     _ => {
                         eprintln!(
-                            "error: --qd-cells needs an integer in 2..=256, got '{}'",
+                            "error: --qd-cells needs an integer in 2..=512, got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -1183,6 +1489,34 @@ fn main() {
                         );
                         std::process::exit(EXIT_USAGE);
                     }
+                }
+            }
+            "--qd-cvt" => {
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-policy" => {
+                cfg.qd_policy = true;
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-uniform" => {
+                cfg.qd_policy = true;
+                cfg.qd_control = 1;
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-random" => {
+                cfg.qd_policy = true;
+                cfg.qd_control = 2;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
                 }
             }
             // #76: exactness escape hatch; the default is on.
@@ -1211,6 +1545,17 @@ fn main() {
                             "error: --pipeline-depth needs an integer from 0 to 64, got '{}'",
                             v
                         );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            // #122: variation engine selection.
+            "--variation" => {
+                let v = val!();
+                match crate::search::VariationMode::parse(&v) {
+                    Ok(mode) => cfg.variation = mode,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
                         std::process::exit(EXIT_USAGE);
                     }
                 }
@@ -1566,6 +1911,13 @@ fn main() {
                 cfg.fit_samples, saved.fit_samples
             ));
         }
+        // #116: fit-only row screening is saved search state too.
+        if fit_rows_set && cfg.fit_rows != saved.fit_rows {
+            conflicts.push(format!(
+                "--fit-rows {} (saved {})",
+                cfg.fit_rows, saved.fit_rows
+            ));
+        }
         // #76: front feedback is saved search state.
         if front_parents_set && cfg.front_parents != saved.front_parents {
             conflicts.push(format!(
@@ -1759,7 +2111,6 @@ fn main() {
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
-            (format == Format::Ndjson, "--ndjson"),
         ];
         for (present, flag) in unsupported {
             if present {
@@ -1790,20 +2141,34 @@ fn main() {
         vars.len() + target_names.len() + usize::from(weight_name.is_some())
     };
     let mut out_of_core_note: Option<String> = None;
+    let mut csv_shape: Option<data::CsvShape> = None;
     let table = if data_path == "-" {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("error reading stdin: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-        let shape = data::csv_shape(&buf);
+        // #126: stdin cannot be reopened for the streaming parser's two passes,
+        // so spool it to a temporary file. A whole-file `String` is never built.
+        let spooled = match spool_stdin() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let shape = match data::csv_shape_path(spooled.path_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
-            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            // The parser streams from the spool, so the text is not resident.
+            let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {
+                let _ = std::fs::remove_file(&spooled.path);
                 refuse_for_memory("<stdin>", shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::parse_table_with(&buf, skip_malformed)
+        data::read_table_with(spooled.path_str(), skip_malformed)
     } else if store::is_store_path(&data_path) {
         match store::FileStore::open(&data_path) {
             Ok(fs) => {
@@ -1837,21 +2202,22 @@ fn main() {
             Err(e) => Err(e),
         }
     } else {
-        let text = match std::fs::read_to_string(&data_path) {
-            Ok(text) => text,
+        // #126: measure and parse by streaming the file; never `read_to_string`.
+        let shape = match data::csv_shape_path(&data_path) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("error: {}: {}", data_path, e);
+                eprintln!("error: {}", e);
                 std::process::exit(EXIT_INPUT);
             }
         };
-        let shape = data::csv_shape(&text);
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
-            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {
                 refuse_for_memory(&data_path, shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::parse_table_with(&text, skip_malformed)
+        data::read_table_with(&data_path, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -2158,8 +2524,34 @@ fn main() {
             }
         }
     }
+    // #129: resolve --gap. Rows pass through; wall time becomes
+    // ceil(seconds / median_dt) and is never silently rounded down to zero.
+    let mut gap = 0usize;
+    if let Some(src) = gap_src.as_deref() {
+        match parse_gap_spec(src, &table, time_col, time_unit) {
+            Ok((rows, note)) => {
+                gap = rows;
+                if let Some(n) = note {
+                    notes.push(n);
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+    if gap > 0 && (train_select.is_some() || test_select.is_some()) {
+        notes.push(
+            "--gap is dropped because explicit --train-select/--test-select replace \
+             positional splitting; add the embargo to the selection expressions instead"
+                .to_string(),
+        );
+        gap = 0;
+    }
     if gap > 0 && !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup) {
         notes.push("--gap only applies to temporal splits; ignored".to_string());
+        gap = 0;
     }
 
     // Per-variable datatypes (issue #5): validate boolean columns and expand
@@ -2285,6 +2677,16 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #112: report the guard's estimate and its rows x columns basis in the
+    // normal preparation block, not only when the guard refuses the file. Use
+    // the resolved projection (after --dtype/lag expansion) here.
+    if let Some(shape) = csv_shape {
+        let used = vars.len()
+            + target_refs.len()
+            + usize::from(weight_col.is_some());
+        prepared.prep.memory_estimate = Some(data::csv_estimate(shape, used));
+    }
 
     // #113: a binary metric needs a binary target. Reject a multi-valued target
     // here, before any search, instead of silently merging its classes at the
@@ -2632,7 +3034,10 @@ fn main() {
             prepared.report.gap,
             folds_json.join(",")
         );
-        if prepared.prep.active() || !prepared.prep.time_unit.is_empty() {
+        if prepared.prep.active()
+            || !prepared.prep.time_unit.is_empty()
+            || prepared.prep.memory_estimate.is_some()
+        {
             let obj = prepared.prep.json();
             let inner = obj.trim_matches(|c| c == '{' || c == '}');
             println!("{{\"event\":\"preparation\",{}}}", inner);
@@ -2770,6 +3175,7 @@ fn main() {
             top,
             out_path,
             json_out.clone(),
+            run_start,
             start,
         );
         std::process::exit(EXIT_OK);
@@ -2794,7 +3200,7 @@ fn main() {
 
     // #116: arm counts are process-wide diagnostics; take a delta around this
     // run so repeated runs in one process (`--report benchmark`) stay readable.
-    let fit_before = fit::fit_arm_counts();
+    let fit_before = fit::fit_arm_counts_full();
     let mut last_saved: Option<(usize, String)> = None;
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
@@ -2860,7 +3266,12 @@ fn main() {
     let diagnostics_start = std::time::Instant::now();
 
     // #140: atomically finish the manifest with an end timestamp and timings.
-    if let (Some(path), Some(m)) = (&run_manifest_path, &manifest_state) {
+    if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
+        // #169: record the fit arm's ledger when the GPU fit ran.
+        if outcome.gpu.is_some() {
+            let (gpu, fallback, refits) = fit::gpu_fit_counts();
+            m.fit = Some((gpu, fallback, refits));
+        }
         let total_secs = run_start.elapsed().as_secs_f64();
         let phases = [
             ("data_prepare", data_prepare_secs),
@@ -2876,23 +3287,27 @@ fn main() {
     // #116: opt-in arm counts. This line is diagnostics only and never feeds
     // back into the search.
     if cfg.fit_report {
-        let (linear, exact) = fit::fit_arm_counts();
-        let linear = linear.saturating_sub(fit_before.0);
-        let exact = exact.saturating_sub(fit_before.1);
-        let total = linear + exact;
+        let counts = fit::fit_arm_counts_full().since(fit_before);
+        let total = counts.total();
         let share = if total == 0 {
             0.0
         } else {
-            100.0 * linear as f64 / total as f64
+            100.0 * counts.linear as f64 / total as f64
         };
         eprintln!(
-            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls)",
+            "# fit: strategy={} linear={} varpro={} stream={} exact={} ({:.1}% linear, {} calls; gpu={} fallbacks={} refits={})",
             cfg.fit_strategy.name(),
-            linear,
-            exact,
+            counts.linear,
+            counts.varpro,
+            counts.stream,
+            counts.exact,
             share,
-            total
+            total,
+            counts.gpu,
+            counts.gpu_fallbacks,
+            counts.gpu_refits
         );
+        eprintln!("# fit: {}", fit::backend_description());
     }
 
     // Seeded solutions, reported once each. The search holds them in
@@ -2903,8 +3318,8 @@ fn main() {
         .seeds
         .iter()
         .map(|s| {
-            let tree = expr::simplify(&expr::denormalize(
-                &expr::simplify(&s.tree),
+            let tree = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&s.tree),
                 &prepared.means,
                 &prepared.stds,
             ));
@@ -2949,8 +3364,8 @@ fn main() {
         .iter()
         .enumerate()
         .map(|(k, s)| {
-            let den = expr::simplify(&expr::denormalize(
-                &expr::simplify(&s.tree),
+            let den = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&s.tree),
                 &prepared.means,
                 &prepared.stds,
             ));
@@ -3185,8 +3600,8 @@ fn main() {
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
-                let den = expr::simplify(&expr::denormalize(
-                    &expr::simplify(&s.tree),
+                let den = expr::simplify_display(&expr::denormalize(
+                    &expr::simplify_display(&s.tree),
                     &f.means,
                     &f.stds,
                 ));
@@ -3340,6 +3755,13 @@ fn main() {
         diagnostics: diagnostics_seconds,
         report: report_seconds,
         total: run_start.elapsed().as_secs_f64(),
+        // #118: the GPU full-path wall is a subset of `search`; it is not added
+        // to `phases_sum`.
+        gpu: outcome
+            .gpu
+            .as_ref()
+            .map(|g| g.accounting.wall_s)
+            .unwrap_or(0.0),
     };
     if let Some(md) = report_md.as_mut() {
         md.push_str(&time_markdown(&timing));
@@ -3364,6 +3786,47 @@ fn main() {
                     }
                 );
                 eprintln!("# time: {}", timing.text());
+                // #121: the fallback counters are not only in --json; a text
+                // run says how much work the CPU pool carried.
+                if let Some(g) = &outcome.gpu {
+                    let programs: usize =
+                        g.generations.iter().map(|s| s.unsupported_programs).sum();
+                    if programs > 0 {
+                        let seconds: f64 =
+                            g.generations.iter().map(|s| s.fallback_seconds).sum();
+                        eprintln!(
+                            "# gpu: cpu fallback {} programs in {:.3}s on {} worker(s)",
+                            programs,
+                            seconds,
+                            g.generations
+                                .last()
+                                .map(|s| s.fallback_workers)
+                                .unwrap_or(0)
+                        );
+                    }
+                }
+                if let Some(g) = &outcome.gpu {
+                    let a = &g.accounting;
+                    eprintln!(
+                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | duty={:.1}% (kernel/wall, not occupancy) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
+                        a.kernel_s,
+                        a.sync_s,
+                        a.alloc_s,
+                        a.h2d_s,
+                        a.d2h_s,
+                        a.launch_s,
+                        a.host_s,
+                        a.wall_s,
+                        100.0 * a.duty_cycle(),
+                        a.evals_per_s(),
+                        a.row_evals_per_s(),
+                        a.quality_per_gpu_hour(
+                            gpu_best_error(&outcome),
+                            gpu_baseline_error(&prepared.train)
+                        )
+                        .unwrap_or(f64::NAN)
+                    );
+                }
                 qd_text(outcome.qd.as_ref());
             }
             for r in &rows {
@@ -3879,32 +4342,6 @@ fn main() {
                 String::new()
             };
             let search_meta_json = format!("{}{}", predictor_json, fit_json);
-            // #131: only a GPU-guided run emits this key, so CPU output stays
-            // byte-identical. Each entry is one generation's scoring batch(es).
-            let gpu_json = match &outcome.gpu {
-                Some(g) => {
-                    let gens: Vec<String> = g
-                        .generations
-                        .iter()
-                        .map(|s| {
-                            let ops: Vec<String> = s
-                                .opcodes
-                                .iter()
-                                .map(|(name, n)| format!("{}:{}", jstr(name), n))
-                                .collect();
-                            format!(
-                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
-                                s.generation,
-                                s.programs,
-                                s.fallbacks,
-                                ops.join(",")
-                            )
-                        })
-                        .collect();
-                    format!("\"gpu\":{{\"generations\":[{}]}},", gens.join(","))
-                }
-                None => String::new(),
-            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -3921,11 +4358,25 @@ fn main() {
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = format!(
-                "{{\"loss\":{},\"value\":{}}}",
-                jstr(cfg.metric.name()),
-                jnum(best_fit_loss)
-            );
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+                // #116: the historical default JSON stays byte-identical; the
+                // portfolio fields appear when a non-default arm or fit-row
+                // screen is in use.
+                format!(
+                    "{{\"loss\":{},\"value\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss)
+                )
+            } else {
+                format!(
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss),
+                    jstr(cfg.fit_strategy.name()),
+                    outcome.fit_rows,
+                    fit::fit_arm_counts_full().since(fit_before).gpu
+                )
+            };
             // #141: report the backend that actually guided the search, with
             // the device name and a reason when the CPU ran. This is derived
             // from the probe/outcome, never from the flags alone.
@@ -3948,10 +4399,9 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
-                gpu_json,         // #131
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -3973,6 +4423,12 @@ fn main() {
                 outcome.convergence.json(),
                 jnum(elapsed),
                 timing.json(),
+                gpu_json(
+                    &outcome.gpu,
+                    gpu_best_error(&outcome),
+                    gpu_baseline_error(&prepared.train),
+                    cfg.fit_strategy.name(),
+                ),
                 checkpoint_json,
                 null_json,
                 baselines_json,
@@ -4189,13 +4645,19 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
                 timing.json(),
+                gpu_json(
+                    &outcome.gpu,
+                    gpu_best_error(&outcome),
+                    gpu_baseline_error(&prepared.train),
+                    cfg.fit_strategy.name(),
+                ),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );
@@ -4281,10 +4743,13 @@ fn run_multi_output(
     top: usize,
     out_path: Option<String>,
     json_out: Option<String>,
+    run_start: std::time::Instant,
     start: std::time::Instant,
 ) {
     let outcome = search::run(cfg, &prepared.train, &prepared.test);
-    let elapsed = start.elapsed().as_secs_f64();
+    let search_seconds = start.elapsed().as_secs_f64();
+    let elapsed = search_seconds;
+    let report_start = std::time::Instant::now();
     let sorted = outcome.archive.sorted();
     let fold_samples: Vec<data::Sample> = if prepared.fold_samples.is_empty() {
         vec![prepared.test.clone()]
@@ -4311,8 +4776,8 @@ fn run_multi_output(
                 .iter()
                 .enumerate()
                 .map(|(j, name)| {
-                    let den = expr::simplify(&expr::denormalize(
-                        &expr::simplify(&trees[j]),
+                    let den = expr::simplify_display(&expr::denormalize(
+                        &expr::simplify_display(&trees[j]),
                         &prepared.means,
                         &prepared.stds,
                     ));
@@ -4356,6 +4821,21 @@ fn run_multi_output(
         rows.truncate(top);
     }
 
+    // #134: the multi-output path gets the same non-overlapping ledger as a
+    // single-target run. It does not run the single-target baseline or
+    // diagnostics phases, so those two windows are explicitly zero rather than
+    // silently excluded. `total` is measured independently at the end of the
+    // report phase, exactly like the single-output path.
+    let timing = PhaseTimings {
+        prep: (start - run_start).as_secs_f64(),
+        search: search_seconds,
+        baselines: 0.0,
+        diagnostics: 0.0,
+        report: report_start.elapsed().as_secs_f64(),
+        total: run_start.elapsed().as_secs_f64(),
+        gpu: 0.0,
+    };
+
     match format {
         Format::Text => {
             if !quiet {
@@ -4372,6 +4852,7 @@ fn run_multi_output(
                     target_names.join(",")
                 );
                 qd_text(outcome.qd.as_ref());
+                eprintln!("# time: {}", timing.text());
                 eprintln!(
                     "# multi-output: one shared shape, one fitted constant vector per output; \
                      train_err/test_err are the mean over {} target(s)",
@@ -4465,13 +4946,24 @@ fn run_multi_output(
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = format!(
-                "{{\"loss\":{},\"value\":{}}}",
-                jstr(cfg.metric.name()),
-                jnum(best_fit_loss)
-            );
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+                format!(
+                    "{{\"loss\":{},\"value\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss)
+                )
+            } else {
+                format!(
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss),
+                    jstr(cfg.fit_strategy.name()),
+                    outcome.fit_rows,
+                    fit::fit_arm_counts_full().gpu
+                )
+            };
             let result_json = format!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -4484,6 +4976,7 @@ fn run_multi_output(
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                timing.json(),
                 // #141: the effective backend, never inferred from flags.
                 outcome.backend.name(),
                 outcome
@@ -4509,10 +5002,28 @@ fn run_multi_output(
             }
         }
         Format::Ndjson => {
-            // Refused earlier; kept exhaustive so a future change cannot
-            // silently emit a misleading stream.
-            eprintln!("error: --ndjson is not supported with multiple targets");
-            std::process::exit(EXIT_USAGE);
+            // #134: the closing event carries the same timing ledger as the
+            // single-output stream and the multi-output JSON object.
+            println!(
+                "{{\"event\":\"done\",\"multi_output\":true,\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{},\"targets\":[{}],\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                outcome.generations,
+                outcome.converged_early,
+                jnum(elapsed),
+                timing.json(),
+                outcome.archive.items.len(),
+                target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
+                outcome.backend.name(),
+                outcome
+                    .backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
         }
     }
 
@@ -5620,8 +6131,8 @@ fn benchmark_run(
             .map(|(e, _, _)| train_error < *e)
             .unwrap_or(true)
         {
-            let den = expr::simplify(&expr::denormalize(
-                &expr::simplify(&sol.tree),
+            let den = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&sol.tree),
                 &prepared.means,
                 &prepared.stds,
             ));
@@ -5924,6 +6435,61 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// A temporary file that removes itself when the CSV load finishes (issue
+/// #126: stdin is spooled so the streaming reader can reopen it).
+struct TempCsv {
+    path: std::path::PathBuf,
+}
+
+impl TempCsv {
+    fn path_str(&self) -> &str {
+        self.path.to_str().unwrap_or("")
+    }
+}
+
+impl Drop for TempCsv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Copy standard input into a temporary CSV file. This keeps `--data -`
+/// streaming: the two parser passes reopen the file instead of a whole-file
+/// `String` staying resident.
+fn spool_stdin() -> Result<TempCsv, String> {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!("rcsr-stdin-{}-{}-{}.csv", pid, nanos, attempt));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot spool stdin to {}: {}",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+        let mut input = std::io::stdin().lock();
+        if let Err(e) = std::io::copy(&mut input, &mut file) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("error reading stdin: {}", e));
+        }
+        return Ok(TempCsv { path });
+    }
+    Err("error reading stdin: could not create a temporary file".to_string())
+}
+
 fn refuse_for_memory(
     path: &str,
     shape: data::CsvShape,
@@ -5940,32 +6506,24 @@ fn refuse_for_memory(
         shape.cols,
         human_bytes(estimate)
     );
-    let table_bytes = (shape.rows as u64)
-        .saturating_mul(shape.cols as u64)
-        .saturating_mul(data::CSV_TABLE_BYTES_PER_CELL);
-    match prep_cols {
-        Some(projected) => {
-            let used = if projected == 0 {
-                shape.cols
-            } else {
-                projected.min(shape.cols)
-            };
-            eprintln!(
-                "  estimate basis: text {} + table {} cells (12 B/cell) + preparation {} used \
-                 columns (24 B/cell, 72 B/row)",
-                human_bytes(shape.bytes),
-                human_bytes(table_bytes),
-                used
-            );
-        }
-        None => {
-            eprintln!(
-                "  estimate basis: text {} + table {} cells (12 B/cell), no search preparation",
-                human_bytes(shape.bytes),
-                human_bytes(table_bytes)
-            );
-        }
-    }
+    let breakdown = match prep_cols {
+        Some(projected) => data::csv_estimate(shape, projected),
+        None => data::csv_load_estimate(shape),
+    };
+    eprintln!(
+        "  estimate basis: {} rows x {} columns ({} used); text {} + table {} \
+         ({} B/cell) + preparation {} ({} B/used cell, {} B/row) + slack {}",
+        breakdown.rows,
+        breakdown.cols,
+        breakdown.used_cols,
+        human_bytes(breakdown.text_bytes),
+        human_bytes(breakdown.table_bytes),
+        data::CSV_TABLE_BYTES_PER_CELL,
+        human_bytes(breakdown.prep_bytes),
+        data::CSV_PREP_BYTES_PER_USED_CELL,
+        data::CSV_PREP_FIXED_BYTES_PER_ROW,
+        human_bytes(breakdown.slack_bytes)
+    );
     eprintln!(
         "  memory budget is {} ({} bytes; set it with --max-memory)",
         human_bytes(limit),
@@ -5995,7 +6553,8 @@ USAGE:
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
   --target <col>             forward-return column used for P&L
-  --expr <formula>           score expression, variables resolved by column name
+  --expr <formula>           score expression, variables resolved by column name;
+                             repeat to select among candidates on the validation slice
   --vars <a,b,...>           feature columns (default: all numeric except target,
                              time and group)
   --time <col>               time/ordering column (numbers or YYYY-MM-DD)
@@ -6013,11 +6572,16 @@ OPTIONS:
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
+  --pool-reset-flat          reset every group to flat at a window seam (the
+                             historical pooled P&L); default carries the boundary
+                             position, so total variation includes |p_end-q_start|
   --periods-per-year <f>     annualisation override (default: infer from the
                              median test time step; 365 for daily crypto bars)
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
+  --allow-lockbox            permit a test window overlapping 2026H2
+                             (declared final test only; default refuses)
   --quiet                    reserved; text output stays on stdout
   -h, --help                 show this help
 ",
@@ -6037,7 +6601,7 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
-    let mut expression: Option<String> = None;
+    let mut expressions: Vec<String> = Vec::new();
     let mut vars_src: Option<String> = None;
     let mut time_col: Option<String> = None;
     let mut group_col: Option<String> = None;
@@ -6049,10 +6613,12 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
+    let mut pool_reset_flat = false;
     let mut json = false;
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
     let mut quiet = false;
+    let mut allow_lockbox = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -6084,7 +6650,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--expr" | "--score-expr" => {
-                expression = Some(need(args, i + 1, "--expr"));
+                expressions.push(need(args, i + 1, "--expr"));
                 i += 1;
             }
             "--vars" => {
@@ -6147,6 +6713,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 ));
                 i += 1;
             }
+            "--pool-reset-flat" => pool_reset_flat = true,
             "--json" => json = true,
             "--out" => {
                 out = Some(need(args, i + 1, "--out"));
@@ -6157,6 +6724,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--quiet" => quiet = true,
+            "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with('-') => {
                 eprintln!(
                     "error: unknown walkforward option '{}'\n\n{}",
@@ -6181,10 +6749,16 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
-    let expression = expression.unwrap_or_else(|| {
+    if expressions.is_empty() {
         eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
-    });
+    }
+    let expression = expressions[0].clone();
+    let candidates = if expressions.len() > 1 {
+        expressions
+    } else {
+        Vec::new()
+    };
     let time_col = time_col.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
@@ -6252,6 +6826,9 @@ fn run_walkforward(args: &[String]) -> ! {
         threshold_quantile: quantile,
         validation_frac,
         periods_per_year,
+        candidates,
+        pool_reset_flat,
+        allow_lockbox,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
@@ -6304,8 +6881,9 @@ OPTIONS:
   --time <column>          store this column as exact i64 timestamps
                            (default: the first integral, time-like column)
   --skip-malformed         drop ragged rows instead of refusing the input
-  --max-memory <size>      refuse before parsing when the rows x columns
-                           estimate exceeds this (not 33x the file size)
+  --max-memory <size>      refuse before parsing when the streamed and
+                           calibrated rows x
+                           columns estimate exceeds this (not 33x file size)
   --force                  override --max-memory
   --quiet                  do not print the summary
   -h, --help               show this help
@@ -6375,6 +6953,486 @@ fn run_verify_manifest(args: &[String]) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// #129: `rcsr audit` — the fail-closed leakage suite.
+///
+/// Exit codes: 0 clean, 2 usage, 3 input, 5 leakage. The JSON report always
+/// includes the resolved spec hash (D11), every finding's detector/column/row,
+/// and the effective sample size (D6).
+fn run_audit(args: &[String]) -> ! {
+    let mut data_path: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut time_name: Option<String> = None;
+    let mut vars: Vec<String> = Vec::new();
+    let mut horizon = 1usize;
+    let mut unit = data::TimeUnit::Seconds;
+    let mut json_out = false;
+    let mut report_path: Option<String> = None;
+    let mut join_on: Option<String> = None;
+    let mut bars_path: Option<String> = None;
+    let mut universe_path: Option<String> = None;
+    let mut actions_path: Option<String> = None;
+    let mut symbol_col: Option<String> = None;
+    let mut price_col: Option<String> = None;
+    let mut resample_small = 15usize;
+    let mut resample_large = 60usize;
+    let mut session_gap: Option<f64> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_default()
+        };
+        match a {
+            "-h" | "--help" => {
+                println!("{}", usage());
+                std::process::exit(EXIT_OK);
+            }
+            "--json" => json_out = true,
+            "--data" => data_path = Some(take(&mut i)),
+            "--target" => target = Some(take(&mut i)),
+            "--time" => time_name = Some(take(&mut i)),
+            "--vars" => {
+                vars = take(&mut i)
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "--horizon" | "--label-horizon" => {
+                horizon = take(&mut i).parse().unwrap_or(0);
+            }
+            "--time-unit" => {
+                let v = take(&mut i);
+                match data::TimeUnit::parse(&v) {
+                    Ok(u) => unit = u,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--report" => report_path = Some(take(&mut i)),
+            "--join-on" => join_on = Some(take(&mut i)),
+            "--bars" => bars_path = Some(take(&mut i)),
+            "--universe" => universe_path = Some(take(&mut i)),
+            "--corporate-actions" => actions_path = Some(take(&mut i)),
+            "--symbol" => symbol_col = Some(take(&mut i)),
+            "--price" => price_col = Some(take(&mut i)),
+            "--resample-small" => {
+                resample_small = take(&mut i).parse().unwrap_or(0);
+            }
+            "--resample-large" => {
+                resample_large = take(&mut i).parse().unwrap_or(0);
+            }
+            "--session-gap" => {
+                session_gap = take(&mut i).parse::<f64>().ok();
+            }
+            other => {
+                eprintln!("error: unknown audit option '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = data_path else {
+        eprintln!("error: audit needs --data <file>");
+        std::process::exit(EXIT_USAGE);
+    };
+    let Some(target) = target else {
+        eprintln!("error: audit needs --target <col>");
+        std::process::exit(EXIT_USAGE);
+    };
+    if horizon == 0 {
+        eprintln!("error: --horizon must be at least 1");
+        std::process::exit(EXIT_USAGE);
+    }
+    let table = match data::read_table(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    let target_idx = match table.index_of(&target) {
+        Ok(j) if table.numeric[j] => j,
+        Ok(_) => {
+            eprintln!("error: target '{}' is not numeric", target);
+            std::process::exit(EXIT_INPUT);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+
+    // Assemble the value columns. The time column is metadata, never a feature.
+    let time_idx = match &time_name {
+        Some(name) => match table.index_of(name) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        },
+        None => None,
+    };
+    let mut value_idx: Vec<usize> = if vars.is_empty() {
+        (0..table.names.len())
+            .filter(|&j| table.numeric[j] && Some(j) != time_idx)
+            .collect()
+    } else {
+        let mut v = Vec::new();
+        for name in &vars {
+            match table.index_of(name) {
+                Ok(j) if table.numeric[j] => v.push(j),
+                Ok(_) => {
+                    eprintln!("error: input '{}' is not numeric", name);
+                    std::process::exit(EXIT_INPUT);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        v
+    };
+    if !value_idx.contains(&target_idx) {
+        value_idx.push(target_idx);
+    }
+    value_idx.sort_unstable();
+    value_idx.dedup();
+    let names: Vec<&str> = value_idx.iter().map(|&j| table.names[j].as_str()).collect();
+
+    let (times, mut time_audit, time_report) = match time_idx {
+        Some(j) => {
+            let raw = data::time_keys(&table, j).to_f64();
+            let (seconds, audit, report) = leakage::time_normalizer(&raw, unit);
+            (seconds, Some(audit), report)
+        }
+        None => {
+            let raw: Vec<f64> = (0..table.len()).map(|i| i as f64).collect();
+            let (seconds, audit, report) = leakage::time_normalizer(&raw, data::TimeUnit::Seconds);
+            (seconds, Some(audit), report)
+        }
+    };
+    let panel = match leakage::Panel::new(
+        times,
+        names
+            .iter()
+            .map(|name| {
+                let j = table.index_of(name).expect("column was resolved above");
+                (name.to_string(), table.col(j).to_vec())
+            })
+            .collect(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+
+    let mut report = time_report;
+    report.merge(leakage::audit_panel(&panel, &target, horizon));
+    // D5 differential learner is already part of audit_panel; run it explicitly
+    // as well so its count is visible even when no name canary exists.
+    report.merge(leakage::differential_suite(&panel, &target, horizon));
+
+    // D10: a repeated key on the probe side would multiply joined rows.
+    if let Some(col) = &join_on {
+        match table.index_of(col) {
+            Ok(j) => {
+                let keys: Vec<u64> = table.col(j).iter().map(|v| v.to_bits()).collect();
+                let (_matched, join_report) = leakage::audit_join_cardinality(&keys, &keys);
+                report.merge(join_report);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+
+    // D2: reconcile a user-supplied bar table (1m->1h vs 1m->15m->1h).
+    if let Some(path) = bars_path {
+        match data::read_table(&path) {
+            Ok(t) => {
+                let need = |name: &str| -> Result<usize, String> {
+                    t.index_of(name).map_err(|e| e.to_string())
+                };
+                let idx = (|| -> Result<[usize; 6], String> {
+                    Ok([
+                        need("time")?,
+                        need("open")?,
+                        need("high")?,
+                        need("low")?,
+                        need("close")?,
+                        need("volume")?,
+                    ])
+                })();
+                match idx {
+                    Ok([it, io, ih, il, ic, iv]) => {
+                        let vw = t.index_of("vwap").ok();
+                        let bars: Vec<leakage::Ohlcv> = (0..t.len())
+                            .map(|r| leakage::Ohlcv {
+                                time: t.value(r, it),
+                                open: t.value(r, io),
+                                high: t.value(r, ih),
+                                low: t.value(r, il),
+                                close: t.value(r, ic),
+                                volume: t.value(r, iv),
+                                vwap: vw.map(|j| t.value(r, j)).unwrap_or(t.value(r, ic)),
+                            })
+                            .collect();
+                        report.merge(leakage::reconcile_resample(
+                            &bars,
+                            resample_small,
+                            resample_large,
+                            session_gap,
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("error: --bars needs columns time,open,high,low,close,volume[,vwap]: {}", e);
+                        std::process::exit(EXIT_INPUT);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+
+    // D8: point-in-time universe from an event CSV (time,symbol,change[,to]).
+    if let Some(path) = universe_path {
+        let Ok(t) = data::read_table(&path) else {
+            eprintln!("error: cannot read universe '{}'", path);
+            std::process::exit(EXIT_INPUT);
+        };
+        let (it, isym, ich) = match (t.index_of("time"), t.index_of("symbol"), t.index_of("change")) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => {
+                eprintln!("error: --universe needs columns time,symbol,change[,to]");
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let ito = t.index_of("to").ok();
+        let mut events = Vec::new();
+        for r in 0..t.len() {
+            let change = match t.cell_text(r, ich).to_ascii_lowercase().as_str() {
+                "listed" | "list" | "add" => leakage::UniverseChange::Listed,
+                "delisted" | "delist" | "remove" => leakage::UniverseChange::Delisted,
+                "renamed" | "rename" => leakage::UniverseChange::Renamed,
+                other => {
+                    eprintln!("error: unknown universe change '{}'", other);
+                    std::process::exit(EXIT_INPUT);
+                }
+            };
+            events.push(leakage::UniverseEvent {
+                time: t.value(r, it),
+                symbol: t.cell_text(r, isym),
+                change,
+                to: ito.map(|j| t.cell_text(r, j)),
+            });
+        }
+        let Some(sym_name) = symbol_col.as_deref() else {
+            eprintln!("error: --universe needs --symbol <col> to identify panel rows");
+            std::process::exit(EXIT_USAGE);
+        };
+        let sym_idx = match table.index_of(sym_name) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let rows: Vec<leakage::UniverseRow> = (0..panel.len())
+            .map(|r| leakage::UniverseRow {
+                time: panel.time[r],
+                symbol: table.cell_text(r, sym_idx),
+            })
+            .collect();
+        report.merge(leakage::audit_universe(&rows, &events));
+    }
+
+    // D9: corporate actions from an event CSV (time,symbol,kind,value).
+    if let Some(path) = actions_path {
+        let Ok(t) = data::read_table(&path) else {
+            eprintln!("error: cannot read corporate actions '{}'", path);
+            std::process::exit(EXIT_INPUT);
+        };
+        let (it, isym, ikind, ival) = match (
+            t.index_of("time"),
+            t.index_of("symbol"),
+            t.index_of("kind"),
+            t.index_of("value"),
+        ) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            _ => {
+                eprintln!("error: --corporate-actions needs columns time,symbol,kind,value");
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let Some(price_name) = price_col.as_deref() else {
+            eprintln!("error: --corporate-actions needs --price <col>");
+            std::process::exit(EXIT_USAGE);
+        };
+        let pj = match table.index_of(price_name) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let mut actions = Vec::new();
+        let mut symbols: Vec<String> = Vec::new();
+        for r in 0..t.len() {
+            let symbol = t.cell_text(r, isym);
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol.clone());
+            }
+            let v = t.value(r, ival);
+            let kind = match t.cell_text(r, ikind).to_ascii_lowercase().as_str() {
+                "split" => leakage::CorporateActionKind::Split(v),
+                "dividend" => leakage::CorporateActionKind::Dividend(v),
+                other => {
+                    eprintln!("error: unknown corporate action '{}'", other);
+                    std::process::exit(EXIT_INPUT);
+                }
+            };
+            actions.push(leakage::CorporateAction {
+                time: t.value(r, it),
+                symbol,
+                kind,
+            });
+        }
+        let prices = table.col(pj);
+        let cuts = leakage::cut_points(&panel, 10);
+        for symbol in symbols {
+            report.merge(leakage::corporate_action_replay(
+                &panel.time,
+                prices,
+                &actions,
+                &symbol,
+                &cuts,
+            ));
+        }
+    }
+
+    // D0/D11: resolved spec and its deterministic hash.
+    let digest = match manifest::sha256_file(&path) {
+        Ok(h) => h,
+        Err(_) => "stdin".to_string(),
+    };
+    let horizon_s = horizon.to_string();
+    let rows_s = table.len().to_string();
+    let target_s = target.clone();
+    let time_s = time_name.clone().unwrap_or_else(|| "<row-index>".to_string());
+    let unit_s = unit.name().to_string();
+    let spec: Vec<(&str, &str)> = vec![
+        ("tool", "rcsr"),
+        ("command", "audit"),
+        ("data_sha256", &digest),
+        ("rows", &rows_s),
+        ("target", &target_s),
+        ("time", &time_s),
+        ("time_unit", &unit_s),
+        ("horizon", &horizon_s),
+        ("tzdb_version", leakage::TZDB_VERSION),
+    ];
+    let required = [("target", target_s.as_str()), ("tzdb_version", leakage::TZDB_VERSION)];
+    let defaults = [("horizon", "1"), ("time_unit", "s")];
+    report.merge(leakage::audit_spec(&spec, &required, &defaults));
+    report.merge(leakage::audit_determinism(&spec, &spec));
+    let hash = leakage::spec_hash(&spec);
+
+    let clean = report.is_clean();
+    let n_eff = leakage::effective_n(panel.len(), horizon);
+    let leaks_json: Vec<String> = report
+        .leaks
+        .iter()
+        .map(|l| {
+            format!(
+                "{{\"detector\":{},\"column\":{},\"row\":{},\"message\":{}}}",
+                jstr(l.detector),
+                l.column.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                l.row.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string()),
+                jstr(&l.message)
+            )
+        })
+        .collect();
+    let ta = time_audit.take().unwrap_or(leakage::TimeAudit {
+        rows: panel.len(),
+        median_dt: 0.0,
+        min_dt: 0.0,
+        max_dt: 0.0,
+        duplicate_instants: 0,
+        non_monotonic_rows: 0,
+    });
+    let out = format!(
+        "{{\"tool\":\"rcsr\",\"version\":{},\"command\":\"audit\",\"clean\":{},\
+         \"checks\":{},\"exit_code\":{},\"spec_hash\":\"{:016x}\",\
+         \"tzdb_version\":{},\"rows\":{},\"target\":{},\"time\":{},\
+         \"time_unit\":{},\"horizon\":{},\"overlap_rows\":{},\"effective_n\":{},\
+         \"time_audit\":{{\"rows\":{},\"median_dt\":{},\"min_dt\":{},\"max_dt\":{},\
+         \"duplicate_instants\":{},\"non_monotonic_rows\":{}}},\
+         \"leaks\":[{}]}}",
+        jstr(VERSION),
+        clean,
+        report.checks,
+        if clean { EXIT_OK } else { EXIT_LEAKAGE },
+        hash,
+        jstr(leakage::TZDB_VERSION),
+        table.len(),
+        jstr(&target),
+        jstr(&time_s),
+        jstr(&unit_s),
+        horizon,
+        horizon.saturating_sub(1),
+        n_eff,
+        ta.rows,
+        ta.median_dt,
+        ta.min_dt,
+        ta.max_dt,
+        ta.duplicate_instants,
+        ta.non_monotonic_rows,
+        leaks_json.join(",")
+    );
+    if let Some(path) = report_path {
+        if let Err(e) = std::fs::write(&path, format!("{out}\n")) {
+            eprintln!("error: cannot write audit report '{}': {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if json_out {
+        println!("{}", out);
+    } else if clean {
+        println!(
+            "audit clean: {} checks, {} rows, N_eff {:.1}, spec {:016x}",
+            report.checks,
+            panel.len(),
+            n_eff,
+            hash
+        );
+    } else {
+        eprintln!("audit failed ({} finding(s)):", report.leaks.len());
+        for leak in &report.leaks {
+            eprintln!(
+                "  [{}]{}{}: {}",
+                leak.detector,
+                leak.column.as_deref().map(|c| format!(" column '{}'", c)).unwrap_or_default(),
+                leak.row.map(|r| format!(" row {}", r)).unwrap_or_default(),
+                leak.message
+            );
+        }
+        eprintln!("report: {}", out);
+    }
+    std::process::exit(if clean { EXIT_OK } else { EXIT_LEAKAGE });
 }
 
 fn run_import(args: &[String]) -> ! {
@@ -6477,16 +7535,17 @@ fn run_import(args: &[String]) -> ! {
         eprintln!("error: '{}' is already a column store", input);
         std::process::exit(EXIT_USAGE);
     }
-    let text = match std::fs::read_to_string(&input) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("error: {}: {}", input, e);
-            std::process::exit(EXIT_INPUT);
-        }
-    };
+    // #126: shape and guard come from a streaming scan; the table is then read
+    // by the streaming parser. The file text is never materialised.
     if let Some(limit) = max_memory.or_else(store::detected_hard_budget) {
-        let shape = data::csv_shape(&text);
-        let estimate = data::estimate_csv_load_bytes(shape);
+        let shape = match data::csv_shape_path(&input) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let estimate = data::estimate_csv_load_stream_bytes(shape);
         if estimate > limit && !force {
             refuse_for_memory(&input, shape, estimate, limit, None);
         }
@@ -6643,6 +7702,28 @@ mod tests {
         }
     }
 
+    /// #115: the time-series checklist must be reachable from the CLI contract,
+    /// and the smoothing flags must describe the causal default correctly.
+    #[test]
+    fn help_and_schema_link_the_time_series_checklist() {
+        for surface in [usage(), schema::json()] {
+            assert!(
+                surface.contains("docs/time-series.md"),
+                "the time-series checklist is not linked from the CLI contract"
+            );
+        }
+        assert!(usage().contains("--smooth-centred"));
+        assert!(schema::json().contains("--smooth-centred"));
+        assert!(
+            schema::json().contains("trailing moving-average"),
+            "schema must describe --smooth as trailing"
+        );
+        assert!(
+            !schema::json().contains("centred moving average per column"),
+            "the stale README wording must not reappear in schema"
+        );
+    }
+
     /// Data preparation stayed opt-in, but every flag must be documented.
     #[test]
     fn help_and_schema_document_data_preparation() {
@@ -6719,6 +7800,7 @@ mod tests {
             diagnostics: 0.05,
             report: 0.02,
             total: 0.67,
+            gpu: 0.12,
         };
         assert!((t.phases_sum() - t.total).abs() <= 0.01 * t.total);
         let json = t.json();
@@ -6729,9 +7811,11 @@ mod tests {
             "diagnostics_seconds",
             "report_seconds",
             "total_seconds",
+            "gpu_seconds",
         ] {
             assert!(json.contains(key), "timing JSON is missing {key}");
         }
         assert!(t.text().contains("total=0.67s"));
+        assert!(t.text().contains("gpu=0.12s"), "GPU wall is a subset, not a phase");
     }
 }

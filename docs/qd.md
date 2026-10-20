@@ -1,14 +1,19 @@
-# Quality-diversity archive (#120)
+# Quality-diversity layer (#120)
 
 The engine has **reset diversity** (restarts, immigrants, structural
 de-duplication). It did not have **niche diversity**: nothing recorded which
 behaviour regions the search never reached, so thousands of evaluations could
 collapse onto one prediction shape without the search noticing.
 
-This increment adds a passive, opt-in quality-diversity layer (`--qd`) over two
-cheap behaviour descriptors. It is the first slice of the CVT-MAP-Elites design
-in issue #120; the search policy and the empirical budget study are listed as
-remaining work below.
+The QD layer is opt-in. It has two levels:
+
+* **passive** (`--qd`): record descriptor cells and report coverage, but never
+  change parent selection, migration, restarts or the reported Pareto front;
+* **policy** (`--qd-policy`): feed the archive back into the search —
+  UCB1 parent draws, stratified cell migration and least-occupied restarts.
+
+With QD disabled the trajectory is bit-identical to before (pinned by
+`tests/qd.rs`).
 
 ## Descriptors
 
@@ -17,68 +22,102 @@ remaining work below.
 | variable usage | distinct input columns read by the tree, divided by the number of inputs | `[0, 1]` |
 | prediction skewness | third standardised moment of the prediction vector, mapped by `0.5 + 0.5·s/(1+|s|)` | `[0, 1]` |
 
-The usage count walks the tree once. The skewness is three passes over the
-prediction vector (mean, second and third moments). In one release run
-(`cargo test --release --lib qd::tests::descriptor_cost -- --nocapture`), the
-complete descriptor, including the tree evaluation, cost **3.2 µs/candidate on
-41 rows** and **92 µs/candidate on 800 rows**. A later GPU pass can accumulate
-`sum p, p², p³, p⁴` in the same SSE reduction and remove that second
-evaluation.
+`PredictionStats::from_prediction` accumulates `Σp, Σp², Σp³, Σp⁴`, sign
+changes and the mean in one local pass; skewness and kurtosis are derived from
+those moments. The SoA/GPU evaluator can add the same accumulators to its SSE
+reduction, so the descriptor does not require a second tree evaluation once a
+prediction vector exists. The current search path still calls
+`descriptor_from_prediction` with the prediction it already computed; the
+`descriptor()` convenience wrapper evaluates once only for standalone callers.
+
+Measured descriptor cost (`cargo test --release --lib qd::tests::descriptor_cost
+-- --nocapture`): **3.2 µs/candidate on 41 rows** and **92 µs/candidate on 800
+rows**, including the tree evaluation in the convenience path.
 
 ## Archive
 
-`--qd` enables a `16 × 16` rectangular grid (256 cells). `--qd-cells N` selects
-`N × N` bins (`N = 23` gives 529 cells, closest to the K = 512 design) and
+`--qd` enables the passive archive. `--qd-cells N` sets the grid side or the
+CVT cell count `K` (`2..=512`; `K = 512` is the design size) and
 `--qd-cell-cap N` bounds each cell's local front (default 4).
 
-Each occupied cell holds a **bounded local Pareto front over `(error, cost)`**,
-using the same ε-dominance rule as the global archive. Insertion is
-deterministic: candidates are offered in a fixed order (island 0..I, population
-order, then the global archive), dominated candidates are dropped, and a tie at
-equal cost/error keeps the first entry. A cell never grows beyond `--qd-cell-cap`.
+* `--qd` alone is the original rectangular `16 × 16` grid.
+* `--qd-cvt` (or `--qd-policy`) uses **CVT-MAP-Elites**: `K` centroids are
+  initialised deterministically from a Halton (2,3) sequence and updated by
+  Lloyd steps over the descriptors actually visited (every 8 `record` calls,
+  4 iterations, bounded 4096-descriptor sample). Existing cell elites are
+  re-assigned to the moved centroids; their local fronts are preserved.
+* Each occupied cell holds a **bounded local Pareto front over `(error, cost)`**
+  with the same ε-dominance rule as the global archive. Insertion is
+  deterministic: fixed island/population/archive order, dominated candidates
+  dropped, equal cost/error keeps the first entry, the middle cost level is
+  dropped at the cap.
 
-The layer is **passive**. It observes evaluated individuals after they have been
-scored; it never selects parents, changes migration, restarts or the reported
-Pareto front. With the flag off, the search is bit-identical to before.
+## Search policy
 
-## Reported coverage
+`--qd-policy` implies `--qd --qd-cvt`. Parent draws use the issue's mix:
+
+| draw | source |
+|---|---|
+| 60% | UCB1 quality cell: best local error minus `2·sqrt(ln(total+1)/(visits+1))` |
+| 25% | uniform occupied cell |
+| 10% | ring neighbour of a random occupied cell |
+| 5% | global Pareto front (the existing `--front-parents` draw) |
+
+Two equal-budget controls are first-class flags: `--qd-uniform` makes every
+occupied cell equally likely, and `--qd-random` hashes descriptors to random
+cells so the partition has no behavioural information. A gain that survives
+only the proposed policy, not the controls, is search capacity rather than
+niche diversity.
+
+Migration keeps the ring but replaces the individual nearest the
+**least-visited cell's centroid** instead of the globally worst error.
+Restarting a stagnant island aims at the least-visited region: it samples four
+random trees and keeps the one whose descriptor is nearest that centroid.
+Seeds are inserted into the archive and keep their own niche.
+
+Cell elites and promoted survivors are **refit exactly on all training rows in
+f64** before the QD report is returned (`QdArchive::refit_all`), so screening
+and `--predictor-samples` never turn the reported QD front into a subset
+estimate. Search-time exploration is still allowed to use the cheap fit.
+
+## Reported coverage and hypervolume
 
 Text output adds one line:
 
 ```text
-# qd: 15/256 descriptor cells occupied (5.9%), 39 local-front entries, cap 4
+# qd (cvt): 141/512 cells occupied (27.5%), 318 entries, best error 1.145..., hypervolume 0.7143
 ```
 
 `--json` adds:
 
 ```json
-"qd":{"bins":16,"cells":256,"occupied":15,"coverage":0.05859375,
-      "entries":39,"best_error":1.145...,"cell_cap":4}
+"qd":{"mode":"cvt","bins":512,"cells":512,"occupied":141,"coverage":0.275,
+      "entries":318,"best_error":1.145...,"cell_cap":4,
+      "hypervolume":0.7143,"evaluations":12000}
 ```
 
-`coverage` is `occupied / cells`. The same seed and flags produce the same
-coverage and the same cell fronts (pinned by `tests/qd.rs`).
+`coverage` is `occupied / cells`; `hypervolume` is the normalized dominated
+area of the archive's `(cost, error)` points; `evaluations` is the number of
+candidates offered. The same seed and flags produce the same coverage, cell
+fronts and centroids.
 
-## What is not implemented yet
+## Checkpoints and exactness
 
-This is deliberately a grid, not a full CVT-MAP-Elites. The remaining work in
-#120, in order:
+`--save` writes `qd_bins`, `qd_cell_cap`, `qd_cvt` and `qd_policy` into the
+checkpoint. The archive itself is rebuilt from the resumed search's evaluated
+candidates; it is reporting state, not trajectory state. The passive layer never
+changes the Pareto front. With the layer disabled, the exactness fixtures are
+unchanged — `tests/qd.rs::qd_is_off_by_default_and_does_not_change_the_front`
+and the pinned archive/checkpoint tests cover this.
 
-1. **CVT centroids** — replace the rectangular grid with a centroidal Voronoi
-   tessellation (K = 512), fitted once from a descriptor sample. The archive
-   contract (cell → bounded local front → deterministic insertion) stays.
-2. **Search feedback** — UCB1 parent selection (60% quality / 25% uniform /
-   10% neighbour / 5% global front), and islands as demes on a ring with
-   stratified cell migration. This is what can raise coverage at an equal
-   evaluation budget; the current layer only *measures* coverage.
-3. **Restart policy** — reseed the least-occupied region instead of replacing a
-   stagnant island with random trees; seeds occupy their own niche.
-4. **Same-pass descriptors** — extend the SSE reduction with `sum p, p², p³,
-   p⁴`, sign changes and one volatility dot product, so the descriptors are
-   nearly free rather than a second evaluation.
-5. **Exact promotion** — cell elites and promoted survivors refit exactly on
-   all rows in f64 (the existing full-data archive rebuild is the template).
-6. **Empirical study** — coverage at equal budget, validation hypervolume per
-   GPU-hour at 4× evaluations, `dHV_real / dHV_null`, DSR at effective trial
-   count, PBO ≤ 0.20, and random-descriptor/uniform-cell controls. The present
-   PR measures descriptor cost and coverage, not those end-to-end claims.
+## Benchmark and controls
+
+The issue asks for equal-budget coverage, validation hypervolume per GPU-hour,
+signal-to-search, DSR/PBO and random-descriptor/uniform-cell controls. The
+implementation exposes the measurement hooks (coverage, hypervolume,
+evaluations, wall time in `elapsed_seconds`, and the full Pareto front for
+validation scoring). The recorded numbers and the unmet boxes are reported in
+the issue/PR, not baked into this document as a claim. The GPU-hour figure is a
+GPU-hour only when the CUDA backend is active; a CPU run reports seconds and the
+same quantity per CPU-second, which is the honest denominator for a CPU-only
+measurement.

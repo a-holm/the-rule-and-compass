@@ -99,13 +99,38 @@ Two consequences:
 * because fitness is measured in *semantics*, the operators are "blind": this is
   the gap that semantic operators (below) try to close.
 
-**Simplification is a rewriting system.** `simplify` applies oriented equations
-`l → r` of a `Σ`-algebra theory; if it terminates and is confluent it computes
-normal forms, i.e. a section of the quotient map. It is deliberately *not* fully
-confluent here, so it is a heuristic — but every rule it applies permanently
-shrinks the term, which reduces both evaluation cost and the printed complexity.
-Equality saturation with an e-graph would compute the *true* normal form up to a
-budget by searching the quotient directly **[planned]**.
+**Simplification is a rewriting system and a proof obligation.** The engine has
+two relations with different jobs:
+
+* **`expr::simplify` — the sound normal form (N_core).** It is used for scoring,
+  de-duplication and CSE. Every rule is value-preserving on IEEE-754 values,
+  including `NaN`, `±inf` and signed zero; a rule that needs a side condition is
+  applied only when the non-relational definedness/range analysis
+  (`expr::analyze_total`, O(nodes)) proves it. The rules are: constant folding
+  when the result is finite; `-(-x) → x`; `x + -0 → x` (and `x + +0 → x` only
+  when `x` is provably non-zero); `x - +0 → x`; `x - x → 0` only when `x` is
+  finite; `x * 1 → x`, `x / 1 → x`, `pow(x,1) → x`, `pow(x,0) → 1`;
+  `x / x → 1` only when `x` is finite and non-zero; `0 * x → ±0` only when `x`
+  is finite with a known sign (the sign follows `x`); and branch pruning for a
+  constant `If` condition. `Add` and `Mul` children are ordered by a total
+  structural key (`op index`, value bits, arity, children, block definition),
+  so `a+b` and `b+a` share one normal form. There is **no** associativity,
+  distributivity or affine re-association: f64 `+` and `*` are not associative,
+  and those rules belong to display only.
+* **`expr::simplify_display` — the display relation (R_approx).** It adds affine
+  normalisation (`x/1.1839 → 0.8447*x`), branch pruning and tolerance-based
+  identity absorption for a readable printed equation. It may change a value at
+  an IEEE edge case and is **never** used for scoring, dedup, CSE or a
+  checkpoint hash.
+
+The sound core terminates (every rule either shrinks the tree or folds it) and
+is confluent on its guarded fragment: it is applied bottom-up in one pass, the
+commutative orientation is a total order, and the result is idempotent
+(`simplify(simplify(t)) = simplify(t)`). The tests exercise idempotence,
+critical pairs, a 10k-tree differential corpus over edge values, and a 10k-tree
+soundness/precision check of the analysis. Equality saturation with an e-graph
+would compute a larger quotient by searching the theory directly **[planned]**.
+
 
 ---
 
@@ -204,7 +229,7 @@ library methods only to *seed* or *pre-process*.
 | Change | Why |
 |---|---|
 | Adjoint-based **Levenberg–Marquardt** constant fitting | One backward sweep gives the whole Jacobian: O(nodes) per row, independent of the number of constants. An undamped Gauss–Newton polish reaches machine precision on well-conditioned fits. |
-| **Affine normalisation** in the simplifier | `(x/c₁)/c₂ → k·x`, constant chains folded, branch pruning for constant conditions. Smaller printed forms *and* fewer nodes to evaluate. |
+| **Sound normal form** in scoring/dedup/CSE, **affine normalisation** in display | `simplify` preserves every IEEE value (including NaN/±inf/±0) and applies guarded cancellations only with a definedness proof; `simplify_display` keeps the readable affine forms. Smaller printed forms *and* deterministic dedup keys. |
 | **ε-dominance** archiving | Removes numerically-equivalent, larger expressions from the front. |
 | **Structural hashing + de-duplication** | Never evaluate two identical candidates in a generation. |
 | **Lexicographic parsimony pressure** | No size-penalty coefficient to tune; bloat is controlled at selection time. |
@@ -258,8 +283,10 @@ reached (`squared` metric unless noted).
 
 `--fit-iters N` sets the Levenberg–Marquardt budget for every candidate, and the
 budget is honoured literally: `--fit-iters 0` (the same as `--no-fit`) performs
-**no fitting at all** — no damped LM iteration and no undamped Gauss–Newton
-polish — so the constants stay exactly as the tree was generated. Earlier
+**no fitting at all** — no damped LM iteration, no IRLS/logistic IRLS round,
+no coordinate polish, no undamped Gauss–Newton polish and no closed-form
+least-squares solve under `--fit-strategy auto|linear` — so the constants stay
+exactly as the tree was generated for every metric. Earlier
 releases silently ran five steps per candidate under `--no-fit` (one forced LM
 iteration plus a four-step polish); after the #135 fix the same daily-panel
 search went from about 3 200 to 7 240 candidate evaluations per second. With the
@@ -560,11 +587,89 @@ approximation. The pre-registered acceptance rules are:
 | size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
 | ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
 | `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+| `--fit-strategy gpu` (#169) | kernel p ≤ 16, nodes ≤ 96, squared/AIC metrics; median constant error ≤ 1e-5 and SSE relative ≤ 1e-8 vs CPU LM on well-conditioned fixtures; every ill-conditioned/non-finite/unsupported candidate falls back and is labelled; finalists refit in exact CPU f64 |
 
 Because the linear arm reaches the optimum in one solve instead of iterating,
 it **can** change the search trajectory (usually by fitting a linear candidate
 better than an 8-iteration LM run). It is therefore opt-in, and it is saved in
-checkpoints as search state; `auto` currently has exactly these two arms.
+checkpoints as search state.
+
+#### Variable projection for separable models (#116)
+
+`a*sin(b*x) + c` is not affine in all three constants, but it is affine in
+`{a, c}` for every fixed `b`. `--fit-strategy varpro` (and `auto`) finds that
+split structurally with the same affine classifier restricted to a candidate
+constant set, then runs Golub–Pereyra variable projection:
+
+* the inner problem is one column-scaled, column-pivoted QR solve for the
+  linear block `beta` at fixed nonlinear `theta`;
+* the outer problem optimises only `theta` on the **projected** residual: each
+  `J_theta` column is orthogonalised against the span of `J_beta` (modified
+  Gram–Schmidt with reorthogonalisation), so the outer step cannot undo the
+  inner solve;
+* damping is Levenberg-style (accepted steps shrink `lambda`, rejected steps
+  grow it), and the arm writes constants only when the result is finite and no
+  worse than the starting point.
+
+For `a*sin(b*x) + c` that turns a 3-parameter LM problem into a 1-parameter
+outer search plus an exact 2-parameter linear solve. `a*(b + x)` is admitted
+with one factor linear and the other nonlinear; a product of two selected
+constants is refused because it is bilinear. Rank deficiency, a non-finite row,
+a failed inner solve or a non-improving result returns `None` and the tree goes
+to exact LM untouched.
+
+#### Out-of-core / row-sharded fitting (#116)
+
+`--fit-strategy stream` keeps only the sufficient statistics of the weighted
+problem — `S = Σ wᵢ gᵢgᵢᵀ`, `b = Σ wᵢ gᵢrᵢ` and `sse = Σ wᵢrᵢ²` — and builds
+them in fixed 8,192-row blocks. Blocks merge by addition, so resident state is
+`O(p²)` (231 doubles at `p = 20`), independent of `N`; the Jacobian is never
+materialised. Sums use Neumaier compensation and a fixed block/merge order, so
+the merger is numerically stable and deterministic. The public `RowSource`
+trait feeds the same code from a resident slice, a disk-backed `.rcsb` reader,
+a memory map or a generated stream; `fit_stream_with` never asks for more than
+one row at a time. `--fit-strategy auto` does not select `stream` yet: the
+dispatcher stays deterministic and does not guess that data is out of core.
+Use `--fit-strategy stream` explicitly.
+
+#### Batched GPU fitting (#169)
+
+The CUDA LM kernel is #169, not this change. #116 supplies the integration
+point and the exactness gate in `src/fit/gpu.rs`:
+
+* a `BatchedFitter` returns constants per candidate, or `None` for an
+  unsupported/ill-conditioned/non-finite candidate;
+* every proposal is applied to a clone and scored in exact `f64` on the same
+  rows, and accepted only if it is finite and no worse than the starting
+  constants;
+* every rejection is refit by the exact CPU arm on the untouched tree;
+* `refit_finalists_exact` reruns the historical LM before reporting.
+
+`--fit-strategy gpu` without a batch backend (a direct call, a checkpoint
+resume, a non-CUDA build) uses the exact CPU arms and records the fallback; it
+is never a silent no-op. `--fit-report` prints GPU accepted/fallback/refit
+counts and whether a CUDA build is present.
+
+#### Exactness and fallbacks
+
+| rule | tolerance / behaviour |
+|---|---|
+| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
+| linear objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
+| linear constants versus exact LM | relative difference `<= 1e-8` on affine tests |
+| VarPro objective versus exact LM | projected SSE `<=` LM SSE × `(1 + 1e-9)` on separable tests |
+| rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
+| size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
+| non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
+| streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
+| GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
+
+`auto` is deterministic: it chooses by tree structure and size only, never by
+wall-clock timing, so a seed cannot change path between runs. For separable
+trees `auto` also runs the exact LM reference from the same starting tree and
+keeps the lower objective, so the adaptive path is never worse than the
+reference; the explicit `varpro` arm skips that verification. The default
+`exact` remains the reference arm and is byte-identical to the pre-#116 path.
 
 `--fit-report` prints the arm counts for the run. On the daily panel
 (`panel_daily_100.csv`, 154,675 rows, target `y1`, inputs `r1,r3,r7,ma7`,
@@ -585,9 +690,66 @@ and test error (`0.30848993 / 0.31136481` versus the `exact` front's best
 `0.30861096 / 0.31146704` at a larger complexity), because the linear arm
 solved candidates that LM's eight iterations left short of the optimum.
 
-**Not yet implemented** (tracked on #116): VarPro for separable nonlinear
-models, batched GPU LM and the adaptive cost-model dispatcher. This PR lands
-only the exact CPU linear arm plus its classifier, fallback and reporting.
+Synthetic fit-only cells (`cargo test --release --test fit_portfolio_bench --
+--ignored`, median of three, `--fit-iters 8`, one shared host) show where each
+new arm pays:
+
+| cell | exact LM | portfolio arm | ratio |
+|---|---:|---:|---:|
+| affine `N=1e3, p=8` | 33.8 ms | 3.4 ms (auto/QR) | **10.1×** |
+| affine `N=1e4, p=4` | 103.4 ms | 12.7 ms (auto/QR) | **8.2×** |
+| affine `N=1e5, p=8` | 1.75 s | 0.32 s (auto/QR) | **5.4×** |
+| affine `N=1e5, p=16` | 1.99 s | 1.42 s (auto/QR) | **1.4×** |
+| separable `N=1e3, p=3` | 7.8 ms | 4.2 ms (VarPro) | **1.9×** |
+| separable `N=1e4, p=3` | 14.1 ms | 41.2 ms (VarPro) | 0.3× |
+| separable `N=1e5, p=3` | 171 ms | 478 ms (VarPro) | 0.4× |
+| streamed `N=1e6` generated rows | 3.99 s | 2.56 s (stream) | **1.56×** |
+
+All VarPro cells reached `sse = 0` at 8 iterations. On a three-constant problem
+the inner beta solve and its line-search trials cost more sweeps than LM's
+three parameters, so VarPro is a correctness/conditioning arm there rather than
+a speed win; it is the structural choice that matters for larger nonlinear
+blocks. The stream arm is 0.83× the resident fit at 1e5 rows (setup dominates)
+and 1.56× faster at 1e6 while keeping only `O(p²)` state. The 1e8-row and
+100-input cells in the issue's matrix were not run on this shared host; the
+implementation does not depend on `N`, but the measurement claim stops here.
+
+#### `--fit-rows`: fit on a subsample, score and archive on all rows
+
+`--fit-rows N` draws a fresh deterministic `N`-row subset each generation and
+fits constants there, while every candidate is scored on the generation's full
+sample. The archive is refit on every training row before it is reported, so a
+reported constant or error is never the subsample estimate. `N >= train rows`
+(and `N = 0`) is an exact no-op, and `--fit-rows` takes precedence over
+`--fit-samples` when both are set. It is a screening lever like
+`--fit-samples`, not an optimisation: the summary says how many rows were used
+and that the archive was refit. On `examples/sine.csv` (`--metric squared
+--generations 8 --pop 200 --fit-iters 8 --seed 3`, three runs) `--fit-rows 10`
+took 0.04–0.05 s user CPU against 0.10 s for the full 45-row fit; the reported
+archive was the same shape class and was refit on all rows. The subsample fit
+can change the *ranking* during the generation, so the final constants are the
+full-row refit, not the screen's numbers.
+
+The issue's cost model goes beyond this deterministic structural dispatch:
+timing-calibrated path selection and automatic subsampling were not adopted,
+because a wall-clock-dependent choice would make a seed non-reproducible. The
+measured cells below justify keeping the dispatcher structural.
+
+
+**Batched GPU LM (#169, opt-in `--fit-strategy gpu`).** A CUDA build can move
+the constants of a whole generation with one block per candidate: value and
+reverse-mode Jacobian for the p constants, `JᵀJ`/`Jᵀr`/SSE accumulation, a
+damped f64 Cholesky solve with a conditioning gate, and ordered trial steps.
+The search phase uses f32 row arithmetic with f64 accumulators and the solve;
+the final undamped polish runs in f64 on an exact f64 copy of the training rows.
+Candidates with no analytic GPU derivative, more than 16 constants, more than
+96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
+are refit by the exact CPU arm and counted as fallbacks. `--fit-strategy gpu`
+applies to the squared/AIC family (the kernel minimises squared error); other
+metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
+training rows in CPU f64 before it is scored and reported, so reported constants
+and metrics never come from f32. The arm is opt-in and saved in checkpoints;
+`exact` remains the default, bit for bit.
 
 #### Subsampled scoring: `--predictor-samples`
 
@@ -644,28 +806,57 @@ noise for the extra rows to average out, so it only spends fewer rows on a
 problem a full fit would solve exactly. Use it when the fitter dominates the
 run and the data are noisy enough that an `N`-row subset is representative.
 
-Measured on the `w2.csv` workload (2 000 rows, 1 500 train, 30 generations,
-pop 100, seed 1, min of three `%U` runs on a shared host), with `m = 200` and a
-1/16 promotion fraction:
+Re-measured on **current `main` (`c4c1d9d`) on 2026-10-20**, on the same
+`w2.csv` fixture (2 000 rows, 1 500 train, md5
+`bcb67700757cebf79ecc26dd954e006e`), 30 generations, pop 100, seed 1,
+`--fit-iters 8`, min and median of four **interleaved** `%U` runs. Host:
+`i7-3770K` (4 cores / 8 threads), load average 18–29 from other agents on the
+same machine, so absolute seconds carry roughly a 10–20 % penalty; every row is
+paired with its full-data run in the same window.
 
-| config | full data | `--fit-samples 200` | speed-up | refitted best error |
+The recorded 2026-10-18 numbers predate #76, which made archive-supplied parents
+the default. The row labelled **recorded workload** therefore passes
+`--no-front-parents`, reproducing the search the target was set on; the
+**current default** row is the same command without that flag:
+
+| config | full data | `--fit-samples 200` | speed-up | best train error |
 |---|---:|---:|---:|---|
-| G=30, absolute | 5.03 s | **2.11 s** | **2.38×** | 0.1633 → **0.0121** (13.5× better) |
-| G=30, squared | 4.58 s | **1.65 s** | **2.78×** | **0.0259 → 0.0398** (1.54× worse) |
-| G=10, absolute | 1.09 s | **0.50 s** | **2.18×** | 0.1762 → **0.2261** (1.28× worse) |
-| G=10, squared | 1.60 s | **0.37 s** | **4.32×** | **0.0259 → 0.0869** (3.36× worse) |
+| recorded workload, G=30, squared | 4.50 s / 4.76 s | **1.59 s / 1.66 s** | **2.83×** | 0.026243 → **0.001723** |
+| current default, G=30, squared | 5.78 s / 5.85 s | **3.93 s / 4.09 s** | **1.47×** | 0.026243 → **0.004474** |
 
-The baselines are the full run's own best shapes **refitted** on all rows, not
-their unrefitted errors (the earlier draft compared against the unrefitted
-0.0865, which was wrong). On the squared metric — the one the 0.0259 baseline
-comes from — the promoted screen is **1.54× worse at G=30** and **3.36× worse
-at G=10**, so the quality cost is visible next to the speed-up. The G=30
-absolute error improves sharply on this seed (0.1633 → 0.0121), which is why
-the delta is reported per metric and not as a general quality claim; the
-recovered squared law is an 11-node expression, while the absolute winner is a
-22-node polynomial/sine form. A larger promotion fraction (1/8) reduced the
-squared error to 0.0042 but erased most of the speed-up (4.03 s, 1.25×), so the
-shipped fraction is 1/16. These are one seed each; the flag stays opt-in.
+The first figure is the minimum, the second the median. The **≤2.0 s** box is
+met on the recorded workload (four runs: 1.59, 1.64, 1.67, 1.75 s) and the
+promoted error is far below the `≤0.05` bound. The binary is also faster there
+than the commit that first shipped the screen (`6bf6679`: 2.17–2.33 s, same
+fixture, same `%U` method), so later work has not regressed this path.
+
+With the **current default** the same command takes 3.93–4.29 s and misses the
+2.0 s bound. That is a different search, not screening overhead: #76's
+archive-supplied parents move the front to promoted trees up to complexity 23
+(the recorded workload's best is complexity 9), and the fitter is ~96 % of the
+run with the 6-per-generation full-data refits about 45 % of the fitting. The
+promoted screen is still 1.47× faster than its **own** full-data baseline on
+this fixture; comparing its absolute seconds with a pre-#76 target would charge
+the trajectory change to the screen. `--fit-samples` remains opt-in.
+
+The **absolute** metric is no longer comparable with the 2026-10-18 `2.11 s`
+row: since #117 the fitter minimises the configured loss, so `absolute` now
+runs IRLS on `|r|` instead of least-squares LM. On this fixture it measures
+10.1 s on the recorded workload (best error 0.015333, well under 0.05); at
+G=10 it is 1.29 s (recorded workload) / 1.17 s (current default) with best
+errors 0.128976 / 0.187767, still under the 0.25 bound. The squared metric
+keeps the exact historical LM path and is therefore the row used for the speed
+re-measurement above. The earlier one-seed quality deltas
+(`0.0259 → 0.0398` etc.) belong to the pre-#76 trajectory and are not
+reproduced here; the current screen recovers a better squared model than the
+full run on this seed (0.001723 vs 0.026243), which is a seed-specific outcome,
+not a general quality claim.
+
+Promoted survivors now also reuse the fitter's final SSE on the squared path
+(#87's exact reuse, applied in `refit_survivor`), removing one full-data scoring
+sweep per survivor. Its measured effect is inside the run-to-run noise; it is
+kept because it removes work without changing a single bit of the reported
+score.
 
 #### Opt-in codegen: `target-cpu=native` and PGO
 

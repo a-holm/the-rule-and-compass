@@ -248,10 +248,22 @@ fn write_tree(n: &Node, out: &mut String) {
 /// Decode a tree written by [`encode_tree`], checking every operator index and
 /// every arity. Trailing tokens are an error, so a corrupt line cannot decode
 /// into a plausible-looking tree.
+///
+/// The tree is subject to the same [`Limits`](crate::parse::Limits) as parsed
+/// text: at most 4096 nodes and a root-to-leaf depth of 256 (issue #153).
 pub fn decode_tree(text: &str) -> Result<Node, String> {
+    decode_tree_with_limits(text, crate::parse::Limits::default())
+}
+
+/// [`decode_tree`] with explicit node and depth limits.
+pub fn decode_tree_with_limits(
+    text: &str,
+    limits: crate::parse::Limits,
+) -> Result<Node, String> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let mut pos = 0usize;
-    let tree = parse_tree(&tokens, &mut pos)?;
+    let mut nodes = 0usize;
+    let tree = parse_tree(&tokens, &mut pos, 1, &mut nodes, limits)?;
     if pos != tokens.len() {
         return Err(format!(
             "tree has {} trailing token(s) after the root",
@@ -261,7 +273,26 @@ pub fn decode_tree(text: &str) -> Result<Node, String> {
     Ok(tree)
 }
 
-fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
+fn parse_tree(
+    tokens: &[&str],
+    pos: &mut usize,
+    depth: usize,
+    nodes: &mut usize,
+    limits: crate::parse::Limits,
+) -> Result<Node, String> {
+    if depth > limits.depth {
+        return Err(format!(
+            "checkpoint tree depth {} exceeds the limit of {}",
+            depth, limits.depth
+        ));
+    }
+    *nodes += 1;
+    if *nodes > limits.nodes {
+        return Err(format!(
+            "checkpoint tree has more than {} nodes",
+            limits.nodes
+        ));
+    }
     let op_tok = next_token(tokens, pos, "operator index")?;
     let index: usize = op_tok
         .parse()
@@ -291,7 +322,7 @@ fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
     }
     let mut kids = Vec::with_capacity(arity);
     for _ in 0..arity {
-        kids.push(parse_tree(tokens, pos)?);
+        kids.push(parse_tree(tokens, pos, depth + 1, nodes, limits)?);
     }
     Ok(Node {
         op,
@@ -1011,8 +1042,13 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_samples",
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
+        "fit_rows",      // #116: missing means 0 (off)
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
+        "qd_cvt",        // #120
+        "qd_policy",     // #120
+        "qd_control",    // #120
+        "variation",     // #122: missing means auto
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1145,6 +1181,20 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         }
     };
 
+    // #116: fit-only row screening; missing means off.
+    let fit_rows = match fields.get("fit_rows").map(|s| s.as_str()) {
+        None => 0,
+        Some(raw) => {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| format!("bad config value for 'fit_rows': '{}'", raw))?;
+            if n == 1 {
+                return Err("config 'fit_rows' must be 0 (off) or at least 2, got 1".to_string());
+            }
+            n
+        }
+    };
+
     // #25: optional fields. Missing means "no units, no filter", which is
     // bit-identical to a checkpoint written before this feature existed.
     if fields.contains_key("units.target") && !fields.contains_key("units") {
@@ -1194,7 +1244,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         None => crate::fit::FitStrategy::Exact,
         Some(raw) => crate::fit::FitStrategy::parse(raw).ok_or_else(|| {
             format!(
-                "config 'fit_strategy' must be exact, auto or linear, got '{}'",
+                "config 'fit_strategy' must be exact, auto, linear, varpro, stream or gpu, got '{}'",
                 raw
             )
         })?,
@@ -1222,6 +1272,43 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     if qd_cell_cap == 0 {
         return Err("config 'qd_cell_cap' must be at least 1".to_string());
     }
+    let qd_cvt = match fields.get("qd_cvt").map(|s| s.as_str()) {
+        None => false,
+        Some("true") => true,
+        Some("false") => false,
+        Some(raw) => return Err(format!("config 'qd_cvt' must be true or false, got '{}'", raw)),
+    };
+    let qd_policy = match fields.get("qd_policy").map(|s| s.as_str()) {
+        None => false,
+        Some("true") => true,
+        Some("false") => false,
+        Some(raw) => {
+            return Err(format!(
+                "config 'qd_policy' must be true or false, got '{}'",
+                raw
+            ))
+        }
+    };
+    let qd_control = match fields.get("qd_control") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<u8>()
+            .map_err(|_| format!("bad config value for 'qd_control': '{}'", raw))?,
+    };
+    if qd_control > 2 {
+        return Err(format!(
+            "config 'qd_control' must be 0, 1 or 2, got {}",
+            qd_control
+        ));
+    }
+    // #122: absent means auto, matching checkpoints written before the flat
+    // postfix engine existed.
+    let variation = match fields.get("variation").map(|s| s.as_str()) {
+        None => crate::search::VariationMode::Auto,
+        Some(raw) => crate::search::VariationMode::parse(raw).map_err(|e| {
+            format!("config 'variation' is invalid: {}", e)
+        })?,
+    };
 
     Ok(Config {
         generations: num_usize("generations")?,
@@ -1243,11 +1330,15 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         patience: num_usize("patience")?,
         predictor_samples,
         fit_samples, // #85
+        fit_rows,     // #116
         front_parents, // #76
         units,
         require_dimensions,
         qd_bins,
         qd_cell_cap,
+        qd_cvt,
+        qd_policy,
+        qd_control,
         progress: None,
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
@@ -1256,6 +1347,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         gpu_notes: true,
         // #119: scheduling only, not saved search state.
         pipeline_depth: 2,
+        variation,
     })
 }
 
@@ -1295,6 +1387,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
+    writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
+    // #122: absent means auto (the historical path for every old checkpoint).
+    writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,
@@ -1336,6 +1431,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.qd_bins > 0 {
         writeln!(out, "config qd_bins {}", cfg.qd_bins).unwrap();
         writeln!(out, "config qd_cell_cap {}", cfg.qd_cell_cap).unwrap();
+        writeln!(out, "config qd_cvt {}", cfg.qd_cvt).unwrap();
+        writeln!(out, "config qd_policy {}", cfg.qd_policy).unwrap();
+        writeln!(out, "config qd_control {}", cfg.qd_control).unwrap();
     }
 }
 

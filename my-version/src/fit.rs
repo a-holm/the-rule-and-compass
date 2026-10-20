@@ -16,27 +16,55 @@
 use crate::expr::{self, Node, Op};
 use crate::metrics::{self, Metric};
 
+// #116: the solver portfolio's additional arms. Each child module uses the
+// flattened tree, adjoint sweep and guarded QR from this module, so the arms
+// share one arithmetic story and one fallback contract.
+mod gpu;
+mod stream;
+mod varpro;
+
+pub use gpu::{
+    backend_description, fit_batch_verified, refit_finalists_exact, BatchStatus, BatchedFitter,
+    VerifiedBatch,
+};
+pub use stream::{fit_stream, fit_stream_with, RowSource, SliceRows, STREAM_BLOCK_ROWS};
+pub use varpro::VarProPartition;
+
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 
 /// #116: which exact constant-fitting arm the search may use.
 ///
-/// All three arms minimise the same weighted squared error on the same rows in
+/// All arms minimise the same weighted squared error on the same rows in
 /// `f64`; they differ only in *how* they reach the minimum. `Exact` is the
-/// historical Levenberg–Marquardt path, bit for bit. `Auto` and `Linear` first
-/// try the closed-form linear least-squares arm for trees that are affine in
-/// every constant; every other tree, and every linear system that is
-/// rank-deficient or whose solution is not an improvement, falls back to
-/// `Exact`. The linear arm is an exact global minimiser for its class, not an
-/// approximation, so it cannot make the objective worse on those trees.
+/// historical Levenberg–Marquardt path, bit for bit. `Auto` dispatches by
+/// structure: the closed-form linear arm when the tree is affine in every
+/// constant, variable projection when it is separable, and the historical LM
+/// otherwise. `Linear`, `VarPro`, `Stream` and `Gpu` force one arm and fall
+/// back to `Exact` whenever the arm cannot prove a safe result.
+///
+/// #169: `Gpu` is the opt-in batched GPU arm. During a CUDA-guided search the
+/// offspring may be left unfitted for a whole-generation batch and fitted in
+/// one block-per-candidate kernel; the integration point and exact verifier
+/// live in the [`gpu`] module. Every unsupported, ill-conditioned or
+/// non-finite candidate is refit on the CPU, and every finalist is refit
+/// exactly in `f64` before reporting. When no batch context exists (a direct
+/// [`fit_weighted_strategy`] call, a checkpoint resume, a non-CUDA build) the
+/// arm behaves like `Auto`; it is never silently a no-op.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FitStrategy {
     /// Today's CPU Levenberg–Marquardt.
     Exact,
-    /// Linear least squares when eligible, otherwise `Exact`.
+    /// Structure-adaptive exact dispatch: linear, then VarPro, then LM.
     Auto,
     /// The linear arm with an `Exact` fallback when a tree is ineligible.
     Linear,
+    /// Variable projection for separable models, `Exact` otherwise.
+    VarPro,
+    /// Out-of-core block LM with exact f64 sufficient-statistic merging.
+    Stream,
+    /// #169: batched GPU LM with a per-candidate CPU fallback.
+    Gpu,
 }
 
 impl FitStrategy {
@@ -46,6 +74,9 @@ impl FitStrategy {
             "exact" | "cpu" => Some(FitStrategy::Exact),
             "auto" => Some(FitStrategy::Auto),
             "linear" => Some(FitStrategy::Linear),
+            "varpro" | "var_pro" => Some(FitStrategy::VarPro),
+            "stream" | "out-of-core" | "outofcore" => Some(FitStrategy::Stream),
+            "gpu" => Some(FitStrategy::Gpu),
             _ => None,
         }
     }
@@ -56,7 +87,16 @@ impl FitStrategy {
             FitStrategy::Exact => "exact",
             FitStrategy::Auto => "auto",
             FitStrategy::Linear => "linear",
+            FitStrategy::VarPro => "varpro",
+            FitStrategy::Stream => "stream",
+            FitStrategy::Gpu => "gpu",
         }
+    }
+
+    /// #169: whether the search should leave offspring unfitted for the
+    /// batched GPU arm instead of fitting each candidate on the CPU.
+    pub fn defers_to_gpu(self) -> bool {
+        matches!(self, FitStrategy::Gpu)
     }
 }
 
@@ -77,15 +117,229 @@ const LINEAR_RANK_TOL: f64 = 1e-12;
 /// #116: process-wide counters for `--fit-report`. They are diagnostics only;
 /// no search decision reads them, so they cannot change a trajectory.
 static LINEAR_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static VARPRO_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STREAM_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXACT_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_REFITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// #116: `(linear, exact)` fit-arm calls since process start.
+/// #116: all arm counts since process start. Kept as a struct so new arms do
+/// not change the meaning of older report fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FitArmCounts {
+    pub linear: u64,
+    pub varpro: u64,
+    pub stream: u64,
+    pub exact: u64,
+    pub gpu: u64,
+    pub gpu_fallbacks: u64,
+    pub gpu_refits: u64,
+}
+
+impl FitArmCounts {
+    /// Difference from an earlier reading (for one run in a reused process).
+    pub fn since(self, before: FitArmCounts) -> FitArmCounts {
+        FitArmCounts {
+            linear: self.linear.saturating_sub(before.linear),
+            varpro: self.varpro.saturating_sub(before.varpro),
+            stream: self.stream.saturating_sub(before.stream),
+            exact: self.exact.saturating_sub(before.exact),
+            gpu: self.gpu.saturating_sub(before.gpu),
+            gpu_fallbacks: self.gpu_fallbacks.saturating_sub(before.gpu_fallbacks),
+            gpu_refits: self.gpu_refits.saturating_sub(before.gpu_refits),
+        }
+    }
+
+    pub fn total(self) -> u64 {
+        self.linear + self.varpro + self.stream + self.exact
+    }
+}
+
+/// #116: `(linear, exact-LM)` fit-arm calls since process start.
+///
+/// Retained for callers written before the portfolio grew. Use
+/// [`fit_arm_counts_full`] to see VarPro, stream and GPU counts as well; the
+/// second value here counts only calls that ended in the historical LM arm.
 pub fn fit_arm_counts() -> (u64, u64) {
+    let counts = fit_arm_counts_full();
+    (counts.linear, counts.exact)
+}
+
+/// #116: all arm counts since process start.
+pub fn fit_arm_counts_full() -> FitArmCounts {
+    use std::sync::atomic::Ordering;
+    FitArmCounts {
+        linear: LINEAR_FITS.load(Ordering::Relaxed),
+        varpro: VARPRO_FITS.load(Ordering::Relaxed),
+        stream: STREAM_FITS.load(Ordering::Relaxed),
+        exact: EXACT_FITS.load(Ordering::Relaxed),
+        gpu: GPU_FITS.load(Ordering::Relaxed),
+        gpu_fallbacks: GPU_FALLBACKS.load(Ordering::Relaxed),
+        gpu_refits: GPU_REFITS.load(Ordering::Relaxed),
+    }
+}
+
+/// #169: record one batched-GPU outcome (`true` = usable, `false` = fallback).
+pub(crate) fn note_gpu_fit(usable: bool) {
+    use std::sync::atomic::Ordering;
+    if usable {
+        GPU_FITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GPU_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// #169: record one exact CPU `f64` finalist refit.
+pub(crate) fn note_gpu_refit() {
+    GPU_REFITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// #169: batched-GPU fit accounting. `GPU_FITS` counts candidates the kernel
+// completed with a usable result; `GPU_FALLBACKS` counts candidates the search
+// then refit on the CPU (unsupported tree, non-finite row, ill-conditioned
+// normal equations, or no device). `GPU_REFITS` counts the exact finalist
+// refits performed before reporting. Diagnostics only; no decision reads them.
+/// #169: `(gpu, fallback, exact_refit)` counts since process start.
+pub fn gpu_fit_counts() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering;
     (
-        LINEAR_FITS.load(Ordering::Relaxed),
-        EXACT_FITS.load(Ordering::Relaxed),
+        GPU_FITS.load(Ordering::Relaxed),
+        GPU_FALLBACKS.load(Ordering::Relaxed),
+        GPU_REFITS.load(Ordering::Relaxed),
     )
+}
+
+/// #169: largest number of constants the batched GPU kernel fits.
+pub const GPU_FIT_MAX_CONSTANTS: usize = 16;
+
+/// #169: largest flattened program (nodes) the batched GPU kernel fits.
+pub const GPU_FIT_MAX_NODES: usize = 96;
+
+/// #169: fit-plan opcodes, kept numerically identical to the evaluator
+/// opcodes in `src/gpu.rs` / `src/cuda/eval.cu` so the two kernels share the
+/// arithmetic cases.
+pub(crate) mod gpu_op {
+    pub const CONST: u32 = 0;
+    pub const VAR: u32 = 1;
+    pub const ADD: u32 = 2;
+    pub const SUB: u32 = 3;
+    pub const MUL: u32 = 4;
+    pub const DIV: u32 = 5;
+    pub const SIN: u32 = 6;
+    pub const COS: u32 = 7;
+    pub const TAN: u32 = 8;
+    pub const EXP: u32 = 9;
+    pub const LOG: u32 = 10;
+    pub const SQRT: u32 = 11;
+    pub const ABS: u32 = 12;
+    pub const TANH: u32 = 13;
+    pub const SIG: u32 = 14;
+    pub const SQUARE: u32 = 15;
+    pub const CUBE: u32 = 16;
+    pub const NEG: u32 = 17;
+    pub const GAUSS: u32 = 18;
+    pub const POW: u32 = 20;
+    pub const SINH: u32 = 21;
+    pub const COSH: u32 = 22;
+    pub const ERF: u32 = 28;
+    pub const ERFC: u32 = 29;
+}
+
+/// #169: map an operator to the fit kernel's opcode. Only operators with a
+/// well-defined analytic derivative in both the value and adjoint sweeps are
+/// eligible; everything else (piecewise-constant, logical, constraint, block,
+/// aggregate and meta operators) makes the candidate fall back to the CPU.
+fn gpu_fit_opcode(op: Op) -> Option<u32> {
+    use gpu_op as g;
+    use Op::*;
+    Some(match op {
+        Const => g::CONST,
+        Input => g::VAR,
+        Add => g::ADD,
+        Sub => g::SUB,
+        Mul => g::MUL,
+        Div => g::DIV,
+        Sin => g::SIN,
+        Cos => g::COS,
+        Tan => g::TAN,
+        Exp => g::EXP,
+        Ln => g::LOG,
+        Sqrt => g::SQRT,
+        Abs => g::ABS,
+        Tanh => g::TANH,
+        Logistic => g::SIG,
+        Square => g::SQUARE,
+        Cube => g::CUBE,
+        Neg => g::NEG,
+        Gauss => g::GAUSS,
+        Pow => g::POW,
+        Sinh => g::SINH,
+        Cosh => g::COSH,
+        Erf => g::ERF,
+        Erfc => g::ERFC,
+        _ => return None,
+    })
+}
+
+/// #169: a candidate flattened for the batched GPU fit kernel.
+///
+/// The program is a postorder array of `4`-word records `[op, kid0, kid1,
+/// slot]`; constants are kept in `c0` so the kernel can move them, and `flat`
+/// is retained so the fitted values can be written back into the tree exactly
+/// like the CPU LM path does.
+pub(crate) struct GpuFitPlan {
+    pub(crate) words: Vec<u32>,
+    pub(crate) nconst: usize,
+    pub(crate) c0: Vec<f64>,
+    flat: Flat,
+}
+
+impl GpuFitPlan {
+    /// Write `c` back into `tree`'s constant slots.
+    pub(crate) fn apply(&self, tree: &mut Node, c: &[f64]) {
+        write_constants(tree, &self.flat, c);
+    }
+}
+
+/// #169: build the GPU fit plan for `tree`, or `None` when the candidate must
+/// stay on the CPU (non-affine block bodies, too many constants or nodes, or an
+/// operator without an analytic GPU derivative).
+pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
+    let f = flatten(tree);
+    if f.nconst == 0 || f.nconst > GPU_FIT_MAX_CONSTANTS || f.op.len() > GPU_FIT_MAX_NODES {
+        return None;
+    }
+    if !f.shared.is_empty() {
+        return None; // block bodies share constants; the CPU path owns those
+    }
+    let mut words = Vec::with_capacity(f.op.len() * 4);
+    for i in 0..f.op.len() {
+        let op = gpu_fit_opcode(f.op[i])?;
+        let kids = &f.kids[i];
+        let k0 = kids.first().copied().unwrap_or(0) as u32;
+        let k1 = kids.get(1).copied().unwrap_or(0) as u32;
+        let slot = if f.cslot[i] >= 0 {
+            f.cslot[i] as u32
+        } else if f.op[i] == Op::Input {
+            f.val[i] as u32
+        } else {
+            u32::MAX
+        };
+        words.extend_from_slice(&[op, k0, k1, slot]);
+    }
+    let mut c0 = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c0[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    Some(GpuFitPlan {
+        words,
+        nconst: f.nconst,
+        c0,
+        flat: f,
+    })
 }
 
 /// Flattened expression: children always precede parents, so index order is a
@@ -959,8 +1213,10 @@ pub fn fit_weighted(
 ///
 /// `FitStrategy::Exact` is exactly [`fit_weighted`] (the historical LM path),
 /// so every existing caller, fixture and checkpoint trajectory is unchanged.
-/// `Auto`/`Linear` try the closed-form linear arm first and fall back to LM for
-/// any tree it cannot solve exactly.
+/// `Auto` tries the closed-form linear arm, then variable projection, and
+/// falls back to LM for any tree those arms cannot solve exactly. The explicit
+/// arms (`Linear`, `VarPro`, `Stream`) use only their own arm before the same
+/// fallback.
 pub fn fit_weighted_strategy(
     tree: &mut Node,
     x: &[Vec<f64>],
@@ -969,6 +1225,7 @@ pub fn fit_weighted_strategy(
     iters: usize,
     strategy: FitStrategy,
 ) -> f64 {
+    use std::sync::atomic::Ordering;
     // #87: the scorer rejects a prediction/target length mismatch; the fitter
     // must not silently fit only the shorter of the two.
     if x.len() != y.len() {
@@ -977,14 +1234,67 @@ pub fn fit_weighted_strategy(
     if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
+    // #135: zero iterations means `--no-fit` on *every* strategy. In
+    // particular the closed-form linear arm is still a least-squares solve and
+    // must not run; `fit_lm` returns the generated constants' SSE without
+    // taking a step. This holds for `Gpu` too: no batch kernel is dispatched.
+    if iters == 0 {
+        return fit_lm(tree, x, y, w, 0);
+    }
+    // #169: `Gpu` only changes the search's *scheduling* (offspring are left
+    // for the batched kernel). Any direct call lacks that batch context, so it
+    // uses the same exact CPU arms as `Auto`: the linear minimiser when it
+    // applies, otherwise the historical LM. It is never a no-op.
     if strategy != FitStrategy::Exact {
-        if let Some(s) = fit_linear(tree, x, y, w) {
-            LINEAR_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return s;
+        // #169: a direct call has no batch context. Record the fallback and use
+        // the same exact CPU arms as `Auto`, never a no-op.
+        if strategy == FitStrategy::Gpu {
+            GPU_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+        }
+        let try_linear = matches!(strategy, FitStrategy::Auto | FitStrategy::Linear | FitStrategy::Gpu);
+        let try_varpro = matches!(strategy, FitStrategy::Auto | FitStrategy::VarPro | FitStrategy::Gpu);
+        if try_linear {
+            if let Some(s) = fit_linear(tree, x, y, w) {
+                LINEAR_FITS.fetch_add(1, Ordering::Relaxed);
+                return s;
+            }
+        }
+        if try_varpro {
+            // `auto` promises never to be worse than the reference LM arm.
+            // VarPro is not a global solver for a general separable problem,
+            // so run the exact LM path from the same starting tree and keep
+            // whichever objective is lower. The explicit `varpro` arm does not
+            // pay this verification cost.
+            let original = (strategy == FitStrategy::Auto).then(|| tree.clone());
+            if let Some(s) = varpro::fit_varpro(tree, x, y, w, iters) {
+                if let Some(mut lm_tree) = original {
+                    let lm_sse = fit_lm(&mut lm_tree, x, y, w, iters);
+                    if lm_sse < s {
+                        *tree = lm_tree;
+                        EXACT_FITS.fetch_add(1, Ordering::Relaxed);
+                        return lm_sse;
+                    }
+                }
+                VARPRO_FITS.fetch_add(1, Ordering::Relaxed);
+                return s;
+            }
+        }
+        if strategy == FitStrategy::Stream {
+            if let Some(s) = stream::fit_stream(tree, x, y, w, iters) {
+                STREAM_FITS.fetch_add(1, Ordering::Relaxed);
+                return s;
+            }
         }
     }
-    EXACT_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    EXACT_FITS.fetch_add(1, Ordering::Relaxed);
     fit_lm(tree, x, y, w, iters)
+}
+
+/// #116: the structural partition VarPro would use, for tests and `--fit-report`.
+/// `None` means the tree is affine in every constant (the linear arm owns it)
+/// or has no constant block that can be eliminated exactly.
+pub fn separable_partition(tree: &Node) -> Option<VarProPartition> {
+    varpro::partition(&flatten(tree))
 }
 
 /// The historical Levenberg–Marquardt fitter (see [`fit_weighted`]).
@@ -1396,6 +1706,17 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
+    // not only the squared family. IRLS, logistic IRLS and the coordinate
+    // polish all force a minimum of one sweep, so return the current score
+    // before reaching any of them. For the squared family this keeps the
+    // historical weighted-SSE return value rather than the mean-squared score.
+    if iters == 0 {
+        return match metric {
+            Squared | Aic | Aicc | Bic => fit_weighted(tree, x, y, w, 0),
+            _ => metric_score(tree, x, y, w, metric),
+        };
+    }
     match metric {
         // The exact historical path. Information criteria fit by least squares
         // and add their parameter penalty when scoring; they do not change the
@@ -2769,6 +3090,114 @@ mod tests {
         assert!(fitted < initial_sse, "positive iters must improve the SSE");
     }
 
+    /// #135: zero iterations is a true no-op for *every* metric, including the
+    /// IRLS/logistic paths that previously forced `iters.max(1)`, and for the
+    /// closed-form linear arm that previously ran before the zero check.
+    #[test]
+    fn zero_iters_is_a_no_op_for_every_metric() {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![-2.0 + 4.0 * i as f64 / 40.0]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| 1.7 * r[0] * r[0] - 0.4 * r[0] + 0.8)
+            .collect();
+        let metrics = [
+            Metric::Squared,
+            Metric::Absolute,
+            Metric::LogSquashed,
+            Metric::Auc,
+            Metric::LogLoss,
+            Metric::Hinge,
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+            Metric::RankCorrelation,
+            Metric::RankCorrelationSigned,
+            Metric::Signed,
+            Metric::Median,
+            Metric::Maximum,
+            Metric::Interquartile,
+            Metric::Slope,
+            Metric::Aic,
+            Metric::Aicc,
+            Metric::Bic,
+        ];
+        for metric in metrics {
+            let mut tree = node(
+                Op::Add,
+                vec![
+                    node(Op::Mul, vec![constant(3.0), input(0)]),
+                    constant(0.5),
+                ],
+            );
+            let before = fitted_constants(&tree);
+            FIT_STEPS.with(|n| n.set(0));
+            let score = fit_weighted_metric(&mut tree, &x, &y, &[], 0, metric);
+            assert_eq!(
+                fitted_constants(&tree),
+                before,
+                "{}: constants must stay as generated",
+                metric.name()
+            );
+            assert!(
+                score.is_finite(),
+                "{}: the generated tree must still be scored, got {score}",
+                metric.name()
+            );
+            assert_eq!(
+                FIT_STEPS.with(|n| n.get()),
+                0,
+                "{}: no LM/polish step may run",
+                metric.name()
+            );
+
+            // Positive iterations must still take steps, so the counter
+            // assertion above cannot pass vacuously.
+            FIT_STEPS.with(|n| n.set(0));
+            fit_weighted_metric(&mut tree, &x, &y, &[], 8, metric);
+            assert!(
+                FIT_STEPS.with(|n| n.get()) > 0,
+                "{}: positive iterations must take steps",
+                metric.name()
+            );
+        }
+    }
+
+    /// #135: `auto`/`linear` must not take the closed-form least-squares arm
+    /// when the budget is zero; on an exactly affine tree that arm would move
+    /// the constants even though `--no-fit` was requested.
+    #[test]
+    fn zero_iters_skips_the_linear_arm_for_auto_and_linear() {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![-2.0 + 4.0 * i as f64 / 40.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 3.0 * r[0] + 2.0).collect();
+        for strategy in [FitStrategy::Auto, FitStrategy::Linear] {
+            let mut tree = node(
+                Op::Add,
+                vec![
+                    node(Op::Mul, vec![constant(1.0), input(0)]),
+                    constant(0.0),
+                ],
+            );
+            let before = fitted_constants(&tree);
+            let initial_sse = flat_sse(&tree, &x, &y);
+            FIT_STEPS.with(|n| n.set(0));
+            let sse = fit_weighted_strategy(&mut tree, &x, &y, &[], 0, strategy);
+            assert_eq!(
+                fitted_constants(&tree),
+                before,
+                "{strategy:?}: constants must stay as generated"
+            );
+            assert_eq!(
+                sse.to_bits(),
+                initial_sse.to_bits(),
+                "{strategy:?}: SSE must be the generated one"
+            );
+            assert_eq!(
+                FIT_STEPS.with(|n| n.get()),
+                0,
+                "{strategy:?}: no least-squares or LM step may run"
+            );
+        }
+    }
+
     /// #116: `a*x + b` is affine in both constants and the closed-form arm
     /// recovers the generating law to machine precision in one solve.
     #[test]
@@ -2919,6 +3348,36 @@ mod tests {
     /// #116: a rank-deficient affine system (two indistinguishable constants)
     /// cannot be solved by the linear arm; it falls back to exact LM without
     /// touching the tree, and the result is bit-identical.
+    /// #116: every strategy has a stable CLI/schema/checkpoint spelling and
+    /// `cpu` remains an alias for the historical arm.
+    #[test]
+    fn strategy_names_round_trip() {
+        for (name, strategy) in [
+            ("exact", FitStrategy::Exact),
+            ("cpu", FitStrategy::Exact),
+            ("auto", FitStrategy::Auto),
+            ("linear", FitStrategy::Linear),
+            ("varpro", FitStrategy::VarPro),
+            ("stream", FitStrategy::Stream),
+            ("gpu", FitStrategy::Gpu),
+        ] {
+            assert_eq!(FitStrategy::parse(name), Some(strategy), "{name}");
+        }
+        for s in [
+            FitStrategy::Exact,
+            FitStrategy::Auto,
+            FitStrategy::Linear,
+            FitStrategy::VarPro,
+            FitStrategy::Stream,
+            FitStrategy::Gpu,
+        ] {
+            assert_eq!(FitStrategy::parse(s.name()), Some(s));
+        }
+        assert!(FitStrategy::parse("convex").is_none());
+        assert!(FitStrategy::Gpu.defers_to_gpu());
+        assert!(!FitStrategy::Auto.defers_to_gpu());
+    }
+
     #[test]
     fn rank_deficient_affine_tree_falls_back_to_exact_lm() {
         let x: Vec<Vec<f64>> = (0..9).map(|i| vec![i as f64]).collect();

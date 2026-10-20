@@ -17,23 +17,59 @@ rcsr --data large.csv --target y --max-memory 2GB
 ```
 
 The estimate is derived from the table's **shape**, not its file size (issue
-#112): once the header and row count are known, the guard models
+#112), and the CSV path **streams** it (issue #126): a quote-aware scan reads the
+file once to measure the header width, data-row count and byte count, then the
+parser makes its two streaming passes. No whole-file `String` is built, so the
+text is not a resident term:
 
 ```text
-text     = bytes read into one String
+text     = bytes read into one String (the current loader; a streaming path
+           removes this term -- see issue #126)
 table    = rows x columns x 12 B          (f64 value + u32 dictionary code)
 prep     = rows x used_columns x 24 B      (cells, train and test copies)
-         + rows x 72 B                     (Vec headers and selectors)
+         + rows x 240 B                    (sample headers, selectors, row copies)
 estimate = (text + table + prep) x 1.25    (allocator slack)
 ```
 
 `used_columns` is the search's projection (`--vars`, `--target`, `--weight`);
 with no `--vars` the whole header is assumed. `rcsr import` has no search
-preparation, so its guard uses the `text + table` terms only. The old `33 x file size` factor
-was calibrated on ~6-column data and predicted 560 GB for a 17 GB, 93-column
-panel that is at most ~27 GB resident. The text term is not optional: the
-loader reads the whole CSV into one `String`, so a 17 GB CSV cannot be less
-than 17 GB resident.
+preparation, so its guard uses the `text + table` terms only. The old
+`33 x file size` factor was calibrated on ~6-column data and predicted 560 GB
+for a 17 GB, 93-column panel that is at most ~27 GB resident. The guard reports
+its estimate **and this basis** (rows x columns, the three terms and slack) in
+the normal preparation block, in text and in `--json`/`--ndjson`, not only when
+it refuses a file.
+
+### Calibration (issue #112)
+
+The fixed preparation term was **72 B/row** before this calibration. On the
+1M-row x 6-column fixture that model predicted 378 MiB, but the search run
+peaked at 552 MiB, so the fixed term was raised to **240 B/row**. The 12 B/cell
+and 24 B/used-cell terms were left unchanged. The raise is justified by the
+measurements below: the estimate is now above the measured peak everywhere,
+but never more than 1.55x it.
+
+Machine: 31 GiB RAM, 8 threads, `/mnt/lager`. `old` is the `read_to_string`
+loader; `stream` is the #126 streaming loader (same estimator without the text
+term). The `search` command is `--target y --generations 1 --pop 8
+--baseline-samples 16 --seed 1`; `import` is `rcsr import ... --quiet`.
+
+| fixture | rows x cols | file | path | peak RSS | estimate | estimate / peak |
+|---|---|---:|---|---:|---:|---:|
+| 6-column | 1,000,000 x 6 | 29.0 MiB | old import | 91.6 MiB | 122.0 MiB | 1.33 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | stream import | 61.8 MiB | 85.8 MiB | 1.39 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | old search | 552.2 MiB | 579.8 MiB | 1.05 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | stream search | 422.1 MiB | 543.7 MiB | 1.29 |
+| 90-column | 150,000 x 90 | 88.4 MiB | old import | 196.1 MiB | 303.6 MiB | 1.55 |
+| 90-column | 150,000 x 90 | 88.4 MiB | stream import | 140.0 MiB | 193.1 MiB | 1.38 |
+| 90-column | 150,000 x 90 | 88.4 MiB | old search | 553.9 MiB | 732.8 MiB | 1.32 |
+| 90-column | 150,000 x 90 | 88.4 MiB | stream search | 452.5 MiB | 622.3 MiB | 1.38 |
+
+The narrow fixture is 30,364,090 bytes; the wide one is 92,696,166 bytes. A
+wide but small-on-disk file is therefore no longer mistaken for cheap: the
+estimate grows with rows x columns, and a narrow but large file is no longer
+multiplied by 33. Tests for both shapes live in
+`my-version/tests/memory_estimate.rs`.
 
 When the estimate is above the budget, `rcsr` prints the file size, the
 rows x columns basis, the estimate and the budget, suggests `--force` and
@@ -102,6 +138,65 @@ When it does not fit, the run prints an `out of core:` note and searches a
 sample selected by the pinned one-multiply hash while scanning groups. The
 sample is a sample: report it as such. (The full-data re-score of the Pareto
 front on a streamed store is follow-up work, not silently claimed here.)
+
+## `rcsr prep`: raw archives to a store, no intermediate CSV
+
+```sh
+rcsr prep --input raw_15m/ --format binance --resample 15m \
+  --features ta:core,exotic:cheap,candle:geometry \
+  --label fwd:1h,cost=10bp,volnorm=96 --mtf 1h,4h,1d \
+  --out crypto_15m.rcsb --jobs 8
+```
+
+`prep` is the raw-market-data front-end of #123. It reads:
+
+* Binance Vision headerless klines (12 columns, including `quote_volume`,
+  `trades`, taker-buy base/quote);
+* Bitstamp headerless klines (6/7 columns);
+* an aliased OHLCV header (`Date`/`Timestamp`/`time`, `Open`/`O`, `Vol`/`Volume`,
+  ...), case- and space-insensitive;
+* CSV, TSV or monthly ZIP archives (stored or deflate), with no intermediate
+  CSV written. A directory is searched recursively and grouped by symbol.
+
+Timestamps are normalised to UTC **seconds** with unit detection by magnitude:
+seconds `|t| < 1e11`, milliseconds `< 1e14`, microseconds `< 1e17`, otherwise
+nanoseconds. `--tz` accepts `UTC`, a fixed `+HH:MM` offset, or
+`America/New_York`/`Europe/London` resolved through the DST calendar. Duplicate
+instants are aggregated (`open` first, `high` max, `low` min, `close` last,
+flows summed), never silently dropped; non-monotonic input is sorted and
+counted.
+
+The transforms are the OHLCV layer's (`docs/ohlcv.md`): calendar-aware
+resampling with exact OHLC and summed flows, causal `--mtf` joins as of the last
+closed higher bar, the named feature groups, and a next-open forward label with
+symmetric cost. A window that spans a gap is `NaN`, never bridged. A panel of
+more than one symbol gets a `symbol` column; a single series keeps the canonical
+`ts,open,high,low,close,volume,quote_volume,trades,taker_buy_base,taker_buy_quote`
+layout, which is byte-identical to `rcsr import` on the same values (pinned by
+`tests/prep_pipeline.rs`).
+
+Symbol migrations are spliced before resampling:
+
+```sh
+rcsr prep ... --migrations 'TOMO->VIC:1.0169,MATIC->POL:1'
+```
+
+Each boundary is measured (`old_close / new_open`) and `|ln(ratio/k)|` must be
+inside the tolerance (default 0.005); a wrong `k` is a hard error, not a fake
+return. Prices are divided by `k`, base volume and taker-buy base multiplied by
+`k`, and the overlap is removed.
+
+`--spec <file>` reads `key=value` lines (`features`, `label`, `resample`, `mtf`,
+`calendar`, `tz`, `migrations`); its SHA-256 is recorded in the manifest and the
+same inputs plus the same spec reproduce the same store bytes. `--dry-run`
+prints the audit and manifest without writing. The manifest (`<out>.manifest.json`)
+records the format, calendar, timezone, timeframe, features, label, migration
+table, input paths/sizes/checksums, audit counters (duplicates, gaps,
+zero-volume rows, units converted, zero-variance features, NaNs) and the output
+checksum.
+
+`--jobs N` parallelises by symbol; symbols are merged in sorted order, so the
+output does not depend on scheduling.
 
 ## File format, versions 1 and 2
 
@@ -216,6 +311,27 @@ are the same function, so row selection is reproducible across passes.
 
 ## Measured
 
+### Streaming CSV (issue #126)
+
+Machine: 31 GiB RAM, 8 threads, `/mnt/lager`. Fixture: a generated
+**1,000,000 rows × 6 columns** CSV, **30,364,090 bytes (29.0 MiB)**. Both
+binaries are release builds; `import` writes the same 58 MiB store.
+
+| path | command | wall | peak RSS |
+|---|---|---|---|
+| old `read_to_string` | `rcsr import rows1m.csv out.rcsb --quiet` | 6.28 s | 93,316 KiB (91.1 MiB) |
+| streaming | `rcsr import rows1m.csv out.rcsb --quiet` | 5.50 s | 63,492 KiB (62.0 MiB) |
+| old `read_to_string` | `rcsr --data rows1m.csv --target y --generations 1 --pop 8 --baseline-samples 16 --seed 1` | 21.71 s | 565,812 KiB (552.5 MiB) |
+| streaming | same command | 25.26 s | 432,164 KiB (422.0 MiB) |
+
+The import difference is the 29 MiB whole-file `String` (plus allocator
+growth); the search difference is larger because the peak included both the
+file text and the prepared samples. The streaming path still builds the
+resident `Table` and search samples, so the guard estimates those terms from the
+measured shape.
+
+### Column store
+
 Machine: 31 GiB RAM, 8 threads, `/mnt/lager` on a spinning disk. Fixture: a
 directly generated version-1 store, **100,000,000 rows × 5 columns = 4.0 GB**,
 searched under `ulimit -v 900000` (900 MiB address space) with
@@ -244,6 +360,9 @@ error: input would exceed the memory budget
     rcsr import <input.csv> <store.rcsb>
 exit 3
 ```
+
+That refusal predates the #112 fixed-row calibration; the same shape is now
+estimated higher (the calibration above records the current numbers).
 
 ## Measured: v1 versus v2
 

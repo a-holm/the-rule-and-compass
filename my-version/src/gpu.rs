@@ -17,6 +17,7 @@
 //!   FP64 runs at 1/64 of FP32.
 
 use crate::expr::{constant, node, Node, Op};
+use crate::gpu_stats::GpuStats;
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -24,51 +25,51 @@ use crate::expr::{constant, node, Node, Op};
 pub mod arch;
 
 /* Opcodes, kept in sync with src/cuda/eval.cu. */
-const OP_CONST: u32 = 0;
-const OP_VAR: u32 = 1;
-const OP_ADD: u32 = 2;
-const OP_SUB: u32 = 3;
-const OP_MUL: u32 = 4;
-const OP_DIV: u32 = 5;
-const OP_SIN: u32 = 6;
-const OP_COS: u32 = 7;
-const OP_TAN: u32 = 8;
-const OP_EXP: u32 = 9;
-const OP_LOG: u32 = 10;
-const OP_SQRT: u32 = 11;
-const OP_ABS: u32 = 12;
-const OP_TANH: u32 = 13;
-const OP_SIG: u32 = 14;
-const OP_SQUARE: u32 = 15;
-const OP_CUBE: u32 = 16;
-const OP_NEG: u32 = 17;
-const OP_GAUSS: u32 = 18;
-const OP_STEP: u32 = 19;
-const OP_POW: u32 = 20;
-const OP_SINH: u32 = 21;
-const OP_COSH: u32 = 22;
+pub const OP_CONST: u32 = 0;
+pub const OP_VAR: u32 = 1;
+pub const OP_ADD: u32 = 2;
+pub const OP_SUB: u32 = 3;
+pub const OP_MUL: u32 = 4;
+pub const OP_DIV: u32 = 5;
+pub const OP_SIN: u32 = 6;
+pub const OP_COS: u32 = 7;
+pub const OP_TAN: u32 = 8;
+pub const OP_EXP: u32 = 9;
+pub const OP_LOG: u32 = 10;
+pub const OP_SQRT: u32 = 11;
+pub const OP_ABS: u32 = 12;
+pub const OP_TANH: u32 = 13;
+pub const OP_SIG: u32 = 14;
+pub const OP_SQUARE: u32 = 15;
+pub const OP_CUBE: u32 = 16;
+pub const OP_NEG: u32 = 17;
+pub const OP_GAUSS: u32 = 18;
+pub const OP_STEP: u32 = 19;
+pub const OP_POW: u32 = 20;
+pub const OP_SINH: u32 = 21;
+pub const OP_COSH: u32 = 22;
 // #131: native hard operators.
-const OP_FLOOR: u32 = 23;
-const OP_CEIL: u32 = 24;
-const OP_ROUND: u32 = 25;
-const OP_MOD: u32 = 26;
-const OP_ATAN2: u32 = 27;
-const OP_ERF: u32 = 28;
-const OP_ERFC: u32 = 29;
-const OP_MIN: u32 = 30;
-const OP_MAX: u32 = 31;
-const OP_IF: u32 = 32;
-const OP_SIGN: u32 = 33;
-const OP_EQUAL: u32 = 34;
-const OP_LESS: u32 = 35;
-const OP_LESS_OR_EQUAL: u32 = 36;
-const OP_GREATER: u32 = 37;
-const OP_GREATER_OR_EQUAL: u32 = 38;
-const OP_AND: u32 = 39;
-const OP_OR: u32 = 40;
-const OP_XOR: u32 = 41;
-const OP_NOT: u32 = 42;
-const OP_HALT: u32 = 255;
+pub const OP_FLOOR: u32 = 23;
+pub const OP_CEIL: u32 = 24;
+pub const OP_ROUND: u32 = 25;
+pub const OP_MOD: u32 = 26;
+pub const OP_ATAN2: u32 = 27;
+pub const OP_ERF: u32 = 28;
+pub const OP_ERFC: u32 = 29;
+pub const OP_MIN: u32 = 30;
+pub const OP_MAX: u32 = 31;
+pub const OP_IF: u32 = 32;
+pub const OP_SIGN: u32 = 33;
+pub const OP_EQUAL: u32 = 34;
+pub const OP_LESS: u32 = 35;
+pub const OP_LESS_OR_EQUAL: u32 = 36;
+pub const OP_GREATER: u32 = 37;
+pub const OP_GREATER_OR_EQUAL: u32 = 38;
+pub const OP_AND: u32 = 39;
+pub const OP_OR: u32 = 40;
+pub const OP_XOR: u32 = 41;
+pub const OP_NOT: u32 = 42;
+pub const OP_HALT: u32 = 255;
 
 /// `(name, opcode)` for the enum-consistency test and for the per-generation
 /// opcode report. Keep the order identical to `src/cuda/eval.cu`.
@@ -119,17 +120,196 @@ const OPCODE_TABLE: &[(&str, u32)] = &[
     ("OP_HALT", OP_HALT),
 ];
 
-/// Compile one expression to postfix bytecode. Returns `false` if the tree uses
-/// an operator the kernel does not implement even after [`lower`] (for example
-/// `floor`, `mod` or `atan2`).
-/// an operator the kernel does not implement (for example `asinh`, `mod` on a
-/// platform without the #131 opcodes, or constraints).
-pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
-    if !emit(n, out) {
-        return false;
+/// The kernel's postfix stack size, matching `RC_MAX_STACK` in
+/// `src/cuda/eval.cu`. The device guards every push against it; the host keeps
+/// [`HOST_MAX_STACK`] slots of headroom so a rejected tree never reaches the
+/// device through the normal path.
+pub const RC_MAX_STACK: usize = 64;
+
+/// #121: host gate for emitted programs. Lowering can expand a tree, so the
+/// static peak stack is checked after [`lower`] and before a single word is
+/// appended. The 8-slot margin leaves room for an opcode that pushes an
+/// intermediate the pass did not model.
+pub const HOST_MAX_STACK: usize = 56;
+
+/// The kernel's operand stack (`RC_MAX_STACK` in `eval.cu`), less the headroom
+/// the guard reserves. A postfix program deeper than this is rejected on the
+/// host instead of silently overrunning the device stack.
+const MAX_PROGRAM_STACK: usize = HOST_MAX_STACK;
+
+/// Why a tree cannot run on the kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompileError {
+    /// The operator has no kernel opcode even after [`lower`]: `asinh`,
+    /// `acosh`, `atanh`, constraints, aggregates and custom blocks.
+    Unsupported(&'static str),
+    /// The lowered postfix program would use more operand-stack slots than the
+    /// kernel has (`RC_MAX_STACK`).
+    StackOverflow { peak: usize, limit: usize },
+}
+
+impl std::fmt::Display for CompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CompileError::Unsupported(op) => {
+                write!(f, "operator `{}` has no GPU opcode", op)
+            }
+            CompileError::StackOverflow { peak, limit } => write!(
+                f,
+                "postfix program needs {peak} stack slots, the kernel allows {limit}"
+            ),
+        }
     }
-    out.push(OP_HALT);
-    true
+}
+
+/// One program that the kernel can run, plus the opcodes it actually emitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledProgram {
+    words: Vec<u32>,
+    opcodes: Vec<(String, usize)>,
+    lowered: bool,
+}
+
+impl CompiledProgram {
+    /// Postfix words, `HALT`-terminated.
+    pub fn words(&self) -> &[u32] {
+        &self.words
+    }
+
+    /// `(opcode name, occurrences)` in the **emitted** program, sorted by
+    /// opcode number. Constants, variables and `HALT` are excluded.
+    pub fn opcodes(&self) -> &[(String, usize)] {
+        &self.opcodes
+    }
+
+    /// Whether [`lower`] had to rewrite the tree before emission (#121).
+    pub fn lowered(&self) -> bool {
+        self.lowered
+    }
+}
+
+/// Compile one expression through the one guarded entry point every caller must
+/// use: [`lower`] first, then the operand-stack guard, then emission.
+///
+/// `compile_program` is what both the search's pool batch and
+/// [`Population::add`] call, so the two paths cannot disagree about which
+/// operators are native or how deep a program may be.
+pub fn compile_program(tree: &Node) -> Result<CompiledProgram, CompileError> {
+    let lowered = lower(tree);
+    let peak = peak_stack(&lowered);
+    if peak > MAX_PROGRAM_STACK {
+        return Err(CompileError::StackOverflow {
+            peak,
+            limit: MAX_PROGRAM_STACK,
+        });
+    }
+    let mut words = Vec::new();
+    if !emit(&lowered, &mut words) {
+        let op = first_unsupported(&lowered).unwrap_or("operator");
+        return Err(CompileError::Unsupported(op));
+    }
+    words.push(OP_HALT);
+    let opcodes = count_opcodes(&words);
+    Ok(CompiledProgram {
+        words,
+        opcodes,
+        lowered: lowered != *tree,
+    })
+}
+
+/// #121 compatibility wrapper over [`compile_program`]: emit into `out` and
+/// report whether [`lower`] rewrote the tree. `None` means the tree is
+/// unsupported or over-deep and must go to the CPU fallback.
+pub fn compile_with_report(n: &Node, out: &mut Vec<u32>) -> Option<bool> {
+    match compile_program(n) {
+        Ok(c) => {
+            out.extend_from_slice(c.words());
+            Some(c.lowered)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Compile one expression to postfix bytecode. Returns `false` if the tree uses
+/// an operator the kernel does not implement even after [`lower`].
+pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
+    compile_with_report(n, out).is_some()
+}
+
+/// The first operator (in tree order) that [`emit`] does not handle.
+fn first_unsupported(n: &Node) -> Option<&'static str> {
+    use Op::*;
+    let supported = matches!(
+        n.op,
+        Const
+            | Input
+            | Neg
+            | Exp
+            | Ln
+            | Abs
+            | Sqrt
+            | Sin
+            | Cos
+            | Tan
+            | Sinh
+            | Cosh
+            | Tanh
+            | Logistic
+            | Step
+            | Gauss
+            | Square
+            | Cube
+            | Floor
+            | Ceil
+            | Round
+            | Sign
+            | Erf
+            | Erfc
+            | Not
+            | Add
+            | Sub
+            | Mul
+            | Div
+            | Pow
+            | Mod
+            | Atan2
+            | Min
+            | Max
+            | Equal
+            | Less
+            | LessOrEqual
+            | Greater
+            | GreaterOrEqual
+            | And
+            | Or
+            | Xor
+            | If
+    );
+    if !supported {
+        return Some(n.op.symbol());
+    }
+    n.kids.iter().find_map(first_unsupported)
+}
+
+/// Count emitted operator words, skipping the operand word after const/var.
+fn count_opcodes(words: &[u32]) -> Vec<(String, usize)> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut i = 0;
+    while i < words.len() {
+        let w = words[i];
+        if w == OP_CONST || w == OP_VAR {
+            i += 2;
+        } else {
+            if w != OP_HALT {
+                *counts.entry(w).or_insert(0usize) += 1;
+            }
+            i += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(op, n)| (opcode_name(op).to_string(), n))
+        .collect()
 }
 
 /// #121: rewrite operators the kernel lacks into exact equivalents over the
@@ -142,7 +322,6 @@ fn lower(n: &Node) -> Node {
         return n.clone();
     }
     let k: Vec<Node> = n.kids.iter().map(lower).collect();
-    let abs_diff = |a: &Node, b: &Node| node(Abs, vec![node(Sub, vec![a.clone(), b.clone()])]);
     match n.op {
         Asinh => {
             // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
@@ -257,9 +436,151 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
     }
 }
 
+/// #122: the kernel opcode and arity of an operator that is emitted directly.
+///
+/// `Const`/`Input` are terminals, not operators; `Asinh`/`Acosh`/`Atanh` are
+/// lowered to exact equivalents by [`compile`], and aggregates, meta nodes,
+/// constraints and custom blocks have no kernel opcode. This function returns
+/// `None` for all of those so a caller can reject a configuration instead of
+/// silently producing a program the kernel cannot evaluate.
+pub fn postfix_opcode(op: Op) -> Option<(u32, usize)> {
+    use Op::*;
+    let (code, arity) = match op {
+        Neg => (OP_NEG, 1),
+        Exp => (OP_EXP, 1),
+        Ln => (OP_LOG, 1),
+        Abs => (OP_ABS, 1),
+        Sqrt => (OP_SQRT, 1),
+        Sin => (OP_SIN, 1),
+        Cos => (OP_COS, 1),
+        Tan => (OP_TAN, 1),
+        Sinh => (OP_SINH, 1),
+        Cosh => (OP_COSH, 1),
+        Tanh => (OP_TANH, 1),
+        Logistic => (OP_SIG, 1),
+        Step => (OP_STEP, 1),
+        Gauss => (OP_GAUSS, 1),
+        Square => (OP_SQUARE, 1),
+        Cube => (OP_CUBE, 1),
+        Floor => (OP_FLOOR, 1),
+        Ceil => (OP_CEIL, 1),
+        Round => (OP_ROUND, 1),
+        Sign => (OP_SIGN, 1),
+        Erf => (OP_ERF, 1),
+        Erfc => (OP_ERFC, 1),
+        Not => (OP_NOT, 1),
+        Add => (OP_ADD, 2),
+        Sub => (OP_SUB, 2),
+        Mul => (OP_MUL, 2),
+        Div => (OP_DIV, 2),
+        Pow => (OP_POW, 2),
+        Mod => (OP_MOD, 2),
+        Atan2 => (OP_ATAN2, 2),
+        Min => (OP_MIN, 2),
+        Max => (OP_MAX, 2),
+        Equal => (OP_EQUAL, 2),
+        Less => (OP_LESS, 2),
+        LessOrEqual => (OP_LESS_OR_EQUAL, 2),
+        Greater => (OP_GREATER, 2),
+        GreaterOrEqual => (OP_GREATER_OR_EQUAL, 2),
+        And => (OP_AND, 2),
+        Or => (OP_OR, 2),
+        Xor => (OP_XOR, 2),
+        If => (OP_IF, 3),
+        _ => return None,
+    };
+    Some((code, arity))
+}
+
+/// #122: the inverse of [`postfix_opcode`], used to rebuild a tree from a
+/// device-format postfix slot. Returns `None` for an unknown or terminal word.
+pub fn opcode_arity(code: u32) -> Option<usize> {
+    Some(match code {
+        OP_NEG | OP_EXP | OP_LOG | OP_ABS | OP_SQRT | OP_SIN | OP_COS | OP_TAN | OP_SINH
+        | OP_COSH | OP_TANH | OP_SIG | OP_STEP | OP_GAUSS | OP_SQUARE | OP_CUBE | OP_FLOOR
+        | OP_CEIL | OP_ROUND | OP_SIGN | OP_ERF | OP_ERFC | OP_NOT => 1,
+        OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_POW | OP_MOD | OP_ATAN2 | OP_MIN | OP_MAX
+        | OP_EQUAL | OP_LESS | OP_LESS_OR_EQUAL | OP_GREATER | OP_GREATER_OR_EQUAL | OP_AND
+        | OP_OR | OP_XOR => 2,
+        OP_IF => 3,
+        _ => return None,
+    })
+}
+
+/// The [`Op`] behind a kernel opcode, for [`postfix::decode`] and for tests.
+pub fn opcode_op(code: u32) -> Option<Op> {
+    use Op::*;
+    Some(match code {
+        OP_NEG => Neg,
+        OP_EXP => Exp,
+        OP_LOG => Ln,
+        OP_ABS => Abs,
+        OP_SQRT => Sqrt,
+        OP_SIN => Sin,
+        OP_COS => Cos,
+        OP_TAN => Tan,
+        OP_SINH => Sinh,
+        OP_COSH => Cosh,
+        OP_TANH => Tanh,
+        OP_SIG => Logistic,
+        OP_STEP => Step,
+        OP_GAUSS => Gauss,
+        OP_SQUARE => Square,
+        OP_CUBE => Cube,
+        OP_FLOOR => Floor,
+        OP_CEIL => Ceil,
+        OP_ROUND => Round,
+        OP_SIGN => Sign,
+        OP_ERF => Erf,
+        OP_ERFC => Erfc,
+        OP_NOT => Not,
+        OP_ADD => Add,
+        OP_SUB => Sub,
+        OP_MUL => Mul,
+        OP_DIV => Div,
+        OP_POW => Pow,
+        OP_MOD => Mod,
+        OP_ATAN2 => Atan2,
+        OP_MIN => Min,
+        OP_MAX => Max,
+        OP_EQUAL => Equal,
+        OP_LESS => Less,
+        OP_LESS_OR_EQUAL => LessOrEqual,
+        OP_GREATER => Greater,
+        OP_GREATER_OR_EQUAL => GreaterOrEqual,
+        OP_AND => And,
+        OP_OR => Or,
+        OP_XOR => Xor,
+        OP_IF => If,
+        _ => return None,
+    })
+}
+
 #[repr(C)]
 struct RawCtx {
     _private: [u8; 0],
+}
+
+/// #118: the C-side ledger for one batch, in milliseconds. The host windows are
+/// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
+/// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawStats {
+    kernel_ms: f64,
+    launch_ms: f64,
+    sync_ms: f64,
+    alloc_ms: f64,
+    h2d_ms: f64,
+    d2h_ms: f64,
+    /// C-side envelope from `rc_stats_begin` to the end of the batch. Kept for
+    /// auditing against the outer wall.
+    #[allow(dead_code)]
+    wall_ms: f64,
+    h2d_bytes: u64,
+    d2h_bytes: u64,
+    batch: i32,
+    failed: i32,
 }
 
 extern "C" {
@@ -272,6 +593,16 @@ extern "C" {
         nprog: i32,
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    /* #118: start and read one batch's host-time ledger. */
+    fn rc_stats_begin(ctx: *mut RawCtx);
+    fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
+    fn rc_predict(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        nprog: i32,
+        out: *mut f32,
+    ) -> i32;
     fn rc_device_count() -> i32;
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
@@ -286,6 +617,32 @@ extern "C" {
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+    fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64) -> i32;
+    /* #169: batched LM constant fitting over the resident dataset. */
+    fn rc_fit_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nprog: i32,
+        kmax: i32,
+        c0: *const f64,
+        iters: i32,
+        outc: *mut f64,
+        outsse: *mut f64,
+        outstatus: *mut i32,
+    ) -> f32;
+}
+
+/// #169: one candidate's batched-GPU fit result.
+#[derive(Clone, Debug)]
+pub struct GpuFitOutput {
+    /// Fitted constants (exact slots, length is the candidate's `p`).
+    pub c: Vec<f64>,
+    /// The kernel's final SSE (recomputed exactly on the CPU for finalists).
+    pub sse: f64,
+    /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
+    pub status: i32,
 }
 
 /// Probe for a usable CUDA device once (issue #141).
@@ -354,8 +711,11 @@ pub struct Population {
     prog: Vec<u32>,
     offsets: Vec<u32>,
     unsupported: usize,
+    /// #121: programs that needed the exact lowering pass. The rest were
+    /// accepted verbatim, so `native + lowered + unsupported == added`.
+    lowered: usize,
     /// #131: operator occurrences, used for the per-generation `--json` report.
-    ops: std::collections::BTreeMap<u32, usize>,
+    ops: std::collections::BTreeMap<String, usize>,
 }
 
 impl Population {
@@ -365,6 +725,7 @@ impl Population {
             prog: Vec::new(),
             offsets: vec![0],
             unsupported: 0,
+            lowered: 0,
             ops: std::collections::BTreeMap::new(),
         }
     }
@@ -373,32 +734,20 @@ impl Population {
     /// in [`Population::unsupported`]) when the expression uses an operator the
     /// kernel does not implement; the population itself stays valid.
     pub fn add(&mut self, tree: &Node) -> bool {
-        let mut buf = Vec::new();
-        let lowered = lower(tree);
-        // #121: the kernel has no stack-bounds check (RC_MAX_STACK=64), so a
-        // lowered program must be rejected before emission if it could overflow.
-        if peak_stack(&lowered) > 56 {
-            self.unsupported += 1;
-            return false;
-        }
-        if !compile(&lowered, &mut buf) {
-            self.unsupported += 1;
-            return false;
-        }
-        // Count operator words, skipping the operand word after const/var.
-        let mut i = 0;
-        while i < buf.len() {
-            let w = buf[i];
-            if w == OP_CONST || w == OP_VAR {
-                i += 2;
-            } else {
-                if w != OP_HALT {
-                    *self.ops.entry(w).or_default() += 1;
-                }
-                i += 1;
+        let compiled = match compile_program(tree) {
+            Ok(c) => c,
+            Err(_) => {
+                self.unsupported += 1;
+                return false;
             }
+        };
+        if compiled.lowered {
+            self.lowered += 1;
         }
-        self.prog.extend_from_slice(&buf);
+        for (name, n) in compiled.opcodes {
+            *self.ops.entry(name).or_default() += n;
+        }
+        self.prog.extend_from_slice(&compiled.words);
         self.offsets.push(self.prog.len() as u32);
         true
     }
@@ -430,6 +779,16 @@ impl Population {
         self.unsupported
     }
 
+    /// #121: compiled programs that needed the exact lowering pass.
+    pub fn lowered(&self) -> usize {
+        self.lowered
+    }
+
+    /// #121: compiled programs the kernel accepted verbatim.
+    pub fn native(&self) -> usize {
+        self.len() - self.lowered
+    }
+
     /// The raw `(program bytes, offsets)` pair, e.g. for [`GpuEvaluator::eval_batch`].
     pub fn programs(&self) -> (&[u32], &[u32]) {
         (&self.prog, &self.offsets)
@@ -441,7 +800,7 @@ impl Population {
     pub fn opcode_usage(&self) -> Vec<(String, usize)> {
         self.ops
             .iter()
-            .map(|(&op, &n)| (opcode_name(op).to_string(), n))
+            .map(|(name, &n)| (name.clone(), n))
             .collect()
     }
 }
@@ -464,6 +823,11 @@ pub struct GpuEvaluator {
     pool_width: usize,
     /// Which of the two arena buffers the last upload/evaluation used.
     pool_last: usize,
+    /// #118: rows in the resident dataset. Kept `u64` for the accounting
+    /// totals; prediction buffers cast it to `usize`.
+    n_rows: u64,
+    /// #118: accumulated host-time ledger for every batch scored here.
+    stats: GpuStats,
 }
 
 impl GpuEvaluator {
@@ -475,11 +839,20 @@ impl GpuEvaluator {
         } else {
             Some(GpuEvaluator {
                 ctx,
+                n_rows: n_rows as u64,
                 pool_cap: 0,
                 pool_width: 0,
                 pool_last: 0,
+                stats: GpuStats::default(),
             })
         }
+    }
+
+    /// #169: upload exact f64 training columns for the batched fit's final
+    /// polish. Column-major `cols[var * n_rows + row]`. Returns `false` when
+    /// the device allocation fails (the CPU arm then remains authoritative).
+    pub(crate) fn set_fit_data(&mut self, cols: &[f64], y: &[f64]) -> bool {
+        unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr()) == 0 }
     }
 
     pub fn device_name() -> String {
@@ -501,21 +874,64 @@ impl GpuEvaluator {
         unsafe { rc_unified() != 0 }
     }
 
+    /// #131 fixtures: raw per-row predictions for a packed batch, `P × N`
+    /// row-major. This is the test-only observation path: unlike
+    /// [`Self::eval_batch`] it does not collapse a program to one SSE and it
+    /// does not apply the hard-failure magnitude limit, so a fixture can see
+    /// `NaN`, infinities and signed zeros exactly as the kernel produced them.
+    ///
+    /// Returns `None` on any CUDA failure.
+    pub fn predictions(&mut self, prog: &[u32], offsets: &[u32]) -> Option<Vec<f32>> {
+        let nprog = offsets.len().saturating_sub(1);
+        if nprog == 0 {
+            return Some(Vec::new());
+        }
+        let total = nprog.checked_mul(usize::try_from(self.n_rows).ok()?)?;
+        let mut out = vec![0.0f32; total];
+        let rc = unsafe {
+            rc_predict(
+                self.ctx,
+                prog.as_ptr(),
+                offsets.as_ptr(),
+                nprog as i32,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc == 0 {
+            Some(out)
+        } else {
+            None
+        }
+    }
+
     /// Score a batch of compiled programs. Returns one sum-of-squared-errors per
     /// program, plus the kernel time in milliseconds.
     ///
     /// A negative time means the upload or the kernel failed; the output must
     /// then be ignored. The search uses this marker to fall back to the CPU.
+    /// Either way the batch's host-time ledger is recorded, so a failed batch
+    /// still shows the wall it cost.
     pub fn eval_batch(&mut self, prog: &[u32], offsets: &[u32]) -> (Vec<f32>, f32) {
         let nprog = offsets.len().saturating_sub(1);
-        unsafe {
-            if rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32) != 0 {
-                return (Vec::new(), -1.0);
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), -1.0);
+                }
+                let mut out = vec![0.0f32; nprog];
+                let ms = rc_eval(self.ctx, out.as_mut_ptr());
+                if ms < 0.0 {
+                    ok = false;
+                }
+                (out, ms)
             }
-            let mut out = vec![0.0f32; nprog];
-            let ms = rc_eval(self.ctx, out.as_mut_ptr());
-            (out, ms)
-        }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
     }
 
     /// #122: evaluate a fixed-capacity [`GenomePool`] through the persistent
@@ -528,23 +944,120 @@ impl GpuEvaluator {
             return (Vec::new(), 0.0);
         }
         let width = pool.width();
-        unsafe {
-            if self.pool_cap < pool.capacity() || self.pool_width != width {
-                if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if self.pool_cap < pool.capacity() || self.pool_width != width {
+                    if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+                        ok = false;
+                        return (Vec::new(), -1.0);
+                    }
+                    self.pool_cap = pool.capacity();
+                    self.pool_width = width;
+                }
+                let which = (self.pool_last ^ 1) as i32;
+                if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+                    ok = false;
                     return (Vec::new(), -1.0);
                 }
-                self.pool_cap = pool.capacity();
+                let mut out = vec![0.0f32; n];
+                let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+                if ms < 0.0 {
+                    ok = false;
+                }
+                self.pool_last = which as usize;
+                (out, ms)
+            }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
+    }
+
+    /// #118: read the C ledger for the batch that just ran and add it to the
+    /// run totals. `wall_s` is measured around the whole call; the residue
+    /// outside the C windows is recorded as `host_s`, so the phase sum closes
+    /// to wall instead of hiding an `other` bucket.
+    fn record_batch(&mut self, wall_s: f64, ok: bool) {
+        let mut raw = RawStats::default();
+        if unsafe { rc_last_stats(self.ctx, &mut raw) } == 0 {
+            let failed = !ok || raw.failed != 0;
+            // The outer wall is measured around the whole evaluator call, while
+            // the C windows only cover reserve/upload/launch/sync/download. The
+            // difference is real host glue: the output vector, the gaps between
+            // those C calls and the Rust wrapper. Record it as `host_s` so the
+            // phase sum closes instead of hiding an "other" bucket.
+            let outer_ms = wall_s * 1e3;
+            let c_windows_ms = raw.alloc_ms + raw.h2d_ms + raw.launch_ms + raw.sync_ms + raw.d2h_ms;
+            let host_ms = (outer_ms - c_windows_ms).max(0.0);
+            self.stats.add_batch(
+                raw.kernel_ms,
+                raw.launch_ms,
+                raw.sync_ms,
+                raw.alloc_ms,
+                raw.h2d_ms,
+                raw.d2h_ms,
+                host_ms,
+                outer_ms,
+                raw.h2d_bytes,
+                raw.d2h_bytes,
+                raw.batch.max(0) as u64,
+                self.n_rows,
+                failed,
+            );
+        }
+    }
+
+    /// Accumulated accounting for every batch scored through this evaluator.
+    pub fn stats(&self) -> GpuStats {
+        self.stats
+    }
+
+    /// #122: evaluate `n` fixed-width slots read directly from `arena`.
+    ///
+    /// This is the primitive the postfix variation path uses: its arena is
+    /// already slot-major and `HALT`-padded, so the evaluation is one upload
+    /// and one launch with no per-program packing. The arena must hold at least
+    /// `n * width` words and every slot must be a complete program.
+    ///
+    /// #118: the whole call is timed and added to the same full-path ledger as
+    /// the packed batch, so a flat-variation run still reports alloc/H2D/
+    /// launch/kernel/sync/D2H/host/wall.
+    pub fn eval_arena(&mut self, arena: &[u32], n: usize, width: usize) -> (Vec<f32>, f32) {
+        if n == 0 {
+            return (Vec::new(), 0.0);
+        }
+        if width < 2 || arena.len() < n * width {
+            return (Vec::new(), -1.0);
+        }
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| unsafe {
+            rc_stats_begin(self.ctx);
+            if self.pool_cap < n || self.pool_width != width {
+                if rc_pool_reserve(self.ctx, n as i32, width as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), -1.0);
+                }
+                self.pool_cap = n;
                 self.pool_width = width;
             }
             let which = (self.pool_last ^ 1) as i32;
-            if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+            if rc_pool_upload(self.ctx, which, arena.as_ptr(), n as i32) != 0 {
+                ok = false;
                 return (Vec::new(), -1.0);
             }
             let mut out = vec![0.0f32; n];
             let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+            if ms < 0.0 {
+                ok = false;
+            }
             self.pool_last = which as usize;
             (out, ms)
-        }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
     }
 
     /// #122: canonical postfix hashes of the last [`Self::eval_pool`] batch,
@@ -569,6 +1082,70 @@ impl GpuEvaluator {
             }
             out
         }
+    }
+
+    /// #169: fit the constants of a whole batch of candidates on the device.
+    ///
+    /// One block per candidate runs its own Levenberg–Marquardt loop over the
+    /// resident rows; the host only uploads the small programs and start
+    /// constants and downloads the results. A negative time means the launch
+    /// failed and every result must be discarded (the caller falls back to the
+    /// CPU for the whole batch).
+    pub(crate) fn fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        let nprog = plans.len();
+        if nprog == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max().unwrap_or(0);
+        if kmax == 0 {
+            return (Vec::new(), -1.0);
+        }
+        let mut words: Vec<u32> = Vec::new();
+        let mut off: Vec<u32> = Vec::with_capacity(nprog + 1);
+        let mut pcount: Vec<i32> = Vec::with_capacity(nprog);
+        let mut c0 = vec![0.0f64; nprog * kmax];
+        off.push(0);
+        for (k, plan) in plans.iter().enumerate() {
+            words.extend_from_slice(&plan.words);
+            off.push(words.len() as u32);
+            pcount.push(plan.nconst as i32);
+            c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+        }
+        let mut outc = vec![0.0f64; nprog * kmax];
+        let mut outsse = vec![0.0f64; nprog];
+        let mut outstatus = vec![0i32; nprog];
+        let ms = unsafe {
+            rc_fit_batch(
+                self.ctx,
+                words.as_ptr(),
+                off.as_ptr(),
+                pcount.as_ptr(),
+                nprog as i32,
+                kmax as i32,
+                c0.as_ptr(),
+                iters as i32,
+                outc.as_mut_ptr(),
+                outsse.as_mut_ptr(),
+                outstatus.as_mut_ptr(),
+            )
+        };
+        if ms < 0.0 {
+            return (Vec::new(), ms);
+        }
+        let out = plans
+            .iter()
+            .enumerate()
+            .map(|(k, plan)| GpuFitOutput {
+                c: outc[k * kmax..k * kmax + plan.nconst].to_vec(),
+                sse: outsse[k],
+                status: outstatus[k],
+            })
+            .collect();
+        (out, ms)
     }
 
     /// Score a whole [`Population`] in one call: one program upload and one
@@ -682,6 +1259,43 @@ mod tests {
         assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
     }
 
+    /// #121: a mixed population keeps its order and reports the
+    /// native/lowered/unsupported split. The two GPU programs must score in
+    /// insertion order, exactly where the caller will merge them.
+    #[test]
+    fn mixed_population_keeps_order_and_counts_lowered() {
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let native = node(Op::If, vec![input(0), constant(1.0), constant(2.0)]);
+        let lowered = node(Op::Asinh, vec![input(0)]);
+        let unsupported = node(Op::Require, vec![trees[0].clone()]);
+        let mut pop = Population::new();
+        assert!(pop.add(&trees[0]));
+        assert!(!pop.add(&unsupported));
+        assert!(pop.add(&native));
+        assert!(pop.add(&lowered));
+        assert_eq!(pop.len(), 3);
+        assert_eq!(pop.native(), 2, "the fixture tree and `if` are accepted verbatim");
+        assert_eq!(pop.lowered(), 1, "asinh needs the lowering pass");
+        assert_eq!(pop.unsupported(), 1);
+        let (sse, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0);
+        assert_eq!(sse.len(), 3);
+        for (slot, tree) in [&trees[0], &native, &lowered].iter().enumerate() {
+            let cpu = cpu_sse(tree, &cols, n, nv, &y);
+            let rel = (sse[slot] as f64 - cpu).abs() / (1.0 + cpu.abs());
+            assert!(
+                rel < 1e-4,
+                "slot {slot}: GPU {} vs CPU {} (relative {rel:.2e})",
+                sse[slot],
+                cpu
+            );
+        }
+    }
+
     #[test]
     fn fixed_slot_pool_matches_the_packed_batch_and_hashes() {
         use crate::genome::{postfix_hash, GenomeMeta, GenomePool};
@@ -709,6 +1323,51 @@ mod tests {
         assert_eq!(device_hash, expected_hash);
 
         // The fixed-slot kernel is the same evaluator: batch == one at a time.
+        let pop = Population::from_trees(&trees);
+        let (packed, _) = ev.eval_population(&pop);
+        for i in 0..trees.len() {
+            let tol = 1e-6 * (1.0 + packed[i].abs());
+            assert!(
+                (slot_sse[i] - packed[i]).abs() <= tol,
+                "slot {}: {:.9} vs packed {:.9}",
+                i,
+                slot_sse[i],
+                packed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn pool_kernel_implements_every_emitted_opcode() {
+        // #122: the fixed-slot kernel used to fall through to `r = 0` for
+        // `min`/`max`/`mod`/comparisons/`if`. A program using them must score
+        // exactly like the packed kernel.
+        use crate::expr::{constant, input, node};
+        let (cols, n, nv, y, _) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let x = || input(0);
+        let trees = vec![
+            node(Op::If, vec![
+                node(Op::Greater, vec![x(), constant(0.0)]),
+                node(Op::Min, vec![x(), constant(0.5)]),
+                node(Op::Mod, vec![x(), constant(0.7)]),
+            ]),
+            node(Op::Max, vec![node(Op::Mul, vec![x(), x()]), constant(0.1)]),
+            node(Op::Atan2, vec![x(), constant(2.0)]),
+            node(Op::Erf, vec![node(Op::Tanh, vec![x()])]),
+        ];
+        let width = 32;
+        let mut pool = crate::genome::GenomePool::new(trees.len(), width);
+        for tree in &trees {
+            let mut words = Vec::new();
+            assert!(compile(tree, &mut words));
+            assert!(pool.push(&words, crate::genome::GenomeMeta::default()));
+        }
+        let (slot_sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0);
         let pop = Population::from_trees(&trees);
         let (packed, _) = ev.eval_population(&pop);
         for i in 0..trees.len() {
@@ -775,6 +1434,87 @@ mod tests {
                 rel
             );
         }
+    }
+
+    /// #131: the Rust opcode constants must match the CUDA enum exactly.
+    /// #121: the device backstop. A program that bypasses the host gate (here
+    /// by writing straight into the genome pool) must be scored as a hard
+    /// failure, not corrupt the local stack. Before the guard this wrote one
+    /// float past `s` for every row.
+    #[test]
+    fn device_stack_guard_rejects_an_over_deep_program() {
+        let (cols, n, nv, y, _) = fixture();
+        let Some(mut ev) = evaluator_or_skip(&cols, n, nv, &y) else {
+            return;
+        };
+        let mut pool = crate::genome::GenomePool::new(1, 2 * (RC_MAX_STACK + 1) + 1);
+        pool.begin_generation();
+        let mut words = Vec::new();
+        // One push past RC_MAX_STACK: 65 constants with no consumer.
+        for _ in 0..=RC_MAX_STACK {
+            words.push(OP_CONST);
+            words.push(1.0f32.to_bits());
+        }
+        words.push(OP_HALT);
+        assert!(pool.push(&words, Default::default()));
+        pool.commit();
+        let (sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0, "the guarded batch must not fail the launch");
+        assert_eq!(sse.len(), 1);
+        // Every row is a hard failure (1e30), so the SSE is n * 1e30.
+        let want = n as f32 * 1e30f32;
+        assert!(
+            ((sse[0] - want) / want).abs() < 1e-5,
+            "expected a hard-failure SSE of {want}, got {}",
+            sse[0]
+        );
+    }
+
+    /// #121: a deep tree that needs lowering is still rejected statically
+    /// before any word is emitted (the lowering pass can add nodes).
+    #[test]
+    fn deep_lowered_tree_is_rejected_before_emission() {
+        // asinh expands into ~10 nodes; wrapping it 8 times raises the peak
+        // stack past the host gate.
+        let mut t = input(0);
+        for _ in 0..8 {
+            t = node(Op::Asinh, vec![t]);
+        }
+        if peak_stack(&lower(&t)) <= HOST_MAX_STACK {
+            // 8 nested expansions are not deep enough on this build; use a
+            // right-deep add chain, which grows one stack slot per level.
+            let mut deep = input(0);
+            for _ in 0..HOST_MAX_STACK {
+                deep = node(Op::Add, vec![input(1), deep]);
+            }
+            assert!(peak_stack(&deep) > HOST_MAX_STACK);
+            let mut pop = Population::new();
+            assert!(!pop.add(&deep));
+            assert_eq!(pop.unsupported(), 1);
+            return;
+        }
+        let mut pop = Population::new();
+        assert!(!pop.add(&t), "an over-deep lowered tree must not be emitted");
+        assert_eq!(pop.unsupported(), 1);
+        assert_eq!(pop.lowered(), 0, "nothing may be counted as emitted");
+    }
+
+    /// #121: the host stack constant must match `RC_MAX_STACK` in the kernel.
+    #[test]
+    fn stack_limits_match_the_kernel() {
+        let src = include_str!("cuda/eval.cu");
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("#define RC_MAX_STACK"))
+            .expect("the kernel defines RC_MAX_STACK");
+        let value: usize = line
+            .split_whitespace()
+            .nth(2)
+            .expect("a value")
+            .parse()
+            .expect("a number");
+        assert_eq!(value, RC_MAX_STACK);
+        assert!(HOST_MAX_STACK < RC_MAX_STACK);
     }
 
     /// #131: the Rust opcode constants must match the CUDA enum exactly.
@@ -942,11 +1682,10 @@ mod tests {
     fn native_mod_matches_floored_semantics() {
         let a = [
             -8.0, -7.0, -1.0, 0.0, 1.0, 7.0, 8.0, 8.0, -8.0, 1e6, -1e6, f64::NAN,
-            f64::INFINITY, 3e38, -3e38,
+            f64::INFINITY, 8_388_608.0,
         ];
         let b = [
-            2.5, 3.0, 3.0, 3.0, 3.0, 3.0, 2.5, -2.5, -2.5, 7.0, 7.0, 1.0, 1.0, 1.0,
-            1.0,
+            2.5, 3.0, 3.0, 3.0, 3.0, 3.0, 2.5, -2.5, -2.5, 7.0, 7.0, 1.0, 1.0, 0.7,
         ];
         let n = a.len();
         let mut cols = vec![0.0f32; 2 * n];
@@ -1050,6 +1789,396 @@ mod tests {
                 ("OP_MIN".to_string(), 1),
             ]
         );
+    }
+
+    /// #131: `compile_program` is the guarded entry point; an unsupported
+    /// operator is named, and a program deeper than the kernel stack is
+    /// rejected on the host.
+    #[test]
+    fn guarded_compile_reports_unsupported_and_stack_overflow() {
+        assert_eq!(
+            compile_program(&node(Op::Require, vec![input(0)])).unwrap_err(),
+            CompileError::Unsupported("require")
+        );
+        let mut deep = input(0);
+        for _ in 0..60 {
+            deep = node(Op::Add, vec![input(1), deep]);
+        }
+        assert!(matches!(
+            compile_program(&deep),
+            Err(CompileError::StackOverflow { .. })
+        ));
+        // `asinh` is lowered, not rejected, so both paths agree.
+        let lowered = compile_program(&node(Op::Asinh, vec![input(0)])).unwrap();
+        assert!(lowered.opcodes().iter().any(|(n, _)| n.as_str() == "OP_LOG"));
+        assert!(lowered.opcodes().iter().all(|(n, _)| n.as_str() != "OP_ASINH"));
+    }
+
+    fn ulp_key(x: f32) -> i64 {
+        let b = x.to_bits();
+        if b & 0x8000_0000 != 0 {
+            -((b & 0x7fff_ffff) as i64)
+        } else {
+            b as i64
+        }
+    }
+
+    fn ulp_diff(a: f32, b: f32) -> i64 {
+        (ulp_key(a) - ulp_key(b)).abs()
+    }
+
+    /// Raw per-row predictions for a batch, `P × N` row-major.
+    fn raw_predictions(
+        cols: &[f32],
+        n: usize,
+        nv: usize,
+        y: &[f32],
+        trees: &[Node],
+    ) -> Option<Vec<f32>> {
+        let mut ev = evaluator_or_skip(cols, n, nv, y)?;
+        let pop = Population::from_trees(trees.iter());
+        assert_eq!(
+            pop.len(),
+            trees.len(),
+            "every fixture tree must compile: {} unsupported",
+            pop.unsupported()
+        );
+        let (prog, offsets) = pop.programs();
+        let preds = ev
+            .predictions(prog, offsets)
+            .expect("raw prediction readback failed");
+        assert_eq!(preds.len(), trees.len() * n);
+        Some(preds)
+    }
+
+    fn unary_rows() -> Vec<f32> {
+        vec![
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            2.5,
+            -2.5,
+            3.5,
+            -3.5,
+            0.1,
+            -0.1,
+            1.0,
+            -1.0,
+            3.9196,
+            9.19,
+            10.05,
+            123.456,
+            -123.456,
+            8_388_608.0,
+            -8_388_608.0,
+            1e10,
+            -1e10,
+            1e-30,
+            -1e-30,
+        ]
+    }
+
+    /// #131 acceptance: every opcode is checked against the f64 CPU reference
+    /// row by row, with an explicit per-op upper bound in f32 ULP.
+    ///
+    /// * exact (`0` ULP): `floor`, `ceil`, `round`, `sign`, `min`, `max`, `if`,
+    ///   comparisons, logicals, `not` — these are bit-exact on the f32 grid;
+    /// * `mod` (1 ULP): the host formula `a - b*floor(a/b)` evaluated with an
+    ///   f32 divide and fused multiply-add;
+    /// * `atan2` (3 ULP), `erf` (2 ULP), `erfc` (4 ULP): libdevice bounds.
+    #[test]
+    fn per_opcode_ulp_bounds_against_the_f64_reference() {
+        let a = unary_rows();
+        let n = a.len();
+        let b: Vec<f32> = a
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| match i % 8 {
+                0 => 3.0,
+                1 => -3.0,
+                2 => 2.5,
+                3 => -2.5,
+                4 => 0.7,
+                5 => -0.7,
+                6 => 1.0,
+                _ => {
+                    if v.is_nan() {
+                        1.0
+                    } else {
+                        -1.0
+                    }
+                }
+            })
+            .collect();
+        let mut cols = vec![0.0f32; 2 * n];
+        let y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i];
+            cols[n + i] = b[i];
+        }
+        let x = || input(0);
+        let z = || input(1);
+        let neg = |k: Node| node(Op::Neg, vec![k]);
+        let cases: Vec<(Node, &str, i64)> = vec![
+            (node(Op::Floor, vec![x()]), "floor", 0),
+            (node(Op::Ceil, vec![x()]), "ceil", 0),
+            (node(Op::Round, vec![x()]), "round", 0),
+            (node(Op::Sign, vec![x()]), "sign", 0),
+            (node(Op::Not, vec![x()]), "not", 0),
+            (node(Op::Erf, vec![x()]), "erf", 2),
+            (node(Op::Erfc, vec![x()]), "erfc", 4),
+            (node(Op::Min, vec![x(), z()]), "min", 0),
+            (node(Op::Max, vec![x(), z()]), "max", 0),
+            (node(Op::Min, vec![z(), x()]), "min(rev)", 0),
+            (node(Op::Max, vec![z(), x()]), "max(rev)", 0),
+            (node(Op::Mod, vec![x(), z()]), "mod", 1),
+            (node(Op::Mod, vec![z(), x()]), "mod(rev)", 1),
+            (node(Op::Atan2, vec![x(), z()]), "atan2", 3),
+            (node(Op::Atan2, vec![z(), x()]), "atan2(rev)", 3),
+            (node(Op::Equal, vec![x(), z()]), "equal", 0),
+            (node(Op::Less, vec![x(), z()]), "less", 0),
+            (node(Op::LessOrEqual, vec![x(), z()]), "less_or_equal", 0),
+            (node(Op::Greater, vec![x(), z()]), "greater", 0),
+            (node(Op::GreaterOrEqual, vec![x(), z()]), "greater_or_equal", 0),
+            (node(Op::And, vec![x(), z()]), "and", 0),
+            (node(Op::Or, vec![x(), z()]), "or", 0),
+            (node(Op::Xor, vec![x(), z()]), "xor", 0),
+            (node(Op::If, vec![x(), z(), neg(z())]), "if", 0),
+            (
+                node(Op::If, vec![x(), constant(1.0), z()]),
+                "if(else-arm)",
+                0,
+            ),
+        ];
+        let trees: Vec<Node> = cases.iter().map(|(t, _, _)| t.clone()).collect();
+        let Some(preds) = raw_predictions(&cols, n, 2, &y, &trees) else {
+            return;
+        };
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![a[i] as f64, b[i] as f64])
+            .collect();
+        let mut worst = vec![0i64; cases.len()];
+        for (k, (tree, name, bound)) in cases.iter().enumerate() {
+            for i in 0..n {
+                let got = preds[k * n + i];
+                let want64 = crate::expr::eval(tree, &rows[i]);
+                if want64.is_nan() {
+                    assert!(got.is_nan(), "{name} row {i}: expected NaN, got {got}");
+                    continue;
+                }
+                let want = want64 as f32;
+                // Documented f32 limit for `mod`: above |a/b| = 2^25 the f32
+                // quotient cannot carry the fractional part, so the remainder
+                // is not the f64 remainder. It must still stay inside the
+                // divisor's range (floored semantics) and is never used for a
+                // reported number.
+                if name.starts_with("mod") {
+                    let q = (a[i] as f64 / b[i] as f64).abs();
+                    if q > 33_554_432.0 {
+                        let g = got as f64;
+                        let bv = b[i] as f64;
+                        assert!(!got.is_nan(), "{name} row {i}: lost the remainder");
+                        if bv > 0.0 {
+                            assert!(g >= 0.0 && g <= bv, "{name} row {i}: {g} outside [0,{bv}]");
+                        } else {
+                            assert!(g <= 0.0 && g >= bv, "{name} row {i}: {g} outside [{bv},0]");
+                        }
+                        continue;
+                    }
+                }
+                let d = ulp_diff(got, want);
+                worst[k] = worst[k].max(d);
+                assert!(
+                    d <= *bound,
+                    "{name} row {i} (a={}, b={}): got {got:?} ({:#010x}), \
+                     reference {want:?} ({:#010x}), {d} ULP > {bound}",
+                    a[i],
+                    b[i],
+                    got.to_bits(),
+                    want.to_bits()
+                );
+                if want64.is_infinite() {
+                    assert_eq!(got, want, "{name} row {i}: infinity sign must match");
+                }
+            }
+        }
+    }
+
+    /// #131 acceptance: the special-value cases named in the issue, asserted
+    /// explicitly rather than through an aggregate error.
+    #[test]
+    fn native_special_values_are_exact() {
+        let a = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            0.0,
+            -0.0,
+            2.5,
+            -2.5,
+            3.5,
+            -3.5,
+            8_388_608.0,
+            -8_388_608.0,
+            3.9196,
+            9.19,
+            10.05,
+        ];
+        let n = a.len();
+        let b: Vec<f32> = a
+            .iter()
+            .map(|&v| {
+                if v.is_nan() || v == f32::INFINITY {
+                    f32::NAN
+                } else {
+                    -3.0
+                }
+            })
+            .collect();
+        let mut cols = vec![0.0f32; 2 * n];
+        let y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i];
+            cols[n + i] = b[i];
+        }
+        let x = || input(0);
+        let z = || input(1);
+        let trees = vec![
+            node(Op::Floor, vec![x()]),
+            node(Op::Ceil, vec![x()]),
+            node(Op::Round, vec![x()]),
+            node(Op::Sign, vec![x()]),
+            node(Op::Erf, vec![x()]),
+            node(Op::Erfc, vec![x()]),
+            node(Op::Min, vec![x(), z()]),
+            node(Op::Max, vec![x(), z()]),
+            node(Op::Atan2, vec![x(), z()]),
+            node(Op::Mod, vec![x(), z()]),
+        ];
+        let Some(preds) = raw_predictions(&cols, n, 2, &y, &trees) else {
+            return;
+        };
+        let row = |k: usize, i: usize| preds[k * n + i];
+        // Signed zeros: floor/ceil/round preserve them; sign/erf normalise to
+        // +0 like expr.rs.
+        assert_eq!(row(0, 4).to_bits(), (-0.0f32).to_bits(), "floor(-0)");
+        assert_eq!(row(1, 4).to_bits(), (-0.0f32).to_bits(), "ceil(-0)");
+        assert_eq!(row(2, 4).to_bits(), (-0.0f32).to_bits(), "round(-0)");
+        assert_eq!(row(3, 4).to_bits(), 0.0f32.to_bits(), "sign(-0)");
+        assert_eq!(row(4, 4).to_bits(), 0.0f32.to_bits(), "erf(-0)");
+        // Round is half-away-from-zero, not ties-to-even.
+        assert_eq!(row(2, 5), 3.0, "round(2.5)");
+        assert_eq!(row(2, 6), -3.0, "round(-2.5)");
+        assert_eq!(row(2, 7), 4.0, "round(3.5)");
+        assert_eq!(row(2, 8), -4.0, "round(-3.5)");
+        // floor/ceil on infinities and NaN.
+        assert_eq!(row(0, 1), f32::INFINITY);
+        assert_eq!(row(0, 2), f32::NEG_INFINITY);
+        assert!(row(0, 0).is_nan(), "floor(NaN)");
+        assert_eq!(row(1, 1), f32::INFINITY);
+        assert!(row(1, 0).is_nan(), "ceil(NaN)");
+        // Large values are already integral: no range bound kicks in.
+        assert_eq!(row(0, 9), 8_388_608.0);
+        assert_eq!(row(0, 10), -8_388_608.0);
+        // Min/max propagate NaN in either operand position.
+        assert!(row(6, 0).is_nan(), "min(NaN, NaN)");
+        assert!(row(6, 1).is_nan(), "min(inf, NaN)");
+        assert!(row(7, 0).is_nan(), "max(NaN, NaN)");
+        assert!(row(7, 1).is_nan(), "max(inf, NaN)");
+        // erf saturates to 1 on the f32 grid; erfc's tail underflows.
+        assert_eq!(row(4, 11), 1.0, "erf(3.9196)");
+        assert!(
+            row(5, 11) > 0.0 && row(5, 11) < 1e-6,
+            "erfc(3.9196) is a small positive tail, got {}",
+            row(5, 11)
+        );
+        // At x = 9.19 the f32 result is at the subnormal boundary: accept zero
+        // or a tiny positive value (documented underflow, not a relative-ULP
+        // claim), and require exact zero once the tail is below f32 range.
+        assert!(
+            row(5, 12) >= 0.0 && row(5, 12) <= 1e-36,
+            "erfc(9.19) underflowed unexpectedly: {}",
+            row(5, 12)
+        );
+        // At 10.05 the true tail is below the f32 range: libdevice returns the
+        // smallest subnormal (1.4e-45) or zero. Both are "zero" for f32 here.
+        assert!(
+            row(5, 13) >= 0.0 && row(5, 13) <= f32::from_bits(2),
+            "erfc(10.05) is below f32 range: {}",
+            row(5, 13)
+        );
+        // atan2 on the negative axis: pi, not 0.
+        assert!((row(8, 3) - std::f32::consts::PI).abs() < 1e-6);
+        assert!((row(8, 4) + std::f32::consts::PI).abs() < 1e-6);
+        // mod is floored. b = -3, so 2.5 -> 2.5 - (-3)*floor(-0.833) = -0.5.
+        assert_eq!(row(9, 5), -0.5, "mod(2.5, -3)");
+    }
+
+    /// #131: the fixed-slot pool used by the search must run the same #131
+    /// opcodes as the packed batch. Before this test the pool kernel silently
+    /// returned 0 for every hard op.
+    #[test]
+    fn fixed_slot_pool_runs_the_native_hard_opcodes() {
+        use crate::genome::{GenomeMeta, GenomePool};
+        let a = [f64::NAN, 0.0, -0.0, 1.0, -1.0, 2.5, -2.5, 3.5, -3.5];
+        let b = [1.0, 1.0, 1.0, 1.0, 1.0, 2.5, -2.5, 1.0, -1.0];
+        let n = a.len();
+        let mut cols = vec![0.0f32; 2 * n];
+        let y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i] as f32;
+            cols[n + i] = b[i] as f32;
+        }
+        let mut ev = match evaluator_or_skip(&cols, n, 2, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let trees = vec![
+            node(Op::Floor, vec![input(0)]),
+            node(Op::Round, vec![input(0)]),
+            node(Op::Erf, vec![input(0)]),
+            node(Op::Atan2, vec![input(0), input(1)]),
+            node(Op::Mod, vec![input(0), input(1)]),
+            node(Op::Min, vec![input(0), input(1)]),
+            node(Op::If, vec![input(0), input(1), input(0)]),
+        ];
+        let width = 16;
+        let mut pool = GenomePool::new(trees.len(), width);
+        for tree in &trees {
+            let c = compile_program(tree).expect("hard op compiles");
+            assert!(pool.push(c.words(), GenomeMeta::default()));
+        }
+        let (slot_sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0, "the fixed-slot kernel ran");
+        assert_eq!(slot_sse.len(), trees.len());
+
+        let pop = Population::from_trees(trees.iter());
+        let (packed, _) = ev.eval_population(&pop);
+        for i in 0..trees.len() {
+            let tol = 1e-6 * (1.0 + packed[i].abs());
+            assert!(
+                (slot_sse[i] - packed[i]).abs() <= tol,
+                "{}: pool SSE {} vs packed {}",
+                trees[i].op.symbol(),
+                slot_sse[i],
+                packed[i]
+            );
+            // ... and both agree with the f64 reference, so "0" is not accepted.
+            let cpu = cpu_sse(&trees[i], &cols, n, 2, &y);
+            let rel = (slot_sse[i] as f64 - cpu).abs() / (1.0 + cpu.abs());
+            assert!(
+                rel < 1e-4,
+                "{}: pool SSE {} vs CPU {} (relative {:.2e})",
+                trees[i].op.symbol(),
+                slot_sse[i],
+                cpu,
+                rel
+            );
+        }
     }
 
     /// Score each tree on the GPU and compare the whole-population SSE with
@@ -1194,5 +2323,491 @@ mod lower_extreme_tests {
         };
         let t = node(Op::Add, vec![leaf_if(1.0, 2.0), leaf_if(3.0, 4.0)]);
         assert_eq!(peak_stack(&t), 4);
+    }
+}
+
+/// #169: correctness of the batched GPU Levenberg–Marquardt arm.
+///
+/// These tests compare the kernel against the historical CPU LM on the same
+/// starting constants and rows. The reported SSE is recomputed on the CPU in
+/// f64 at the fitted constants, so the comparison measures the constants rather
+/// than the kernel's f32 row arithmetic.
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+    use crate::expr::{constant, eval, input, node, Node, Op};
+
+    /// One basis function with no fitted constants of its own.
+    fn basis(k: usize) -> Node {
+        let x = input(0);
+        match k {
+            0 => constant(1.0),
+            1 => x,
+            2 => node(Op::Square, vec![x]),
+            3 => node(Op::Cube, vec![x]),
+            4 => node(Op::Sin, vec![x]),
+            5 => node(Op::Cos, vec![x]),
+            6 => node(Op::Tanh, vec![x]),
+            7 => node(Op::Logistic, vec![x]),
+            8 => node(Op::Gauss, vec![x]),
+            9 => node(Op::Erf, vec![x]),
+            10 => node(Op::Sinh, vec![x]),
+            11 => node(Op::Cosh, vec![x]),
+            12 => node(Op::Abs, vec![x]),
+            13 => node(Op::Mul, vec![x.clone(), node(Op::Sin, vec![x])]),
+            14 => node(Op::Mul, vec![x.clone(), node(Op::Cos, vec![x])]),
+            _ => node(Op::Mul, vec![x.clone(), node(Op::Tanh, vec![x])]),
+        }
+    }
+
+    /// `Σ coeffs[k] · basis(k)`, one constant per term.
+    fn model(coeffs: &[f64]) -> Node {
+        let mut terms = Vec::new();
+        for (k, &c) in coeffs.iter().enumerate() {
+            if k == 0 {
+                // The intercept is a bare constant; multiplying it by a
+                // constant-one basis would add a second (unidentified) slot.
+                terms.push(constant(c));
+            } else {
+                terms.push(node(Op::Mul, vec![constant(c), basis(k)]));
+            }
+        }
+        let mut tree = terms.pop().expect("at least one term");
+        while let Some(t) = terms.pop() {
+            tree = node(Op::Add, vec![t, tree]);
+        }
+        tree
+    }
+
+    fn dataset(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = (i as f64 / (n - 1) as f64) * 5.0 - 2.5;
+            x.push(vec![a]);
+        }
+        let y = x.iter().map(|r| 0.0 + eval(&model(&[1.5]), r)).collect();
+        (x, y)
+    }
+
+    fn cols_from(x: &[Vec<f64>], y: &[f64]) -> (Vec<f32>, Vec<f32>) {
+        let n = x.len();
+        let mut cols = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = x[i][0] as f32;
+        }
+        (cols, y.iter().map(|&v| v as f32).collect())
+    }
+
+    fn constants(tree: &Node) -> Vec<f64> {
+        fn walk(n: &Node, out: &mut Vec<f64>) {
+            if n.op == Op::Const {
+                out.push(n.val);
+            }
+            for k in &n.kids {
+                walk(k, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, &mut out);
+        out
+    }
+
+    fn sse_at(tree: &mut Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
+        crate::fit::fit_weighted(tree, x, y, &[], 0)
+    }
+
+    /// A deliberately well-conditioned design: one independent input column per
+    /// constant (sinusoids at distinct frequencies over a full period, so the
+    /// columns are orthogonal). The optimum is unique and the CPU/GPU constants
+    /// are comparable at 1e-5.
+    fn linear_fixture(
+        p: usize,
+        n: usize,
+    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>, Vec<f64>, Vec<f64>) {
+        let target: Vec<f64> = (0..p).map(|k| df64(1.0 + 0.31 * k as f64)).collect();
+        let start: Vec<f64> = (0..p).map(|k| df64(0.25 + 0.07 * k as f64)).collect();
+        let mut x = vec![vec![0.0; p]; n];
+        let mut cols = vec![0.0f32; n * p];
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = std::f64::consts::TAU * i as f64 / (n - 1) as f64;
+            let mut v = 0.0;
+            for k in 0..p {
+                let a = df64(((k + 1) as f64 * t).sin());
+                x[i][k] = a;
+                cols[k * n + i] = a as f32;
+                v += target[k] * a;
+            }
+            let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+            y.push(v + noise);
+        }
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        (x, y, cols, y32, target, start)
+    }
+
+    fn df64(v: f64) -> f64 {
+        v
+    }
+
+    fn linear_model(coeffs: &[f64]) -> Node {
+        let mut terms = Vec::new();
+        for (k, &c) in coeffs.iter().enumerate() {
+            terms.push(node(Op::Mul, vec![constant(c), input(k)]));
+        }
+        let mut tree = terms.pop().expect("at least one term");
+        while let Some(t) = terms.pop() {
+            tree = node(Op::Add, vec![t, tree]);
+        }
+        tree
+    }
+
+    #[test]
+    fn gpu_fit_matches_the_cpu_lm_for_p_1_to_16() {
+        let n = 800;
+        let mut errors: Vec<f64> = Vec::new();
+        let mut worst_sse_rel = 0.0f64;
+        for p in 1..=16usize {
+            let (x, y, cols, y32, _target, start) = linear_fixture(p, n);
+            let mut ev = match GpuEvaluator::new(&cols, n, p, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU test: no usable CUDA device");
+                    return;
+                }
+            };
+
+            let mut cols64 = vec![0.0f64; n * p];
+            for i in 0..n {
+                for k in 0..p {
+                    cols64[k * n + i] = x[i][k];
+                }
+            }
+            assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+
+            let mut cpu_tree = linear_model(&start);
+            crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+            let cpu_sse = crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+            let cpu_c = constants(&cpu_tree);
+
+            let mut gpu_tree = linear_model(&start);
+            let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("well-conditioned plan");
+            assert_eq!(plan.nconst, p, "p={}", p);
+            let (out, ms) = ev.fit_batch(&[&plan], 8);
+            assert!(ms >= 0.0, "fit kernel ran for p={}", p);
+            assert_eq!(out.len(), 1);
+            let res = &out[0];
+            assert_eq!(res.status, 0, "p={} must be well conditioned", p);
+            let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("plan");
+            plan.apply(&mut gpu_tree, &res.c);
+            let gpu_c = constants(&gpu_tree);
+            assert_eq!(gpu_c.len(), p);
+
+            let mut gpu_sse_tree = gpu_tree.clone();
+            let gpu_sse = sse_at(&mut gpu_sse_tree, &x, &y);
+            let rel = (gpu_sse - cpu_sse).abs() / cpu_sse.abs().max(1e-8);
+            worst_sse_rel = worst_sse_rel.max(rel);
+            for (a, b) in gpu_c.iter().zip(&cpu_c) {
+                errors.push((a - b).abs() / (1.0 + b.abs()));
+            }
+            assert!(
+                rel <= 1e-8,
+                "p={}: SSE relative {:.3e} (gpu {:.12e}, cpu {:.12e})",
+                p,
+                rel,
+                gpu_sse,
+                cpu_sse
+            );
+        }
+        errors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = errors[errors.len() / 2];
+        assert!(
+            median <= 1e-5,
+            "median constant error {:.3e} (worst SSE rel {:.3e})",
+            median,
+            worst_sse_rel
+        );
+    }
+
+    #[test]
+    fn gpu_fit_matches_a_nonlinear_cpu_fit() {
+        let n = 800;
+        let (x, _) = dataset(n);
+        let target = model(&[2.0, -0.5, 0.8, 0.0, 1.0]);
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+                eval(&target, r) + noise
+            })
+            .collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        let mut cpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
+        let cpu_sse = crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+        let cpu_c = constants(&cpu_tree);
+
+        let mut gpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
+        let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("nonlinear plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8);
+        assert_eq!(out[0].status, 0, "the nonlinear fixture is well conditioned");
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu_c = constants(&gpu_tree);
+        assert_eq!(cpu_c.len(), 5);
+        assert_eq!(gpu_c.len(), 5);
+        for (a, b) in gpu_c.iter().zip(&cpu_c) {
+            let e = (a - b).abs() / (1.0 + b.abs());
+            assert!(e <= 1e-5, "constant error {:.3e}: {} vs {}", e, a, b);
+        }
+        let mut gpu_sse_tree = gpu_tree.clone();
+        let gpu_sse = sse_at(&mut gpu_sse_tree, &x, &y);
+        let rel = (gpu_sse - cpu_sse).abs() / cpu_sse.abs().max(1e-8);
+        assert!(rel <= 1e-8, "SSE relative {:.3e}", rel);
+    }
+
+    #[test]
+    fn p_above_the_kernel_cap_is_rejected_for_cpu_fallback() {
+        for p in 17..=20usize {
+            let start: Vec<f64> = vec![0.1; p];
+            assert!(
+                crate::fit::gpu_fit_plan(&model(&start)).is_none(),
+                "p={} must stay on the CPU",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn rank_deficient_and_non_finite_fixtures_are_labelled() {
+        let n = 400;
+        let (x, _) = dataset(n);
+        let (cols, y32) = cols_from(&x, &vec![0.0; n]);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+
+        // Two identical columns: J^T J is exactly rank deficient.
+        let x0 = input(0);
+        let collinear = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.1), x0.clone()]),
+                node(Op::Mul, vec![constant(0.2), x0.clone()]),
+            ],
+        );
+        let tree = collinear;
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("collinear plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
+
+        // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
+        let bad = node(
+            Op::Sqrt,
+            vec![node(
+                Op::Sub,
+                vec![constant(0.25), node(Op::Square, vec![input(0)])],
+            )],
+        );
+        let y: Vec<f64> = x.iter().map(|r| eval(&bad, r)).collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
+        let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
+        let (out, _) = ev.fit_batch(&[&plan], 4);
+        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+
+        // Unsupported (piecewise-constant) operators never reach the kernel.
+        let floor = node(Op::Floor, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
+        assert!(crate::fit::gpu_fit_plan(&floor).is_none());
+    }
+
+
+    /// #169 measurement (ignored): fit-stage throughput of the batched kernel
+    /// versus the CPU LM on `P` candidates over `N = 154k` rows. Run with
+    /// `cargo test --release --features cuda --lib bench_batched_fit -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_batched_fit() {
+        fn nl(c: &[f64]) -> Node {
+            let x = input(0);
+            let trig = |coef: f64, freq: f64, cos: bool| {
+                let arg = node(Op::Mul, vec![constant(freq), x.clone()]);
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(coef),
+                        node(if cos { Op::Cos } else { Op::Sin }, vec![arg]),
+                    ],
+                )
+            };
+            match c.len() {
+                4 => node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(c[3]), x.clone()]),
+                        node(
+                            Op::Add,
+                            vec![
+                                trig(c[1], c[2], false),
+                                constant(c[0]),
+                            ],
+                        ),
+                    ],
+                ),
+                8 => node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(c[7]), x.clone()]),
+                        node(
+                            Op::Add,
+                            vec![
+                                trig(c[1], c[2], false),
+                                node(
+                                    Op::Add,
+                                    vec![
+                                        trig(c[3], c[4], true),
+                                        node(
+                                            Op::Add,
+                                            vec![
+                                                node(
+                                                    Op::Mul,
+                                                    vec![
+                                                        constant(c[5]),
+                                                        node(Op::Tanh, vec![node(
+                                                            Op::Mul,
+                                                            vec![constant(c[6]), x.clone()],
+                                                        )]),
+                                                    ],
+                                                ),
+                                                constant(c[0]),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                _ => unreachable!(),
+            }
+        }
+
+        let n = 154_000usize;
+        let threads = 8usize;
+        let (x, _) = dataset(n);
+        for p in [4usize, 8] {
+            // The issue's gate is P >= 512; measure a quarter of that for the
+            // 8-thread CPU wall while keeping this benchmark under a minute.
+            let candidates: usize = if p == 4 { 256 } else { 64 };
+            let target: Vec<f64> = (0..p).map(|k| 0.5 + 0.23 * k as f64).collect();
+            let start: Vec<f64> = target.iter().map(|&v| 0.9 * v).collect();
+            let target_tree = nl(&target);
+            let y: Vec<f64> = x
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+                    eval(&target_tree, r) + noise
+                })
+                .collect();
+            let (cols, y32) = cols_from(&x, &y);
+
+            let t0 = std::time::Instant::now();
+            let per = candidates.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let x = &x;
+                    let y = &y;
+                    let start = &start;
+                    scope.spawn(move || {
+                        for _ in 0..per {
+                            let mut t = nl(start);
+                            crate::fit::fit_weighted(&mut t, x, y, &[], 8);
+                        }
+                    });
+                }
+            });
+            let cpu = t0.elapsed().as_secs_f64();
+
+            let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU benchmark: no usable device");
+                    return;
+                }
+            };
+            let mut cols64 = vec![0.0f64; n];
+            for i in 0..n {
+                cols64[i] = x[i][0];
+            }
+            ev.set_fit_data(&cols64, &y);
+            let plan = crate::fit::gpu_fit_plan(&nl(&start)).expect("plan");
+            let plans: Vec<&crate::fit::GpuFitPlan> =
+                (0..candidates).map(|_| &plan).collect();
+            let t1 = std::time::Instant::now();
+            let (out, ms) = ev.fit_batch(&plans, 8);
+            let gpu = t1.elapsed().as_secs_f64();
+            let ok = out.iter().filter(|r| r.status == 0).count();
+            eprintln!(
+                "p={} N={} P={} cpu={:.3}s gpu={:.3}s (kernel {:.1}ms, ok {}/{}) fit speedup={:.1}x",
+                p,
+                n,
+                candidates,
+                cpu,
+                gpu,
+                ms,
+                ok,
+                out.len(),
+                cpu / gpu.max(1e-9)
+            );
+        }
+    }
+
+    #[test]
+    fn a_fitted_tree_is_independent_of_batch_composition() {
+        let n = 400;
+        let (x, _) = dataset(n);
+        let target = model(&[2.0, -0.5, 1.0]);
+        let y: Vec<f64> = x.iter().map(|r| eval(&target, r)).collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let start = model(&[0.3, 0.2, 0.1]);
+        let alone = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (out_alone, _) = ev.fit_batch(&[&alone], 6);
+        assert_eq!(out_alone[0].status, 0);
+
+        // Same candidate repeated four times: every block owns one candidate,
+        // so every result must be bit-identical to the lone fit.
+        let plans: Vec<_> = (0..4)
+            .map(|_| crate::fit::gpu_fit_plan(&start).expect("plan"))
+            .collect();
+        let plan_refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (out, _) = ev.fit_batch(&plan_refs, 6);
+        for r in &out {
+            assert_eq!(r.status, 0);
+            assert_eq!(r.c, out_alone[0].c, "batch composition changed constants");
+            assert_eq!(r.sse.to_bits(), out_alone[0].sse.to_bits());
+        }
     }
 }

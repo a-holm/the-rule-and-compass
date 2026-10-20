@@ -751,7 +751,8 @@ pub struct CsvShape {
     pub rows: usize,
     /// Header fields.
     pub cols: usize,
-    /// The text the loader holds while parsing, in bytes.
+    /// Bytes of source text read (a resident `String` only when measured with
+    /// [`csv_shape`]; the CLI measures the same field from a stream).
     pub bytes: u64,
 }
 
@@ -793,28 +794,148 @@ pub fn csv_shape(text: &str) -> CsvShape {
     }
 }
 
+/// Measure a delimited source **while reading it**, with the same quote-aware
+/// record reader that builds the table (issue #126).
+///
+/// The scan holds one logical record at a time. It returns the table shape and
+/// the number of bytes consumed, so the memory guard no longer needs a
+/// whole-file `String` (or a whole-file `read_to_string`) to estimate a run.
+pub fn csv_shape_stream<'a, F>(mut open: F) -> Result<CsvShape, String>
+where
+    F: FnMut() -> Result<Box<dyn std::io::BufRead + 'a>, String>,
+{
+    let mut rd = CsvRecords::new(open()?);
+    let header = match rd.next() {
+        Some(Ok(record)) => record,
+        Some(Err(e)) => return Err(e),
+        None => {
+            return Ok(CsvShape {
+                rows: 0,
+                cols: 0,
+                bytes: 0,
+            })
+        }
+    };
+    let cols = header.fields.len();
+    let mut rows = 0usize;
+    for record in &mut rd {
+        let record = record?;
+        // A ragged row is still a record the source contains; counting it keeps
+        // the fallback estimate an upper bound before the parser refuses it.
+        if !record.fields.is_empty() {
+            rows += 1;
+        }
+    }
+    Ok(CsvShape {
+        rows,
+        cols,
+        bytes: rd.bytes,
+    })
+}
+
+/// [`csv_shape_stream`] for a path, opening the file a second time (the parser
+/// reopens it for its typing and building passes as well).
+pub fn csv_shape_path(path: &str) -> Result<CsvShape, String> {
+    csv_shape_stream(|| {
+        std::fs::File::open(path)
+            .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn std::io::BufRead>)
+            .map_err(|e| format!("{}: {}", path, e))
+    })
+}
+
 /// Resident bytes per table cell: one `f64` value plus the `u32` code that a
 /// low-cardinality numeric or text column keeps alongside it.
 pub const CSV_TABLE_BYTES_PER_CELL: u64 = 12;
 
-/// Per-row preparation cost: `Vec` headers and selector bookkeeping for the
-/// row-major `cells`, train and test copies.
-pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 72;
+/// Per-row preparation cost: one row header per sample row, selector
+/// bookkeeping, and the per-row copies the search and diagnostics keep.
+///
+/// This was 72 B before the #112 calibration. The 1M-row x 6-column run peaked
+/// at 552 MiB while the old model predicted 378 MiB, so the fixed term was
+/// raised to 240 B/row. At that value both the 6-column and 90-column measured
+/// peaks are covered without exceeding 1.5x (see `docs/data-format.md`).
+pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 240;
 
 /// Per-row, per-used-column preparation cost: one `f64` in each of the
 /// `cells`, train and test copies, plus each row's `Vec<f64>` header.
 pub const CSV_PREP_BYTES_PER_USED_CELL: u64 = 24;
 
-/// Estimated peak resident bytes for loading and preparing a CSV (issue #112).
+/// One measured memory estimate and its terms (issue #112). Reporting the
+/// basis, rather than only the total, lets the preparation block show that the
+/// guard used `rows x columns` and not a multiple of the file size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvEstimate {
+    pub rows: usize,
+    pub cols: usize,
+    /// Columns used by the search (`--vars` + targets + weight); `cols` when no
+    /// projection was supplied.
+    pub used_cols: usize,
+    pub text_bytes: u64,
+    pub table_bytes: u64,
+    pub prep_bytes: u64,
+    /// The 25 % allocator slack included in `total_bytes`.
+    pub slack_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl CsvEstimate {
+    /// Drop the resident text term. A streaming caller (issue #126) uses this;
+    /// the terms stay the same so calibration still applies.
+    pub fn without_text(mut self) -> Self {
+        let base = self
+            .table_bytes
+            .saturating_add(self.prep_bytes);
+        self.text_bytes = 0;
+        self.total_bytes = base.saturating_mul(5) / 4;
+        self.slack_bytes = self.total_bytes.saturating_sub(base);
+        self
+    }
+}
+
+/// Estimated peak resident bytes for loading and preparing a CSV (issue #112),
+/// with the terms exposed.
 ///
-/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus a
-/// per-row preparation overhead and 25 % allocator slack. `used_cols` is the
-/// search's projection (variables plus targets); pass `0` when it is not known
-/// yet and the whole header width is used. The text term matters: the loader
-/// reads the whole file into one `String`, so a wide 17 GB CSV is at least
-/// 17 GB resident.
-pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus
+/// `rows x 240 B` of fixed preparation overhead and 25 % allocator slack.
+/// `used_cols` is the search's projection (variables plus targets); pass `0`
+/// when it is not known yet and the whole header width is used. The text term
+/// matters for a caller that holds the whole file, such as the current
+/// `read_to_string` path; a streaming caller uses [`CsvEstimate::without_text`].
+pub fn csv_estimate(shape: CsvShape, used_cols: usize) -> CsvEstimate {
     let (text, table, rows) = csv_terms(shape);
+    let cols = shape.cols.max(1);
+    let used = if used_cols == 0 {
+        cols
+    } else {
+        used_cols.min(cols)
+    };
+    let prep = rows.saturating_mul(
+        (used as u64)
+            .saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
+            .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
+    );
+    let base = text.saturating_add(table).saturating_add(prep);
+    let total = base.saturating_mul(5) / 4;
+    CsvEstimate {
+        rows: shape.rows,
+        cols: shape.cols,
+        used_cols: used,
+        text_bytes: text,
+        table_bytes: table,
+        prep_bytes: prep,
+        slack_bytes: total.saturating_sub(base),
+        total_bytes: total,
+    }
+}
+
+/// Estimated peak resident bytes for the **streaming** CSV path (issue #126).
+///
+/// The CLI no longer keeps the file text in memory, so the text term is zero;
+/// the shape is measured from the stream and the table/preparation terms are
+/// the same as [`estimate_csv_bytes`]. `bytes` on the shape is still the number
+/// of bytes read, for reporting, not a resident term.
+pub fn estimate_csv_stream_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    let (_text, table, rows) = csv_terms(shape);
     let cols = shape.cols.max(1) as u64;
     let used = if used_cols == 0 {
         cols
@@ -825,17 +946,42 @@ pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
         used.saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
             .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
     );
-    text.saturating_add(table)
-        .saturating_add(prep)
-        .saturating_mul(5)
-        / 4
+    table.saturating_add(prep).saturating_mul(5) / 4
+}
+
+/// Estimated peak resident bytes for a streaming `rcsr import`: the resident
+/// table plus allocator slack, with no whole-file text and no search sample.
+pub fn estimate_csv_load_stream_bytes(shape: CsvShape) -> u64 {
+    let (_text, table, _rows) = csv_terms(shape);
+    table.saturating_mul(5) / 4
 }
 
 /// Estimated peak resident bytes for reading a CSV without preparing a search
 /// sample (`rcsr import`): the text plus the resident table.
-pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+pub fn csv_load_estimate(shape: CsvShape) -> CsvEstimate {
     let (text, table, _) = csv_terms(shape);
-    text.saturating_add(table).saturating_mul(5) / 4
+    let base = text.saturating_add(table);
+    let total = base.saturating_mul(5) / 4;
+    CsvEstimate {
+        rows: shape.rows,
+        cols: shape.cols,
+        used_cols: shape.cols,
+        text_bytes: text,
+        table_bytes: table,
+        prep_bytes: 0,
+        slack_bytes: total.saturating_sub(base),
+        total_bytes: total,
+    }
+}
+
+/// [`csv_estimate`]'s total, kept as the concise guard entry point.
+pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    csv_estimate(shape, used_cols).total_bytes
+}
+
+/// [`csv_load_estimate`]'s total, kept as the concise import guard entry point.
+pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+    csv_load_estimate(shape).total_bytes
 }
 
 /// `(text, table, rows)`; `text` is the whole-file buffer, so an unmeasured
@@ -984,6 +1130,8 @@ struct CsvRecords<R: std::io::BufRead> {
     reader: R,
     /// 1-based number of the last physical line read.
     line: usize,
+    /// Bytes consumed from the source, including record separators.
+    bytes: u64,
     /// Chosen delimiter; `None` until the header has been sniffed.
     delim: Option<char>,
     /// A record read during sniffing that must be returned next.
@@ -995,6 +1143,7 @@ impl<R: std::io::BufRead> CsvRecords<R> {
         CsvRecords {
             reader,
             line: 0,
+            bytes: 0,
             delim: None,
             pending: None,
         }
@@ -1005,7 +1154,8 @@ impl<R: std::io::BufRead> CsvRecords<R> {
         let mut bytes = Vec::new();
         match self.reader.read_until(b'\n', &mut bytes) {
             Ok(0) => None,
-            Ok(_) => {
+            Ok(n) => {
+                self.bytes = self.bytes.saturating_add(n as u64);
                 self.line += 1;
                 while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
                     bytes.pop();
@@ -1461,8 +1611,9 @@ pub struct Prepared {
     pub validation: Option<Sample>,
     /// All test folds concatenated, in fold order (what the search evaluates on).
     pub test: Sample,
-    /// One sample per evaluation block. With `folds == 1` this is a single
-    /// sample identical to `test`.
+    /// One sample per evaluation block when there is more than one fold. With
+    /// `folds == 1` this is empty and `test` is the single block (issue #133:
+    /// the pooled block is not built twice).
     pub fold_samples: Vec<Sample>,
     /// Affine denormalisation constants: original = normalised * stds + means.
     /// With the default centre/scale these are the training mean and standard
@@ -1678,6 +1829,9 @@ pub struct PrepReport {
     pub time_non_monotonic: usize,
     /// Numeric rows rescaled from ms/us/ns to seconds.
     pub time_converted: usize,
+    /// #112: the memory guard's estimate for this CSV and its basis. `None`
+    /// for a `.rcsb` store or when the source did not go through the CSV guard.
+    pub memory_estimate: Option<CsvEstimate>,
 }
 
 impl Default for PrepReport {
@@ -1698,6 +1852,7 @@ impl Default for PrepReport {
             time_duplicates: 0,
             time_non_monotonic: 0,
             time_converted: 0,
+            memory_estimate: None,
         }
     }
 }
@@ -1720,6 +1875,20 @@ impl PrepReport {
     /// the raw option values that are not part of the counts.
     pub fn text_lines(&self, outlier_iqr: Option<f64>, smooth: usize) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(m) = self.memory_estimate {
+            out.push(format!(
+                "# preparation: memory estimate {} B from {} rows x {} columns ({} used); \
+                 basis: text {} B + table {} B + preparation {} B + slack {} B",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.text_bytes,
+                m.table_bytes,
+                m.prep_bytes,
+                m.slack_bytes
+            ));
+        }
         if self.fill != "none" || self.rows_dropped_missing > 0 {
             out.push(format!(
                 "# preparation: fill={} rows_filled={} rows_dropped_missing={}",
@@ -1793,8 +1962,24 @@ impl PrepReport {
 
     /// The `preparation` object shared by `--json` and `--ndjson`.
     pub fn json(&self) -> String {
+        let memory = match self.memory_estimate {
+            Some(m) => format!(
+                "{{\"estimate_bytes\":{},\"rows\":{},\"columns\":{},\"used_columns\":{},\
+                 \"text_bytes\":{},\"table_bytes\":{},\"preparation_bytes\":{},\
+                 \"slack_bytes\":{},\"basis\":\"rows x columns\"}}",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.text_bytes,
+                m.table_bytes,
+                m.prep_bytes,
+                m.slack_bytes
+            ),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{},\"memory\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
@@ -1809,7 +1994,8 @@ impl PrepReport {
             self.time_rows,
             self.time_duplicates,
             self.time_non_monotonic,
-            self.time_converted
+            self.time_converted,
+            memory
         )
     }
 }
@@ -2118,8 +2304,20 @@ pub fn prepare_full_targets_weighted_with(
 ) -> Result<Prepared, String> {
     // With an explicit --fill method, a junk token in an otherwise numeric
     // column is treated as a missing value (and then filled or dropped).
-    // Without it the column stays non-numeric, exactly as before.
-    let coerced = if prep.fill != FillMethod::None {
+    // Without it the column stays non-numeric, exactly as before. #133: only
+    // clone/scan the table when a named input or target is actually non-numeric;
+    // an all-numeric store must not pay for a second full columnar image.
+    let needs_coerce = prep.fill != FillMethod::None
+        && (targets.iter().any(|name| {
+            t.index_of(name)
+                .map(|j| !t.numeric[j])
+                .unwrap_or(false)
+        }) || vars.iter().any(|name| {
+            t.index_of(name)
+                .map(|j| !t.numeric[j])
+                .unwrap_or(false)
+        }));
+    let coerced = if needs_coerce {
         Some(coerce_numeric(t))
     } else {
         None
@@ -2281,7 +2479,9 @@ pub fn prepare_full_targets_weighted_with(
     // stage mutates a cell (fill / outlier / smoothing). The default path
     // (no fill, no outlier rule, no smoothing) reads the table directly, so the
     // preparation no longer duplicates every used column before sampling.
-    let mutating = !matches!(prep.fill, FillMethod::None)
+    // `Drop` only reads cells to set the row mask; it never mutates one, so it
+    // must not trigger the row-major copy either.
+    let mutating = !matches!(prep.fill, FillMethod::None | FillMethod::Drop)
         || prep.outlier_iqr.is_some_and(|k| k > 0.0)
         || prep.smooth > 1;
     #[cfg(test)]
@@ -2297,10 +2497,18 @@ pub fn prepare_full_targets_weighted_with(
     } else {
         None
     };
+    // #133: when no stage needs a mutable copy, keep direct slices of the
+    // columnar table. Reads then avoid the per-cell `Table::value` bounds and
+    // `Option` chain on every row of every column.
+    let direct_cols: Vec<&[f64]> = if cells.is_none() {
+        used_cols.iter().map(|&c| filtered.col(c)).collect()
+    } else {
+        Vec::new()
+    };
     let cell = |cells: &Option<Vec<Vec<f64>>>, r: usize, k: usize| -> f64 {
         match cells {
             Some(c) => c[r][k],
-            None => filtered.value(r, used_cols[k]),
+            None => direct_cols[k][r],
         }
     };
     let mut keep = vec![true; n];
@@ -2605,16 +2813,27 @@ pub fn prepare_full_targets_weighted_with(
             stds[j] = 1.0;
             continue;
         }
-        let vals: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
-        let m = vals.iter().sum::<f64>() / vals.len() as f64;
-        let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
+        // #133: sum in the same training-row order without materialising a
+        // per-column copy. The arithmetic (two passes, mean then squared
+        // deviations) is unchanged, so selected rows and scores stay identical.
+        let mut sum = 0.0f64;
+        for &i in &train_idx {
+            sum += cell(&cells, i, j);
+        }
+        let m = sum / train_idx.len() as f64;
+        let mut var = 0.0f64;
+        for &i in &train_idx {
+            let d = cell(&cells, i, j) - m;
+            var += d.powi(2);
+        }
+        var /= train_idx.len() as f64;
         let s = var.sqrt();
         // #133: median/min/max/IQR/range are the only modes that read an
         // ordered copy. The default mean/std path never clones or sorts.
         let need_sorted = !matches!(prep.center, Center::Mean | Center::None)
             || !matches!(prep.scale, Scale::Std | Scale::None);
         let sorted = if need_sorted {
-            let mut sorted = vals.clone();
+            let mut sorted: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             sorted
         } else {
@@ -2640,20 +2859,46 @@ pub fn prepare_full_targets_weighted_with(
         let mut s = Sample::default();
         s.x.reserve(idx.len());
         s.y.reserve(idx.len());
-        for &i in idx {
-            let mut row = Vec::with_capacity(nv);
-            for j in 0..nv {
-                row.push((cell(&cells, i, j) - means[j]) / stds[j]);
-            }
-            s.x.push(row);
-            // Target 0 lives in `y`; a multi-output sample also keeps every
-            // target (including the first) in `ys` (issue #15).
-            s.y.push(cell(&cells, i, nv));
-        }
-        if nt > 1 {
-            s.ys = (0..nt)
-                .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
+        if cells.is_none() {
+            // Default path: allocate the rows once, then fill them in
+            // row-blocks. Reading 53 columns row-by-row streams from 53
+            // distant cache lines; a 256-row block makes each column read
+            // sequential and keeps the written rows in L2.
+            const ROW_BLOCK: usize = 256;
+            s.x = (0..idx.len())
+                .map(|_| vec![0.0; nv])
                 .collect();
+            for rb in (0..idx.len()).step_by(ROW_BLOCK) {
+                let re = (rb + ROW_BLOCK).min(idx.len());
+                for j in 0..nv {
+                    let src = direct_cols[j];
+                    let m = means[j];
+                    let sd = stds[j];
+                    for r in rb..re {
+                        s.x[r][j] = (src[idx[r]] - m) / sd;
+                    }
+                }
+            }
+            s.y = idx.iter().map(|&i| direct_cols[nv][i]).collect();
+            if nt > 1 {
+                s.ys = (0..nt)
+                    .map(|j| idx.iter().map(|&i| direct_cols[nv + j][i]).collect())
+                    .collect();
+            }
+        } else {
+            for &i in idx {
+                let mut row = Vec::with_capacity(nv);
+                for j in 0..nv {
+                    row.push((cell(&cells, i, j) - means[j]) / stds[j]);
+                }
+                s.x.push(row);
+                s.y.push(cell(&cells, i, nv));
+            }
+            if nt > 1 {
+                s.ys = (0..nt)
+                    .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
+                    .collect();
+            }
         }
         if let Some(w) = &weights_raw {
             s.w = idx.iter().map(|&i| w[i]).collect();
@@ -2676,21 +2921,18 @@ pub fn prepare_full_targets_weighted_with(
             ));
         }
     }
-    let fold_samples: Vec<Sample> = fold_idx.iter().map(|f| make(f)).collect();
-    let mut test = Sample::default();
-    for f in &fold_samples {
-        test.x.extend(f.x.iter().cloned());
-        test.y.extend(f.y.iter().copied());
-        test.w.extend(f.w.iter().copied());
-        if f.is_multi() {
-            if test.ys.is_empty() {
-                test.ys = vec![Vec::new(); f.ys.len()];
-            }
-            for (dst, src) in test.ys.iter_mut().zip(&f.ys) {
-                dst.extend(src.iter().copied());
-            }
-        }
-    }
+    // #133: build the pooled test block once from the concatenated fold
+    // indices. The old path built every fold sample and then cloned all of its
+    // rows into `test`, doubling the test-side allocations. With a single fold
+    // (the default) `fold_samples` stays empty and every consumer falls back to
+    // `test`; with several folds the per-fold samples are still materialised.
+    let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+    let test = make(&test_idx);
+    let fold_samples: Vec<Sample> = if fold_idx.len() > 1 {
+        fold_idx.iter().map(|f| make(f)).collect()
+    } else {
+        Vec::new()
+    };
 
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
@@ -2717,6 +2959,7 @@ pub fn prepare_full_targets_weighted_with(
             time_duplicates: hazards.duplicates,
             time_non_monotonic: hazards.non_monotonic,
             time_converted: hazards.converted,
+            memory_estimate: None,
         },
     })
 }
@@ -4587,6 +4830,27 @@ mod tests {
             "the default mean/std path must not materialise a row-major copy"
         );
 
+        // #133: `drop` only reads cells to build the keep mask; it must not
+        // trigger the row-major copy that mutating fills need.
+        CELL_COPIES.with(|n| n.set(0));
+        let _ = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Drop,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            0,
+            "a drop-only fill must not copy the used columns"
+        );
+
         CELL_COPIES.with(|n| n.set(0));
         let _ = prepare_full_with(
             &t,
@@ -4603,7 +4867,7 @@ mod tests {
         assert_eq!(
             CELL_COPIES.with(|n| n.get()),
             1,
-            "a fill stage needs one mutable copy"
+            "a mutating fill needs one mutable copy"
         );
     }
 }

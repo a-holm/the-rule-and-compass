@@ -1,0 +1,445 @@
+//! #116: out-of-core / row-sharded fitting with exact `f64` merging.
+//!
+//! The historical LM loop borrows a resident `Vec<Vec<f64>>`. The streaming arm
+//! keeps only the sufficient statistics of the weighted problem:
+//!
+//! ```text
+//! S   = Σ w_i g_i g_iᵀ      (p × p)
+//! b   = Σ w_i g_i r_i       (p)
+//! sse = Σ w_i r_i²          (scalar)
+//! ```
+//!
+//! `S`, `b` and `sse` are built a block at a time and merged by addition, so
+//! the resident state is `O(p²)`, not `O(N p)`. Each row is read once per LM
+//! iteration (plus one forward pass for the trial SSE); the Jacobian is never
+//! materialised. The row source is a trait, so a `.rcsb` store, a memory-mapped
+//! file or a generated/streamed table can feed the same exact merger without
+//! the `Sample` being resident.
+//!
+//! Sums use Neumaier compensation. Merging block partials is therefore
+//! numerically stable and, unlike naive `f32` atomics, deterministic: the block
+//! boundaries and merge order are fixed, so the same source always produces the
+//! same constants.
+
+use super::*;
+
+/// Rows per accumulation block. The same value is used for every pass, making
+/// the reduction order deterministic for a given row count.
+pub const STREAM_BLOCK_ROWS: usize = 8192;
+
+/// A read-only row source for the streaming fitter.
+///
+/// Implementors can read from disk or generate rows; the fitter only asks for
+/// one row at a time and retains nothing beyond the current block's statistics.
+/// Returning `false` from the callback stops iteration (used on the first
+/// non-finite row, which routes the candidate to the exact fallback).
+pub trait RowSource {
+    /// Total number of logical rows.
+    fn rows(&self) -> usize;
+    /// Visit every row as `(x, y, weight)`. The callback returns `false` to
+    /// abort. The return value is `true` when every row was visited.
+    fn for_each_row(&self, f: &mut dyn FnMut(&[f64], f64, f64) -> bool) -> bool;
+}
+
+/// The resident slice implementation, used by the CLI when the training sample
+/// is already in memory. The algorithm is still blockwise and never allocates
+/// a design matrix.
+pub struct SliceRows<'a> {
+    pub x: &'a [Vec<f64>],
+    pub y: &'a [f64],
+    pub w: &'a [f64],
+}
+
+impl RowSource for SliceRows<'_> {
+    fn rows(&self) -> usize {
+        self.y.len()
+    }
+
+    fn for_each_row(&self, f: &mut dyn FnMut(&[f64], f64, f64) -> bool) -> bool {
+        let n = self.y.len().min(self.x.len());
+        for i in 0..n {
+            let w = self.w.get(i).copied().unwrap_or(1.0);
+            if !f(&self.x[i], self.y[i], w) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Neumaier-compensated accumulator.
+#[derive(Clone, Copy, Debug, Default)]
+struct Acc {
+    sum: f64,
+    comp: f64,
+}
+
+impl Acc {
+    fn add(&mut self, x: f64) {
+        let t = self.sum + x;
+        if self.sum.abs() >= x.abs() {
+            self.comp += (self.sum - t) + x;
+        } else {
+            self.comp += (x - t) + self.sum;
+        }
+        self.sum = t;
+    }
+
+    fn get(self) -> f64 {
+        self.sum + self.comp
+    }
+}
+
+/// Mergeable sufficient statistics. `p` is the number of constants.
+#[derive(Clone, Debug)]
+struct Sufficient {
+    s: Vec<Acc>,
+    b: Vec<Acc>,
+    sse: Acc,
+    rows: usize,
+    p: usize,
+}
+
+impl Sufficient {
+    fn new(p: usize) -> Self {
+        Sufficient {
+            s: vec![Acc::default(); p * p],
+            b: vec![Acc::default(); p],
+            sse: Acc::default(),
+            rows: 0,
+            p,
+        }
+    }
+
+    fn reset(&mut self) {
+        for a in &mut self.s {
+            *a = Acc::default();
+        }
+        for a in &mut self.b {
+            *a = Acc::default();
+        }
+        self.sse = Acc::default();
+        self.rows = 0;
+    }
+
+    /// Add one weighted row. `g` is `√w·J` and `r` is `√w·(f−y)`.
+    fn add_row(&mut self, g: &[f64], r: f64) {
+        for i in 0..self.p {
+            self.b[i].add(g[i] * r);
+            for j in 0..=i {
+                self.s[i * self.p + j].add(g[i] * g[j]);
+            }
+        }
+        self.sse.add(r * r);
+        self.rows += 1;
+    }
+
+    /// Merge another block by addition. This is the exact f64 reduction step;
+    /// no design matrix and no per-row data are needed.
+    fn merge(&mut self, other: &Sufficient) {
+        debug_assert_eq!(self.p, other.p);
+        for (a, o) in self.s.iter_mut().zip(&other.s) {
+            a.add(o.sum);
+            a.add(o.comp);
+        }
+        for (a, o) in self.b.iter_mut().zip(&other.b) {
+            a.add(o.sum);
+            a.add(o.comp);
+        }
+        self.sse.add(other.sse.sum);
+        self.sse.add(other.sse.comp);
+        self.rows += other.rows;
+    }
+
+    fn normal(&self) -> Vec<Vec<f64>> {
+        let p = self.p;
+        let mut a = vec![vec![0.0; p]; p];
+        for i in 0..p {
+            for j in 0..=i {
+                let v = self.s[i * p + j].get();
+                a[i][j] = v;
+                a[j][i] = v;
+            }
+        }
+        a
+    }
+
+    fn rhs(&self) -> Vec<f64> {
+        self.b.iter().map(|a| -a.get()).collect()
+    }
+}
+
+/// #116: fit a tree from any [`RowSource`] using block sufficient statistics.
+///
+/// Returns the weighted SSE, or `None` when the source cannot be read
+/// consistently, a value is non-finite, or the normal equations are singular.
+/// On `None` the tree is untouched and the caller runs the exact LM path.
+pub fn fit_stream_with<S: RowSource>(tree: &mut Node, source: &S, iters: usize) -> Option<f64> {
+    let f = flatten(tree);
+    let k = f.nconst;
+    if k == 0 || source.rows() == 0 {
+        let mut v = vec![0.0; f.op.len().max(1)];
+        return Some(sse_scan(&f, source, &[], &mut v)?);
+    }
+    let mut c = vec![0.0; k];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut best_c = c.clone();
+    let mut best_sse = sse_scan(&f, source, &best_c, &mut vec![0.0; f.op.len()])?;
+    let start = best_sse;
+    let mut lambda = 1e-3;
+    let mut aborted = false;
+
+    for _ in 0..iters.max(1) {
+        let Some(stats) = accumulate(&f, source, &c) else {
+            aborted = true;
+            break;
+        };
+        let a = stats.normal();
+        let mut rhs = stats.rhs();
+        let Some(step) = solve(&a, &mut rhs, lambda, k) else {
+            break;
+        };
+        let trial: Vec<f64> = c
+            .iter()
+            .zip(&step)
+            .map(|(v, d)| (v + d).clamp(-1e6, 1e6))
+            .collect();
+        if !trial.iter().all(|v| v.is_finite()) {
+            aborted = true;
+            break;
+        }
+        let Some(trial_sse) = sse_scan(&f, source, &trial, &mut vec![0.0; f.op.len()]) else {
+            aborted = true;
+            break;
+        };
+        if trial_sse < best_sse {
+            c = trial;
+            best_c = c.clone();
+            best_sse = trial_sse;
+            lambda = (lambda / 8.0).max(1e-12);
+            if best_sse == 0.0 {
+                break;
+            }
+        } else {
+            lambda *= 6.0;
+            if lambda > 1e9 {
+                break;
+            }
+        }
+    }
+    if aborted || !best_sse.is_finite() || best_sse > start {
+        return None;
+    }
+    write_constants(tree, &f, &best_c);
+    Some(best_sse)
+}
+
+/// Resident slice entry point for the streaming arm.
+pub fn fit_stream(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> Option<f64> {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != y.len()) {
+        return None;
+    }
+    fit_stream_with(tree, &SliceRows { x, y, w }, iters)
+}
+
+/// Accumulate one iteration's normal equations in fixed-size blocks.
+fn accumulate(f: &Flat, source: &dyn RowSource, c: &[f64]) -> Option<Sufficient> {
+    let k = f.nconst;
+    let mut total = Sufficient::new(k);
+    let mut block = Sufficient::new(k);
+    let mut v = vec![0.0; f.op.len()];
+    let mut adj = vec![0.0; f.op.len()];
+    let mut grad = vec![0.0; k];
+    let mut g = vec![0.0; k];
+    let mut ok = true;
+    let mut seen = 0usize;
+    let complete = source.for_each_row(&mut |row, t, sw| {
+        if sw == 0.0 {
+            return true; // a zero-weight row contributes nothing
+        }
+        if !(sw.is_finite() && sw > 0.0) {
+            ok = false;
+            return false;
+        }
+        eval_row(f, row, c, &mut v);
+        let root = sw.sqrt();
+        let r = root * (v[f.root] - t);
+        if !r.is_finite() {
+            ok = false;
+            return false;
+        }
+        backward(f, &v, &mut adj, &mut grad);
+        for (dst, &src) in g.iter_mut().zip(&grad) {
+            if !src.is_finite() {
+                ok = false;
+                return false;
+            }
+            *dst = root * src;
+        }
+        block.add_row(&g, r);
+        seen += 1;
+        if seen % STREAM_BLOCK_ROWS == 0 {
+            total.merge(&block);
+            block.reset();
+        }
+        true
+    });
+    if !ok || !complete {
+        return None;
+    }
+    total.merge(&block);
+    Some(total)
+}
+
+/// Forward-only weighted SSE over the source.
+fn sse_scan(f: &Flat, source: &dyn RowSource, c: &[f64], v: &mut [f64]) -> Option<f64> {
+    let mut acc = Acc::default();
+    let mut ok = true;
+    let complete = source.for_each_row(&mut |row, t, sw| {
+        if sw == 0.0 {
+            return true;
+        }
+        if !(sw.is_finite() && sw > 0.0) {
+            ok = false;
+            return false;
+        }
+        eval_row(f, row, c, v);
+        let r = sw.sqrt() * (v[f.root] - t);
+        if !r.is_finite() {
+            ok = false;
+            return false;
+        }
+        acc.add(r * r);
+        true
+    });
+    if !ok || !complete {
+        None
+    } else {
+        Some(acc.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+
+    fn fitted(tree: &Node) -> Vec<f64> {
+        let f = flatten(tree);
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..f.op.len() {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        c
+    }
+
+    /// A generated source is never materialised. This exercises the same code
+    /// path a disk-backed out-of-core source would use: rows arrive one at a
+    /// time, the fitter keeps only `p²` statistics.
+    struct Generated {
+        n: usize,
+    }
+
+    impl RowSource for Generated {
+        fn rows(&self) -> usize {
+            self.n
+        }
+
+        fn for_each_row(&self, f: &mut dyn FnMut(&[f64], f64, f64) -> bool) -> bool {
+            for i in 0..self.n {
+                let x = -3.0 + 6.0 * i as f64 / (self.n - 1) as f64;
+                // a*sin(b*x)+c, the classic separable law.
+                let y = 2.0 * (0.9 * x).sin() + 0.3;
+                if !f(&[x], y, 1.0) {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    fn model() -> Node {
+        node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.5),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(0.5), input(0)])]),
+                    ],
+                ),
+                constant(0.0),
+            ],
+        )
+    }
+
+    #[test]
+    fn streaming_fit_matches_the_resident_fit() {
+        let n = 20_000;
+        let source = Generated { n };
+        let mut streamed = model();
+        let a = fit_stream_with(&mut streamed, &source, 16).expect("stream fit");
+        // Materialise the same rows only for the comparison.
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        source.for_each_row(&mut |row, t, _| {
+            x.push(row.to_vec());
+            y.push(t);
+            true
+        });
+        let mut resident = model();
+        let b = fit_weighted(&mut resident, &x, &y, &[], 16);
+        assert!((a - b).abs() <= 1e-9 * (1.0 + b.abs()), "stream {a} vs resident {b}");
+        for (u, v) in fitted(&streamed).iter().zip(fitted(&resident)) {
+            assert!((u - v).abs() <= 1e-6 * (1.0 + v.abs()), "constants {u} vs {v}");
+        }
+    }
+
+    /// Block-size independence: merging 997-row blocks and 8192-row blocks
+    /// gives the same statistics to rounding, so the merge is stable.
+    #[test]
+    fn sufficient_statistics_merge_additively() {
+        let p = 3;
+        let mut whole = Sufficient::new(p);
+        let mut a = Sufficient::new(p);
+        let mut b = Sufficient::new(p);
+        for i in 0..3000 {
+            let g = [i as f64, (i as f64).sqrt(), 1.0];
+            let r = (i % 7) as f64 - 3.0;
+            whole.add_row(&g, r);
+            if i < 997 {
+                a.add_row(&g, r);
+            } else {
+                b.add_row(&g, r);
+            }
+        }
+        a.merge(&b);
+        for i in 0..p * p {
+            let (u, v) = (whole.s[i].get(), a.s[i].get());
+            assert!((u - v).abs() <= 1e-9 * (1.0 + u.abs()), "S[{i}] {u} vs {v}");
+        }
+        assert!((whole.sse.get() - a.sse.get()).abs() <= 1e-9 * (1.0 + whole.sse.get()));
+    }
+
+    #[test]
+    fn non_finite_rows_reject_the_streaming_arm() {
+        struct Bad;
+        impl RowSource for Bad {
+            fn rows(&self) -> usize {
+                3
+            }
+            fn for_each_row(&self, f: &mut dyn FnMut(&[f64], f64, f64) -> bool) -> bool {
+                f(&[0.0], f64::INFINITY, 1.0)
+            }
+        }
+        let mut tree = model();
+        assert!(fit_stream_with(&mut tree, &Bad, 8).is_none());
+    }
+}

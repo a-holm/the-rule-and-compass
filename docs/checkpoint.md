@@ -47,6 +47,11 @@ usual but are not checkpointed.
 The format is plain UTF-8 text, one record per line. It is hand-written and
 read by the engine itself; no third-party parser is involved.
 
+Every encoded tree is bounded to **4096 nodes** and a root-to-leaf **depth of
+256** (a single node has depth 1). `decode_tree` returns an error such as
+`checkpoint tree depth 257 exceeds the limit of 256` or `checkpoint tree has
+more than 4096 nodes`; it never recurses without a bound.
+
 ```text
 rcsr-checkpoint v1
 config generations 40
@@ -88,7 +93,7 @@ Every record:
 
 | record | contents |
 |---|---|
-| `config <key> <value>` | one search setting. All settings that influence the trajectory are present; `complexity.op_costs` carries one cost per `Op`, in discriminant order. `units`, `units.target` and `require_dimensions` are optional: they are written only when `--units` is active, and a checkpoint without them loads as units-free. `front_parents` is optional too: it is written only when `--no-front-parents` is used, and a checkpoint without it loads with the Pareto-front feedback on. |
+| `config <key> <value>` | one search setting. All settings that influence the trajectory are present; `complexity.op_costs` carries one cost per `Op`, in discriminant order. `units`, `units.target` and `require_dimensions` are optional: they are written only when `--units` is active, and a checkpoint without them loads as units-free. `front_parents` is optional too: it is written only when `--no-front-parents` is used, and a checkpoint without it loads with the Pareto-front feedback on. The QD settings (`qd_bins`, `qd_cell_cap`, `qd_cvt`, `qd_policy`) are optional and written only when the layer is enabled; a checkpoint without them loads with QD off. |
 | `backend <cpu\|gpu\|unknown>` | evaluator that produced the state (#140). New checkpoints always write `cpu` or `gpu`; `unknown` only appears when reading a checkpoint from before this record existed. |
 | `config_hash <hex>` | FNV-1a 64-bit hash of the canonical `config` lines, excluding the `generations` budget (resuming may raise it). The loader recomputes it and refuses a checkpoint whose configuration text does not agree. |
 | `generations <n>` | completed generations (the next generation to run). |

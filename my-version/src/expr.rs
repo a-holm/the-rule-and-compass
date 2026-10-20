@@ -1893,6 +1893,658 @@ pub fn structural_hash(n: &Node) -> u64 {
     h
 }
 
+
+// ---------------------------------------------------------------------------
+// Definedness and range analysis (issue #143)
+// ---------------------------------------------------------------------------
+
+/// A conservative non-relational abstract domain. `Fin` means every value in
+/// the interval is finite; `MayNaN` also covers infinities and failed guards.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Domain {
+    Fin { lo: f64, hi: f64 },
+    MayNaN,
+}
+
+/// Interval plus a proof that zero is outside the interval.
+#[derive(Clone, Copy, Debug)]
+struct Info {
+    dom: Domain,
+    nonzero: bool,
+}
+
+impl Info {
+    fn unknown() -> Self {
+        Info {
+            dom: Domain::MayNaN,
+            nonzero: false,
+        }
+    }
+
+    fn fin(lo: f64, hi: f64) -> Option<Self> {
+        if lo.is_finite() && hi.is_finite() && lo <= hi {
+            Some(Info {
+                dom: Domain::Fin { lo, hi },
+                nonzero: lo > 0.0 || hi < 0.0,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn total(self) -> bool {
+        matches!(self.dom, Domain::Fin { .. })
+    }
+
+    fn bounds(self) -> Option<(f64, f64)> {
+        match self.dom {
+            Domain::Fin { lo, hi } => Some((lo, hi)),
+            Domain::MayNaN => None,
+        }
+    }
+}
+
+fn next_down(x: f64) -> f64 {
+    if x.is_finite() {
+        x.next_down()
+    } else {
+        x
+    }
+}
+
+fn next_up(x: f64) -> f64 {
+    if x.is_finite() {
+        x.next_up()
+    } else {
+        x
+    }
+}
+
+fn add_bounds(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    let lo = a.0 + b.0;
+    let hi = a.1 + b.1;
+    if lo.is_finite() && hi.is_finite() {
+        Some((next_down(lo), next_up(hi)))
+    } else {
+        None
+    }
+}
+
+fn sub_bounds(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    add_bounds(a, (-b.1, -b.0))
+}
+
+fn mul_bounds(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    let p = [a.0 * b.0, a.0 * b.1, a.1 * b.0, a.1 * b.1];
+    if p.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let lo = p.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = p.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Some((next_down(lo), next_up(hi)))
+}
+
+fn div_bounds(a: (f64, f64), b: (f64, f64)) -> Option<(f64, f64)> {
+    // `eval` returns NaN when |denominator| < 1e-12, so a total division needs
+    // the whole denominator interval on one side of that guard.
+    if !(b.0 > 1e-12 || b.1 < -1e-12) {
+        return None;
+    }
+    let q = [a.0 / b.0, a.0 / b.1, a.1 / b.0, a.1 / b.1];
+    if q.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let lo = q.iter().copied().fold(f64::INFINITY, f64::min);
+    let hi = q.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Some((next_down(lo), next_up(hi)))
+}
+
+fn pow_int_bounds(base: (f64, f64), n: i32) -> Option<(f64, f64)> {
+    if n == 0 {
+        return Some((1.0, 1.0));
+    }
+    let mut acc = (1.0, 1.0);
+    let mut b = base;
+    let mut k = n.unsigned_abs();
+    while k > 0 {
+        if k & 1 == 1 {
+            acc = mul_bounds(acc, b)?;
+        }
+        k >>= 1;
+        if k > 0 {
+            b = mul_bounds(b, b)?;
+        }
+    }
+    if n < 0 {
+        div_bounds((1.0, 1.0), acc)
+    } else {
+        Some(acc)
+    }
+}
+
+fn join(a: Info, b: Info) -> Info {
+    match (a.dom, b.dom) {
+        (Domain::Fin { lo: al, hi: ah }, Domain::Fin { lo: bl, hi: bh }) => {
+            Info::fin(al.min(bl), ah.max(bh)).unwrap_or_else(Info::unknown)
+        }
+        _ => Info::unknown(),
+    }
+}
+
+fn round_info(x: Info, lo: f64, hi: f64) -> Info {
+    if x.total() {
+        Info::fin(lo, hi).unwrap_or_else(Info::unknown)
+    } else {
+        Info::unknown()
+    }
+}
+
+/// Abstract interpretation of definedness and ranges for one tree.
+///
+/// `bounds` supplies `[lo, hi]` for input columns; `None` treats an input as
+/// possibly non-finite (the conservative choice for the no-data simplifier).
+/// `env` supplies parameter intervals for a block body. The analysis is
+/// non-relational and O(nodes): it is the proof obligation behind the guarded
+/// cancellations in [`simplify`].
+fn analyze(n: &Node, bounds: Option<&[(f64, f64)]>, env: Option<&[Domain]>) -> Info {
+    use Op::*;
+    if n.op.is_meta() || n.op.is_agg() {
+        return if n.val.is_finite() {
+            Info::fin(n.val, n.val).unwrap_or_else(Info::unknown)
+        } else {
+            Info::unknown()
+        };
+    }
+    if n.op.is_custom() {
+        let Some(block) = &n.block else {
+            return Info::unknown();
+        };
+        let args: Vec<Domain> = n
+            .kids
+            .iter()
+            .map(|k| analyze(k, bounds, env).dom)
+            .collect();
+        return analyze(&block.body, None, Some(&args));
+    }
+    match n.op {
+        Const => {
+            if n.val.is_finite() {
+                Info::fin(n.val, n.val).unwrap_or_else(Info::unknown)
+            } else {
+                Info::unknown()
+            }
+        }
+        Input => {
+            let i = n.val as usize;
+            if let Some(env) = env {
+                return match env.get(i).copied().unwrap_or(Domain::MayNaN) {
+                    Domain::Fin { lo, hi } => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                    Domain::MayNaN => Info::unknown(),
+                };
+            }
+            let Some((lo, hi)) = bounds.and_then(|b| b.get(i)).copied() else {
+                return Info::unknown();
+            };
+            Info::fin(lo, hi).unwrap_or_else(Info::unknown)
+        }
+        Neg => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some((lo, hi)) => Info::fin(-hi, -lo).unwrap_or_else(Info::unknown),
+            None => Info::unknown(),
+        },
+        Abs => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some((lo, hi)) if hi < 0.0 => Info::fin(-hi, -lo).unwrap_or_else(Info::unknown),
+            Some((lo, hi)) if lo > 0.0 => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+            Some((lo, hi)) => Info::fin(0.0, (-lo).max(hi)).unwrap_or_else(Info::unknown),
+            None => Info::unknown(),
+        },
+        Exp => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if hi <= 700.0 => {
+                    Info::fin(next_down(lo.exp()), next_up(hi.exp())).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Ln => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if lo > 0.0 => {
+                    Info::fin(next_down(lo.ln()), next_up(hi.ln())).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Sqrt => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if lo >= 0.0 => {
+                    Info::fin(0.0, next_up(hi.sqrt())).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Sin | Cos => round_info(analyze(&n.kids[0], bounds, env), -1.0, 1.0),
+        Tan => Info::unknown(),
+        Sinh => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some((lo, hi)) if lo.abs() <= 700.0 && hi.abs() <= 700.0 => {
+                Info::fin(next_down(lo.sinh()), next_up(hi.sinh())).unwrap_or_else(Info::unknown)
+            }
+            _ => Info::unknown(),
+        },
+        Cosh => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some((lo, hi)) if lo.abs() <= 700.0 && hi.abs() <= 700.0 => {
+                let (a, b) = (lo.cosh(), hi.cosh());
+                let min = if lo <= 0.0 && hi >= 0.0 { 1.0 } else { a.min(b) };
+                Info::fin(next_down(min), next_up(a.max(b))).unwrap_or_else(Info::unknown)
+            }
+            _ => Info::unknown(),
+        },
+        Tanh => round_info(analyze(&n.kids[0], bounds, env), -1.0, 1.0),
+        Logistic => round_info(analyze(&n.kids[0], bounds, env), 0.0, 1.0),
+        // `step(NaN)` and `step(inf)` are both finite (0 or 1).
+        Step => Info::fin(0.0, 1.0).unwrap(),
+        Gauss => round_info(analyze(&n.kids[0], bounds, env), 0.0, 1.0),
+        Erf => round_info(analyze(&n.kids[0], bounds, env), -1.0, 1.0),
+        Erfc => round_info(analyze(&n.kids[0], bounds, env), 0.0, 2.0),
+        Square => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some(v) => match mul_bounds(v, v) {
+                Some((lo, hi)) => Info::fin(lo.max(0.0), hi).unwrap_or_else(Info::unknown),
+                None => Info::unknown(),
+            },
+            None => Info::unknown(),
+        },
+        Cube => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some(v) => match mul_bounds(v, v).and_then(|(l, h)| mul_bounds((l, h), v)) {
+                Some((lo, hi)) => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                None => Info::unknown(),
+            },
+            None => Info::unknown(),
+        },
+        Floor | Ceil | Round => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) => {
+                    let (lo, hi) = match n.op {
+                        Floor => (lo.floor(), hi.floor()),
+                        Ceil => (lo.ceil(), hi.ceil()),
+                        _ => (lo.round(), hi.round()),
+                    };
+                    Info::fin(lo, hi).unwrap_or_else(Info::unknown)
+                }
+                None => Info::unknown(),
+            }
+        }
+        Sign => round_info(analyze(&n.kids[0], bounds, env), -1.0, 1.0),
+        Asinh => match analyze(&n.kids[0], bounds, env).bounds() {
+            Some((lo, hi)) => {
+                Info::fin(next_down(lo.asinh()), next_up(hi.asinh())).unwrap_or_else(Info::unknown)
+            }
+            None => Info::unknown(),
+        },
+        Acosh => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if lo >= 1.0 => {
+                    Info::fin(next_down(lo.acosh()), next_up(hi.acosh())).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Atanh => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if lo > -1.0 && hi < 1.0 => {
+                    Info::fin(next_down(lo.atanh()), next_up(hi.atanh())).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Add => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some(a), Some(b)) => match add_bounds(a, b) {
+                    Some((lo, hi)) => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                    None => Info::unknown(),
+                },
+                _ => Info::unknown(),
+            }
+        }
+        Sub => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some(a), Some(b)) => match sub_bounds(a, b) {
+                    Some((lo, hi)) => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                    None => Info::unknown(),
+                },
+                _ => Info::unknown(),
+            }
+        }
+        Mul => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some(a), Some(b)) => match mul_bounds(a, b) {
+                    Some((lo, hi)) => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                    None => Info::unknown(),
+                },
+                _ => Info::unknown(),
+            }
+        }
+        Div => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some(a), Some(b)) => match div_bounds(a, b) {
+                    Some((lo, hi)) => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                    None => Info::unknown(),
+                },
+                _ => Info::unknown(),
+            }
+        }
+        Pow => {
+            let b = &n.kids[1];
+            // `pow(x, 0)` is 1 even for NaN and ±inf; `pow(x, 1)` is x.
+            if b.op == Const && b.val.to_bits() == 0.0f64.to_bits() {
+                return Info::fin(1.0, 1.0).unwrap();
+            }
+            if b.op == Const && b.val.to_bits() == 1.0f64.to_bits() {
+                return analyze(&n.kids[0], bounds, env);
+            }
+            let a = analyze(&n.kids[0], bounds, env);
+            if let (Some(ab), Some(n)) = (a.bounds(), b.op.eq(&Op::Const).then_some(b.val)) {
+                if n.fract() == 0.0 && n.abs() <= 1024.0 {
+                    if let Some((lo, hi)) = pow_int_bounds(ab, n as i32) {
+                        return Info::fin(lo, hi).unwrap_or_else(Info::unknown);
+                    }
+                }
+            }
+            Info::unknown()
+        }
+        Mod => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some(a), Some(b)) if div_bounds(a, b).is_some() => {
+                    let m = b.0.abs().max(b.1.abs());
+                    Info::fin(-m, m).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Atan2 => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            if a.total() && b.total() {
+                Info::fin(
+                    -std::f64::consts::PI,
+                    std::f64::consts::PI,
+                )
+                .unwrap_or_else(Info::unknown)
+            } else {
+                Info::unknown()
+            }
+        }
+        Min => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some((al, ah)), Some((bl, bh))) => {
+                    Info::fin(al.min(bl), ah.min(bh)).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        Max => {
+            let a = analyze(&n.kids[0], bounds, env);
+            let b = analyze(&n.kids[1], bounds, env);
+            match (a.bounds(), b.bounds()) {
+                (Some((al, ah)), Some((bl, bh))) => {
+                    Info::fin(al.max(bl), ah.max(bh)).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        If => {
+            let c = analyze(&n.kids[0], bounds, env);
+            let a = analyze(&n.kids[1], bounds, env);
+            let b = analyze(&n.kids[2], bounds, env);
+            match c.bounds() {
+                Some((lo, _)) if lo > 0.0 => a,
+                Some((_, hi)) if hi <= 0.0 => b,
+                Some(_) if a.total() && b.total() => join(a, b),
+                _ => Info::unknown(),
+            }
+        }
+        Equal | Less | LessOrEqual | Greater | GreaterOrEqual | And | Or | Xor | Not => {
+            // Every comparison and logical operator propagates NaN, so all
+            // operands must be finite for the result to be total.
+            if n.kids.iter().all(|k| analyze(k, bounds, env).total()) {
+                Info::fin(0.0, 1.0).unwrap()
+            } else {
+                Info::unknown()
+            }
+        }
+        Require | Constrain => {
+            let a = analyze(&n.kids[0], bounds, env);
+            match a.bounds() {
+                Some((lo, hi)) if lo > 0.0 => Info::fin(lo, hi).unwrap_or_else(Info::unknown),
+                _ => Info::unknown(),
+            }
+        }
+        Between => {
+            let v = analyze(&n.kids[0], bounds, env);
+            let lo = analyze(&n.kids[1], bounds, env);
+            let hi = analyze(&n.kids[2], bounds, env);
+            match (v.bounds(), lo.bounds(), hi.bounds()) {
+                (Some((vl, vh)), Some((_, lh)), Some((hl, _))) if lh <= vl && vh <= hl => {
+                    Info::fin(vl, vh).unwrap_or_else(Info::unknown)
+                }
+                _ => Info::unknown(),
+            }
+        }
+        _ => Info::unknown(),
+    }
+}
+
+/// Total and range analysis of `n`, using `bounds` for input columns.
+/// `None` means an input may be non-finite.
+pub fn analyze_total(n: &Node, bounds: Option<&[(f64, f64)]>) -> bool {
+    analyze(n, bounds, None).total()
+}
+
+/// Canonical structural order, used to orient the commutative `Add`/`Mul`
+/// children. It is a total order on nodes (op index, value bits, arity, children,
+/// block definition), so the normal form is deterministic.
+fn cmp_nodes(a: &Node, b: &Node) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    a.op
+        .index()
+        .cmp(&b.op.index())
+        .then_with(|| a.val.to_bits().cmp(&b.val.to_bits()))
+        .then_with(|| a.kids.len().cmp(&b.kids.len()))
+        .then_with(|| {
+            for (x, y) in a.kids.iter().zip(&b.kids) {
+                let c = cmp_nodes(x, y);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            Ordering::Equal
+        })
+        .then_with(|| match (&a.block, &b.block) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(x), Some(y)) => x
+                .name
+                .cmp(&y.name)
+                .then_with(|| x.params.len().cmp(&y.params.len()))
+                .then_with(|| cmp_nodes(&x.body, &y.body)),
+        })
+}
+
+fn exact_val(n: &Node, bits: u64) -> bool {
+    n.op == Op::Const && n.val.to_bits() == bits
+}
+
+fn zero_literal(n: &Node) -> Option<f64> {
+    if n.op == Op::Const && n.val == 0.0 {
+        Some(n.val)
+    } else {
+        None
+    }
+}
+
+/// Sound, value-preserving simplification: the normal form used for scoring,
+/// de-duplication and CSE.
+///
+/// Every rule is exact on IEEE-754 values, including `NaN`, `±inf` and signed
+/// zero. Cancellations that need a proof (`x-x`, `x/x`, `0*x`) are applied only
+/// when [`analyze`] proves the operand finite (and, for `x/x`, non-zero); with
+/// no data bounds an input is treated as possibly non-finite, so those rules
+/// stay off. Associativity, distributivity and affine re-association are
+/// deliberately absent: they change f64 rounding and belong to
+/// [`simplify_display`].
+pub fn simplify(n: &Node) -> Node {
+    simplify_with_bounds(n, None)
+}
+
+/// [`simplify`] with per-input `[lo, hi]` bounds, which enable the guarded
+/// cancellation rules for subtrees that contain inputs.
+pub fn simplify_with_bounds(n: &Node, bounds: Option<&[(f64, f64)]>) -> Node {
+    use Op::*;
+    let mut m = Node {
+        op: n.op,
+        val: n.val,
+        kids: n
+            .kids
+            .iter()
+            .map(|k| simplify_with_bounds(k, bounds))
+            .collect(),
+        block: n.block.clone(),
+    };
+    if m.op == Const || m.op == Input {
+        return m;
+    }
+    if m.op.is_custom() {
+        if let Some(block) = &mut m.block {
+            block.body = simplify(&block.body);
+        }
+        return m;
+    }
+    if m.op.is_meta() {
+        m.val = meta_value(m.op, &m.kids[0]);
+    }
+    if !m.op.is_agg() && m.kids.iter().all(|k| k.op == Const) {
+        let v = eval(&m, &[]);
+        if v.is_finite() {
+            return constant(v);
+        }
+    }
+    match m.op {
+        Neg => {
+            if m.kids[0].op == Neg && m.kids[0].kids.len() == 1 {
+                return m.kids[0].kids[0].clone();
+            }
+        }
+        Add => {
+            // `x + -0` is exactly `x` for every IEEE value (including -0).
+            let neg_zero = (-0.0f64).to_bits();
+            if exact_val(&m.kids[0], neg_zero) {
+                return m.kids[1].clone();
+            }
+            if exact_val(&m.kids[1], neg_zero) {
+                return m.kids[0].clone();
+            }
+            // `x + +0` is an identity unless x can be -0. A strictly signed
+            // interval (or a concrete aggregate/meta value) proves that.
+            for (zero, other) in [(&m.kids[0], &m.kids[1]), (&m.kids[1], &m.kids[0])] {
+                if exact_val(zero, 0.0f64.to_bits()) {
+                    if let Some((lo, hi)) = analyze(other, bounds, None).bounds() {
+                        if lo > 0.0 || hi < 0.0 {
+                            return other.clone();
+                        }
+                    }
+                }
+            }
+        }
+        Sub => {
+            // `x - +0` is exactly `x`; `x - -0` is not (it turns -0 into +0).
+            if exact_val(&m.kids[1], 0.0f64.to_bits()) {
+                return m.kids[0].clone();
+            }
+            if same(&m.kids[0], &m.kids[1]) {
+                let info = analyze(&m.kids[0], bounds, None);
+                if info.total() {
+                    return constant(0.0);
+                }
+            }
+        }
+        Mul => {
+            if exact_val(&m.kids[0], 1.0f64.to_bits())
+                || exact_val(&m.kids[1], 1.0f64.to_bits())
+            {
+                return if exact_val(&m.kids[0], 1.0f64.to_bits()) {
+                    m.kids[1].clone()
+                } else {
+                    m.kids[0].clone()
+                };
+            }
+            // `0 * x` is only a constant zero when x is finite and has a known
+            // sign, because the sign of the zero result follows x.
+            for (zero, other) in [(&m.kids[0], &m.kids[1]), (&m.kids[1], &m.kids[0])] {
+                if let Some(z) = zero_literal(zero) {
+                    let info = analyze(other, bounds, None);
+                    if let Some((lo, hi)) = info.bounds() {
+                        if lo > 0.0 || hi < 0.0 {
+                            let negative = z.is_sign_negative() ^ (hi < 0.0);
+                            return constant(if negative { -0.0 } else { 0.0 });
+                        }
+                    }
+                }
+            }
+        }
+        Div => {
+            if exact_val(&m.kids[1], 1.0f64.to_bits()) {
+                return m.kids[0].clone();
+            }
+            if same(&m.kids[0], &m.kids[1]) {
+                let info = analyze(&m.kids[0], bounds, None);
+                if info.total() && info.nonzero {
+                    return constant(1.0);
+                }
+            }
+        }
+        Pow => {
+            if m.kids[1].op == Const {
+                if m.kids[1].val.to_bits() == 1.0f64.to_bits() {
+                    return m.kids[0].clone();
+                }
+                if m.kids[1].val.to_bits() == 0.0f64.to_bits() {
+                    return constant(1.0);
+                }
+            }
+        }
+        If => {
+            if m.kids[0].op == Const {
+                return if m.kids[0].val > 0.0 {
+                    m.kids[1].clone()
+                } else {
+                    m.kids[2].clone()
+                };
+            }
+        }
+        _ => {}
+    }
+    if m.op == Add || m.op == Mul {
+        m.kids.sort_by(cmp_nodes);
+    }
+    m
+}
+
 /// `k * u`, pulled into canonical form by absorbing any constant factor that
 /// already sits at the top of `u`. Keeps `0.8447*(x)` rather than `x/1.1839`.
 fn mul_const(k: f64, u: Node) -> Node {
@@ -1931,18 +2583,24 @@ fn add_const(k: f64, u: Node) -> Node {
     node(Op::Add, vec![constant(k), u])
 }
 
-/// Bottom-up constant folding, algebraic identities, and affine normalisation.
+/// Display-only aggressive simplification: constant folding, algebraic
+/// identities and affine normalisation.
 ///
 /// Equivalent expressions evaluate identically, so collapsing them removes work
 /// that buys nothing (see `docs/optimisation.md`, "the kernel of evaluation").
 /// Normalising constant factors also makes the printed equation readable:
 /// `x/1.1839` becomes `0.8447*x`, and `(x/c1)/c2` becomes `1.6894*x`.
-pub fn simplify(n: &Node) -> Node {
+///
+/// **This is not value-preserving at IEEE edge cases** (it applies
+/// `x + 0 -> x`, `0*x -> 0`, tolerance-based identities and affine
+/// re-association). Use [`simplify`] for scoring, dedup and CSE; use this only
+/// when producing a human-readable equation.
+pub fn simplify_display(n: &Node) -> Node {
     use Op::*;
     let mut m = Node {
         op: n.op,
         val: n.val,
-        kids: n.kids.iter().map(simplify).collect(),
+        kids: n.kids.iter().map(simplify_display).collect(),
         block: n.block.clone(),
     };
     if m.op == Const || m.op == Input {
@@ -1953,7 +2611,7 @@ pub fn simplify(n: &Node) -> Node {
     // use; the fitter synchronises the copies (see `docs/building-blocks.md`).
     if m.op.is_custom() {
         if let Some(block) = &mut m.block {
-            block.body = simplify(&block.body);
+            block.body = simplify_display(&block.body);
         }
         return m;
     }
@@ -2099,6 +2757,11 @@ pub fn denormalize(n: &Node, means: &[f64], stds: &[f64]) -> Node {
 mod tests {
     use super::*;
 
+    /// Bit-exact value equality except that all NaNs compare equal.
+    fn same_value(a: f64, b: f64) -> bool {
+        (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+    }
+
     /// Evaluate a meta operator on `child`; `row` must not matter.
     fn meta_val(kind: Op, child: Node, row: &[f64]) -> f64 {
         eval(&meta(kind, child), row)
@@ -2184,11 +2847,15 @@ mod tests {
             node(Op::Add, vec![input(0), constant(0.0)]),
         );
         assert_eq!(tree.val, 3.0);
-        let simple = simplify(&tree);
+        let simple = simplify_display(&tree);
         assert_eq!(simple.op, Op::Complexity);
-        // `x + 0` becomes `x`, so the argument is one node.
+        // `x + 0` becomes `x` in the display normal form, so the argument is
+        // one node.
         assert_eq!(simple.val, 1.0);
         assert_eq!(eval(&simple, &[4.0]), 1.0);
+        // The sound core deliberately keeps `x + +0` (it is not an identity at
+        // x = -0), so the cached shape stays at 3 nodes there.
+        assert_eq!(simplify(&tree).val, 3.0);
     }
 
     #[test]
@@ -2350,6 +3017,107 @@ mod tests {
         assert!(bind_aggregates(&mut not_a_column, &t).is_err());
         let mut out_of_range = node(Op::Agg(AggKind::Mean), vec![input(3)]);
         assert!(bind_aggregates(&mut out_of_range, &t).is_err());
+    }
+
+    #[test]
+    fn sound_core_keeps_unsafe_cancellations() {
+        let x = input(0);
+        let div_zero = node(Op::Div, vec![constant(1.0), constant(0.0)]);
+        let cases = [
+            node(Op::Sub, vec![x.clone(), x.clone()]),
+            node(Op::Div, vec![x.clone(), x.clone()]),
+            node(Op::Mul, vec![constant(0.0), x.clone()]),
+            node(Op::Add, vec![x.clone(), constant(0.0)]),
+            node(Op::Sub, vec![div_zero.clone(), div_zero.clone()]),
+        ];
+        for t in cases {
+            let s = simplify(&t);
+            // None of these may become a finite constant without a proof.
+            assert!(
+                !(s.op == Op::Const && s.val.is_finite()),
+                "unsafe rewrite of {}",
+                to_string(&t, &["x".to_string()])
+            );
+            for row in [[-0.0], [0.0], [1.0], [f64::INFINITY], [f64::NAN]] {
+                assert!(
+                    same_value(eval(&t, &row), eval(&s, &row)),
+                    "{} at {:?}: {} -> {}",
+                    to_string(&t, &["x".to_string()]),
+                    row,
+                    eval(&t, &row),
+                    eval(&s, &row)
+                );
+            }
+        }
+        // `x - x` stays NaN at a non-finite input.
+        let t = node(Op::Sub, vec![x.clone(), x.clone()]);
+        assert!(eval(&simplify(&t), &[f64::INFINITY]).is_nan());
+        // The display relation is allowed to make the aggressive rewrite.
+        assert_eq!(simplify_display(&t).op, Op::Const);
+    }
+
+    #[test]
+    fn sound_core_uses_proofs_to_enable_safe_cancellations() {
+        let x = input(0);
+        let bounds = [(-2.0, 2.0)];
+        let exp_x = node(Op::Exp, vec![x.clone()]);
+        // exp is finite and strictly positive on the bounded column.
+        assert!(analyze_total(&exp_x, Some(&bounds)));
+        assert_eq!(simplify_with_bounds(&node(Op::Sub, vec![exp_x.clone(), exp_x.clone()]), Some(&bounds)).op, Op::Const);
+        assert_eq!(simplify_with_bounds(&node(Op::Div, vec![exp_x.clone(), exp_x.clone()]), Some(&bounds)).op, Op::Const);
+        // 0*exp(x) is +0 because exp(x) > 0.
+        let z = simplify_with_bounds(&node(Op::Mul, vec![constant(0.0), exp_x]), Some(&bounds));
+        assert_eq!(z.op, Op::Const);
+        assert_eq!(z.val.to_bits(), 0.0f64.to_bits());
+        // Without bounds the same rewrites are withheld.
+        let t = node(Op::Sub, vec![input(0), input(0)]);
+        assert_eq!(simplify(&t).op, Op::Sub);
+    }
+
+    #[test]
+    fn sound_core_is_signed_zero_exact() {
+        let x = input(0);
+        // x + -0 is an identity at every input, including -0.
+        let t = node(Op::Add, vec![x.clone(), constant(-0.0)]);
+        assert_eq!(simplify(&t).op, Op::Input);
+        // x - +0 is an identity; x - -0 is not.
+        assert_eq!(simplify(&node(Op::Sub, vec![x.clone(), constant(0.0)])).op, Op::Input);
+        assert_ne!(simplify(&node(Op::Sub, vec![x.clone(), constant(-0.0)])).op, Op::Input);
+        // x * 1 and x / 1 are exact for NaN, inf and both zeros.
+        for t in [
+            node(Op::Mul, vec![x.clone(), constant(1.0)]),
+            node(Op::Div, vec![x.clone(), constant(1.0)]),
+        ] {
+            assert_eq!(simplify(&t).op, Op::Input);
+        }
+        // A constant one ulp away is not an identity.
+        let almost_one = 1.0f64 + f64::EPSILON;
+        assert_ne!(
+            simplify(&node(Op::Mul, vec![x.clone(), constant(almost_one)])).op,
+            Op::Input
+        );
+    }
+
+    #[test]
+    fn sound_core_canonicalises_add_and_mul_and_is_idempotent() {
+        let x = input(0);
+        let y = input(1);
+        let z = node(Op::Sin, vec![input(0)]);
+        for (a, b) in [
+            (node(Op::Add, vec![x.clone(), y.clone()]), node(Op::Add, vec![y.clone(), x.clone()])),
+            (node(Op::Mul, vec![x.clone(), y.clone()]), node(Op::Mul, vec![y.clone(), x.clone()])),
+            (
+                node(Op::Add, vec![x.clone(), node(Op::Add, vec![y.clone(), z.clone()])]),
+                node(Op::Add, vec![node(Op::Add, vec![z.clone(), y.clone()]), x.clone()]),
+            ),
+        ] {
+            let sa = simplify(&a);
+            let sb = simplify(&b);
+            assert_eq!(structural_hash(&sa), structural_hash(&sb));
+            assert!(same(&sa, &sb));
+            assert_eq!(structural_hash(&simplify(&sa)), structural_hash(&sa));
+            assert_eq!(structural_hash(&simplify(&sb)), structural_hash(&sb));
+        }
     }
 
     /// Each fixture is mutated with many seeds; a mutation that returns the

@@ -1,0 +1,2 @@
+# resolved_seed=15198 label=B backend=gpu
+rcsr --data d.csv --target y --vars x --time ts --train-select 'ts >= 0 and ts < -86400' --test-select 'ts >= 0 and ts < 10' --seed 15198 --generations 1000000 --save runs/B.ckpt --save-every 25 --run-manifest runs/B.manifest.json --json-out runs/B.result.json --progress --gpu

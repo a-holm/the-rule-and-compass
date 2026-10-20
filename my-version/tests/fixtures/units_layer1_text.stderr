@@ -1,3 +1,4 @@
+# preparation: memory estimate 1585 B from 4 rows x 2 columns (2 used); basis: text 20 B + table 96 B + preparation 1152 B + slack 317 B
 # seeded: complexity=5 train_error=2.500000  y = x
 # diagnostics: n=4 k=2 constants | overfit index (test/train)=inf | Durbin-Watson=0.467 (row order is arbitrary here)
 # residual tests (best solution): Ljung-Box h=0 Q=NaN p=NaN | Breusch-Pagan LM=3.876 p=0.049 (variance changes with fitted) | skewness=0.000 excess kurtosis=-1.360

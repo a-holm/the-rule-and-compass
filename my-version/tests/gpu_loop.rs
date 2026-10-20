@@ -366,6 +366,66 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
     );
 }
 
+/// #121: a generation that mixes native, lowered (`asinh`) and unsupported
+/// (`require`) candidates is deterministic, and the JSON reports the split and
+/// the CPU fallback time/workers for every GPU generation.
+#[cfg(feature = "cuda")]
+#[test]
+fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let train = sample(48);
+    let test = sample(48);
+    let mut cfg = config(37, true);
+    cfg.generations = 12;
+    cfg.pop = 36;
+    cfg.islands = 2;
+    cfg.fit_iters = 0;
+    cfg.ops = vec![Op::Add, Op::Mul, Op::Asinh, Op::If, Op::Require];
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "the mixed batch changed the archive");
+    let gpu = a.gpu.expect("a GPU run reports gpu stats");
+    assert!(!gpu.generations.is_empty());
+    let mut saw_unsupported = false;
+    for s in &gpu.generations {
+        assert_eq!(s.native + s.lowered, s.programs);
+        assert_eq!(s.fallbacks, s.unsupported_programs);
+        saw_unsupported |= s.unsupported_programs > 0;
+        if s.fallback_seconds > 0.0 {
+            assert!(s.fallback_workers >= 1);
+        }
+    }
+    assert!(
+        saw_unsupported,
+        "the fixture must exercise the CPU fallback, got {:?}",
+        gpu.generations
+    );
+
+    // The CLI surface: the counters are real JSON keys, not just struct fields.
+    let (code, stdout, stderr) = run_cli(
+        &[
+            "--data", "-", "--target", "y", "--vars", "x",
+            "--generations", "3", "--pop", "24", "--seed", "37",
+            "--metric", "squared", "--ops", "add,mul,asinh,require", "--gpu", "--json",
+        ],
+        Some("1"),
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    for key in [
+        "\"native\":",
+        "\"supported\":",
+        "\"lowered\":",
+        "\"unsupported_programs\":",
+        "\"fallback_seconds\":",
+        "\"fallback_workers\":",
+        "\"totals\":",
+    ] {
+        assert!(stdout.contains(key), "missing {key} in json: {stdout}");
+    }
+}
+
 /// #119: the overlap pipeline must not change a single scored value. The
 /// synchronous path (`pipeline_depth = 0`) and the bounded overlap path are
 /// compared on the same seed; every archive member, its exact `f64` error bits
@@ -467,4 +527,86 @@ fn batched_generation_is_deterministic_given_the_seed() {
             .collect::<Vec<_>>(),
         b.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>()
     );
+}
+
+/// #118: a CPU run reports `"gpu":null` — never fabricated zeroes, and never a
+/// duty or occupancy value it did not measure.
+#[test]
+fn cpu_json_reports_gpu_null() {
+    let (code, stdout, _stderr) = run_cli(
+        &[
+            "--data",
+            "-",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "2",
+            "--pop",
+            "16",
+            "--seed",
+            "3",
+            "--no-gpu",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("\"gpu\":null"),
+        "a CPU run must report gpu:null, got: {stdout}"
+    );
+}
+
+/// #118: a GPU run reports the measured ledger, keeps #131's per-generation
+/// opcode report, and the host windows close to the independently measured
+/// wall. Occupancy stays null: it needs ncu, not a guess from duty.
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_run_reports_measured_accounting_not_occupancy() {
+    let train = sample(64);
+    let test = sample(64);
+    let out = search::run(&config(11, true), &train, &test);
+    let g = out.gpu.expect("the GPU path scored generations");
+    let a = g.accounting;
+    assert!(a.wall_s > 0.0, "the full path wall must be measured");
+    assert!(a.batches > 0 && a.programs > 0 && a.evals > 0);
+    assert!(a.evals == a.programs, "one candidate evaluation per program");
+    assert_eq!(a.row_evals, a.programs * a.rows);
+    assert!(a.kernel_s >= 0.0 && a.sync_s >= 0.0 && a.alloc_s >= 0.0);
+    assert!(a.d2h_bytes > 0, "the SSE output must be downloaded");
+    assert!(
+        a.decomposition_within(0.01),
+        "host windows should explain the wall within 1%: accounted {} vs wall {} (residual {:+.4})",
+        a.accounted_s(),
+        a.wall_s,
+        a.residual_fraction()
+    );
+    assert!((0.0..=1.0).contains(&a.duty_cycle()));
+    assert!(a.quality_per_gpu_hour(1.0, 10.0).is_some());
+    // #131 must still be present alongside the accounting.
+    assert!(
+        !g.generations.is_empty(),
+        "the per-generation opcode report was removed by the accounting change"
+    );
+}
+
+/// #118: a failed batch is still timed, adds no evaluations and cannot inflate
+/// throughput. `eval_batch` with zero programs fails before the kernel.
+#[cfg(feature = "cuda")]
+#[test]
+fn failed_batch_is_timed_but_not_counted_as_an_eval() {
+    let cols = vec![0.0f32, 1.0, 2.0, 3.0];
+    let y = vec![0.0f32, 1.0, 2.0, 3.0];
+    let mut ev = rcsr::gpu::GpuEvaluator::new(&cols, 4, 1, &y).expect("a CUDA device");
+    let (out, ms) = ev.eval_batch(&[], &[0]);
+    assert!(out.is_empty());
+    assert!(ms < 0.0, "an empty batch must report the error marker");
+    let a = ev.stats();
+    assert_eq!(a.batches, 1);
+    assert_eq!(a.failed_batches, 1);
+    assert_eq!(a.evals, 0);
+    assert_eq!(a.evals_per_s(), 0.0);
+    assert!(a.wall_s >= 0.0);
 }
