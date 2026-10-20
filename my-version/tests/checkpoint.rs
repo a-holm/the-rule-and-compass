@@ -325,6 +325,58 @@ fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     );
 }
 
+/// #140: a GPU-backed checkpoint resumed on the same GPU must reproduce the
+/// uninterrupted archive bit for bit, just like the CPU A/B test above. The
+/// test is hardware-gated: without a usable device it is skipped, not failed.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_gpu_run_and_a_gpu_resume_match_exactly() {
+    if !rcsr::backend::probe().available() {
+        eprintln!("no usable GPU; skipping the GPU->GPU resume A/B test");
+        return;
+    }
+    let train = sample(240);
+    let test = sample(80);
+    let mut full = Config {
+        generations: 20,
+        ..config(17)
+    };
+    full.gpu = true;
+    let uninterrupted = search::run(&full, &train, &test);
+    assert_eq!(uninterrupted.backend, rcsr::backend::Kind::Gpu);
+
+    let mut first = full.clone();
+    first.generations = 10;
+    let text = checkpoint_text(&first, &train, &test);
+    assert!(
+        text.contains("backend gpu\n"),
+        "a GPU checkpoint must record its backend"
+    );
+    let saved = Checkpoint::from_text(&text).expect("parse saved GPU checkpoint");
+
+    let resumed = search::run_resumable(&full, &train, &test, Some(saved), 0, |_| {})
+        .expect("GPU resume");
+    assert_eq!(resumed.backend, rcsr::backend::Kind::Gpu);
+    assert_eq!(
+        describe(&uninterrupted),
+        describe(&resumed),
+        "the GPU-resumed archive must be identical (errors compared by bit pattern)"
+    );
+    assert_eq!(
+        uninterrupted
+            .test_errors
+            .iter()
+            .map(|e| e.to_bits())
+            .collect::<Vec<_>>(),
+        resumed
+            .test_errors
+            .iter()
+            .map(|e| e.to_bits())
+            .collect::<Vec<_>>(),
+        "GPU test errors must be identical"
+    );
+}
+
 #[test]
 fn resuming_onto_different_training_data_is_refused() {
     let train = sample(120);
