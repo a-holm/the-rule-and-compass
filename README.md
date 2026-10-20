@@ -86,6 +86,29 @@ A syntax error names the offending column:
 `--eval-expr "2 * (x + )"` fails with
 `expected a number, variable, function or '(' (column 10)` and exit code 2.
 
+### Walk-forward evaluation and backtest
+
+`rcsr walkforward` evaluates one supplied expression over time windows on a
+`.rcsb` store (CSV is also accepted), applies a long/flat rule and charges costs
+on position changes. It reads the store group by group, uses the same f64
+evaluator as `--eval-expr`, and reports per-window and pooled Sharpe, CAGR, max
+drawdown, turnover, exposure, hit rate, break-even hit rate, trades and rows as
+JSON or Markdown:
+
+```sh
+rcsr walkforward --data panel_daily_long.rcsb --target fwd1 \
+  --expr 'logistic(r60) - tanh(r120)' --vars r60,r120 \
+  --time ts --group-by symbol --horizon 172800 \
+  --window '2019,0,1546128000,1546300800,1577836800' \
+  --cost-bps 10 --threshold-quantile 0.7 --json
+```
+
+Test windows are defined only by time; the purge gap must be at least the
+horizon, and the threshold comes from training (or an optional trailing
+validation slice), never from the test block. See
+[`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
+definitions and the reference-agreement check against the Python evaluator.
+
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
 comparisons (`x > 0`, `x <= y`, `x == 0`), the logical operators
@@ -801,6 +824,7 @@ docs/data-splitting.md        train/test splitting for time series and panel dat
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard
+docs/walkforward.md           walk-forward evaluation, costs, metrics and the long/flat rule
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
