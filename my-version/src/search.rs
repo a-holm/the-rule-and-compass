@@ -80,6 +80,11 @@ pub struct Config {
     /// training row before it is reported. Values below 2 are rejected by the
     /// CLI.
     pub fit_samples: usize,
+    /// #116: `--fit-rows N`. Like [`fit_samples`](Self::fit_samples), fit
+    /// constants on a deterministic `N`-row subsample and score on all rows;
+    /// `0` keeps the historical path and `N` at least the sample size is an
+    /// exact no-op. When both are set, `fit_rows` wins and is reported as such.
+    pub fit_rows: usize,
     /// #76: let the global Pareto front supply a fraction of parents. `false`
     /// is the pre-#76 algorithm, bit for bit; `true` (the default when it is
     /// measured to help) draws a parent from the front with probability
@@ -155,6 +160,7 @@ impl Default for Config {
             patience: 40,
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
+            fit_rows: 0,    // #116: off by default
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
@@ -209,6 +215,7 @@ impl Config {
         compare!(patience, "patience");
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
+        compare!(fit_rows, "fit_rows"); // #116
         compare!(front_parents, "front_parents"); // #76
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
@@ -711,10 +718,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
     }
-    // #85: the screened path scores offspring on a per-generation subset, which
-    // the resident full-sample GPU evaluator cannot represent.
-    if cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < train.len() {
-        return Some("--fit-samples scores offspring on a screening subset");
+    // #85/#116: the screened path scores offspring on a per-generation subset,
+    // which the resident full-sample GPU evaluator cannot represent.
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
+        return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
     }
     None
 }
@@ -1072,10 +1080,27 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
 /// rows a generation is scored on.
 const FIT_SUBSET_SALT: u32 = 0x85F1_7A5B;
 
+/// #85/#116: rows requested for the fit screen. `--fit-rows` takes precedence
+/// when both are set (the CLI says so), and both ignore a request at or above
+/// the sample size so that `--fit-rows N` with `N >= train` is an exact full
+/// fit.
+fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
+    let request = if cfg.fit_rows >= 2 {
+        cfg.fit_rows
+    } else {
+        cfg.fit_samples
+    };
+    if cfg.fit_iters == 0 || request < 2 || request >= sample.len() {
+        0
+    } else {
+        request
+    }
+}
+
 /// #85: true when constants are fitted on fewer rows than the generation's
 /// scoring sample. A request at least as large as the sample is a no-op.
 fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
-    cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < sample.len()
+    effective_fit_rows(cfg, sample) > 0
 }
 
 /// #85: the rows used to fit constants in one generation.
@@ -1090,7 +1115,7 @@ fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Optio
     }
     let idx = generation_subset(
         sample.len(),
-        cfg.fit_samples,
+        effective_fit_rows(cfg, sample),
         cfg.seed ^ FIT_SUBSET_SALT,
         generation,
     );
@@ -1454,6 +1479,10 @@ pub struct Outcome {
     /// #85: effective rows per generation used to fit constants, or `0` when
     /// screening is off. Never larger than the training sample.
     pub fit_samples: usize,
+    /// #116: effective `--fit-rows` request used to fit constants, or `0` when
+    /// the full training sample was used. This is the fit-only screen; every
+    /// reported error and every archived constant is refit on all rows.
+    pub fit_rows: usize,
     /// #85: whether the reported archive was refit on the full training sample.
     pub archive_refit: bool,
     /// #86: effective rows per generation used for scoring and fitting, or `0`
@@ -2492,7 +2521,13 @@ fn run_search(
         convergence,
         // #85: the CLI states both numbers; `0` keeps the old output.
         fit_samples: if fit_screened {
-            cfg.fit_samples.min(train.len())
+            let rows = effective_fit_rows(cfg, train);
+            if rows > 0 { rows.min(train.len()) } else { cfg.fit_samples.min(train.len()) }
+        } else {
+            0
+        },
+        fit_rows: if fit_screened && cfg.fit_rows >= 2 {
+            cfg.fit_rows.min(train.len())
         } else {
             0
         },
@@ -2873,6 +2908,27 @@ mod tests {
         let b = fit_for_generation(&cfg, &s, 1).expect("generation 1 screens");
         assert_eq!(a.len(), 5);
         assert_ne!(a.x, b.x, "consecutive generations must draw fresh rows");
+    }
+
+    /// #116: `--fit-rows N` screens the fit only; `N >= train rows` is an
+    /// exact no-op and `--fit-rows` wins over `--fit-samples`.
+    #[test]
+    fn fit_rows_is_a_full_fit_at_or_above_the_sample_size() {
+        let s = sample(); // 21 rows
+        let mut cfg = Config {
+            fit_rows: s.len(),
+            ..Default::default()
+        };
+        assert!(fit_for_generation(&cfg, &s, 0).is_none(), "N == rows is a full fit");
+        cfg.fit_rows = s.len() + 25;
+        assert!(fit_for_generation(&cfg, &s, 0).is_none(), "N > rows is a full fit");
+        cfg.fit_rows = 8;
+        let sub = fit_for_generation(&cfg, &s, 0).expect("8 rows screens");
+        assert_eq!(sub.len(), 8);
+        cfg.fit_samples = 5;
+        let sub = fit_for_generation(&cfg, &s, 0).expect("fit_rows wins");
+        assert_eq!(sub.len(), 8);
+        assert_eq!(effective_fit_rows(&cfg, &s), 8);
     }
 
     /// #85: a survivor is refitted and scored on the full sample before it can

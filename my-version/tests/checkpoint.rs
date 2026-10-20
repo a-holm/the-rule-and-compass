@@ -276,6 +276,21 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
 }
 
 #[test]
+fn fit_portfolio_settings_round_trip() {
+    use rcsr::fit::FitStrategy;
+    let train = sample(120);
+    let test = sample(40);
+    let mut cfg = config(5);
+    cfg.fit_strategy = FitStrategy::VarPro;
+    cfg.fit_rows = 17;
+    let text = checkpoint_text(&cfg, &train, &test);
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(cp.config.fit_strategy, FitStrategy::VarPro);
+    assert_eq!(cp.config.fit_rows, 17);
+    assert_eq!(cp.to_text(), text, "round trip must preserve the new fields");
+}
+
+#[test]
 fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     let train = sample(240);
     let test = sample(80);

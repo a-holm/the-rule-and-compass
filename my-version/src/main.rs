@@ -350,14 +350,26 @@ SEARCH:
                              log_squashed use IRLS; auc/log_loss/hinge use
                              logistic IRLS; rank/order/correlation losses use a
                              deterministic coordinate polish
-  --fit-strategy <name>      exact | auto | linear (default exact). `exact` is
-                             the historical CPU Levenberg–Marquardt path, bit
-                             for bit. `auto`/`linear` solve trees affine in
-                             every constant by closed-form QR and fall back to
-                             exact otherwise; the linear arm is an exact global
-                             minimiser for squared error only
-  --fit-report               print the constant-fitting arm counts at the end
-                             of the run (diagnostics only)
+  --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
+                             exact). `exact` is the historical CPU
+                             Levenberg–Marquardt path, bit for bit. `auto`
+                             dispatches by structure: closed-form QR for trees
+                             affine in every constant, variable projection for
+                             separable models, exact LM otherwise. `linear`,
+                             `varpro` and `stream` force one arm and fall back
+                             to exact LM when it cannot prove a safe result;
+                             `stream` merges f64 sufficient statistics over row
+                             blocks. `gpu` is the #169 batched kernel with a CPU
+                             fallback; without a batch backend it uses the exact
+                             CPU arms (never a no-op)
+  --fit-report               print the constant-fitting arm counts (linear,
+                             varpro, stream, exact, GPU fallback/refit) at the
+                             end of the run (diagnostics only)
+  --fit-rows <N>             fit constants on a deterministic N-row subsample
+                             and score/archive on all training rows (default 0
+                             = off; N >= train rows is an exact full fit). The
+                             archive and every reported error are refit on all
+                             rows
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -850,6 +862,8 @@ fn main() {
     // #85: remember an explicit --fit-samples so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_samples_set = false;
+    // #116: explicit --fit-rows for the resume settings check.
+    let mut fit_rows_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -1131,6 +1145,16 @@ fn main() {
             }
             // #116: reporting-only arm counts.
             "--fit-report" => cfg.fit_report = true,
+            // #116: fit on a deterministic subsample, score and archive on all rows.
+            "--fit-rows" => {
+                let n: usize = val!().parse().unwrap_or(0);
+                if n == 1 {
+                    eprintln!("error: --fit-rows needs 0 (off) or an integer >= 2");
+                    std::process::exit(EXIT_USAGE);
+                }
+                cfg.fit_rows = if n >= 2 { n } else { 0 };
+                fit_rows_set = true;
+            }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
                 let v = val!();
@@ -1141,8 +1165,8 @@ fn main() {
                     }
                     None => {
                         eprintln!(
-                            "error: --fit-strategy needs exact, auto or linear (cpu is an \
-                             alias for exact), got '{}'",
+                            "error: --fit-strategy needs exact, auto, linear, varpro, \
+                             stream or gpu (cpu is an alias for exact), got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -1564,6 +1588,13 @@ fn main() {
             conflicts.push(format!(
                 "--fit-samples {} (saved {})",
                 cfg.fit_samples, saved.fit_samples
+            ));
+        }
+        // #116: fit-only row screening is saved search state too.
+        if fit_rows_set && cfg.fit_rows != saved.fit_rows {
+            conflicts.push(format!(
+                "--fit-rows {} (saved {})",
+                cfg.fit_rows, saved.fit_rows
             ));
         }
         // #76: front feedback is saved search state.
@@ -2794,7 +2825,7 @@ fn main() {
 
     // #116: arm counts are process-wide diagnostics; take a delta around this
     // run so repeated runs in one process (`--report benchmark`) stay readable.
-    let fit_before = fit::fit_arm_counts();
+    let fit_before = fit::fit_arm_counts_full();
     let mut last_saved: Option<(usize, String)> = None;
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
@@ -2876,23 +2907,27 @@ fn main() {
     // #116: opt-in arm counts. This line is diagnostics only and never feeds
     // back into the search.
     if cfg.fit_report {
-        let (linear, exact) = fit::fit_arm_counts();
-        let linear = linear.saturating_sub(fit_before.0);
-        let exact = exact.saturating_sub(fit_before.1);
-        let total = linear + exact;
+        let counts = fit::fit_arm_counts_full().since(fit_before);
+        let total = counts.total();
         let share = if total == 0 {
             0.0
         } else {
-            100.0 * linear as f64 / total as f64
+            100.0 * counts.linear as f64 / total as f64
         };
         eprintln!(
-            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls)",
+            "# fit: strategy={} linear={} varpro={} stream={} exact={} ({:.1}% linear, {} calls; gpu={} fallbacks={} refits={})",
             cfg.fit_strategy.name(),
-            linear,
-            exact,
+            counts.linear,
+            counts.varpro,
+            counts.stream,
+            counts.exact,
             share,
-            total
+            total,
+            counts.gpu,
+            counts.gpu_fallbacks,
+            counts.gpu_refits
         );
+        eprintln!("# fit: {}", fit::backend_description());
     }
 
     // Seeded solutions, reported once each. The search holds them in
@@ -3921,11 +3956,25 @@ fn main() {
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = format!(
-                "{{\"loss\":{},\"value\":{}}}",
-                jstr(cfg.metric.name()),
-                jnum(best_fit_loss)
-            );
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+                // #116: the historical default JSON stays byte-identical; the
+                // portfolio fields appear when a non-default arm or fit-row
+                // screen is in use.
+                format!(
+                    "{{\"loss\":{},\"value\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss)
+                )
+            } else {
+                format!(
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss),
+                    jstr(cfg.fit_strategy.name()),
+                    outcome.fit_rows,
+                    fit::fit_arm_counts_full().since(fit_before).gpu
+                )
+            };
             // #141: report the backend that actually guided the search, with
             // the device name and a reason when the CPU ran. This is derived
             // from the probe/outcome, never from the flags alone.
@@ -4465,11 +4514,22 @@ fn run_multi_output(
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = format!(
-                "{{\"loss\":{},\"value\":{}}}",
-                jstr(cfg.metric.name()),
-                jnum(best_fit_loss)
-            );
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+                format!(
+                    "{{\"loss\":{},\"value\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss)
+                )
+            } else {
+                format!(
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    jstr(cfg.metric.name()),
+                    jnum(best_fit_loss),
+                    jstr(cfg.fit_strategy.name()),
+                    outcome.fit_rows,
+                    fit::fit_arm_counts_full().gpu
+                )
+            };
             let result_json = format!(
                 "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
