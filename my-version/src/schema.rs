@@ -154,7 +154,7 @@ pub fn json() -> String {
          \"walkforward\":{{\"command\":\"rcsr walkforward\",\"summary\":\"walk-forward evaluation/backtest of one expression over a .rcsb column store or CSV\",\"doc\":\"docs/walkforward.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
-{{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name\"}},\
+{{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
 {{\"name\":\"--group-by\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel group column; costs and positions are per group\"}},\
@@ -165,6 +165,7 @@ pub fn json() -> String {
 {{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"10\",\"description\":\"cost per side in basis points\"}},\
 {{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"training/validation score quantile\"}},\
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
+{{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\

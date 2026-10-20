@@ -49,6 +49,8 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         threshold_quantile: 0.70,
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
+        candidates: Vec::new(),
+        pool_reset_flat: false,
     }
 }
 
@@ -297,6 +299,9 @@ fn json_and_markdown_carry_the_rules_and_metrics() {
         "\"pooled\"",
         "\"break_even_hit_rate\"",
         "\"memory_bound\"",
+        "\"pooled_seam\"",
+        "\"sign_test\"",
+        "\"selection\"",
     ] {
         assert!(json.contains(key), "missing {}", key);
     }
@@ -304,4 +309,197 @@ fn json_and_markdown_carry_the_rules_and_metrics() {
     assert!(md.contains("Long/flat only"));
     assert!(md.contains("## Pooled"));
     assert!(md.contains("break-even"));
+}
+
+#[test]
+fn carried_seam_charges_the_boundary_term() {
+    // Training x=0..3, q0 threshold=0. Window 1 is long throughout and ends
+    // long. Window 2 starts flat at t=6 and re-enters at t=7.
+    let rows = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, 0.01),
+        (6.0, -1.0, 0.0),
+        (7.0, 7.0, 0.01),
+    ];
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 4.0, 4.0, 6.0),
+            window("b", 0.0, 4.0, 6.0, 8.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    s.cost_bps = 100.0;
+    let carried = walkforward::run_table(&t, &s, "test").unwrap();
+    // Carry: entry at 4, exit at 6 (the seam |1-0|), re-entry at 7 = 3 trades.
+    assert_eq!(carried.pooled.trades, 3);
+    assert_eq!(carried.seam_trades, 1);
+    assert!((carried.seam_cost - 0.01).abs() < 1e-15, "seam {}", carried.seam_cost);
+    assert!(!carried.pool_reset_flat);
+
+    s.pool_reset_flat = true;
+    let reset = walkforward::run_table(&t, &s, "test").unwrap();
+    // Reset: entry in each window = 2 trades; the seam term is absent.
+    assert_eq!(reset.pooled.trades, 2);
+    assert_eq!(reset.seam_trades, 0);
+    assert!((reset.seam_cost - 0.0).abs() < 1e-15);
+    assert!(carried.pooled.total_abs_delta > reset.pooled.total_abs_delta);
+}
+
+#[test]
+fn carried_seam_does_not_recharge_an_unchanged_position() {
+    let rows = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, 0.01),
+        (6.0, 6.0, 0.01),
+        (7.0, 7.0, 0.01),
+    ];
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 4.0, 4.0, 6.0),
+            window("b", 0.0, 4.0, 6.0, 8.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    let carried = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(carried.pooled.trades, 1, "one entry for the whole pooled path");
+    assert_eq!(carried.seam_trades, 0);
+    assert!((carried.seam_cost - 0.0).abs() < 1e-15);
+    s.pool_reset_flat = true;
+    let reset = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(reset.pooled.trades, 2, "one entry per window when reset");
+}
+
+#[test]
+fn cross_section_merge_carries_sum_and_count() {
+    // Symbol A is present at t0 and t1; symbol B only at t0. A pre-divided
+    // mean cannot be merged, because the denominators differ.
+    let mut sequential = walkforward::CrossSection::default();
+    sequential.add(0.0, 0.1, 0.1);
+    sequential.add(0.0, 0.3, 0.3);
+    sequential.add(1.0, 0.2, 0.2);
+    let (seq_net, seq_gross) = sequential.series();
+
+    let mut a = walkforward::CrossSection::default();
+    a.add(0.0, 0.1, 0.1);
+    a.add(1.0, 0.2, 0.2);
+    let mut b = walkforward::CrossSection::default();
+    b.add(0.0, 0.3, 0.3);
+    let mut merged = a.clone();
+    merged.merge(&b);
+    let (net, gross) = merged.series();
+    assert_eq!(net, seq_net);
+    assert_eq!(gross, seq_gross);
+    assert_eq!(merged.periods[0].count, 2, "t0 has two groups");
+    assert_eq!(merged.periods[1].count, 1, "t1 has one group");
+}
+
+#[test]
+fn expanding_folds_report_the_sign_test_as_not_applicable() {
+    let rows = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.01),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, 0.01),
+        (6.0, 6.0, 0.01),
+    ];
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("early", 0.0, 3.0, 3.0, 4.0),
+            // Expanding: train_2 contains test_1 [3,4).
+            window("late", 0.0, 5.0, 5.0, 6.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert!(!r.sign_test.applicable);
+    assert_eq!(r.sign_test.p_value, None);
+    assert!(r.sign_test.method.contains("expanding"));
+    assert!(r.json().contains("\"applicable\":false"));
+}
+
+#[test]
+fn disjoint_rolling_folds_compute_a_binomial_sign_test() {
+    let rows = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.01),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, 0.0),
+        (6.0, 6.0, 0.01),
+    ];
+    let t = single(&rows);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 2.0, 2.0, 3.0),
+            window("b", 3.0, 4.0, 4.0, 5.0),
+            window("c", 5.0, 6.0, 6.0, 7.0),
+        ],
+    );
+    s.threshold_quantile = 0.0;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert!(r.sign_test.applicable, "{}", r.sign_test.method);
+    assert_eq!(r.sign_test.positive, 3);
+    assert_eq!(r.sign_test.total, 3);
+    assert!((r.sign_test.p_value.unwrap() - 0.125).abs() < 1e-15);
+}
+
+#[test]
+fn candidates_are_selected_on_validation_never_on_test() {
+    // Validation MSE prefers `x`; the test block would prefer `-x` (which
+    // stays flat). Changing the test targets must not move the choice.
+    let rows = [
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),  // validation
+        (3.0, 3.0, 10.0), // validation
+        (4.0, 4.0, -0.02),
+        (5.0, 5.0, -0.03),
+    ];
+    let t = single(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 6.0)]);
+    s.validation_frac = 0.5;
+    s.threshold_quantile = 0.5;
+    s.candidates = vec!["x".to_string(), "-x".to_string()];
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(r.candidates, vec!["x".to_string(), "-x".to_string()]);
+    assert_eq!(r.windows[0].candidate, 0, "validation picks x");
+    assert_eq!(r.selected_on, "validation");
+    assert!(!r.test_used_for_selection);
+    let err = r.windows[0].validation_error.unwrap();
+    assert!((err - 26.5).abs() < 1e-12, "validation MSE {}", err);
+    assert_eq!(r.windows[0].expression, "x");
+
+    // Flip the test target signs: the test block would now prefer -x, but the
+    // report still chooses x because selection happened on validation.
+    let flipped: Vec<(f64, &str, f64, f64)> = rows
+        .iter()
+        .map(|&(ts, x, y)| (ts, "A", x, if ts >= 4.0 { -y } else { y }))
+        .collect();
+    let t2 = table(&flipped);
+    let r2 = walkforward::run_table(&t2, &s, "test").unwrap();
+    assert_eq!(r2.windows[0].candidate, 0);
+    assert_eq!(r2.windows[0].validation_error, Some(err));
+
+    // Multiple candidates without a validation slice are refused.
+    s.validation_frac = 0.0;
+    let e = walkforward::run_table(&t, &s, "test").unwrap_err();
+    assert!(e.contains("validation"), "{}", e);
 }
