@@ -842,8 +842,9 @@ fn fit_constants_with_iters(
             &fit.y,
             &fit.w,
             iters,
-        // #116 + #117: strategy and metric together.
-        let sse = crate::fit::fit_weighted_strategy_metric(
+            cfg.fit_strategy,
+            cfg.metric,
+        );
         Some(FitResult {
             sse,
             hash: expr::structural_hash(tree),
