@@ -45,6 +45,7 @@ pub fn json() -> String {
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
+        ("--null-block", "int", "0", "block-permutation null: contiguous block length in rows (>= label horizon; 0 = i.i.d. shuffle). Implies 19 runs when --null-runs is absent"),
         // #69: reference set always exact; only query rows are sampled, and
         // only for mean-loss metrics.
         ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
