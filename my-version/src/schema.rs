@@ -21,6 +21,8 @@ pub fn json() -> String {
         ("--max-levels", "int", "16", "maximum distinct values in a categorical column"),
         ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
+        ("--validation-frac", "float", "0", "fraction of the chronological training period held out as a validation slice for selection (0 = off); the test block is scoring-only"),
+        ("--select-by", "enum", "validation-if-present", "candidate ranking criterion: train | validation | aicc; test_error is never a criterion"),
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, implicit, implicit_residual, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
         ("--outlier-iqr", "float", "none", "drop rows beyond k interquartile ranges from the training median"),

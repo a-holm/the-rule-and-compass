@@ -122,6 +122,14 @@ INPUT:
                              refuse the file with an input error (exit 3) naming
                              the 1-based line and both field counts
   --test-frac <f>            held-out fraction (default 0.25)
+  --validation-frac <f>      hold out the last <f> of the chronological training
+                             period as a validation slice for selection
+                             (0 = off). The test block is never used to choose
+                             a candidate.
+  --select-by train|validation|aicc
+                             criterion used to rank/report candidates (default
+                             validation when a slice exists, otherwise train).
+                             test_error is scoring-only, never a criterion.
 
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
@@ -476,10 +484,16 @@ fn parse_filter(flag: &str, src: Option<&str>, table: &data::Table) -> Option<da
 #[derive(Clone)]
 struct Row {
     rank: usize,
+    /// Position in the archive's train-error order, before selection reorders
+    /// the printed rows (#111).
+    archive_rank: usize,
     complexity: f64,
     /// Fitted constants: the free parameters of the model.
     k_constants: usize,
     train_error: f64,
+    /// Error on the chronological validation slice, when one exists (#111).
+    /// Selection reads this (or train/AICc), never `test_error`.
+    validation_error: f64,
     test_error: f64,
     /// Small-sample-corrected AIC (fit vs. constants), lower is better.
     aicc: f64,
@@ -584,6 +598,11 @@ fn main() {
     let mut dtype_src: Option<String> = None;
     let mut max_levels = 16usize;
     let mut test_frac = 0.25;
+    // #111: chronological validation slice inside the training period, and the
+    // criterion used to choose the reported candidate. Selection never reads
+    // the test lockbox.
+    let mut validation_frac = 0.0f64;
+    let mut select_by_arg: Option<String> = None;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
     let mut progress = false;
@@ -784,6 +803,8 @@ fn main() {
                 seed_set = true;
             }
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
+            "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
+            "--select-by" => select_by_arg = Some(val!()),
             "--fill" => {
                 let v = val!();
                 match data::FillMethod::parse(&v) {
@@ -1355,6 +1376,7 @@ fn main() {
             (resume_path.is_some(), "--resume"),
             (cv_mode.is_some(), "--cv"),
             (null_runs > 0, "--null-runs"),
+            (validation_frac > 0.0 || select_by_arg.is_some(), "--validation-frac/--select-by"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
@@ -1825,6 +1847,7 @@ fn main() {
         group_col,
         test_frac,
         gap,
+        validation_frac,
         folds,
         train_select,
         test_select,
@@ -1856,6 +1879,32 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #111: selection criterion. Default to the validation slice when one is
+    // present, otherwise train (the historical behaviour). Asking for
+    // validation without a slice is a usage error rather than a silent
+    // fallback to train.
+    let mut select_by: Option<rcsr::selection::SelectBy> = match select_by_arg.as_deref() {
+        Some(src) => match rcsr::selection::SelectBy::parse(src) {
+            Ok(by) => Some(by),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        // No explicit criterion and no slice: keep the historical archive
+        // order (complexity, then train error) rather than re-ranking.
+        None => None,
+    };
+    if select_by.is_none() && prepared.validation.is_some() {
+        select_by = Some(rcsr::selection::SelectBy::Validation);
+    }
+    if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
+        eprintln!(
+            "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
 
     // #14: implicit relations. The target becomes one more input (normalised
     // with its training mean/std, so denormalisation prints original units) and
@@ -2356,6 +2405,10 @@ fn main() {
             } else {
                 fold_errors.iter().sum::<f64>() / fold_errors.len() as f64
             };
+            let validation_error = match &prepared.validation {
+                Some(v) => search::eval_error(&s.tree, v, cfg.metric),
+                None => f64::NAN,
+            };
             let pred: Vec<f64> = prepared
                 .train
                 .x
@@ -2411,9 +2464,11 @@ fn main() {
             };
             Row {
                 rank: k + 1,
+                archive_rank: k + 1,
                 complexity: s.cost,
                 k_constants: kconst,
                 train_error,
+                validation_error,
                 test_error,
                 aicc,
                 bic,
@@ -2443,6 +2498,36 @@ fn main() {
             }
         })
         .collect();
+
+    // #111: selection. Reorder the front by the chosen criterion and renumber
+    // the display rank; the archive rank is kept for reports that need the
+    // underlying search order. `test_error` is never a criterion. With no
+    // criterion the historical archive order is untouched.
+    if let Some(by) = select_by {
+        let candidates: Vec<rcsr::selection::Candidate> = rows
+            .iter()
+            .map(|r| rcsr::selection::Candidate {
+                train: r.train_error,
+                validation: if r.validation_error.is_finite() {
+                    Some(r.validation_error)
+                } else {
+                    None
+                },
+                test: Some(r.test_error),
+                aicc: r.aicc,
+            })
+            .collect();
+        let order = rcsr::selection::order(&candidates, by);
+        let reordered: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
+        rows = reordered;
+        for (k, r) in rows.iter_mut().enumerate() {
+            r.rank = k + 1;
+        }
+        if !quiet {
+            eprintln!("# selection: {} (test errors are scoring-only)", by.name());
+        }
+    }
+
     // Residual diagnostics for the best (lowest training-error) solution: the
     // one a reader would quote.
     let best_resid = rows
@@ -2600,16 +2685,21 @@ fn main() {
             outlier_iqr,
             smooth,
             &notes,
+            select_by,
         ),
         ReportKind::Sensitivity => {
-            let selected = full_rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let selected = if select_by.is_some() {
+                full_rows.first()
+            } else {
+                full_rows.iter().min_by(|a, b| {
+                    a.train_error
+                        .partial_cmp(&b.train_error)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            };
             let sorted = outcome.archive.sorted();
             let tree = selected
-                .and_then(|r| r.rank.checked_sub(1).and_then(|i| sorted.get(i)))
+                .and_then(|r| r.archive_rank.checked_sub(1).and_then(|i| sorted.get(i)))
                 .map(|s| &s.tree);
             sensitivity_markdown(selected, tree, &prepared, &vars, &target)
         }
@@ -2647,22 +2737,41 @@ fn main() {
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
                 let lhs = if implicit_mode { "0" } else { target.as_str() };
-                println!(
-                    "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
-                    r.rank,
-                    r.complexity,
-                    fmt_err(r.train_error),
-                    fmt_err(r.test_error),
-                    fmt_err(r.aicc),
-                    lhs,
-                    r.expression
-                );
+                if prepared.validation.is_some() {
+                    println!(
+                        "{:>3}  complexity={:<3} train_err={:<13} val_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
+                        r.rank,
+                        r.complexity,
+                        fmt_err(r.train_error),
+                        fmt_err(r.validation_error),
+                        fmt_err(r.test_error),
+                        fmt_err(r.aicc),
+                        lhs,
+                        r.expression
+                    );
+                } else {
+                    println!(
+                        "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
+                        r.rank,
+                        r.complexity,
+                        fmt_err(r.train_error),
+                        fmt_err(r.test_error),
+                        fmt_err(r.aicc),
+                        lhs,
+                        r.expression
+                    );
+                }
             }
-            if let Some(r) = rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
+            let selected_row = if select_by.is_some() {
+                rows.first()
+            } else {
+                rows.iter().min_by(|a, b| {
+                    a.train_error
+                        .partial_cmp(&b.train_error)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            };
+            if let Some(r) = selected_row {
                 eprintln!(
                     "# diagnostics: n={} k={} constants | overfit index (test/train)={:.3} | Durbin-Watson={:.3}{}",
                     prepared.train.len(),
@@ -2894,11 +3003,17 @@ fn main() {
                     "null".to_string(),
                 ),
             };
+            let validation_split_json = if prepared.report.validation_rows > 0 {
+                format!(",\"validation_rows\":{}", prepared.report.validation_rows)
+            } else {
+                String::new()
+            };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
+                validation_split_json,
                 prepared.test.len(),
                 prepared
                     .fold_samples
@@ -2941,9 +3056,21 @@ fn main() {
                     } else {
                         String::new()
                     };
+                    // Only a run that actually has a selection criterion gains
+                    // the new fields; an ordinary run stays byte-identical.
+                    let selection_json = if select_by.is_some() {
+                        format!(
+                            "\"archive_rank\":{},\"validation_error\":{},",
+                            r.archive_rank,
+                            jnum(r.validation_error)
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
+                        selection_json,
                         r.complexity,
                         r.k_constants,
                         jnum(r.train_error),
@@ -3171,9 +3298,19 @@ fn main() {
                 } else {
                     String::new()
                 };
+                let selection_json = if select_by.is_some() {
+                    format!(
+                        "\"archive_rank\":{},\"validation_error\":{},",
+                        r.archive_rank,
+                        jnum(r.validation_error)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
+                    selection_json,
                     r.complexity,
                     r.k_constants,
                     jnum(r.train_error),
@@ -3859,13 +3996,18 @@ fn summary_markdown(
     outlier_iqr: Option<f64>,
     smooth: usize,
     notes: &[String],
+    select_by: Option<rcsr::selection::SelectBy>,
 ) -> String {
     let mut s = String::new();
-    let chosen = rows.iter().min_by(|a, b| {
-        a.train_error
-            .partial_cmp(&b.train_error)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let chosen = if select_by.is_some() {
+        rows.first()
+    } else {
+        rows.iter().min_by(|a, b| {
+            a.train_error
+                .partial_cmp(&b.train_error)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
 
     let _ = writeln!(s, "# rcsr model summary\n");
     let _ = writeln!(s, "## What produced this\n");

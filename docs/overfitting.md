@@ -463,12 +463,26 @@ summary is bit-identical to the pre-#92 result.
 
 ## 4. What `rcsr` reports today
 
+### The test lockbox and the validation slice
+
+The holdout is a **lockbox**: a block you may look at to report an honest error,
+but not to choose a model. Selecting the best of many candidates by
+`test_error` spends the block and makes the reported number optimistic. With
+`--validation-frac f`, the last `f` share of the chronological training period
+becomes a validation slice, separated from fit-train by the `--gap` embargo.
+Selection ranks on validation by default (`--select-by validation|train|aicc`)
+and `test_error` stays scoring-only. The synthetic test in
+`my-version/tests/validation.rs` demonstrates the leak: ranking by test reports
+a smaller test error than the validation-selected candidate, while the
+test-selected candidate is the worse model on validation.
+
 Every solution carries:
 
 | Field | Meaning |
 |---|---|
 | `train_error` | error on the fitting rows |
-| `test_error` | error on held-out rows (mean over `--folds` blocks) |
+| `validation_error` | error on the chronological validation slice when `--validation-frac` is set; the default selection criterion |
+| `test_error` | error on the held-out **lockbox** (mean over `--folds` blocks). Scoring-only: never rank candidates by it |
 | `fold_errors` | the individual held-out blocks |
 | `k_constants` | fitted constants — the model's free parameters |
 | `aicc`, `bic` | fit vs. constants (lower is better) |

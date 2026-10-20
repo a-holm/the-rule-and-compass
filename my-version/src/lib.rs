@@ -24,6 +24,7 @@ pub mod resample; // #92: index-based resampling with a BLB cap
 pub mod rng;
 pub mod schema;
 pub mod search;
+pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
 pub mod units;

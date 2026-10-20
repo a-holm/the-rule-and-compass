@@ -965,6 +965,11 @@ pub struct SplitSpec {
     pub test_frac: f64,
     /// Rows dropped immediately after the train/test boundary (embargo).
     pub gap: usize,
+    /// Fraction of the training period held out as a **validation** slice,
+    /// taken chronologically from its end (issue #111). `0` disables the slice.
+    /// Model selection may read train and validation; the test block stays a
+    /// lockbox.
+    pub validation_frac: f64,
     /// Number of contiguous evaluation blocks in the test region.
     pub folds: usize,
     /// Rows where this expression is true are assigned to training (issue #3).
@@ -984,6 +989,7 @@ impl Default for SplitSpec {
             group_col: None,
             test_frac: 0.25,
             gap: 0,
+            validation_frac: 0.0,
             folds: 1,
             train_select: None,
             test_select: None,
@@ -999,6 +1005,11 @@ pub struct SplitReport {
     pub rows_total: usize,
     pub train_rows: usize,
     pub test_rows: usize,
+    /// Rows carved out of the training period as the validation slice (#111).
+    pub validation_rows: usize,
+    /// Training rows dropped as a purge/embargo between fit-train and
+    /// validation (#111).
+    pub purged_validation_rows: usize,
     pub folds: usize,
     pub gap: usize,
     pub groups_total: usize,
@@ -1021,6 +1032,10 @@ pub struct SplitReport {
 
 pub struct Prepared {
     pub train: Sample,
+    /// Chronological validation slice carved from the end of the training
+    /// period (#111), when `SplitSpec::validation_frac > 0`. Selection may use
+    /// it; the search never fits on it.
+    pub validation: Option<Sample>,
     /// All test folds concatenated, in fold order (what the search evaluates on).
     pub test: Sample,
     /// One sample per evaluation block. With `folds == 1` this is a single
@@ -1625,6 +1640,63 @@ pub fn prepare_full_targets_weighted_with(
         return Err("training split is empty (reduce --test-frac)".to_string());
     }
 
+    // #111: carve a chronological validation slice from the **end** of the
+    // training period. Selection may use train/validation; the test block is a
+    // lockbox and never influences which candidate wins. A purge of `gap` rows
+    // stands between fit-train and validation, mirroring the test embargo.
+    let mut validation_idx: Vec<usize> = Vec::new();
+    if spec.validation_frac > 0.0 {
+        if !(spec.validation_frac < 1.0) {
+            return Err("--validation-frac must be in (0, 1)".to_string());
+        }
+        let order: Vec<usize> = if let Some(tc) = spec.time_col {
+            let keys = time_keys(filtered, tc);
+            let mut v = train_idx.clone();
+            v.sort_by(|&a, &b| {
+                keys[a]
+                    .partial_cmp(&keys[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(&b))
+            });
+            v
+        } else {
+            // Without a time column the file order is the chronological order.
+            let mut v = train_idx.clone();
+            v.sort_unstable();
+            v
+        };
+        let m = order.len();
+        if m >= 2 {
+            let want = ((m as f64) * spec.validation_frac).round() as usize;
+            let vn = want.clamp(1, m - 1);
+            let cut = m - vn;
+            let gap = spec.gap.min(cut.saturating_sub(1));
+            let fit_cut = cut - gap;
+            validation_idx = order[cut..].to_vec();
+            train_idx = order[..fit_cut].to_vec();
+            report.purged_validation_rows = gap;
+            report.notes.push(format!(
+                "validation: held out the last {} of {} training row(s){}",
+                vn,
+                m,
+                if gap > 0 {
+                    format!(" after a {}-row purge between fit-train and validation", gap)
+                } else {
+                    String::new()
+                }
+            ));
+        } else {
+            report.notes.push(
+                "validation slice requested but the training period has fewer than 2 rows; \
+                 all training rows are used to fit"
+                    .to_string(),
+            );
+        }
+        if train_idx.is_empty() {
+            return Err("--validation-frac left no rows to fit on".to_string());
+        }
+    }
+
     let n = filtered.len();
     // Used columns: every input, then every target (one target in the
     // single-output case; issue #15 keeps all of them row-aligned here).
@@ -1726,7 +1798,7 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Previous => {
-                    for side in split_sides(&train_idx, &fold_idx) {
+                    for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         let mut last: Vec<Option<f64>> = vec![None; nc];
                         for &r in &side {
                             for k in 0..nc {
@@ -1743,7 +1815,7 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Interpolate => {
-                    for side in split_sides(&train_idx, &fold_idx) {
+                    for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         for k in 0..nc {
                             let mut p = 0usize;
                             while p < side.len() {
@@ -1864,7 +1936,7 @@ pub fn prepare_full_targets_weighted_with(
     // value (and vice versa).
     let mut smoothed = 0usize;
     if prep.smooth > 1 {
-        for side in split_sides(&train_idx, &fold_idx) {
+        for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
             let side: Vec<usize> = side.into_iter().filter(|&r| keep[r]).collect();
             for col in 0..nc {
                 // Smoothing a 0/1 column would create fractions and break the
@@ -1880,6 +1952,7 @@ pub fn prepare_full_targets_weighted_with(
 
     // Rows dropped by preparation leave both the training and test sets.
     train_idx.retain(|&i| keep[i]);
+    validation_idx.retain(|&i| keep[i]);
     for f in fold_idx.iter_mut() {
         f.retain(|&i| keep[i]);
     }
@@ -1888,6 +1961,7 @@ pub fn prepare_full_targets_weighted_with(
         return Err("preparation removed every training row".to_string());
     }
     report.train_rows = train_idx.len();
+    report.validation_rows = validation_idx.len();
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len().max(1);
 
@@ -1954,6 +2028,11 @@ pub fn prepare_full_targets_weighted_with(
     };
 
     let train = make(&train_idx);
+    let validation = if validation_idx.is_empty() {
+        None
+    } else {
+        Some(make(&validation_idx))
+    };
     if let (Some(w), Some(name)) = (&weights_raw, weight) {
         let positive = train_idx.iter().filter(|&&i| w[i] > 0.0).count();
         if positive == 0 {
@@ -1981,6 +2060,7 @@ pub fn prepare_full_targets_weighted_with(
 
     Ok(Prepared {
         train,
+        validation,
         test,
         fold_samples,
         means,
@@ -2058,11 +2138,22 @@ fn quantile(sorted: &[f64], p: f64) -> f64 {
 
 /// The training and test rows in table order, for operations that walk a
 /// column sequentially. Working per side is what keeps them leak-free.
-fn split_sides(train: &[usize], folds: &[Vec<usize>]) -> Vec<Vec<usize>> {
+fn split_sides(
+    train: &[usize],
+    folds: &[Vec<usize>],
+    validation: &[usize],
+) -> Vec<Vec<usize>> {
     let mut sides = Vec::new();
     let mut tr = train.to_vec();
     tr.sort_unstable();
     sides.push(tr);
+    // Validation is its own side: a forward fill or smoother must not read
+    // across the fit-train/validation boundary either (#111).
+    let mut va = validation.to_vec();
+    va.sort_unstable();
+    if !va.is_empty() {
+        sides.push(va);
+    }
     let mut te: Vec<usize> = folds.iter().flatten().copied().collect();
     te.sort_unstable();
     te.dedup();
