@@ -1887,6 +1887,12 @@ fn validate_weights(name: &str, w: &[f64]) -> Result<(), String> {
     Ok(())
 }
 
+// #133: test-only count of row-major `cells` copies built by preparation.
+#[cfg(test)]
+thread_local! {
+    static CELL_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub fn prepare_full(
     t: &Table,
     vars: &[String],
@@ -2043,9 +2049,6 @@ pub fn prepare_full_targets_weighted_with(
         &filtered_owned
     };
 
-    let x_raw: Vec<Vec<f64>> = (0..filtered.len())
-        .map(|r| var_idx.iter().map(|&i| filtered.col(i)[r]).collect())
-        .collect();
     // Weights follow the rows through the split; validate them on the surviving
     // population (after --exclude / --filter) rather than on discarded rows.
     let weights_raw: Option<Vec<f64>> = match weight_idx {
@@ -2057,8 +2060,7 @@ pub fn prepare_full_targets_weighted_with(
         }
         None => None,
     };
-    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng, &x_raw)?;
-    drop(x_raw);
+    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng)?;
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
@@ -2126,9 +2128,32 @@ pub fn prepare_full_targets_weighted_with(
     // single-output case; issue #15 keeps all of them row-aligned here).
     let used_cols: Vec<usize> = var_idx.iter().copied().chain(tgt_idx.iter().copied()).collect();
     let nc = used_cols.len();
-    let mut cells: Vec<Vec<f64>> = (0..filtered.len())
-        .map(|r| used_cols.iter().map(|&c| filtered.value(r, c)).collect())
-        .collect();
+    // #133: a full row-major `cells` copy is only needed when a preparation
+    // stage mutates a cell (fill / outlier / smoothing). The default path
+    // (no fill, no outlier rule, no smoothing) reads the table directly, so the
+    // preparation no longer duplicates every used column before sampling.
+    let mutating = !matches!(prep.fill, FillMethod::None)
+        || prep.outlier_iqr.is_some_and(|k| k > 0.0)
+        || prep.smooth > 1;
+    #[cfg(test)]
+    if mutating {
+        CELL_COPIES.with(|n| n.set(n.get() + 1));
+    }
+    let mut cells: Option<Vec<Vec<f64>>> = if mutating {
+        Some(
+            (0..filtered.len())
+                .map(|r| used_cols.iter().map(|&c| filtered.value(r, c)).collect())
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let cell = |cells: &Option<Vec<Vec<f64>>>, r: usize, k: usize| -> f64 {
+        match cells {
+            Some(c) => c[r][k],
+            None => filtered.value(r, used_cols[k]),
+        }
+    };
     let mut keep = vec![true; n];
     let mut row_filled = vec![false; n];
     let mut rows_dropped_missing = 0usize;
@@ -2144,7 +2169,7 @@ pub fn prepare_full_targets_weighted_with(
             let mut detail: Vec<String> = Vec::new();
             let mut total = 0usize;
             for (k, &c) in used_cols.iter().enumerate() {
-                let missing = (0..n).filter(|&r| cells[r][k].is_nan()).count();
+                let missing = (0..n).filter(|&r| cell(&cells, r, k).is_nan()).count();
                 if missing > 0 {
                     total += missing;
                     let name = t
@@ -2166,7 +2191,7 @@ pub fn prepare_full_targets_weighted_with(
         }
         FillMethod::Drop => {
             for r in 0..n {
-                if (0..nc).any(|k| cells[r][k].is_nan()) {
+                if (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                     keep[r] = false;
                     rows_dropped_missing += 1;
                 }
@@ -2179,7 +2204,7 @@ pub fn prepare_full_targets_weighted_with(
                     let mut vals: Vec<f64> = train_idx
                         .iter()
                         .filter_map(|&r| {
-                            let v = cells[r][k];
+                            let v = cell(&cells, r, k);
                             if v.is_finite() {
                                 Some(v)
                             } else {
@@ -2212,6 +2237,7 @@ pub fn prepare_full_targets_weighted_with(
 
             match method {
                 FillMethod::Mean | FillMethod::Median | FillMethod::Zero => {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
                     for r in 0..n {
                         for k in 0..nc {
                             if cells[r][k].is_nan() {
@@ -2222,6 +2248,7 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Previous => {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
                     for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         let mut last: Vec<Option<f64>> = vec![None; nc];
                         for &r in &side {
@@ -2239,6 +2266,7 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Interpolate => {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
                     for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         for k in 0..nc {
                             let mut p = 0usize;
@@ -2276,7 +2304,7 @@ pub fn prepare_full_targets_weighted_with(
     // it is dropped rather than silently passed to the search.
     if !matches!(prep.fill, FillMethod::None | FillMethod::Drop) {
         for r in 0..n {
-            if keep[r] && (0..nc).any(|k| cells[r][k].is_nan()) {
+            if keep[r] && (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                 keep[r] = false;
                 rows_dropped_missing += 1;
             }
@@ -2296,7 +2324,7 @@ pub fn prepare_full_targets_weighted_with(
             if !keep[r] {
                 continue;
             }
-            let v = cells[r][j];
+            let v = cell(&cells, r, j);
             if !(v == 0.0 || v == 1.0) {
                 let name = t
                     .names
@@ -2324,7 +2352,7 @@ pub fn prepare_full_targets_weighted_with(
                 let mut vals: Vec<f64> = train_idx
                     .iter()
                     .filter_map(|&r| {
-                        let v = cells[r][col];
+                        let v = cell(&cells, r, col);
                         if keep[r] && v.is_finite() {
                             Some(v)
                         } else {
@@ -2345,7 +2373,7 @@ pub fn prepare_full_targets_weighted_with(
                     continue;
                 }
                 let out = (0..nc).any(|c| {
-                    let v = cells[r][c];
+                    let v = cell(&cells, r, c);
                     v.is_finite() && (v < bounds[c].0 || v > bounds[c].1)
                 });
                 if out {
@@ -2369,7 +2397,12 @@ pub fn prepare_full_targets_weighted_with(
                 if col < nv && dtype_at(col) == DType::Boolean {
                     continue;
                 }
-                smoothed += smooth_cells(&mut cells, &side, col, prep.smooth);
+                smoothed += smooth_cells(
+                    cells.as_mut().expect("smoothing requires a mutable copy"),
+                    &side,
+                    col,
+                    prep.smooth,
+                );
             }
         }
     }
@@ -2406,12 +2439,21 @@ pub fn prepare_full_targets_weighted_with(
             stds[j] = 1.0;
             continue;
         }
-        let vals: Vec<f64> = train_idx.iter().map(|&i| cells[i][j]).collect();
+        let vals: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
         let m = vals.iter().sum::<f64>() / vals.len() as f64;
         let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
         let s = var.sqrt();
-        let mut sorted = vals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // #133: median/min/max/IQR/range are the only modes that read an
+        // ordered copy. The default mean/std path never clones or sorts.
+        let need_sorted = !matches!(prep.center, Center::Mean | Center::None)
+            || !matches!(prep.scale, Scale::Std | Scale::None);
+        let sorted = if need_sorted {
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted
+        } else {
+            Vec::new()
+        };
         means[j] = match prep.center {
             Center::Mean => m,
             Center::Median => quantile(&sorted, 0.5),
@@ -2430,19 +2472,21 @@ pub fn prepare_full_targets_weighted_with(
 
     let make = |idx: &[usize]| -> Sample {
         let mut s = Sample::default();
+        s.x.reserve(idx.len());
+        s.y.reserve(idx.len());
         for &i in idx {
-            s.x.push(
-                (0..nv)
-                    .map(|j| (cells[i][j] - means[j]) / stds[j])
-                    .collect(),
-            );
+            let mut row = Vec::with_capacity(nv);
+            for j in 0..nv {
+                row.push((cell(&cells, i, j) - means[j]) / stds[j]);
+            }
+            s.x.push(row);
             // Target 0 lives in `y`; a multi-output sample also keeps every
             // target (including the first) in `ys` (issue #15).
-            s.y.push(cells[i][nv]);
+            s.y.push(cell(&cells, i, nv));
         }
         if nt > 1 {
             s.ys = (0..nt)
-                .map(|j| idx.iter().map(|&i| cells[i][nv + j]).collect())
+                .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
                 .collect();
         }
         if let Some(w) = &weights_raw {
@@ -2863,7 +2907,6 @@ fn build_split(
     t: &Table,
     spec: &SplitSpec,
     rng: &mut Mt,
-    x_raw: &[Vec<f64>],
 ) -> Result<(Vec<usize>, Vec<Vec<usize>>, SplitReport), String> {
     let n = t.len();
     let folds = spec.folds.max(1);
@@ -3119,7 +3162,6 @@ fn build_split(
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len();
     report.notes = notes;
-    let _ = x_raw;
     let all_folds: Vec<usize> = fold_idx.iter().flatten().copied().collect();
     report.selector = describe_selector(n, &train, &all_folds);
     Ok((train, fold_idx, report))
@@ -4326,5 +4368,49 @@ mod tests {
         // The trailing train gap and the leading test gap cannot interpolate.
         assert_eq!(p.prep.rows_dropped_missing, 2);
         assert_eq!(p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![6.0]);
+    }
+
+    /// #133: the default path (no fill, no outlier rule, no smoothing) reads
+    /// the table directly. Only a mutating preparation copies the used columns.
+    #[test]
+    fn the_default_path_does_not_copy_the_used_columns() {
+        let t = table("t,x,y\n0,1,2\n1,2,4\n2,3,6\n3,4,8\n4,5,10\n");
+        let vars = ["x".to_string()];
+
+        CELL_COPIES.with(|n| n.set(0));
+        let p = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec::default(),
+        )
+        .unwrap();
+        assert_eq!(p.train.len() + p.test.len(), 5);
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            0,
+            "the default mean/std path must not materialise a row-major copy"
+        );
+
+        CELL_COPIES.with(|n| n.set(0));
+        let _ = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Mean,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            1,
+            "a fill stage needs one mutable copy"
+        );
     }
 }

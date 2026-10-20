@@ -36,6 +36,19 @@ value. Smoothing windows shrink at the train/test boundary for the same reason.
 Rows that preparation removes disappear from both the training and the test
 set; they are never silently kept.
 
+## Copies, ordering and normalisation cost
+
+The default path (no fill, no outlier rule, no smoothing) reads the used
+columns straight from the loaded table: it does not make a row-major copy of
+them (`#133`). Only a *mutating* stage (fill, outlier removal, smoothing) needs
+that copy, and it is made once. The split itself is a selector over the table,
+not a second copy.
+
+Centre/scale still computes the training mean and standard deviation in one
+pass. Median, min, max, IQR and range need an ordered copy; mean/std (the
+default) does not sort. This changes no number: the same training rows produce
+the same constants and the same samples in the same order.
+
 ## Ragged rows
 
 The field count is part of the data contract. A data row with more or fewer
