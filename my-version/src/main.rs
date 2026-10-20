@@ -89,7 +89,7 @@ fn usage() -> String {
 
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
-  rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -5007,6 +5007,8 @@ OPTIONS:
   --data <input.csv>       input table (alternative to the positional path)
   --out <store.rcsb>       output store
   --group-rows <N>         rows per I/O group (default {})
+  --time <column>          store this column as exact i64 timestamps
+                           (default: the first integral, time-like column)
   --skip-malformed         drop ragged rows instead of refusing the input
   --max-memory <size>      refuse before parsing when ~33x the CSV exceeds this
   --force                  override --max-memory
@@ -5029,6 +5031,7 @@ fn run_import(args: &[String]) -> ! {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut group_rows = store::DEFAULT_GROUP_ROWS;
+    let mut time_name: Option<String> = None;
     let mut skip_malformed = false;
     let mut max_memory: Option<u64> = None;
     let mut force = false;
@@ -5063,6 +5066,16 @@ fn run_import(args: &[String]) -> ! {
                 }
             }
             "--skip-malformed" => skip_malformed = true,
+            "--time" => {
+                i += 1;
+                match args.get(i) {
+                    Some(name) => time_name = Some(name.clone()),
+                    None => {
+                        eprintln!("error: --time requires a column name");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--max-memory" => {
                 i += 1;
                 match args.get(i).map(|s| parse_memory_bytes(s)) {
@@ -5119,24 +5132,39 @@ fn run_import(args: &[String]) -> ! {
             refuse_for_memory(&input, meta.len(), estimate, limit);
         }
     }
-    let table = match data::read_table_with(&input, skip_malformed) {
+    let table = match data::read_table_with_time(&input, skip_malformed, time_name.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
     };
-    if let Err(e) = store::write_store(&output, &table, group_rows) {
+    let time_col = match &time_name {
+        Some(name) => match table.index_of(name) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("error: --time {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+    if let Err(e) = store::write_store_with_time(&output, &table, group_rows, time_col) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_INPUT);
     }
     if !quiet {
+        let stored = time_col
+            .or_else(|| (0..table.n_cols()).find(|&c| table.ints(c).is_some()))
+            .map(|c| format!(", time='{}' as i64", table.names[c]))
+            .unwrap_or_default();
         println!(
-            "imported {} rows x {} columns to {} (group_rows={})",
+            "imported {} rows x {} columns to {} (group_rows={}{})",
             table.len(),
             table.n_cols(),
             output,
-            group_rows
+            group_rows,
+            stored
         );
     }
     std::process::exit(EXIT_OK);

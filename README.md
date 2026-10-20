@@ -267,7 +267,9 @@ the determinism guarantee and its limits.
   (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
   of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store
   that can be scanned group by group and searched from a bounded hash sample
-  when it does not fit; see [`docs/data-format.md`](docs/data-format.md).
+  when it does not fit. The time column is stored as `i64` (nanosecond-safe;
+  `--time <col>` or the first integral time-like column), so ordering never
+  rounds two prints together; see [`docs/data-format.md`](docs/data-format.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 

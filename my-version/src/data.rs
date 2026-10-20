@@ -227,6 +227,13 @@ impl DictColumn {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Column {
     pub values: Vec<f64>,
+    /// Exact 64-bit integer cells, for columns whose source text is integral
+    /// and whose name marks them as a time axis (`ts`, `timestamp`, ...).
+    /// Nanosecond timestamps exceed binary64's 2^53 exact range, so ordering
+    /// and round-tripping use this view, never `values`. `i64::MIN` marks a
+    /// missing cell; the evaluator still sees `values` (and so never performs
+    /// arithmetic on a time column by accident).
+    pub ints: Option<Vec<i64>>,
     pub dict: Option<DictColumn>,
 }
 
@@ -321,6 +328,11 @@ impl Table {
         self.columns.get(col).and_then(|c| c.dict.as_ref())
     }
 
+    /// Exact integer cells for a time column (see [`Column::ints`]).
+    pub fn ints(&self, col: usize) -> Option<&[i64]> {
+        self.columns.get(col).and_then(|c| c.ints.as_deref())
+    }
+
     /// Copy one row out. Hot loops use [`Table::col`] instead.
     pub fn row(&self, row: usize) -> Vec<f64> {
         self.columns.iter().map(|c| c.values.get(row).copied().unwrap_or(f64::NAN)).collect()
@@ -365,6 +377,7 @@ impl Table {
                 } else {
                     idx.iter().map(|&r| c.values[r]).collect()
                 },
+                ints: c.ints.as_ref().map(|v| idx.iter().map(|&r| v[r]).collect()),
                 dict: c.dict.as_ref().map(|d| DictColumn {
                     codes: idx.iter().map(|&r| d.codes[r]).collect(),
                     levels: d.levels.clone(),
@@ -621,6 +634,7 @@ pub fn apply_dtypes(
                         true,
                         Column {
                             values,
+                            ints: None,
                             dict: Some(DictColumn {
                                 codes,
                                 levels: vec!["1".to_string(), "0".to_string()],
@@ -733,8 +747,18 @@ pub fn read_table(path: &str) -> Result<Table, String> {
 /// Like [`read_table`], but `skip_malformed` drops ragged rows instead of
 /// refusing the file. The number dropped is kept on [`Table`].
 pub fn read_table_with(path: &str, skip_malformed: bool) -> Result<Table, String> {
+    read_table_with_time(path, skip_malformed, None)
+}
+
+/// Like [`read_table_with`], with an explicit time column name whose integral
+/// cells are kept as an exact `i64` view even when the name is not time-like.
+pub fn read_table_with_time(
+    path: &str,
+    skip_malformed: bool,
+    time_col_name: Option<&str>,
+) -> Result<Table, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
-    parse_table_with(&text, skip_malformed)
+    parse_table_with_time(&text, skip_malformed, time_col_name)
 }
 
 /// Split one delimited line into trimmed fields. Whitespace-delimited input
@@ -761,6 +785,17 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
 /// `skip_malformed`, rows whose field count differs from the header are
 /// dropped and counted (`Table::skipped_malformed`) instead of refused.
 pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, String> {
+    parse_table_with_time(text, skip_malformed, None)
+}
+
+/// [`parse_table_with`] with an explicit time column name (for
+/// `rcsr import --time <col>`). Integral cells in that column are retained as
+/// exact `i64` values; a non-integral cell falls back to the f64-only layout.
+pub fn parse_table_with_time(
+    text: &str,
+    skip_malformed: bool,
+    time_col_name: Option<&str>,
+) -> Result<Table, String> {
     let mut header: Option<&str> = None;
     let mut nfields = 0usize;
     let mut delim = ',';
@@ -855,6 +890,26 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     // Once it crosses the cap the map is dropped immediately, so a large random
     // column never builds one `String` key per distinct value.
     let mut dict_live: Vec<bool> = (0..nfields).map(|_| true).collect();
+    // A time-like column whose cells are all integers keeps an exact `i64`
+    // view alongside the `f64` evaluator view. Names are the only signal the
+    // CSV reader has before `--time` is chosen, and a false negative is safe:
+    // the column simply falls back to binary64 (the old behaviour).
+    let mut int_candidate: Vec<bool> = (0..nfields)
+        .map(|j| {
+            numeric[j]
+                && (time_name(&names[j])
+                    || time_col_name.is_some_and(|t| t == names[j]))
+        })
+        .collect();
+    let mut ints: Vec<Vec<i64>> = (0..nfields)
+        .map(|j| {
+            if int_candidate[j] {
+                Vec::with_capacity(data_rows)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     seen_header = false;
     for l in text.lines() {
         let trimmed = l.trim();
@@ -877,6 +932,19 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
                 } else {
                     cell.parse::<f64>().unwrap_or(f64::NAN)
                 });
+                if int_candidate[j] {
+                    if is_missing_token(cell) {
+                        ints[j].push(i64::MIN);
+                    } else {
+                        match cell.parse::<i64>() {
+                            Ok(v) => ints[j].push(v),
+                            Err(_) => {
+                                int_candidate[j] = false;
+                                ints[j] = Vec::new();
+                            }
+                        }
+                    }
+                }
             }
             if !dict_live[j] {
                 continue;
@@ -902,6 +970,9 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     }
 
     for (j, col) in columns.iter_mut().enumerate() {
+        if int_candidate[j] {
+            col.ints = Some(std::mem::take(&mut ints[j]));
+        }
         if dict_live[j] {
             col.dict = Some(DictColumn {
                 codes: std::mem::take(&mut codes[j]),
@@ -2479,11 +2550,11 @@ fn build_split(
                 Some((tr, folds_idx)) => {
                     report.train_time_max = order
                         .get(tr.len().saturating_sub(1))
-                        .map(|&i| keys[i]);
+                        .map(|&i| keys.value(i));
                     report.test_time_min = folds_idx
                         .iter()
                         .flatten()
-                        .map(|&i| keys[i])
+                        .map(|&i| keys.value(i))
                         .fold(None, |acc: Option<f64>, v| {
                             Some(acc.map_or(v, |a| a.min(v)))
                         });
@@ -2566,9 +2637,7 @@ fn build_split(
             for g in 0..names.len() {
                 let mut rows: Vec<usize> = (0..n).filter(|&i| ids[i] == g).collect();
                 rows.sort_by(|&a, &b| {
-                    keys[a]
-                        .partial_cmp(&keys[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    keys.cmp(a, b).then(a.cmp(&b))
                 });
                 match split_ordered(&rows, spec, folds) {
                     Some((tr, folds_idx)) => {
@@ -2645,33 +2714,97 @@ fn split_blocks(idx: &[usize], folds: usize) -> Vec<Vec<usize>> {
     out
 }
 
-fn sorted_by(keys: &[f64]) -> Vec<usize> {
+/// Comparable ordering keys for a time column: exact `i64` when the table
+/// carries one (nanosecond-safe), otherwise the historical `f64` seconds.
+#[derive(Clone, Debug)]
+pub enum TimeKeys {
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+}
+
+impl TimeKeys {
+    pub fn len(&self) -> usize {
+        match self {
+            TimeKeys::I64(v) => v.len(),
+            TimeKeys::F64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total order with a row-stable tie break applied by the caller. A gap
+    /// (`i64::MIN`) sorts last, matching the old `NaN -> +inf` rule.
+    fn cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        match self {
+            TimeKeys::I64(v) => {
+                let key = |i: i64| if i == i64::MIN { i64::MAX } else { i };
+                key(v[a]).cmp(&key(v[b]))
+            }
+            TimeKeys::F64(v) => v[a]
+                .partial_cmp(&v[b])
+                .unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+
+    /// Display form for split reports (seconds or raw ticks, whichever unit the
+    /// source used). Precision beyond binary64 is not claimed here.
+    pub fn value(&self, i: usize) -> f64 {
+        match self {
+            TimeKeys::I64(v) => {
+                if v[i] == i64::MIN {
+                    f64::INFINITY
+                } else {
+                    v[i] as f64
+                }
+            }
+            TimeKeys::F64(v) => v[i],
+        }
+    }
+
+    fn difference(&self, a: usize, b: usize) -> f64 {
+        match self {
+            TimeKeys::I64(v) => {
+                if v[a] == i64::MIN || v[b] == i64::MIN {
+                    f64::INFINITY
+                } else {
+                    v[b].saturating_sub(v[a]) as f64
+                }
+            }
+            TimeKeys::F64(v) => v[b] - v[a],
+        }
+    }
+}
+
+fn sorted_by(keys: &TimeKeys) -> Vec<usize> {
     let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|&a, &b| {
-        keys[a]
-            .partial_cmp(&keys[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
     order
 }
 
 /// Comparable ordering key for every row of a time column.
 ///
-/// Numbers and dates are parsed to seconds; if any value cannot be parsed the
-/// whole column falls back to lexicographic order, which is still a valid total
-/// order (and the right one for zero-padded `YYYY-MM-DD`).
-pub fn time_keys(t: &Table, col: usize) -> Vec<f64> {
+/// Integers are used exactly when the table has an `i64` view (a time-like
+/// column parsed from integral text or loaded from an i64 store block), so
+/// two nanosecond prints 1 ns apart stay distinct. Otherwise numbers and dates
+/// are parsed to seconds; if any value cannot be parsed the whole column falls
+/// back to lexicographic order, which is still a valid total order (and the
+/// right one for zero-padded `YYYY-MM-DD`).
+pub fn time_keys(t: &Table, col: usize) -> TimeKeys {
     let n = t.len();
+    if let Some(ints) = t.ints(col) {
+        return TimeKeys::I64(ints.to_vec());
+    }
     // A numeric column without gaps is already in seconds: parsing its text
     // would only round-trip the same `f64`.
     if t.numeric[col] && !t.col(col).iter().any(|v| v.is_nan()) {
-        return t.col(col).to_vec();
+        return TimeKeys::F64(t.col(col).to_vec());
     }
     if let Some(d) = t.dict(col) {
         let parsed: Option<Vec<f64>> = (0..n).map(|r| parse_time(d.text(r))).collect();
         if let Some(v) = parsed {
-            return v;
+            return TimeKeys::F64(v);
         }
         let mut pairs: Vec<(String, usize)> = (0..n)
             .map(|r| (d.text(r).trim().to_string(), r))
@@ -2681,14 +2814,16 @@ pub fn time_keys(t: &Table, col: usize) -> Vec<f64> {
         for (rank, (_s, r)) in pairs.into_iter().enumerate() {
             key[r] = rank as f64;
         }
-        return key;
+        return TimeKeys::F64(key);
     }
     // High-cardinality numeric column with missing cells: compare the values
     // directly and sort gaps last.
-    t.col(col)
-        .iter()
-        .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
-        .collect()
+    TimeKeys::F64(
+        t.col(col)
+            .iter()
+            .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
+            .collect(),
+    )
 }
 
 /// Parse a timestamp to seconds: accepts plain numbers, `YYYY-MM-DD`,
@@ -2847,9 +2982,9 @@ pub fn add_lags(
         }
         None => (vec![0usize; n], 1),
     };
-    let keys: Vec<f64> = match time_col {
+    let keys: TimeKeys = match time_col {
         Some(c) => time_keys(t, c),
-        None => (0..n).map(|i| i as f64).collect(),
+        None => TimeKeys::F64((0..n).map(|i| i as f64).collect()),
     };
 
     let mut by_series: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -2863,17 +2998,12 @@ pub fn add_lags(
     let mut seg_pos = vec![0usize; n];
     let mut seg_rows: Vec<Vec<usize>> = Vec::new();
     for rows in by_series.iter_mut() {
-        rows.sort_by(|&a, &b| {
-            keys[a]
-                .partial_cmp(&keys[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
+        rows.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
         if rows.is_empty() {
             continue;
         }
         let dts: Vec<f64> = if lag.gap_break > 0.0 && rows.len() > 1 {
-            rows.windows(2).map(|w| keys[w[1]] - keys[w[0]]).collect()
+            rows.windows(2).map(|w| keys.difference(w[0], w[1])).collect()
         } else {
             Vec::new()
         };
@@ -2960,6 +3090,7 @@ pub fn add_lags(
             true,
             Column {
                 values,
+                ints: None,
                 dict: None,
             },
         );
@@ -2989,14 +3120,18 @@ fn hash_str(s: &str, seed: u64) -> u64 {
     h
 }
 
+/// True when a column name marks it as a time/ordering axis.
+fn time_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["time", "date", "timestamp", "datetime", "ts", "day", "dt"]
+        .iter()
+        .any(|k| name == *k || name.contains(k))
+}
+
 /// True when column `j` looks like a time/ordering axis (by name, or because it
 /// is monotone non-decreasing and almost all distinct).
 pub fn is_time_like(t: &Table, j: usize) -> bool {
-    let name = t.names[j].to_lowercase();
-    if ["time", "date", "timestamp", "datetime", "ts", "day", "dt"]
-        .iter()
-        .any(|k| name == *k || name.contains(k))
-    {
+    if time_name(&t.names[j]) {
         return true;
     }
     if !t.numeric[j] {
