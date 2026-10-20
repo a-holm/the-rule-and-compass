@@ -118,9 +118,30 @@ normalised to `+0` to match the host). The static kernel grew from 1000 to 1312
 SASS (+31%), registers from 26 to 27, and the 288-byte stack frame is unchanged
 on `sm_86`. A CUDA-guided run reports the opcode and fallback counts for each
 generation under `gpu.generations` in `--json`; a CPU run's JSON is unchanged.
-Operators without an opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates)
-still take the CPU fallback, and the final f64 CPU rescore remains the
-exactness guarantee for reported results.
+Operators without an opcode after exact lowering (constraints, aggregates, a
+custom block the inliner cannot handle) still take the CPU fallback, and the
+final f64 CPU rescore remains the exactness guarantee for reported results.
+
+**CPU fallback pool (#121).** Unsupported programs are not scored on the
+scoring thread. Each generation collects them into jobs and hands them to a
+persistent worker pool created with the GPU search (`RCSR_CPU_FALLBACK_THREADS`,
+default `min(cores, 8)`); the `sync_channel` queue holds at most one chunk per
+worker, so a burst cannot grow memory without bound. Results come back tagged
+with their absolute candidate index and are merged in candidate order, so the
+fitness bits and the archive are identical to the serial walk for any worker
+count (`search::tests::cpu_fallback_is_identical_for_one_and_many_threads`, and
+the mixed supported/unsupported integration test). `gpu.generations[]` reports
+`programs`, `native`, `lowered`, `fallbacks`/`unsupported_programs`,
+`fallback_seconds` and `fallback_workers`; `gpu.totals` aggregates the run.
+
+**Static and device stack guards (#121).** The lowering pass can expand a tree,
+so the host computes the postfix peak stack after lowering and rejects anything
+above 56 slots before a word is emitted; that tree goes to the CPU pool. The
+device is still guarded independently: every push checks `RC_MAX_STACK` (64) and
+every operator checks its operand depth, returning NaN (a hard failure) instead
+of writing past the local stack if a malformed or future program ever slips
+through. `gpu::deep_lowered_tree_is_rejected_before_emission` and
+`gpu::device_stack_guard_rejects_an_over_deep_program` pin both halves.
 
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
 FP64 runs at **1/64 of FP32**, so an FP64 kernel would throw away the whole
@@ -398,13 +419,17 @@ the GPU at all:
   stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
   implemented with the same positional `(seed, island, generation, slot, draw)`
   contract the full device-variation stage will use.
-* **Unsupported programs no longer serialise the batch.** `if` has no kernel
-  opcode, and the old `GpuSearch::score` scored every such tree one after
-  another on the calling thread. They are now split into contiguous slices and
-  scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
-  `min(cores, 8)`). Each tree is independent, so the result is bit-identical;
-  `search::tests::cpu_fallback_is_identical_for_one_and_many_threads` pins the
-  one-thread and four-thread results together.
+* **Unsupported programs no longer serialise the batch.** Before #131 `if` had
+  no kernel opcode, and the old `GpuSearch::score` scored every such tree one
+  after another on the calling thread. `if` is now a native opcode; the
+  remaining unsupported programs (constraints, aggregates, unlowed blocks) are
+  submitted to a persistent bounded CPU worker pool *before* the kernel launch,
+  so the fallback overlaps the batch instead of forming a tail. Each tree is
+  independent, so the result is bit-identical to the serial walk and merged in
+  candidate order; `search::tests::cpu_fallback_is_identical_for_one_and_many_threads`
+  pins the one-thread and four-thread results together and
+  `fallback_pool_is_bounded_and_merges_in_candidate_order` pins the queue bound
+  and the merge order with a non-contiguous pending set.
 * **Archive insertion without a pre-emptive clone.** `Archive::try_insert_view`
   tests dominance on `(cost, error)` first and clones the tree only for a
   candidate that enters the front.
@@ -428,6 +453,46 @@ population dominate. The kernel itself stays ~1–3 ms per generation: at the
 full device variation and fitting (#116), not the launch path. Exactness: the `P = 2 000`, 5-generation JSON
 report is byte-identical to `origin/main` apart from `elapsed_seconds`, i.e.
 the same constants, expressions and errors.
+
+### The `if` cell and the worker pool (#121)
+
+The regression in `gpu-search/2` §2.2 was measured as a GPU run with default
+operators (11.16 s) against the same run with `--ops` excluding `if` (1.17 s):
+40 generations, `pop 200`, 4 islands, `--no-fit`, `N = 1 500` training rows,
+seed 1, RTX 3060. Remeasured on the same host with the finished lowering and
+worker pool:
+
+| Run | Wall (three runs) | vs recorded 11.16 s |
+|---|---|---|
+| default operators (includes `if`) | 1.04 / 1.09 / 1.17 s | **9.5–10.7× faster** |
+| `--ops` excluding `if` | 0.87 / 0.90 / 0.93 s | — |
+
+The `if` cell is now within 1.15× of the no-`if` cell, so the serialisation is
+gone rather than merely shortened. `if` is native (#131); the pool covers the
+programs that still have no opcode.
+
+Fallback-only cell, `N = 15 000` training rows, `pop 2 000`, 5 generations,
+`--ops add,mul,div,require`, 5 704 unsupported programs:
+
+| `RCSR_CPU_FALLBACK_THREADS` | fallback s | whole run s |
+|---:|---:|---:|
+| 1 (serial) | 4.77 | 10.44 |
+| 8 (default) | 1.44 (**3.3×**) | 7.48 (1.4×) |
+
+A mixed 40-generation cell (`if` plus `require`, 15 756 fallback programs) gives
+the same Pareto archive at 1, 4 and 8 workers — SHA-256 of
+(expression, train error, test error, complexity) is `06b05c11e491dbf2` for all
+three — with fallback time 2.07 / 1.19 / 0.79 s and wall 3.48 / 2.45 / 1.74 s.
+
+**The 5× fallback-only target is not reachable on this host and is not claimed.**
+The i7-3770K has 4 physical cores (8 hyperthreads); the pool achieves 3.3× of
+the 4× ceiling (83 % parallel efficiency), and Amdahl's law caps the whole
+run at 2.0× because variation and simplification stay serial. Reaching 5× on
+unsupported programs needs either at least 8 physical cores or native opcodes
+for the remaining operators (`require`/`between`/`constrain`, aggregates),
+which is the opcode-request path in `gpu-lowering/C-lowering-pass.md` §6, not a
+scheduling change. The 9.5× `if` cell itself is met at 9.5–10.7× because the
+native `if` opcode removes the fallback rather than parallelising it.
 
 What remains staged: device-side mutation/crossover and a fused device
 selection/archive. The pool, hash and Philox contracts above are the interface

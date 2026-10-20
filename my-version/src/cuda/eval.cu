@@ -104,6 +104,173 @@ struct RcCtx {
 
 __device__ __forceinline__ float logisticf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+/* #121: one row of a postfix program, shared by the offset kernel and the
+   fixed-stride pool kernel so both execute the same instruction set.
+
+   The 64-slot stack is guarded on the device as well as on the host: a push
+   past `RC_MAX_STACK` or an operator reading below the current depth returns
+   NaN, which both kernels score as a hard failure. Without these checks a
+   program emitted without the host's `peak_stack` gate would write past `s`
+   and corrupt device state instead of failing that candidate. `sp > 0` on
+   HALT means a missing operand (or an empty program) is a hard failure too. */
+__device__ __forceinline__ float rc_eval_row(const unsigned int *__restrict__ code,
+                                             const float *__restrict__ cols,
+                                             int n,
+                                             int row)
+{
+    float s[RC_MAX_STACK];
+    int sp = 0;
+    for (;;) {
+        unsigned int w = *code++;
+        if (w == OP_CONST) {
+            if (sp >= RC_MAX_STACK) return CUDART_NAN_F;
+            s[sp++] = __uint_as_float(*code++);
+        } else if (w == OP_VAR) {
+            unsigned int k = *code++;
+            if (sp >= RC_MAX_STACK) return CUDART_NAN_F;
+            s[sp++] = cols[(size_t)k * (size_t)n + (size_t)row];
+        } else if (w == OP_HALT) {
+            return sp > 0 ? s[0] : CUDART_NAN_F;
+        } else if (w == OP_ADD) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            s[sp - 1] += b;
+        } else if (w == OP_SUB) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            s[sp - 1] -= b;
+        } else if (w == OP_MUL) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            s[sp - 1] *= b;
+        } else if (w == OP_DIV) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            /* Match the host evaluator: a near-zero denominator is a domain
+               error (NaN), which the host then scores as a hard failure. */
+            s[sp - 1] = (fabsf(b) < 1e-12f) ? CUDART_NAN_F : s[sp - 1] / b;
+        } else if (w == OP_POW) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[sp - 1];
+            s[sp - 1] = (a < 0.0f && fabsf(b - roundf(b)) > 1e-9f)
+                            ? CUDART_NAN_F
+                            : powf(a, b);
+        } else if (w == OP_MOD) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[sp - 1];
+            /* Host semantics: floored remainder with the same guards as
+               expr::eval. `floorf(q)` (not fmodf) makes the sign follow
+               the divisor. The quotient guard catches finite operands
+               whose f32 quotient overflows. */
+            float r = CUDART_NAN_F;
+            if (isfinite(a) && isfinite(b) && fabsf(b) >= 1e-12f) {
+                float q = a / b;
+                r = isfinite(q) ? fmaf(-b, floorf(q), a) : CUDART_NAN_F;
+            }
+            s[sp - 1] = r;
+        } else if (w == OP_ATAN2) {
+            if (sp < 2) return CUDART_NAN_F;
+            float x = s[--sp];
+            float y = s[sp - 1];
+            s[sp - 1] = (isnan(y) || isnan(x)) ? CUDART_NAN_F : atan2f(y, x);
+        } else if (w == OP_MIN || w == OP_MAX) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[sp - 1];
+            if (isnan(a) || isnan(b)) {
+                s[sp - 1] = CUDART_NAN_F;
+            } else {
+                s[sp - 1] = (w == OP_MIN) ? fminf(a, b) : fmaxf(a, b);
+            }
+        } else if (w == OP_EQUAL || w == OP_LESS || w == OP_LESS_OR_EQUAL
+                   || w == OP_GREATER || w == OP_GREATER_OR_EQUAL) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[sp - 1];
+            if (isnan(a) || isnan(b)) {
+                s[sp - 1] = CUDART_NAN_F;
+            } else {
+                int r = 0;
+                switch (w) {
+                    case OP_EQUAL: r = a == b; break;
+                    case OP_LESS: r = a < b; break;
+                    case OP_LESS_OR_EQUAL: r = a <= b; break;
+                    case OP_GREATER: r = a > b; break;
+                    default: r = a >= b; break;
+                }
+                s[sp - 1] = r ? 1.0f : 0.0f;
+            }
+        } else if (w == OP_AND || w == OP_OR || w == OP_XOR) {
+            if (sp < 2) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[sp - 1];
+            if (isnan(a) || isnan(b)) {
+                s[sp - 1] = CUDART_NAN_F;
+            } else {
+                int r = 0;
+                switch (w) {
+                    case OP_AND: r = (a > 0.0f) && (b > 0.0f); break;
+                    case OP_OR: r = (a > 0.0f) || (b > 0.0f); break;
+                    default: r = (a > 0.0f) != (b > 0.0f); break;
+                }
+                s[sp - 1] = r ? 1.0f : 0.0f;
+            }
+        } else if (w == OP_IF) {
+            /* Both arms have already been evaluated on the stack; a true
+               select discards the unselected value, including NaN. */
+            if (sp < 3) return CUDART_NAN_F;
+            float b = s[--sp];
+            float a = s[--sp];
+            s[sp - 1] = (s[sp - 1] > 0.0f) ? a : b;
+        } else {
+            /* unary operators */
+            if (sp < 1) return CUDART_NAN_F;
+            float a = s[sp - 1];
+            float r = a;
+            switch (w) {
+                case OP_SIN: r = sinf(a); break;
+                case OP_COS: r = cosf(a); break;
+                case OP_TAN: {
+                    float t = tanf(a);
+                    r = isfinite(t) ? t : CUDART_NAN_F;
+                } break;
+                case OP_EXP: r = expf(a); break;
+                case OP_LOG: r = (a > 0.0f) ? logf(a) : CUDART_NAN_F; break;
+                case OP_SQRT: r = (a >= 0.0f) ? sqrtf(a) : CUDART_NAN_F; break;
+                case OP_ABS: r = fabsf(a); break;
+                case OP_TANH: r = tanhf(a); break;
+                case OP_SIG: r = logisticf(a); break;
+                case OP_SQUARE: r = a * a; break;
+                case OP_CUBE: r = a * a * a; break;
+                case OP_NEG: r = -a; break;
+                case OP_GAUSS: r = expf(-a * a); break;
+                case OP_STEP: r = a > 0.0f ? 1.0f : 0.0f; break;
+                case OP_SINH: r = sinhf(a); break;
+                case OP_COSH: r = coshf(a); break;
+                case OP_FLOOR: r = floorf(a); break;
+                case OP_CEIL: r = ceilf(a); break;
+                case OP_ROUND: r = roundf(a); break;
+                case OP_ERF:
+                    /* expr::erf returns +0 for -0; erff preserves the
+                       sign bit, so normalise zeros. */
+                    r = (a == 0.0f) ? 0.0f : erff(a);
+                    break;
+                case OP_ERFC: r = erfcf(a); break;
+                case OP_SIGN:
+                    r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 1.0f : (a < 0.0f ? -1.0f : 0.0f));
+                    break;
+                case OP_NOT:
+                    r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
+                    break;
+                default: r = CUDART_NAN_F; break;
+            }
+            s[sp - 1] = r;
+        }
+    }
+}
+
 __global__ void eval_kernel(const float *__restrict__ cols,
                             const float *__restrict__ y,
                             int n,
@@ -114,147 +281,10 @@ __global__ void eval_kernel(const float *__restrict__ cols,
 {
     const int p = blockIdx.x;
     float acc = 0.0f;
+    const unsigned int *code = prog + off[p];
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float s[RC_MAX_STACK];
-        int sp = 0;
-        unsigned int q = off[p];
-        for (;;) {
-            unsigned int w = prog[q++];
-            if (w == OP_CONST) {
-                s[sp++] = __uint_as_float(prog[q++]);
-            } else if (w == OP_VAR) {
-                unsigned int k = prog[q++];
-                s[sp++] = cols[(size_t)k * (size_t)n + (size_t)i];
-            } else if (w == OP_HALT) {
-                break;
-            } else if (w == OP_ADD) {
-                float b = s[--sp];
-                s[sp - 1] += b;
-            } else if (w == OP_SUB) {
-                float b = s[--sp];
-                s[sp - 1] -= b;
-            } else if (w == OP_MUL) {
-                float b = s[--sp];
-                s[sp - 1] *= b;
-            } else if (w == OP_DIV) {
-                float b = s[--sp];
-                /* Match the host evaluator: a near-zero denominator is a domain
-                   error (NaN), which the host then scores as a hard failure. */
-                s[sp - 1] = (fabsf(b) < 1e-12f) ? CUDART_NAN_F : s[sp - 1] / b;
-            } else if (w == OP_POW) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                s[sp - 1] = (a < 0.0f && fabsf(b - roundf(b)) > 1e-9f)
-                                ? CUDART_NAN_F
-                                : powf(a, b);
-            } else if (w == OP_MOD) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                /* Host semantics: floored remainder with the same guards as
-                   expr::eval. `floorf(q)` (not fmodf) makes the sign follow
-                   the divisor. The quotient guard catches finite operands
-                   whose f32 quotient overflows. */
-                float r = CUDART_NAN_F;
-                if (isfinite(a) && isfinite(b) && fabsf(b) >= 1e-12f) {
-                    float q = a / b;
-                    r = isfinite(q) ? fmaf(-b, floorf(q), a) : CUDART_NAN_F;
-                }
-                s[sp - 1] = r;
-            } else if (w == OP_ATAN2) {
-                float x = s[--sp];
-                float y = s[sp - 1];
-                s[sp - 1] = (isnan(y) || isnan(x)) ? CUDART_NAN_F : atan2f(y, x);
-            } else if (w == OP_MIN || w == OP_MAX) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                if (isnan(a) || isnan(b)) {
-                    s[sp - 1] = CUDART_NAN_F;
-                } else {
-                    s[sp - 1] = (w == OP_MIN) ? fminf(a, b) : fmaxf(a, b);
-                }
-            } else if (w == OP_EQUAL || w == OP_LESS || w == OP_LESS_OR_EQUAL
-                       || w == OP_GREATER || w == OP_GREATER_OR_EQUAL) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                if (isnan(a) || isnan(b)) {
-                    s[sp - 1] = CUDART_NAN_F;
-                } else {
-                    int r = 0;
-                    switch (w) {
-                        case OP_EQUAL: r = a == b; break;
-                        case OP_LESS: r = a < b; break;
-                        case OP_LESS_OR_EQUAL: r = a <= b; break;
-                        case OP_GREATER: r = a > b; break;
-                        default: r = a >= b; break;
-                    }
-                    s[sp - 1] = r ? 1.0f : 0.0f;
-                }
-            } else if (w == OP_AND || w == OP_OR || w == OP_XOR) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                if (isnan(a) || isnan(b)) {
-                    s[sp - 1] = CUDART_NAN_F;
-                } else {
-                    int r = 0;
-                    switch (w) {
-                        case OP_AND: r = (a > 0.0f) && (b > 0.0f); break;
-                        case OP_OR: r = (a > 0.0f) || (b > 0.0f); break;
-                        default: r = (a > 0.0f) != (b > 0.0f); break;
-                    }
-                    s[sp - 1] = r ? 1.0f : 0.0f;
-                }
-            } else if (w == OP_IF) {
-                /* Both arms have already been evaluated on the stack; a true
-                   select discards the unselected value, including NaN. */
-                float b = s[--sp];
-                float a = s[--sp];
-                s[sp - 1] = (s[sp - 1] > 0.0f) ? a : b;
-            } else {
-                /* unary operators */
-                float a = s[sp - 1];
-                float r = a;
-                switch (w) {
-                    case OP_SIN: r = sinf(a); break;
-                    case OP_COS: r = cosf(a); break;
-                    case OP_TAN: {
-                        float t = tanf(a);
-                        r = isfinite(t) ? t : CUDART_NAN_F;
-                    } break;
-                    case OP_EXP: r = expf(a); break;
-                    case OP_LOG: r = (a > 0.0f) ? logf(a) : CUDART_NAN_F; break;
-                    case OP_SQRT: r = (a >= 0.0f) ? sqrtf(a) : CUDART_NAN_F; break;
-                    case OP_ABS: r = fabsf(a); break;
-                    case OP_TANH: r = tanhf(a); break;
-                    case OP_SIG: r = logisticf(a); break;
-                    case OP_SQUARE: r = a * a; break;
-                    case OP_CUBE: r = a * a * a; break;
-                    case OP_NEG: r = -a; break;
-                    case OP_GAUSS: r = expf(-a * a); break;
-                    case OP_STEP: r = a > 0.0f ? 1.0f : 0.0f; break;
-                    case OP_SINH: r = sinhf(a); break;
-                    case OP_COSH: r = coshf(a); break;
-                    case OP_FLOOR: r = floorf(a); break;
-                    case OP_CEIL: r = ceilf(a); break;
-                    case OP_ROUND: r = roundf(a); break;
-                    case OP_ERF:
-                        /* expr::erf returns +0 for -0; erff preserves the
-                           sign bit, so normalise zeros. */
-                        r = (a == 0.0f) ? 0.0f : erff(a);
-                        break;
-                    case OP_ERFC: r = erfcf(a); break;
-                    case OP_SIGN:
-                        r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 1.0f : (a < 0.0f ? -1.0f : 0.0f));
-                        break;
-                    case OP_NOT:
-                        r = isnan(a) ? CUDART_NAN_F : (a > 0.0f ? 0.0f : 1.0f);
-                        break;
-                    default: r = 0.0f; break;
-                }
-                s[sp - 1] = r;
-            }
-        }
-        float pred = s[0];
+        float pred = rc_eval_row(code, cols, n, i);
         /* Shared magnitude limit: anything non-finite or astronomically large is
            a hard failure. Applying the *same* rule on the host keeps the f32
            kernel and the f64 reference on the same fitness landscape. */
@@ -287,69 +317,11 @@ __global__ void eval_pool_kernel(const float *__restrict__ cols,
                                  float *__restrict__ out)
 {
     const int p = blockIdx.x;
-    const unsigned int *slot = prog + (size_t)p * (size_t)width;
+    const unsigned int *code = prog + (size_t)p * (size_t)width;
     float acc = 0.0f;
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float s[RC_MAX_STACK];
-        int sp = 0;
-        int q = 0;
-        for (;;) {
-            unsigned int w = slot[q++];
-            if (w == OP_CONST) {
-                s[sp++] = __uint_as_float(slot[q++]);
-            } else if (w == OP_VAR) {
-                unsigned int k = slot[q++];
-                s[sp++] = cols[(size_t)k * (size_t)n + (size_t)i];
-            } else if (w == OP_HALT) {
-                break;
-            } else if (w == OP_ADD) {
-                float b = s[--sp];
-                s[sp - 1] += b;
-            } else if (w == OP_SUB) {
-                float b = s[--sp];
-                s[sp - 1] -= b;
-            } else if (w == OP_MUL) {
-                float b = s[--sp];
-                s[sp - 1] *= b;
-            } else if (w == OP_DIV) {
-                float b = s[--sp];
-                s[sp - 1] = (fabsf(b) < 1e-12f) ? CUDART_NAN_F : s[sp - 1] / b;
-            } else if (w == OP_POW) {
-                float b = s[--sp];
-                float a = s[sp - 1];
-                s[sp - 1] = (a < 0.0f && fabsf(b - roundf(b)) > 1e-9f)
-                                ? CUDART_NAN_F
-                                : powf(a, b);
-            } else {
-                float a = s[sp - 1];
-                float r = a;
-                switch (w) {
-                    case OP_SIN: r = sinf(a); break;
-                    case OP_COS: r = cosf(a); break;
-                    case OP_TAN: {
-                        float t = tanf(a);
-                        r = isfinite(t) ? t : CUDART_NAN_F;
-                    } break;
-                    case OP_EXP: r = expf(a); break;
-                    case OP_LOG: r = (a > 0.0f) ? logf(a) : CUDART_NAN_F; break;
-                    case OP_SQRT: r = (a >= 0.0f) ? sqrtf(a) : CUDART_NAN_F; break;
-                    case OP_ABS: r = fabsf(a); break;
-                    case OP_TANH: r = tanhf(a); break;
-                    case OP_SIG: r = logisticf(a); break;
-                    case OP_SQUARE: r = a * a; break;
-                    case OP_CUBE: r = a * a * a; break;
-                    case OP_NEG: r = -a; break;
-                    case OP_GAUSS: r = expf(-a * a); break;
-                    case OP_STEP: r = a > 0.0f ? 1.0f : 0.0f; break;
-                    case OP_SINH: r = sinhf(a); break;
-                    case OP_COSH: r = coshf(a); break;
-                    default: r = 0.0f; break;
-                }
-                s[sp - 1] = r;
-            }
-        }
-        float pred = s[0];
+        float pred = rc_eval_row(code, cols, n, i);
         if (!isfinite(pred) || fabsf(pred) > 1e30f) {
             acc += 1e30f;
             continue;
