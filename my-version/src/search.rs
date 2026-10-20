@@ -14,7 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
-use crate::checkpoint::{Checkpoint, Individual, IslandState};
+use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{
@@ -515,6 +515,29 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         return Some("--fit-samples scores offspring on a screening subset");
     }
     None
+}
+
+/// The backend this configuration and sample will use in this build
+/// (issue #140).
+///
+/// This mirrors the capability checks in [`run_search`] and is used by the CLI
+/// to refuse a backend-changing `--resume` before the search starts. An actual
+/// device failure still falls back to the CPU inside the search.
+pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
+    #[cfg(feature = "cuda")]
+    {
+        if cfg.gpu
+            && !matches!(
+                std::env::var("RCSR_GPU").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            )
+            && gpu_blocker(cfg, train).is_none()
+        {
+            return Backend::Gpu;
+        }
+    }
+    let _ = (cfg, train);
+    Backend::Cpu
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
@@ -1245,6 +1268,7 @@ type CheckpointFn<'a> = &'a mut dyn FnMut(&Checkpoint);
 #[allow(clippy::too_many_arguments)]
 fn snapshot(
     cfg: &Config,
+    backend: Backend,
     gens_done: usize,
     stopped_early: bool,
     best_prev: f64,
@@ -1260,6 +1284,8 @@ fn snapshot(
     let (words, idx) = main_rng.state();
     Checkpoint {
         config: cfg.clone(),
+        backend,
+        config_hash: crate::checkpoint::config_hash(cfg),
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -1882,8 +1908,14 @@ fn run_search(
             // A checkpoint is taken only at a generation boundary: all of the
             // generation's work, including migration and restarts, is done.
             if save_every > 0 && gens_done % save_every == 0 {
+                let backend = if defer_gpu || gpu_used {
+                    Backend::Gpu
+                } else {
+                    Backend::Cpu
+                };
                 let cp = snapshot(
                     cfg,
+                    backend,
                     gens_done,
                     converged_early,
                     best_prev,
@@ -1905,8 +1937,14 @@ fn run_search(
     // full-data archive rebuild, so the saved archive is the search archive at
     // the last completed generation.
     if on_checkpoint.is_some() {
+        let backend = if defer_gpu || gpu_used {
+            Backend::Gpu
+        } else {
+            Backend::Cpu
+        };
         let cp = snapshot(
             cfg,
+            backend,
             gens_done,
             converged_early,
             best_prev,

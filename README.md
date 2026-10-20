@@ -229,9 +229,10 @@ and leakage rules, and a worked recovery example.
 ## Save and resume a run
 
 A long search can be checkpointed and continued later. The checkpoint carries
-the complete search state — configuration, populations, per-island RNG states,
-stagnation and patience counters, archive and a data fingerprint — so a resumed
-run follows the identical trajectory:
+the complete search state — configuration, backend (`cpu`/`gpu`), canonical
+config hash, populations, per-island RNG states, stagnation and patience
+counters, archive and a data fingerprint — so a resumed run follows the
+identical trajectory:
 
 ```sh
 rcsr --data examples/line.csv --target y --vars x \
@@ -241,11 +242,24 @@ rcsr --data examples/line.csv --target y --vars x \
 ```
 
 `--save-every <N>` sets the interval (default 25 generations); a checkpoint is
-always written on exit. Saving does not consume randomness, so it cannot change
-the result. The saved search settings win on resume; only the generation budget
-may be raised, and data that does not match the saved fingerprint is refused.
-See [`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format,
-the determinism guarantee and its limits.
+always written on exit. Saves are crash-safe: temp file, `fsync`, atomic rename,
+with the previous good generation kept as `run.rcsr.prev`. Saving does not
+consume randomness, so it cannot change the result. The saved search settings
+win on resume; only the generation budget may be raised, and data that does not
+match the saved fingerprint is refused. A CPU checkpoint is never silently
+continued on the GPU (or vice versa): `--resume` refuses the backend change
+unless `--allow-backend-change` is explicit. See
+[`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format, the
+determinism guarantee and its limits.
+
+`--run-manifest <path>` records the evidence needed to reproduce a long run:
+commit and dirty state, the SHA-256 of the running binary, the data file
+checksum and sample fingerprints, the resolved configuration, seed, backend,
+device/driver/CUDA, UTC start/end and phase timings. `rcsr verify-manifest`
+re-checks it against the current binary, commit, data and config and exits
+non-zero on any mismatch. `--json-out <path>` publishes the final JSON result
+atomically instead of streaming it. See
+[`docs/run-integrity.md`](docs/run-integrity.md).
 
 ## Using it from other programs
 
@@ -808,6 +822,8 @@ docs/overfitting.md           avoiding and detecting overfitting, with reference
 docs/meta-operators.md        structural meta operators and their cache rule
 docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
+docs/checkpoint.md            save/resume state, atomic writes and backend identity
+docs/run-integrity.md         run manifests, verification and reproducible launchers
 docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results

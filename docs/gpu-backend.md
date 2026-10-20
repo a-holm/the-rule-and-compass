@@ -9,6 +9,16 @@ design maps onto an NVIDIA DGX Spark.
 The backend is **opt-in**. The default build remains pure `std` with no
 dependencies and no CUDA requirement.
 
+## Backend identity and resumes
+
+Checkpoints record `backend cpu|gpu` (#140). `--resume` refuses a CPU/GPU
+change with exit code `3` and an error naming both backends; pass
+`--allow-backend-change` to override it deliberately. The override is printed on
+stderr and recorded in `--run-manifest` under `resume.backend_change`. This is
+the fix for the observed incident where `resume_10h.py` omitted `--gpu` and
+silently continued a GPU-selected population on the CPU. Always state `--gpu`
+or `--cpu` explicitly in a launcher, even though CPU is the default.
+
 ## Build and run
 
 ```sh
@@ -24,13 +34,13 @@ RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 ./target/release/rcsr-gpu-bench --data examples/sine.csv --target y --vars x \
     --batch 8000 --depth 5 --seed 5
 
-# opt in to GPU-guided search when a device is present
+# opt in to GPU-guided search when a device is present (--gpu is required)
 ./target/release/rcsr --data examples/sine.csv --target y --vars x \
-    --generations 200 --pop 200 --islands 4 --seed 7 --metric squared
+    --generations 200 --pop 200 --islands 4 --seed 7 --metric squared --gpu
 
 # force the CPU evaluator (alias: --cpu), or simulate a missing device
-./target/release/rcsr ... --no-gpu
-RCSR_GPU=0 ./target/release/rcsr ...
+./target/release/rcsr ... --gpu --cpu
+RCSR_GPU=0 ./target/release/rcsr ... --gpu
 ```
 
 `RCSR_CUDA_ARCH` is validated before `nvcc` runs. A malformed value, or a

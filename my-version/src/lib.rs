@@ -2,6 +2,7 @@
 //!
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
+pub mod atomic;
 pub mod bench;
 pub mod checkpoint;
 pub mod column;
@@ -15,6 +16,7 @@ pub mod fit;
 pub mod gpu;
 pub mod gui;
 pub mod implicit;
+pub mod manifest;
 pub mod metrics;
 pub mod multi;
 pub mod pareto;

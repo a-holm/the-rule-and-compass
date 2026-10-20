@@ -11,8 +11,9 @@
 //! * `--time-budget` bounds wall-clock time, so a caller never blocks forever;
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
-use rcsr::checkpoint::Checkpoint;
+use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::complexity::ComplexityModel;
+use rcsr::manifest;
 use rcsr::expr::{self, Op};
 use rcsr::fit;
 use rcsr::metrics::{self, Metric};
@@ -90,6 +91,7 @@ fn usage() -> String {
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -340,12 +342,29 @@ SEARCH:
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
-                             generations; saving does not change the search
+                             generations; saving does not change the search.
+                             Writes are atomic and the previous good generation
+                             is kept as <file>.prev
   --save-every <N>           generation interval for --save (default 25)
   --resume <file>            continue from a checkpoint. The saved search
                              settings win; --generations may only be raised.
                              Training and test data must match the saved
                              fingerprint; a mismatch is refused (exit 3).
+                             The saved backend (cpu/gpu) must also match; a
+                             mismatch is refused unless overridden below
+  --allow-backend-change     resume a checkpoint on a different backend
+                             (cpu<->gpu) and say so on stderr and in the
+                             run manifest
+
+RUN INTEGRITY (#140):
+  --run-manifest <file>      atomically write a JSON manifest with commit,
+                             dirty state, binary SHA-256, data checksum and
+                             fingerprint, resolved config, seed, backend,
+                             device/driver/CUDA, UTC start/end and phase timings;
+                             update it atomically at the end
+  verify-manifest <file>     check a manifest against the current binary,
+  [--data <file>]            commit, data file and canonical config; exit 1 on
+                             any mismatch (exit 0 when everything matches)
 
 OUTPUT:
   --format text|json|ndjson  (default text)
@@ -357,7 +376,10 @@ OUTPUT:
                              ndjson. See docs/convergence.md
   --top <N>                  report at most N Pareto rows (default: all)
   --quiet                    suppress the human-readable header
-  --out <file>               also write the Pareto front as TSV
+  --out <file>               also write the Pareto front as TSV (atomic)
+  --json-out <file>          write the final JSON result to this file atomically
+                             instead of streaming it to stdout (implies --json).
+                             Progress still goes to stderr, or NDJSON on stdout
 
 REPORTS (Markdown, issue #29):
   --report <type>            emit a Markdown report after the run. One type per
@@ -561,6 +583,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
     }
+    // #140: verify a run manifest without starting a search.
+    if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
+        run_verify_manifest(&args[1..]);
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
         std::process::exit(EXIT_OK);
@@ -632,6 +658,10 @@ fn main() {
     let mut save_every = 25usize;
     let mut save_every_set = false;
     let mut resume_path: Option<String> = None;
+    // #140: run integrity flags.
+    let mut allow_backend_change = false;
+    let mut run_manifest_path: Option<String> = None;
+    let mut json_out: Option<String> = None;
 
     // Which search flags were written on the command line. Used to refuse a
     // resume whose explicit override contradicts the saved configuration.
@@ -967,6 +997,9 @@ fn main() {
                 }
             }
             "--resume" => resume_path = Some(val!()),
+            "--allow-backend-change" => allow_backend_change = true,
+            "--run-manifest" => run_manifest_path = Some(val!()),
+            "--json-out" => json_out = Some(val!()),
             "--format" => {
                 format = match val!().as_str() {
                     "json" => Format::Json,
@@ -1049,6 +1082,15 @@ fn main() {
     if save_every_set && save_path.is_none() {
         eprintln!("error: --save-every requires --save <file>");
         std::process::exit(EXIT_USAGE);
+    }
+    if allow_backend_change && resume_path.is_none() {
+        eprintln!("error: --allow-backend-change only applies to --resume");
+        std::process::exit(EXIT_USAGE);
+    }
+    if json_out.is_some() {
+        // #140: a file result is a JSON document, published atomically. It
+        // replaces the stdout stream for the final object.
+        format = Format::Json;
     }
     if eval_expr.is_some() && (save_path.is_some() || resume_path.is_some()) {
         eprintln!("error: --save and --resume cannot be combined with --eval-expr");
@@ -1267,10 +1309,19 @@ fn main() {
         // The generation budget is the one setting that may be *raised* on
         // resume: all earlier generations are unaffected and a longer run is
         // the same trajectory plus more generations.
+        //
+        // #140: evaluator choices are *not* saved search settings, but they
+        // must survive the resume. Previously `cfg = saved` silently reset
+        // `--gpu` to the default CPU, which is exactly how a GPU run was
+        // continued on the CPU.
+        let requested_gpu = cfg.gpu;
+        let requested_simd = cfg.simd;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
         }
+        effective.gpu = requested_gpu;
+        effective.simd = requested_simd;
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
@@ -1310,6 +1361,9 @@ fn main() {
         }
     }
 
+    // #140: phase timings for the run manifest start here, before the table is
+    // read, so the manifest covers the whole run rather than just the search.
+    let run_start = std::time::Instant::now();
     let data_path = match data_path {
         Some(p) => p,
         None => {
@@ -1358,6 +1412,7 @@ fn main() {
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
+            (run_manifest_path.is_some(), "--run-manifest"),
             (format == Format::Ndjson, "--ndjson"),
         ];
         for (present, flag) in unsupported {
@@ -1948,12 +2003,33 @@ fn main() {
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.
+    let mut backend_change: Option<(String, String)> = None;
     if let Some(cp) = &resume_checkpoint {
         if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        // #140: a GPU checkpoint must not be continued on the CPU (or vice
+        // versa) without an explicit override. The effective backend mirrors
+        // the search's own capability checks.
+        let current_backend = search::effective_backend(&cfg, &prepared.train);
+        if let Err(e) = cp.check_backend(current_backend, allow_backend_change) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        if cp.backend != Backend::Unknown && cp.backend != current_backend {
+            backend_change = Some((
+                cp.backend.as_str().to_string(),
+                current_backend.as_str().to_string(),
+            ));
+            eprintln!(
+                "# checkpoint: backend changed {} -> {} (allowed by --allow-backend-change)",
+                cp.backend.as_str(),
+                current_backend.as_str()
+            );
+        }
     }
+    let effective_backend = search::effective_backend(&cfg, &prepared.train);
 
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
@@ -2030,6 +2106,29 @@ fn main() {
                 eprintln!("{}", line);
             }
         }));
+    }
+
+    // #140: publish the run manifest before the search so a killed process
+    // still leaves evidence of what it was doing. It is updated atomically at
+    // the end with the end time and phase timings.
+    let data_prepare_secs = run_start.elapsed().as_secs_f64();
+    let mut manifest_state: Option<manifest::Manifest> = None;
+    if let Some(path) = &run_manifest_path {
+        let m = manifest::collect(
+            VERSION,
+            &data_path,
+            rcsr::checkpoint::fingerprint(&prepared.train),
+            rcsr::checkpoint::fingerprint(&prepared.test),
+            &cfg,
+            effective_backend.as_str(),
+            resume_path.clone(),
+            backend_change.clone(),
+        );
+        if let Err(e) = m.write(path, None, &[("data_prepare", data_prepare_secs)]) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        manifest_state = Some(m);
     }
 
     let start = std::time::Instant::now();
@@ -2205,6 +2304,7 @@ fn main() {
             quiet,
             top,
             out_path,
+            json_out.clone(),
             start,
         );
         std::process::exit(EXIT_OK);
@@ -2287,6 +2387,20 @@ fn main() {
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
+
+    // #140: atomically finish the manifest with an end timestamp and timings.
+    if let (Some(path), Some(m)) = (&run_manifest_path, &manifest_state) {
+        let total_secs = run_start.elapsed().as_secs_f64();
+        let phases = [
+            ("data_prepare", data_prepare_secs),
+            ("search", elapsed),
+            ("total", total_secs),
+        ];
+        if let Err(e) = m.write(path, Some(&manifest::utc_now()), &phases) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
 
     // Seeded solutions, reported once each. The search holds them in
     // normalised-input space; show the original-units form, exactly like a
@@ -3120,7 +3234,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string()),
                 outcome.generations
             );
-            println!(
+            let result_json = format!(
                 "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 jstr(VERSION),
@@ -3151,6 +3265,16 @@ fn main() {
                 seeds_json.join(","),
                 pareto.join(",")
             );
+            // #140: a requested result file is published atomically; stdout
+            // never carries a stream that a killed process can truncate.
+            if let Some(path) = &json_out {
+                if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            } else {
+                println!("{}", result_json);
+            }
         }
         Format::Ndjson => {
             for (expression, complexity, error) in &seed_rows {
@@ -3331,7 +3455,7 @@ fn main() {
                 r.rank, r.complexity, r.train_error, r.test_error, r.expression
             ));
         }
-        if let Err(e) = std::fs::write(&path, buf) {
+        if let Err(e) = rcsr::atomic::write_text_atomic(&path, &buf) {
             eprintln!("error writing {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -3401,6 +3525,7 @@ fn run_multi_output(
     quiet: bool,
     top: usize,
     out_path: Option<String>,
+    json_out: Option<String>,
     start: std::time::Instant,
 ) {
     let outcome = search::run(cfg, &prepared.train, &prepared.test);
@@ -3575,7 +3700,7 @@ fn run_multi_output(
                     )
                 })
                 .collect();
-            println!(
+            let result_json = format!(
                 "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
@@ -3590,6 +3715,14 @@ fn run_multi_output(
                 jnum(elapsed),
                 pareto.join(",")
             );
+            if let Some(path) = &json_out {
+                if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            } else {
+                println!("{}", result_json);
+            }
         }
         Format::Ndjson => {
             // Refused earlier; kept exhaustive so a future change cannot
@@ -3618,7 +3751,7 @@ fn run_multi_output(
                 ));
             }
         }
-        if let Err(e) = std::fs::write(&path, buf) {
+        if let Err(e) = rcsr::atomic::write_text_atomic(&path, &buf) {
             eprintln!("error writing {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -5015,6 +5148,69 @@ OPTIONS:
 ",
         store::DEFAULT_GROUP_ROWS
     )
+}
+
+/// `rcsr verify-manifest <path> [--data <file>]` (issue #140).
+///
+/// Exit 0 when every check passes, 1 on any mismatch, 2 on a usage error.
+fn run_verify_manifest(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "rcsr verify-manifest <manifest.json> [--data <file>]\n\n\
+             Check a --run-manifest against the current binary, git commit, data\n\
+             file and canonical configuration. Exit 0 when all match, 1 otherwise."
+        );
+        std::process::exit(EXIT_OK);
+    }
+    let mut path: Option<String> = None;
+    let mut data: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data" | "-d" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => data = Some(v.clone()),
+                    None => {
+                        eprintln!("error: --data requires a value");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown verify-manifest argument '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("error: verify-manifest takes exactly one manifest path");
+                    std::process::exit(EXIT_USAGE);
+                }
+                path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = path else {
+        eprintln!("error: verify-manifest needs a manifest path");
+        std::process::exit(EXIT_USAGE);
+    };
+    match manifest::verify(&path, data.as_deref()) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{}", line);
+            }
+            println!("PASS manifest {}", path);
+            std::process::exit(EXIT_OK);
+        }
+        Err(lines) => {
+            for line in lines.lines() {
+                eprintln!("{}", line);
+            }
+            eprintln!("FAIL manifest {}", path);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_import(args: &[String]) -> ! {
