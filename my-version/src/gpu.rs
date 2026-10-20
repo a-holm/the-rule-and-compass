@@ -121,15 +121,38 @@ const OPCODE_TABLE: &[(&str, u32)] = &[
 
 /// Compile one expression to postfix bytecode. Returns `false` if the tree uses
 /// an operator the kernel does not implement even after [`lower`] (for example
-/// `floor`, `mod` or `atan2`).
-/// an operator the kernel does not implement (for example `asinh`, `mod` on a
-/// platform without the #131 opcodes, or constraints).
+/// an aggregate, a constraint or a custom block).
 pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
-    if !emit(n, out) {
-        return false;
+    compile_with_report(n, out).is_some()
+}
+
+/// #121: the kernel's postfix stack size, matching `RC_MAX_STACK` in
+/// `src/cuda/eval.cu`. The device guards every push against it; the host keeps
+/// [`HOST_MAX_STACK`] slots of headroom so a rejected tree never reaches the
+/// device through the normal path.
+pub const RC_MAX_STACK: usize = 64;
+
+/// #121: host gate for emitted programs. Lowering can expand a tree, so the
+/// static peak stack is checked after [`lower`] and before a single word is
+/// appended. The 8-slot margin leaves room for an opcode that pushes an
+/// intermediate the pass did not model.
+pub const HOST_MAX_STACK: usize = 56;
+
+/// #121: compile a tree and report whether [`lower`] had to rewrite it.
+///
+/// `Some(true)` is a lowered program, `Some(false)` one the kernel accepts
+/// verbatim, and `None` an unsupported or over-deep tree that must go to the
+/// CPU fallback. The report feeds `unsupported_programs`/`lowered` in `--json`.
+pub fn compile_with_report(n: &Node, out: &mut Vec<u32>) -> Option<bool> {
+    let lowered = lower(n);
+    if peak_stack(&lowered) > HOST_MAX_STACK {
+        return None;
+    }
+    if !emit(&lowered, out) {
+        return None;
     }
     out.push(OP_HALT);
-    true
+    Some(lowered != *n)
 }
 
 /// #121: rewrite operators the kernel lacks into exact equivalents over the
@@ -142,7 +165,6 @@ fn lower(n: &Node) -> Node {
         return n.clone();
     }
     let k: Vec<Node> = n.kids.iter().map(lower).collect();
-    let abs_diff = |a: &Node, b: &Node| node(Abs, vec![node(Sub, vec![a.clone(), b.clone()])]);
     match n.op {
         Asinh => {
             // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
@@ -354,6 +376,9 @@ pub struct Population {
     prog: Vec<u32>,
     offsets: Vec<u32>,
     unsupported: usize,
+    /// #121: programs that needed the exact lowering pass. The rest were
+    /// accepted verbatim, so `native + lowered + unsupported == added`.
+    lowered: usize,
     /// #131: operator occurrences, used for the per-generation `--json` report.
     ops: std::collections::BTreeMap<u32, usize>,
 }
@@ -365,6 +390,7 @@ impl Population {
             prog: Vec::new(),
             offsets: vec![0],
             unsupported: 0,
+            lowered: 0,
             ops: std::collections::BTreeMap::new(),
         }
     }
@@ -374,16 +400,14 @@ impl Population {
     /// kernel does not implement; the population itself stays valid.
     pub fn add(&mut self, tree: &Node) -> bool {
         let mut buf = Vec::new();
-        let lowered = lower(tree);
-        // #121: the kernel has no stack-bounds check (RC_MAX_STACK=64), so a
-        // lowered program must be rejected before emission if it could overflow.
-        if peak_stack(&lowered) > 56 {
+        // #121: `compile_with_report` applies the exact lowering pass and the
+        // static stack gate (the kernel has no host-side bounds check).
+        let Some(lowered) = compile_with_report(tree, &mut buf) else {
             self.unsupported += 1;
             return false;
-        }
-        if !compile(&lowered, &mut buf) {
-            self.unsupported += 1;
-            return false;
+        };
+        if lowered {
+            self.lowered += 1;
         }
         // Count operator words, skipping the operand word after const/var.
         let mut i = 0;
@@ -428,6 +452,16 @@ impl Population {
     /// Trees that could not be compiled because of an unsupported operator.
     pub fn unsupported(&self) -> usize {
         self.unsupported
+    }
+
+    /// #121: compiled programs that needed the exact lowering pass.
+    pub fn lowered(&self) -> usize {
+        self.lowered
+    }
+
+    /// #121: compiled programs the kernel accepted verbatim.
+    pub fn native(&self) -> usize {
+        self.len() - self.lowered
     }
 
     /// The raw `(program bytes, offsets)` pair, e.g. for [`GpuEvaluator::eval_batch`].
@@ -682,6 +716,43 @@ mod tests {
         assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
     }
 
+    /// #121: a mixed population keeps its order and reports the
+    /// native/lowered/unsupported split. The two GPU programs must score in
+    /// insertion order, exactly where the caller will merge them.
+    #[test]
+    fn mixed_population_keeps_order_and_counts_lowered() {
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let native = node(Op::If, vec![input(0), constant(1.0), constant(2.0)]);
+        let lowered = node(Op::Asinh, vec![input(0)]);
+        let unsupported = node(Op::Require, vec![trees[0].clone()]);
+        let mut pop = Population::new();
+        assert!(pop.add(&trees[0]));
+        assert!(!pop.add(&unsupported));
+        assert!(pop.add(&native));
+        assert!(pop.add(&lowered));
+        assert_eq!(pop.len(), 3);
+        assert_eq!(pop.native(), 2, "the fixture tree and `if` are accepted verbatim");
+        assert_eq!(pop.lowered(), 1, "asinh needs the lowering pass");
+        assert_eq!(pop.unsupported(), 1);
+        let (sse, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0);
+        assert_eq!(sse.len(), 3);
+        for (slot, tree) in [&trees[0], &native, &lowered].iter().enumerate() {
+            let cpu = cpu_sse(tree, &cols, n, nv, &y);
+            let rel = (sse[slot] as f64 - cpu).abs() / (1.0 + cpu.abs());
+            assert!(
+                rel < 1e-4,
+                "slot {slot}: GPU {} vs CPU {} (relative {rel:.2e})",
+                sse[slot],
+                cpu
+            );
+        }
+    }
+
     #[test]
     fn fixed_slot_pool_matches_the_packed_batch_and_hashes() {
         use crate::genome::{postfix_hash, GenomeMeta, GenomePool};
@@ -775,6 +846,87 @@ mod tests {
                 rel
             );
         }
+    }
+
+    /// #131: the Rust opcode constants must match the CUDA enum exactly.
+    /// #121: the device backstop. A program that bypasses the host gate (here
+    /// by writing straight into the genome pool) must be scored as a hard
+    /// failure, not corrupt the local stack. Before the guard this wrote one
+    /// float past `s` for every row.
+    #[test]
+    fn device_stack_guard_rejects_an_over_deep_program() {
+        let (cols, n, nv, y, _) = fixture();
+        let Some(mut ev) = evaluator_or_skip(&cols, n, nv, &y) else {
+            return;
+        };
+        let mut pool = crate::genome::GenomePool::new(1, 2 * (RC_MAX_STACK + 1) + 1);
+        pool.begin_generation();
+        let mut words = Vec::new();
+        // One push past RC_MAX_STACK: 65 constants with no consumer.
+        for _ in 0..=RC_MAX_STACK {
+            words.push(OP_CONST);
+            words.push(1.0f32.to_bits());
+        }
+        words.push(OP_HALT);
+        assert!(pool.push(&words, Default::default()));
+        pool.commit();
+        let (sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0, "the guarded batch must not fail the launch");
+        assert_eq!(sse.len(), 1);
+        // Every row is a hard failure (1e30), so the SSE is n * 1e30.
+        let want = n as f32 * 1e30f32;
+        assert!(
+            ((sse[0] - want) / want).abs() < 1e-5,
+            "expected a hard-failure SSE of {want}, got {}",
+            sse[0]
+        );
+    }
+
+    /// #121: a deep tree that needs lowering is still rejected statically
+    /// before any word is emitted (the lowering pass can add nodes).
+    #[test]
+    fn deep_lowered_tree_is_rejected_before_emission() {
+        // asinh expands into ~10 nodes; wrapping it 8 times raises the peak
+        // stack past the host gate.
+        let mut t = input(0);
+        for _ in 0..8 {
+            t = node(Op::Asinh, vec![t]);
+        }
+        if peak_stack(&lower(&t)) <= HOST_MAX_STACK {
+            // 8 nested expansions are not deep enough on this build; use a
+            // right-deep add chain, which grows one stack slot per level.
+            let mut deep = input(0);
+            for _ in 0..HOST_MAX_STACK {
+                deep = node(Op::Add, vec![input(1), deep]);
+            }
+            assert!(peak_stack(&deep) > HOST_MAX_STACK);
+            let mut pop = Population::new();
+            assert!(!pop.add(&deep));
+            assert_eq!(pop.unsupported(), 1);
+            return;
+        }
+        let mut pop = Population::new();
+        assert!(!pop.add(&t), "an over-deep lowered tree must not be emitted");
+        assert_eq!(pop.unsupported(), 1);
+        assert_eq!(pop.lowered(), 0, "nothing may be counted as emitted");
+    }
+
+    /// #121: the host stack constant must match `RC_MAX_STACK` in the kernel.
+    #[test]
+    fn stack_limits_match_the_kernel() {
+        let src = include_str!("cuda/eval.cu");
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("#define RC_MAX_STACK"))
+            .expect("the kernel defines RC_MAX_STACK");
+        let value: usize = line
+            .split_whitespace()
+            .nth(2)
+            .expect("a value")
+            .parse()
+            .expect("a number");
+        assert_eq!(value, RC_MAX_STACK);
+        assert!(HOST_MAX_STACK < RC_MAX_STACK);
     }
 
     /// #131: the Rust opcode constants must match the CUDA enum exactly.

@@ -366,6 +366,66 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
     );
 }
 
+/// #121: a generation that mixes native, lowered (`asinh`) and unsupported
+/// (`require`) candidates is deterministic, and the JSON reports the split and
+/// the CPU fallback time/workers for every GPU generation.
+#[cfg(feature = "cuda")]
+#[test]
+fn mixed_supported_and_unsupported_candidates_are_deterministic_and_reported() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let train = sample(48);
+    let test = sample(48);
+    let mut cfg = config(37, true);
+    cfg.generations = 12;
+    cfg.pop = 36;
+    cfg.islands = 2;
+    cfg.fit_iters = 0;
+    cfg.ops = vec![Op::Add, Op::Mul, Op::Asinh, Op::If, Op::Require];
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "the mixed batch changed the archive");
+    let gpu = a.gpu.expect("a GPU run reports gpu stats");
+    assert!(!gpu.generations.is_empty());
+    let mut saw_unsupported = false;
+    for s in &gpu.generations {
+        assert_eq!(s.native + s.lowered, s.programs);
+        assert_eq!(s.fallbacks, s.unsupported_programs);
+        saw_unsupported |= s.unsupported_programs > 0;
+        if s.fallback_seconds > 0.0 {
+            assert!(s.fallback_workers >= 1);
+        }
+    }
+    assert!(
+        saw_unsupported,
+        "the fixture must exercise the CPU fallback, got {:?}",
+        gpu.generations
+    );
+
+    // The CLI surface: the counters are real JSON keys, not just struct fields.
+    let (code, stdout, stderr) = run_cli(
+        &[
+            "--data", "-", "--target", "y", "--vars", "x",
+            "--generations", "3", "--pop", "24", "--seed", "37",
+            "--metric", "squared", "--ops", "add,mul,asinh,require", "--gpu", "--json",
+        ],
+        Some("1"),
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    for key in [
+        "\"native\":",
+        "\"supported\":",
+        "\"lowered\":",
+        "\"unsupported_programs\":",
+        "\"fallback_seconds\":",
+        "\"fallback_workers\":",
+        "\"totals\":",
+    ] {
+        assert!(stdout.contains(key), "missing {key} in json: {stdout}");
+    }
+}
+
 /// #119: the overlap pipeline must not change a single scored value. The
 /// synchronous path (`pipeline_depth = 0`) and the bounded overlap path are
 /// compared on the same seed; every archive member, its exact `f64` error bits

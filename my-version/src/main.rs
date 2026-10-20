@@ -401,6 +401,13 @@ SEARCH:
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
                              only effective with --gpu
+                             Programs with no device opcode (constraints,
+                             aggregates, blocks the lowerer cannot rewrite) are
+                             scored by a bounded CPU worker pool, never on the
+                             scoring thread; RCSR_CPU_FALLBACK_THREADS sets its
+                             size (default min(cores, 8)). --json reports each
+                             generation's native/lowered/unsupported counts and
+                             fallback seconds
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -3364,6 +3371,25 @@ fn main() {
                     }
                 );
                 eprintln!("# time: {}", timing.text());
+                // #121: the fallback counters are not only in --json; a text
+                // run says how much work the CPU pool carried.
+                if let Some(g) = &outcome.gpu {
+                    let programs: usize =
+                        g.generations.iter().map(|s| s.unsupported_programs).sum();
+                    if programs > 0 {
+                        let seconds: f64 =
+                            g.generations.iter().map(|s| s.fallback_seconds).sum();
+                        eprintln!(
+                            "# gpu: cpu fallback {} programs in {:.3}s on {} worker(s)",
+                            programs,
+                            seconds,
+                            g.generations
+                                .last()
+                                .map(|s| s.fallback_workers)
+                                .unwrap_or(0)
+                        );
+                    }
+                }
                 qd_text(outcome.qd.as_ref());
             }
             for r in &rows {
@@ -3893,15 +3919,44 @@ fn main() {
                                 .map(|(name, n)| format!("{}:{}", jstr(name), n))
                                 .collect();
                             format!(
-                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
                                 s.generation,
                                 s.programs,
+                                s.native,
+                                s.native,
+                                s.lowered,
                                 s.fallbacks,
+                                s.unsupported_programs,
+                                jnum(s.fallback_seconds),
+                                s.fallback_workers,
                                 ops.join(",")
                             )
                         })
                         .collect();
-                    format!("\"gpu\":{{\"generations\":[{}]}},", gens.join(","))
+                    let sum = |f: fn(&rcsr::search::GpuGenStats) -> usize| {
+                        g.generations.iter().map(f).sum::<usize>()
+                    };
+                    let fallback_seconds: f64 =
+                        g.generations.iter().map(|s| s.fallback_seconds).sum();
+                    let totals = format!(
+                        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
+                        sum(|s| s.programs),
+                        sum(|s| s.native),
+                        sum(|s| s.native),
+                        sum(|s| s.lowered),
+                        sum(|s| s.fallbacks),
+                        sum(|s| s.unsupported_programs),
+                        jnum(fallback_seconds),
+                        g.generations
+                            .last()
+                            .map(|s| s.fallback_workers)
+                            .unwrap_or(0)
+                    );
+                    format!(
+                        "\"gpu\":{{\"generations\":[{}],\"totals\":{}}},",
+                        gens.join(","),
+                        totals
+                    )
                 }
                 None => String::new(),
             };

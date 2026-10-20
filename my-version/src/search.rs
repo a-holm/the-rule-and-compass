@@ -33,7 +33,9 @@ use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
 use crate::units::Units;
-use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "cuda")]
+use std::collections::BTreeMap;
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub struct Config {
@@ -382,6 +384,8 @@ struct GpuSearch {
     pool: Option<crate::genome::GenomePool>,
     /// #131: per-generation opcode/fallback counts.
     stats: BTreeMap<usize, GpuGenStats>,
+    /// #121: persistent bounded CPU pool for unsupported programs.
+    fallback: Option<FallbackPool>,
 }
 
 #[cfg(feature = "cuda")]
@@ -415,6 +419,7 @@ impl GpuSearch {
                 n_rows,
                 pool: None,
                 stats: BTreeMap::new(),
+                fallback: Some(FallbackPool::new(fallback_workers(), fallback_workers())),
             }),
             None => Err(format!(
                 "no usable CUDA device ({})",
@@ -453,6 +458,7 @@ impl GpuSearch {
 
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        let mut lowered = 0usize;
         // #122: one fixed-width slot per genome. A tree whose postfix exceeds
         // the configured bound is scored on the CPU (the existing fallback), so
         // a wide seed can never truncate or corrupt the arena.
@@ -473,48 +479,97 @@ impl GpuSearch {
                 tag: j as u32,
                 ..Default::default()
             };
-            if crate::gpu::compile(&islands[i][j].tree, &mut buf)
-                && buf.len() <= width
-                && pool.push(&buf, meta)
-            {
-                slots.push((i, j));
-            } else {
-                on_cpu.push((i, j));
+            // #121: the same compile + exact-lowering + stack gate as
+            // `Population::add`, with a report of whether lowering rewrote it.
+            match crate::gpu::compile_with_report(&islands[i][j].tree, &mut buf) {
+                Some(was_lowered) if buf.len() <= width && pool.push(&buf, meta) => {
+                    if was_lowered {
+                        lowered += 1;
+                    }
+                    slots.push((i, j));
+                }
+                _ => on_cpu.push((i, j)),
             }
         }
 
-        // #131: record what the batch actually used. Several calls can belong
-        // to one generation (initial screening, refit, restarts); merge them.
+        // #131/#121: record what the batch actually used. Several calls can
+        // belong to one generation (initial screening, refit, restarts); merge
+        // them.
         let stats = self.stats.entry(generation).or_default();
         stats.generation = generation;
         stats.programs += pool.len();
+        stats.native += pool.len() - lowered;
+        stats.lowered += lowered;
         stats.fallbacks += on_cpu.len();
+        stats.unsupported_programs += on_cpu.len();
+        stats.fallback_workers = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool")
+            .workers();
 
+        // #121: hand the unsupported trees to the worker pool *before* the
+        // kernel launch, so CPU fallback and GPU evaluation overlap. The view
+        // must outlive the ticket; `finish` below waits for every chunk before
+        // it is dropped.
+        let cpu_view = if on_cpu.is_empty() {
+            None
+        } else {
+            Some(EvalSample::new(train, cfg))
+        };
+        let ticket = cpu_view.as_ref().map(|view| {
+            let jobs: Vec<(usize, Node)> = on_cpu
+                .iter()
+                .map(|&(i, j)| (0, islands[i][j].tree.clone()))
+                .collect();
+            self.fallback
+                .as_ref()
+                .expect("a GPU search owns its fallback pool")
+                .submit(jobs, view, cfg)
+        });
+
+        let mut gpu_error: Option<String> = None;
         if !pool.is_empty() {
             let (sse, ms) = self.ev.eval_pool(pool);
             if ms < 0.0 || sse.len() != pool.len() {
-                return Err("CUDA batch evaluation failed".to_string());
+                // Do not return before the submitted fallback batch is drained:
+                // a stale result would be read by the next call.
+                gpu_error = Some("CUDA batch evaluation failed".to_string());
+            } else {
+                let n = self.n_rows as f64;
+                for (&(i, j), &s) in slots.iter().zip(sse.iter()) {
+                    islands[i][j].error = if s.is_finite() {
+                        (s as f64) / n
+                    } else {
+                        f64::INFINITY
+                    };
+                }
+                // The generation is complete: the just-evaluated arena becomes
+                // the readable front, and the next generation writes into the
+                // other one.
+                pool.commit();
             }
-            let n = self.n_rows as f64;
-            for (&(i, j), &s) in slots.iter().zip(sse.iter()) {
-                islands[i][j].error = if s.is_finite() {
-                    (s as f64) / n
-                } else {
-                    f64::INFINITY
-                };
-            }
-            // The generation is complete: the just-evaluated arena becomes the
-            // readable front, and the next generation writes into the other one.
-            pool.commit();
         }
-        if !on_cpu.is_empty() {
-            // #27: the CPU fallback uses the same SoA view as the live search.
-            let train_view = EvalSample::new(train, cfg);
-            // #122: unsupported programs used to be scored serially after the
-            // kernel (the measured 2 s tail at P=10 000, 5 % `if`). Score them
-            // on a bounded CPU pool instead; each tree is independent, so the
-            // result is bit-identical to the serial walk.
-            rescore_pending_cpu(islands, &train_view, cfg);
+        if let Some(ticket) = ticket {
+            // #121: the persistent bounded pool scored these off this thread;
+            // errors are merged in candidate order, independent of completion
+            // order and worker count. The results are discarded on a failed
+            // batch, which the caller re-scores in full.
+            let (errors, seconds) = self
+                .fallback
+                .as_ref()
+                .expect("a GPU search owns its fallback pool")
+                .finish(ticket);
+            if gpu_error.is_none() {
+                for (&(i, j), &e) in on_cpu.iter().zip(errors.iter()) {
+                    islands[i][j].error = e;
+                }
+            }
+            let stats = self.stats.entry(generation).or_default();
+            stats.fallback_seconds += seconds;
+        }
+        if let Some(e) = gpu_error {
+            return Err(e);
         }
         Ok(())
     }
@@ -529,69 +584,262 @@ impl GpuSearch {
                 .collect(),
         }
     }
+
+    /// #121: move the fallback pool out before the evaluator is dropped, so a
+    /// failed CUDA batch can still use it for the CPU rescore.
+    fn take_fallback(&mut self) -> FallbackPool {
+        self.fallback
+            .take()
+            .expect("the fallback pool is taken at most once")
+    }
 }
 
 /// Score every still-pending (`error.is_nan()`) individual on the CPU.
 ///
-/// Work is split into contiguous slices of each island's population and scored
-/// on up to [`fallback_workers`] threads. A tree's error depends only on the
-/// tree and the sample, never on a neighbour or on completion order, so the
-/// parallel and serial paths return the same bits. Small batches stay serial:
-/// the thread round trip would cost more than it saves.
-fn rescore_pending_cpu(islands: &mut [Vec<Ind>], train: &EvalSample, cfg: &Config) {
-    rescore_pending_cpu_with(islands, train, cfg, fallback_workers());
-}
-
-/// The worker count is a parameter so the determinism test can compare one
-/// thread with many without touching the process environment.
-fn rescore_pending_cpu_with(
+/// A tree's error depends only on the tree and the sample, never on a neighbour
+/// or on completion order, so the parallel and serial paths return the same
+/// bits. The worker count is a function parameter in the unit tests so one and
+/// many threads can be compared without touching the process environment.
+#[cfg(feature = "cuda")]
+fn rescore_pending_cpu(
     islands: &mut [Vec<Ind>],
     train: &EvalSample,
     cfg: &Config,
-    workers: usize,
-) {
-    let pending: usize = islands
+    pool: &FallbackPool,
+) -> f64 {
+    let jobs: Vec<(usize, Node)> = islands
         .iter()
-        .map(|pop| pop.iter().filter(|ind| ind.error.is_nan()).count())
-        .sum();
-    if pending == 0 {
-        return;
+        .flat_map(|pop| {
+            pop.iter()
+                .filter(|ind| ind.error.is_nan())
+                .map(|ind| ind.tree.clone())
+        })
+        .enumerate()
+        .collect();
+    if jobs.is_empty() {
+        return 0.0;
     }
-    let workers = workers.min(pending);
-    if workers <= 1 {
-        for pop in islands.iter_mut() {
-            for ind in pop.iter_mut() {
-                if ind.error.is_nan() {
-                    ind.reeval(train, cfg); // #25
-                }
+    let (errors, seconds) = pool.score(jobs, train, cfg);
+    // Deterministic merge: `errors` is indexed by the (island, slot) order the
+    // jobs were collected in, independent of which worker finished first or
+    // how many workers there were. The tree and complexity were already set by
+    // `Ind::pending`; only the pending fitness is filled in, exactly as the
+    // serial `reeval` path would.
+    let mut k = 0;
+    for pop in islands.iter_mut() {
+        for ind in pop.iter_mut() {
+            if ind.error.is_nan() {
+                ind.error = errors[k];
+                k += 1;
             }
         }
-        return;
     }
-    let islands_n = islands.len().max(1);
-    let per_island = (workers / islands_n).max(1);
-    let blocks = expr::current_blocks();
-    std::thread::scope(|scope| {
-        for pop in islands.iter_mut() {
-            let per = pop.len().div_ceil(per_island).max(1);
-            for chunk in pop.chunks_mut(per) {
-                let blocks = blocks.clone();
-                scope.spawn(move || {
-                    // #10: custom blocks are thread-local, exactly as in an
-                    // island's evolution thread.
-                    expr::set_blocks(blocks);
-                    for ind in chunk.iter_mut() {
-                        if ind.error.is_nan() {
-                            ind.reeval(train, cfg); // #25
-                        }
-                    }
-                });
-            }
-        }
-    });
+    debug_assert_eq!(k, errors.len());
+    seconds
 }
 
-/// #122: size of the bounded CPU fallback pool.
+/// #121: a persistent, bounded CPU fallback pool.
+///
+/// Unsupported programs used to be scored serially on the calling (broker)
+/// thread after every GPU batch; one `if` stalled the whole generation. This
+/// pool is created once per GPU run, never evaluates on the calling thread, and
+/// keeps at most `workers` chunks queued (a `sync_channel`), so a burst cannot
+/// grow memory without bound.
+///
+/// Jobs carry owned, simplified trees. Results come back tagged with their
+/// absolute index and the caller merges them in index order, so the archive and
+/// every error bit are identical to the serial walk for any worker count.
+#[cfg(feature = "cuda")]
+struct FallbackPool {
+    tx: std::sync::mpsc::SyncSender<FallbackChunk>,
+    done: std::sync::mpsc::Receiver<FallbackResult>,
+    workers: usize,
+    queue: usize,
+    /// Number of worker threads that have executed at least one chunk. Used by
+    /// the tests to prove the scoring ran on the pool, not the caller.
+    busy: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Borrowed scoring context for one [`FallbackPool::score`] call. The raw
+/// pointers are only dereferenced by workers between `score` sending the chunks
+/// and receiving the last result; `score` blocks on that result before the
+/// borrow ends, so they cannot outlive `train`/`cfg`.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct ScoreContext(*const EvalSample<'static>, *const Config);
+
+// SAFETY: the pointees are read-only for the duration of the call and the
+// caller joins every chunk before returning; see the type comment.
+#[cfg(feature = "cuda")]
+unsafe impl Send for ScoreContext {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for ScoreContext {}
+
+#[cfg(feature = "cuda")]
+struct FallbackChunk {
+    start: usize,
+    jobs: Vec<(usize, Node)>,
+    ctx: ScoreContext,
+    blocks: Vec<expr::Block>,
+}
+
+#[cfg(feature = "cuda")]
+struct FallbackResult {
+    start: usize,
+    errors: Vec<f64>,
+}
+
+#[cfg(feature = "cuda")]
+impl FallbackPool {
+    /// Spawn `workers` named worker threads. `queue` bounds the number of
+    /// chunks waiting in the channel; with `queue == workers` at most
+    /// `2 * workers` chunks are in flight (one running per worker, one queued).
+    fn new(workers: usize, queue: usize) -> Self {
+        let workers = workers.max(1);
+        let queue = queue.max(1);
+        let (tx, rx) = std::sync::mpsc::sync_channel::<FallbackChunk>(queue);
+        let (done_tx, done) = std::sync::mpsc::channel::<FallbackResult>();
+        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+        let busy = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for i in 0..workers {
+            let rx = std::sync::Arc::clone(&rx);
+            let done_tx = done_tx.clone();
+            let busy = std::sync::Arc::clone(&busy);
+            std::thread::Builder::new()
+                .name(format!("rcsr-fallback-{i}"))
+                .spawn(move || {
+                    let mut counted = false;
+                    loop {
+                        let chunk = {
+                            let guard = rx.lock().expect("the fallback queue is not poisoned");
+                            guard.recv()
+                        };
+                        let Ok(chunk) = chunk else { break };
+                        if !counted {
+                            busy.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            counted = true;
+                        }
+                        // #10: custom blocks are thread-local.
+                        expr::set_blocks(chunk.blocks);
+                        // SAFETY: the context borrows `train`/`cfg` from
+                        // `score`, which is blocked waiting for this result.
+                        let (train, cfg) = unsafe { (&*chunk.ctx.0, &*chunk.ctx.1) };
+                        let mut errors = Vec::with_capacity(chunk.jobs.len());
+                        for (_, tree) in &chunk.jobs {
+                            errors.push(score_tree(tree, train, cfg));
+                        }
+                        if done_tx
+                            .send(FallbackResult {
+                                start: chunk.start,
+                                errors,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+                .expect("spawn a CPU fallback worker");
+        }
+        FallbackPool {
+            tx,
+            done,
+            workers,
+            queue,
+            busy,
+        }
+    }
+
+    /// Send `jobs` to the worker pool and return a ticket. Sending blocks only
+    /// while the bounded channel is full, so this returns as soon as every
+    /// chunk is queued or running; [`FallbackPool::finish`] waits for the
+    /// results. Splitting submit from finish lets the caller overlap the CPU
+    /// fallback with the GPU kernel instead of paying a serial tail.
+    fn submit(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> FallbackTicket {
+        debug_assert!(self.queue >= 1, "the fallback queue is bounded but non-empty");
+        debug_assert!(
+            self.busy.load(std::sync::atomic::Ordering::Relaxed) <= self.workers,
+            "more worker threads ran than the pool owns"
+        );
+        let total = jobs.len();
+        let started = std::time::Instant::now();
+        // Contiguous, fixed-size chunks: ~4 chunks per worker keeps the queue
+        // fed without making the channel the bottleneck.
+        let chunk_len = total.div_ceil(self.workers * 4).max(1);
+        let blocks = expr::current_blocks();
+        let ctx = ScoreContext(
+            train as *const EvalSample as *const EvalSample<'static>,
+            cfg as *const Config,
+        );
+        let mut chunks = 0usize;
+        let mut pending = jobs.into_iter().peekable();
+        while pending.peek().is_some() {
+            let start = chunks;
+            let jobs: Vec<(usize, Node)> = pending.by_ref().take(chunk_len).collect();
+            self.tx
+                .send(FallbackChunk {
+                    start,
+                    jobs,
+                    ctx,
+                    blocks: blocks.clone(),
+                })
+                .expect("the fallback pool is alive");
+            chunks += 1;
+        }
+        FallbackTicket {
+            chunks,
+            chunk_len,
+            total,
+            started,
+        }
+    }
+
+    /// Wait for a submitted batch and return errors in job order plus the
+    /// wall-clock seconds since submission.
+    fn finish(&self, ticket: FallbackTicket) -> (Vec<f64>, f64) {
+        let mut out = vec![f64::NAN; ticket.total];
+        let mut received = 0;
+        while received < ticket.chunks {
+            let result = self
+                .done
+                .recv()
+                .expect("the fallback pool returned a result");
+            for (offset, error) in result.errors.into_iter().enumerate() {
+                // `start` is the chunk ordinal; the absolute job index is
+                // recomputed from the chunk's own position in the job list.
+                let idx = result.start * ticket.chunk_len + offset;
+                if idx < ticket.total {
+                    out[idx] = error;
+                }
+            }
+            received += 1;
+        }
+        (out, ticket.started.elapsed().as_secs_f64())
+    }
+
+    /// Score `jobs` on the pool and return errors in the same order, plus the
+    /// wall-clock fallback seconds.
+    fn score(&self, jobs: Vec<(usize, Node)>, train: &EvalSample, cfg: &Config) -> (Vec<f64>, f64) {
+        let ticket = self.submit(jobs, train, cfg);
+        self.finish(ticket)
+    }
+
+    fn workers(&self) -> usize {
+        self.workers
+    }
+}
+
+/// #121: a submitted fallback batch, waiting to be collected.
+#[cfg(feature = "cuda")]
+struct FallbackTicket {
+    chunks: usize,
+    chunk_len: usize,
+    total: usize,
+    started: std::time::Instant,
+}
+
+/// #121: size of the bounded CPU fallback pool.
+#[cfg(feature = "cuda")]
 fn fallback_workers() -> usize {
     const MAX: usize = 8;
     if let Ok(v) = std::env::var("RCSR_CPU_FALLBACK_THREADS") {
@@ -635,11 +883,13 @@ fn score_generation(
             // #141: the backend report must record the runtime fallback, not
             // just the startup choice.
             *backend_reason = Some(e);
+            // #121: keep the fallback pool alive for the rescore below.
+            let fallback = g.take_fallback();
             *gpu = None;
             // #27: re-scoring the pending batch goes through the SoA view.
             let train_view = EvalSample::new(train, cfg);
-            // #122: the same bounded CPU pool as the per-batch fallback.
-            rescore_pending_cpu(islands, &train_view, cfg);
+            // #121: the same bounded worker pool as the per-batch fallback.
+            rescore_pending_cpu(islands, &train_view, cfg, &fallback);
             false
         }
     }
@@ -656,6 +906,7 @@ fn score_pipeline_batch(
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<f64>>],
     n_rows: usize,
+    generation: usize,
 ) -> Result<(), String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
@@ -667,6 +918,15 @@ fn score_pipeline_batch(
             slots.push((i, j));
         }
     }
+    // #121: the overlap path uses the same lowering and reports the same
+    // supported/lowered/unsupported split as the synchronous path.
+    let stats = g.stats.entry(generation).or_default();
+    stats.generation = generation;
+    stats.programs += pop.len();
+    stats.native += pop.native();
+    stats.lowered += pop.lowered();
+    stats.fallbacks += pop.unsupported();
+    stats.unsupported_programs += pop.unsupported();
     if pop.is_empty() {
         return Ok(());
     }
@@ -1431,8 +1691,18 @@ pub struct GpuGenStats {
     pub opcodes: Vec<(String, usize)>,
     /// Programs compiled into the batch.
     pub programs: usize,
+    /// #121: compiled programs the kernel accepted verbatim.
+    pub native: usize,
+    /// #121: compiled programs that needed the exact lowering pass.
+    pub lowered: usize,
     /// Candidates sent to the CPU fallback in the same batch.
     pub fallbacks: usize,
+    /// #121: alias of `fallbacks`, matching the issue's JSON name.
+    pub unsupported_programs: usize,
+    /// #121: wall-clock seconds the CPU fallback pool spent in this batch.
+    pub fallback_seconds: f64,
+    /// #121: worker threads in the fallback pool.
+    pub fallback_workers: usize,
 }
 
 /// #131: aggregate GPU usage for a run.
@@ -2119,6 +2389,7 @@ fn run_search(
                             &mut gpu,
                             &mut pipeline_results,
                             gen_train.len(),
+                            gen,
                         )
                     });
                 }
@@ -2157,15 +2428,17 @@ fn run_search(
                                 eprintln!("# gpu: unavailable ({})", e);
                             }
                         }
+                        // #121: keep the pool for the rescore, then drop the
+                        // evaluator; a failed batch also scores via the pool.
+                        let fallback = gpu
+                            .as_mut()
+                            .map(|g| g.take_fallback())
+                            .unwrap_or_else(|| {
+                                FallbackPool::new(fallback_workers(), fallback_workers())
+                            });
                         gpu = None;
                         let train_view = EvalSample::new(train, cfg);
-                        for pop in islands.iter_mut() {
-                            for ind in pop.iter_mut() {
-                                if ind.error.is_nan() {
-                                    ind.reeval(&train_view, cfg); // #25
-                                }
-                            }
-                        }
+                        rescore_pending_cpu(&mut islands, &train_view, cfg, &fallback);
                         defer_gpu = false;
                     }
                 } else if !screened {
@@ -2967,9 +3240,10 @@ mod tests {
         );
     }
 
-    /// #122: the bounded CPU fallback must be a pure parallelisation, not a
-    /// change of result. One thread and four threads score the same unsupported
-    /// (`if`) and supported trees to the same bits.
+    /// #122/#121: the bounded CPU fallback must be a pure parallelisation, not
+    /// a change of result. One thread and four threads score the same
+    /// unsupported (`if`) and supported trees to the same bits.
+    #[cfg(feature = "cuda")]
     #[test]
     fn cpu_fallback_is_identical_for_one_and_many_threads() {
         let s = sample();
@@ -3007,13 +3281,91 @@ mod tests {
         };
         let mut one = make();
         let mut many = make();
-        rescore_pending_cpu_with(&mut one, &view, &cfg, 1);
-        rescore_pending_cpu_with(&mut many, &view, &cfg, 4);
+        let single = FallbackPool::new(1, 1);
+        let quad = FallbackPool::new(4, 4);
+        rescore_pending_cpu(&mut one, &view, &cfg, &single);
+        rescore_pending_cpu(&mut many, &view, &cfg, &quad);
         for (a, b) in one.iter().flatten().zip(many.iter().flatten()) {
             assert_eq!(a.error.to_bits(), b.error.to_bits());
             assert_eq!(a.complexity.to_bits(), b.complexity.to_bits());
             assert!(expr::same(&a.tree, &b.tree));
         }
+        // The serial reference: the same trees scored in the calling thread.
+        for (k, tree) in trees.iter().enumerate() {
+            let serial = score_tree(tree, &view, &cfg);
+            assert_eq!(
+                one[k / 4][k % 4].error.to_bits(),
+                serial.to_bits(),
+                "worker result differs from the serial walk at job {k}"
+            );
+        }
         assert!(one[0][0].error.is_finite(), "the unsupported tree was scored");
+        // The work ran on the pool's threads, not the caller.
+        assert!(
+            single.busy.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the fallback pool never ran a job"
+        );
+        assert!(
+            quad.busy.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the four-worker pool never ran a job"
+        );
+    }
+
+    /// #121: the fallback queue is bounded by construction and the merge order
+    /// does not depend on which worker finished first. Also checks that already
+    /// scored individuals are skipped without shifting the pending results.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fallback_pool_is_bounded_and_merges_in_candidate_order() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        // 97 distinct trees: `sin(k*x)` scores differently for every k.
+        let trees: Vec<Node> = (0..97)
+            .map(|k| node(Op::Sin, vec![node(Op::Mul, vec![constant(k as f64), input(0)])]))
+            .collect();
+        let pool = FallbackPool::new(2, 2);
+        assert_eq!(pool.workers(), 2);
+        assert_eq!(pool.queue, 2, "the queue holds at most one chunk per worker");
+
+        // Islands with every third individual already scored, so the pending
+        // set is non-contiguous and a naive index would drift.
+        let mut islands: Vec<Vec<Ind>> = trees
+            .chunks(17)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let mut ind = Ind::pending(t.clone(), &cfg);
+                        if i % 3 == 1 {
+                            ind.error = -1.0;
+                        }
+                        ind
+                    })
+                    .collect()
+            })
+            .collect();
+        rescore_pending_cpu(&mut islands, &view, &cfg, &pool);
+        let mut pending = 0usize;
+        for pop in &islands {
+            for ind in pop {
+                if ind.error == -1.0 {
+                    continue;
+                }
+                let want = score_tree(&ind.tree, &view, &cfg);
+                assert_eq!(
+                    ind.error.to_bits(),
+                    want.to_bits(),
+                    "the merged result shifted relative to its candidate"
+                );
+                pending += 1;
+            }
+        }
+        assert!(pending > 60, "the fixture must actually exercise the pool");
+        assert!(
+            pool.busy.load(std::sync::atomic::Ordering::Relaxed) <= 2,
+            "the pool ran more threads than it owns"
+        );
     }
 }
