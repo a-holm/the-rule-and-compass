@@ -847,38 +847,85 @@ pub fn csv_shape_path(path: &str) -> Result<CsvShape, String> {
 /// low-cardinality numeric or text column keeps alongside it.
 pub const CSV_TABLE_BYTES_PER_CELL: u64 = 12;
 
-/// Per-row preparation cost: `Vec` headers and selector bookkeeping for the
-/// row-major `cells`, train and test copies.
-pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 72;
+/// Per-row preparation cost: one row header per sample row, selector
+/// bookkeeping, and the per-row copies the search and diagnostics keep.
+///
+/// This was 72 B before the #112 calibration. The 1M-row x 6-column run peaked
+/// at 552 MiB while the old model predicted 378 MiB, so the fixed term was
+/// raised to 240 B/row. At that value both the 6-column and 90-column measured
+/// peaks are covered without exceeding 1.5x (see `docs/data-format.md`).
+pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 240;
 
 /// Per-row, per-used-column preparation cost: one `f64` in each of the
 /// `cells`, train and test copies, plus each row's `Vec<f64>` header.
 pub const CSV_PREP_BYTES_PER_USED_CELL: u64 = 24;
 
-/// Estimated peak resident bytes for loading and preparing a CSV (issue #112).
+/// One measured memory estimate and its terms (issue #112). Reporting the
+/// basis, rather than only the total, lets the preparation block show that the
+/// guard used `rows x columns` and not a multiple of the file size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvEstimate {
+    pub rows: usize,
+    pub cols: usize,
+    /// Columns used by the search (`--vars` + targets + weight); `cols` when no
+    /// projection was supplied.
+    pub used_cols: usize,
+    pub text_bytes: u64,
+    pub table_bytes: u64,
+    pub prep_bytes: u64,
+    /// The 25 % allocator slack included in `total_bytes`.
+    pub slack_bytes: u64,
+    pub total_bytes: u64,
+}
+
+impl CsvEstimate {
+    /// Drop the resident text term. A streaming caller (issue #126) uses this;
+    /// the terms stay the same so calibration still applies.
+    pub fn without_text(mut self) -> Self {
+        let base = self
+            .table_bytes
+            .saturating_add(self.prep_bytes);
+        self.text_bytes = 0;
+        self.total_bytes = base.saturating_mul(5) / 4;
+        self.slack_bytes = self.total_bytes.saturating_sub(base);
+        self
+    }
+}
+
+/// Estimated peak resident bytes for loading and preparing a CSV (issue #112),
+/// with the terms exposed.
 ///
-/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus a
-/// per-row preparation overhead and 25 % allocator slack. `used_cols` is the
-/// search's projection (variables plus targets); pass `0` when it is not known
-/// yet and the whole header width is used. This function keeps the text term
-/// for callers that measured a resident buffer with [`csv_shape`]; the CLI
-/// streams and calls [`estimate_csv_stream_bytes`] instead.
-pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus
+/// `rows x 240 B` of fixed preparation overhead and 25 % allocator slack.
+/// `used_cols` is the search's projection (variables plus targets); pass `0`
+/// when it is not known yet and the whole header width is used. The text term
+/// matters for a caller that holds the whole file, such as the current
+/// `read_to_string` path; a streaming caller uses [`CsvEstimate::without_text`].
+pub fn csv_estimate(shape: CsvShape, used_cols: usize) -> CsvEstimate {
     let (text, table, rows) = csv_terms(shape);
-    let cols = shape.cols.max(1) as u64;
+    let cols = shape.cols.max(1);
     let used = if used_cols == 0 {
         cols
     } else {
-        (used_cols as u64).min(cols)
+        used_cols.min(cols)
     };
     let prep = rows.saturating_mul(
-        used.saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
+        (used as u64)
+            .saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
             .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
     );
-    text.saturating_add(table)
-        .saturating_add(prep)
-        .saturating_mul(5)
-        / 4
+    let base = text.saturating_add(table).saturating_add(prep);
+    let total = base.saturating_mul(5) / 4;
+    CsvEstimate {
+        rows: shape.rows,
+        cols: shape.cols,
+        used_cols: used,
+        text_bytes: text,
+        table_bytes: table,
+        prep_bytes: prep,
+        slack_bytes: total.saturating_sub(base),
+        total_bytes: total,
+    }
 }
 
 /// Estimated peak resident bytes for the **streaming** CSV path (issue #126).
@@ -911,9 +958,30 @@ pub fn estimate_csv_load_stream_bytes(shape: CsvShape) -> u64 {
 
 /// Estimated peak resident bytes for reading a CSV without preparing a search
 /// sample (`rcsr import`): the text plus the resident table.
-pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+pub fn csv_load_estimate(shape: CsvShape) -> CsvEstimate {
     let (text, table, _) = csv_terms(shape);
-    text.saturating_add(table).saturating_mul(5) / 4
+    let base = text.saturating_add(table);
+    let total = base.saturating_mul(5) / 4;
+    CsvEstimate {
+        rows: shape.rows,
+        cols: shape.cols,
+        used_cols: shape.cols,
+        text_bytes: text,
+        table_bytes: table,
+        prep_bytes: 0,
+        slack_bytes: total.saturating_sub(base),
+        total_bytes: total,
+    }
+}
+
+/// [`csv_estimate`]'s total, kept as the concise guard entry point.
+pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    csv_estimate(shape, used_cols).total_bytes
+}
+
+/// [`csv_load_estimate`]'s total, kept as the concise import guard entry point.
+pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+    csv_load_estimate(shape).total_bytes
 }
 
 /// `(text, table, rows)`; `text` is the whole-file buffer, so an unmeasured
@@ -1760,6 +1828,9 @@ pub struct PrepReport {
     pub time_non_monotonic: usize,
     /// Numeric rows rescaled from ms/us/ns to seconds.
     pub time_converted: usize,
+    /// #112: the memory guard's estimate for this CSV and its basis. `None`
+    /// for a `.rcsb` store or when the source did not go through the CSV guard.
+    pub memory_estimate: Option<CsvEstimate>,
 }
 
 impl Default for PrepReport {
@@ -1780,6 +1851,7 @@ impl Default for PrepReport {
             time_duplicates: 0,
             time_non_monotonic: 0,
             time_converted: 0,
+            memory_estimate: None,
         }
     }
 }
@@ -1802,6 +1874,20 @@ impl PrepReport {
     /// the raw option values that are not part of the counts.
     pub fn text_lines(&self, outlier_iqr: Option<f64>, smooth: usize) -> Vec<String> {
         let mut out = Vec::new();
+        if let Some(m) = self.memory_estimate {
+            out.push(format!(
+                "# preparation: memory estimate {} B from {} rows x {} columns ({} used); \
+                 basis: text {} B + table {} B + preparation {} B + slack {} B",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.text_bytes,
+                m.table_bytes,
+                m.prep_bytes,
+                m.slack_bytes
+            ));
+        }
         if self.fill != "none" || self.rows_dropped_missing > 0 {
             out.push(format!(
                 "# preparation: fill={} rows_filled={} rows_dropped_missing={}",
@@ -1875,8 +1961,24 @@ impl PrepReport {
 
     /// The `preparation` object shared by `--json` and `--ndjson`.
     pub fn json(&self) -> String {
+        let memory = match self.memory_estimate {
+            Some(m) => format!(
+                "{{\"estimate_bytes\":{},\"rows\":{},\"columns\":{},\"used_columns\":{},\
+                 \"text_bytes\":{},\"table_bytes\":{},\"preparation_bytes\":{},\
+                 \"slack_bytes\":{},\"basis\":\"rows x columns\"}}",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.text_bytes,
+                m.table_bytes,
+                m.prep_bytes,
+                m.slack_bytes
+            ),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{},\"memory\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
@@ -1891,7 +1993,8 @@ impl PrepReport {
             self.time_rows,
             self.time_duplicates,
             self.time_non_monotonic,
-            self.time_converted
+            self.time_converted,
+            memory
         )
     }
 }
@@ -2799,6 +2902,7 @@ pub fn prepare_full_targets_weighted_with(
             time_duplicates: hazards.duplicates,
             time_non_monotonic: hazards.non_monotonic,
             time_converted: hazards.converted,
+            memory_estimate: None,
         },
     })
 }

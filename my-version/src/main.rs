@@ -108,9 +108,11 @@ INPUT:
                              512MB, 2GiB). Exit 3 with the rows x columns
                              estimate and an actionable message instead of
                              SIGABRT/SIGKILL. The CSV reader streams, so the
-                             file text is not resident. A `.rcsb` store that
-                             does not fit is searched from a hash sample with
-                             bounded RSS; a CSV is refused before parsing.
+                             file text is not resident. The calibrated estimate
+                             and its rows x columns basis are reported in the
+                             preparation block. A `.rcsb` store that does not
+                             fit is searched from a hash sample with bounded
+                             RSS; a CSV is refused before parsing.
   --force                    override --max-memory and try the resident path
                              anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
@@ -2063,6 +2065,7 @@ fn main() {
         vars.len() + target_names.len() + usize::from(weight_name.is_some())
     };
     let mut out_of_core_note: Option<String> = None;
+    let mut csv_shape: Option<data::CsvShape> = None;
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -2597,6 +2600,16 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
 
+    // #112: report the guard's estimate and its rows x columns basis in the
+    // normal preparation block, not only when the guard refuses the file. Use
+    // the resolved projection (after --dtype/lag expansion) here.
+    if let Some(shape) = csv_shape {
+        let used = vars.len()
+            + target_refs.len()
+            + usize::from(weight_col.is_some());
+        prepared.prep.memory_estimate = Some(data::csv_estimate(shape, used));
+    }
+
     // #113: a binary metric needs a binary target. Reject a multi-valued target
     // here, before any search, instead of silently merging its classes at the
     // midpoint and reporting a number that means something else.
@@ -2943,7 +2956,10 @@ fn main() {
             prepared.report.gap,
             folds_json.join(",")
         );
-        if prepared.prep.active() || !prepared.prep.time_unit.is_empty() {
+        if prepared.prep.active()
+            || !prepared.prep.time_unit.is_empty()
+            || prepared.prep.memory_estimate.is_some()
+        {
             let obj = prepared.prep.json();
             let inner = obj.trim_matches(|c| c == '{' || c == '}');
             println!("{{\"event\":\"preparation\",{}}}", inner);
@@ -6405,32 +6421,24 @@ fn refuse_for_memory(
         shape.cols,
         human_bytes(estimate)
     );
-    let table_bytes = (shape.rows as u64)
-        .saturating_mul(shape.cols as u64)
-        .saturating_mul(data::CSV_TABLE_BYTES_PER_CELL);
-    match prep_cols {
-        Some(projected) => {
-            let used = if projected == 0 {
-                shape.cols
-            } else {
-                projected.min(shape.cols)
-            };
-            eprintln!(
-                "  estimate basis: text {} + table {} cells (12 B/cell) + preparation {} used \
-                 columns (24 B/cell, 72 B/row)",
-                human_bytes(shape.bytes),
-                human_bytes(table_bytes),
-                used
-            );
-        }
-        None => {
-            eprintln!(
-                "  estimate basis: text {} + table {} cells (12 B/cell), no search preparation",
-                human_bytes(shape.bytes),
-                human_bytes(table_bytes)
-            );
-        }
-    }
+    let breakdown = match prep_cols {
+        Some(projected) => data::csv_estimate(shape, projected),
+        None => data::csv_load_estimate(shape),
+    };
+    eprintln!(
+        "  estimate basis: {} rows x {} columns ({} used); text {} + table {} \
+         ({} B/cell) + preparation {} ({} B/used cell, {} B/row) + slack {}",
+        breakdown.rows,
+        breakdown.cols,
+        breakdown.used_cols,
+        human_bytes(breakdown.text_bytes),
+        human_bytes(breakdown.table_bytes),
+        data::CSV_TABLE_BYTES_PER_CELL,
+        human_bytes(breakdown.prep_bytes),
+        data::CSV_PREP_BYTES_PER_USED_CELL,
+        data::CSV_PREP_FIXED_BYTES_PER_ROW,
+        human_bytes(breakdown.slack_bytes)
+    );
     eprintln!(
         "  memory budget is {} ({} bytes; set it with --max-memory)",
         human_bytes(limit),
@@ -6769,7 +6777,8 @@ OPTIONS:
   --time <column>          store this column as exact i64 timestamps
                            (default: the first integral, time-like column)
   --skip-malformed         drop ragged rows instead of refusing the input
-  --max-memory <size>      refuse before parsing when the streamed rows x
+  --max-memory <size>      refuse before parsing when the streamed and
+                           calibrated rows x
                            columns estimate exceeds this (not 33x file size)
   --force                  override --max-memory
   --quiet                  do not print the summary
