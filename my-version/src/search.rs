@@ -28,7 +28,7 @@ use crate::pareto::{Archive, Sol};
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
 // #120: the opt-in quality-diversity archive.
-use crate::qd::{QdArchive, QdReport};
+use crate::qd::{self, QdArchive, QdReport};
 use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
@@ -104,6 +104,17 @@ pub struct Config {
     pub qd_bins: usize,
     /// #120: maximum local Pareto front per descriptor cell.
     pub qd_cell_cap: usize,
+    /// #120: use a CVT-MAP-Elites archive (K centroids) instead of the
+    /// rectangular grid. `qd_bins` is then the number of centroids.
+    pub qd_cvt: bool,
+    /// #120: feed the archive back into parent selection, migration and
+    /// restarts (UCB1, stratified cells, least-occupied reseeding). Off means
+    /// the layer is passive and the trajectory is unchanged.
+    pub qd_policy: bool,
+    /// #120 control: `0` is the UCB1 mix, `1` selects cells uniformly and `2`
+    /// hashes descriptors to random cells. Only the first is the proposed
+    /// method; the other two are equal-budget controls.
+    pub qd_control: u8,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
@@ -168,6 +179,9 @@ impl Default for Config {
             require_dimensions: false,
             qd_bins: 0, // #120: off
             qd_cell_cap: 4,
+            qd_cvt: false,
+            qd_policy: false,
+            qd_control: 0,
             progress: None,
             simd: true, // #27
             // #141: the GPU is the default backend when the binary is built
@@ -221,6 +235,9 @@ impl Config {
         compare!(front_parents, "front_parents"); // #76
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
+        compare!(qd_cvt, "qd_cvt"); // #120
+        compare!(qd_policy, "qd_policy"); // #120
+        compare!(qd_control, "qd_control"); // #120
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -1537,6 +1554,39 @@ fn pick_parent<'a>(island: &'a [Ind], front: &'a [Sol], rng: &mut Mt, p: f64) ->
     }
 }
 
+/// #120: one parent under the QD policy or the original #76 draw.
+///
+/// The QD branch reads the archive snapshot only; it never mutates the archive
+/// inside a generation. `front_p` keeps the 5% global-front draw that the
+/// issue reserves for the diversity policy.
+fn pick_parent_policy(
+    island: &[Ind],
+    front: &[Sol],
+    qd: Option<&QdArchive>,
+    rng: &mut Mt,
+    front_p: f64,
+    qd_policy: bool,
+    qd_control: u8,
+) -> Node {
+    if qd_policy {
+        // The issue reserves 5 % of QD parent draws for the global front.
+        if let Some(tree) = front_parent(front, rng, 0.05) {
+            return tree.clone();
+        }
+        let parent = qd.and_then(|q| {
+            if qd_control == 1 {
+                q.select_parent_uniform(rng)
+            } else {
+                q.select_parent(rng)
+            }
+        });
+        if let Some(tree) = parent {
+            return tree.clone();
+        }
+    }
+    pick_parent(island, front, rng, front_p).clone()
+}
+
 // #77: seed the per-generation duplicate set with the elite (`next`) and every
 // parent (`isl`), so a child that is an unchanged parent is rejected before the
 // expensive fit and score.
@@ -1585,6 +1635,10 @@ fn evolve_island(
     // still run in parallel. `front_p == 0.0` makes it a no-op.
     front: &[Sol],
     front_p: f64,
+    // #120: the QD archive at the start of this generation (read-only).
+    qd: Option<&QdArchive>,
+    qd_policy: bool,
+    qd_control: u8,
     // #119: when present, every pending candidate is also offered to the
     // bounded GPU queue as soon as it is fitted, so scoring overlaps the rest
     // of this generation. `None` is the synchronous path exactly.
@@ -1622,10 +1676,13 @@ fn evolve_island(
 
     while next.len() < pop && attempts < max_attempts {
         attempts += 1;
-        let p1 = pick_parent(isl, front, rng, front_p); // #76
-        let mut child = p1.clone();
+        // #120: with the policy on, a UCB/stratified cell elite supplies most
+        // parents; 5% still come from the global Pareto front. With the policy
+        // off this is exactly the #76 draw.
+        let p1 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
+        let mut child = p1;
         if rng.bool(0.5) {
-            let parent2 = pick_parent(isl, front, rng, front_p).clone(); // #76
+            let parent2 = pick_parent_policy(isl, front, qd, rng, front_p, qd_policy, qd_control);
             crossover_with(&mut child, &parent2, rng, Some(aggs));
         }
         mutate_with(&mut child, rng, nvars, &cfg.ops, Some(aggs));
@@ -1689,6 +1746,45 @@ fn evolve_island(
             Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         });
         offer(&sink, slot, &next[slot]); // #119
+    }
+
+    // #120: a small niche-immigrant stream. Without it mutation keeps the
+    // island in the same descriptor region even when parents are drawn from
+    // the archive. The immigrants are aimed at the least-visited cell and are
+    // scored exactly like any other offspring (the GPU batch defers them too).
+    if qd_policy {
+        if let Some(target) = qd.and_then(|q| q.least_occupied_descriptor()) {
+            let immigrants = (pop / 10).max(1).min(pop);
+            for k in 0..immigrants {
+                let mut t = random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
+                let mut best_score = {
+                    let d = qd::descriptor(&t, train.sample);
+                    (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2)
+                };
+                for _ in 0..3 {
+                    let cand = random_tree_with(rng, nvars, &cfg.ops, cfg.init_depth, Some(aggs));
+                    let d = qd::descriptor(&cand, train.sample);
+                    let score = (d.usage - target.usage).powi(2) + (d.skew - target.skew).powi(2);
+                    if score < best_score {
+                        t = cand;
+                        best_score = score;
+                    }
+                }
+                let mut tree = expr::simplify(&t);
+                let mut fitted = None;
+                if cfg.fit_iters > 0 && !train.sample.is_multi() {
+                    fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample);
+                    tree = expr::simplify(&tree);
+                }
+                let slot = pop - immigrants + k;
+                next[slot] = if defer_gpu {
+                    Ind::pending(tree, cfg)
+                } else {
+                    Ind::evaluated_fitted(tree, fitted, train, cfg)
+                };
+                offer(&sink, slot, &next[slot]);
+            }
+        }
     }
 
     *isl = next;
@@ -2243,9 +2339,19 @@ fn run_search(
                 } else {
                     ind.clone()
                 };
-                for pop in islands.iter_mut() {
-                    if k < pop.len() {
-                        pop[k] = in_pop.clone();
+                if cfg.qd_policy {
+                    // #120: a seed occupies one niche rather than being cloned
+                    // into every island. The QD layer later records it at its
+                    // own descriptor.
+                    let ii = k % islands.len();
+                    if k < islands[ii].len() {
+                        islands[ii][k] = in_pop;
+                    }
+                } else {
+                    for pop in islands.iter_mut() {
+                        if k < pop.len() {
+                            pop[k] = in_pop.clone();
+                        }
                     }
                 }
             }
@@ -2272,7 +2378,13 @@ fn run_search(
     // never feeds back into selection, so turning it on cannot change the
     // trajectory or the Pareto front.
     let mut qd_archive = if cfg.qd_bins > 0 {
-        Some(QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap))
+        Some(if cfg.qd_control == 2 {
+            QdArchive::new_random(cfg.qd_bins, cfg.qd_cell_cap)
+        } else if cfg.qd_cvt {
+            QdArchive::new_cvt(cfg.qd_bins, cfg.qd_cell_cap)
+        } else {
+            QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
+        })
     } else {
         None
     };
@@ -2347,6 +2459,9 @@ fn run_search(
             } else {
                 0.0
             };
+            // #120: the archive as of the previous generation, borrowed exactly
+            // like the Pareto front. It is updated only after the barrier.
+            let qd_snapshot = qd_archive.as_ref();
             // #119: overlap the GPU with the rest of this generation. The CPU
             // threads keep generating and fitting; the main thread drains a
             // bounded queue and scores batches. Selection still waits for every
@@ -2409,6 +2524,9 @@ fn run_search(
                                 defer_gpu && !screened,
                                 front,   // #76
                                 front_p, // #76
+                                qd_snapshot, // #120
+                                cfg.qd_policy, // #120
+                                cfg.qd_control, // #120 control
                                 sender.as_ref().map(|t| (t, i)), // #119
                             ) // #85
                         })
@@ -2588,11 +2706,47 @@ fn run_search(
                 for ii in 0..islands.len() {
                     let src = (ii + 1) % islands.len();
                     if let Some(t) = &bests[src] {
-                        if let Some(worst) = islands[ii].iter_mut().max_by(|a, b| {
-                            a.error
-                                .partial_cmp(&b.error)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        }) {
+                        // #120: stratified migration replaces the individual in
+                        // the least-visited descriptor cell, not the globally
+                        // worst error. With QD off this is the old best-to-worst
+                        // ring migration bit for bit.
+                        let victim = if cfg.qd_policy {
+                            match qd_archive
+                                .as_ref()
+                                .and_then(|q| q.least_occupied_descriptor())
+                            {
+                                Some(target) => islands[ii]
+                                    .iter()
+                                    .enumerate()
+                                    .min_by(|(_, a), (_, b)| {
+                                        let da = qd::descriptor(&a.tree, gen_train);
+                                        let db = qd::descriptor(&b.tree, gen_train);
+                                        let score = |d: qd::Descriptor| {
+                                            (d.usage - target.usage).powi(2)
+                                                + (d.skew - target.skew).powi(2)
+                                        };
+                                        score(da)
+                                            .partial_cmp(&score(db))
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|(i, _)| i),
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let slot = victim.or_else(|| {
+                            islands[ii]
+                                .iter()
+                                .enumerate()
+                                .max_by(|(_, a), (_, b)| {
+                                    a.error
+                                        .partial_cmp(&b.error)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                })
+                                .map(|(i, _)| i)
+                        });
+                        if let Some(worst) = slot.and_then(|i| islands[ii].get_mut(i)) {
                             // #26: batch the migrant with the next GPU call.
                             *worst = if defer_gpu {
                                 Ind::pending(t.clone(), cfg)
@@ -2623,6 +2777,15 @@ fn run_search(
                     }
                     if stagnant[ii] >= 2 {
                         let mut r = rngs[ii].clone();
+                        // #120: aim the restart at the least-visited region by
+                        // rejection sampling a few cheap descriptor probes.
+                        let qd_target = if cfg.qd_policy {
+                            qd_archive
+                                .as_ref()
+                                .and_then(|q| q.least_occupied_descriptor())
+                        } else {
+                            None
+                        };
                         for ind in islands[ii].iter_mut() {
                             let mut t = random_tree_with(
                                 &mut r,
@@ -2631,6 +2794,31 @@ fn run_search(
                                 cfg.init_depth,
                                 Some(&aggs),
                             );
+                            if let Some(target) = qd_target {
+                                let mut best = t.clone();
+                                let mut best_d = qd::descriptor(&t, gen_train);
+                                let mut best_score = (best_d.usage - target.usage).powi(2)
+                                    + (best_d.skew - target.skew).powi(2);
+                                for _ in 0..3 {
+                                    let cand = random_tree_with(
+                                        &mut r,
+                                        nvars,
+                                        &cfg.ops,
+                                        cfg.init_depth,
+                                        Some(&aggs),
+                                    );
+                                    let d = qd::descriptor(&cand, gen_train);
+                                    let score = (d.usage - target.usage).powi(2)
+                                        + (d.skew - target.skew).powi(2);
+                                    if score < best_score {
+                                        best = cand;
+                                        best_d = d;
+                                        best_score = score;
+                                    }
+                                }
+                                let _ = best_d;
+                                t = best;
+                            }
                             // #15: multi-output fits per output inside the evaluator.
                             let mut fitted = None;
                             if cfg.fit_iters > 0 && !gen_train.is_multi() {
@@ -2701,6 +2889,18 @@ fn run_search(
                 );
                 emit(&mut on_checkpoint, &cp);
             }
+        }
+    }
+
+    // #120: promoted cell elites are rebuilt exactly on every training row in
+    // f64 before they are reported. Screening and row subsets may guide the
+    // search, but the QD report is never a subset estimate.
+    if cfg.qd_policy {
+        if let Some(qd) = qd_archive.as_mut() {
+            qd.refit_all(|tree| {
+                let sol = refit_survivor(tree, &train_data, cfg);
+                (sol.error, sol.cost)
+            });
         }
     }
 
@@ -2988,7 +3188,10 @@ mod tests {
                 false,
                 front,
                 0.0,
-                None, // #119: synchronous test path
+                None,  // #120: no QD snapshot in this test
+                false, // #120
+                0,     // #120 control
+                None,  // #119: synchronous test path
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
