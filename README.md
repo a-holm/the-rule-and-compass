@@ -536,6 +536,15 @@ and `previous`/`interpolate` never cross the train/test boundary. See
 [`docs/data-preparation.md`](docs/data-preparation.md) for each method, when
 *not* to use it, and a worked example.
 
+### Checking for leakage
+
+Leakage is caught differentially, not by a significance test. The
+[`leakage` module](docs/leakage.md) provides truncation replay (recompute at
+cut points; every completed row must be bit-identical), a future-shift probe,
+canary detection and synthetic leak/no-leak fixtures. They run in
+`cargo test --release --test leakage` and can be pointed at your own panel with
+`Panel::from_csv`; `assert_clean()` panics on a real leak instead of logging it.
+
 ### Forecasting: history and delayed variables
 
 A forecast usually needs *history*: today's value may depend on yesterday's.
