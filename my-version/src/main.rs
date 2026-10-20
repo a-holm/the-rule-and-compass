@@ -19,7 +19,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability, store};
+use rcsr::{data, diagnostics, multi, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -90,6 +90,7 @@ fn usage() -> String {
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -569,6 +570,13 @@ fn main() {
     // #71: `import` is a subcommand, handled before the search option parser.
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
+    }
+    // #124: a reusable Rust walk-forward evaluator over the column store.
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("walkforward") | Some("eval")
+    ) {
+        run_walkforward(&args[1..]);
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
@@ -5041,6 +5049,312 @@ fn refuse_for_memory(path: &str, file_bytes: u64, estimate: u64, limit: u64) -> 
     eprintln!("    rcsr import <input.csv> <store.rcsb>");
     eprintln!("    rcsr --data <store.rcsb> --target <col> --max-memory {}", human_bytes(limit));
     std::process::exit(EXIT_INPUT);
+}
+
+fn walkforward_usage() -> String {
+    format!(
+        "rcsr {VERSION} — walk-forward evaluation over a .rcsb column store
+
+USAGE:
+  rcsr walkforward --data <store.rcsb|csv> --target <col> --expr <formula> \\
+                   --time <col> --window <label,train_start,train_end,test_start,test_end> ...
+
+  Evaluates one expression with the engine's own f64 evaluator (no Python, no
+  code strings), applies a long/flat rule and charges costs on position changes.
+  Windows are half-open by time; the purge gap test_start-train_end must be at
+  least --horizon and --embargo. The threshold comes from training/validation
+  rows only. See docs/walkforward.md.
+
+OPTIONS:
+  --data <path>              .rcsb column store, or a CSV table as a fallback
+  --target <col>             forward-return column used for P&L
+  --expr <formula>           score expression, variables resolved by column name
+  --vars <a,b,...>           feature columns (default: all numeric except target,
+                             time and group)
+  --time <col>               time/ordering column (numbers or YYYY-MM-DD)
+  --group-by <col>           panel group column; positions and costs are per
+                             group and rows sharing a timestamp are equal-weighted
+  --window <spec>            LABEL,TRAIN_START,TRAIN_END,TEST_START,TEST_END
+                             (repeatable; the four-bound form is also accepted)
+  --windows <file>           CSV file of window rows with the same columns
+  --horizon <seconds>        forward-label horizon; minimum purge/embargo
+                             (default 0)
+  --embargo <seconds>        extra gap between train_end and test_start
+                             (default: the horizon)
+  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
+  --threshold-quantile <q>   training/validation score quantile (default {DEFAULT_QUANTILE})
+  --validation-frac <f>      trailing fraction of the training time range used to
+                             set the threshold instead of all training rows
+                             (default 0: use all training rows)
+  --periods-per-year <f>     annualisation override (default: infer from the
+                             median test time step; 365 for daily crypto bars)
+  --json                     print the full JSON report to stdout
+  --out <file>               write the JSON report to a file
+  --markdown <file|->        write the Markdown report ('-' = stdout)
+  --quiet                    reserved; text output stays on stdout
+  -h, --help                 show this help
+",
+        DEFAULT_COST_BPS = walkforward::DEFAULT_COST_BPS,
+        DEFAULT_QUANTILE = walkforward::DEFAULT_QUANTILE
+    )
+}
+
+fn run_walkforward(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", walkforward_usage());
+        std::process::exit(EXIT_OK);
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("rcsr {}", VERSION);
+        std::process::exit(EXIT_OK);
+    }
+    let mut data_path: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut expression: Option<String> = None;
+    let mut vars_src: Option<String> = None;
+    let mut time_col: Option<String> = None;
+    let mut group_col: Option<String> = None;
+    let mut windows: Vec<walkforward::Window> = Vec::new();
+    let mut windows_file: Option<String> = None;
+    let mut horizon = 0.0f64;
+    let mut embargo: Option<f64> = None;
+    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    let mut quantile = walkforward::DEFAULT_QUANTILE;
+    let mut validation_frac = 0.0f64;
+    let mut periods_per_year: Option<f64> = None;
+    let mut json = false;
+    let mut out: Option<String> = None;
+    let mut markdown: Option<String> = None;
+    let mut quiet = false;
+
+    let need = |args: &[String], i: usize, flag: &str| -> String {
+        match args.get(i) {
+            Some(v) => v.clone(),
+            None => {
+                eprintln!("error: {} requires a value", flag);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    };
+    let number = |src: String, flag: &str| -> f64 {
+        match src.parse::<f64>() {
+            Ok(v) if v.is_finite() => v,
+            _ => {
+                eprintln!("error: {} needs a finite number, got '{}'", flag, src);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    };
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data" | "-d" => {
+                data_path = Some(need(args, i + 1, "--data"));
+                i += 1;
+            }
+            "--target" => {
+                target = Some(need(args, i + 1, "--target"));
+                i += 1;
+            }
+            "--expr" | "--score-expr" => {
+                expression = Some(need(args, i + 1, "--expr"));
+                i += 1;
+            }
+            "--vars" => {
+                vars_src = Some(need(args, i + 1, "--vars"));
+                i += 1;
+            }
+            "--time" => {
+                time_col = Some(need(args, i + 1, "--time"));
+                i += 1;
+            }
+            "--group-by" => {
+                group_col = Some(need(args, i + 1, "--group-by"));
+                i += 1;
+            }
+            "--window" => {
+                let src = need(args, i + 1, "--window");
+                match walkforward::Window::parse(&src) {
+                    Ok(w) => windows.push(w),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                i += 1;
+            }
+            "--windows" => {
+                windows_file = Some(need(args, i + 1, "--windows"));
+                i += 1;
+            }
+            "--horizon" => {
+                horizon = number(need(args, i + 1, "--horizon"), "--horizon");
+                i += 1;
+            }
+            "--embargo" => {
+                embargo = Some(number(need(args, i + 1, "--embargo"), "--embargo"));
+                i += 1;
+            }
+            "--cost-bps" => {
+                cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                i += 1;
+            }
+            "--threshold-quantile" => {
+                quantile = number(
+                    need(args, i + 1, "--threshold-quantile"),
+                    "--threshold-quantile",
+                );
+                i += 1;
+            }
+            "--validation-frac" => {
+                validation_frac = number(
+                    need(args, i + 1, "--validation-frac"),
+                    "--validation-frac",
+                );
+                i += 1;
+            }
+            "--periods-per-year" => {
+                periods_per_year = Some(number(
+                    need(args, i + 1, "--periods-per-year"),
+                    "--periods-per-year",
+                ));
+                i += 1;
+            }
+            "--json" => json = true,
+            "--out" => {
+                out = Some(need(args, i + 1, "--out"));
+                i += 1;
+            }
+            "--markdown" => {
+                markdown = Some(need(args, i + 1, "--markdown"));
+                i += 1;
+            }
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') => {
+                eprintln!(
+                    "error: unknown walkforward option '{}'\n\n{}",
+                    other,
+                    walkforward_usage()
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                eprintln!("error: unexpected argument '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        i += 1;
+    }
+
+    let data_path = data_path.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let target = target.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let expression = expression.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let time_col = time_col.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    if let Some(file) = windows_file {
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                let mut seen = 0usize;
+                for (n, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    // Skip a header row: it names the columns rather than
+                    // carrying four parseable timestamps.
+                    if seen == 0
+                        && (line.contains("train_start")
+                            || line.contains("train_end")
+                            || line.starts_with("label,"))
+                    {
+                        seen += 1;
+                        continue;
+                    }
+                    seen += 1;
+                    match walkforward::Window::parse(line) {
+                        Ok(w) => windows.push(w),
+                        Err(e) => {
+                            eprintln!("error: {}:{}: {}", file, n + 1, e);
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}: {}", file, e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    if windows.is_empty() {
+        eprintln!(
+            "error: walkforward needs at least one --window or --windows file\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    let vars: Vec<String> = vars_src
+        .map(|s| {
+            s.split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = walkforward::EvalSpec {
+        expression,
+        vars,
+        target,
+        time: time_col,
+        group: group_col,
+        windows,
+        horizon,
+        embargo,
+        cost_bps,
+        threshold_quantile: quantile,
+        validation_frac,
+        periods_per_year,
+    };
+    let report = match walkforward::run_path(&data_path, &spec) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    let wrote_out = out.is_some();
+    let wrote_markdown = markdown.is_some();
+    if let Some(path) = out {
+        if let Err(e) = std::fs::write(&path, report.json()) {
+            eprintln!("error: {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if let Some(path) = markdown {
+        if path == "-" {
+            print!("{}", report.markdown());
+        } else if let Err(e) = std::fs::write(&path, report.markdown()) {
+            eprintln!("error: {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if json {
+        println!("{}", report.json());
+    } else if !quiet && !wrote_out && !wrote_markdown {
+        print!("{}", report.text());
+    }
+    std::process::exit(EXIT_OK);
 }
 
 fn import_usage() -> String {

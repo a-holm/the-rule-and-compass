@@ -137,6 +137,27 @@ impl Header {
         let lo = group.saturating_mul(self.group_rows);
         (self.n_rows.saturating_sub(lo)).min(self.group_rows)
     }
+
+    /// Column index by exact name.
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.name == name)
+    }
+
+    /// Whether column `col` is numeric (text columns only have dictionary codes).
+    pub fn is_numeric(&self, col: usize) -> Option<bool> {
+        self.columns.get(col).map(|c| c.numeric)
+    }
+
+    /// Dictionary levels for a text (or low-cardinality numeric) column.
+    ///
+    /// The codes returned by [`FileStore::read_codes`] index this slice. `None`
+    /// means the column does not carry a dictionary.
+    pub fn levels(&self, col: usize) -> Option<&[String]> {
+        self.columns
+            .get(col)
+            .filter(|c| c.has_codes)
+            .map(|c| c.levels.as_slice())
+    }
 }
 
 /// A healthy store on disk: header plus an open file handle.
