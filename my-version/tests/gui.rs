@@ -99,6 +99,48 @@ fn every_flag_has_a_type_default_and_description() {
 }
 
 
+/// #38: the form is generated from `rcsr schema`, so every option it renders
+/// must reach a deliberate outcome. A documented flag may be supported or
+/// rejected, but never reported as "unknown argument".
+#[test]
+fn every_schema_option_is_supported_or_explicitly_rejected() {
+    let doc = rcsr::schema::json();
+    assert!(gui::is_valid_json(&doc), "schema is not valid JSON");
+    // Only the root search options; subcommands carry their own lists.
+    let root = doc.split("\"operators\"").next().expect("root options");
+    let mut seen = 0;
+    for entry in root.split("\"name\":\"--").skip(1) {
+        let name = format!("--{}", entry.split('"').next().unwrap_or(""));
+        // Find this entry's type field before the next option.
+        let tail = entry.split("\"name\":\"--").next().unwrap_or(entry);
+        let ty = tail
+            .split("\"type\":\"")
+            .nth(1)
+            .and_then(|t| t.split('"').next())
+            .unwrap_or("");
+        let mut args = vec![name.clone()];
+        if ty != "flag" {
+            args.push("1".to_string());
+        }
+        match gui::parse_web_args_for_test(&args) {
+            Ok(()) => {}
+            Err(message) => assert!(
+                !message.contains("unknown argument"),
+                "the GUI renders {name} but rejects it as unknown: {message}"
+            ),
+        }
+        seen += 1;
+    }
+    assert!(seen >= 50, "expected the full option table, found {seen}");
+    for (name, reason) in gui::rejected_options() {
+        assert!(
+            doc.contains(&format!("\"{}\"", name)),
+            "unsupported option {name} is not in the schema"
+        );
+        assert!(!reason.is_empty(), "{name} has an empty reason");
+    }
+}
+
 #[test]
 fn run_endpoint_streams_ndjson_ending_in_done() {
     let server = gui::serve("127.0.0.1", 0).expect("start server");
