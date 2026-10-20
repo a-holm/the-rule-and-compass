@@ -25,51 +25,51 @@ use crate::gpu_stats::GpuStats;
 pub mod arch;
 
 /* Opcodes, kept in sync with src/cuda/eval.cu. */
-const OP_CONST: u32 = 0;
-const OP_VAR: u32 = 1;
-const OP_ADD: u32 = 2;
-const OP_SUB: u32 = 3;
-const OP_MUL: u32 = 4;
-const OP_DIV: u32 = 5;
-const OP_SIN: u32 = 6;
-const OP_COS: u32 = 7;
-const OP_TAN: u32 = 8;
-const OP_EXP: u32 = 9;
-const OP_LOG: u32 = 10;
-const OP_SQRT: u32 = 11;
-const OP_ABS: u32 = 12;
-const OP_TANH: u32 = 13;
-const OP_SIG: u32 = 14;
-const OP_SQUARE: u32 = 15;
-const OP_CUBE: u32 = 16;
-const OP_NEG: u32 = 17;
-const OP_GAUSS: u32 = 18;
-const OP_STEP: u32 = 19;
-const OP_POW: u32 = 20;
-const OP_SINH: u32 = 21;
-const OP_COSH: u32 = 22;
+pub const OP_CONST: u32 = 0;
+pub const OP_VAR: u32 = 1;
+pub const OP_ADD: u32 = 2;
+pub const OP_SUB: u32 = 3;
+pub const OP_MUL: u32 = 4;
+pub const OP_DIV: u32 = 5;
+pub const OP_SIN: u32 = 6;
+pub const OP_COS: u32 = 7;
+pub const OP_TAN: u32 = 8;
+pub const OP_EXP: u32 = 9;
+pub const OP_LOG: u32 = 10;
+pub const OP_SQRT: u32 = 11;
+pub const OP_ABS: u32 = 12;
+pub const OP_TANH: u32 = 13;
+pub const OP_SIG: u32 = 14;
+pub const OP_SQUARE: u32 = 15;
+pub const OP_CUBE: u32 = 16;
+pub const OP_NEG: u32 = 17;
+pub const OP_GAUSS: u32 = 18;
+pub const OP_STEP: u32 = 19;
+pub const OP_POW: u32 = 20;
+pub const OP_SINH: u32 = 21;
+pub const OP_COSH: u32 = 22;
 // #131: native hard operators.
-const OP_FLOOR: u32 = 23;
-const OP_CEIL: u32 = 24;
-const OP_ROUND: u32 = 25;
-const OP_MOD: u32 = 26;
-const OP_ATAN2: u32 = 27;
-const OP_ERF: u32 = 28;
-const OP_ERFC: u32 = 29;
-const OP_MIN: u32 = 30;
-const OP_MAX: u32 = 31;
-const OP_IF: u32 = 32;
-const OP_SIGN: u32 = 33;
-const OP_EQUAL: u32 = 34;
-const OP_LESS: u32 = 35;
-const OP_LESS_OR_EQUAL: u32 = 36;
-const OP_GREATER: u32 = 37;
-const OP_GREATER_OR_EQUAL: u32 = 38;
-const OP_AND: u32 = 39;
-const OP_OR: u32 = 40;
-const OP_XOR: u32 = 41;
-const OP_NOT: u32 = 42;
-const OP_HALT: u32 = 255;
+pub const OP_FLOOR: u32 = 23;
+pub const OP_CEIL: u32 = 24;
+pub const OP_ROUND: u32 = 25;
+pub const OP_MOD: u32 = 26;
+pub const OP_ATAN2: u32 = 27;
+pub const OP_ERF: u32 = 28;
+pub const OP_ERFC: u32 = 29;
+pub const OP_MIN: u32 = 30;
+pub const OP_MAX: u32 = 31;
+pub const OP_IF: u32 = 32;
+pub const OP_SIGN: u32 = 33;
+pub const OP_EQUAL: u32 = 34;
+pub const OP_LESS: u32 = 35;
+pub const OP_LESS_OR_EQUAL: u32 = 36;
+pub const OP_GREATER: u32 = 37;
+pub const OP_GREATER_OR_EQUAL: u32 = 38;
+pub const OP_AND: u32 = 39;
+pub const OP_OR: u32 = 40;
+pub const OP_XOR: u32 = 41;
+pub const OP_NOT: u32 = 42;
+pub const OP_HALT: u32 = 255;
 
 /// `(name, opcode)` for the enum-consistency test and for the per-generation
 /// opcode report. Keep the order identical to `src/cuda/eval.cu`.
@@ -434,6 +434,126 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
         // unsupported so the caller can fall back to the CPU evaluator.
         _ => false,
     }
+}
+
+/// #122: the kernel opcode and arity of an operator that is emitted directly.
+///
+/// `Const`/`Input` are terminals, not operators; `Asinh`/`Acosh`/`Atanh` are
+/// lowered to exact equivalents by [`compile`], and aggregates, meta nodes,
+/// constraints and custom blocks have no kernel opcode. This function returns
+/// `None` for all of those so a caller can reject a configuration instead of
+/// silently producing a program the kernel cannot evaluate.
+pub fn postfix_opcode(op: Op) -> Option<(u32, usize)> {
+    use Op::*;
+    let (code, arity) = match op {
+        Neg => (OP_NEG, 1),
+        Exp => (OP_EXP, 1),
+        Ln => (OP_LOG, 1),
+        Abs => (OP_ABS, 1),
+        Sqrt => (OP_SQRT, 1),
+        Sin => (OP_SIN, 1),
+        Cos => (OP_COS, 1),
+        Tan => (OP_TAN, 1),
+        Sinh => (OP_SINH, 1),
+        Cosh => (OP_COSH, 1),
+        Tanh => (OP_TANH, 1),
+        Logistic => (OP_SIG, 1),
+        Step => (OP_STEP, 1),
+        Gauss => (OP_GAUSS, 1),
+        Square => (OP_SQUARE, 1),
+        Cube => (OP_CUBE, 1),
+        Floor => (OP_FLOOR, 1),
+        Ceil => (OP_CEIL, 1),
+        Round => (OP_ROUND, 1),
+        Sign => (OP_SIGN, 1),
+        Erf => (OP_ERF, 1),
+        Erfc => (OP_ERFC, 1),
+        Not => (OP_NOT, 1),
+        Add => (OP_ADD, 2),
+        Sub => (OP_SUB, 2),
+        Mul => (OP_MUL, 2),
+        Div => (OP_DIV, 2),
+        Pow => (OP_POW, 2),
+        Mod => (OP_MOD, 2),
+        Atan2 => (OP_ATAN2, 2),
+        Min => (OP_MIN, 2),
+        Max => (OP_MAX, 2),
+        Equal => (OP_EQUAL, 2),
+        Less => (OP_LESS, 2),
+        LessOrEqual => (OP_LESS_OR_EQUAL, 2),
+        Greater => (OP_GREATER, 2),
+        GreaterOrEqual => (OP_GREATER_OR_EQUAL, 2),
+        And => (OP_AND, 2),
+        Or => (OP_OR, 2),
+        Xor => (OP_XOR, 2),
+        If => (OP_IF, 3),
+        _ => return None,
+    };
+    Some((code, arity))
+}
+
+/// #122: the inverse of [`postfix_opcode`], used to rebuild a tree from a
+/// device-format postfix slot. Returns `None` for an unknown or terminal word.
+pub fn opcode_arity(code: u32) -> Option<usize> {
+    Some(match code {
+        OP_NEG | OP_EXP | OP_LOG | OP_ABS | OP_SQRT | OP_SIN | OP_COS | OP_TAN | OP_SINH
+        | OP_COSH | OP_TANH | OP_SIG | OP_STEP | OP_GAUSS | OP_SQUARE | OP_CUBE | OP_FLOOR
+        | OP_CEIL | OP_ROUND | OP_SIGN | OP_ERF | OP_ERFC | OP_NOT => 1,
+        OP_ADD | OP_SUB | OP_MUL | OP_DIV | OP_POW | OP_MOD | OP_ATAN2 | OP_MIN | OP_MAX
+        | OP_EQUAL | OP_LESS | OP_LESS_OR_EQUAL | OP_GREATER | OP_GREATER_OR_EQUAL | OP_AND
+        | OP_OR | OP_XOR => 2,
+        OP_IF => 3,
+        _ => return None,
+    })
+}
+
+/// The [`Op`] behind a kernel opcode, for [`postfix::decode`] and for tests.
+pub fn opcode_op(code: u32) -> Option<Op> {
+    use Op::*;
+    Some(match code {
+        OP_NEG => Neg,
+        OP_EXP => Exp,
+        OP_LOG => Ln,
+        OP_ABS => Abs,
+        OP_SQRT => Sqrt,
+        OP_SIN => Sin,
+        OP_COS => Cos,
+        OP_TAN => Tan,
+        OP_SINH => Sinh,
+        OP_COSH => Cosh,
+        OP_TANH => Tanh,
+        OP_SIG => Logistic,
+        OP_STEP => Step,
+        OP_GAUSS => Gauss,
+        OP_SQUARE => Square,
+        OP_CUBE => Cube,
+        OP_FLOOR => Floor,
+        OP_CEIL => Ceil,
+        OP_ROUND => Round,
+        OP_SIGN => Sign,
+        OP_ERF => Erf,
+        OP_ERFC => Erfc,
+        OP_NOT => Not,
+        OP_ADD => Add,
+        OP_SUB => Sub,
+        OP_MUL => Mul,
+        OP_DIV => Div,
+        OP_POW => Pow,
+        OP_MOD => Mod,
+        OP_ATAN2 => Atan2,
+        OP_MIN => Min,
+        OP_MAX => Max,
+        OP_EQUAL => Equal,
+        OP_LESS => Less,
+        OP_LESS_OR_EQUAL => LessOrEqual,
+        OP_GREATER => Greater,
+        OP_GREATER_OR_EQUAL => GreaterOrEqual,
+        OP_AND => And,
+        OP_OR => Or,
+        OP_XOR => Xor,
+        OP_IF => If,
+        _ => return None,
+    })
 }
 
 #[repr(C)]
@@ -861,6 +981,52 @@ impl GpuEvaluator {
         self.stats
     }
 
+    /// #122: evaluate `n` fixed-width slots read directly from `arena`.
+    ///
+    /// This is the primitive the postfix variation path uses: its arena is
+    /// already slot-major and `HALT`-padded, so the evaluation is one upload
+    /// and one launch with no per-program packing. The arena must hold at least
+    /// `n * width` words and every slot must be a complete program.
+    ///
+    /// #118: the whole call is timed and added to the same full-path ledger as
+    /// the packed batch, so a flat-variation run still reports alloc/H2D/
+    /// launch/kernel/sync/D2H/host/wall.
+    pub fn eval_arena(&mut self, arena: &[u32], n: usize, width: usize) -> (Vec<f32>, f32) {
+        if n == 0 {
+            return (Vec::new(), 0.0);
+        }
+        if width < 2 || arena.len() < n * width {
+            return (Vec::new(), -1.0);
+        }
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| unsafe {
+            rc_stats_begin(self.ctx);
+            if self.pool_cap < n || self.pool_width != width {
+                if rc_pool_reserve(self.ctx, n as i32, width as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), -1.0);
+                }
+                self.pool_cap = n;
+                self.pool_width = width;
+            }
+            let which = (self.pool_last ^ 1) as i32;
+            if rc_pool_upload(self.ctx, which, arena.as_ptr(), n as i32) != 0 {
+                ok = false;
+                return (Vec::new(), -1.0);
+            }
+            let mut out = vec![0.0f32; n];
+            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+            if ms < 0.0 {
+                ok = false;
+            }
+            self.pool_last = which as usize;
+            (out, ms)
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
+    }
+
     /// #122: canonical postfix hashes of the last [`Self::eval_pool`] batch,
     /// computed on the device with the same FNV-1a mix as
     /// [`crate::genome::postfix_hash`]. Used to check the two implementations
@@ -1060,6 +1226,51 @@ mod tests {
         assert_eq!(device_hash, expected_hash);
 
         // The fixed-slot kernel is the same evaluator: batch == one at a time.
+        let pop = Population::from_trees(&trees);
+        let (packed, _) = ev.eval_population(&pop);
+        for i in 0..trees.len() {
+            let tol = 1e-6 * (1.0 + packed[i].abs());
+            assert!(
+                (slot_sse[i] - packed[i]).abs() <= tol,
+                "slot {}: {:.9} vs packed {:.9}",
+                i,
+                slot_sse[i],
+                packed[i]
+            );
+        }
+    }
+
+    #[test]
+    fn pool_kernel_implements_every_emitted_opcode() {
+        // #122: the fixed-slot kernel used to fall through to `r = 0` for
+        // `min`/`max`/`mod`/comparisons/`if`. A program using them must score
+        // exactly like the packed kernel.
+        use crate::expr::{constant, input, node};
+        let (cols, n, nv, y, _) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let x = || input(0);
+        let trees = vec![
+            node(Op::If, vec![
+                node(Op::Greater, vec![x(), constant(0.0)]),
+                node(Op::Min, vec![x(), constant(0.5)]),
+                node(Op::Mod, vec![x(), constant(0.7)]),
+            ]),
+            node(Op::Max, vec![node(Op::Mul, vec![x(), x()]), constant(0.1)]),
+            node(Op::Atan2, vec![x(), constant(2.0)]),
+            node(Op::Erf, vec![node(Op::Tanh, vec![x()])]),
+        ];
+        let width = 32;
+        let mut pool = crate::genome::GenomePool::new(trees.len(), width);
+        for tree in &trees {
+            let mut words = Vec::new();
+            assert!(compile(tree, &mut words));
+            assert!(pool.push(&words, crate::genome::GenomeMeta::default()));
+        }
+        let (slot_sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0);
         let pop = Population::from_trees(&trees);
         let (packed, _) = ev.eval_population(&pop);
         for i in 0..trees.len() {

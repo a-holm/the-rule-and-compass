@@ -96,6 +96,7 @@ pub fn json() -> String {
         ("--qd-uniform", "flag", "false", "control: select occupied QD cells uniformly instead of the UCB1 mix"),
         ("--qd-random", "flag", "false", "control: hash descriptors to random cells, removing behaviour information"),
         ("--pipeline-depth", "int", "2", "bounded CPU/GPU overlap depth in batches (0 = synchronous; only with --gpu); results and archive identical to the synchronous path"),
+        ("--variation", "enum", "auto", "variation engine: auto (flat postfix arena for --no-fit GPU runs with population >= 4096), node (historical owned-tree loop) or postfix (require the flat path; error when the run does not qualify)"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations; the write is atomic and the previous generation is kept as <file>.prev"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),
