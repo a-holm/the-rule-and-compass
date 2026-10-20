@@ -444,6 +444,7 @@ operators, 10 generations, three interleaved runs each on a busy shared host
 |---|---:|---:|---:|
 | `--variation node` (historical default pipeline) | 5.71 / 6.82 / 7.20 | 3.54–7.24 | 1.47 |
 | `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
+| `--variation node --pipeline-depth 0` (best tree setting) | 5.01 / 5.15 / 5.28 | 3.19 | 1.94 |
 
 At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
 of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10
