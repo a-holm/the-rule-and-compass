@@ -17,6 +17,7 @@
 //!   FP64 runs at 1/64 of FP32.
 
 use crate::expr::{constant, node, Node, Op};
+use crate::gpu_stats::GpuStats;
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -262,6 +263,28 @@ struct RawCtx {
     _private: [u8; 0],
 }
 
+/// #118: the C-side ledger for one batch, in milliseconds. The host windows are
+/// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
+/// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawStats {
+    kernel_ms: f64,
+    launch_ms: f64,
+    sync_ms: f64,
+    alloc_ms: f64,
+    h2d_ms: f64,
+    d2h_ms: f64,
+    /// C-side envelope from `rc_stats_begin` to the end of the batch. Kept for
+    /// auditing against the outer wall.
+    #[allow(dead_code)]
+    wall_ms: f64,
+    h2d_bytes: u64,
+    d2h_bytes: u64,
+    batch: i32,
+    failed: i32,
+}
+
 extern "C" {
     fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32) -> *mut RawCtx;
     fn rc_destroy(ctx: *mut RawCtx);
@@ -272,6 +295,9 @@ extern "C" {
         nprog: i32,
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    /* #118: start and read one batch's host-time ledger. */
+    fn rc_stats_begin(ctx: *mut RawCtx);
+    fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
     fn rc_device_count() -> i32;
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
@@ -464,6 +490,10 @@ pub struct GpuEvaluator {
     pool_width: usize,
     /// Which of the two arena buffers the last upload/evaluation used.
     pool_last: usize,
+    /// #118: rows in the resident dataset, used for row-evaluation counts.
+    n_rows: u64,
+    /// #118: accumulated host-time ledger for every batch scored here.
+    stats: GpuStats,
 }
 
 impl GpuEvaluator {
@@ -478,6 +508,8 @@ impl GpuEvaluator {
                 pool_cap: 0,
                 pool_width: 0,
                 pool_last: 0,
+                n_rows: n_rows as u64,
+                stats: GpuStats::default(),
             })
         }
     }
@@ -506,16 +538,29 @@ impl GpuEvaluator {
     ///
     /// A negative time means the upload or the kernel failed; the output must
     /// then be ignored. The search uses this marker to fall back to the CPU.
+    /// Either way the batch's host-time ledger is recorded, so a failed batch
+    /// still shows the wall it cost.
     pub fn eval_batch(&mut self, prog: &[u32], offsets: &[u32]) -> (Vec<f32>, f32) {
         let nprog = offsets.len().saturating_sub(1);
-        unsafe {
-            if rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32) != 0 {
-                return (Vec::new(), -1.0);
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if rc_set_programs(self.ctx, prog.as_ptr(), offsets.as_ptr(), nprog as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), -1.0);
+                }
+                let mut out = vec![0.0f32; nprog];
+                let ms = rc_eval(self.ctx, out.as_mut_ptr());
+                if ms < 0.0 {
+                    ok = false;
+                }
+                (out, ms)
             }
-            let mut out = vec![0.0f32; nprog];
-            let ms = rc_eval(self.ctx, out.as_mut_ptr());
-            (out, ms)
-        }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
     }
 
     /// #122: evaluate a fixed-capacity [`GenomePool`] through the persistent
@@ -528,23 +573,74 @@ impl GpuEvaluator {
             return (Vec::new(), 0.0);
         }
         let width = pool.width();
-        unsafe {
-            if self.pool_cap < pool.capacity() || self.pool_width != width {
-                if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if self.pool_cap < pool.capacity() || self.pool_width != width {
+                    if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+                        ok = false;
+                        return (Vec::new(), -1.0);
+                    }
+                    self.pool_cap = pool.capacity();
+                    self.pool_width = width;
+                }
+                let which = (self.pool_last ^ 1) as i32;
+                if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+                    ok = false;
                     return (Vec::new(), -1.0);
                 }
-                self.pool_cap = pool.capacity();
-                self.pool_width = width;
+                let mut out = vec![0.0f32; n];
+                let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+                if ms < 0.0 {
+                    ok = false;
+                }
+                self.pool_last = which as usize;
+                (out, ms)
             }
-            let which = (self.pool_last ^ 1) as i32;
-            if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
-                return (Vec::new(), -1.0);
-            }
-            let mut out = vec![0.0f32; n];
-            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
-            self.pool_last = which as usize;
-            (out, ms)
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
+    }
+
+    /// #118: read the C ledger for the batch that just ran and add it to the
+    /// run totals. `wall_s` is measured around the whole call; the residue
+    /// outside the C windows is recorded as `host_s`, so the phase sum closes
+    /// to wall instead of hiding an `other` bucket.
+    fn record_batch(&mut self, wall_s: f64, ok: bool) {
+        let mut raw = RawStats::default();
+        if unsafe { rc_last_stats(self.ctx, &mut raw) } == 0 {
+            let failed = !ok || raw.failed != 0;
+            // The outer wall is measured around the whole evaluator call, while
+            // the C windows only cover reserve/upload/launch/sync/download. The
+            // difference is real host glue: the output vector, the gaps between
+            // those C calls and the Rust wrapper. Record it as `host_s` so the
+            // phase sum closes instead of hiding an "other" bucket.
+            let outer_ms = wall_s * 1e3;
+            let c_windows_ms = raw.alloc_ms + raw.h2d_ms + raw.launch_ms + raw.sync_ms + raw.d2h_ms;
+            let host_ms = (outer_ms - c_windows_ms).max(0.0);
+            self.stats.add_batch(
+                raw.kernel_ms,
+                raw.launch_ms,
+                raw.sync_ms,
+                raw.alloc_ms,
+                raw.h2d_ms,
+                raw.d2h_ms,
+                host_ms,
+                outer_ms,
+                raw.h2d_bytes,
+                raw.d2h_bytes,
+                raw.batch.max(0) as u64,
+                self.n_rows,
+                failed,
+            );
         }
+    }
+
+    /// Accumulated accounting for every batch scored through this evaluator.
+    pub fn stats(&self) -> GpuStats {
+        self.stats
     }
 
     /// #122: canonical postfix hashes of the last [`Self::eval_pool`] batch,

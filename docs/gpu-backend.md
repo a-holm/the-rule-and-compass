@@ -493,6 +493,113 @@ evaluation is **10–40×** (reported figures for this style of workload range f
 ~18× to ~40×; the 201–1 678× measured above is against a much slower
 single-threaded reference), rising further with row tiling and CUDA graphs.
 
+## Measuring the full GPU path (issue #118)
+
+The older benchmark placed an event pair immediately after the launch, so
+`cudaEventElapsedTime` reported only kernel execution. Sync, the device→host
+copy of the SSEs and the per-generation `cudaMalloc`/`cudaFree` happened outside
+that window — the overhead that made the end-to-end loop look worse than the
+kernel table.
+
+`eval.cu` now records **disjoint host windows** for the whole batch:
+`rc_stats_begin` → allocation (including the synchronising
+`cudaMalloc`/`cudaFree`) → H2D upload → launch → `cudaEventSynchronize` → D2H
+download. `rc_last_stats` exposes them; `GpuStats` (`src/gpu_stats.rs`)
+accumulates them. `kernel_s` is GPU-event time *inside* that wall: it is the
+numerator of duty, never another additive phase.
+
+The `--json`/NDJSON `gpu` block contains:
+
+`kernel_s`, `launch_s`, `sync_s`, `alloc_s`, `h2d_s`, `d2h_s`, `transfer_s`,
+`window_s`, `host_s`, `accounted_s`, `wall_s`, `idle_s`, `residual_fraction`, `h2d_bytes`,
+`d2h_bytes`, `batches`, `failed_batches`, `programs`, `evals`, `row_evals`,
+`evals_per_s`, `row_evals_per_s`, `generations_per_s`, `duty_cycle`,
+`duty_source`, `sm_occupancy`, `occupancy_source`, `quality_per_gpu_hour`, and
+the #131 per-generation `generations` opcode/fallback report. A CPU run reports
+`"gpu": null`.
+
+Definitions that matter:
+
+* **wall** is the whole evaluator path measured by the caller. `window_s` is
+  the five C host windows and `host_s` the Rust glue outside them; their sum
+  `accounted_s` closes to wall, and `residual_fraction` reports any leftover.
+  `tests/gpu_loop.rs` asserts closure within 1 % on a real GPU run.
+* **evals/s** counts candidate evaluations (`programs / wall`); **row-evals/s**
+  counts `programs × rows / wall`. A failed batch contributes wall and bytes but
+  zero evaluations.
+* **duty** is `kernel_s / wall_s`, a kernel-time fraction. It is not
+  `nvidia-smi utilization.gpu` (a 1 Hz sample of "some kernel was resident") and
+  it is not SM occupancy.
+* **quality/GPU-hour** is decades of error reduction against the constant-mean
+  baseline per measured full-path GPU-hour:
+  `-log10(best_sse / mean_baseline_sse) / hours`. A throughput gain is not a
+  search gain: compare quality at matched cumulative evaluations and paired
+  seeds.
+* **`sm_occupancy` is `null`** with `occupancy_source: "ncu (not run)"`.
+  Occupancy requires `ncu` and is never inferred from sampled utilisation.
+
+`rcsr-gpu-bench` prints the ledger, full-path candidate and row throughput,
+duty, quality per GPU-hour, and a comparison against both the interpreted walk
+and the engine's own SoA/AVX evaluator (the baseline the #118 gate names).
+
+How to measure properly:
+
+```sh
+# full-path ledger from the harness itself
+./target/release/rcsr-gpu-bench --data cell5000.csv --target y --vars x1,x2 \
+  --batch 800 --depth 5
+
+# continuous duty/timeline and host gaps: nsys sees the real API sequence
+nsys profile --stats=true -t cuda,nvtx \
+  ./target/release/rcsr-gpu-bench --data cell5000.csv --batch 800 --depth 5
+
+# achieved occupancy / SM throughput: ncu, one diagnostic cell, separate run
+ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed,\
+dram__throughput.avg.pct_of_peak_sustained_elapsed \
+  ./target/release/rcsr-gpu-bench --data cell5000.csv --batch 512 --depth 5
+
+# CUPTI activity tracing (continuous duty, not a 1 Hz sample)
+nsys profile -t cuda --cuda-um-cpu-page-faults=false -o gpu-duty ...
+```
+
+Do not use `nvidia-smi --query-gpu=utilization.gpu` for a sub-10 ms kernel: it
+samples at 1 Hz (or 100 ms at best) and measures "some kernel was resident", not
+occupancy or SM throughput. Use it only as a coarse cross-check.
+
+A/B the evaluator that matters: `--no-simd` (scalar walk), default (SoA/AVX),
+and `--gpu`. A speed-up against the interpreted walk is not the gate.
+
+### Measured on the RTX 3060 cell (issue #118)
+
+Cell: `cell5000.csv`, `N = 5 000`, `V = 2`, `P = 800`, depth 5, seed 7,
+`sm_86`, CUDA 12.0, plain device memory. Three interleaved repeats, 25 batches
+each, on a shared 8-core host with other builds active; absolute times move by
+tens of percent, so medians are quoted.
+
+| | before (event-only timer) | after (full path) |
+|---|---:|---:|
+| GPU batch wall | 0.519 ms (kernel only) | **0.523 ms** (alloc+H2D+launch+sync+D2H) |
+| row-evals/s | 7.70e9 (kernel only) | **7.66e9** (full path) |
+| SoA/AVX CPU batch | not measured | 367.2 ms |
+| speed-up vs SoA/AVX | not measured | **~702×** |
+| speed-up vs interpreted walk | 847–864× | ~1 035× |
+| C-window / host coverage | not measured | **99.1–99.2 % / 0.8–0.9 %** |
+| kernel-time duty | not measured | **70.1–83.5 % (median 80.2 %)** |
+
+The old "8e9 evals/s" was the kernel event only. The new number is the same
+order on this cell because the batch is large enough that copies and sync are
+small; the *reported* number is now the real path and the decomposition is
+visible. On a small cell (`N = 1 000`, `P = 100`, depth 5) the full path was
+0.095–0.221 ms against 5.96–16.52 ms for SoA/AVX, i.e. 27–128× faster in every
+repeat; there is no small-cell regression in evaluator throughput.
+
+Occupancy is **not** verified: `ncu` returns `ERR_NVGPUCTRPERM` (no permission
+to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
+`nsys profile -t cuda` traces the run, but its importer is missing here, so no
+CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
+substitute for either.
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
@@ -508,6 +615,10 @@ single-threaded reference), rising further with row tiling and CUDA graphs.
 | Queue FIFO order and `capacity + batch + 1` memory bound under a forced slow consumer | `src/pipeline.rs` unit tests, any machine | **verified** |
 | ≥1.1× end-to-end with the default fitter at pop 400, N ≥ 5 000 | RTX 3060, `d5k.csv`, shared host | **not met** — 1.02–1.06×; GPU phase is only 2–3 % of wall |
 | Reported law/train/test errors agree with the CPU backend | RTX 3060, `tests/gpu_loop.rs` | **verified** (law predictions within 1e-12; errors within 1e-9, observed 0) |
+| Full-path ledger (alloc/H2D/launch/sync/D2H) and duty | RTX 3060, `src/gpu_stats.rs` tests + `tests/gpu_loop.rs` + `rcsr-gpu-bench` | **verified** (host windows close to wall; kernel-time duty, not occupancy) |
+| Speed-up against the SoA/AVX path (not the interpreted walk) | RTX 3060, `rcsr-gpu-bench` | **measured** (see the PR/issue; the benchmark prints both baselines) |
+| Failed batch is timed but adds no evaluations | RTX 3060, `tests/gpu_loop.rs` | **verified** |
+| SM occupancy / achieved SM throughput | needs `ncu` with counter permission | **unverified here** — reported as `null`, never invented |
 | `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
 | `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |

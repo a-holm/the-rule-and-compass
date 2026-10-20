@@ -85,7 +85,7 @@ pub fn json() -> String {
         ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
-        ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical"),
+        ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical. JSON reports the measured kernel/sync/alloc/copy wall and kernel-time duty; SM occupancy is null unless measured separately with ncu"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
         ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
         ("--qd-cells", "int", "16", "descriptor grid bins per axis (2..=256; enables --qd)"),
