@@ -27,6 +27,8 @@ pub mod metrics;
 pub mod multi;
 pub mod ohlcv;
 pub mod pareto;
+#[cfg(feature = "cuda")]
+pub mod postfix;
 pub mod panel; // #145: point-in-time membership and panel
 pub mod parse;
 pub mod pipeline; // #119: bounded producer/scorer overlap

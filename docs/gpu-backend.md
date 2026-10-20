@@ -107,20 +107,70 @@ GPU and CPU agree on which candidates are hopeless.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
-are compiled to native opcodes instead of falling back to the serial CPU
-evaluator. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
+compile to native opcodes instead of falling back to the serial CPU evaluator.
+Both kernels — the packed `eval_kernel` and the fixed-slot `eval_pool_kernel`
+used by the search — call one `rc_exec_row` device function, so an operator has
+exactly one implementation and cannot silently differ between the pipeline and
+pool paths. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
 zero, matching Rust — not `cvt.rni`, which is ties-to-even); `min`/`max` guard
 NaN explicitly so either NaN operand yields NaN like `expr.rs`; `if` evaluates
 both arms but a true select discards the unselected one; `mod` uses the host's
 floored `a - b*floor(a/b)` with the `|b|<1e-12` and finite-quotient guards;
-`atan2`, `erf` and `erfc` call libdevice (2/2/4 ulp documented; `erf(-0)` is
-normalised to `+0` to match the host). The static kernel grew from 1000 to 1312
-SASS (+31%), registers from 26 to 27, and the 288-byte stack frame is unchanged
-on `sm_86`. A CUDA-guided run reports the opcode and fallback counts for each
-generation under `gpu.generations` in `--json`; a CPU run's JSON is unchanged.
-Operators without an opcode after exact lowering (constraints, aggregates, a
-custom block the inliner cannot handle) still take the CPU fallback, and the
-final f64 CPU rescore remains the exactness guarantee for reported results.
+`atan2`, `erf` and `erfc` call libdevice. `erf(-0)` is normalised to `+0` to
+match the host.
+
+Every tree reaches the device through `gpu::compile_program`, the one guarded
+entry point: it applies the #121 `lower()` rewrites, rejects a postfix program
+that would need more than 56 operand-stack slots, and returns the opcodes that
+were actually emitted. `Population::add` (pipeline path) and the fixed-slot
+batch (synchronous path) both use it, so they agree on `asinh`/`acosh`/`atanh`
+and on the stack limit.
+
+**Exactness limits of the native opcodes (f32).** `floor`, `ceil`, `round`,
+`sign`, `min`, `max`, `if`, comparisons and logicals are exact on the f32 grid
+(0 ULP); `mod` is asserted to 1 ULP, `atan2` to 3 ULP, `erf` to 2 ULP and
+`erfc` to 4 ULP against the f64 CPU reference
+(`per_opcode_ulp_bounds_against_the_f64_reference`). These bounds are
+relative-ULP claims for the normal f32
+range. Outside it the contract is different: `erff` saturates to 1 at
+`|x| >= 3.9196`, `erfcf` reaches the subnormal boundary around `x = 9.19` and
+returns zero at `x = 10.05`, so a relative-ULP bound is meaningless there;
+`native_special_values_are_exact` asserts those cases explicitly: at
+`x = 10.05` libdevice returns the smallest subnormal (1.4e-45) or zero, not a
+relative-accurate tail. A second limit belongs to `mod`: its quotient is f32,
+so above `|a/b| = 2^25` the fractional part of the quotient is not representable
+and the result is not the f64 remainder; a range correction keeps it inside
+`[0,b)` (or `(b,0]` for negative `b`), and the fixture checks that documented
+behaviour instead of a ULP bound. Below `2^25` (which covers the `8 388 608 /
+0.7` case) the correction makes `mod` match the f64 reference to 1 ULP. `mod`
+returns NaN for a non-finite operand, `|b| < 1e-12` or a non-finite f32
+quotient, as the host does, and `atan2` returns NaN if either operand is NaN.
+Discontinuous
+operators (`floor`, `ceil`, `round`, `mod`, `sign`, comparisons, `if`) can jump
+by O(1) on a 1-ULP input change, so they are never approximated in the tree and
+the final archive is always re-scored by the CPU f64 evaluator. The accumulation
+itself is f32 (see the 200 000-row caveat below), so the f32 fitness is a
+search signal, not a reported number.
+
+Static kernel cost measured on `sm_86` (CUDA 12.0, `-O3`), before and after this
+change:
+
+| kernel | SASS before | SASS after | registers | stack |
+|---|---:|---:|---:|---:|
+| `eval_kernel` (packed / pipeline) | 1 312 | 1 336 (+1.8%) | 27 → 27 | 288 B → 288 B |
+| `eval_pool_kernel` (fixed slots / synchronous) | 1 008 | 1 336 (+32.6%) | 28 → 30 | 288 B → 288 B |
+| `predict_kernel` (test fixtures only) | — | 1 296 | 26 | 288 B |
+
+The pool kernel grew because it previously **did not implement** the #131
+opcodes at all (it fell through to `r = 0.0f`); the growth is the cost of the
+operators it now shares with the packed kernel, not a regression in a working
+path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
+and fallback counts for each generation under `gpu.generations` in `--json`,
+aggregated from the emitted programs of both the pipeline batches and the
+synchronous fallback batch; a CPU run's JSON is unchanged. Operators without an
+opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates) still take the CPU
+fallback, and the final f64 CPU rescore remains the exactness guarantee for
+reported results.
 
 **CPU fallback pool (#121).** Unsupported programs are not scored on the
 scoring thread. Each generation collects them into jobs and hands them to a
@@ -294,6 +344,23 @@ parallelism; the current search loop uses one thread per island, and a
 `{"event":"backend",...}` object before the results. The run manifest from
 #140 will carry the same fields when it lands; until then JSON is the record.
 
+A GPU-guided run also carries `gpu.generations`, one object per scoring
+generation, aggregated from the programs actually emitted by the guarded
+compiler (pipeline batches and the synchronous fallback batch share a
+generation key):
+
+```json
+"gpu": {"generations": [
+  {"generation": 0, "programs": 200, "fallbacks": 0,
+   "opcodes": {"OP_ADD": 431, "OP_ERF": 12, "OP_FLOOR": 7, "OP_MUL": 260}}
+]}
+```
+
+`programs` counts trees uploaded to the device, `fallbacks` counts candidates
+in the same batch that the guarded compiler rejected, and `opcodes` counts
+operator words in the uploaded programs. The counters describe what ran, not
+what the operator set allowed.
+
 ### Exactness
 
 Cross-backend runs are **not bit-identical by construction**. The GPU scores a
@@ -407,23 +474,41 @@ evaluation, rather than constant fitting, is the bottleneck. Making the fit
 cheaper or moving it to the GPU is a separate workstream; batch size and launch
 overhead are addressed by the fixed-capacity pool below.
 
-### Fixed-capacity genome pool and the unsupported tail (#122)
+### Fixed-capacity genome pool and flat postfix variation (#122)
 
-The first dehosting stage removes two pieces of host work that did not depend on
-the GPU at all:
+The GPU search keeps the historical owned-tree loop for fitting runs and for
+configurations the flat engine cannot reproduce exactly. A second engine removes
+the per-child tree work from the fit-free, large-population path:
 
 * **One persistent program arena.** `genome::GenomePool` is a fixed-capacity,
   double-buffered postfix arena. Every genome occupies exactly
   `width_for(max_complexity) = 2*max_complexity + 4` words (64 words = 256 B at
   the default 30), so a slot never moves and there is no free list. The CUDA
-  context now reserves `d_pool[2]` once; a generation uploads into the back
-  buffer and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is
-  2.6 MB per buffer, bounded by capacity and flat across generations.
+  context reserves `d_pool[2]` once; a generation uploads into the back buffer
+  and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is 2.6 MB per
+  buffer, bounded by capacity and flat across generations.
 * **Device-canonical hash.** `rc_pool_hash` computes the same FNV-1a postfix
   hash as `genome::postfix_hash`, bit for bit; the pool can therefore dedup in
   stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
   implemented with the same positional `(seed, island, generation, slot, draw)`
   contract the full device-variation stage will use.
+* **Flat variation arena.** `postfix::Arena` holds `islands × pop` fixed-width
+  programs plus SoA length/cost/hash/error arrays. `postfix::Variation` performs
+  tournament selection, subtree crossover, point/terminal/subtree mutation,
+  complexity and width bounds, structural hashing and duplicate rejection
+  directly on the arena. It allocates no tree and calls no simplifier per child.
+  Every random decision comes from Philox4x32-10 keyed by
+  `(seed, island, generation, slot)`.
+* **Survivor-only archive hand-off.** The archive is tested on `(error, cost)`
+  first (`Archive::admits`); a tree is rebuilt from postfix only when the
+  candidate actually enters the front. `Archive::canonicalize` then rebuilds a
+  monotone `(cost, error)` staircase, and `Archive::hash` is the determinism
+  gate. The final reported front is rebuilt from those survivors only and
+  rescored in `f64` on the full training sample.
+* **The full opcode set in the pool kernel.** The fixed-slot kernel used to fall
+  through to `r = 0` for `min`, `max`, `mod`, comparisons, logical operators and
+  `if`; it now calls the same `rc_exec_row`
+  as the packed kernel (`gpu::tests::pool_kernel_implements_every_emitted_opcode`).
 * **Unsupported programs no longer serialise the batch.** Before #131 `if` had
   no kernel opcode, and the old `GpuSearch::score` scored every such tree one
   after another on the calling thread. `if` is now a native opcode; the
@@ -439,25 +524,22 @@ the GPU at all:
   tests dominance on `(cost, error)` first and clones the tree only for a
   candidate that enters the front.
 
-Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 5 000`,
-`--no-fit --gpu --seed 1`, `P = 10 000`, default operators (including `if`),
-three interleaved runs each, wall for 10 generations:
+The path is selected before generation 0 and recorded in the backend note:
 
-| Run | min / median |
-|---|---:|
-| `origin/main` | 18.3 s / 22.8 s |
-| #122 stage | 8.8 s / 10.7 s (**2.1–2.4×**) |
+```sh
+rcsr ... --no-fit --gpu --variation auto      # flat arena when it qualifies
+rcsr ... --variation node                      # historical owned-tree loop
+rcsr ... --variation postfix                   # require the flat path
+```
 
-The per-generation CPU fallback for 8 521 unsupported trees fell from 2.15 s
-(serial) to 0.73 s on the 8-thread pool (3.0× on 4 physical cores). With the
-operator set that has no unsupported opcode (`--ops` without `if`) the same
-`P = 10 000`, 20-generation cell is unchanged (5.44 s vs 5.34 s): the pool
-removes allocation and clone overhead there, but variation and the startup
-population dominate. The kernel itself stays ~1–3 ms per generation: at the
-`--no-fit` slope this is under 1 % duty, which is why the remaining plan targets
-full device variation and fitting (#116), not the launch path. Exactness: the `P = 2 000`, 5-generation JSON
-report is byte-identical to `origin/main` apart from `elapsed_seconds`, i.e.
-the same constants, expressions and errors.
+`auto` requires a GPU, `--fit-iters 0`, `islands × pop >= 4096`, the default
+complexity model, no aggregates/custom blocks/dimension constraints, no
+screening or predictor subsampling and no QD layer. The flat engine draws parents
+from the island tournament only: the archive-guided `--front-parents` draw is
+not ported, so `auto` can produce a different (but deterministic) trajectory. Everything else stays on the
+owned-tree path, including all constant fitting (#116), simplification of
+reported expressions, checkpoints and exact `f64` reporting. A fitting run can
+therefore never be silently approximated by the flat engine.
 
 ### The `if` cell and the worker pool (#121)
 
@@ -498,6 +580,25 @@ for the remaining operators (`require`/`between`/`constrain`, aggregates),
 which is the opcode-request path in `gpu-lowering/C-lowering-pass.md` §6, not a
 scheduling change. The 9.5× `if` cell itself is met at 9.5–10.7× because the
 native `if` opcode removes the fallback rather than parallelising it.
+
+Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 3 750` training rows from
+a 5 000-row two-input sample, `--no-fit --gpu --seed 1`, `P = 10 000`, default
+operators, 10 generations, three interleaved runs each on a busy shared host
+(the absolute numbers are noisy; the ratio is pairwise):
+
+| Run | wall, s | search, s | generations/s |
+|---|---:|---:|---:|
+| `--variation node` (historical default pipeline) | 5.71 / 6.82 / 7.20 | 3.54–7.24 | 1.47 |
+| `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
+| `--variation node --pipeline-depth 0` (best tree setting) | 5.01 / 5.15 / 5.28 | 3.19 | 1.94 |
+
+At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
+of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10
+generations. A 2-D hypervolume over `(complexity, train error)` with reference
+point `(40, 1)` was 34.6 for the 40-generation flat run at 2.2 s against 31.6
+for the 10-generation tree run at 3.5 s. The archive is deterministic for a
+seed, repeats across 1 and 4 islands, and a checkpoint/resume trip reproduces
+the uninterrupted archive hash (`tests/postfix_loop.rs`).
 
 What remains staged: device-side mutation/crossover and a fused device
 selection/archive. The pool, hash and Philox contracts above are the interface

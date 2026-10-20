@@ -455,6 +455,12 @@ SEARCH:
                              size (default min(cores, 8)). --json reports each
                              generation's native/lowered/unsupported counts and
                              fallback seconds
+  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -604,26 +610,61 @@ fn gpu_json(
         .quality_per_gpu_hour(best_error, baseline_error)
         .map(jnum)
         .unwrap_or_else(|| "null".to_string());
+    let ops_json = |ops: &std::collections::BTreeMap<String, usize>| -> String {
+        ops.iter()
+            .map(|(name, n)| format!("{}:{}", jstr(name), n))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let gens: Vec<String> = g
         .generations
         .iter()
         .map(|s| {
-            let ops: Vec<String> = s
-                .opcodes
-                .iter()
-                .map(|(name, n)| format!("{}:{}", jstr(name), n))
-                .collect();
             format!(
-                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
+                s.native,
+                s.native + s.lowered,
+                s.lowered,
                 s.fallbacks,
-                ops.join(",")
+                s.unsupported_programs,
+                jnum(s.fallback_seconds),
+                s.fallback_workers,
+                ops_json(&s.opcodes)
             )
         })
         .collect();
+    // #121: `gpu.totals` aggregates the per-generation counters over the run.
+    let mut total_ops = std::collections::BTreeMap::new();
+    let (mut t_programs, mut t_native, mut t_lowered, mut t_fallbacks) = (0usize, 0usize, 0usize, 0usize);
+    let (mut t_unsupported, mut t_seconds, mut t_workers) = (0usize, 0.0f64, 0usize);
+    for s in &g.generations {
+        t_programs += s.programs;
+        t_native += s.native;
+        t_lowered += s.lowered;
+        t_fallbacks += s.fallbacks;
+        t_unsupported += s.unsupported_programs;
+        t_seconds += s.fallback_seconds;
+        t_workers = t_workers.max(s.fallback_workers);
+        for (name, n) in &s.opcodes {
+            *total_ops.entry(name.clone()).or_insert(0usize) += *n;
+        }
+    }
+    let totals = format!(
+        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
+        t_programs,
+        t_native,
+        t_native + t_lowered,
+        t_lowered,
+        t_fallbacks,
+        t_unsupported,
+        jnum(t_seconds),
+        t_workers,
+        ops_json(&total_ops)
+    );
     format!(
-        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}]}}",
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}}}",
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.sync_s),
@@ -649,7 +690,8 @@ fn gpu_json(
         jnum(a.generations_per_s()),
         jnum(a.duty_cycle()),
         quality,
-        gens.join(",")
+        gens.join(","),
+        totals
     )
 }
 
@@ -1491,6 +1533,17 @@ fn main() {
                     }
                 }
             }
+            // #122: variation engine selection.
+            "--variation" => {
+                let v = val!();
+                match crate::search::VariationMode::parse(&v) {
+                    Ok(mode) => cfg.variation = mode,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -2090,6 +2143,7 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
             // The parser streams from the spool, so the text is not resident.
             let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
@@ -2140,6 +2194,7 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
             let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {

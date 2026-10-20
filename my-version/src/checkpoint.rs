@@ -1048,6 +1048,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "qd_cvt",        // #120
         "qd_policy",     // #120
         "qd_control",    // #120
+        "variation",     // #122: missing means auto
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1300,6 +1301,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             qd_control
         ));
     }
+    // #122: absent means auto, matching checkpoints written before the flat
+    // postfix engine existed.
+    let variation = match fields.get("variation").map(|s| s.as_str()) {
+        None => crate::search::VariationMode::Auto,
+        Some(raw) => crate::search::VariationMode::parse(raw).map_err(|e| {
+            format!("config 'variation' is invalid: {}", e)
+        })?,
+    };
 
     Ok(Config {
         generations: num_usize("generations")?,
@@ -1338,6 +1347,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         gpu_notes: true,
         // #119: scheduling only, not saved search state.
         pipeline_depth: 2,
+        variation,
     })
 }
 
@@ -1378,6 +1388,8 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
+    // #122: absent means auto (the historical path for every old checkpoint).
+    writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,

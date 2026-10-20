@@ -145,7 +145,7 @@ __device__ __forceinline__ float logisticf(float x) { return 1.0f / (1.0f + expf
    program emitted without the host's `peak_stack` gate would write past `s`
    and corrupt device state instead of failing that candidate. `sp > 0` on
    HALT means a missing operand (or an empty program) is a hard failure too. */
-__device__ __forceinline__ float rc_eval_row(const unsigned int *__restrict__ code,
+__device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ code,
                                              const float *__restrict__ cols,
                                              int n,
                                              int row)
@@ -193,13 +193,26 @@ __device__ __forceinline__ float rc_eval_row(const unsigned int *__restrict__ co
             float b = s[--sp];
             float a = s[sp - 1];
             /* Host semantics: floored remainder with the same guards as
-               expr::eval. `floorf(q)` (not fmodf) makes the sign follow
-               the divisor. The quotient guard catches finite operands
-               whose f32 quotient overflows. */
+               expr::eval. `floorf(q)` (not fmodf) makes the sign follow the
+               divisor. The quotient is f32, so above |a/b| = 2^25 its
+               fractional part is not representable and the result is no
+               longer the f64 remainder (documented in docs/gpu-backend.md;
+               the final archive is re-scored on the CPU). For the range the
+               search can use, one range correction removes the single ULP of
+               quotient rounding that can push r across 0 or |b|. */
             float r = CUDART_NAN_F;
             if (isfinite(a) && isfinite(b) && fabsf(b) >= 1e-12f) {
                 float q = a / b;
-                r = isfinite(q) ? fmaf(-b, floorf(q), a) : CUDART_NAN_F;
+                if (isfinite(q)) {
+                    r = fmaf(-b, floorf(q), a);
+                    float ab = fabsf(b);
+                    float rs = (b > 0.0f) ? r : -r;
+                    if (rs < 0.0f) {
+                        r += b;
+                    } else if (rs >= ab) {
+                        r -= b;
+                    }
+                }
             }
             s[sp - 1] = r;
         } else if (w == OP_ATAN2) {
@@ -316,7 +329,7 @@ __global__ void eval_kernel(const float *__restrict__ cols,
     const unsigned int *code = prog + off[p];
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float pred = rc_eval_row(code, cols, n, i);
+        float pred = rc_exec_row(code, cols, n, i);
         /* Shared magnitude limit: anything non-finite or astronomically large is
            a hard failure. Applying the *same* rule on the host keeps the f32
            kernel and the f64 reference on the same fitness landscape. */
@@ -353,7 +366,7 @@ __global__ void eval_pool_kernel(const float *__restrict__ cols,
     float acc = 0.0f;
 
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        float pred = rc_eval_row(code, cols, n, i);
+        float pred = rc_exec_row(code, cols, n, i);
         if (!isfinite(pred) || fabsf(pred) > 1e30f) {
             acc += 1e30f;
             continue;
@@ -370,6 +383,22 @@ __global__ void eval_pool_kernel(const float *__restrict__ cols,
         __syncthreads();
     }
     if (threadIdx.x == 0) out[p] = sh[0];
+}
+
+/* #131 fixtures: raw per-row predictions of a packed batch, P x N row-major.
+   Unlike the fitness kernels this does not apply the hard-failure magnitude
+   limit, so a fixture can see NaN, infinities and signed zeros. */
+__global__ void predict_kernel(const float *__restrict__ cols,
+                               int n,
+                               const unsigned int *__restrict__ prog,
+                               const unsigned int *__restrict__ off,
+                               float *__restrict__ out)
+{
+    const int p = blockIdx.x;
+    const unsigned int *pr = prog + off[p];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        out[(size_t)p * (size_t)n + (size_t)i] = rc_exec_row(pr, cols, n, i);
+    }
 }
 
 /* #122: canonical postfix hash, FNV-1a over the words up to and including
@@ -559,6 +588,34 @@ float rc_eval(void *ctx, float *out)
     st->batch = c->nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
+}
+
+/* #131 fixtures: upload a packed batch and write its P x N raw predictions
+   (row-major) into `out`. Test-only; the fitness path still uses rc_eval /
+   rc_pool_eval. Returns 0 on success, -1 on any CUDA error. */
+int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
+               int nprog, float *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nprog <= 0) return -1;
+    if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1;
+    size_t total = (size_t)nprog * (size_t)c->n;
+    float *d_pred = 0;
+    if (cudaMalloc((void **)&d_pred, sizeof(float) * total) != 0) return -1;
+    int threads = RC_MIN_THREADS;
+    while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->d_prog, c->d_off, d_pred);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(d_pred);
+        return -1;
+    }
+    if (cudaMemcpy(out, d_pred, sizeof(float) * total, cudaMemcpyDeviceToHost)
+        != cudaSuccess) {
+        cudaFree(d_pred);
+        return -1;
+    }
+    cudaFree(d_pred);
+    return 0;
 }
 
 /* --- #122: persistent fixed-capacity program pool ------------------------ */
