@@ -426,6 +426,47 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #134: non-overlapping wall-clock phases for one search run. `prep` covers
+/// argument parsing, loading and preparation; `search` is the evolutionary
+/// run; the rest are the post-search work. `total` is measured independently at
+/// the end, so the phases can be checked against the wall instead of assumed to
+/// add up. `elapsed_seconds` is kept as the search phase for compatibility.
+#[derive(Clone, Copy, Default)]
+struct PhaseTimings {
+    prep: f64,
+    search: f64,
+    baselines: f64,
+    diagnostics: f64,
+    report: f64,
+    total: f64,
+}
+
+impl PhaseTimings {
+    fn json(&self) -> String {
+        format!(
+            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{}}}",
+            jnum(self.prep),
+            jnum(self.search),
+            jnum(self.baselines),
+            jnum(self.diagnostics),
+            jnum(self.report),
+            jnum(self.total)
+        )
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s",
+            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total
+        )
+    }
+
+    #[cfg(test)]
+    fn phases_sum(&self) -> f64 {
+        self.prep + self.search + self.baselines + self.diagnostics + self.report
+    }
+}
+
 /// The `variables_detail` array shared by `--json`, `--ndjson` and
 /// `--eval-expr`: one object per search input with its datatype. A one-hot
 /// indicator also reports its source column.
@@ -573,6 +614,9 @@ fn main() {
         print!("{}", schema::json());
         std::process::exit(EXIT_OK);
     }
+    // #134: everything before the search is `prep`, including argument parsing,
+    // loading and data preparation.
+    let run_start = std::time::Instant::now();
 
     let mut cfg = search::Config::default();
     // #91: the GPU path is opt-in. A default run is CPU, so the same command
@@ -2032,7 +2076,7 @@ fn main() {
         }));
     }
 
-    let start = std::time::Instant::now();
+    let search_start = std::time::Instant::now();
     let split_line = format!(
         "split={} | selector: {} | train rows: {} | test rows: {}{}{}{}",
         prepared.report.mode,
@@ -2205,7 +2249,7 @@ fn main() {
             quiet,
             top,
             out_path,
-            start,
+            search_start,
         );
         std::process::exit(EXIT_OK);
     }
@@ -2222,7 +2266,7 @@ fn main() {
             implicit_mode,
             format,
             quiet,
-            start,
+            search_start,
         );
         std::process::exit(EXIT_OK);
     }
@@ -2286,7 +2330,10 @@ fn main() {
             std::process::exit(EXIT_INPUT);
         }
     };
-    let elapsed = start.elapsed().as_secs_f64();
+    let search_seconds = search_start.elapsed().as_secs_f64();
+    // Compatibility: `elapsed_seconds` has always meant the search phase.
+    let elapsed = search_seconds;
+    let diagnostics_start = std::time::Instant::now();
 
     // Seeded solutions, reported once each. The search holds them in
     // normalised-input space; show the original-units form, exactly like a
@@ -2454,9 +2501,12 @@ fn main() {
         })
         .map(|r| r.resid_tests);
 
+    let mut diagnostics_seconds = diagnostics_start.elapsed().as_secs_f64();
+
     // Null baselines: the trivial models a real fit must beat (issue #23).
     // #69: the k-NN reference set is always all training rows; only the query
     // rows are optionally sampled by `--baseline-samples`.
+    let baselines_start = std::time::Instant::now();
     let baselines = diagnostics::Baselines::fit_sampled(
         &prepared.train,
         &fold_samples,
@@ -2464,6 +2514,8 @@ fn main() {
         baseline_samples,
         cfg.seed,
     );
+    let baselines_seconds = baselines_start.elapsed().as_secs_f64();
+    let diagnostics_start = std::time::Instant::now();
 
     // Stability selection (issue #20): bootstrap the training rows, re-run the
     // identical search, and count how often each structural form and each input
@@ -2575,12 +2627,15 @@ fn main() {
         null_control = Some(diagnostics::NullControl::summarise(observed, best_null));
     }
 
+    diagnostics_seconds += diagnostics_start.elapsed().as_secs_f64();
+
     let finite = rows.iter().any(|r| r.train_error.is_finite());
     let full_rows = rows.clone();
 
     // Optional Markdown report (issue #29), built from the full Pareto front so
     // `--top` only trims the ordinary table/TSV output below.
-    let report_md = report.map(|kind| match kind {
+    let report_start = std::time::Instant::now();
+    let mut report_md = report.map(|kind| match kind {
         ReportKind::Summary => summary_markdown(
             &command,
             &prepared,
@@ -2624,6 +2679,20 @@ fn main() {
             quiet,
         ),
     });
+    let report_seconds = report_start.elapsed().as_secs_f64();
+    // #134: measured independently, after all phases. Emitting the JSON/text is
+    // not part of `total`; the phases cover everything up to this point.
+    let timing = PhaseTimings {
+        prep: (search_start - run_start).as_secs_f64(),
+        search: search_seconds,
+        baselines: baselines_seconds,
+        diagnostics: diagnostics_seconds,
+        report: report_seconds,
+        total: run_start.elapsed().as_secs_f64(),
+    };
+    if let Some(md) = report_md.as_mut() {
+        md.push_str(&time_markdown(&timing));
+    }
 
     if top > 0 && rows.len() > top {
         rows.truncate(top);
@@ -2643,6 +2712,7 @@ fn main() {
                         ""
                     }
                 );
+                eprintln!("# time: {}", timing.text());
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -3121,7 +3191,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 jstr(VERSION),
                 cfg.seed,
@@ -3142,6 +3212,7 @@ fn main() {
                 // #18: the four convergence numbers.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                timing.json(),
                 checkpoint_json,
                 null_json,
                 baselines_json,
@@ -3311,12 +3382,13 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                timing.json(),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );
@@ -3840,6 +3912,23 @@ fn md_esc(s: &str) -> String {
 /// diagnostic already computed, the whole Pareto front and a trust verdict that
 /// cites the numbers rather than asserting confidence.
 #[allow(clippy::too_many_arguments)]
+/// #134: the phase breakdown in text reports.
+fn time_markdown(t: &PhaseTimings) -> String {
+    format!(
+        "\n## Time\n\n\
+         | phase | seconds |\n|---|---:|\n\
+         | preparation | {:.3} |\n\
+         | search | {:.3} |\n\
+         | baselines | {:.3} |\n\
+         | diagnostics | {:.3} |\n\
+         | report | {:.3} |\n\
+         | **total wall** | **{:.3}** |\n\n\
+         `elapsed_seconds` in JSON is the search phase, kept for compatibility;\n\
+         use `total_seconds` (or the sum above) for wall-clock cost.\n",
+        t.prep, t.search, t.baselines, t.diagnostics, t.report, t.total
+    )
+}
+
 fn summary_markdown(
     command: &str,
     prepared: &data::Prepared,
@@ -5306,5 +5395,32 @@ mod tests {
         }
         assert!(usage().contains("aggregates:"));
         assert!(Op::parse_list_checked("mean,count").is_ok());
+    }
+
+    /// #134: the phase ledger exposes non-overlapping windows and a separate
+    /// measured total, so a report can never silently quote search time as wall.
+    #[test]
+    fn phase_timings_sum_to_the_measured_total() {
+        let t = PhaseTimings {
+            prep: 0.10,
+            search: 0.20,
+            baselines: 0.30,
+            diagnostics: 0.05,
+            report: 0.02,
+            total: 0.67,
+        };
+        assert!((t.phases_sum() - t.total).abs() <= 0.01 * t.total);
+        let json = t.json();
+        for key in [
+            "prep_seconds",
+            "search_seconds",
+            "baselines_seconds",
+            "diagnostics_seconds",
+            "report_seconds",
+            "total_seconds",
+        ] {
+            assert!(json.contains(key), "timing JSON is missing {key}");
+        }
+        assert!(t.text().contains("total=0.67s"));
     }
 }
