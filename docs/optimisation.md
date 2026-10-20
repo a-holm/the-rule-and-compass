@@ -258,8 +258,10 @@ reached (`squared` metric unless noted).
 
 `--fit-iters N` sets the Levenberg–Marquardt budget for every candidate, and the
 budget is honoured literally: `--fit-iters 0` (the same as `--no-fit`) performs
-**no fitting at all** — no damped LM iteration and no undamped Gauss–Newton
-polish — so the constants stay exactly as the tree was generated. Earlier
+**no fitting at all** — no damped LM iteration, no IRLS/logistic IRLS round,
+no coordinate polish, no undamped Gauss–Newton polish and no closed-form
+least-squares solve under `--fit-strategy auto|linear` — so the constants stay
+exactly as the tree was generated for every metric. Earlier
 releases silently ran five steps per candidate under `--no-fit` (one forced LM
 iteration plus a four-step polish); after the #135 fix the same daily-panel
 search went from about 3 200 to 7 240 candidate evaluations per second. With the
