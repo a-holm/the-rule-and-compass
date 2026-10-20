@@ -370,15 +370,20 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
+     [--max-memory size] [--force] [--skip-malformed]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
+     [--weight col]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--seed-expr expr] [--seed-file path]
+     [--implicit] [--implicit-derivative] [--function def]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
-     [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
+     [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
+     [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
@@ -390,12 +395,18 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]
+     [--gpu] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
-     [--format text|json|ndjson] [--progress]
+     [--allow-backend-change] [--run-manifest file] [--json-out file]
+     [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
 ```
+
+Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
+their own option lists in `rcsr schema` under `import`, `walkforward` and
+`verify-manifest`; the block above is the root search command.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)

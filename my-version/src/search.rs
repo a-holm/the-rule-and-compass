@@ -33,7 +33,7 @@ use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
 use crate::units::Units;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 
 #[derive(Clone)]
 pub struct Config {
@@ -538,12 +538,14 @@ impl GpuSearch {
 /// tree and the sample, never on a neighbour or on completion order, so the
 /// parallel and serial paths return the same bits. Small batches stay serial:
 /// the thread round trip would cost more than it saves.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn rescore_pending_cpu(islands: &mut [Vec<Ind>], train: &EvalSample, cfg: &Config) {
     rescore_pending_cpu_with(islands, train, cfg, fallback_workers());
 }
 
 /// The worker count is a parameter so the determinism test can compare one
 /// thread with many without touching the process environment.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn rescore_pending_cpu_with(
     islands: &mut [Vec<Ind>],
     train: &EvalSample,
@@ -592,6 +594,7 @@ fn rescore_pending_cpu_with(
 }
 
 /// #122: size of the bounded CPU fallback pool.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn fallback_workers() -> usize {
     const MAX: usize = 8;
     if let Ok(v) = std::env::var("RCSR_CPU_FALLBACK_THREADS") {

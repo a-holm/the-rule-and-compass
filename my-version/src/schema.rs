@@ -9,9 +9,17 @@ use crate::expr::Op;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The schema document, identical for the CLI and the server.
-pub fn json() -> String {
-    let opts = [
+/// Whether `name` is one of the documented root search options.
+pub fn has_option(name: &str) -> bool {
+    OPTIONS.iter().any(|(n, _, _, _)| *n == name)
+}
+
+/// The one option table used by `rcsr schema`, the GUI and the tests.
+///
+/// Each row is `(name, type, default, description)`. Adding a flag here is the
+/// only edit needed for the document; [`has_option`] lets a surface reject a
+/// known CLI flag explicitly rather than calling it unknown.
+pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
         ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A CSV is estimated from rows x columns (text + table + preparation) once the header and row count are known, and exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
         ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
@@ -87,6 +95,7 @@ pub fn json() -> String {
         ("--time-budget", "float", "none", "wall-clock seconds"),
         ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
+        ("--cpu", "flag", "false", "alias for --no-gpu: force CPU evaluation"),
         ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
         ("--qd-cells", "int", "16", "descriptor grid bins per axis (2..=256; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
@@ -99,15 +108,21 @@ pub fn json() -> String {
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
         ("--json-out", "string", "none", "write the final JSON result to this file atomically instead of stdout (implies --json); progress stays on stderr/NDJSON"),
         ("--format", "enum", "text", "text | json | ndjson"),
+        ("--json", "flag", "false", "shorthand for --format json: one JSON result object"),
+        ("--ndjson", "flag", "false", "shorthand for --format ndjson: one event per line"),
         ("--progress", "flag", "false", "emit per-generation progress with convergence statistics (confidence, stability, maturity, percent_converged); see docs/convergence.md"),
+        ("--quiet", "flag", "false", "suppress the human-readable header, the GPU fallback note and the one-line resource summary"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
         ("--report", "enum", "none", "Markdown report: summary | sensitivity | benchmark (single value; last wins)"),
         ("--report-out", "string", "none", "write the Markdown report to this path (otherwise text=stdout, json/ndjson=stderr)"),
         ("--report-repeats", "int", "5", "independent searches for --report benchmark"),
-    ];
+];
+
+/// The schema document, identical for the CLI and the server.
+pub fn json() -> String {
     let mut items = String::new();
-    for (i, (name, ty, default, desc)) in opts.iter().enumerate() {
+    for (i, (name, ty, default, desc)) in OPTIONS.iter().enumerate() {
         if i > 0 {
             items.push(',');
         }
@@ -145,6 +160,17 @@ pub fn json() -> String {
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+         \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
+ {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\
+ {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"rows per I/O group\"}},\
+ {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto-detected\",\"description\":\"store this column as exact i64 timestamps\"}},\
+ {{\"name\":\"--skip-malformed\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"drop ragged rows instead of refusing the input\"}},\
+ {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse before parsing when the estimate exceeds this\"}},\
+ {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory\"}},\
+ {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
+         \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
