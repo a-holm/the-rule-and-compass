@@ -110,7 +110,13 @@ rcsr walkforward --data panel_daily_long.rcsb --target fwd1 \
 
 Test windows are defined only by time; the purge gap must be at least the
 horizon, and the threshold comes from training (or an optional trailing
-validation slice), never from the test block. See
+validation slice), never from the test block. Per-window metrics start every
+group flat; pooled P&L carries each group's ending position across a window
+boundary and charges the seam term `|p_end - q_start|` (pass
+`--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
+candidates by their validation error; the test block is never a selection
+input. The fold sign test is reported as not applicable for expanding folds
+because `test_k` lies inside `train_{k+1}`. See
 [`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
 definitions and the reference-agreement check against the Python evaluator.
 

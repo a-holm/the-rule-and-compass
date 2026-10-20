@@ -5995,7 +5995,8 @@ USAGE:
 OPTIONS:
   --data <path>              .rcsb column store, or a CSV table as a fallback
   --target <col>             forward-return column used for P&L
-  --expr <formula>           score expression, variables resolved by column name
+  --expr <formula>           score expression, variables resolved by column name;
+                             repeat to select among candidates on the validation slice
   --vars <a,b,...>           feature columns (default: all numeric except target,
                              time and group)
   --time <col>               time/ordering column (numbers or YYYY-MM-DD)
@@ -6013,6 +6014,9 @@ OPTIONS:
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
+  --pool-reset-flat          reset every group to flat at a window seam (the
+                             historical pooled P&L); default carries the boundary
+                             position, so total variation includes |p_end-q_start|
   --periods-per-year <f>     annualisation override (default: infer from the
                              median test time step; 365 for daily crypto bars)
   --json                     print the full JSON report to stdout
@@ -6037,7 +6041,7 @@ fn run_walkforward(args: &[String]) -> ! {
     }
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
-    let mut expression: Option<String> = None;
+    let mut expressions: Vec<String> = Vec::new();
     let mut vars_src: Option<String> = None;
     let mut time_col: Option<String> = None;
     let mut group_col: Option<String> = None;
@@ -6049,6 +6053,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut quantile = walkforward::DEFAULT_QUANTILE;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
+    let mut pool_reset_flat = false;
     let mut json = false;
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
@@ -6084,7 +6089,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--expr" | "--score-expr" => {
-                expression = Some(need(args, i + 1, "--expr"));
+                expressions.push(need(args, i + 1, "--expr"));
                 i += 1;
             }
             "--vars" => {
@@ -6147,6 +6152,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 ));
                 i += 1;
             }
+            "--pool-reset-flat" => pool_reset_flat = true,
             "--json" => json = true,
             "--out" => {
                 out = Some(need(args, i + 1, "--out"));
@@ -6181,10 +6187,16 @@ fn run_walkforward(args: &[String]) -> ! {
         eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
     });
-    let expression = expression.unwrap_or_else(|| {
+    if expressions.is_empty() {
         eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
-    });
+    }
+    let expression = expressions[0].clone();
+    let candidates = if expressions.len() > 1 {
+        expressions
+    } else {
+        Vec::new()
+    };
     let time_col = time_col.unwrap_or_else(|| {
         eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
         std::process::exit(EXIT_USAGE);
@@ -6252,6 +6264,8 @@ fn run_walkforward(args: &[String]) -> ! {
         threshold_quantile: quantile,
         validation_frac,
         periods_per_year,
+        candidates,
+        pool_reset_flat,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
