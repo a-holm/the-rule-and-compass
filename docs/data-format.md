@@ -63,6 +63,42 @@ sample selected by the pinned one-multiply hash while scanning groups. The
 sample is a sample: report it as such. (The full-data re-score of the Pareto
 front on a streamed store is follow-up work, not silently claimed here.)
 
+## Prep: raw market data to a store
+
+`rcsr prep` is the market-data path: it reads a raw OHLCV file and writes the
+store directly, with no intermediate CSV.
+
+```sh
+rcsr prep raw_1m.csv --out crypto_15m.rcsb --resample 15m \
+  --manifest crypto_15m.json
+rcsr prep raw_1m.csv --dry-run          # audit only, writes nothing
+```
+
+Layouts: Binance monthly klines (12 headerless columns: open time, O/H/L/C,
+volume, close time, quote volume, trades, taker-buy base/quote, ignore) and
+Bitstamp (6 headerless columns) are detected from a numeric first line; an
+aliased header (`Date`/`Timestamp`/`time`, `Open`/`O`, `Vol`/`Volume`, ...) is
+also accepted. `--format auto|binance|bitstamp|ohlcv` overrides detection.
+
+The pipeline validates the schema (time, open, high, low, close and volume are
+required and numeric; `high < low` is refused with the row), normalises a
+numeric timestamp column from s/ms/µs/ns to seconds, drops duplicate numeric
+instants (first wins), counts non-monotonic steps, sorts by time, then
+resamples with `open=first`, `high=max`, `low=min`, `close=last` and sums for
+volume, quote volume, trades and taker-buy columns. Buckets are aligned to the
+interval from the Unix epoch; empty buckets are not invented and are counted as
+gaps. Raw rows (`--resample none`) keep their timestamps.
+
+The audit is printed and the optional manifest records the layout, input/output
+row counts, unit and conversions, duplicates, non-monotonic steps, gaps,
+zero-volume bars and a `spec_hash` over the options. The store bytes are
+deterministic for the same input, spec and `--group-rows`.
+
+**Not yet implemented** (tracked on #123): monthly ZIP archives, a feature/label
+spec file, symbol-migration splice, per-symbol parallelism, and the measured
+100-coin comparison with the Python builder. The manifest records the options,
+not a full feature spec, until that lands.
+
 ## File format, version 1
 
 All integers and floating-point values are little-endian. The layout is:

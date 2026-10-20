@@ -19,7 +19,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability, store};
+use rcsr::{data, diagnostics, multi, prep, search, stability, store};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -90,6 +90,8 @@ fn usage() -> String {
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr prep <raw.csv> --out <store.rcsb> [--format auto|binance|bitstamp|ohlcv]
+             [--resample 15m|1h|1d] [--manifest <json>] [--dry-run]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -560,6 +562,10 @@ fn main() {
     // #71: `import` is a subcommand, handled before the search option parser.
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
+    }
+    // #123: `prep` builds a store straight from raw klines/CSV.
+    if args.first().map(|s| s.as_str()) == Some("prep") {
+        run_prep(&args[1..]);
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
@@ -5015,6 +5021,147 @@ OPTIONS:
 ",
         store::DEFAULT_GROUP_ROWS
     )
+}
+
+fn prep_usage() -> String {
+    format!(
+        "rcsr {VERSION} — raw OHLCV CSV to a column store (no intermediate CSV)
+
+USAGE:
+  rcsr prep <raw.csv> --out <store.rcsb> [options]
+  rcsr prep <raw.csv> --dry-run          audit without writing
+
+  Reads Binance/Bitstamp raw klines (headerless or aliased headers), validates
+  the OHLCV schema, normalises the timestamp unit (s/ms/us/ns), drops duplicate
+  instants, sorts deterministically, optionally resamples with open=first,
+  high=max, low=min, close=last and sums, and writes the versioned `.rcsb`
+  store directly through the same writer as `rcsr import`.
+
+OPTIONS:
+  --out, -o <store.rcsb>   output store (required unless --dry-run)
+  --format <layout>        auto (default), binance, bitstamp or ohlcv
+  --resample <interval>    15m, 1h, 1d, 1w (default: raw, no resampling)
+  --group-rows <N>         rows per I/O group in the store (default {})
+  --manifest <json>        write the spec, spec hash and audit as JSON
+  --dry-run                print the audit and write nothing
+  --json                   print the audit as JSON (with --dry-run or normally)
+  --quiet                  suppress the summary (the audit still goes to stderr?)
+  -h, --help               show this help
+",
+        store::DEFAULT_GROUP_ROWS
+    )
+}
+
+fn run_prep(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", prep_usage());
+        std::process::exit(EXIT_OK);
+    }
+    let mut input: Option<String> = None;
+    let mut out: Option<String> = None;
+    let mut layout = prep::Layout::Auto;
+    let mut resample = "none".to_string();
+    let mut group_rows = store::DEFAULT_GROUP_ROWS;
+    let mut manifest: Option<String> = None;
+    let mut dry_run = false;
+    let mut json = false;
+    let mut quiet = false;
+    let mut i = 0;
+    macro_rules! val {
+        () => {{
+            let flag = args.get(i).cloned().unwrap_or_default();
+            i += 1;
+            match args.get(i) {
+                Some(v) => v.clone(),
+                None => {
+                    eprintln!("error: {} requires a value", flag);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }};
+    }
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" | "-o" => out = Some(val!()),
+            "--format" => {
+                let v = val!();
+                match prep::Layout::parse(&v) {
+                    Ok(l) => layout = l,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--resample" => resample = val!(),
+            "--group-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => group_rows = n,
+                    _ => {
+                        eprintln!("error: --group-rows needs an integer >= 1");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--manifest" => manifest = Some(val!()),
+            "--dry-run" => dry_run = true,
+            "--json" => json = true,
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown prep option '{}'\n\n{}", other, prep_usage());
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                if input.is_none() {
+                    input = Some(other.to_string());
+                } else {
+                    eprintln!("error: unexpected argument '{}'", other);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+        i += 1;
+    }
+    let input = input.unwrap_or_else(|| {
+        eprintln!("error: prep needs an input CSV\n\n{}", prep_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let audit = match prep::run(
+        &input,
+        layout,
+        &resample,
+        group_rows,
+        out.as_deref(),
+        manifest.as_deref(),
+        dry_run,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    if json {
+        println!("{}", audit.json(prep::spec_hash(&format!("{}:{}", input, resample))));
+    } else {
+        for line in audit.text_lines() {
+            if dry_run || !quiet {
+                println!("{}", line);
+            }
+        }
+        if !dry_run && !quiet {
+            println!(
+                "prepared {} rows x {} columns from {} to {} (resample={})",
+                audit.rows_out,
+                audit.columns.len(),
+                input,
+                out.as_deref().unwrap_or("?"),
+                audit.resample
+            );
+        }
+    }
+    std::process::exit(EXIT_OK);
 }
 
 fn run_import(args: &[String]) -> ! {

@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod multi;
 pub mod pareto;
 pub mod parse;
+pub mod prep;
 pub mod progress_stats;
 pub mod resample; // #92: index-based resampling with a BLB cap
 pub mod rng;

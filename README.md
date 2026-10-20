@@ -268,6 +268,10 @@ the determinism guarantee and its limits.
   of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store
   that can be scanned group by group and searched from a bounded hash sample
   when it does not fit; see [`docs/data-format.md`](docs/data-format.md).
+* **Market-data prep**: `rcsr prep raw.csv --out panel.rcsb --resample 15m`
+  reads Binance/Bitstamp klines or an aliased OHLCV CSV, validates the schema,
+  normalises the timestamp unit, sorts deterministically, resamples and writes
+  the store directly (no intermediate CSV). `--dry-run` prints the audit.
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 

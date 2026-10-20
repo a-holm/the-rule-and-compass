@@ -104,6 +104,7 @@ pub fn json() -> String {
     let operators: Vec<String> = Op::names().iter().map(|n| jstr(n)).collect();
     format!(
         "{{\n  \"tool\":\"rcsr\",\n  \"version\":{},\n  \"summary\":{},\n  \
+         \"subcommands\":[{{\"command\":\"import\",\"description\":\"CSV to a versioned .rcsb column store\"}},{{\"command\":\"prep\",\"description\":\"raw OHLCV klines/CSV to .rcsb directly: layouts, unit normalisation, validation, deterministic ordering, resampling; --dry-run audits without writing\"}}],\n  \
          \"options\":[{}\n  ],\n  \
          \"operators\":[{}],\n  \
          \"complexity\":{{\"formula\":\"sum(op_cost) + var_weight*n_vars + const_weight*n_consts + depth_weight*max_depth\",\"defaults\":{{\"op_cost\":1,\"var_weight\":1,\"const_weight\":1,\"depth_weight\":0}},\"operator_nodes_only\":true,\"depth\":\"edges from the root; a single node has depth 0\"}},\n  \
