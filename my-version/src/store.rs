@@ -40,7 +40,38 @@ use std::io::{Read, Write};
 /// Eight-byte magic; the trailing NUL makes a truncated file easy to reject.
 pub const MAGIC: &[u8; 8] = b"RCSRBIN\0";
 /// Format version. A mismatch is refused with an actionable message.
+///
+/// Version 1 is the original all-`f64` layout. Issue #127 adds an optional
+/// per-column `"dtype"` field *without* bumping the version: a v1 header
+/// without `dtype` is the old all-`f64` store, and a header with
+/// `"dtype":"i64"` stores that column's blocks as little-endian `i64`. This
+/// keeps every existing store readable while new stores can be
+/// nanosecond-safe.
 pub const VERSION: u32 = 1;
+
+/// Storage type of one column's value blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DType {
+    F64,
+    I64,
+}
+
+impl DType {
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::F64 => "f64",
+            DType::I64 => "i64",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f64" => Some(DType::F64),
+            "i64" => Some(DType::I64),
+            _ => None,
+        }
+    }
+}
 /// Default row group, sized for 512 KiB per `f64` column (the measured I/O
 /// block). It is a streaming unit, not an L2 tile.
 pub const DEFAULT_GROUP_ROWS: usize = 65_536;
@@ -54,6 +85,8 @@ pub const RESIDENT_BYTES_PER_CELL: u64 = 300;
 struct ColumnMeta {
     name: String,
     numeric: bool,
+    /// Value-block type. `i64` is used for the time column only.
+    dtype: DType,
     levels: Vec<String>,
     /// `true` when the column has a dictionary and therefore a code block.
     has_codes: bool,
@@ -86,6 +119,18 @@ impl Header {
 
     pub fn numeric(&self) -> Vec<bool> {
         self.columns.iter().map(|c| c.numeric).collect()
+    }
+
+    /// Value-block type per column, in header order.
+    pub fn dtypes(&self) -> Vec<DType> {
+        self.columns.iter().map(|c| c.dtype).collect()
+    }
+
+    /// Byte width of one value cell in `col`.
+    fn value_width(&self, col: usize) -> u64 {
+        match self.columns[col].dtype {
+            DType::F64 | DType::I64 => 8,
+        }
     }
 
     pub fn group_len(&self, group: usize) -> usize {
@@ -206,8 +251,9 @@ impl FileStore {
         }
         for g in 0..n_groups {
             let len = self.header.group_len(g) as u64;
-            for col in &self.header.columns {
-                let values_end = self.data_start + col.offsets[g] + len * 8;
+            for (c, col) in self.header.columns.iter().enumerate() {
+                let values_end =
+                    self.data_start + col.offsets[g] + len * self.header.value_width(c);
                 if values_end > file_len {
                     return Err(format!(
                         "{}: truncated data: group {} column '{}' ends at byte {} but the file is {} bytes",
@@ -261,9 +307,42 @@ impl FileStore {
         for (c, col) in self.header.columns.iter().enumerate() {
             let dst = buf.col_mut(c);
             let off = self.data_start + col.offsets[group];
-            read_f64_block(&self.file, &self.path, off, dst, scratch)?;
+            match col.dtype {
+                DType::F64 => read_f64_block(&self.file, &self.path, off, dst, scratch)?,
+                DType::I64 => {
+                    let mut ints = vec![0i64; len];
+                    read_i64_block(&self.file, &self.path, off, &mut ints, scratch)?;
+                    for (dst, v) in dst.iter_mut().zip(ints) {
+                        *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
+                    }
+                }
+            }
         }
         Ok(buf.view_ref())
+    }
+
+    /// Read one group's exact `i64` values for `col` (the time column), or an
+    /// empty vector when the column is stored as `f64`.
+    pub fn read_i64(&self, group: usize, col: usize) -> Result<Vec<i64>, String> {
+        let meta = self
+            .header
+            .columns
+            .get(col)
+            .ok_or_else(|| format!("{}: column {} is out of range", self.path, col))?;
+        if meta.dtype != DType::I64 {
+            return Ok(Vec::new());
+        }
+        let len = self.header.group_len(group);
+        let mut out = vec![0i64; len];
+        let mut scratch = Vec::new();
+        read_i64_block(
+            &self.file,
+            &self.path,
+            self.data_start + meta.offsets[group],
+            &mut out,
+            &mut scratch,
+        )?;
+        Ok(out)
     }
 
     /// Decode a group's dictionary codes for `col`, as `u32` values in a fresh
@@ -328,6 +407,18 @@ impl FileStore {
                 }
             })
             .collect();
+        let mut ints: Vec<Option<Vec<i64>>> = self
+            .header
+            .columns
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::I64 {
+                    Some(Vec::with_capacity(n))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut buf = GroupBuf::new();
         let mut scratch = Vec::new();
         for g in 0..self.header.n_groups() {
@@ -335,6 +426,9 @@ impl FileStore {
             for (c, col) in self.header.columns.iter().enumerate() {
                 if col.numeric {
                     values[c].extend_from_slice(view.col(c));
+                }
+                if col.dtype == DType::I64 {
+                    ints[c].as_mut().unwrap().extend(self.read_i64(g, c)?);
                 }
                 if col.has_codes {
                     let part = self.read_codes(g, c)?;
@@ -349,6 +443,7 @@ impl FileStore {
             .enumerate()
             .map(|(c, col)| Column {
                 values: std::mem::take(&mut values[c]),
+                ints: ints[c].take(),
                 dict: codes[c].take().map(|codes| DictColumn {
                     codes,
                     levels: col.levels.clone(),
@@ -402,6 +497,18 @@ impl FileStore {
                 }
             })
             .collect();
+        let mut ints: Vec<Option<Vec<i64>>> = self
+            .header
+            .columns
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::I64 {
+                    Some(Vec::with_capacity(max_rows))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut buf = GroupBuf::new();
         let mut scratch = Vec::new();
         let mut selected_rows = 0usize;
@@ -418,6 +525,13 @@ impl FileStore {
                 if col.numeric {
                     for &r in &keep {
                         values[c].push(view.col(c)[r]);
+                    }
+                }
+                if col.dtype == DType::I64 {
+                    let part = self.read_i64(g, c)?;
+                    let dst = ints[c].as_mut().unwrap();
+                    for &r in &keep {
+                        dst.push(part[r]);
                     }
                 }
             }
@@ -439,6 +553,7 @@ impl FileStore {
             .enumerate()
             .map(|(c, col)| Column {
                 values: std::mem::take(&mut values[c]),
+                ints: ints[c].take(),
                 dict: codes[c].take().map(|codes| DictColumn {
                     codes,
                     levels: col.levels.clone(),
@@ -553,13 +668,47 @@ pub fn detected_hard_budget() -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Write `table` as a version-1 store at `path`.
+///
+/// A column that carries an exact `i64` time view (see
+/// [`crate::data::Table::ints`]) is written as an `i64` block, so nanosecond
+/// timestamps round-trip exactly. Everything else is `f64` as before.
 pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), String> {
+    write_store_with_time(path, table, group_rows, None)
+}
+
+/// [`write_store`] with an explicit time column (`rcsr import --time <col>`).
+/// When `time_col` is `None` the first column with an exact `i64` view is used;
+/// with no such column the store is the historical all-`f64` layout.
+pub fn write_store_with_time(
+    path: &str,
+    table: &Table,
+    group_rows: usize,
+    time_col: Option<usize>,
+) -> Result<(), String> {
     let group_rows = group_rows.max(1);
     let n_rows = table.len();
     let n_cols = table.n_cols();
     if n_rows == 0 {
         return Err("cannot write a column store with no rows".to_string());
     }
+    let time_col = match time_col {
+        Some(c) => {
+            if c >= n_cols {
+                return Err(format!(
+                    "time column {} is out of range ({} columns)",
+                    c, n_cols
+                ));
+            }
+            if table.ints(c).is_none() {
+                return Err(format!(
+                    "time column '{}' is not an integer timestamp; i64 storage needs whole-number cells",
+                    table.names[c]
+                ));
+            }
+            Some(c)
+        }
+        None => (0..n_cols).find(|&c| table.ints(c).is_some()),
+    };
     let n_groups = (n_rows + group_rows - 1) / group_rows;
     let mut columns: Vec<ColumnMeta> = (0..n_cols)
         .map(|c| {
@@ -567,6 +716,11 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
             ColumnMeta {
                 name: table.names[c].clone(),
                 numeric: table.numeric[c],
+                dtype: if Some(c) == time_col {
+                    DType::I64
+                } else {
+                    DType::F64
+                },
                 levels: dict.map(|d| d.levels.clone()).unwrap_or_default(),
                 has_codes: dict.is_some(),
                 offsets: Vec::with_capacity(n_groups),
@@ -588,6 +742,7 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
             }
         }
     }
+    let dtypes: Vec<DType> = columns.iter().map(|c| c.dtype).collect();
     let header = Header {
         n_rows,
         n_cols,
@@ -614,10 +769,22 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
         for c in 0..n_cols {
             bytes.clear();
             bytes.reserve((hi - lo) * 8);
-            let values = table.col(c);
-            for r in lo..hi {
-                let v = values.get(r).copied().unwrap_or(f64::NAN);
-                bytes.extend_from_slice(&v.to_le_bytes());
+            match dtypes[c] {
+                DType::F64 => {
+                    let values = table.col(c);
+                    for r in lo..hi {
+                        let v = values.get(r).copied().unwrap_or(f64::NAN);
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                DType::I64 => {
+                    let ints = table.ints(c).ok_or_else(|| {
+                        format!("column '{}' has no i64 view", table.names[c])
+                    })?;
+                    for r in lo..hi {
+                        bytes.extend_from_slice(&ints.get(r).copied().unwrap_or(i64::MIN).to_le_bytes());
+                    }
+                }
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -667,9 +834,10 @@ fn header_json(h: &Header) -> String {
             .collect::<Vec<_>>()
             .join(",");
         cols.push_str(&format!(
-            "{{\"name\":{},\"numeric\":{},\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
+            "{{\"name\":{},\"numeric\":{},\"dtype\":\"{}\",\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
             jstr(&c.name),
             c.numeric,
+            c.dtype.name(),
             levels,
             c.has_codes,
             offsets,
@@ -734,9 +902,31 @@ fn read_f64_block(
     Ok(())
 }
 
+fn read_i64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [i64],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    scratch.resize(bytes, 0);
+    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
+        format!(
+            "{}: reading {} bytes at offset {}: {}",
+            path, bytes, offset, e
+        )
+    })?;
+    for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(src);
+        *dst = i64::from_le_bytes(b);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {    use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
 }
 
@@ -856,6 +1046,27 @@ fn parse_header(text: &str) -> Result<Header, String> {
             .get("numeric")
             .and_then(Json::as_bool)
             .ok_or_else(|| format!("column '{}' is missing numeric", name))?;
+        // Absent in the original v1 header, which means all-`f64`.
+        let dtype = match c.get("dtype") {
+            None => DType::F64,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("column '{}' has a non-string dtype", name))?;
+                DType::parse(s).ok_or_else(|| {
+                    format!(
+                        "column '{}' has unknown dtype '{}' (expected f64 or i64)",
+                        name, s
+                    )
+                })?
+            }
+        };
+        if dtype == DType::I64 && !numeric {
+            return Err(format!(
+                "column '{}' has dtype i64 but numeric:false",
+                name
+            ));
+        }
         let levels = c
             .get("levels")
             .and_then(Json::as_arr)
@@ -876,6 +1087,7 @@ fn parse_header(text: &str) -> Result<Header, String> {
         columns.push(ColumnMeta {
             name,
             numeric,
+            dtype,
             levels,
             has_codes,
             offsets,
@@ -1108,6 +1320,7 @@ mod tests {
                 ColumnMeta {
                     name: "a\"b".to_string(),
                     numeric: true,
+                    dtype: DType::F64,
                     levels: vec![],
                     has_codes: false,
                     offsets: vec![0, 64, 128],
@@ -1116,6 +1329,7 @@ mod tests {
                 ColumnMeta {
                     name: "label".to_string(),
                     numeric: false,
+                    dtype: DType::F64,
                     levels: vec!["x".to_string(), "y".to_string()],
                     has_codes: true,
                     offsets: vec![0, 32, 64],
