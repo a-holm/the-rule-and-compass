@@ -1132,6 +1132,7 @@ impl RunPlan {
                 lags: raw.lags,
                 history_frac: raw.history_frac,
                 gap_break: raw.gap_break,
+                time: data::TimeSpec::default(),
             };
             let (t2, v2, rep) = data::add_lags(&table, &vars, &lag_spec, time_col, group_col)?;
             table = t2;
@@ -1176,6 +1177,7 @@ impl RunPlan {
             train_select,
             test_select,
             exclude,
+            time: data::TimeSpec::default(),
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

@@ -6,6 +6,10 @@ opt-in, and the defaults reproduce the behaviour of a plain run**: no filling
 (a gap is an error, not a silent `NaN`), no outlier removal, no smoothing,
 mean/standard-deviation normalisation and no row filter.
 
+Time columns follow the strict policy in [`time-parsing.md`](time-parsing.md):
+offset-aware ISO 8601, an explicit date-only choice, and numeric s/ms/us/ns
+detection with a refusal on ambiguity.
+
 The one rule that shapes the whole design is the same as for splitting:
 **nothing about the test rows may influence the numbers used to prepare the
 training rows.** See [`data-splitting.md`](data-splitting.md) for the split

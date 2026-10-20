@@ -1283,6 +1283,8 @@ pub struct SplitSpec {
     pub test_select: Option<Filter>,
     /// Rows where this expression is true are dropped before splitting (#3).
     pub exclude: Option<Filter>,
+    /// #130: how the time column is parsed.
+    pub time: TimeSpec,
 }
 
 impl Default for SplitSpec {
@@ -1297,6 +1299,7 @@ impl Default for SplitSpec {
             train_select: None,
             test_select: None,
             exclude: None,
+            time: TimeSpec::default(),
         }
     }
 }
@@ -2782,7 +2785,8 @@ fn build_split(
             let time_col = spec
                 .time_col
                 .ok_or("temporal split needs a time column (--time <col>)")?;
-            let keys = time_keys(t, time_col);
+            let (keys, trep) = time_keys_with(t, time_col, &spec.time)?;
+            report.notes.extend(trep.text_lines());
             let order = sorted_by(&keys);
             match split_ordered(&order, spec, folds) {
                 Some((tr, folds_idx)) => {
@@ -2866,7 +2870,8 @@ fn build_split(
             let group_col = spec
                 .group_col
                 .ok_or("temporal-group split needs a group column (--group-by <col>)")?;
-            let keys = time_keys(t, time_col);
+            let (keys, trep) = time_keys_with(t, time_col, &spec.time)?;
+            report.notes.extend(trep.text_lines());
             let (ids, names) = group_ids(t, group_col);
             report.groups_total = names.len();
             let mut train: Vec<usize> = Vec::new();
@@ -3062,10 +3067,402 @@ pub fn time_keys(t: &Table, col: usize) -> TimeKeys {
             .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
             .collect(),
     )
+
+// ---------------------------------------------------------------------------
+// #130: strict time parsing
+// ---------------------------------------------------------------------------
+
+/// What to do with a date-only value (`2024-01-02`, no clock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DateOnlyPolicy {
+    /// Refuse the file: the instant is under-specified. The default.
+    Error,
+    /// The value means 00:00:00 UTC.
+    UtcMidnight,
+    /// The value means the session close, 21:00 UTC (16:00 New York, EST).
+    SessionClose,
 }
 
-/// Parse a timestamp to seconds: accepts plain numbers, `YYYY-MM-DD`,
-/// `YYYY/MM/DD` and an optional `T`/space separated `HH:MM[:SS]`.
+impl DateOnlyPolicy {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "error" => Ok(DateOnlyPolicy::Error),
+            "utc-midnight" => Ok(DateOnlyPolicy::UtcMidnight),
+            "session-close" => Ok(DateOnlyPolicy::SessionClose),
+            other => Err(format!(
+                "unknown --date-only policy '{}' (expected error, utc-midnight or session-close)",
+                other
+            )),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            DateOnlyPolicy::Error => "error",
+            DateOnlyPolicy::UtcMidnight => "utc-midnight",
+            DateOnlyPolicy::SessionClose => "session-close",
+        }
+    }
+}
+
+/// Unit of a numeric time column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeUnit {
+    Seconds,
+    Millis,
+    Micros,
+    Nanos,
+}
+
+impl TimeUnit {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "s" | "sec" | "seconds" => Ok(TimeUnit::Seconds),
+            "ms" | "millis" | "milliseconds" => Ok(TimeUnit::Millis),
+            "us" | "µs" | "micros" | "microseconds" => Ok(TimeUnit::Micros),
+            "ns" | "nanos" | "nanoseconds" => Ok(TimeUnit::Nanos),
+            other => Err(format!(
+                "unknown --time-unit '{}' (expected s, ms, us or ns)",
+                other
+            )),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeUnit::Seconds => "s",
+            TimeUnit::Millis => "ms",
+            TimeUnit::Micros => "us",
+            TimeUnit::Nanos => "ns",
+        }
+    }
+    /// Multiplier from this unit to seconds.
+    fn to_seconds(self) -> f64 {
+        match self {
+            TimeUnit::Seconds => 1.0,
+            TimeUnit::Millis => 1e-3,
+            TimeUnit::Micros => 1e-6,
+            TimeUnit::Nanos => 1e-9,
+        }
+    }
+}
+
+/// How to interpret a time column. The defaults are deliberately strict:
+/// date-only values are an error and bare clock times are reported as UTC.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeSpec {
+    pub date_only: DateOnlyPolicy,
+    /// Explicit unit for numeric columns; `None` auto-detects.
+    pub unit: Option<TimeUnit>,
+    /// Fixed UTC offset in seconds for timestamps without their own offset.
+    /// `None` means UTC (and is reported, never silent).
+    pub tz: Option<i64>,
+}
+
+impl Default for TimeSpec {
+    fn default() -> Self {
+        TimeSpec {
+            date_only: DateOnlyPolicy::Error,
+            unit: None,
+            tz: None,
+        }
+    }
+}
+
+impl TimeSpec {
+    /// Parse `--tz`: `UTC`/`Z` or a fixed offset such as `+02:00`, `-0500`.
+    ///
+    /// Named zones need a tz database (and DST rules); std has none, so they
+    /// are refused with a suggestion rather than guessed.
+    pub fn parse_tz(s: &str) -> Result<i64, String> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("utc") || t.eq_ignore_ascii_case("z") || t == "+00:00" {
+            return Ok(0);
+        }
+        let (sign, rest) = match t.as_bytes().first() {
+            Some(b'+') => (1i64, &t[1..]),
+            Some(b'-') => (-1i64, &t[1..]),
+            _ => {
+                return Err(format!(
+                    "--tz '{}': named time zones need a tz database; pass a fixed offset \
+                     such as --tz -05:00 (or UTC)",
+                    s
+                ))
+            }
+        };
+        let digits: String = rest.chars().filter(|c| *c != ':').collect();
+        if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "--tz '{}': expected a fixed offset such as -05:00 or +0530",
+                s
+            ));
+        }
+        let hh: i64 = digits[0..2].parse().unwrap_or(99);
+        let mm: i64 = digits[2..4].parse().unwrap_or(99);
+        if hh > 23 || mm > 59 {
+            return Err(format!("--tz '{}': offset out of range", s));
+        }
+        Ok(sign * (hh * 3600 + mm * 60))
+    }
+}
+
+/// What a time column contained and how it was converted, for the preparation
+/// block and the split notes.
+#[derive(Clone, Debug, Default)]
+pub struct TimeReport {
+    pub format: String,
+    pub unit: String,
+    pub date_only: String,
+    pub rows: usize,
+    /// Rows that carried their own UTC offset.
+    pub offset_rows: usize,
+    /// Numeric rows rescaled from ms/us/ns to seconds.
+    pub scaled_rows: usize,
+    pub notes: Vec<String>,
+}
+
+impl TimeReport {
+    pub fn text_lines(&self) -> Vec<String> {
+        let mut out = vec![format!(
+            "# time: format={} unit={} date-only={} offset_rows={} scaled_rows={}",
+            self.format, self.unit, self.date_only, self.offset_rows, self.scaled_rows
+        )];
+        out.extend(self.notes.iter().map(|n| format!("# time: {}", n)));
+        out
+    }
+
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"format\":\"{}\",\"unit\":\"{}\",\"date_only\":\"{}\",\"rows\":{},\"offset_rows\":{},\"scaled_rows\":{},\"notes\":{}}}",
+            self.format,
+            self.unit,
+            self.date_only,
+            self.rows,
+            self.offset_rows,
+            self.scaled_rows,
+            json_note_array(&self.notes)
+        )
+    }
+}
+
+fn json_note_array(notes: &[String]) -> String {
+    let items: Vec<String> = notes
+        .iter()
+        .map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Numeric unit windows: the converted instant must land between 1973 and
+/// 2103. The windows are disjoint by a factor of 1000, so realistic data is
+/// unambiguous; tiny values (row indices) are handled separately.
+const EPOCH_MIN_SECS: f64 = 1.0e8;
+const EPOCH_MAX_SECS: f64 = 4.2e9;
+
+fn unit_fits(vmin: f64, vmax: f64, unit: TimeUnit) -> bool {
+    let inv = 1.0 / unit.to_seconds();
+    let lo = EPOCH_MIN_SECS * inv;
+    let hi = EPOCH_MAX_SECS * inv;
+    vmin >= lo && vmax <= hi
+}
+
+fn detect_time_unit(values: &[f64], spec: &TimeSpec) -> Result<(TimeUnit, usize), String> {
+    let mut vmin = f64::INFINITY;
+    let mut vmax = f64::NEG_INFINITY;
+    let mut finite = 0usize;
+    for &v in values {
+        if v.is_finite() {
+            finite += 1;
+            vmin = vmin.min(v);
+            vmax = vmax.max(v);
+        }
+    }
+    if finite == 0 {
+        return Err("time column has no finite values".to_string());
+    }
+    if let Some(u) = spec.unit {
+        return Ok((u, finite));
+    }
+    // Row-index-like columns: too small to be an epoch in any unit. Keep the
+    // historical meaning (seconds) so synthetic integer time axes are
+    // unchanged.
+    if vmin >= 0.0 && vmax < EPOCH_MIN_SECS {
+        return Ok((TimeUnit::Seconds, 0));
+    }
+    let fits: Vec<TimeUnit> = [TimeUnit::Seconds, TimeUnit::Millis, TimeUnit::Micros, TimeUnit::Nanos]
+        .into_iter()
+        .filter(|&u| unit_fits(vmin, vmax, u))
+        .collect();
+    match fits.as_slice() {
+        [one] => Ok((*one, if *one == TimeUnit::Seconds { 0 } else { finite })),
+        [] => Err(format!(
+            "numeric time column spans [{} ..= {}] and fits no single epoch unit \
+             (s/ms/us/ns); pass --time-unit s|ms|us|ns if you know the unit",
+            vmin, vmax
+        )),
+        many => Err(format!(
+            "numeric time column is ambiguous: it fits {} units ({}); pass --time-unit \
+             s|ms|us|ns",
+            many.len(),
+            many.iter().map(|u| u.name()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+struct ParsedTime {
+    secs: f64,
+    /// Comparable signature of the syntactic form: separator, date-only vs
+    /// date-time, and whether the value carried an offset.
+    signature: String,
+    has_offset: bool,
+    date_only: bool,
+}
+
+/// Parse one strict ISO 8601 / RFC 3339 value.
+fn parse_iso(s: &str, spec: &TimeSpec) -> Result<ParsedTime, String> {
+    let (date, clock) = match s.split_once(['T', ' ']) {
+        Some((d, c)) => (d, Some(c.trim())),
+        None => (s, None),
+    };
+    if date.is_empty() {
+        return Err(format!("'{}' has no date", s));
+    }
+    let sep = if date.contains('/') {
+        '/'
+    } else {
+        '-'
+    };
+    let parts: Vec<&str> = date.split(sep).collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(format!(
+            "'{}': expected YYYY-MM-DD (or YYYY/MM/DD){}",
+            s,
+            if clock.is_some() { " with an optional clock" } else { "" }
+        ));
+    }
+    let y: i64 = parts[0]
+        .parse()
+        .map_err(|_| format!("'{}': bad year '{}'", s, parts[0]))?;
+    let mo: i64 = parts[1]
+        .parse()
+        .map_err(|_| format!("'{}': bad month '{}'", s, parts[1]))?;
+    let d: i64 = parts[2]
+        .parse()
+        .map_err(|_| format!("'{}': bad day '{}'", s, parts[2]))?;
+    if !(1..=12).contains(&mo) {
+        return Err(format!("'{}': month {} is out of range", s, mo));
+    }
+    if d < 1 || d > days_in_month(y, mo) {
+        return Err(format!("'{}': day {} is out of range for {}-{:02}", s, d, y, mo));
+    }
+    let mut secs = days_from_civil(y, mo, d) as f64 * 86400.0;
+    let mut has_offset = false;
+    let mut has_clock = false;
+    if let Some(mut c) = clock {
+        if c.is_empty() {
+            return Err(format!("'{}': empty clock after T/space", s));
+        }
+        has_clock = true;
+        let mut offset = 0i64;
+        if c.ends_with('Z') || c.ends_with('z') {
+            has_offset = true;
+            c = &c[..c.len() - 1];
+        } else if let Some(pos) = c.rfind(['+', '-']) {
+            if pos > 0 {
+                has_offset = true;
+                let sign = if c.as_bytes()[pos] == b'-' { -1 } else { 1 };
+                let off = &c[pos + 1..];
+                let digits: String = off.chars().filter(|ch| *ch != ':').collect();
+                if digits.len() != 4 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err(format!("'{}': bad UTC offset '+{}'", s, &c[pos..]));
+                }
+                let oh: i64 = digits[0..2].parse().unwrap_or(99);
+                let om: i64 = digits[2..4].parse().unwrap_or(99);
+                if oh > 23 || om > 59 {
+                    return Err(format!("'{}': UTC offset out of range", s));
+                }
+                offset = sign * (oh * 3600 + om * 60);
+                c = &c[..pos];
+            }
+        }
+        let tp: Vec<&str> = c.split(':').collect();
+        if tp.len() < 2 || tp.len() > 3 {
+            return Err(format!("'{}': expected HH:MM[:SS[.fff]]", s));
+        }
+        let hh: i64 = tp[0]
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{}': bad hour '{}'", s, tp[0]))?;
+        let mm: i64 = tp[1]
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{}': bad minute '{}'", s, tp[1]))?;
+        let ss: f64 = if tp.len() == 3 {
+            tp[2]
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}': bad second '{}'", s, tp[2]))?
+        } else {
+            0.0
+        };
+        if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0.0..61.0).contains(&ss) {
+            return Err(format!("'{}': clock component out of range", s));
+        }
+        secs += hh as f64 * 3600.0 + mm as f64 * 60.0 + ss;
+        // An explicit offset converts to UTC. Without one, use --tz or UTC;
+        // the caller records which assumption was used.
+        let applied = if has_offset {
+            offset
+        } else {
+            spec.tz.unwrap_or(0)
+        };
+        secs -= applied as f64;
+    } else {
+        match spec.date_only {
+            DateOnlyPolicy::Error => {
+                return Err(format!(
+                    "'{}' is date-only: its instant is under-specified. Pass \
+                     --date-only utc-midnight or --date-only session-close",
+                    s
+                ))
+            }
+            DateOnlyPolicy::UtcMidnight => {}
+            DateOnlyPolicy::SessionClose => secs += 21.0 * 3600.0,
+        }
+    }
+    // Widths catch the `2024-1-2` vs `2024-01-02` mix that a purely
+    // lexicographic fallback would order wrongly. Offsets are compared
+    // separately: with --tz a mixed offset/plain column is allowed.
+    let signature = format!(
+        "{}{}{}{}",
+        sep,
+        has_clock,
+        parts[1].len(),
+        parts[2].len()
+    );
+    Ok(ParsedTime {
+        secs,
+        signature,
+        has_offset,
+        date_only: !has_clock,
+    })
+}
+
+/// Parse a timestamp to seconds with the strictest defaults.
+///
+/// Accepts plain numbers (returned unchanged), `YYYY-MM-DD` (as UTC midnight,
+/// for backwards compatibility of this helper), `YYYY/MM/DD` and an optional
+/// `T`/space separated `HH:MM[:SS[.fff]]` with `Z` or `±HH:MM` offsets.
+/// [`time_keys_with`] is the column-level entry point and enforces the
+/// date-only policy.
 pub fn parse_time(s: &str) -> Option<f64> {
     let s = s.trim();
     if s.is_empty() {
@@ -3074,33 +3471,146 @@ pub fn parse_time(s: &str) -> Option<f64> {
     if let Ok(v) = s.parse::<f64>() {
         return Some(v);
     }
-    let (date, clock) = match s.split_once(['T', ' ']) {
-        Some((d, c)) => (d, Some(c)),
-        None => (s, None),
+    let spec = TimeSpec {
+        date_only: DateOnlyPolicy::UtcMidnight,
+        ..Default::default()
     };
-    let norm: String = date
-        .chars()
-        .map(|c| if c == '/' { '-' } else { c })
-        .collect();
-    let parts: Vec<&str> = norm.split('-').collect();
-    if parts.len() != 3 {
-        return None;
+    parse_iso(s, &spec).ok().map(|p| p.secs)
+}
+
+/// Comparable ordering keys for a time column, with an explicit [`TimeSpec`].
+///
+/// Numeric columns are unit-detected (s/ms/us/ns) and normalised to seconds;
+/// ISO 8601 columns are offset-aware and must share one format (and one
+/// offset convention unless `--tz` overrides). Every conversion and assumption
+/// is returned in [`TimeReport`].
+pub fn time_keys_with(
+    t: &Table,
+    col: usize,
+    spec: &TimeSpec,
+) -> Result<(Vec<f64>, TimeReport), String> {
+    let n = t.len();
+    let mut report = TimeReport {
+        date_only: spec.date_only.name().to_string(),
+        ..Default::default()
+    };
+    // A full numeric column: detect and normalise its unit. A high-cardinality
+    // numeric column with missing cells takes the same path (NaN is a gap).
+    if t.numeric[col] || t.dict(col).is_none() {
+        let values = t.col(col);
+        let (unit, scaled) = detect_time_unit(values, spec)?;
+        let factor = unit.to_seconds();
+        let keys: Vec<f64> = values
+            .iter()
+            .map(|&v| {
+                if v.is_nan() {
+                    f64::INFINITY
+                } else {
+                    v * factor
+                }
+            })
+            .collect();
+        report.format = "numeric".to_string();
+        report.unit = unit.name().to_string();
+        report.rows = n;
+        report.scaled_rows = scaled;
+        if scaled > 0 {
+            report.notes.push(format!(
+                "numeric time column read as {} and scaled to seconds ({} row(s))",
+                unit.name(),
+                scaled
+            ));
+        } else {
+            report
+                .notes
+                .push(format!("numeric time column read as {}", unit.name()));
+        }
+        return Ok((keys, report));
     }
-    let y: i64 = parts[0].parse().ok()?;
-    let mo: i64 = parts[1].parse().ok()?;
-    let d: i64 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return None;
+    let dict = t.dict(col).expect("dictionary checked above");
+    let mut keys = Vec::with_capacity(n);
+    let mut signature: Option<String> = None;
+    let mut first_has_offset: Option<bool> = None;
+    let mut offset_rows = 0usize;
+    let mut plain_rows = 0usize;
+    let mut date_only_rows = 0usize;
+    let mut assumed_utc = false;
+    for r in 0..n {
+        let raw = dict.text(r).trim();
+        if raw.is_empty() || is_missing_token(raw) {
+            keys.push(f64::INFINITY);
+            continue;
+        }
+        let parsed = parse_iso(raw, spec)
+            .map_err(|e| format!("data row {} (time column '{}'): {}", r + 1, t.names[col], e))?;
+        if let Some(sig) = &signature {
+            // Mixed formats are refused; an offset/plain mix is refused unless
+            // --tz tells us what the plain values mean.
+            if *sig != parsed.signature {
+                return Err(format!(
+                    "data row {} (time column '{}'): mixed time formats ('{}' after an earlier \
+                     '{}'); normalise the column, or pass --tz/--date-only with one convention",
+                    r + 1,
+                    t.names[col],
+                    raw,
+                    dict.text(0)
+                ));
+            }
+            if first_has_offset != Some(parsed.has_offset) && spec.tz.is_none() {
+                return Err(format!(
+                    "data row {} (time column '{}'): mixes offset-bearing and offset-less \
+                     timestamps ('{}'); pass --tz UTC or a fixed offset to state what the \
+                     offset-less values mean",
+                    r + 1,
+                    t.names[col],
+                    raw
+                ));
+            }
+        } else {
+            signature = Some(parsed.signature.clone());
+            first_has_offset = Some(parsed.has_offset);
+        }
+        if parsed.has_offset {
+            offset_rows += 1;
+        } else {
+            plain_rows += 1;
+        }
+        if parsed.date_only {
+            date_only_rows += 1;
+        }
+        if !parsed.has_offset && spec.tz.is_none() && !assumed_utc && !parsed.date_only {
+            assumed_utc = true;
+        }
+        keys.push(parsed.secs);
     }
-    let mut secs = days_from_civil(y, mo, d) as f64 * 86400.0;
-    if let Some(c) = clock {
-        let tp: Vec<&str> = c.split(':').collect();
-        let hh: f64 = tp.first().and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        let mm: f64 = tp.get(1).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        let ss: f64 = tp.get(2).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        secs += hh * 3600.0 + mm * 60.0 + ss;
+    let sig = signature.unwrap_or_else(|| "-".to_string());
+    report.format = if sig.contains('/') { "iso8601-slash" } else { "iso8601" }.to_string();
+    report.unit = "s".to_string();
+    report.rows = n;
+    report.offset_rows = offset_rows;
+    if date_only_rows > 0 {
+        report.notes.push(format!(
+            "{} date-only value(s) read as {}",
+            date_only_rows,
+            spec.date_only.name()
+        ));
     }
-    Some(secs)
+    if assumed_utc {
+        report
+            .notes
+            .push("offset-less timestamps interpreted as UTC (no --tz given)".to_string());
+    }
+    if offset_rows > 0 {
+        report
+            .notes
+            .push(format!("{} row(s) converted from their ISO 8601 offset to UTC", offset_rows));
+    }
+    if plain_rows > 0 && offset_rows > 0 {
+        report
+            .notes
+            .push("mixed offset/offset-less input accepted because --tz was given".to_string());
+    }
+    Ok((keys, report))
 }
 
 /// Days since the Unix epoch (Howard Hinnant's `days_from_civil`).
@@ -3169,6 +3679,8 @@ pub struct LagSpec {
     /// Start a new series when the time step exceeds this multiple of the
     /// series' median step (`0` disables gap splitting).
     pub gap_break: f64,
+    /// #130: how the time column is parsed.
+    pub time: TimeSpec,
 }
 
 #[derive(Clone, Default)]
