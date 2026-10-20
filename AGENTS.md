@@ -24,6 +24,11 @@ defines:
 * how to run several agents in parallel without them colliding over the same
   files.
 
+For time-series or panel data, read [`docs/time-series.md`](docs/time-series.md)
+before choosing a split: it is the checklist for purge/embargo, overlapping
+labels, look-ahead preparation, lockboxes, per-group reporting, multiple
+testing and transaction costs.
+
 Roadmap work is tracked as GitHub issues labelled `roadmap`:
 
 ```sh

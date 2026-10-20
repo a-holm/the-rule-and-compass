@@ -7,7 +7,10 @@ wrong, but because the model was tested on information it had already seen.
 
 This document explains the four splitting rules `rcsr` implements, why the
 default (a random split) is wrong for anything with a time order, and how the
-extras (`--gap`, `--folds`, `--split auto`) work.
+extras (`--gap`, `--folds`, `--split auto`) work. Once the split is chosen,
+run the full audit in [`time-series.md`](time-series.md): purge/embargo,
+overlapping labels, look-ahead preparation, lockboxes, per-group reporting,
+multiple testing and costs.
 
 ## The one rule that matters: no leakage
 
