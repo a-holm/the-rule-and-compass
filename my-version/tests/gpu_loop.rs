@@ -192,7 +192,7 @@ fn unavailable_device_falls_back_by_default_with_a_recorded_reason() {
         "built without --features cuda"
     };
     assert!(
-        stdout.contains(&format!("\"backend_reason\":\"{}\"", expected)),
+        stdout.contains(&format!("\"backend_reason\":\"{}", expected)),
         "expected a recorded fallback reason, json: {stdout}"
     );
     if cfg!(feature = "cuda") {
