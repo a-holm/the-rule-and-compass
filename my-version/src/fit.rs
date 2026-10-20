@@ -1086,7 +1086,13 @@ pub fn fit_weighted_strategy(
     if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
-
+    // #135: zero iterations means `--no-fit` on *every* strategy. In
+    // particular the closed-form linear arm is still a least-squares solve and
+    // must not run; `fit_lm` returns the generated constants' SSE without
+    // taking a step.
+    if iters == 0 {
+        return fit_lm(tree, x, y, w, 0);
+    }
     if strategy != FitStrategy::Exact {
         // #169: a direct call has no batch context. Record the fallback and use
         // the same exact CPU arms as `Auto`, never a no-op.
@@ -1548,6 +1554,17 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
+    // not only the squared family. IRLS, logistic IRLS and the coordinate
+    // polish all force a minimum of one sweep, so return the current score
+    // before reaching any of them. For the squared family this keeps the
+    // historical weighted-SSE return value rather than the mean-squared score.
+    if iters == 0 {
+        return match metric {
+            Squared | Aic | Aicc | Bic => fit_weighted(tree, x, y, w, 0),
+            _ => metric_score(tree, x, y, w, metric),
+        };
+    }
     match metric {
         // The exact historical path. Information criteria fit by least squares
         // and add their parameter penalty when scoring; they do not change the
@@ -2919,6 +2936,114 @@ mod tests {
         assert!(FIT_STEPS.with(|n| n.get()) > 0, "positive iters must take steps");
         assert_ne!(fitted_constants(&tree), before, "positive iters must fit");
         assert!(fitted < initial_sse, "positive iters must improve the SSE");
+    }
+
+    /// #135: zero iterations is a true no-op for *every* metric, including the
+    /// IRLS/logistic paths that previously forced `iters.max(1)`, and for the
+    /// closed-form linear arm that previously ran before the zero check.
+    #[test]
+    fn zero_iters_is_a_no_op_for_every_metric() {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![-2.0 + 4.0 * i as f64 / 40.0]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| 1.7 * r[0] * r[0] - 0.4 * r[0] + 0.8)
+            .collect();
+        let metrics = [
+            Metric::Squared,
+            Metric::Absolute,
+            Metric::LogSquashed,
+            Metric::Auc,
+            Metric::LogLoss,
+            Metric::Hinge,
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+            Metric::RankCorrelation,
+            Metric::RankCorrelationSigned,
+            Metric::Signed,
+            Metric::Median,
+            Metric::Maximum,
+            Metric::Interquartile,
+            Metric::Slope,
+            Metric::Aic,
+            Metric::Aicc,
+            Metric::Bic,
+        ];
+        for metric in metrics {
+            let mut tree = node(
+                Op::Add,
+                vec![
+                    node(Op::Mul, vec![constant(3.0), input(0)]),
+                    constant(0.5),
+                ],
+            );
+            let before = fitted_constants(&tree);
+            FIT_STEPS.with(|n| n.set(0));
+            let score = fit_weighted_metric(&mut tree, &x, &y, &[], 0, metric);
+            assert_eq!(
+                fitted_constants(&tree),
+                before,
+                "{}: constants must stay as generated",
+                metric.name()
+            );
+            assert!(
+                score.is_finite(),
+                "{}: the generated tree must still be scored, got {score}",
+                metric.name()
+            );
+            assert_eq!(
+                FIT_STEPS.with(|n| n.get()),
+                0,
+                "{}: no LM/polish step may run",
+                metric.name()
+            );
+
+            // Positive iterations must still take steps, so the counter
+            // assertion above cannot pass vacuously.
+            FIT_STEPS.with(|n| n.set(0));
+            fit_weighted_metric(&mut tree, &x, &y, &[], 8, metric);
+            assert!(
+                FIT_STEPS.with(|n| n.get()) > 0,
+                "{}: positive iterations must take steps",
+                metric.name()
+            );
+        }
+    }
+
+    /// #135: `auto`/`linear` must not take the closed-form least-squares arm
+    /// when the budget is zero; on an exactly affine tree that arm would move
+    /// the constants even though `--no-fit` was requested.
+    #[test]
+    fn zero_iters_skips_the_linear_arm_for_auto_and_linear() {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![-2.0 + 4.0 * i as f64 / 40.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 3.0 * r[0] + 2.0).collect();
+        for strategy in [FitStrategy::Auto, FitStrategy::Linear] {
+            let mut tree = node(
+                Op::Add,
+                vec![
+                    node(Op::Mul, vec![constant(1.0), input(0)]),
+                    constant(0.0),
+                ],
+            );
+            let before = fitted_constants(&tree);
+            let initial_sse = flat_sse(&tree, &x, &y);
+            FIT_STEPS.with(|n| n.set(0));
+            let sse = fit_weighted_strategy(&mut tree, &x, &y, &[], 0, strategy);
+            assert_eq!(
+                fitted_constants(&tree),
+                before,
+                "{strategy:?}: constants must stay as generated"
+            );
+            assert_eq!(
+                sse.to_bits(),
+                initial_sse.to_bits(),
+                "{strategy:?}: SSE must be the generated one"
+            );
+            assert_eq!(
+                FIT_STEPS.with(|n| n.get()),
+                0,
+                "{strategy:?}: no least-squares or LM step may run"
+            );
+        }
     }
 
     /// #116: `a*x + b` is affine in both constants and the closed-form arm

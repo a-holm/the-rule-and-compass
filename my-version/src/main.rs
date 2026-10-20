@@ -359,7 +359,8 @@ SEARCH:
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants
-                             (default 8; 0 = no fitting at all). Constants are
+                             (default 8; 0 = no fitting at all, for every
+                             metric and both fit strategies). Constants are
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
                              log_squashed use IRLS; auc/log_loss/hinge use
