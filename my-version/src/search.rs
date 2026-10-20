@@ -941,6 +941,13 @@ fn can_reuse_sse(cfg: &Config, train: &EvalSample, fit: &FitResult, hash: u64) -
         && !train.sample.is_empty()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// #85: how many times [`refit_survivor`] reused the fitter's final SSE
+    /// instead of scoring the promoted tree again.
+    static REFIT_SSE_REUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
 /// objective when more than one target is present. Single-output samples take
 /// the SoA/scalar pair in [`eval_error_on`].
@@ -1101,12 +1108,25 @@ fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Optio
 /// there, ready to enter the archive.
 fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
     let mut tree = expr::simplify(tree);
+    // #85/#87: the promoted tree is fitted on exactly the rows that will score
+    // it, so for the squared metric the fitter's final SSE is the score.
+    // Reusing it removes one full-data sweep per survivor; the score is the
+    // same bit pattern (see `Ind::evaluated_fitted`).
+    let mut fitted = None;
     if cfg.fit_iters > 0 && !train.sample.is_multi() {
-        fit_constants(&mut tree, cfg, train.sample, train.sample);
+        fitted = fit_constants(&mut tree, cfg, train.sample, train.sample);
         tree = expr::simplify(&tree);
     }
+    let hash = expr::structural_hash(&tree);
     let error = if cfg.accepts_dimensions(&tree) {
-        score_tree(&tree, train, cfg)
+        match fitted {
+            Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
+                #[cfg(test)]
+                REFIT_SSE_REUSED.with(|n| n.set(n.get() + 1));
+                fit.sse / train.sample.len() as f64
+            }
+            _ => score_tree(&tree, train, cfg), // #27
+        }
     } else {
         f64::INFINITY
     };
@@ -2895,6 +2915,51 @@ mod tests {
         let full = eval_error_with(&sol.tree, &s, Metric::Squared, true);
         assert_eq!(sol.error.to_bits(), full.to_bits());
         assert!(sol.error < 1e-12, "full-data error = {}", sol.error);
+    }
+
+    /// #85: the promoted tree is fitted on exactly the rows that score it, so
+    /// the squared path reuses the fitter's final SSE instead of walking every
+    /// row a second time. A metric with a different loss still scores afresh.
+    #[test]
+    fn refit_reuses_the_fit_sse_only_on_the_exact_squared_path() {
+        let s = sample(); // y = x0
+        let view = EvalSample::new(
+            &s,
+            &Config {
+                metric: Metric::Squared,
+                fit_iters: 8,
+                ..Default::default()
+            },
+        );
+        let mut squared = Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            ..Default::default()
+        };
+        // A constant under `sin` cannot fold into the expression, so the hash
+        // at the fit and after simplification agree.
+        let tree = node(
+            Op::Sin,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)])],
+        );
+        let before = REFIT_SSE_REUSED.with(|n| n.get());
+        refit_survivor(&tree, &view, &squared);
+        assert_eq!(
+            REFIT_SSE_REUSED.with(|n| n.get()),
+            before + 1,
+            "the squared refit must reuse the final SSE"
+        );
+
+        // The configured loss for `absolute` is not the fitter's squared SSE.
+        squared.metric = Metric::Absolute;
+        let before = REFIT_SSE_REUSED.with(|n| n.get());
+        let view = EvalSample::new(&s, &squared);
+        refit_survivor(&tree, &view, &squared);
+        assert_eq!(
+            REFIT_SSE_REUSED.with(|n| n.get()),
+            before,
+            "a non-squared metric must never reuse the squared SSE"
+        );
     }
 
     /// #87: guarded operators must not leave a finite fit SSE behind. The
