@@ -2,7 +2,9 @@
 //! rows are sampled, stays an estimate of the same row-average loss.
 
 use rcsr::data::Sample;
-use rcsr::diagnostics::{knn_predict, knn_sampling_supported, Baselines, KNN_KD_MAX_DIM};
+use rcsr::diagnostics::{
+    knn_predict, knn_sampling_supported, Baselines, DEFAULT_BASELINE_SAMPLES, KNN_KD_MAX_DIM,
+};
 use rcsr::metrics::{self, Metric};
 
 /// Deterministic synthetic sample with `n` rows and `dims` inputs.
@@ -124,6 +126,41 @@ fn zero_samples_means_no_caps_at_all() {
     assert!(no_caps.knn_test_query_sem.is_nan());
 }
 
+/// #132: the CLI default is bounded on a large training set but exact when the
+/// panel is no larger than the cap. `0` still means every row.
+#[test]
+fn default_query_cap_is_bounded_large_and_exact_small() {
+    let large = sample(5_000, 2, 41);
+    let b = Baselines::fit_sampled(
+        &large,
+        &[],
+        Metric::Absolute,
+        DEFAULT_BASELINE_SAMPLES,
+        7,
+    );
+    assert_eq!(b.knn_reference_rows, large.len());
+    assert_eq!(b.knn_train_query_rows, DEFAULT_BASELINE_SAMPLES);
+    assert!(b.knn_capped);
+    assert!(b.knn_train_query_sem.is_finite() && b.knn_train_query_sem > 0.0);
+    assert!(b.knn_seconds >= 0.0);
+
+    let small = sample(100, 2, 42);
+    let e = Baselines::fit_sampled(
+        &small,
+        &[],
+        Metric::Absolute,
+        DEFAULT_BASELINE_SAMPLES,
+        7,
+    );
+    assert_eq!(e.knn_train_query_rows, small.len());
+    assert!(!e.knn_capped);
+    assert!(e.knn_train_query_sem.is_nan());
+
+    let exact = Baselines::fit_sampled(&large, &[], Metric::Absolute, 0, 7);
+    assert_eq!(exact.knn_train_query_rows, large.len());
+    assert!(!exact.knn_capped);
+}
+
 #[test]
 fn json_reports_split_query_rows_and_sems() {
     let train = sample(20_000, 3, 8);
@@ -133,6 +170,7 @@ fn json_reports_split_query_rows_and_sems() {
     assert!(json.contains("\"train_query_rows\":256"), "{json}");
     assert!(json.contains("\"test_query_rows\":0"), "{json}");
     assert!(json.contains("\"capped\":true"), "{json}");
+    assert!(json.contains("\"seconds\":"), "{json}");
     assert!(!json.contains("\"train_query_sem\":null"), "{json}");
 
     let exact = Baselines::fit_sampled(&train, &[], Metric::Absolute, 0, 17);

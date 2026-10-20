@@ -234,6 +234,54 @@ fn json_timing_phases_sum_to_the_measured_wall() {
         Some(Json::Num(v)) => assert_eq!(*v, search),
         other => panic!("elapsed_seconds missing or not a number: {other:?}"),
     }
+    }
+
+/// #132: the CLI's default baseline is capped, and explicitly passing 0 still
+/// asks for the exact every-row query. The JSON carries the sampling fields.
+#[test]
+fn cli_baseline_default_is_capped_and_zero_is_exact() {
+    let csv = TempCsv::new(&line_csv(2000));
+    let base = [
+        "--data", csv.as_str(), "--target", "y", "--vars", "x",
+        "--seed", "3", "--generations", "1", "--pop", "8", "--json",
+    ];
+    let parse = |out: &Output| {
+        let parsed = parse_json(String::from_utf8_lossy(&out.stdout).trim())
+            .expect("valid JSON");
+        let Json::Obj(items) = parsed else { panic!("object") };
+        let baselines = match obj_get(&items, "baselines") {
+            Some(Json::Obj(v)) => v,
+            _ => panic!("baselines missing"),
+        };
+        let knn = match obj_get(baselines, "knn") {
+            Some(Json::Obj(v)) => v,
+            _ => panic!("knn missing"),
+        };
+        let num = |k: &str| match obj_get(knn, k) {
+            Some(Json::Num(v)) => *v,
+            other => panic!("knn.{k} missing: {other:?}"),
+        };
+        let capped = match obj_get(knn, "capped") {
+            Some(Json::Bool(v)) => *v,
+            other => panic!("knn.capped missing: {other:?}"),
+        };
+        (num("reference_rows"), num("train_query_rows"), capped, obj_get(knn, "seconds").is_some())
+    };
+    let out = run(&base);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (reference, queries, capped, has_seconds) = parse(&out);
+    assert_eq!(reference, 1500.0, "default test split leaves 1500 training rows");
+    assert_eq!(queries, 512.0, "the default must be the bounded cap");
+    assert!(capped);
+    assert!(has_seconds, "JSON must report the baseline seconds");
+
+    let mut args = base.to_vec();
+    args.extend(["--baseline-samples", "0"]);
+    let out = run(&args);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (_, queries, capped, _) = parse(&out);
+    assert_eq!(queries, 1500.0, "0 must mean every row");
+    assert!(!capped);
 }
 
 #[test]

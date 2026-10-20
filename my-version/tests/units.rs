@@ -494,13 +494,18 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 /// compared against the recorded golden.
 fn mask_elapsed(src: &str) -> String {
     let src = mask_timing(src);
+    let src = mask_seconds(&src);
     let key = "\"elapsed_seconds\":";
     let mut out = String::with_capacity(src.len());
     let mut rest = &src[..];
     while let Some(i) = rest.find(key) {
         out.push_str(&rest[..i + key.len()]);
-        out.push_str("ELAPSED");
+        out.push_str(placeholder);
         let after = &rest[i + key.len()..];
+        if after.starts_with(placeholder) {
+            rest = &after[placeholder.len()..];
+            continue;
+        }
         let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
         rest = &after[end..];
     }
@@ -536,6 +541,26 @@ fn mask_timing(src: &str) -> String {
                 _ => {}
             }
         }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mask the k-NN baseline's `seconds` field added in #132.
+fn mask_seconds(src: &str) -> String {
+    let key = "\"seconds\":";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = &src[..];
+    while let Some(i) = rest.find(key) {
+        out.push_str(&rest[..i + key.len()]);
+        out.push_str("SECONDS");
+        let after = &rest[i + key.len()..];
+        if after.starts_with("SECONDS") {
+            rest = &after["SECONDS".len()..];
+            continue;
+        }
+        let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
         rest = &after[end..];
     }
     out.push_str(rest);

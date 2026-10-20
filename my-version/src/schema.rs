@@ -50,7 +50,7 @@ pub fn json() -> String {
         ("--null-block", "int", "0", "block-permutation null: contiguous block length in rows (>= label horizon; 0 = i.i.d. shuffle). Implies 19 runs when --null-runs is absent"),
         // #69: reference set always exact; only query rows are sampled, and
         // only for mean-loss metrics.
-        ("--baseline-samples", "int", "0", "k-NN null baseline query rows to score (0 = every row; absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction"),
+        ("--baseline-samples", "int", "512", "k-NN null baseline query rows to score (default 512; 0 = every row, opt-in because the exact query is O(train^2*d); absolute/squared/log_squashed only). The reference set is always all training rows; sampled results report train/test SEM with the finite-population correction, and JSON reports reference/query rows, capped and seconds"),
         ("--bootstrap-error", "int", "0", "bootstrap resamples for the .632+ error estimate (0 = off); above n^0.7 >= 1000 rows the draw is a BLB subsample of b = n^0.7 rows and the resample size is reported"),
         ("--cv", "string", "none", "cross-validation scheme: k-fold | rolling | purged"),
         ("--cv-k", "int", "5", "number of cross-validation folds"),
