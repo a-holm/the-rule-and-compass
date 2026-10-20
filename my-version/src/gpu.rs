@@ -16,7 +16,7 @@
 //! * FP32 throughout, because on both the RTX 3060 and the GB10 in the DGX Spark
 //!   FP64 runs at 1/64 of FP32.
 
-use crate::expr::{Node, Op};
+use crate::expr::{constant, node, Node, Op};
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -50,14 +50,89 @@ const OP_COSH: u32 = 22;
 const OP_HALT: u32 = 255;
 
 /// Compile one expression to postfix bytecode. Returns `false` if the tree uses
-/// an operator the kernel does not implement (`if`, which is a branch and would
-/// reintroduce divergence).
+/// an operator the kernel does not implement even after [`lower`] (for example
+/// `floor`, `mod` or `atan2`).
 pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
     if !emit(n, out) {
         return false;
     }
     out.push(OP_HALT);
     true
+}
+
+/// #121: rewrite operators the kernel lacks into exact equivalents over the
+/// supported instruction set. The identities below are exact for finite values
+/// (NaN semantics differ for a few, so search results are always verified by
+/// the f64 CPU scorer before they are reported).
+fn lower(n: &Node) -> Node {
+    use Op::*;
+    if matches!(n.op, Const | Input) {
+        return n.clone();
+    }
+    let k: Vec<Node> = n.kids.iter().map(lower).collect();
+    let abs_diff = |a: &Node, b: &Node| node(Abs, vec![node(Sub, vec![a.clone(), b.clone()])]);
+    match n.op {
+        Min | Max => {
+            // #121: gated tie form. `(a+b-|a-b|)/2` overflows in f32
+            // (min(1e8, 1) -> 0), so never add the operands.
+            let a = k[0].clone(); let b = k[1].clone();
+            let u = node(Step, vec![node(Sub, vec![b.clone(), a.clone()])]);
+            let v = node(Step, vec![node(Sub, vec![a.clone(), b.clone()])]);
+            let w = node(Sub, vec![node(Sub, vec![constant(1.0), u.clone()]), v.clone()]);
+            if matches!(n.op, Min) {
+                node(Add, vec![
+                    node(Add, vec![node(Mul, vec![u, a.clone()]), node(Mul, vec![v, b])]),
+                    node(Mul, vec![w, a]),
+                ])
+            } else {
+                node(Add, vec![
+                    node(Add, vec![node(Mul, vec![u, b]), node(Mul, vec![v, a.clone()])]),
+                    node(Mul, vec![w, a]),
+                ])
+            }
+        }
+        If => {
+            // #121: symmetric gate; the compact b + step(c)(a-b) is not exact
+            // for extreme arms. Both arms are evaluated, so this is only used
+            // when both are finite (the compiler's totality check is follow-up).
+            let c = node(Step, vec![k[0].clone()]);
+            let nc = node(Sub, vec![constant(1.0), c.clone()]);
+            node(Add, vec![node(Mul, vec![c, k[1].clone()]), node(Mul, vec![nc, k[2].clone()])])
+        }
+        Sign => node(Sub, vec![node(Step, vec![k[0].clone()]), node(Step, vec![node(Neg, vec![k[0].clone()])])]),
+        Less => node(Step, vec![node(Sub, vec![k[1].clone(), k[0].clone()])]),
+        LessOrEqual => node(Sub, vec![constant(1.0), node(Step, vec![node(Sub, vec![k[0].clone(), k[1].clone()])])]),
+        Greater => node(Step, vec![node(Sub, vec![k[0].clone(), k[1].clone()])]),
+        GreaterOrEqual => node(Sub, vec![constant(1.0), node(Step, vec![node(Sub, vec![k[1].clone(), k[0].clone()])])]),
+        Equal => {
+            let d = abs_diff(&k[0], &k[1]);
+            node(Sub, vec![
+                node(Sub, vec![constant(1.0), node(Step, vec![d.clone()])]),
+                node(Step, vec![node(Neg, vec![d])]),
+            ])
+        }
+        Not => node(Sub, vec![constant(1.0), node(Step, vec![k[0].clone()])]),
+        And => node(Mul, vec![node(Step, vec![k[0].clone()]), node(Step, vec![k[1].clone()])]),
+        Or => node(Step, vec![node(Add, vec![k[0].clone(), k[1].clone()])]),
+        Xor => node(Abs, vec![node(Sub, vec![node(Step, vec![k[0].clone()]), node(Step, vec![k[1].clone()])])]),
+        Asinh => {
+            // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
+            let x = k[0].clone();
+            let sgn = node(Sub, vec![node(Step, vec![x.clone()]), node(Step, vec![node(Neg, vec![x.clone()])])]);
+            let mag = node(Ln, vec![node(Add, vec![node(Abs, vec![x.clone()]), node(Sqrt, vec![node(Add, vec![node(Mul, vec![x.clone(), x]), constant(1.0)])])])]);
+            node(Mul, vec![sgn, mag])
+        }
+        Acosh => {
+            // factored (x-1)(x+1) survives x -> 1 in f32
+            let x = k[0].clone();
+            node(Ln, vec![node(Add, vec![x.clone(), node(Sqrt, vec![node(Mul, vec![node(Sub, vec![x.clone(), constant(1.0)]), node(Add, vec![x, constant(1.0)])])])])])
+        }
+        Atanh => {
+            let x = k[0].clone();
+            node(Mul, vec![constant(0.5), node(Ln, vec![node(Div, vec![node(Add, vec![constant(1.0), x.clone()]), node(Sub, vec![constant(1.0), x])])])])
+        }
+        _ => node(n.op, k),
+    }
 }
 
 /// Emit the opcodes for a subtree. The `HALT` terminator is added only by
@@ -151,6 +226,28 @@ extern "C" {
 /// call transfers the whole population and launches one kernel with one block
 /// per program, returning one SSE per program. It is deliberately *not* wired
 /// into the search loop yet; the search owns its own scheduling.
+/// #121: postfix peak stack depth. Leaves push; unary is net zero; an
+/// n-ary operator pops n-1. Reject before emission when the kernel's 64-slot
+/// stack could overflow.
+fn peak_stack(n: &Node) -> usize {
+    fn walk(n: &Node, cur: &mut usize, peak: &mut usize) {
+        for k in &n.kids {
+            walk(k, cur, peak);
+        }
+        match n.kids.len() {
+            0 => {
+                *cur += 1;
+                if *cur > *peak { *peak = *cur; }
+            }
+            1 => {}
+            k => { *cur -= k - 1; }
+        }
+    }
+    let (mut cur, mut peak) = (0, 0);
+    walk(n, &mut cur, &mut peak);
+    peak
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Population {
     prog: Vec<u32>,
@@ -173,7 +270,14 @@ impl Population {
     /// kernel does not implement; the population itself stays valid.
     pub fn add(&mut self, tree: &Node) -> bool {
         let mut buf = Vec::new();
-        if !compile(tree, &mut buf) {
+        let lowered = lower(tree);
+        // #121: the kernel has no stack-bounds check (RC_MAX_STACK=64), so a
+        // lowered program must be rejected before emission if it could overflow.
+        if peak_stack(&lowered) > 56 {
+            self.unsupported += 1;
+            return false;
+        }
+        if !compile(&lowered, &mut buf) {
             self.unsupported += 1;
             return false;
         }
@@ -363,13 +467,14 @@ mod tests {
         let mut pop = Population::new();
         assert!(pop.is_empty());
         assert!(pop.add(&trees[0]));
-        // `if` is a branch and has no kernel opcode.
-        assert!(!pop.add(&node(
+        // `if` is lowered, but `floor` still has no kernel opcode.
+        assert!(pop.add(&node(
             Op::If,
             vec![input(0), constant(1.0), constant(2.0)]
         )));
+        assert!(!pop.add(&node(Op::Floor, vec![input(0)])));
         assert!(pop.add(&trees[1]));
-        assert_eq!(pop.len(), 2);
+        assert_eq!(pop.len(), 3);
         assert_eq!(pop.unsupported(), 1);
         let (prog, offsets) = pop.programs();
         assert_eq!(offsets.len(), pop.len() + 1);
@@ -431,5 +536,153 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn lowered_if_runs_on_the_gpu_and_matches_the_cpu() {
+        let (cols, n, nv, y, _) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let trees = vec![
+            node(
+                Op::If,
+                vec![input(0), input(1), node(Op::Neg, vec![input(0)])],
+            ),
+            node(Op::Min, vec![input(0), input(1)]),
+            node(Op::Max, vec![input(0), constant(0.25)]),
+            node(Op::Sign, vec![input(1)]),
+            node(Op::Greater, vec![input(0), input(1)]),
+        ];
+        let pop = Population::from_trees(&trees);
+        assert_eq!(pop.len(), trees.len(), "every lowered tree must compile");
+        assert_eq!(pop.unsupported(), 0);
+        let (gpu, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0, "CUDA batch failed");
+        for (i, tree) in trees.iter().enumerate() {
+            let cpu = cpu_sse(tree, &cols, n, nv, &y);
+            let rel = (gpu[i] as f64 - cpu).abs() / (1.0 + cpu.abs());
+            assert!(
+                rel < 1e-4,
+                "lowered program {}: GPU SSE {} vs CPU SSE {} (relative {:.2e})",
+                i,
+                gpu[i],
+                cpu,
+                rel
+            );
+        }
+    }
 }
 
+
+#[cfg(test)]
+mod lower_tests {
+    use super::*;
+    use crate::expr::{eval, input};
+
+    fn close(a: f64, b: f64) {
+        if a.is_nan() && b.is_nan() { return; }
+        assert!((a - b).abs() <= 1e-9 * (1.0 + a.abs().max(b.abs())), "{a} vs {b}");
+    }
+
+    fn check(t: Node, rows: &[Vec<f64>]) {
+        let l = lower(&t);
+        let mut buf = Vec::new();
+        assert!(compile(&l, &mut buf), "lowered tree must compile");
+        for r in rows {
+            close(eval(&t, r), eval(&l, r));
+        }
+    }
+
+    #[test]
+    fn lowered_operators_match_the_cpu() {
+        let rows = [
+            vec![-2.0, -0.5], vec![-0.5, 0.0], vec![0.0, 0.0],
+            vec![0.25, 0.75], vec![1.5, 2.0], vec![3.0, -1.0],
+        ];
+        let x = || input(0);
+        let y = || input(1);
+        check(node(Op::Min, vec![x(), y()]), &rows);
+        check(node(Op::Max, vec![x(), y()]), &rows);
+        check(node(Op::If, vec![x(), y(), node(Op::Neg, vec![y()])]), &rows);
+        check(node(Op::Sign, vec![x()]), &rows);
+        check(node(Op::Less, vec![x(), y()]), &rows);
+        check(node(Op::LessOrEqual, vec![x(), y()]), &rows);
+        check(node(Op::Greater, vec![x(), y()]), &rows);
+        check(node(Op::GreaterOrEqual, vec![x(), y()]), &rows);
+        check(node(Op::Equal, vec![x(), y()]), &rows);
+        check(node(Op::And, vec![x(), y()]), &rows);
+        check(node(Op::Or, vec![x(), y()]), &rows);
+        check(node(Op::Xor, vec![x(), y()]), &rows);
+        check(node(Op::Not, vec![x()]), &rows);
+        check(node(Op::Asinh, vec![x()]), &rows);
+        check(node(Op::Atanh, vec![node(Op::Div, vec![x(), constant(4.0)])]), &rows);
+    }
+
+    #[test]
+    fn acosh_matches_on_its_domain() {
+        let t = node(Op::Acosh, vec![input(0)]);
+        let l = lower(&t);
+        for x in [1.0, 1.5, 2.0, 10.0] {
+            close(eval(&t, &[x]), eval(&l, &[x]));
+        }
+    }
+}
+
+#[cfg(test)]
+mod lower_extreme_tests {
+    use super::*;
+    use crate::expr::{constant, eval, input, node, Op};
+
+    #[test]
+    fn min_max_do_not_add_operands() {
+        let cases = [(1e8, 1.0), (3e38, -3e38), (1.0, 1.0), (-0.0, 0.0)];
+        for (a, b) in cases {
+            let mn = node(Op::Min, vec![constant(a), constant(b)]);
+            let mx = node(Op::Max, vec![constant(a), constant(b)]);
+            assert_eq!(eval(&lower(&mn), &[]), a.min(b));
+            assert_eq!(eval(&lower(&mx), &[]), a.max(b));
+        }
+    }
+
+    #[test]
+    fn if_is_exact_for_extreme_arms() {
+        let t = node(Op::If, vec![input(0), constant(1.0), constant(1e8)]);
+        let l = lower(&t);
+        for (x, want) in [(1.0, 1.0), (-1.0, 1e8), (0.0, 1e8)] {
+            assert_eq!(eval(&l, &[x]), want);
+        }
+    }
+
+    #[test]
+    fn asinh_negative_uses_the_odd_form() {
+        let t = node(Op::Asinh, vec![input(0)]);
+        let l = lower(&t);
+        let a = eval(&t, &[-1e8]);
+        let b = eval(&l, &[-1e8]);
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn peak_stack_guard_rejects_too_deep() {
+        // right-deep add chain: postfix peak grows with depth
+        let mut t = input(0);
+        for _ in 0..60 {
+            t = node(Op::Add, vec![input(1), t]);
+        }
+        assert!(peak_stack(&t) > 56);
+        let mut pop = Population::new();
+        assert!(!pop.add(&t), "a >56-deep program must be rejected before emission");
+    }
+
+    #[test]
+    fn peak_stack_counts_ternary_pops() {
+        // An `if` pushes 3 and pops 2 (net +1). Two ternaries under one add
+        // peak at 4; counting a ternary as popping one would report 5.
+        let leaf_if = |a: f64, b: f64| {
+            node(Op::If, vec![input(0), constant(a), constant(b)])
+        };
+        let t = node(Op::Add, vec![leaf_if(1.0, 2.0), leaf_if(3.0, 4.0)]);
+        assert_eq!(peak_stack(&t), 4);
+    }
+}
