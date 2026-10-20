@@ -1461,8 +1461,9 @@ pub struct Prepared {
     pub validation: Option<Sample>,
     /// All test folds concatenated, in fold order (what the search evaluates on).
     pub test: Sample,
-    /// One sample per evaluation block. With `folds == 1` this is a single
-    /// sample identical to `test`.
+    /// One sample per evaluation block when there is more than one fold. With
+    /// `folds == 1` this is empty and `test` is the single block (issue #133:
+    /// the pooled block is not built twice).
     pub fold_samples: Vec<Sample>,
     /// Affine denormalisation constants: original = normalised * stds + means.
     /// With the default centre/scale these are the training mean and standard
@@ -2118,8 +2119,20 @@ pub fn prepare_full_targets_weighted_with(
 ) -> Result<Prepared, String> {
     // With an explicit --fill method, a junk token in an otherwise numeric
     // column is treated as a missing value (and then filled or dropped).
-    // Without it the column stays non-numeric, exactly as before.
-    let coerced = if prep.fill != FillMethod::None {
+    // Without it the column stays non-numeric, exactly as before. #133: only
+    // clone/scan the table when a named input or target is actually non-numeric;
+    // an all-numeric store must not pay for a second full columnar image.
+    let needs_coerce = prep.fill != FillMethod::None
+        && (targets.iter().any(|name| {
+            t.index_of(name)
+                .map(|j| !t.numeric[j])
+                .unwrap_or(false)
+        }) || vars.iter().any(|name| {
+            t.index_of(name)
+                .map(|j| !t.numeric[j])
+                .unwrap_or(false)
+        }));
+    let coerced = if needs_coerce {
         Some(coerce_numeric(t))
     } else {
         None
@@ -2281,7 +2294,9 @@ pub fn prepare_full_targets_weighted_with(
     // stage mutates a cell (fill / outlier / smoothing). The default path
     // (no fill, no outlier rule, no smoothing) reads the table directly, so the
     // preparation no longer duplicates every used column before sampling.
-    let mutating = !matches!(prep.fill, FillMethod::None)
+    // `Drop` only reads cells to set the row mask; it never mutates one, so it
+    // must not trigger the row-major copy either.
+    let mutating = !matches!(prep.fill, FillMethod::None | FillMethod::Drop)
         || prep.outlier_iqr.is_some_and(|k| k > 0.0)
         || prep.smooth > 1;
     #[cfg(test)]
@@ -2297,10 +2312,18 @@ pub fn prepare_full_targets_weighted_with(
     } else {
         None
     };
+    // #133: when no stage needs a mutable copy, keep direct slices of the
+    // columnar table. Reads then avoid the per-cell `Table::value` bounds and
+    // `Option` chain on every row of every column.
+    let direct_cols: Vec<&[f64]> = if cells.is_none() {
+        used_cols.iter().map(|&c| filtered.col(c)).collect()
+    } else {
+        Vec::new()
+    };
     let cell = |cells: &Option<Vec<Vec<f64>>>, r: usize, k: usize| -> f64 {
         match cells {
             Some(c) => c[r][k],
-            None => filtered.value(r, used_cols[k]),
+            None => direct_cols[k][r],
         }
     };
     let mut keep = vec![true; n];
@@ -2605,16 +2628,27 @@ pub fn prepare_full_targets_weighted_with(
             stds[j] = 1.0;
             continue;
         }
-        let vals: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
-        let m = vals.iter().sum::<f64>() / vals.len() as f64;
-        let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
+        // #133: sum in the same training-row order without materialising a
+        // per-column copy. The arithmetic (two passes, mean then squared
+        // deviations) is unchanged, so selected rows and scores stay identical.
+        let mut sum = 0.0f64;
+        for &i in &train_idx {
+            sum += cell(&cells, i, j);
+        }
+        let m = sum / train_idx.len() as f64;
+        let mut var = 0.0f64;
+        for &i in &train_idx {
+            let d = cell(&cells, i, j) - m;
+            var += d.powi(2);
+        }
+        var /= train_idx.len() as f64;
         let s = var.sqrt();
         // #133: median/min/max/IQR/range are the only modes that read an
         // ordered copy. The default mean/std path never clones or sorts.
         let need_sorted = !matches!(prep.center, Center::Mean | Center::None)
             || !matches!(prep.scale, Scale::Std | Scale::None);
         let sorted = if need_sorted {
-            let mut sorted = vals.clone();
+            let mut sorted: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             sorted
         } else {
@@ -2640,20 +2674,46 @@ pub fn prepare_full_targets_weighted_with(
         let mut s = Sample::default();
         s.x.reserve(idx.len());
         s.y.reserve(idx.len());
-        for &i in idx {
-            let mut row = Vec::with_capacity(nv);
-            for j in 0..nv {
-                row.push((cell(&cells, i, j) - means[j]) / stds[j]);
-            }
-            s.x.push(row);
-            // Target 0 lives in `y`; a multi-output sample also keeps every
-            // target (including the first) in `ys` (issue #15).
-            s.y.push(cell(&cells, i, nv));
-        }
-        if nt > 1 {
-            s.ys = (0..nt)
-                .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
+        if cells.is_none() {
+            // Default path: allocate the rows once, then fill them in
+            // row-blocks. Reading 53 columns row-by-row streams from 53
+            // distant cache lines; a 256-row block makes each column read
+            // sequential and keeps the written rows in L2.
+            const ROW_BLOCK: usize = 256;
+            s.x = (0..idx.len())
+                .map(|_| vec![0.0; nv])
                 .collect();
+            for rb in (0..idx.len()).step_by(ROW_BLOCK) {
+                let re = (rb + ROW_BLOCK).min(idx.len());
+                for j in 0..nv {
+                    let src = direct_cols[j];
+                    let m = means[j];
+                    let sd = stds[j];
+                    for r in rb..re {
+                        s.x[r][j] = (src[idx[r]] - m) / sd;
+                    }
+                }
+            }
+            s.y = idx.iter().map(|&i| direct_cols[nv][i]).collect();
+            if nt > 1 {
+                s.ys = (0..nt)
+                    .map(|j| idx.iter().map(|&i| direct_cols[nv + j][i]).collect())
+                    .collect();
+            }
+        } else {
+            for &i in idx {
+                let mut row = Vec::with_capacity(nv);
+                for j in 0..nv {
+                    row.push((cell(&cells, i, j) - means[j]) / stds[j]);
+                }
+                s.x.push(row);
+                s.y.push(cell(&cells, i, nv));
+            }
+            if nt > 1 {
+                s.ys = (0..nt)
+                    .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
+                    .collect();
+            }
         }
         if let Some(w) = &weights_raw {
             s.w = idx.iter().map(|&i| w[i]).collect();
@@ -2676,21 +2736,18 @@ pub fn prepare_full_targets_weighted_with(
             ));
         }
     }
-    let fold_samples: Vec<Sample> = fold_idx.iter().map(|f| make(f)).collect();
-    let mut test = Sample::default();
-    for f in &fold_samples {
-        test.x.extend(f.x.iter().cloned());
-        test.y.extend(f.y.iter().copied());
-        test.w.extend(f.w.iter().copied());
-        if f.is_multi() {
-            if test.ys.is_empty() {
-                test.ys = vec![Vec::new(); f.ys.len()];
-            }
-            for (dst, src) in test.ys.iter_mut().zip(&f.ys) {
-                dst.extend(src.iter().copied());
-            }
-        }
-    }
+    // #133: build the pooled test block once from the concatenated fold
+    // indices. The old path built every fold sample and then cloned all of its
+    // rows into `test`, doubling the test-side allocations. With a single fold
+    // (the default) `fold_samples` stays empty and every consumer falls back to
+    // `test`; with several folds the per-fold samples are still materialised.
+    let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+    let test = make(&test_idx);
+    let fold_samples: Vec<Sample> = if fold_idx.len() > 1 {
+        fold_idx.iter().map(|f| make(f)).collect()
+    } else {
+        Vec::new()
+    };
 
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
@@ -4587,6 +4644,27 @@ mod tests {
             "the default mean/std path must not materialise a row-major copy"
         );
 
+        // #133: `drop` only reads cells to build the keep mask; it must not
+        // trigger the row-major copy that mutating fills need.
+        CELL_COPIES.with(|n| n.set(0));
+        let _ = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Drop,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            0,
+            "a drop-only fill must not copy the used columns"
+        );
+
         CELL_COPIES.with(|n| n.set(0));
         let _ = prepare_full_with(
             &t,
@@ -4603,7 +4681,7 @@ mod tests {
         assert_eq!(
             CELL_COPIES.with(|n| n.get()),
             1,
-            "a fill stage needs one mutable copy"
+            "a mutating fill needs one mutable copy"
         );
     }
 }
