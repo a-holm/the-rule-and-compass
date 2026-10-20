@@ -31,8 +31,11 @@ pub enum Metric {
     Absolute,
     /// Mean squared error.
     Squared,
-    /// `1 - |Pearson r|`.
+    /// `1 - |Pearson r|`: shape, either direction.
     Correlation,
+    /// `1 - Pearson r`: shape **and** direction (an inverted model is
+    /// penalised, not rewarded).
+    CorrelationSigned,
     /// Median absolute error.
     Median,
     /// Worst-case (maximum) absolute error.
@@ -41,8 +44,10 @@ pub enum Metric {
     Signed,
     /// Mean `ln(1 + e^2)`: squared error that does not chase outliers.
     LogSquashed,
-    /// `1 - |Spearman rank correlation|`.
+    /// `1 - |Spearman rank correlation|`: monotone shape, either direction.
     RankCorrelation,
+    /// `1 - Spearman rank correlation`: monotone shape **and** direction.
+    RankCorrelationSigned,
     /// Mean absolute error over the middle 50% of residuals.
     Interquartile,
     /// `1 - AUC` (classification).
@@ -74,11 +79,13 @@ impl Metric {
             Absolute,
             Squared,
             Correlation,
+            CorrelationSigned,
             Median,
             Maximum,
             Signed,
             LogSquashed,
             RankCorrelation,
+            RankCorrelationSigned,
             Interquartile,
             Slope,
             ImplicitDerivative,
@@ -100,11 +107,17 @@ impl Metric {
             "absolute" | "abs" | "mae" | "l1" => Absolute,
             "squared" | "square" | "mse" | "l2" => Squared,
             "correlation" | "corr" | "r" => Correlation,
+            "correlation_signed" | "corr_signed" | "signed_correlation" | "r_signed" => {
+                CorrelationSigned
+            }
             "median" | "medae" => Median,
             "maximum" | "max" | "max_error" | "worst_case" => Maximum,
             "signed" | "bias" => Signed,
             "log_squashed" | "logsquashed" | "log" => LogSquashed,
             "rank_correlation" | "rank" | "spearman" => RankCorrelation,
+            "rank_correlation_signed" | "rank_signed" | "spearman_signed" => {
+                RankCorrelationSigned
+            }
             "interquartile" | "iqr" | "iqmae" => Interquartile,
             "auc" | "roc" => Auc,
             "log_loss" | "logloss" | "cross_entropy" => LogLoss,
@@ -135,11 +148,13 @@ impl Metric {
             Absolute => "absolute",
             Squared => "squared",
             Correlation => "correlation",
+            CorrelationSigned => "correlation_signed",
             Median => "median",
             Maximum => "maximum",
             Signed => "signed",
             LogSquashed => "log_squashed",
             RankCorrelation => "rank_correlation",
+            RankCorrelationSigned => "rank_correlation_signed",
             Interquartile => "interquartile",
             Auc => "auc",
             LogLoss => "log_loss",
@@ -153,8 +168,11 @@ impl Metric {
         }
     }
 
-    /// True for metrics that read the target as two classes. The label is
-    /// `y > (min+max)/2`; the model output is treated as a logit.
+    /// True for metrics that read the target as **two** classes. The label is
+    /// `y > (min+max)/2`; the model output is treated as a logit. More than two
+    /// distinct target values are refused by the CLI
+    /// ([`classification_target_error`]) rather than silently collapsed to
+    /// `positive = {largest class}`.
     pub fn is_classification(self) -> bool {
         matches!(self, Metric::Auc | Metric::LogLoss | Metric::Hinge)
     }
@@ -203,11 +221,13 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
         Metric::Absolute => mean_abs(&resid),
         Metric::Squared => mean_sq(&resid),
         Metric::Correlation => 1.0 - correlation(pred, y).abs(),
+        Metric::CorrelationSigned => 1.0 - correlation(pred, y),
         Metric::Median => median_abs(&resid),
         Metric::Maximum => resid.iter().fold(0.0f64, |a, e| a.max(e.abs())),
         Metric::Signed => mean(&resid).abs(),
         Metric::LogSquashed => resid.iter().map(|e| (1.0 + e * e).ln()).sum::<f64>() / n as f64,
         Metric::RankCorrelation => 1.0 - rank_correlation(pred, y).abs(),
+        Metric::RankCorrelationSigned => 1.0 - rank_correlation(pred, y),
         Metric::Interquartile => interquartile_mean_abs(&resid),
         Metric::Slope => {
             if n < 2 {
@@ -236,16 +256,17 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
 /// True when `m` has a defined weighted form. The CLI refuses `--weight` for
 /// every other metric rather than silently ignoring the weights.
 ///
-/// Supported: `absolute`, `squared`, `correlation`, `signed`, `log_squashed`,
-/// `implicit`, `implicit_residual`, `aic`, `aicc` and `bic`. The order-statistic,
-/// classification, rank and first-difference metrics have no standard weighted
-/// definition (see `docs/weights.md`).
+/// Supported: `absolute`, `squared`, `correlation`, `correlation_signed`,
+/// `signed`, `log_squashed`, `implicit`, `implicit_residual`, `aic`, `aicc` and
+/// `bic`. The order-statistic, classification, rank and first-difference metrics
+/// have no standard weighted definition (see `docs/weights.md`).
 pub fn weights_supported(m: Metric) -> bool {
     matches!(
         m,
         Metric::Absolute
             | Metric::Squared
             | Metric::Correlation
+            | Metric::CorrelationSigned
             | Metric::Signed
             | Metric::LogSquashed
             | Metric::ImplicitDerivative
@@ -262,6 +283,7 @@ pub fn weighted_metric_names() -> &'static [&'static str] {
         "absolute",
         "squared",
         "correlation",
+        "correlation_signed",
         "signed",
         "log_squashed",
         "implicit",
@@ -284,6 +306,7 @@ pub fn weighted_metric_names() -> &'static [&'static str] {
 /// signed      |Σ wᵢ·eᵢ / Σ wᵢ|
 /// log_squashed Σ wᵢ·ln(1 + eᵢ²) / Σ wᵢ
 /// correlation 1 - |r_w|, the weighted Pearson correlation
+/// correlation_signed 1 - r_w (direction preserved)
 /// aic/aicc/bic weighted RSS, n = number of rows with wᵢ > 0
 /// ```
 ///
@@ -343,6 +366,7 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
             .sum::<f64>()
             / total,
         Metric::Correlation => 1.0 - weighted_correlation(pred, y, w).abs(),
+        Metric::CorrelationSigned => 1.0 - weighted_correlation(pred, y, w),
         Metric::Signed => {
             (resid.iter().zip(w).map(|(e, wi)| wi * e).sum::<f64>() / total).abs()
         }
@@ -585,6 +609,35 @@ fn binary_labels(y: &[f64]) -> Vec<f64> {
     y.iter().map(|&v| if v > mid { 1.0 } else { 0.0 }).collect()
 }
 
+/// Why `y` cannot be used with a binary classification metric, if it cannot.
+///
+/// `auc`, `log_loss` and `hinge` label a row `y > (min+max)/2`. With three or
+/// more distinct values that rule silently merges classes: on `{-1, 0, +1}` it
+/// calls `+1` positive and `{0, -1}` negative, so a model that separates
+/// `-1` from `{0, +1}` scores as if it had learned nothing. The CLI therefore
+/// refuses such a target instead of reporting a meaningless number.
+///
+/// Exactly two distinct values are valid (including an imbalanced or a
+/// single-class sample, which the metric treats as chance). `None` also means
+/// the target is empty and has nothing to classify.
+pub fn classification_target_error(y: &[f64]) -> Option<String> {
+    let mut vals: Vec<f64> = y.iter().copied().filter(|v| v.is_finite()).collect();
+    if vals.len() != y.len() {
+        return Some("the target contains non-finite values".to_string());
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    vals.dedup();
+    if vals.len() <= 2 {
+        return None;
+    }
+    let shown: Vec<String> = vals.iter().take(4).map(|v| format!("{v:.6}")).collect();
+    Some(format!(
+        "the target has {} distinct values ({}); binary metrics need at most two",
+        vals.len(),
+        shown.join(", ")
+    ))
+}
+
 fn sigmoid(x: f64) -> f64 {
     // Numerically stable logistic.
     if x >= 0.0 {
@@ -707,6 +760,84 @@ mod tests {
         // Reversed -> |r| = 1 as well.
         let d = [4.0, 3.0, 2.0, 1.0];
         assert!(approx(score(&a, &d, Metric::Correlation), 0.0, 1e-12));
+    }
+
+    #[test]
+    fn signed_correlation_penalises_an_inverted_model_that_unsigned_cannot() {
+        let y = [1.0, 2.0, 3.0, 4.0, 8.0];
+        let inverted = [-1.0, -2.0, -3.0, -4.0, -8.0];
+        // The unsigned variants cannot tell the right direction from the wrong
+        // one: both are a perfect fit of |r|.
+        assert!(approx(score(&inverted, &y, Metric::Correlation), 0.0, 1e-12));
+        assert!(approx(
+            score(&inverted, &y, Metric::RankCorrelation),
+            0.0,
+            1e-12
+        ));
+        // The signed variants must reject the inversion.
+        assert!(approx(
+            score(&inverted, &y, Metric::CorrelationSigned),
+            2.0,
+            1e-12
+        ));
+        assert!(approx(
+            score(&inverted, &y, Metric::RankCorrelationSigned),
+            2.0,
+            1e-12
+        ));
+        // A model with the right sign but a different level is still rewarded.
+        let shifted = [11.0, 12.0, 13.0, 14.0, 18.0];
+        assert!(approx(
+            score(&shifted, &y, Metric::CorrelationSigned),
+            0.0,
+            1e-12
+        ));
+        // Even a noisy prediction and its reflection have identical *unsigned*
+        // error but opposite signed errors.
+        let noisy = [1.0, 2.0, 4.0, 3.0, 9.0];
+        let reflected = [9.0, 8.0, 6.0, 7.0, 1.0]; // 2*mean - noisy, mean = 5
+        assert!(approx(
+            score(&noisy, &y, Metric::Correlation),
+            score(&reflected, &y, Metric::Correlation),
+            1e-12
+        ));
+        assert!(
+            score(&noisy, &y, Metric::CorrelationSigned) < 0.5
+                && score(&reflected, &y, Metric::CorrelationSigned) > 1.5,
+            "signed metric must distinguish the reflection"
+        );
+    }
+
+    #[test]
+    fn classification_targets_with_three_values_are_rejected() {
+        assert!(classification_target_error(&[0.0, 1.0, 1.0]).is_none());
+        assert!(classification_target_error(&[0.0, 0.0]).is_none());
+        let err = classification_target_error(&[-1.0, 0.0, 1.0]).unwrap();
+        assert!(err.contains("3 distinct values"), "{err}");
+        assert!(err.contains("binary"), "{err}");
+        // Non-finite values are refused rather than silently dropped.
+        assert!(classification_target_error(&[0.0, f64::NAN]).is_some());
+    }
+
+    #[test]
+    fn signed_correlation_supports_weights() {
+        assert!(weights_supported(Metric::CorrelationSigned));
+        let p = [0.0, 1.0, 2.0, 3.0];
+        let y = [3.0, 2.0, 1.0, 0.0];
+        let w = [1.0, 2.0, 1.0, 1.0];
+        let dup_p = [0.0, 1.0, 1.0, 2.0, 3.0];
+        let dup_y = [3.0, 2.0, 2.0, 1.0, 0.0];
+        assert!(approx(
+            score_weighted(&p, &y, &w, Metric::CorrelationSigned, 0),
+            score(&dup_p, &dup_y, Metric::CorrelationSigned),
+            1e-12
+        ));
+        // Both are perfectly inverted, so the signed score is 2 under weights.
+        assert!(approx(
+            score_weighted(&p, &y, &w, Metric::CorrelationSigned, 0),
+            2.0,
+            1e-12
+        ));
     }
 
     #[test]

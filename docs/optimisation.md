@@ -211,6 +211,35 @@ library methods only to *seed* or *pre-process*.
 | **Parallel islands** | Islands are independent, so they evolve on separate threads. |
 | **Convergence / time-budget stopping** | Stop when there is nothing left to gain, or when a caller's deadline arrives. |
 
+### 3.0 Constants are fitted to the scoring loss
+
+The constants of a candidate are fitted against the **configured `--metric`**,
+not always against squared error (issue #117). The objective that ranks the
+front and the objective that moves the constants are now the same wherever that
+is mathematically well posed:
+
+| metric | fitting strategy |
+|---|---|
+| `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
+| `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
+| `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
+| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
+| `correlation`, `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
+
+Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
+and writes a trial back only when the configured loss improves. `squared`
+results are bit-identical to the pre-#117 engine (`tests` pin the constants and
+SSE). The weighted normal equations now scale **both** the Jacobian and the
+residual by `sqrt(w)`; before this change the weighted fit mixed a weighted
+Jacobian with a half-weighted gradient, which is corrected as part of the same
+work.
+
+The fitted loss is reported in `--json` under `fitting` (`loss` names the
+objective, `value` is the best fitted training loss). A non-smooth metric whose
+polish cannot improve on the squared fit keeps the squared constants and the same
+reported score.
+
 ### 3.1 Measured results
 
 Same seeds, same generations, same population; wall-clock on the development
@@ -224,6 +253,17 @@ reached (`squared` metric unless noted).
 | `y = e^{−0.4x}·cos(3x)` | 120 | 2.59 × 10⁻² | 12.0 s | **2.47 × 10⁻⁵** | 12.6 s | 155 / 400 |
 | `y = 2x + 1` | 40 | — | — | **5.3 × 10⁻⁷** (rounding floor) | 1.8 s | 200 |
 | `y = sin x` | 60 | — | — | **3 × 10⁻³⁰** | 2.2 s | 300 |
+
+### 3.2 The constant-fitting budget
+
+`--fit-iters N` sets the Levenberg–Marquardt budget for every candidate, and the
+budget is honoured literally: `--fit-iters 0` (the same as `--no-fit`) performs
+**no fitting at all** — no damped LM iteration and no undamped Gauss–Newton
+polish — so the constants stay exactly as the tree was generated. Earlier
+releases silently ran five steps per candidate under `--no-fit` (one forced LM
+iteration plus a four-step polish); after the #135 fix the same daily-panel
+search went from about 3 200 to 7 240 candidate evaluations per second. With the
+default `--fit-iters 8` the fit is bit-for-bit unchanged.
 
 Three effects are visible. First, **accuracy**: constant fitting turns
 "approximately right" into "exact", which is why the errors drop by 13–20 orders
@@ -407,6 +447,23 @@ trend that matters is the AVX speed-up over the existing walk, which grows with
 the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
 less because AVX alone cannot vectorise those functions.
 
+#### Constants behind `sign` and `step`
+
+`sign` and `step` are piecewise constant: their derivative is zero almost
+everywhere, and so is the adjoint that [`fit.rs`](../my-version/src/fit.rs)
+uses to move constants. A constant that reaches the output only through one of
+them therefore never changes during fitting; whatever threshold the search
+happened to create is printed, but it is not an optimum. When the fitted Pareto
+front contains such a constant the CLI prints a warning naming `sign`/`step`.
+
+The workable pattern is **fit a smooth surrogate, threshold at inference**:
+search and fit `logistic(k·(x - t))` or `tanh(k·(x - t))`, which have usable
+gradients in `k` and `t`, then replace the surrogate with the hard switch only
+when the final rule is written down. Alternatively pin the threshold as a
+literal constant and do not ask the fitter to move it. A model using `sign` or
+`step` is still valid as a *given* rule; it is only the joint fitting that is
+ill-posed.
+
 #### Measured: search-level effect
 
 The kernel table measures one evaluation. In a real search the same candidate is
@@ -468,6 +525,69 @@ fitter rejects `x.len() != y.len()`. The other operators already produce a
 non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
 `Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
 multi-output search trajectory without fixing a finite-vs-infinite divergence.
+
+#### The exact linear least-squares arm (#116)
+
+The default fitter is still the LM/adjoint path described above. Some trees do
+not need iterations at all: when the value is **affine in every constant** —
+`f(x; c) = f(x; c₀) + Σⱼ (cⱼ − c₀ⱼ)·gⱼ(x)` — the minimiser is the solution of a
+linear least-squares problem. `--fit-strategy auto` (or `linear`) detects that
+class structurally and solves it directly:
+
+* the adjoint sweep at the current constants gives the coefficients `gⱼ(x)`
+  exactly and independently of `c₀`;
+* the weighted design matrix `√w·J` is solved by **column-scaled,
+  column-pivoted Householder QR**, never the normal equations, so the condition
+  number is not squared;
+* the constants are written back only if the closed-form weighted SSE is finite
+  and no worse than the starting point.
+
+The classifier is structural, not a numerical test: a product of two
+constant-dependent factors is bilinear and rejected; any nonlinear operator is
+accepted only when its whole subtree is constant-free; `if` may choose between
+affine branches only when its condition is constant-free. `a*x + b`,
+`a*x² + b*sin(x) + c` and `a*f(x) + b*g(x) + c` qualify; `a*sin(b*x) + c`,
+`a*(b + x)` and `exp(a*x)` do not.
+
+**Exactness.** The arm is an exact global minimiser for its class, not an
+approximation. The pre-registered acceptance rules are:
+
+| rule | tolerance / behaviour |
+|---|---|
+| affine objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
+| constants versus exact LM | relative difference `<= 1e-8` on affine tests |
+| rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
+| size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
+| ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
+| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+
+Because the linear arm reaches the optimum in one solve instead of iterating,
+it **can** change the search trajectory (usually by fitting a linear candidate
+better than an 8-iteration LM run). It is therefore opt-in, and it is saved in
+checkpoints as search state; `auto` currently has exactly these two arms.
+
+`--fit-report` prints the arm counts for the run. On the daily panel
+(`panel_daily_100.csv`, 154,675 rows, target `y1`, inputs `r1,r3,r7,ma7`,
+`--seed 3 --islands 1 --pop 200 --generations 5 --patience 0`), two alternating
+pairs on a shared host:
+
+| strategy | linear / exact calls | user CPU | wall (median) |
+|---|---:|---:|---:|
+| `exact` | 0 / 995 | 80.0 s | 110.6 s |
+| `auto` | 491 / 504 (49.3 %) | 53.4 s | 66.9 s |
+
+That is **1.50× user-CPU** and **1.65× wall-clock** for the run. The HOURLY panel
+(`panel_hourly_compact.csv`, 3.9M rows, target `y60`, `--fill drop --pop 100
+--generations 2`) measured 513.6 s → 402.9 s user CPU (**1.28×**, 49.0 % linear
+calls) and 631 s → 437 s wall. The archive improvements on the daily run were
+strictly non-worse: `auto` reported two extra Pareto members with lower train
+and test error (`0.30848993 / 0.31136481` versus the `exact` front's best
+`0.30861096 / 0.31146704` at a larger complexity), because the linear arm
+solved candidates that LM's eight iterations left short of the optimum.
+
+**Not yet implemented** (tracked on #116): VarPro for separable nonlinear
+models, batched GPU LM and the adaptive cost-model dispatcher. This PR lands
+only the exact CPU linear arm plus its classifier, fallback and reporting.
 
 #### Subsampled scoring: `--predictor-samples`
 
@@ -591,6 +711,39 @@ instruction dispatch; the explicit AVX intrinsics do not depend on it. As with
 `target-cpu=native`, keep these flags in the build recipe rather than in a
 committed configuration, so a release built on one machine still runs on
 another.
+
+### 3.4 Dehosting stage 1: pool, canonical hash, parallel fallback (#122)
+
+The fit-free search is host-bound: at `N = 5 000`, `P = 10 000` the evaluation
+kernel is ~2 % of a generation, and the rest is variation, simplification,
+hashing and — with the default operator set — the **serial** CPU scoring of
+`if` programs the kernel cannot compile. Stage 1 of #122 attacks the parts that
+do not change the search trajectory:
+
+* `genome::GenomePool` — a fixed-capacity, double-buffered postfix arena with
+  SoA metadata. Width is `2*max_complexity + 4` words (64 words = 256 B at the
+  default), so slots never move and peak memory is constant (2.6 MB per 10 000
+  genomes per buffer).
+* a persistent CUDA arena with the same layout (`rc_pool_reserve`,
+  `rc_pool_upload`, `rc_pool_eval`): no `cudaMalloc`/`cudaFree` inside the
+  generation loop;
+* a device canonical hash (`rc_pool_hash`) matching `genome::postfix_hash`, and
+  Philox4x32-10 with the positional `(seed, island, generation, slot, draw)`
+  contract, both tested;
+* a bounded CPU pool for unsupported programs, replacing the serial tail
+  (`RCSR_CPU_FALLBACK_THREADS`, default `min(cores, 8)`);
+* `Archive::try_insert_view`, which clones a tree only after it survives the
+  dominance test.
+
+Measured (RTX 3060, i7-3770K, `N = 5 000`, `--no-fit`, `--gpu`, default
+operators, `P = 10 000`, 10 generations, three interleaved runs):
+**18.3/22.8 s → 8.8/10.7 s (min/median, 2.1–2.4×)**. The unsupported tail
+alone fell from 2.15 s to 0.73 s for 8 521 trees (3.0× on four physical cores);
+without `if` the same cell is flat (5.44 s → 5.34 s), since variation and the
+startup population dominate there. The JSON report for a 5-generation
+`P = 2 000` run is byte-identical to the pre-#122 build apart from
+`elapsed_seconds`. Device variation and a device archive remain the next
+stages; fitting and all f64 reporting stay on the CPU.
 
 ---
 

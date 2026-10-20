@@ -18,8 +18,13 @@ complexity)**, and returns the front of non-dominated equations — the most
 accurate equation at each level of complexity.
 
 Constants inside a candidate are not guessed: each candidate's constants are
-fitted by **Levenberg–Marquardt**, so a candidate with the right *shape* is
-immediately usable even if its numbers started out wrong.
+fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
+candidate with the right *shape* is immediately usable even if its numbers
+started out wrong, and the fitted numbers minimise the same loss that ranks the
+front. Candidates affine in every constant can instead use the closed-form
+column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
+error and falls back to the metric-aware path otherwise; the default remains
+the historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -85,6 +90,29 @@ cargo run --release -- --data examples/line.csv --target y --vars x \
 A syntax error names the offending column:
 `--eval-expr "2 * (x + )"` fails with
 `expected a number, variable, function or '(' (column 10)` and exit code 2.
+
+### Walk-forward evaluation and backtest
+
+`rcsr walkforward` evaluates one supplied expression over time windows on a
+`.rcsb` store (CSV is also accepted), applies a long/flat rule and charges costs
+on position changes. It reads the store group by group, uses the same f64
+evaluator as `--eval-expr`, and reports per-window and pooled Sharpe, CAGR, max
+drawdown, turnover, exposure, hit rate, break-even hit rate, trades and rows as
+JSON or Markdown:
+
+```sh
+rcsr walkforward --data panel_daily_long.rcsb --target fwd1 \
+  --expr 'logistic(r60) - tanh(r120)' --vars r60,r120 \
+  --time ts --group-by symbol --horizon 172800 \
+  --window '2019,0,1546128000,1546300800,1577836800' \
+  --cost-bps 10 --threshold-quantile 0.7 --json
+```
+
+Test windows are defined only by time; the purge gap must be at least the
+horizon, and the threshold comes from training (or an optional trailing
+validation slice), never from the test block. See
+[`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
+definitions and the reference-agreement check against the Python evaluator.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
@@ -229,9 +257,10 @@ and leakage rules, and a worked recovery example.
 ## Save and resume a run
 
 A long search can be checkpointed and continued later. The checkpoint carries
-the complete search state — configuration, populations, per-island RNG states,
-stagnation and patience counters, archive and a data fingerprint — so a resumed
-run follows the identical trajectory:
+the complete search state — configuration, backend (`cpu`/`gpu`), canonical
+config hash, populations, per-island RNG states, stagnation and patience
+counters, archive and a data fingerprint — so a resumed run follows the
+identical trajectory:
 
 ```sh
 rcsr --data examples/line.csv --target y --vars x \
@@ -241,11 +270,24 @@ rcsr --data examples/line.csv --target y --vars x \
 ```
 
 `--save-every <N>` sets the interval (default 25 generations); a checkpoint is
-always written on exit. Saving does not consume randomness, so it cannot change
-the result. The saved search settings win on resume; only the generation budget
-may be raised, and data that does not match the saved fingerprint is refused.
-See [`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format,
-the determinism guarantee and its limits.
+always written on exit. Saves are crash-safe: temp file, `fsync`, atomic rename,
+with the previous good generation kept as `run.rcsr.prev`. Saving does not
+consume randomness, so it cannot change the result. The saved search settings
+win on resume; only the generation budget may be raised, and data that does not
+match the saved fingerprint is refused. A CPU checkpoint is never silently
+continued on the GPU (or vice versa): `--resume` refuses the backend change
+unless `--allow-backend-change` is explicit. See
+[`docs/checkpoint.md`](docs/checkpoint.md) for the versioned text format, the
+determinism guarantee and its limits.
+
+`--run-manifest <path>` records the evidence needed to reproduce a long run:
+commit and dirty state, the SHA-256 of the running binary, the data file
+checksum and sample fingerprints, the resolved configuration, seed, backend,
+device/driver/CUDA, UTC start/end and phase timings. `rcsr verify-manifest`
+re-checks it against the current binary, commit, data and config and exits
+non-zero on any mismatch. `--json-out <path>` publishes the final JSON result
+atomically instead of streaming it. See
+[`docs/run-integrity.md`](docs/run-integrity.md).
 
 ## Using it from other programs
 
@@ -265,9 +307,11 @@ the determinism guarantee and its limits.
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
   (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
-  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store
+  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
+  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
   that can be scanned group by group and searched from a bounded hash sample
-  when it does not fit; see [`docs/data-format.md`](docs/data-format.md).
+  when it does not fit; v1 stores still load. See
+  [`docs/data-format.md`](docs/data-format.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -333,13 +377,16 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--validation-frac f] [--select-by train|validation|aicc]
      [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
-     [--null-runs N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
+     [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--fit-iters N] [--fit-strategy exact|auto|linear] [--fit-report] [--no-fit]
+     [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--pipeline-depth N]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]
@@ -409,6 +456,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
 * `--folds K` splits the test region into `K` contiguous blocks and reports the
   error of each block next to the mean, so an unstable model cannot hide behind
   a lucky pooled number.
+* `--validation-frac f` holds out the last `f` of the training period as a
+  chronological validation slice (with a `--gap` purge either side) and
+  `--select-by train|validation|aicc` chooses the ranking criterion; the test
+  block is a scoring-only lockbox and is never used to select. See
+  [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
@@ -417,7 +469,9 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   unused, and both counts are reported — nothing is discarded silently.
 
 See [`docs/data-splitting.md`](docs/data-splitting.md) for the reasoning and the
-worked examples.
+worked examples, and [`docs/time-series.md`](docs/time-series.md) for the full
+time-series and panel audit (purge/embargo, overlapping labels, look-ahead
+preparation, lockboxes, per-group reporting, multiple testing and costs).
 
 ## Cleaning and preparing data
 
@@ -506,8 +560,9 @@ influence on the fit or the error.
 rcsr --data d.csv --target y --vars x --weight w --metric squared
 ```
 
-`absolute`, `squared`, `signed`, `log_squashed` and `correlation` become
-weighted means (weighted Pearson for the correlation); `aic`, `aicc` and `bic`
+`absolute`, `squared`, `signed`, `log_squashed`, `correlation` and
+`correlation_signed` become weighted means (weighted Pearson for the
+correlations); `aic`, `aicc` and `bic`
 use the weighted RSS and the number of positive-weight rows as `n`. A weight of
 2 is exactly a duplicated row because the normalisation is `Σwᵢ·lossᵢ / Σwᵢ`,
 not division by the row count. The fitter solves the weighted least-squares
@@ -535,6 +590,15 @@ computed from the **training rows only** and applied to both sides; smoothing
 and `previous`/`interpolate` never cross the train/test boundary. See
 [`docs/data-preparation.md`](docs/data-preparation.md) for each method, when
 *not* to use it, and a worked example.
+
+### Checking for leakage
+
+Leakage is caught differentially, not by a significance test. The
+[`leakage` module](docs/leakage.md) provides truncation replay (recompute at
+cut points; every completed row must be bit-identical), a future-shift probe,
+canary detection and synthetic leak/no-leak fixtures. They run in
+`cargo test --release --test leakage` and can be pointed at your own panel with
+`Panel::from_csv`; `assert_clean()` panics on a real leak instead of logging it.
 
 ### Forecasting: history and delayed variables
 
@@ -569,6 +633,11 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 # null control (19 shuffled-target runs): best=0.61 median=0.72 p=0.05 — the real fit beats the noise control
 ```
 
+For autocorrelated series or overlapping labels, add `--null-block N` (N at
+least the label horizon) to permute contiguous blocks instead of rows; the
+report names the method, block length and block count, and the i.i.d. shuffle is
+anti-conservative there. See [`docs/overfitting.md`](docs/overfitting.md).
+
 | check | question it answers |
 |---|---|
 | `train_error` vs `test_error` | does it survive data it never saw? |
@@ -592,8 +661,10 @@ contain. The k-NN baseline's reference set is always all training rows; for up
 to eight inputs a k-d tree answers exact queries, and above that the exact
 brute-force path reuses one buffer (still `O(query_rows × reference_rows × d)`,
 so the 200k-under-a-minute result is a `d <= 8` claim). Only query rows can be
-sampled, with `--baseline-samples N` (default `0` = every row, and only for
-absolute/squared/log_squashed). That is an unbiased estimate of the row-average
+sampled, with `--baseline-samples N` (default `512`; `0` = every row, and only
+for absolute/squared/log_squashed). The default cap keeps the exact
+`O(train²·d)` query bounded on large panels; the JSON reports reference/query
+rows, `capped`, SEMs and seconds. That is an unbiased estimate of the row-average
 loss, and `--json` reports train/test query rows and SEMs with the
 finite-population correction. The residual tests (Ljung–Box, Breusch–Pagan,
 skewness, excess kurtosis) are reported for the best solution; a small p-value
@@ -698,11 +769,13 @@ list and the recorded results.
   [`docs/meta-operators.md`](docs/meta-operators.md); the aggregates are
   training-column statistics cached once per search — see
   [`docs/aggregation.md`](docs/aggregation.md));
-- **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
-  maximum, signed, log-squashed, rank correlation, interquartile, slope,
-  AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
-- **Levenberg–Marquardt constant fitting** using adjoint (backpropagation)
-  derivatives — one backward sweep gives every constant's gradient, with
+fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
+candidate with the right *shape* is immediately usable even if its numbers
+started out wrong, and the fitted numbers minimise the same loss that ranks the
+front. Candidates affine in every constant can instead use the closed-form
+column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
+error and falls back to the metric-aware path otherwise; the default remains
+the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant
@@ -719,6 +792,11 @@ list and the recorded results.
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
+- **opt-in quality-diversity coverage** (`--qd`, `--qd-cells`, `--qd-cell-cap`):
+  a rectangular descriptor grid over variable usage × prediction skewness, with
+  a bounded local `(error, cost)` front per cell. The layer is passive and
+  reports occupied-cell coverage in text and `--json`; it does not change the
+  Pareto front. See [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
@@ -780,6 +858,22 @@ list and the recorded results.
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
 
+## Backends: GPU by default when available
+
+A binary built with `--features cuda` probes the device once at startup and uses
+the GPU to guide the search whenever one is available; a build without the
+feature, or a machine with no usable device, falls back to the CPU and records
+the reason. `--gpu` asserts that a device must exist (exit 2 otherwise),
+`--no-gpu`/`--cpu` forces the CPU, and `RCSR_GPU=0` simulates a missing device.
+Non-quiet runs print one resource line with the backend, device, available
+threads and training rows/columns, and `--json` records `backend`,
+`backend_reason` and `device`.
+
+Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
+change the search trajectory. Reported metrics, constants and diagnostics are
+always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
+reproduction. See [`docs/gpu-backend.md`](docs/gpu-backend.md).
+
 ## Is the search converging?
 
 `--progress` reports four bounded numbers every generation — **confidence**
@@ -798,9 +892,11 @@ SPEC.md                       behaviour specification
 docs/how-symbolic-regression-works.md   plain-language explainer
 docs/optimisation.md          theory, literature and measurements behind the search
 docs/data-splitting.md        train/test splitting for time series and panel data
+docs/time-series.md           time-series/panel checklist: purge, look-ahead, lockbox, costs
 docs/data-preparation.md      missing values, outliers, smoothing, scaling and filters
 docs/memory-model.md          bytes per cell, dictionary encoding and row selectors
 docs/data-format.md           versioned .rcsb column store, import and the memory guard
+docs/walkforward.md           walk-forward evaluation, costs, metrics and the long/flat rule
 docs/variable-types.md        boolean and categorical inputs, one-hot encoding
 docs/weights.md               per-row weights, weighted metrics and weighted least squares
 docs/implicit.md              implicit relations f(x, y) = 0 and the level-set metric
@@ -808,10 +904,13 @@ docs/overfitting.md           avoiding and detecting overfitting, with reference
 docs/meta-operators.md        structural meta operators and their cache rule
 docs/aggregation.md           dataset aggregates: semantics, cache and leakage rules
 docs/seeds.md                 start the search from a known formula (--seed-expr/--seed-file)
+docs/checkpoint.md            save/resume state, atomic writes and backend identity
+docs/run-integrity.md         run manifests, verification and reproducible launchers
 docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
+docs/qd.md                    opt-in quality-diversity coverage archive (--qd)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

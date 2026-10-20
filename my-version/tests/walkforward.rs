@@ -1,0 +1,307 @@
+//! Walk-forward evaluation (issue #124).
+//!
+//! The tests use a tiny table whose scores, threshold and forward returns are
+//! known by hand. They pin the long/flat rule, the per-side cost, the
+//! train-only threshold, the purge check, pooled aggregation and the direct
+//! `.rcsb` path.
+
+use rcsr::data;
+use rcsr::store;
+use rcsr::walkforward::{self, EvalSpec, Window};
+
+fn table(rows: &[(f64, &str, f64, f64)]) -> data::Table {
+    let mut s = String::from("ts,sym,x,target\n");
+    for (ts, sym, x, y) in rows {
+        s.push_str(&format!("{},{},{},{}\n", ts, sym, x, y));
+    }
+    data::parse_table(&s).unwrap()
+}
+
+fn single(rows: &[(f64, f64, f64)]) -> data::Table {
+    let rows: Vec<(f64, &str, f64, f64)> = rows
+        .iter()
+        .map(|&(ts, x, y)| (ts, "A", x, y))
+        .collect();
+    table(&rows)
+}
+
+fn window(label: &str, a: f64, b: f64, c: f64, d: f64) -> Window {
+    Window {
+        label: label.to_string(),
+        train_start: a,
+        train_end: b,
+        test_start: c,
+        test_end: d,
+    }
+}
+
+fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
+    EvalSpec {
+        expression: expr.to_string(),
+        vars: vec!["x".to_string()],
+        target: "target".to_string(),
+        time: "ts".to_string(),
+        group: None,
+        windows,
+        horizon: 0.0,
+        embargo: None,
+        cost_bps: 10.0,
+        threshold_quantile: 0.70,
+        validation_frac: 0.0,
+        periods_per_year: Some(4.0),
+    }
+}
+
+#[test]
+fn known_expression_threshold_costs_and_metrics() {
+    // Training x = 0..3; q50 threshold = 1.5. Test x = 4..7, so every test row
+    // is long. Cost 100 bp/side; only the first row changes position.
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, -0.02),
+        (6.0, 6.0, 0.03),
+        (7.0, 7.0, -0.01),
+    ]);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    s.cost_bps = 100.0;
+    s.threshold_quantile = 0.5;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(r.windows.len(), 1);
+    let w = &r.windows[0];
+    assert!((w.threshold - 1.5).abs() < 1e-15, "threshold {}", w.threshold);
+    assert_eq!(w.train_rows, 4);
+    assert_eq!(w.test_rows, 4);
+    assert_eq!(w.metrics.rows, 4);
+    assert_eq!(w.metrics.active_rows, 4);
+    assert_eq!(w.metrics.trades, 1);
+    assert_eq!(w.metrics.entries, 1);
+    assert!((w.metrics.exposure - 1.0).abs() < 1e-15);
+    assert!((w.metrics.hit_rate - 0.5).abs() < 1e-15);
+    // total cost 0.01 over four active rows = 25 bp per long row
+    assert!((w.metrics.avg_cost_bps - 25.0).abs() < 1e-12);
+    // First net return is 0.01 - 0.01 = 0; the rest follow the target.
+    // equity = 1 * 0.98 * 1.03 * 0.99
+    let equity = 1.0 * 0.98 * 1.03 * 0.99;
+    assert!((w.metrics.total_return - (equity - 1.0)).abs() < 1e-15);
+    assert!((w.metrics.cagr - (equity - 1.0)).abs() < 1e-15);
+    // The first period is flat (equity 1), then -2%: the peak is the start.
+    assert!((w.metrics.max_drawdown - (-0.02)).abs() < 1e-15);
+    assert_eq!(w.threshold_source, "train");
+}
+
+#[test]
+fn every_position_change_is_charged() {
+    // Test scores 3,0,3,0 against threshold 1.5: four changes, two entries.
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 3.0, 0.0),
+        (5.0, 0.0, 0.0),
+        (6.0, 3.0, 0.0),
+        (7.0, 0.0, 0.0),
+    ]);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    s.cost_bps = 100.0;
+    s.threshold_quantile = 0.5;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let w = &r.windows[0];
+    assert_eq!(w.metrics.trades, 4);
+    assert_eq!(w.metrics.entries, 2);
+    assert!((w.metrics.exposure - 0.5).abs() < 1e-15);
+    assert!((w.metrics.total_return - (0.99f64.powi(4) - 1.0)).abs() < 1e-15);
+    // Four periods, each -0.01 (target zero, cost on every change).
+    assert!((r.pooled.mean_return + 0.01).abs() < 1e-15);
+}
+
+#[test]
+fn negative_score_never_opens_a_short() {
+    assert_eq!(walkforward::position_for(-5.0, 0.0), 0.0);
+    assert_eq!(walkforward::position_for(-5.0, -6.0), 1.0);
+    assert_eq!(walkforward::position_for(f64::NAN, -6.0), 0.0);
+
+    let t = single(&[
+        (0.0, -3.0, 0.0),
+        (1.0, -2.0, 0.0),
+        (2.0, -1.0, 0.0),
+        (3.0, -0.5, 0.0),
+        (4.0, -5.0, 0.01),
+        (5.0, -4.0, 0.02),
+    ]);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 6.0)]);
+    s.threshold_quantile = 0.0; // threshold = -3
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let w = &r.windows[0];
+    // The test scores are below the training minimum, so the rule is flat.
+    assert_eq!(w.metrics.active_rows, 0);
+    assert_eq!(w.metrics.trades, 0);
+    assert!((w.metrics.exposure - 0.0).abs() < 1e-15);
+}
+
+#[test]
+fn threshold_uses_only_train_or_validation_rows() {
+    let mut rows = vec![
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+    ];
+    // The test scores are enormous; a look-ahead threshold would move with them.
+    rows.push((4.0, 1.0e9, 0.01));
+    rows.push((5.0, 2.0e9, 0.02));
+    let t = single(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 6.0)]);
+    s.threshold_quantile = 0.5;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert!((r.windows[0].threshold - 1.5).abs() < 1e-15);
+    assert_eq!(r.windows[0].threshold_source, "train");
+
+    // With a validation slice, the threshold comes from the trailing half.
+    s.validation_frac = 0.5;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(r.windows[0].threshold_source, "validation");
+    assert_eq!(r.windows[0].validation_rows, 2);
+    assert!((r.windows[0].threshold - 2.5).abs() < 1e-15);
+}
+
+#[test]
+fn purge_gap_shorter_than_horizon_is_refused() {
+    let t = single(&[(0.0, 0.0, 0.0), (1.0, 1.0, 0.0), (2.0, 2.0, 0.0)]);
+    let mut s = spec("x", vec![window("w", 0.0, 2.0, 2.5, 3.0)]);
+    s.horizon = 1.0;
+    let err = walkforward::run_table(&t, &s, "test").unwrap_err();
+    assert!(err.contains("purge gap"), "{}", err);
+}
+
+#[test]
+fn pooled_covers_every_window_and_is_deterministic() {
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 3.0, 0.01),
+        (5.0, 0.0, -0.01),
+        (6.0, 0.0, 0.0),
+        (7.0, 1.0, 0.0),
+        (8.0, 2.0, 0.0),
+        (9.0, 3.0, 0.0),
+        (10.0, 3.0, 0.02),
+        (11.0, 0.0, -0.02),
+    ]);
+    let mut s = spec(
+        "x",
+        vec![
+            window("a", 0.0, 4.0, 4.0, 6.0),
+            window("b", 6.0, 10.0, 10.0, 12.0),
+        ],
+    );
+    s.threshold_quantile = 0.5;
+    let r1 = walkforward::run_table(&t, &s, "test").unwrap();
+    let r2 = walkforward::run_table(&t, &s, "test").unwrap();
+    assert_eq!(r1.json(), r2.json());
+    assert_eq!(r1.windows.len(), 2);
+    assert_eq!(r1.pooled.rows, 4);
+    assert_eq!(r1.pooled.periods, 4);
+    assert_eq!(r1.pooled.trades, 4);
+    assert_eq!(r1.windows.iter().map(|w| w.metrics.rows).sum::<usize>(), 4);
+}
+
+#[test]
+fn store_path_matches_the_resident_table() {
+    let rows: Vec<(f64, &str, f64, f64)> = (0..8)
+        .map(|i| {
+            let i = i as f64;
+            (i, "A", i, if i < 4.0 { 0.0 } else { (i - 5.0) * 0.01 })
+        })
+        .collect();
+    let t = table(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    s.threshold_quantile = 0.5;
+    s.cost_bps = 5.0;
+    let resident = walkforward::run_table(&t, &s, "test").unwrap();
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!(
+        "rcsr-walkforward-{}-{}.rcsb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = path.to_string_lossy().into_owned();
+    store::write_store(&path, &t, 3).unwrap();
+    let streamed = walkforward::run_path(&path, &s).unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(resident.source, "test");
+    assert_eq!(streamed.source, "store-stream");
+    assert!((resident.windows[0].threshold - streamed.windows[0].threshold).abs() < 1e-15);
+    assert_eq!(resident.windows[0].test_rows, streamed.windows[0].test_rows);
+    assert!((resident.pooled.sharpe - streamed.pooled.sharpe).abs() < 1e-15);
+    assert!((resident.pooled.cagr - streamed.pooled.cagr).abs() < 1e-15);
+    assert!((resident.pooled.max_drawdown - streamed.pooled.max_drawdown).abs() < 1e-15);
+    assert!((resident.pooled.turnover - streamed.pooled.turnover).abs() < 1e-15);
+}
+
+#[test]
+fn costs_and_positions_are_per_group() {
+    // Two groups with one test row each. Both go long from flat, so there are
+    // two entries and two costs, not one shared flat-to-long transition.
+    let rows = [
+        (0.0, "A", 0.0, 0.0),
+        (1.0, "A", 1.0, 0.0),
+        (2.0, "A", 2.0, 0.01),
+        (0.0, "B", 1.0, 0.0),
+        (1.0, "B", 2.0, 0.0),
+        (2.0, "B", 3.0, 0.01),
+    ];
+    let t = table(&rows);
+    let mut s = spec("x", vec![window("w", 0.0, 2.0, 2.0, 3.0)]);
+    s.group = Some("sym".to_string());
+    s.threshold_quantile = 0.0; // every score above the training minimum
+    s.cost_bps = 100.0;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let w = &r.windows[0];
+    assert_eq!(w.metrics.entries, 2);
+    assert_eq!(w.metrics.trades, 2);
+    assert_eq!(w.metrics.active_rows, 2);
+    // One timestamp, the mean net return is 0.01 - 0.01 = 0 in both groups.
+    assert!((w.metrics.mean_return - 0.0).abs() < 1e-15);
+    assert!((w.metrics.avg_cost_bps - 100.0).abs() < 1e-12);
+}
+
+#[test]
+fn json_and_markdown_carry_the_rules_and_metrics() {
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, 0.02),
+    ]);
+    let s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 6.0)]);
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let json = r.json();
+    for key in [
+        "\"window_definition\"",
+        "\"cost_model\"",
+        "\"position_rule\"",
+        "\"pooled\"",
+        "\"break_even_hit_rate\"",
+        "\"memory_bound\"",
+    ] {
+        assert!(json.contains(key), "missing {}", key);
+    }
+    let md = r.markdown();
+    assert!(md.contains("Long/flat only"));
+    assert!(md.contains("## Pooled"));
+    assert!(md.contains("break-even"));
+}

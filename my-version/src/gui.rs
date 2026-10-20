@@ -1132,6 +1132,7 @@ impl RunPlan {
                 lags: raw.lags,
                 history_frac: raw.history_frac,
                 gap_break: raw.gap_break,
+                time: data::TimeSpec::default(),
             };
             let (t2, v2, rep) = data::add_lags(&table, &vars, &lag_spec, time_col, group_col)?;
             table = t2;
@@ -1172,16 +1173,20 @@ impl RunPlan {
             group_col,
             test_frac: raw.test_frac,
             gap: raw.gap,
+            validation_frac: 0.0,
             folds: raw.folds.max(1),
             train_select,
             test_select,
             exclude,
+            time: data::TimeSpec::default(),
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {
             fill: raw.fill,
             outlier_iqr: raw.outlier_iqr,
             smooth: raw.smooth,
+            smooth_centred: false,
+            allow_interpolate: false,
             center: raw.center,
             scale: raw.scale,
             filter,

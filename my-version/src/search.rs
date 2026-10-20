@@ -14,7 +14,7 @@
 //!   tie-break) so bloat is controlled without a hand-tuned penalty;
 //! * the loop stops early when it has converged, or when a time budget is hit.
 
-use crate::checkpoint::{Checkpoint, Individual, IslandState};
+use crate::checkpoint::{Backend, Checkpoint, Individual, IslandState};
 use crate::complexity::ComplexityModel;
 use crate::data::Sample;
 use crate::expr::{
@@ -27,11 +27,13 @@ use crate::pareto::{Archive, Sol};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
+// #120: the opt-in quality-diversity archive.
+use crate::qd::{QdArchive, QdReport};
 use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
 use crate::units::Units;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone)]
 pub struct Config {
@@ -50,6 +52,14 @@ pub struct Config {
     pub init_depth: usize,
     /// Levenberg–Marquardt iterations for constant fitting (0 disables).
     pub fit_iters: usize,
+    /// #116: exact constant-fitting arm. `Exact` is the historical CPU LM;
+    /// `Auto`/`Linear` use the closed-form linear least-squares arm for trees
+    /// affine in every constant and fall back to LM otherwise. Changing it
+    /// changes the trajectory, so it is a saved search setting.
+    pub fit_strategy: crate::fit::FitStrategy,
+    /// #116: print one `# fit:` line with the arm counts. Reporting only; it is
+    /// not saved in a checkpoint and is ignored by the search settings check.
+    pub fit_report: bool,
     /// Discard structurally duplicated offspring before evaluating them.
     pub dedup: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
@@ -81,6 +91,12 @@ pub struct Config {
     /// #25: reject a candidate whose root dimension differs from the target's
     /// (infinite error) instead of merely noting the mismatch.
     pub require_dimensions: bool,
+    /// #120: bins per descriptor axis for the opt-in quality-diversity archive.
+    /// `0` disables it (the default), so every existing trajectory and pinned
+    /// archive is unchanged.
+    pub qd_bins: usize,
+    /// #120: maximum local Pareto front per descriptor cell.
+    pub qd_cell_cap: usize,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
@@ -95,6 +111,12 @@ pub struct Config {
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
     pub gpu_notes: bool,
+    /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
+    /// While the GPU scores a batch, the CPU keeps generating and fitting the
+    /// next candidates. This is a scheduling choice only: the scored values,
+    /// candidate order and archive are identical to the synchronous path, so it
+    /// is not saved in a checkpoint.
+    pub pipeline_depth: usize,
 }
 
 /// A per-generation progress report.
@@ -126,6 +148,8 @@ impl Default for Config {
             restart_interval: 60,
             init_depth: 3,
             fit_iters: 8,
+            fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_report: false,
             dedup: true,
             time_budget: None,
             patience: 40,
@@ -134,13 +158,18 @@ impl Default for Config {
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
+            qd_bins: 0, // #120: off
+            qd_cell_cap: 4,
             progress: None,
             simd: true, // #27
-            // #26: the library defaults to the CPU so every existing caller and
-            // test keeps its trajectory; the `rcsr` CLI opts in automatically.
-            // `--no-gpu` turns it off again.
-            gpu: false,
+            // #141: the GPU is the default backend when the binary is built
+            // with CUDA and a device is available. The probe happens once at
+            // startup; a non-CUDA build, a missing device or an unsupported
+            // objective falls back to the CPU. `--no-gpu`/`--cpu` is the
+            // deliberate override and `--gpu` asserts that a device exists.
+            gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
+            pipeline_depth: 2, // #119: only used when the GPU path is active
         }
     }
 }
@@ -172,6 +201,7 @@ impl Config {
         compare!(restart_interval, "restart_interval");
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
+        compare!(fit_strategy, "fit_strategy"); // #116
         compare!(dedup, "dedup");
         if self.time_budget.map(f64::to_bits) != other.time_budget.map(f64::to_bits) {
             diff.push("time_budget");
@@ -180,6 +210,8 @@ impl Config {
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(front_parents, "front_parents"); // #76
+        compare!(qd_bins, "qd_bins"); // #120
+        compare!(qd_cell_cap, "qd_cell_cap"); // #120
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -344,6 +376,12 @@ impl Ind {
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
     n_rows: usize,
+    /// #122: the fixed-capacity, double-buffered postfix arena. It is allocated
+    /// once (grown only if a later batch is larger) and reused every generation,
+    /// so a generation never calls `cudaMalloc` for its programs.
+    pool: Option<crate::genome::GenomePool>,
+    /// #131: per-generation opcode/fallback counts.
+    stats: BTreeMap<usize, GpuGenStats>,
 }
 
 #[cfg(feature = "cuda")]
@@ -372,7 +410,12 @@ impl GpuSearch {
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
         match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
-            Some(ev) => Ok(GpuSearch { ev, n_rows }),
+            Some(ev) => Ok(GpuSearch {
+                ev,
+                n_rows,
+                pool: None,
+                stats: BTreeMap::new(),
+            }),
             None => Err(format!(
                 "no usable CUDA device ({})",
                 crate::gpu::GpuEvaluator::device_name()
@@ -392,6 +435,7 @@ impl GpuSearch {
         islands: &mut [Vec<Ind>],
         train: &Sample,
         cfg: &Config,
+        generation: usize,
     ) -> Result<(), String> {
         let pending: Vec<(usize, usize)> = islands
             .iter()
@@ -407,20 +451,48 @@ impl GpuSearch {
             return Ok(());
         }
 
-        let mut pop = crate::gpu::Population::new();
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        // #122: one fixed-width slot per genome. A tree whose postfix exceeds
+        // the configured bound is scored on the CPU (the existing fallback), so
+        // a wide seed can never truncate or corrupt the arena.
+        let width = crate::genome::width_for(cfg.max_complexity);
+        let reuse = self
+            .pool
+            .as_ref()
+            .map_or(false, |p| p.capacity() >= pending.len() && p.width() == width);
+        if !reuse {
+            self.pool = Some(crate::genome::GenomePool::new(pending.len().max(1), width));
+        }
+        let pool = self.pool.as_mut().expect("a pool was just allocated");
+        pool.begin_generation();
         for &(i, j) in &pending {
-            if pop.add(&islands[i][j].tree) {
+            let mut buf = Vec::new();
+            let meta = crate::genome::GenomeMeta {
+                island: i as u16,
+                tag: j as u32,
+                ..Default::default()
+            };
+            if crate::gpu::compile(&islands[i][j].tree, &mut buf)
+                && buf.len() <= width
+                && pool.push(&buf, meta)
+            {
                 slots.push((i, j));
             } else {
                 on_cpu.push((i, j));
             }
         }
 
-        if !pop.is_empty() {
-            let (sse, ms) = self.ev.eval_population(&pop);
-            if ms < 0.0 || sse.len() != pop.len() {
+        // #131: record what the batch actually used. Several calls can belong
+        // to one generation (initial screening, refit, restarts); merge them.
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
+        stats.programs += pool.len();
+        stats.fallbacks += on_cpu.len();
+
+        if !pool.is_empty() {
+            let (sse, ms) = self.ev.eval_pool(pool);
+            if ms < 0.0 || sse.len() != pool.len() {
                 return Err("CUDA batch evaluation failed".to_string());
             }
             let n = self.n_rows as f64;
@@ -431,16 +503,106 @@ impl GpuSearch {
                     f64::INFINITY
                 };
             }
+            // The generation is complete: the just-evaluated arena becomes the
+            // readable front, and the next generation writes into the other one.
+            pool.commit();
         }
         if !on_cpu.is_empty() {
             // #27: the CPU fallback uses the same SoA view as the live search.
             let train_view = EvalSample::new(train, cfg);
-            for (i, j) in on_cpu {
-                islands[i][j].reeval(&train_view, cfg); // #25
-            }
+            // #122: unsupported programs used to be scored serially after the
+            // kernel (the measured 2 s tail at P=10 000, 5 % `if`). Score them
+            // on a bounded CPU pool instead; each tree is independent, so the
+            // result is bit-identical to the serial walk.
+            rescore_pending_cpu(islands, &train_view, cfg);
         }
         Ok(())
     }
+
+    /// #131: the per-generation report, in generation order.
+    fn run_stats(&self) -> GpuRunStats {
+        GpuRunStats {
+            generations: self
+                .stats
+                .values()
+                .cloned()
+                .collect(),
+        }
+    }
+}
+
+/// Score every still-pending (`error.is_nan()`) individual on the CPU.
+///
+/// Work is split into contiguous slices of each island's population and scored
+/// on up to [`fallback_workers`] threads. A tree's error depends only on the
+/// tree and the sample, never on a neighbour or on completion order, so the
+/// parallel and serial paths return the same bits. Small batches stay serial:
+/// the thread round trip would cost more than it saves.
+fn rescore_pending_cpu(islands: &mut [Vec<Ind>], train: &EvalSample, cfg: &Config) {
+    rescore_pending_cpu_with(islands, train, cfg, fallback_workers());
+}
+
+/// The worker count is a parameter so the determinism test can compare one
+/// thread with many without touching the process environment.
+fn rescore_pending_cpu_with(
+    islands: &mut [Vec<Ind>],
+    train: &EvalSample,
+    cfg: &Config,
+    workers: usize,
+) {
+    let pending: usize = islands
+        .iter()
+        .map(|pop| pop.iter().filter(|ind| ind.error.is_nan()).count())
+        .sum();
+    if pending == 0 {
+        return;
+    }
+    let workers = workers.min(pending);
+    if workers <= 1 {
+        for pop in islands.iter_mut() {
+            for ind in pop.iter_mut() {
+                if ind.error.is_nan() {
+                    ind.reeval(train, cfg); // #25
+                }
+            }
+        }
+        return;
+    }
+    let islands_n = islands.len().max(1);
+    let per_island = (workers / islands_n).max(1);
+    let blocks = expr::current_blocks();
+    std::thread::scope(|scope| {
+        for pop in islands.iter_mut() {
+            let per = pop.len().div_ceil(per_island).max(1);
+            for chunk in pop.chunks_mut(per) {
+                let blocks = blocks.clone();
+                scope.spawn(move || {
+                    // #10: custom blocks are thread-local, exactly as in an
+                    // island's evolution thread.
+                    expr::set_blocks(blocks);
+                    for ind in chunk.iter_mut() {
+                        if ind.error.is_nan() {
+                            ind.reeval(train, cfg); // #25
+                        }
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// #122: size of the bounded CPU fallback pool.
+fn fallback_workers() -> usize {
+    const MAX: usize = 8;
+    if let Ok(v) = std::env::var("RCSR_CPU_FALLBACK_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX)
 }
 
 /// #26: score the pending individuals, falling back to the CPU on any error.
@@ -455,11 +617,13 @@ fn score_generation(
     islands: &mut [Vec<Ind>],
     train: &Sample,
     cfg: &Config,
+    backend_reason: &mut Option<String>,
+    generation: usize,
 ) -> bool {
     let Some(g) = gpu.as_mut() else {
         return false;
     };
-    match g.score(islands, train, cfg) {
+    match g.score(islands, train, cfg, generation) {
         Ok(()) => {
             *used = true;
             true
@@ -468,19 +632,57 @@ fn score_generation(
             if cfg.gpu_notes {
                 eprintln!("# gpu: unavailable ({})", e);
             }
+            // #141: the backend report must record the runtime fallback, not
+            // just the startup choice.
+            *backend_reason = Some(e);
             *gpu = None;
             // #27: re-scoring the pending batch goes through the SoA view.
             let train_view = EvalSample::new(train, cfg);
-            for pop in islands.iter_mut() {
-                for ind in pop.iter_mut() {
-                    if ind.error.is_nan() {
-                        ind.reeval(&train_view, cfg); // #25
-                    }
-                }
-            }
+            // #122: the same bounded CPU pool as the per-batch fallback.
+            rescore_pending_cpu(islands, &train_view, cfg);
             false
         }
     }
+}
+
+/// #119: score one overlap batch, writing each result into its fixed
+/// `(island, slot)` destination. Candidates the kernel cannot compile are left
+/// `None` and scored by the normal barrier path afterwards. A CUDA failure is
+/// returned to the caller, which stops the GPU and re-scores the whole
+/// generation on the CPU.
+#[cfg(feature = "cuda")]
+fn score_pipeline_batch(
+    jobs: Vec<PipelineJob>,
+    gpu: &mut Option<GpuSearch>,
+    results: &mut [Vec<Option<f64>>],
+    n_rows: usize,
+) -> Result<(), String> {
+    let Some(g) = gpu.as_mut() else {
+        return Err("pipeline scoring without a GPU evaluator".to_string());
+    };
+    let mut pop = crate::gpu::Population::new();
+    let mut slots: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
+    for (i, j, tree) in jobs {
+        if pop.add(&tree) {
+            slots.push((i, j));
+        }
+    }
+    if pop.is_empty() {
+        return Ok(());
+    }
+    let (sse, ms) = g.ev.eval_population(&pop);
+    if ms < 0.0 || sse.len() != pop.len() {
+        return Err("CUDA batch evaluation failed".to_string());
+    }
+    let n = n_rows as f64;
+    for (&(i, j), &s) in slots.iter().zip(&sse) {
+        results[i][j] = Some(if s.is_finite() {
+            (s as f64) / n
+        } else {
+            f64::INFINITY
+        });
+    }
+    Ok(())
 }
 
 /// #26: whether a run may use the GPU at all.
@@ -515,6 +717,29 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
         return Some("--fit-samples scores offspring on a screening subset");
     }
     None
+}
+
+/// The backend this configuration and sample will use in this build
+/// (issue #140).
+///
+/// This mirrors the capability checks in [`run_search`] and is used by the CLI
+/// to refuse a backend-changing `--resume` before the search starts. An actual
+/// device failure still falls back to the CPU inside the search.
+pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
+    #[cfg(feature = "cuda")]
+    {
+        if cfg.gpu
+            && !matches!(
+                std::env::var("RCSR_GPU").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            )
+            && gpu_blocker(cfg, train).is_none()
+        {
+            return Backend::Gpu;
+        }
+    }
+    let _ = (cfg, train);
+    Backend::Cpu
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
@@ -554,6 +779,8 @@ struct EvalSample<'a> {
 
 impl<'a> EvalSample<'a> {
     fn new(sample: &'a Sample, cfg: &Config) -> Self {
+        #[cfg(test)]
+        note_transpose();
         EvalSample {
             sample,
             cols: if cfg.simd {
@@ -563,6 +790,29 @@ impl<'a> EvalSample<'a> {
             },
         }
     }
+}
+
+// #133: test-only count of SoA transposes on this thread. The search builds
+// these views on the main thread (island threads share the view), so a unit
+// test can assert "once per distinct sample" instead of "once per use".
+#[cfg(test)]
+thread_local! {
+    static TRANSPOSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_transpose() {
+    TRANSPOSES.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+fn transpose_count() -> usize {
+    TRANSPOSES.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn reset_transpose_count() {
+    TRANSPOSES.with(|n| n.set(0));
 }
 
 fn eval_error_on(tree: &Node, data: &EvalSample, metric: Metric) -> f64 {
@@ -602,7 +852,7 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
     data.sample.x.iter().map(|row| eval(tree, row)).collect()
 }
 
-/// #14: fit a candidate's constants on the objective its metric actually
+/// #14, #117: fit a candidate's constants on the objective its metric actually
 /// scores.
 ///
 /// The implicit-derivative metric is scale-free. Fitting `f` against the zero
@@ -610,9 +860,12 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
 /// constant towards zero, collapsing the level set into the trivial `f == 0`;
 /// the guard rightly rejects that candidate, so a good shape would be destroyed
 /// before it could be scored. In this one case [`crate::implicit::fit`]
-/// minimises the signed geometric residual `f / ||grad f||` instead. Every
-/// other metric (including `implicit_residual`, which by definition scores
-/// `|f|`) keeps the historical `fit_weighted` path bit for bit.
+/// minimises the signed geometric residual `f / ||grad f||` instead.
+///
+/// Every explicit metric goes through [`crate::fit::fit_weighted_metric`], which
+/// keeps `squared`/AIC/AICc/BIC on the exact historical least-squares path and
+/// fits the configured loss for the others (IRLS, logistic IRLS, or a
+/// documented coordinate polish for rank/order losses).
 ///
 /// #85: `fit` is the (possibly screening) sample the constants are fitted on;
 /// `score` is the sample that will score the candidate. They are the same
@@ -641,10 +894,16 @@ fn fit_constants_with_iters(
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
-        let sse = crate::fit::fit_weighted(tree, &fit.x, &fit.y, &fit.w, iters);
-        // #87: remember the tree the SSE belongs to. Simplification after the
-        // fit may fold constants, in which case the SSE is stale and the
-        // caller must score normally.
+        // #116 + #117: strategy and metric together.
+        let sse = crate::fit::fit_weighted_strategy_metric(
+            tree,
+            &fit.x,
+            &fit.y,
+            &fit.w,
+            iters,
+            cfg.fit_strategy,
+            cfg.metric,
+        );
         Some(FitResult {
             sse,
             hash: expr::structural_hash(tree),
@@ -655,8 +914,9 @@ fn fit_constants_with_iters(
     }
 }
 
-/// #87: the fitter's own residual sum of squares at the constants it wrote
-/// back, plus the structural hash of the tree at that moment.
+/// #87: the fitter's own value at the constants it wrote back (the residual
+/// sum of squares for the squared family, the configured loss otherwise), plus
+/// the structural hash of the tree at that moment.
 struct FitResult {
     sse: f64,
     hash: u64,
@@ -999,8 +1259,24 @@ fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
     }
 }
 
+/// #119: one candidate job for the overlap queue: island, destination slot in
+/// that island's `next` vector, and the tree to score.
+type PipelineJob = (usize, usize, Node);
+
+/// #119: offer a freshly generated candidate to the overlap queue. Sending is
+/// best-effort by design: the consumer drains until every sender is dropped, so
+/// a send can only fail if the whole pipeline has already stopped (it never
+/// does while producers run). The candidate itself stays in the producer's
+/// `next`, so a dropped job is simply scored at the barrier.
+fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot: usize, ind: &Ind) {
+    if let Some((tx, island)) = sink {
+        let _ = tx.send((*island, slot, ind.tree.clone()));
+    }
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
+#[allow(clippy::too_many_arguments)]
 fn evolve_island(
     isl: &mut Vec<Ind>,
     rng: &mut Mt,
@@ -1022,6 +1298,10 @@ fn evolve_island(
     // still run in parallel. `front_p == 0.0` makes it a no-op.
     front: &[Sol],
     front_p: f64,
+    // #119: when present, every pending candidate is also offered to the
+    // bounded GPU queue as soon as it is fitted, so scoring overlaps the rest
+    // of this generation. `None` is the synchronous path exactly.
+    sink: Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -1093,7 +1373,9 @@ fn evolve_island(
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
+        let slot = next.len();
         next.push(ind);
+        offer(&sink, slot, &next[slot]); // #119
     }
 
     // Fill any remainder with fresh random trees.
@@ -1113,11 +1395,13 @@ fn evolve_island(
             tree = expr::simplify(&tree);
         }
         // #26: same deferral for the random fill.
+        let slot = next.len();
         next.push(if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
             Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         });
+        offer(&sink, slot, &next[slot]); // #119
     }
 
     *isl = next;
@@ -1136,6 +1420,25 @@ pub struct SeedResult {
     pub complexity: f64,
     /// Training error under [`Config::metric`].
     pub error: f64,
+}
+
+/// #131: one GPU scoring batch, reported in `--json` under `gpu.generations`.
+#[derive(Clone, Debug, Default)]
+pub struct GpuGenStats {
+    /// Generation number this batch belongs to.
+    pub generation: usize,
+    /// Operator occurrences in the programs that ran on the GPU.
+    pub opcodes: Vec<(String, usize)>,
+    /// Programs compiled into the batch.
+    pub programs: usize,
+    /// Candidates sent to the CPU fallback in the same batch.
+    pub fallbacks: usize,
+}
+
+/// #131: aggregate GPU usage for a run.
+#[derive(Clone, Debug, Default)]
+pub struct GpuRunStats {
+    pub generations: Vec<GpuGenStats>,
 }
 
 pub struct Outcome {
@@ -1157,6 +1460,20 @@ pub struct Outcome {
     /// when the full training sample was used (off, exact no-op, or a request
     /// widened above the break-even).
     pub predictor_samples: usize,
+    /// #141: the backend that actually guided the generations, recorded from
+    /// what ran rather than inferred from the flags. Reported errors are
+    /// always rebuilt on the CPU in `f64` regardless of this value.
+    pub backend: crate::backend::Kind,
+    /// #141: why the CPU ran instead of the GPU (missing feature, no device,
+    /// unsupported objective or a CUDA error).
+    pub backend_reason: Option<String>,
+    /// #141: the device that guided the search, when `backend` is `gpu`.
+    pub device: Option<String>,
+    /// #131: which native opcodes and how many CPU fallbacks each GPU batch
+    /// used. `None` when the run did not use the GPU.
+    pub gpu: Option<GpuRunStats>,
+    /// #120: quality-diversity coverage report, or `None` when the layer is off.
+    pub qd: Option<QdReport>,
 }
 
 /// Run a search once, from a fresh start.
@@ -1245,6 +1562,7 @@ type CheckpointFn<'a> = &'a mut dyn FnMut(&Checkpoint);
 #[allow(clippy::too_many_arguments)]
 fn snapshot(
     cfg: &Config,
+    backend: Backend,
     gens_done: usize,
     stopped_early: bool,
     best_prev: f64,
@@ -1260,6 +1578,8 @@ fn snapshot(
     let (words, idx) = main_rng.state();
     Checkpoint {
         config: cfg.clone(),
+        backend,
+        config_hash: crate::checkpoint::config_hash(cfg),
         generations: gens_done,
         stopped_early,
         best_prev,
@@ -1358,10 +1678,16 @@ fn run_search(
     // definitions; the list is empty unless --function was supplied.
     let blocks = expr::current_blocks();
 
-    // #26: one resident evaluator for the full training sample, used for whole
-    // generations. Constants were already fitted on the CPU; this only chooses
-    // where the tree evaluation runs. A missing feature, a missing device or an
-    // unsupported objective leaves `defer_gpu` false and the CPU path runs.
+    // #26/#141: one resident evaluator for the full training sample, used for
+    // whole generations. Constants were already fitted on the CPU; this only
+    // chooses where the tree evaluation runs. The backend report below records
+    // what actually ran: a missing feature, a missing device, an unsupported
+    // objective or a runtime CUDA error leaves the CPU path and a reason.
+    #[cfg(feature = "cuda")]
+    let mut backend_device: Option<String> = None;
+    #[cfg(not(feature = "cuda"))]
+    let backend_device: Option<String> = None;
+    let mut backend_reason: Option<String> = None;
     #[cfg(feature = "cuda")]
     let mut gpu: Option<GpuSearch> = if !cfg.gpu {
         None
@@ -1371,30 +1697,49 @@ fn run_search(
                 if cfg.gpu_notes {
                     eprintln!("# gpu: off ({})", reason);
                 }
+                backend_reason = Some(reason.to_string());
                 None
             }
             None => match GpuSearch::new(train) {
                 Ok(g) => {
+                    let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
+                        let scheduling = if cfg.pipeline_depth == 0 {
+                            "synchronous batches".to_string()
+                        } else {
+                            format!(
+                                "overlap depth {} (batches of {})",
+                                cfg.pipeline_depth,
+                                (cfg.pop / cfg.pipeline_depth.max(1)).max(1)
+                            )
+                        };
                         eprintln!(
-                            "# gpu: {} (one batch per generation; f32 fitness, reported numbers stay f64)",
-                            crate::gpu::GpuEvaluator::device_name()
+                            "# gpu: {} ({}; f32 fitness, reported numbers stay f64)",
+                            crate::gpu::GpuEvaluator::device_name(),
+                            scheduling
                         );
                     }
+                    backend_device = Some(device);
                     Some(g)
                 }
                 Err(e) => {
                     if cfg.gpu_notes {
                         eprintln!("# gpu: unavailable ({})", e);
                     }
+                    backend_reason = Some(e);
                     None
                 }
             },
         }
     };
     #[cfg(not(feature = "cuda"))]
-    if cfg.gpu && cfg.gpu_notes {
-        eprintln!("# gpu: unavailable (built without --features cuda)");
+    {
+        if cfg.gpu {
+            backend_reason = Some("built without --features cuda".to_string());
+            if cfg.gpu_notes {
+                eprintln!("# gpu: unavailable (built without --features cuda)");
+            }
+        }
     }
     #[cfg(feature = "cuda")]
     let mut defer_gpu = gpu.is_some();
@@ -1498,14 +1843,22 @@ fn run_search(
         // Generation 0's subset also scores the initial population, so nothing
         // is evaluated on the full table before the first generation.
         let init_sample = training_for_generation(cfg, train, 0);
-        let init_train = init_sample.as_ref().unwrap_or(train);
-        let init_data = EvalSample::new(init_train, cfg); // #27
+        // #133: with no predictor subset, generation 0 scores the full training
+        // sample whose SoA view already exists; do not transpose it again.
+        let init_data_owned;
+        let init_data = match &init_sample {
+            Some(sample) => {
+                init_data_owned = EvalSample::new(sample, cfg);
+                &init_data_owned
+            }
+            None => &train_data,
+        };
         // #85: with screening on, the initial population is the first set of
         // full-data parents, so it must not start on a predictor subset.
         let init_eval = if fit_sampling_active(cfg, train) {
             &train_data
         } else {
-            &init_data
+            init_data
         };
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
@@ -1535,11 +1888,10 @@ fn run_search(
     // loaded populations is deterministic, so an ordinary CPU resume keeps the
     // exact same trajectory.
     if resumed && !defer_gpu {
-        // #27: re-scoring goes through the same SoA view as the live search.
-        let train_view = EvalSample::new(train, cfg);
+        // #27/#133: re-scoring shares the SoA view built once above.
         for pop in islands.iter_mut() {
             for ind in pop.iter_mut() {
-                ind.reeval(&train_view, cfg); // #25
+                ind.reeval(&train_data, cfg); // #25
             }
         }
     }
@@ -1556,9 +1908,16 @@ fn run_search(
         // The population is being inserted before generation 0, whose subset
         // (if any) already scores the initial individuals; use the same sample
         // so every individual competes on identical rows.
-        let init_sample = training_for_generation(cfg, train, 0);
-        let init_train = init_sample.as_ref().unwrap_or(train);
-        let init_data = EvalSample::new(init_train, cfg); // #27
+        let seed_sample = training_for_generation(cfg, train, 0);
+        // #133: no subset means the full-data view already exists.
+        let seed_data_owned;
+        let seed_data = match &seed_sample {
+            Some(sample) => {
+                seed_data_owned = EvalSample::new(sample, cfg);
+                &seed_data_owned
+            }
+            None => &train_data,
+        };
         for (k, ind) in prepare_seeds(cfg, &train_data, seeds, &aggs)
             .into_iter()
             .enumerate()
@@ -1570,8 +1929,8 @@ fn run_search(
                 error: ind.error,
             });
             if k < cfg.pop {
-                let in_pop = if init_sample.is_some() {
-                    Ind::evaluated(ind.tree.clone(), &init_data, cfg) // #25
+                let in_pop = if seed_sample.is_some() {
+                    Ind::evaluated(ind.tree.clone(), seed_data, cfg) // #25
                 } else if defer_gpu {
                     // #26: the archive keeps the CPU error; the population copy
                     // is scored with the rest of generation 0.
@@ -1597,13 +1956,21 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg);
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done);
     }
 
     // #18: one tracker, updated once per generation from the archive. It holds
     // no population state, so it cannot affect the search trajectory.
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut stats_observed = false;
+    // #120: passive descriptor archive. It observes evaluated individuals and
+    // never feeds back into selection, so turning it on cannot change the
+    // trajectory or the Pareto front.
+    let mut qd_archive = if cfg.qd_bins > 0 {
+        Some(QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap))
+    } else {
+        None
+    };
 
     if !converged_early {
         for gen in gens_done..cfg.generations {
@@ -1613,7 +1980,16 @@ fn run_search(
             // `None` means the full training sample, exactly as before.
             let gen_sample = training_for_generation(cfg, train, gen);
             let gen_train = gen_sample.as_ref().unwrap_or(train);
-            let gen_data = EvalSample::new(gen_train, cfg); // #27
+            // #133: transpose once per distinct sample, not once per use. With
+            // no predictor subset the generation shares the full-data view.
+            let gen_data_owned;
+            let gen_data: &EvalSample = match &gen_sample {
+                Some(sample) => {
+                    gen_data_owned = EvalSample::new(sample, cfg);
+                    &gen_data_owned
+                }
+                None => &train_data,
+            };
             // #85: a fresh screening subset for constant fitting, drawn from
             // this generation's sample. `None` keeps the whole sample.
             let fit_sample = fit_for_generation(cfg, gen_train, gen);
@@ -1630,7 +2006,7 @@ fn run_search(
             } else {
                 None
             };
-            let eval_data = screen_data.as_ref().unwrap_or(&gen_data);
+            let eval_data = screen_data.as_ref().unwrap_or(gen_data);
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -1641,7 +2017,7 @@ fn run_search(
             if gen > 0 && gen_sample.is_some() && !screened {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.refit_and_reeval(&gen_data, fit_train, cfg); // #25
+                        ind.refit_and_reeval(gen_data, fit_train, cfg); // #25
                     }
                 }
             }
@@ -1666,11 +2042,52 @@ fn run_search(
             } else {
                 0.0
             };
+            // #119: overlap the GPU with the rest of this generation. The CPU
+            // threads keep generating and fitting; the main thread drains a
+            // bounded queue and scores batches. Selection still waits for every
+            // result at the barrier, so the trajectory is unchanged.
+            #[cfg(feature = "cuda")]
+            let pipeline_active = !screened && defer_gpu && cfg.pipeline_depth > 0;
+            #[cfg(not(feature = "cuda"))]
+            let pipeline_active = false;
+            // One batch is `pop / depth` candidates, so `depth` batches queue
+            // ahead of the scorer; live memory is at most `(depth + 1) * batch`
+            // candidate trees plus their compiled programs.
+            let batch_size = (cfg.pop / cfg.pipeline_depth.max(1)).max(1);
+            let queue_capacity = cfg.pipeline_depth.max(1) * batch_size;
+            #[cfg(not(feature = "cuda"))]
+            let _ = (pipeline_active, batch_size, queue_capacity);
+            #[cfg(feature = "cuda")]
+            let mut pipeline_results: Vec<Vec<Option<f64>>> =
+                vec![vec![None; cfg.pop.max(1)]; islands.len()];
+            #[cfg(feature = "cuda")]
+            let mut pipeline_error: Option<String> = None;
+            #[cfg(feature = "cuda")]
+            let mut pipeline_scored = false;
             std::thread::scope(|s| {
+                // The queue lives in the scope: producers take a clone of the
+                // sender, and `drain` consumes the original so it can end.
+                #[cfg(feature = "cuda")]
+                let queue = if pipeline_active {
+                    Some(crate::pipeline::JobQueue::new(queue_capacity))
+                } else {
+                    None
+                };
+                #[cfg(feature = "cuda")]
+                let senders: Vec<Option<std::sync::mpsc::SyncSender<PipelineJob>>> =
+                    (0..islands.len())
+                        .map(|_| queue.as_ref().map(|q| q.sender()))
+                        .collect();
+                #[cfg(not(feature = "cuda"))]
+                let senders: Vec<Option<std::sync::mpsc::SyncSender<PipelineJob>>> =
+                    vec![None; islands.len()];
+
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
-                    .map(|(isl, r)| {
+                    .zip(senders.into_iter())
+                    .enumerate()
+                    .map(|(i, ((isl, r), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
                         s.spawn(move || {
@@ -1687,21 +2104,75 @@ fn run_search(
                                 defer_gpu && !screened,
                                 front,   // #76
                                 front_p, // #76
+                                sender.as_ref().map(|t| (t, i)), // #119
                             ) // #85
                         })
                     })
                     .collect();
+
+                #[cfg(feature = "cuda")]
+                if let Some(queue) = queue {
+                    pipeline_error = queue.drain(batch_size, |jobs| {
+                        pipeline_scored = true;
+                        score_pipeline_batch(
+                            jobs,
+                            &mut gpu,
+                            &mut pipeline_results,
+                            gen_train.len(),
+                        )
+                    });
+                }
+
                 for h in handles {
                     let _ = h.join();
                 }
             });
 
-            // #26: one batched call covers every candidate of the generation.
             #[cfg(feature = "cuda")]
             {
-                if !screened {
+                if pipeline_active {
+                    // Results are keyed by (island, slot), so the arrival order
+                    // across concurrent island threads cannot change them.
+                    for (i, slots) in pipeline_results.iter().enumerate() {
+                        for (j, value) in slots.iter().enumerate() {
+                            if let Some(e) = value {
+                                islands[i][j].error = *e;
+                            }
+                        }
+                    }
+                    if pipeline_error.is_none() {
+                        if pipeline_scored {
+                            gpu_used = true;
+                        }
+                        // Score anything the kernel could not compile (left
+                        // pending) through the normal CPU fallback.
+                        defer_gpu =
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
+                    } else {
+                        // Stop the GPU and re-score every still-pending
+                        // candidate in f64 on the CPU; a failed batch must
+                        // never leave a wrong (or missing) number behind.
+                        if cfg.gpu_notes {
+                            if let Some(e) = &pipeline_error {
+                                eprintln!("# gpu: unavailable ({})", e);
+                            }
+                        }
+                        gpu = None;
+                        let train_view = EvalSample::new(train, cfg);
+                        for pop in islands.iter_mut() {
+                            for ind in pop.iter_mut() {
+                                if ind.error.is_nan() {
+                                    ind.reeval(&train_view, cfg); // #25
+                                }
+                            }
+                        }
+                        defer_gpu = false;
+                    }
+                } else if !screened {
+                    // #26: one batched call covers every candidate of the
+                    // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
                 }
             }
 
@@ -1740,12 +2211,12 @@ fn run_search(
                     if ind.error < gen_best {
                         gen_best = ind.error;
                     }
-                    archive.try_insert(Sol {
-                        complexity: expr::complexity(&ind.tree),
-                        cost: ind.complexity,
-                        tree: ind.tree.clone(),
-                        error: ind.error,
-                    });
+                    archive.try_insert_view(
+                        &ind.tree,
+                        ind.error,
+                        expr::complexity(&ind.tree),
+                        ind.complexity,
+                    );
                 }
             }
 
@@ -1818,7 +2289,7 @@ fn run_search(
                             *worst = if defer_gpu {
                                 Ind::pending(t.clone(), cfg)
                             } else {
-                                Ind::evaluated(t.clone(), &gen_data, cfg) // #25
+                                Ind::evaluated(t.clone(), gen_data, cfg) // #25
                             };
                         }
                     }
@@ -1862,7 +2333,7 @@ fn run_search(
                             *ind = if defer_gpu {
                                 Ind::pending(t, cfg)
                             } else {
-                                Ind::evaluated_fitted(t, fitted, &gen_data, cfg) // #87
+                                Ind::evaluated_fitted(t, fitted, gen_data, cfg) // #87
                             };
                         }
                         rngs[ii] = r;
@@ -1876,14 +2347,38 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
+            }
+
+            // #120: record this generation's evaluated behaviours. The order
+            // is fixed (island 0..I, population order, then the archive), so
+            // the archive is a deterministic function of the trajectory.
+            if let Some(qd) = qd_archive.as_mut() {
+                let mut items = Vec::new();
+                for pop in &islands {
+                    for ind in pop {
+                        if ind.error.is_finite() {
+                            items.push((ind.tree.clone(), ind.error, ind.complexity));
+                        }
+                    }
+                }
+                for s in &archive.items {
+                    items.push((s.tree.clone(), s.error, s.cost));
+                }
+                qd.record(items, gen_train);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
             // generation's work, including migration and restarts, is done.
             if save_every > 0 && gens_done % save_every == 0 {
+                let backend = if defer_gpu || gpu_used {
+                    Backend::Gpu
+                } else {
+                    Backend::Cpu
+                };
                 let cp = snapshot(
                     cfg,
+                    backend,
                     gens_done,
                     converged_early,
                     best_prev,
@@ -1905,8 +2400,14 @@ fn run_search(
     // full-data archive rebuild, so the saved archive is the search archive at
     // the last completed generation.
     if on_checkpoint.is_some() {
+        let backend = if defer_gpu || gpu_used {
+            Backend::Gpu
+        } else {
+            Backend::Cpu
+        };
         let cp = snapshot(
             cfg,
+            backend,
             gens_done,
             converged_early,
             best_prev,
@@ -1974,6 +2475,13 @@ fn run_search(
         convergence = progress_stats.observe(gens_done, best, &final_archive);
     }
 
+    // #131: the GPU report is emitted only for a run that actually used the
+    // device, so a CPU run's JSON is byte-identical to before.
+    #[cfg(feature = "cuda")]
+    let gpu_stats = if gpu_used { gpu.as_ref().map(|g| g.run_stats()) } else { None };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_stats: Option<GpuRunStats> = None;
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
@@ -1991,6 +2499,16 @@ fn run_search(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
+        backend: if gpu_used {
+            crate::backend::Kind::Gpu
+        } else {
+            crate::backend::Kind::Cpu
+        },
+        backend_reason,
+        device: if gpu_used { backend_device } else { None },
+        gpu: gpu_stats,
+        // #120: coverage of the descriptor grid for this run.
+        qd: qd_archive.as_ref().map(|q| q.report()),
     })
 }
 
@@ -2009,6 +2527,51 @@ mod tests {
             y.push(a);
         }
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    /// #141: the library default follows the build: a CUDA binary prefers the
+    /// GPU, every other build is CPU. Selection still depends on the probe.
+    #[test]
+    fn gpu_default_follows_the_cuda_feature() {
+        assert_eq!(Config::default().gpu, cfg!(feature = "cuda"));
+    }
+
+    /// #141: a CPU outcome reports the reason and never a stale device. The
+    /// CPU is forced here so this test is deterministic on a GPU machine.
+    #[test]
+    fn cpu_outcome_reports_backend_and_reason() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.gpu = false;
+        cfg.generations = 2;
+        cfg.pop = 12;
+        cfg.patience = 0;
+        let out = run(&cfg, &s, &s);
+        assert_eq!(out.backend, crate::backend::Kind::Cpu);
+        assert!(out.device.is_none());
+    }
+
+    /// #133: the full training view is built once for the run and reused by
+    /// generation 0 and every generation that draws no predictor subset. The
+    /// pooled test view is built once at the end.
+    #[test]
+    fn the_full_train_view_is_transposed_once_per_run() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.generations = 4;
+        cfg.pop = 8;
+        cfg.fit_iters = 0;
+        cfg.islands = 1;
+        cfg.predictor_samples = None;
+        assert!(cfg.simd);
+        reset_transpose_count();
+        let _ = run(&cfg, &s, &s);
+        assert_eq!(
+            transpose_count(),
+            2,
+            "expected one full-train and one test transpose, got {}",
+            transpose_count()
+        );
     }
 
     // #76: two distinguishable front members.
@@ -2111,6 +2674,7 @@ mod tests {
                 false,
                 front,
                 0.0,
+                None, // #119: synchronous test path
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
@@ -2401,5 +2965,55 @@ mod tests {
             !seen.insert(expr::structural_hash(&parent.tree)),
             "a clone of a parent must be a duplicate"
         );
+    }
+
+    /// #122: the bounded CPU fallback must be a pure parallelisation, not a
+    /// change of result. One thread and four threads score the same unsupported
+    /// (`if`) and supported trees to the same bits.
+    #[test]
+    fn cpu_fallback_is_identical_for_one_and_many_threads() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let trees = vec![
+            node(
+                Op::If,
+                vec![
+                    node(Op::Mul, vec![input(0), constant(2.0)]),
+                    input(1),
+                    constant(0.5),
+                ],
+            ),
+            node(Op::Sin, vec![input(0)]),
+            node(Op::Div, vec![constant(1.0), input(0)]),
+            node(
+                Op::Add,
+                vec![node(Op::Square, vec![input(1)]), constant(1.0)],
+            ),
+        ];
+        let make = || {
+            vec![
+                trees
+                    .iter()
+                    .cloned()
+                    .map(|t| Ind::pending(t, &cfg))
+                    .collect::<Vec<_>>(),
+                trees
+                    .iter()
+                    .cloned()
+                    .map(|t| Ind::pending(t, &cfg))
+                    .collect::<Vec<_>>(),
+            ]
+        };
+        let mut one = make();
+        let mut many = make();
+        rescore_pending_cpu_with(&mut one, &view, &cfg, 1);
+        rescore_pending_cpu_with(&mut many, &view, &cfg, 4);
+        for (a, b) in one.iter().flatten().zip(many.iter().flatten()) {
+            assert_eq!(a.error.to_bits(), b.error.to_bits());
+            assert_eq!(a.complexity.to_bits(), b.complexity.to_bits());
+            assert!(expr::same(&a.tree, &b.tree));
+        }
+        assert!(one[0][0].error.is_finite(), "the unsupported tree was scored");
     }
 }

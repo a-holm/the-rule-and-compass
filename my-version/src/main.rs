@@ -11,15 +11,16 @@
 //! * `--time-budget` bounds wall-clock time, so a caller never blocks forever;
 //! * exit codes are stable and documented (see [`EXIT_USAGE`] etc.).
 
-use rcsr::checkpoint::Checkpoint;
+use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::complexity::ComplexityModel;
+use rcsr::manifest;
 use rcsr::expr::{self, Op};
 use rcsr::fit;
 use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability, store};
+use rcsr::{backend, data, diagnostics, multi, qd, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -89,7 +90,9 @@ fn usage() -> String {
 
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
-  rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
+  rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -99,10 +102,11 @@ INPUT:
                              for CSV ('-' reads the table from standard input)
   --max-memory <size>        refuse when the estimated resident footprint is
                              larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
-                             512MB, 2GiB). Exit 3 with an actionable message
-                             instead of SIGABRT/SIGKILL. A `.rcsb` store that
-                             does not fit is searched from a hash sample with
-                             bounded RSS; a CSV is refused before parsing.
+                             512MB, 2GiB). Exit 3 with the rows x columns
+                             estimate and an actionable message instead of
+                             SIGABRT/SIGKILL. A `.rcsb` store that does not fit
+                             is searched from a hash sample with bounded RSS;
+                             a CSV is refused before parsing.
   --force                    override --max-memory and try the resident path
                              anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
@@ -122,12 +126,20 @@ INPUT:
                              refuse the file with an input error (exit 3) naming
                              the 1-based line and both field counts
   --test-frac <f>            held-out fraction (default 0.25)
+  --validation-frac <f>      hold out the last <f> of the chronological training
+                             period as a validation slice for selection
+                             (0 = off). The test block is never used to choose
+                             a candidate.
+  --select-by train|validation|aicc
+                             criterion used to rank/report candidates (default
+                             validation when a slice exists, otherwise train).
+                             test_error is scoring-only, never a criterion.
 
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
                              positive. A weight of 2 means \"this row twice\":
-                             absolute, squared, correlation, signed,
-                             log_squashed, implicit, implicit_residual become
+                             absolute, squared, correlation, correlation_signed,
+                             signed, log_squashed, implicit, implicit_residual become
                              weighted means, and aic/aicc/bic use the weighted
                              RSS. Refused for metrics with no weighted definition
                              (median, maximum, interquartile, slope,
@@ -143,8 +155,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              interpolate linear between the neighbours
   --outlier-iqr <k>          drop rows more than k interquartile ranges from the
                              column median (bounds from training rows only)
-  --smooth <k>               k-wide centred moving average per column (edges
-                             shrink; windows never cross the train/test split)
+  --smooth <k>               k-wide TRAILING moving average per column (a row
+                             reads only its own and earlier rows; edges shrink)
+  --smooth-centred <k>       the old centred window. Reads future bars and is
+                             a look-ahead on time series; reported as centred
+  --allow-interpolate        permit --fill interpolate on time-ordered data
+                             (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
   --filter <expr>            keep only rows where the expression is > 0; may
@@ -164,7 +180,16 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                                              subjects, sensors), never both sides
                              temporal-group  a temporal split inside every group
                              auto            infer from the columns and report
-  --time <col>               time/ordering column; implies temporal
+  --time <col>               time/ordering column; implies temporal. Accepts
+                             epoch numbers or ISO 8601 with a Z / +-HH:MM offset
+  --date-only <policy>       date-only time values: error (default, refuses an
+                             under-specified instant), utc-midnight or
+                             session-close (21:00 UTC)
+  --time-unit s|ms|us|ns     unit of a numeric time column (default: detect;
+                             a mixed or out-of-range column is refused)
+  --tz <offset>              fixed offset for timestamps without one (UTC or
+                             +-HH:MM; named zones need a tz database and are
+                             refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
   --gap <rows>               embargo: rows dropped between train and test to stop
@@ -192,11 +217,12 @@ OVERFITTING DIAGNOSTICS (always on):
                               in the same metric as the search: a model must
                               beat them to earn its complexity
   --baseline-samples <N>      score at most N query rows for the k-NN baseline
-                              (default 0 = every row; absolute/squared/
+                              (default 512; 0 = every row; absolute/squared/
                               log_squashed only). The reference set is always
                               all training rows; sampled results report their
                               standard error with the finite-population
-                              correction (#69)
+                              correction (#69). The exact every-row query is
+                              O(train^2*d), so 0 is opt-in on large panels
   overfit index               test_error / train_error
   constant errors             standard error and relative uncertainty of every
                               fitted constant, from the Gauss-Newton Jacobian
@@ -214,6 +240,12 @@ OVERFITTING DIAGNOSTICS (always on):
                              (y-randomisation control) and report the null error
                              distribution and a p-value; inferential, costs n
                              extra searches
+  --null-block <N>           permute contiguous blocks of N rows instead of
+                             single rows (N >= 2, and at least the label
+                             horizon). For autocorrelated series the i.i.d.
+                             shuffle is anti-conservative; the report records
+                             method, block length and number of blocks. With no
+                             --null-runs it runs 19 permutations
   --bootstrap-error <n>      refit each solution's constants on n bootstrap
                              resamples and report the apparent, out-of-bag and
                              .632+ error estimates (Efron & Tibshirani 1997);
@@ -252,11 +284,16 @@ MULTI-OUTPUT (--target y1,y2):
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
-                             absolute  squared  correlation  median  maximum
-                             signed  log_squashed  rank_correlation  interquartile
-                             slope  auc  log_loss  hinge  aic  aicc  bic
+                             absolute  squared  correlation  correlation_signed
+                             median  maximum  signed  log_squashed
+                             rank_correlation  rank_correlation_signed
+                             interquartile  slope  auc  log_loss  hinge  aic  aicc  bic
                              implicit  implicit_residual  (implicit model)
-                             (auc/log_loss/hinge treat the target as two classes)
+                             correlation/rank_correlation score 1-|r| and accept an
+                             inverted model; the _signed variants score 1-r and
+                             require the right direction. auc/log_loss/hinge treat
+                             the target as two classes and reject targets with
+                             more than two distinct values.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -306,8 +343,22 @@ SEARCH:
                              consistent with the target's (infinite error);
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
-  --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
-  --no-fit                   disable constant fitting
+  --fit-iters <N>            Levenberg–Marquardt iterations for constants
+                             (default 8; 0 = no fitting at all). Constants are
+                             fitted to the configured --metric: squared/aic/
+                             aicc/bic use exact least squares; absolute and
+                             log_squashed use IRLS; auc/log_loss/hinge use
+                             logistic IRLS; rank/order/correlation losses use a
+                             deterministic coordinate polish
+  --fit-strategy <name>      exact | auto | linear (default exact). `exact` is
+                             the historical CPU Levenberg–Marquardt path, bit
+                             for bit. `auto`/`linear` solve trees affine in
+                             every constant by closed-form QR and fall back to
+                             exact otherwise; the linear arm is an exact global
+                             minimiser for squared error only
+  --fit-report               print the constant-fitting arm counts at the end
+                             of the run (diagnostics only)
+  --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)
@@ -331,21 +382,51 @@ SEARCH:
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
-  --gpu                      let the GPU guide the search when built with
-                             --features cuda and a device is present. Reported
-                             errors stay CPU f64, but f32 fitness can change the
-                             trajectory, so this is opt-in
-  --no-gpu                   force CPU evaluation (alias --cpu); this is the
-                             default, so the flag is only for explicitness
+  --gpu                      assert that the GPU must guide the search: an
+                             error (exit 2) when the binary was not built with
+                             --features cuda or no device is present. Without
+                             --gpu/--cpu, a CUDA build with a usable device uses
+                             the GPU automatically. Reported errors stay CPU
+                             f64, but f32 fitness can change the trajectory
+                             (cross-backend runs are not bit-identical)
+  --no-gpu                   force CPU evaluation (alias --cpu); also the
+                             reproducibility escape hatch for a byte-identical
+                             CPU trajectory
+  --qd                       record an opt-in quality-diversity archive over
+                             (variable usage x prediction skewness), passive;
+                             it never changes parents or the Pareto front
+  --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
+  --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
+  --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
+                             bounded pending queue of N batches (default 2; 0 =
+                             synchronous). Results and archive are identical;
+                             only effective with --gpu
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
-                             generations; saving does not change the search
+                             generations; saving does not change the search.
+                             Writes are atomic and the previous good generation
+                             is kept as <file>.prev
   --save-every <N>           generation interval for --save (default 25)
   --resume <file>            continue from a checkpoint. The saved search
                              settings win; --generations may only be raised.
                              Training and test data must match the saved
                              fingerprint; a mismatch is refused (exit 3).
+                             The saved backend (cpu/gpu) must also match; a
+                             mismatch is refused unless overridden below
+  --allow-backend-change     resume a checkpoint on a different backend
+                             (cpu<->gpu) and say so on stderr and in the
+                             run manifest
+
+RUN INTEGRITY (#140):
+  --run-manifest <file>      atomically write a JSON manifest with commit,
+                             dirty state, binary SHA-256, data checksum and
+                             fingerprint, resolved config, seed, backend,
+                             device/driver/CUDA, UTC start/end and phase timings;
+                             update it atomically at the end
+  verify-manifest <file>     check a manifest against the current binary,
+  [--data <file>]            commit, data file and canonical config; exit 1 on
+                             any mismatch (exit 0 when everything matches)
 
 OUTPUT:
   --format text|json|ndjson  (default text)
@@ -356,8 +437,12 @@ OUTPUT:
                              maturity, percent_converged); stderr, or stdout in
                              ndjson. See docs/convergence.md
   --top <N>                  report at most N Pareto rows (default: all)
-  --quiet                    suppress the human-readable header
-  --out <file>               also write the Pareto front as TSV
+  --quiet                    suppress the human-readable header, the GPU
+                             fallback note and the one-line resource summary
+  --out <file>               also write the Pareto front as TSV (atomic)
+  --json-out <file>          write the final JSON result to this file atomically
+                             instead of streaming it to stdout (implies --json).
+                             Progress still goes to stderr, or NDJSON on stdout
 
 REPORTS (Markdown, issue #29):
   --report <type>            emit a Markdown report after the run. One type per
@@ -426,6 +511,78 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #120: QD coverage in the human-readable log.
+fn qd_text(q: Option<&qd::QdReport>) {
+    if let Some(q) = q {
+        eprintln!(
+            "# qd: {}/{} cells occupied ({:.1}%), {} entries, best error {}",
+            q.occupied,
+            q.cells,
+            100.0 * q.coverage,
+            q.entries,
+            jnum(q.best_error)
+        );
+    }
+}
+
+/// #120: QD coverage in the JSON result (`null` when the layer is off).
+fn qd_json(q: Option<&qd::QdReport>) -> String {
+    match q {
+        None => "null".to_string(),
+        Some(q) => format!(
+            "{{\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{}}}",
+            q.bins,
+            q.cells,
+            q.occupied,
+            jnum(q.coverage),
+            q.entries,
+            jnum(q.best_error),
+            q.cell_cap
+        ),
+    }
+}
+
+/// #134: non-overlapping wall-clock phases for one search run. `prep` covers
+/// argument parsing, loading and preparation; `search` is the evolutionary
+/// run; the rest are the post-search work. `total` is measured independently at
+/// the end, so the phases can be checked against the wall instead of assumed to
+/// add up. `elapsed_seconds` is kept as the search phase for compatibility.
+#[derive(Clone, Copy, Default)]
+struct PhaseTimings {
+    prep: f64,
+    search: f64,
+    baselines: f64,
+    diagnostics: f64,
+    report: f64,
+    total: f64,
+}
+
+impl PhaseTimings {
+    fn json(&self) -> String {
+        format!(
+            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{}}}",
+            jnum(self.prep),
+            jnum(self.search),
+            jnum(self.baselines),
+            jnum(self.diagnostics),
+            jnum(self.report),
+            jnum(self.total)
+        )
+    }
+
+    fn text(&self) -> String {
+        format!(
+            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s",
+            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total
+        )
+    }
+
+    #[cfg(test)]
+    fn phases_sum(&self) -> f64 {
+        self.prep + self.search + self.baselines + self.diagnostics + self.report
+    }
+}
+
 /// The `variables_detail` array shared by `--json`, `--ndjson` and
 /// `--eval-expr`: one object per search input with its datatype. A one-hot
 /// indicator also reports its source column.
@@ -476,10 +633,16 @@ fn parse_filter(flag: &str, src: Option<&str>, table: &data::Table) -> Option<da
 #[derive(Clone)]
 struct Row {
     rank: usize,
+    /// Position in the archive's train-error order, before selection reorders
+    /// the printed rows (#111).
+    archive_rank: usize,
     complexity: f64,
     /// Fitted constants: the free parameters of the model.
     k_constants: usize,
     train_error: f64,
+    /// Error on the chronological validation slice, when one exists (#111).
+    /// Selection reads this (or train/AICc), never `test_error`.
+    validation_error: f64,
     test_error: f64,
     /// Small-sample-corrected AIC (fit vs. constants), lower is better.
     aicc: f64,
@@ -561,6 +724,17 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
     }
+    // #124: a reusable Rust walk-forward evaluator over the column store.
+    if matches!(
+        args.first().map(|s| s.as_str()),
+        Some("walkforward") | Some("eval")
+    ) {
+        run_walkforward(&args[1..]);
+    }
+    // #140: verify a run manifest without starting a search.
+    if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
+        run_verify_manifest(&args[1..]);
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
         std::process::exit(EXIT_OK);
@@ -573,17 +747,26 @@ fn main() {
         print!("{}", schema::json());
         std::process::exit(EXIT_OK);
     }
+    // #134: everything before the search is `prep`, including argument parsing,
+    // loading and data preparation.
+    let run_start = std::time::Instant::now();
 
     let mut cfg = search::Config::default();
-    // #91: the GPU path is opt-in. A default run is CPU, so the same command
-    // produces the same archive whether or not the binary was built with
-    // `--features cuda`. Pass `--gpu` to let f32 fitness guide the search.
+    // #141: whether the user asserted a backend explicitly. `None` means the
+    // run follows the build/device default; `Some(true)` is `--gpu` and
+    // `Some(false)` is `--no-gpu`/`--cpu`.
+    let mut gpu_explicit: Option<bool> = None;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
     let mut dtype_src: Option<String> = None;
     let mut max_levels = 16usize;
     let mut test_frac = 0.25;
+    // #111: chronological validation slice inside the training period, and the
+    // criterion used to choose the reported candidate. Selection never reads
+    // the test lockbox.
+    let mut validation_frac = 0.0f64;
+    let mut select_by_arg: Option<String> = None;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
     let mut progress = false;
@@ -601,9 +784,17 @@ fn main() {
     let mut lags = 0usize;
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
+    let mut date_only = data::DateOnlyPolicy::Error;
+    let mut time_unit: Option<data::TimeUnit> = None;
+    let mut tz: Option<i64> = None;
     let mut null_runs = 0usize;
+    // #114: block length for a block-permutation null; 0 selects the i.i.d.
+    // row shuffle. `--null-block` without `--null-runs` runs 19 permutations.
+    let mut null_block = 0usize;
     // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
-    let mut baseline_samples = 0usize;
+    // #132: bounded by default; `--baseline-samples 0` opts into every row.
+    let mut baseline_samples = diagnostics::DEFAULT_BASELINE_SAMPLES;
+    let mut baseline_samples_set = false;
     let mut bootstrap_resamples = 0usize;
     let mut eval_expr: Option<String> = None;
     let mut seed_exprs: Vec<String> = Vec::new();
@@ -620,6 +811,8 @@ fn main() {
     let mut force = false;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
+    let mut smooth_centred = false;
+    let mut allow_interpolate = false;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -632,6 +825,10 @@ fn main() {
     let mut save_every = 25usize;
     let mut save_every_set = false;
     let mut resume_path: Option<String> = None;
+    // #140: run integrity flags.
+    let mut allow_backend_change = false;
+    let mut run_manifest_path: Option<String> = None;
+    let mut json_out: Option<String> = None;
 
     // Which search flags were written on the command line. Used to refuse a
     // resume whose explicit override contradicts the saved configuration.
@@ -643,6 +840,9 @@ fn main() {
     let mut seed_set = false;
     let mut ops_set = false;
     let mut fit_iters_set = false;
+    // #116: remember an explicit --fit-strategy so a resume can refuse a
+    // contradiction with the saved configuration.
+    let mut fit_strategy_set = false;
     let mut dedup_set = false;
     let mut patience_set = false;
     let mut time_budget_set = false;
@@ -784,6 +984,8 @@ fn main() {
                 seed_set = true;
             }
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
+            "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
+            "--select-by" => select_by_arg = Some(val!()),
             "--fill" => {
                 let v = val!();
                 match data::FillMethod::parse(&v) {
@@ -809,6 +1011,18 @@ fn main() {
                     std::process::exit(EXIT_USAGE);
                 }
             },
+            // #110: centred smoothing reads future bars; opt in explicitly.
+            "--smooth-centred" => match val!().parse::<usize>() {
+                Ok(k) => {
+                    smooth = k;
+                    smooth_centred = true;
+                }
+                Err(_) => {
+                    eprintln!("error: --smooth-centred needs a non-negative integer window");
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            "--allow-interpolate" => allow_interpolate = true,
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -842,9 +1056,44 @@ fn main() {
             "--lags" => lags = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
+            // #130: strict time parsing. Every choice is reported.
+            "--date-only" => {
+                let v = val!();
+                match data::DateOnlyPolicy::parse(&v) {
+                    Ok(p) => date_only = p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--time-unit" => {
+                let v = val!();
+                match data::TimeUnit::parse(&v) {
+                    Ok(u) => time_unit = Some(u),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--tz" => {
+                let v = val!();
+                match data::TimeSpec::parse_tz(&v) {
+                    Ok(o) => tz = Some(o),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
+            "--null-block" => null_block = val!().parse().unwrap_or(0),
             // #69: 0 = no caps; a positive N samples only the query rows.
-            "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
+            "--baseline-samples" => {
+                baseline_samples = val!().parse().unwrap_or(baseline_samples);
+                baseline_samples_set = true;
+            }
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
             "--ops" => {
                 match Op::parse_list_checked(&val!()) {
@@ -880,9 +1129,61 @@ fn main() {
                 cfg.fit_iters = 0;
                 fit_iters_set = true;
             }
+            // #116: reporting-only arm counts.
+            "--fit-report" => cfg.fit_report = true,
+            // #116: exact constant-fitting arm.
+            "--fit-strategy" => {
+                let v = val!();
+                match fit::FitStrategy::parse(&v) {
+                    Some(s) => {
+                        cfg.fit_strategy = s;
+                        fit_strategy_set = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --fit-strategy needs exact, auto or linear (cpu is an \
+                             alias for exact), got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #120: opt-in quality-diversity coverage archive.
+            "--qd" => {
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 16;
+                }
+            }
+            "--qd-cells" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (2..=256).contains(&n) => cfg.qd_bins = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cells needs an integer in 2..=256, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--qd-cell-cap" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=64).contains(&n) => cfg.qd_cell_cap = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cell-cap needs an integer in 1..=64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -892,10 +1193,28 @@ fn main() {
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
             "--no-simd" => cfg.simd = false,
-            // #26: force the CPU evaluator even in a CUDA build. A
-            // performance choice, not saved search state.
-            "--gpu" => cfg.gpu = true,
-            "--no-gpu" | "--cpu" => cfg.gpu = false,
+            "--gpu" => {
+                cfg.gpu = true;
+                gpu_explicit = Some(true);
+            }
+            "--no-gpu" | "--cpu" => {
+                cfg.gpu = false;
+                gpu_explicit = Some(false);
+            }
+            // #119: bounded CPU/GPU overlap depth in batches (0 = off).
+            "--pipeline-depth" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n <= 64 => cfg.pipeline_depth = n,
+                    _ => {
+                        eprintln!(
+                            "error: --pipeline-depth needs an integer from 0 to 64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -967,6 +1286,9 @@ fn main() {
                 }
             }
             "--resume" => resume_path = Some(val!()),
+            "--allow-backend-change" => allow_backend_change = true,
+            "--run-manifest" => run_manifest_path = Some(val!()),
+            "--json-out" => json_out = Some(val!()),
             "--format" => {
                 format = match val!().as_str() {
                     "json" => Format::Json,
@@ -1050,6 +1372,15 @@ fn main() {
         eprintln!("error: --save-every requires --save <file>");
         std::process::exit(EXIT_USAGE);
     }
+    if allow_backend_change && resume_path.is_none() {
+        eprintln!("error: --allow-backend-change only applies to --resume");
+        std::process::exit(EXIT_USAGE);
+    }
+    if json_out.is_some() {
+        // #140: a file result is a JSON document, published atomically. It
+        // replaces the stdout stream for the final object.
+        format = Format::Json;
+    }
     if eval_expr.is_some() && (save_path.is_some() || resume_path.is_some()) {
         eprintln!("error: --save and --resume cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
@@ -1081,20 +1412,33 @@ fn main() {
     // #69: query sampling is an unbiased estimate only for mean-loss metrics.
     // Refuse the flag elsewhere rather than silently reporting a subsample of a
     // median/correlation/AIC as if it were the full-sample value.
-    if baseline_samples > 0 && !diagnostics::knn_sampling_supported(cfg.metric) {
-        eprintln!(
-            "error: --baseline-samples {} only supports mean-loss metrics \
-             (absolute, squared, log_squashed), not {}",
-            baseline_samples,
-            cfg.metric.name()
-        );
-        std::process::exit(EXIT_USAGE);
+    if !diagnostics::knn_sampling_supported(cfg.metric) {
+        if baseline_samples_set && baseline_samples > 0 {
+            eprintln!(
+                "error: --baseline-samples {} only supports mean-loss metrics \
+                 (absolute, squared, log_squashed), not {}",
+                baseline_samples,
+                cfg.metric.name()
+            );
+            std::process::exit(EXIT_USAGE);
+        }
+        // The bounded default does not apply: a subsample of a median or an
+        // information criterion is a different estimator, not an estimate of
+        // the same quantity.
+        baseline_samples = 0;
     }
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
     // the real run: refuse rather than report a meaningless p-value.
+    if null_block > 0 && null_runs == 0 {
+        null_runs = 19;
+    }
+    if null_block == 1 {
+        eprintln!("error: --null-block must be at least 2 rows (use --null-runs for the i.i.d. shuffle)");
+        std::process::exit(EXIT_USAGE);
+    }
     if implicit_mode && null_runs > 0 {
-        eprintln!("error: --implicit cannot be combined with --null-runs");
+        eprintln!("error: --implicit cannot be combined with --null-runs/--null-block");
         eprintln!("  the null control shuffles the target, which is an input here");
         std::process::exit(EXIT_USAGE);
     }
@@ -1185,6 +1529,14 @@ fn main() {
                 cfg.fit_iters, saved.fit_iters
             ));
         }
+        // #116: the fitting arm is saved search state.
+        if fit_strategy_set && cfg.fit_strategy != saved.fit_strategy {
+            conflicts.push(format!(
+                "--fit-strategy {} (saved {})",
+                cfg.fit_strategy.name(),
+                saved.fit_strategy.name()
+            ));
+        }
         if dedup_set && cfg.dedup != saved.dedup {
             conflicts.push(format!("--no-dedup (saved dedup is {})", saved.dedup));
         }
@@ -1267,13 +1619,56 @@ fn main() {
         // The generation budget is the one setting that may be *raised* on
         // resume: all earlier generations are unaffected and a longer run is
         // the same trajectory plus more generations.
+        //
+        // #140: evaluator choices are *not* saved search settings, but they
+        // must survive the resume. Previously `cfg = saved` silently reset
+        // `--gpu` to the default CPU, which is exactly how a GPU run was
+        // continued on the CPU.
+        let requested_gpu = cfg.gpu;
+        let requested_simd = cfg.simd;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
         }
+        effective.gpu = requested_gpu;
+        effective.simd = requested_simd;
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
+    }
+
+    // #141: probe the device once, before the dataset is loaded. The probe
+    // allocates nothing; the search opens its own resident context later. This
+    // is the single runtime decision behind the startup summary and JSON.
+    let gpu_probe = backend::probe();
+    match gpu_explicit {
+        Some(true) => {
+            if !gpu_probe.available() {
+                let why = gpu_probe
+                    .reason
+                    .as_deref()
+                    .unwrap_or("no usable CUDA device");
+                eprintln!(
+                    "error: --gpu was requested but no GPU is available ({})",
+                    why
+                );
+                eprintln!("       omit --gpu (or pass --cpu) to run on the CPU");
+                std::process::exit(EXIT_USAGE);
+            }
+            cfg.gpu = true;
+        }
+        Some(false) => cfg.gpu = false,
+        None => {
+            cfg.gpu = gpu_probe.available();
+            // A non-CUDA build is CPU by design; only a CUDA-capable binary
+            // that failed to find a device needs a fallback warning.
+            if !cfg.gpu && !quiet && cfg!(feature = "cuda") {
+                eprintln!(
+                    "# gpu: unavailable ({}); using the CPU",
+                    gpu_probe.reason.as_deref().unwrap_or("no usable CUDA device")
+                );
+            }
+        }
     }
 
     // User-defined building blocks (issue #10). The definitions are parsed
@@ -1310,6 +1705,9 @@ fn main() {
         }
     }
 
+    // #140: phase timings for the run manifest start here, before the table is
+    // read, so the manifest covers the whole run rather than just the search.
+    let run_start = std::time::Instant::now();
     let data_path = match data_path {
         Some(p) => p,
         None => {
@@ -1355,9 +1753,12 @@ fn main() {
             (resume_path.is_some(), "--resume"),
             (cv_mode.is_some(), "--cv"),
             (null_runs > 0, "--null-runs"),
+            (validation_frac > 0.0 || select_by_arg.is_some(), "--validation-frac/--select-by"),
+            (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
+            (run_manifest_path.is_some(), "--run-manifest"),
             (format == Format::Ndjson, "--ndjson"),
         ];
         for (present, flag) in unsupported {
@@ -1372,14 +1773,22 @@ fn main() {
         }
     }
 
-    // #71: the guard and the backing choice happen before any resident Table
-    // or search sample is built.
+    // #71/#112: the guard and the backing choice happen before any resident
+    // Table or search sample is built. A CSV estimate uses the table's shape
+    // (rows x columns) once the text has been read, never `33 x file size`.
     let detected_budget = store::detected_memory_budget();
     let budget = max_memory.or(detected_budget);
     // A CSV refusal uses only a hard wall (`--max-memory`, `ulimit -v` or a
-    // cgroup limit), never the soft MemAvailable figure: the 33x estimate is
-    // deliberately conservative.
+    // cgroup limit), never the soft MemAvailable figure.
     let guard_budget = max_memory.or_else(store::detected_hard_budget);
+    // The search touches every explicitly named variable plus every target and
+    // the weight column. With no `--vars` the projection is not known yet, so
+    // the estimate assumes the whole header.
+    let projected_cols = if vars.is_empty() {
+        0
+    } else {
+        vars.len() + target_names.len() + usize::from(weight_name.is_some())
+    };
     let mut out_of_core_note: Option<String> = None;
     let table = if data_path == "-" {
         let mut buf = String::new();
@@ -1387,10 +1796,11 @@ fn main() {
             eprintln!("error reading stdin: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        let shape = data::csv_shape(&buf);
         if let Some(limit) = guard_budget {
-            let estimate = (buf.len() as u64).saturating_mul(33);
+            let estimate = data::estimate_csv_bytes(shape, projected_cols);
             if estimate > limit && !force {
-                refuse_for_memory("<stdin>", buf.len() as u64, estimate, limit);
+                refuse_for_memory("<stdin>", shape, estimate, limit, Some(projected_cols));
             }
         }
         data::parse_table_with(&buf, skip_malformed)
@@ -1427,15 +1837,21 @@ fn main() {
             Err(e) => Err(e),
         }
     } else {
-        if let Ok(meta) = std::fs::metadata(&data_path) {
-            if let Some(limit) = guard_budget {
-                let estimate = meta.len().saturating_mul(33);
-                if estimate > limit && !force {
-                    refuse_for_memory(&data_path, meta.len(), estimate, limit);
-                }
+        let text = match std::fs::read_to_string(&data_path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("error: {}: {}", data_path, e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let shape = data::csv_shape(&text);
+        if let Some(limit) = guard_budget {
+            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            if estimate > limit && !force {
+                refuse_for_memory(&data_path, shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::read_table_with(&data_path, skip_malformed)
+        data::parse_table_with(&text, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -1770,6 +2186,11 @@ fn main() {
             lags,
             history_frac,
             gap_break,
+            time: data::TimeSpec {
+                date_only,
+                unit: time_unit,
+                tz,
+            },
         };
         match data::add_lags(&table, &vars, &lag_spec, time_col, group_col) {
             Ok((t2, v2, rep)) => {
@@ -1825,15 +2246,23 @@ fn main() {
         group_col,
         test_frac,
         gap,
+        validation_frac,
         folds,
         train_select,
         test_select,
         exclude,
+        time: data::TimeSpec {
+            date_only,
+            unit: time_unit,
+            tz,
+        },
     };
     let prep = data::PrepSpec {
         fill,
         outlier_iqr,
         smooth,
+        smooth_centred,
+        allow_interpolate,
         center,
         scale,
         filter,
@@ -1856,6 +2285,62 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #113: a binary metric needs a binary target. Reject a multi-valued target
+    // here, before any search, instead of silently merging its classes at the
+    // midpoint and reporting a number that means something else.
+    if cfg.metric.is_classification() {
+        for j in 0..prepared.train.target_count() {
+            let name = target_names.get(j).map(|s| s.as_str()).unwrap_or(target.as_str());
+            // Check the union of both sides: a distinct class that happens to
+            // sit only in the held-out rows still makes the target multi-valued.
+            let values: Vec<f64> = prepared
+                .train
+                .target(j)
+                .iter()
+                .chain(prepared.test.target(j))
+                .copied()
+                .collect();
+            if let Some(why) = metrics::classification_target_error(&values) {
+                eprintln!(
+                    "error: --metric {} treats '{}' as a binary target, but {}",
+                    cfg.metric.name(),
+                    name,
+                    why
+                );
+                eprintln!(
+                    "  collapse the target to two classes yourself, or pick a regression metric \
+                     (absolute, squared, log_squashed, ...)"
+                );
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    // #111: selection criterion. Default to the validation slice when one is
+    // present, otherwise train (the historical behaviour). Asking for
+    // validation without a slice is a usage error rather than a silent
+    // fallback to train.
+    let mut select_by: Option<rcsr::selection::SelectBy> = match select_by_arg.as_deref() {
+        Some(src) => match rcsr::selection::SelectBy::parse(src) {
+            Ok(by) => Some(by),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        // No explicit criterion and no slice: keep the historical archive
+        // order (complexity, then train error) rather than re-ranking.
+        None => None,
+    };
+    if select_by.is_none() && prepared.validation.is_some() {
+        select_by = Some(rcsr::selection::SelectBy::Validation);
+    }
+    if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
+        eprintln!(
+            "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
 
     // #14: implicit relations. The target becomes one more input (normalised
     // with its training mean/std, so denormalisation prints original units) and
@@ -1948,12 +2433,33 @@ fn main() {
 
     // A resumed search must run on exactly the rows that produced the saved
     // state, otherwise every saved error and population would be meaningless.
+    let mut backend_change: Option<(String, String)> = None;
     if let Some(cp) = &resume_checkpoint {
         if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        // #140: a GPU checkpoint must not be continued on the CPU (or vice
+        // versa) without an explicit override. The effective backend mirrors
+        // the search's own capability checks.
+        let current_backend = search::effective_backend(&cfg, &prepared.train);
+        if let Err(e) = cp.check_backend(current_backend, allow_backend_change) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        if cp.backend != Backend::Unknown && cp.backend != current_backend {
+            backend_change = Some((
+                cp.backend.as_str().to_string(),
+                current_backend.as_str().to_string(),
+            ));
+            eprintln!(
+                "# checkpoint: backend changed {} -> {} (allowed by --allow-backend-change)",
+                cp.backend.as_str(),
+                current_backend.as_str()
+            );
+        }
     }
+    let effective_backend = search::effective_backend(&cfg, &prepared.train);
 
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
@@ -2032,7 +2538,31 @@ fn main() {
         }));
     }
 
-    let start = std::time::Instant::now();
+    let search_start = std::time::Instant::now();
+    // #140: publish the run manifest before the search so a killed process
+    // still leaves evidence of what it was doing. It is updated atomically at
+    // the end with the end time and phase timings.
+    let data_prepare_secs = run_start.elapsed().as_secs_f64();
+    let mut manifest_state: Option<manifest::Manifest> = None;
+    if let Some(path) = &run_manifest_path {
+        let m = manifest::collect(
+            VERSION,
+            &data_path,
+            rcsr::checkpoint::fingerprint(&prepared.train),
+            rcsr::checkpoint::fingerprint(&prepared.test),
+            &cfg,
+            effective_backend.as_str(),
+            resume_path.clone(),
+            backend_change.clone(),
+        );
+        if let Err(e) = m.write(path, None, &[("data_prepare", data_prepare_secs)]) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        manifest_state = Some(m);
+    }
+
+    let start = search_start;
     let split_line = format!(
         "split={} | selector: {} | train rows: {} | test rows: {}{}{}{}",
         prepared.report.mode,
@@ -2102,7 +2632,7 @@ fn main() {
             prepared.report.gap,
             folds_json.join(",")
         );
-        if prepared.prep.active() {
+        if prepared.prep.active() || !prepared.prep.time_unit.is_empty() {
             let obj = prepared.prep.json();
             let inner = obj.trim_matches(|c| c == '{' || c == '}');
             println!("{{\"event\":\"preparation\",{}}}", inner);
@@ -2189,9 +2719,43 @@ fn main() {
         }
     }
 
-    // #26: the backend note belongs to the CLI, not to the library. `--quiet`
-    // promises an empty stderr for machine-readable output, so it suppresses it.
+    // #26/#141: the backend note belongs to the CLI, not to the library.
+    // `--quiet` promises an empty stderr for machine-readable output, so it
+    // suppresses the note and the one-line resource summary.
     cfg.gpu_notes = !quiet;
+
+    // #141: one line stating the resources this run will use. `rows`/`cols`
+    // are the training table (the search's hot loop); test rows are in the
+    // split object. The backend is the startup decision; a per-objective
+    // fallback is still reported once by the search itself.
+    if !quiet {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cols = prepared.train.x.first().map(|r| r.len()).unwrap_or(0);
+        let (kind, device, reason) = if cfg.gpu && gpu_probe.available() {
+            ("gpu", gpu_probe.device.as_deref().unwrap_or("unknown"), None)
+        } else {
+            (
+                "cpu",
+                "-",
+                gpu_explicit
+                    .filter(|explicit| !*explicit)
+                    .map(|_| "--cpu/--no-gpu")
+                    .or(gpu_probe.reason.as_deref()),
+            )
+        };
+        match reason {
+            Some(why) => eprintln!(
+                "# resource: backend={} device={} threads={} rows={} cols={} ({})",
+                kind, device, threads, prepared.train.len(), cols, why
+            ),
+            None => eprintln!(
+                "# resource: backend={} device={} threads={} rows={} cols={}",
+                kind, device, threads, prepared.train.len(), cols
+            ),
+        }
+    }
 
     // #15: multi-output reporting has its own shape (one entry per target);
     // the single-output path below is untouched.
@@ -2205,6 +2769,7 @@ fn main() {
             quiet,
             top,
             out_path,
+            json_out.clone(),
             start,
         );
         std::process::exit(EXIT_OK);
@@ -2222,11 +2787,14 @@ fn main() {
             implicit_mode,
             format,
             quiet,
-            start,
+            search_start,
         );
         std::process::exit(EXIT_OK);
     }
 
+    // #116: arm counts are process-wide diagnostics; take a delta around this
+    // run so repeated runs in one process (`--report benchmark`) stay readable.
+    let fit_before = fit::fit_arm_counts();
     let mut last_saved: Option<(usize, String)> = None;
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
@@ -2286,7 +2854,46 @@ fn main() {
             std::process::exit(EXIT_INPUT);
         }
     };
-    let elapsed = start.elapsed().as_secs_f64();
+    let search_seconds = search_start.elapsed().as_secs_f64();
+    // Compatibility: `elapsed_seconds` has always meant the search phase.
+    let elapsed = search_seconds;
+    let diagnostics_start = std::time::Instant::now();
+
+    // #140: atomically finish the manifest with an end timestamp and timings.
+    if let (Some(path), Some(m)) = (&run_manifest_path, &manifest_state) {
+        let total_secs = run_start.elapsed().as_secs_f64();
+        let phases = [
+            ("data_prepare", data_prepare_secs),
+            ("search", elapsed),
+            ("total", total_secs),
+        ];
+        if let Err(e) = m.write(path, Some(&manifest::utc_now()), &phases) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+
+    // #116: opt-in arm counts. This line is diagnostics only and never feeds
+    // back into the search.
+    if cfg.fit_report {
+        let (linear, exact) = fit::fit_arm_counts();
+        let linear = linear.saturating_sub(fit_before.0);
+        let exact = exact.saturating_sub(fit_before.1);
+        let total = linear + exact;
+        let share = if total == 0 {
+            0.0
+        } else {
+            100.0 * linear as f64 / total as f64
+        };
+        eprintln!(
+            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls)",
+            cfg.fit_strategy.name(),
+            linear,
+            exact,
+            share,
+            total
+        );
+    }
 
     // Seeded solutions, reported once each. The search holds them in
     // normalised-input space; show the original-units form, exactly like a
@@ -2356,6 +2963,10 @@ fn main() {
             } else {
                 fold_errors.iter().sum::<f64>() / fold_errors.len() as f64
             };
+            let validation_error = match &prepared.validation {
+                Some(v) => search::eval_error(&s.tree, v, cfg.metric),
+                None => f64::NAN,
+            };
             let pred: Vec<f64> = prepared
                 .train
                 .x
@@ -2411,9 +3022,11 @@ fn main() {
             };
             Row {
                 rank: k + 1,
+                archive_rank: k + 1,
                 complexity: s.cost,
                 k_constants: kconst,
                 train_error,
+                validation_error,
                 test_error,
                 aicc,
                 bic,
@@ -2443,6 +3056,60 @@ fn main() {
             }
         })
         .collect();
+
+    // #113: sign/step have a zero adjoint, so a constant behind one cannot be
+    // fitted. Say so once, rather than letting the printed threshold look
+    // optimised.
+    if cfg.fit_iters > 0 {
+        let mut zero_ops: Vec<&'static str> = Vec::new();
+        for s in &sorted {
+            if expr::count_constants(&s.tree) > 0 {
+                for op in fit::zero_adjoint_ops(&s.tree) {
+                    if !zero_ops.contains(&op) {
+                        zero_ops.push(op);
+                    }
+                }
+            }
+        }
+        if !zero_ops.is_empty() {
+            eprintln!(
+                "# warning: the Pareto front contains fitted constants behind {}: the adjoint \
+                 is zero there, so their position is not optimised. Fit a smooth surrogate \
+                 (e.g. logistic or tanh) and threshold only at inference, or pin the threshold \
+                 as a fixed constant. See docs/optimisation.md.",
+                zero_ops.join(" and ")
+            );
+        }
+    }
+    // #111: selection. Reorder the front by the chosen criterion and renumber
+    // the display rank; the archive rank is kept for reports that need the
+    // underlying search order. `test_error` is never a criterion. With no
+    // criterion the historical archive order is untouched.
+    if let Some(by) = select_by {
+        let candidates: Vec<rcsr::selection::Candidate> = rows
+            .iter()
+            .map(|r| rcsr::selection::Candidate {
+                train: r.train_error,
+                validation: if r.validation_error.is_finite() {
+                    Some(r.validation_error)
+                } else {
+                    None
+                },
+                test: Some(r.test_error),
+                aicc: r.aicc,
+            })
+            .collect();
+        let order = rcsr::selection::order(&candidates, by);
+        let reordered: Vec<Row> = order.into_iter().map(|i| rows[i].clone()).collect();
+        rows = reordered;
+        for (k, r) in rows.iter_mut().enumerate() {
+            r.rank = k + 1;
+        }
+        if !quiet {
+            eprintln!("# selection: {} (test errors are scoring-only)", by.name());
+        }
+    }
+
     // Residual diagnostics for the best (lowest training-error) solution: the
     // one a reader would quote.
     let best_resid = rows
@@ -2454,9 +3121,12 @@ fn main() {
         })
         .map(|r| r.resid_tests);
 
+    let mut diagnostics_seconds = diagnostics_start.elapsed().as_secs_f64();
+
     // Null baselines: the trivial models a real fit must beat (issue #23).
     // #69: the k-NN reference set is always all training rows; only the query
     // rows are optionally sampled by `--baseline-samples`.
+    let baselines_start = std::time::Instant::now();
     let baselines = diagnostics::Baselines::fit_sampled(
         &prepared.train,
         &fold_samples,
@@ -2464,6 +3134,8 @@ fn main() {
         baseline_samples,
         cfg.seed,
     );
+    let baselines_seconds = baselines_start.elapsed().as_secs_f64();
+    let diagnostics_start = std::time::Instant::now();
 
     // Stability selection (issue #20): bootstrap the training rows, re-run the
     // identical search, and count how often each structural form and each input
@@ -2548,11 +3220,18 @@ fn main() {
         let mut best_null = Vec::with_capacity(null_runs);
         for r in 0..null_runs {
             let mut rng = Mt::new(cfg.seed ^ (0x51ED_2701u32.wrapping_mul(r as u32 + 1)));
-            let mut y = prepared.train.y.clone();
-            for j in (1..y.len()).rev() {
-                let t = rng.usize_below(j + 1);
-                y.swap(j, t);
-            }
+            // #114: a block null is seeded from the same stream, so it is as
+            // reproducible as the i.i.d. shuffle.
+            let y = if null_block > 1 {
+                diagnostics::block_permute(&prepared.train.y, null_block, &mut rng)
+            } else {
+                let mut y = prepared.train.y.clone();
+                for j in (1..y.len()).rev() {
+                    let t = rng.usize_below(j + 1);
+                    y.swap(j, t);
+                }
+                y
+            };
             let shuffled = data::Sample {
                 x: prepared.train.x.clone(),
                 y,
@@ -2567,20 +3246,42 @@ fn main() {
                 .map(|s| s.error)
                 .fold(f64::INFINITY, f64::min);
             if !quiet {
-                eprintln!("# null run {}/{}: best train error {:.6}", r + 1, null_runs, b);
+                eprintln!(
+                    "# null run {}/{} ({}): best train error {:.6}",
+                    r + 1,
+                    null_runs,
+                    if null_block > 1 {
+                        format!("block {}", null_block)
+                    } else {
+                        "iid".to_string()
+                    },
+                    b
+                );
             }
             best_null.push(b);
         }
         cfg.progress = saved_progress;
-        null_control = Some(diagnostics::NullControl::summarise(observed, best_null));
+        null_control = Some(if null_block > 1 {
+            diagnostics::NullControl::summarise_block(
+                observed,
+                best_null,
+                null_block,
+                diagnostics::block_count(prepared.train.len(), null_block),
+            )
+        } else {
+            diagnostics::NullControl::summarise(observed, best_null)
+        });
     }
+
+    diagnostics_seconds += diagnostics_start.elapsed().as_secs_f64();
 
     let finite = rows.iter().any(|r| r.train_error.is_finite());
     let full_rows = rows.clone();
 
     // Optional Markdown report (issue #29), built from the full Pareto front so
     // `--top` only trims the ordinary table/TSV output below.
-    let report_md = report.map(|kind| match kind {
+    let report_start = std::time::Instant::now();
+    let mut report_md = report.map(|kind| match kind {
         ReportKind::Summary => summary_markdown(
             &command,
             &prepared,
@@ -2600,16 +3301,21 @@ fn main() {
             outlier_iqr,
             smooth,
             &notes,
+            select_by,
         ),
         ReportKind::Sensitivity => {
-            let selected = full_rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            let selected = if select_by.is_some() {
+                full_rows.first()
+            } else {
+                full_rows.iter().min_by(|a, b| {
+                    a.train_error
+                        .partial_cmp(&b.train_error)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            };
             let sorted = outcome.archive.sorted();
             let tree = selected
-                .and_then(|r| r.rank.checked_sub(1).and_then(|i| sorted.get(i)))
+                .and_then(|r| r.archive_rank.checked_sub(1).and_then(|i| sorted.get(i)))
                 .map(|s| &s.tree);
             sensitivity_markdown(selected, tree, &prepared, &vars, &target)
         }
@@ -2624,6 +3330,20 @@ fn main() {
             quiet,
         ),
     });
+    let report_seconds = report_start.elapsed().as_secs_f64();
+    // #134: measured independently, after all phases. Emitting the JSON/text is
+    // not part of `total`; the phases cover everything up to this point.
+    let timing = PhaseTimings {
+        prep: (search_start - run_start).as_secs_f64(),
+        search: search_seconds,
+        baselines: baselines_seconds,
+        diagnostics: diagnostics_seconds,
+        report: report_seconds,
+        total: run_start.elapsed().as_secs_f64(),
+    };
+    if let Some(md) = report_md.as_mut() {
+        md.push_str(&time_markdown(&timing));
+    }
 
     if top > 0 && rows.len() > top {
         rows.truncate(top);
@@ -2643,26 +3363,47 @@ fn main() {
                         ""
                     }
                 );
+                eprintln!("# time: {}", timing.text());
+                qd_text(outcome.qd.as_ref());
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
                 let lhs = if implicit_mode { "0" } else { target.as_str() };
-                println!(
-                    "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
-                    r.rank,
-                    r.complexity,
-                    fmt_err(r.train_error),
-                    fmt_err(r.test_error),
-                    fmt_err(r.aicc),
-                    lhs,
-                    r.expression
-                );
+                if prepared.validation.is_some() {
+                    println!(
+                        "{:>3}  complexity={:<3} train_err={:<13} val_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
+                        r.rank,
+                        r.complexity,
+                        fmt_err(r.train_error),
+                        fmt_err(r.validation_error),
+                        fmt_err(r.test_error),
+                        fmt_err(r.aicc),
+                        lhs,
+                        r.expression
+                    );
+                } else {
+                    println!(
+                        "{:>3}  complexity={:<3} train_err={:<13} test_err={:<13} aicc={:<12}  {} = {}",
+                        r.rank,
+                        r.complexity,
+                        fmt_err(r.train_error),
+                        fmt_err(r.test_error),
+                        fmt_err(r.aicc),
+                        lhs,
+                        r.expression
+                    );
+                }
             }
-            if let Some(r) = rows.iter().min_by(|a, b| {
-                a.train_error
-                    .partial_cmp(&b.train_error)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
+            let selected_row = if select_by.is_some() {
+                rows.first()
+            } else {
+                rows.iter().min_by(|a, b| {
+                    a.train_error
+                        .partial_cmp(&b.train_error)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            };
+            if let Some(r) = selected_row {
                 eprintln!(
                     "# diagnostics: n={} k={} constants | overfit index (test/train)={:.3} | Durbin-Watson={:.3}{}",
                     prepared.train.len(),
@@ -2680,8 +3421,16 @@ fn main() {
             }
             if let Some(c) = &null_control {
                 eprintln!(
-                    "# null control ({} shuffled-target runs): best={:.6} median={:.6} p={:.3} — {}",
-                    c.runs,
+                    "# null control ({}, observed={:.6}): best={:.6} median={:.6} p={:.3} — {}",
+                    if c.method == "block" {
+                        format!(
+                            "{} block-permutation runs, {} blocks of up to {} rows",
+                            c.runs, c.blocks, c.block_len
+                        )
+                    } else {
+                        format!("{} i.i.d. shuffled-target runs", c.runs)
+                    },
+                    c.observed,
                     c.null_min,
                     c.null_median,
                     c.p_value,
@@ -2894,11 +3643,17 @@ fn main() {
                     "null".to_string(),
                 ),
             };
+            let validation_split_json = if prepared.report.validation_rows > 0 {
+                format!(",\"validation_rows\":{}", prepared.report.validation_rows)
+            } else {
+                String::new()
+            };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
+                validation_split_json,
                 prepared.test.len(),
                 prepared
                     .fold_samples
@@ -2941,9 +3696,21 @@ fn main() {
                     } else {
                         String::new()
                     };
+                    // Only a run that actually has a selection criterion gains
+                    // the new fields; an ordinary run stays byte-identical.
+                    let selection_json = if select_by.is_some() {
+                        format!(
+                            "\"archive_rank\":{},\"validation_error\":{},",
+                            r.archive_rank,
+                            jnum(r.validation_error)
+                        )
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        "{{\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                        "{{\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                         r.rank,
+                        selection_json,
                         r.complexity,
                         r.k_constants,
                         jnum(r.train_error),
@@ -2963,8 +3730,12 @@ fn main() {
                 .collect();
             let null_json = match &null_control {
                 Some(c) => format!(
-                    "{{\"runs\":{},\"best\":[{}],\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    "{{\"runs\":{},\"method\":{},\"block_len\":{},\"blocks\":{},\"observed\":{},\"best\":[{}],\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
                     c.runs,
+                    jstr(c.method),
+                    c.block_len,
+                    c.blocks,
+                    jnum(c.observed),
                     c.best.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     jnum(c.null_min),
                     jnum(c.null_median),
@@ -3108,6 +3879,32 @@ fn main() {
                 String::new()
             };
             let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #131: only a GPU-guided run emits this key, so CPU output stays
+            // byte-identical. Each entry is one generation's scoring batch(es).
+            let gpu_json = match &outcome.gpu {
+                Some(g) => {
+                    let gens: Vec<String> = g
+                        .generations
+                        .iter()
+                        .map(|s| {
+                            let ops: Vec<String> = s
+                                .opcodes
+                                .iter()
+                                .map(|(name, n)| format!("{}:{}", jstr(name), n))
+                                .collect();
+                            format!(
+                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                                s.generation,
+                                s.programs,
+                                s.fallbacks,
+                                ops.join(",")
+                            )
+                        })
+                        .collect();
+                    format!("\"gpu\":{{\"generations\":[{}]}},", gens.join(","))
+                }
+                None => String::new(),
+            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -3120,12 +3917,45 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string()),
                 outcome.generations
             );
-            println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+            let best_fit_loss = rows
+                .iter()
+                .map(|r| r.train_error)
+                .fold(f64::INFINITY, f64::min);
+            let fitting_json = format!(
+                "{{\"loss\":{},\"value\":{}}}",
+                jstr(cfg.metric.name()),
+                jnum(best_fit_loss)
+            );
+            // #141: report the backend that actually guided the search, with
+            // the device name and a reason when the CPU ran. This is derived
+            // from the probe/outcome, never from the flags alone.
+            let backend_reason = if gpu_explicit == Some(false) {
+                Some("--cpu/--no-gpu".to_string())
+            } else {
+                outcome
+                    .backend_reason
+                    .clone()
+                    .or_else(|| gpu_probe.reason.clone())
+            };
+            let backend_json = format!(
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},",
+                outcome.backend.name(),
+                backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
+            let result_json = format!(
+                "{{{}{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
+                backend_json,     // #141
+                gpu_json,         // #131
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
+                fitting_json,
                 jstr(&target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
                 variables_detail_json(&variable_types),
@@ -3142,17 +3972,51 @@ fn main() {
                 // #18: the four convergence numbers.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                timing.json(),
                 checkpoint_json,
                 null_json,
                 baselines_json,
                 resid_json,
                 cv_json,
                 stability_json,
+                qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")
             );
+            // #140: a requested result file is published atomically; stdout
+            // never carries a stream that a killed process can truncate.
+            if let Some(path) = &json_out {
+                if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            } else {
+                println!("{}", result_json);
+            }
         }
         Format::Ndjson => {
+            // #141: state the effective backend before the stream of results.
+            let nd_backend_reason = if gpu_explicit == Some(false) {
+                Some("--cpu/--no-gpu".to_string())
+            } else {
+                outcome
+                    .backend_reason
+                    .clone()
+                    .or_else(|| gpu_probe.reason.clone())
+            };
+            println!(
+                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                outcome.backend.name(),
+                nd_backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
             for (expression, complexity, error) in &seed_rows {
                 println!(
                     "{{\"event\":\"seed\",\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
@@ -3171,9 +4035,19 @@ fn main() {
                 } else {
                     String::new()
                 };
+                let selection_json = if select_by.is_some() {
+                    format!(
+                        "\"archive_rank\":{},\"validation_error\":{},",
+                        r.archive_rank,
+                        jnum(r.validation_error)
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{{\"event\":\"solution\",\"rank\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
+                    "{{\"event\":\"solution\",\"rank\":{},{}\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"aicc\":{},\"bic\":{},\"durbin_watson\":{},\"overfit_index\":{},\"fold_errors\":[{}],\"bootstrap_error\":{},\"constant_errors\":{}{},\"stability\":{},\"expression\":{}}}",
                     r.rank,
+                    selection_json,
                     r.complexity,
                     r.k_constants,
                     jnum(r.train_error),
@@ -3192,8 +4066,12 @@ fn main() {
             }
             if let Some(c) = &null_control {
                 println!(
-                    "{{\"event\":\"null_control\",\"runs\":{},\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    "{{\"event\":\"null_control\",\"runs\":{},\"method\":{},\"block_len\":{},\"blocks\":{},\"observed\":{},\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
                     c.runs,
+                    jstr(c.method),
+                    c.block_len,
+                    c.blocks,
+                    jnum(c.observed),
                     jnum(c.null_min),
                     jnum(c.null_median),
                     jnum(c.p_value),
@@ -3311,12 +4189,13 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                timing.json(),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );
@@ -3331,7 +4210,7 @@ fn main() {
                 r.rank, r.complexity, r.train_error, r.test_error, r.expression
             ));
         }
-        if let Err(e) = std::fs::write(&path, buf) {
+        if let Err(e) = rcsr::atomic::write_text_atomic(&path, &buf) {
             eprintln!("error writing {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -3401,6 +4280,7 @@ fn run_multi_output(
     quiet: bool,
     top: usize,
     out_path: Option<String>,
+    json_out: Option<String>,
     start: std::time::Instant,
 ) {
     let outcome = search::run(cfg, &prepared.train, &prepared.test);
@@ -3419,7 +4299,12 @@ fn run_multi_output(
         .map(|(k, s)| {
             // Fit one constant vector per output on the training rows, then
             // score every output on the same fitted trees (no test leakage).
-            let trees = multi::fitted_outputs(&s.tree, &prepared.train, cfg.fit_iters);
+            let trees = multi::fitted_outputs_metric(
+                &s.tree,
+                &prepared.train,
+                cfg.metric,
+                cfg.fit_iters,
+            );
             let train_errors = multi::output_errors(&trees, &prepared.train, cfg.metric);
             let test_errors = multi::output_errors(&trees, &prepared.test, cfg.metric);
             let targets = target_names
@@ -3486,6 +4371,7 @@ fn run_multi_output(
                     },
                     target_names.join(",")
                 );
+                qd_text(outcome.qd.as_ref());
                 eprintln!(
                     "# multi-output: one shared shape, one fitted constant vector per output; \
                      train_err/test_err are the mean over {} target(s)",
@@ -3575,11 +4461,21 @@ fn run_multi_output(
                     )
                 })
                 .collect();
-            println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+            let best_fit_loss = rows
+                .iter()
+                .map(|r| r.train_error)
+                .fold(f64::INFINITY, f64::min);
+            let fitting_json = format!(
+                "{{\"loss\":{},\"value\":{}}}",
+                jstr(cfg.metric.name()),
+                jnum(best_fit_loss)
+            );
+            let result_json = format!(
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
+                fitting_json,
                 jstr(&target_names.join(",")),
                 target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
@@ -3588,8 +4484,29 @@ fn run_multi_output(
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                // #141: the effective backend, never inferred from flags.
+                outcome.backend.name(),
+                outcome
+                    .backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                qd_json(outcome.qd.as_ref()),
                 pareto.join(",")
             );
+            if let Some(path) = &json_out {
+                if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            } else {
+                println!("{}", result_json);
+            }
         }
         Format::Ndjson => {
             // Refused earlier; kept exhaustive so a future change cannot
@@ -3618,7 +4535,7 @@ fn run_multi_output(
                 ));
             }
         }
-        if let Err(e) = std::fs::write(&path, buf) {
+        if let Err(e) = rcsr::atomic::write_text_atomic(&path, &buf) {
             eprintln!("error writing {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -3840,6 +4757,23 @@ fn md_esc(s: &str) -> String {
 /// diagnostic already computed, the whole Pareto front and a trust verdict that
 /// cites the numbers rather than asserting confidence.
 #[allow(clippy::too_many_arguments)]
+/// #134: the phase breakdown in text reports.
+fn time_markdown(t: &PhaseTimings) -> String {
+    format!(
+        "\n## Time\n\n\
+         | phase | seconds |\n|---|---:|\n\
+         | preparation | {:.3} |\n\
+         | search | {:.3} |\n\
+         | baselines | {:.3} |\n\
+         | diagnostics | {:.3} |\n\
+         | report | {:.3} |\n\
+         | **total wall** | **{:.3}** |\n\n\
+         `elapsed_seconds` in JSON is the search phase, kept for compatibility;\n\
+         use `total_seconds` (or the sum above) for wall-clock cost.\n",
+        t.prep, t.search, t.baselines, t.diagnostics, t.report, t.total
+    )
+}
+
 fn summary_markdown(
     command: &str,
     prepared: &data::Prepared,
@@ -3859,13 +4793,18 @@ fn summary_markdown(
     outlier_iqr: Option<f64>,
     smooth: usize,
     notes: &[String],
+    select_by: Option<rcsr::selection::SelectBy>,
 ) -> String {
     let mut s = String::new();
-    let chosen = rows.iter().min_by(|a, b| {
-        a.train_error
-            .partial_cmp(&b.train_error)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let chosen = if select_by.is_some() {
+        rows.first()
+    } else {
+        rows.iter().min_by(|a, b| {
+            a.train_error
+                .partial_cmp(&b.train_error)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    };
 
     let _ = writeln!(s, "# rcsr model summary\n");
     let _ = writeln!(s, "## What produced this\n");
@@ -4128,6 +5067,16 @@ fn summary_markdown(
         let _ = writeln!(s, "## Null control\n");
         match null_control {
             Some(c) => {
+                let _ = writeln!(
+                    s,
+                    "_Null: {}; observed error {}._\n",
+                    if c.method == "block" {
+                        format!("block permutation, {} blocks of up to {} rows", c.blocks, c.block_len)
+                    } else {
+                        "i.i.d. target shuffle".to_string()
+                    },
+                    md_num(c.observed)
+                );
                 let _ = writeln!(s, "| shuffled runs | best null error | median null error | p-value | verdict |");
                 let _ = writeln!(s, "|---:|---:|---:|---:|---|");
                 let _ = writeln!(
@@ -4347,9 +5296,14 @@ fn trust_paragraph(
         Some(c) => {
             let _ = write!(
                 out,
-                "Across {} shuffled-target runs the search reached a best error of {} \
+                "Across {} {} the search reached a best error of {} \
                  (median {}); the permutation p-value is {}, which means ",
                 c.runs,
+                if c.method == "block" {
+                    format!("block-permutation runs ({} blocks of up to {} rows)", c.blocks, c.block_len)
+                } else {
+                    "shuffled-target runs".to_string()
+                },
                 md_num(c.null_min),
                 md_num(c.null_median),
                 md_num(c.p_value)
@@ -4970,14 +5924,48 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn refuse_for_memory(path: &str, file_bytes: u64, estimate: u64, limit: u64) -> ! {
+fn refuse_for_memory(
+    path: &str,
+    shape: data::CsvShape,
+    estimate: u64,
+    limit: u64,
+    prep_cols: Option<usize>,
+) -> ! {
     eprintln!("error: input would exceed the memory budget");
     eprintln!(
-        "  {}: {} on disk; estimated resident footprint {} (~33x, measured 1.75 KiB/row)",
+        "  {}: {} on disk, {} rows x {} columns; estimated resident footprint {}",
         path,
-        human_bytes(file_bytes),
+        human_bytes(shape.bytes),
+        shape.rows,
+        shape.cols,
         human_bytes(estimate)
     );
+    let table_bytes = (shape.rows as u64)
+        .saturating_mul(shape.cols as u64)
+        .saturating_mul(data::CSV_TABLE_BYTES_PER_CELL);
+    match prep_cols {
+        Some(projected) => {
+            let used = if projected == 0 {
+                shape.cols
+            } else {
+                projected.min(shape.cols)
+            };
+            eprintln!(
+                "  estimate basis: text {} + table {} cells (12 B/cell) + preparation {} used \
+                 columns (24 B/cell, 72 B/row)",
+                human_bytes(shape.bytes),
+                human_bytes(table_bytes),
+                used
+            );
+        }
+        None => {
+            eprintln!(
+                "  estimate basis: text {} + table {} cells (12 B/cell), no search preparation",
+                human_bytes(shape.bytes),
+                human_bytes(table_bytes)
+            );
+        }
+    }
     eprintln!(
         "  memory budget is {} ({} bytes; set it with --max-memory)",
         human_bytes(limit),
@@ -4988,6 +5976,312 @@ fn refuse_for_memory(path: &str, file_bytes: u64, estimate: u64, limit: u64) -> 
     eprintln!("    rcsr import <input.csv> <store.rcsb>");
     eprintln!("    rcsr --data <store.rcsb> --target <col> --max-memory {}", human_bytes(limit));
     std::process::exit(EXIT_INPUT);
+}
+
+fn walkforward_usage() -> String {
+    format!(
+        "rcsr {VERSION} — walk-forward evaluation over a .rcsb column store
+
+USAGE:
+  rcsr walkforward --data <store.rcsb|csv> --target <col> --expr <formula> \\
+                   --time <col> --window <label,train_start,train_end,test_start,test_end> ...
+
+  Evaluates one expression with the engine's own f64 evaluator (no Python, no
+  code strings), applies a long/flat rule and charges costs on position changes.
+  Windows are half-open by time; the purge gap test_start-train_end must be at
+  least --horizon and --embargo. The threshold comes from training/validation
+  rows only. See docs/walkforward.md.
+
+OPTIONS:
+  --data <path>              .rcsb column store, or a CSV table as a fallback
+  --target <col>             forward-return column used for P&L
+  --expr <formula>           score expression, variables resolved by column name
+  --vars <a,b,...>           feature columns (default: all numeric except target,
+                             time and group)
+  --time <col>               time/ordering column (numbers or YYYY-MM-DD)
+  --group-by <col>           panel group column; positions and costs are per
+                             group and rows sharing a timestamp are equal-weighted
+  --window <spec>            LABEL,TRAIN_START,TRAIN_END,TEST_START,TEST_END
+                             (repeatable; the four-bound form is also accepted)
+  --windows <file>           CSV file of window rows with the same columns
+  --horizon <seconds>        forward-label horizon; minimum purge/embargo
+                             (default 0)
+  --embargo <seconds>        extra gap between train_end and test_start
+                             (default: the horizon)
+  --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
+  --threshold-quantile <q>   training/validation score quantile (default {DEFAULT_QUANTILE})
+  --validation-frac <f>      trailing fraction of the training time range used to
+                             set the threshold instead of all training rows
+                             (default 0: use all training rows)
+  --periods-per-year <f>     annualisation override (default: infer from the
+                             median test time step; 365 for daily crypto bars)
+  --json                     print the full JSON report to stdout
+  --out <file>               write the JSON report to a file
+  --markdown <file|->        write the Markdown report ('-' = stdout)
+  --quiet                    reserved; text output stays on stdout
+  -h, --help                 show this help
+",
+        DEFAULT_COST_BPS = walkforward::DEFAULT_COST_BPS,
+        DEFAULT_QUANTILE = walkforward::DEFAULT_QUANTILE
+    )
+}
+
+fn run_walkforward(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{}", walkforward_usage());
+        std::process::exit(EXIT_OK);
+    }
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("rcsr {}", VERSION);
+        std::process::exit(EXIT_OK);
+    }
+    let mut data_path: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut expression: Option<String> = None;
+    let mut vars_src: Option<String> = None;
+    let mut time_col: Option<String> = None;
+    let mut group_col: Option<String> = None;
+    let mut windows: Vec<walkforward::Window> = Vec::new();
+    let mut windows_file: Option<String> = None;
+    let mut horizon = 0.0f64;
+    let mut embargo: Option<f64> = None;
+    let mut cost_bps = walkforward::DEFAULT_COST_BPS;
+    let mut quantile = walkforward::DEFAULT_QUANTILE;
+    let mut validation_frac = 0.0f64;
+    let mut periods_per_year: Option<f64> = None;
+    let mut json = false;
+    let mut out: Option<String> = None;
+    let mut markdown: Option<String> = None;
+    let mut quiet = false;
+
+    let need = |args: &[String], i: usize, flag: &str| -> String {
+        match args.get(i) {
+            Some(v) => v.clone(),
+            None => {
+                eprintln!("error: {} requires a value", flag);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    };
+    let number = |src: String, flag: &str| -> f64 {
+        match src.parse::<f64>() {
+            Ok(v) if v.is_finite() => v,
+            _ => {
+                eprintln!("error: {} needs a finite number, got '{}'", flag, src);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    };
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data" | "-d" => {
+                data_path = Some(need(args, i + 1, "--data"));
+                i += 1;
+            }
+            "--target" => {
+                target = Some(need(args, i + 1, "--target"));
+                i += 1;
+            }
+            "--expr" | "--score-expr" => {
+                expression = Some(need(args, i + 1, "--expr"));
+                i += 1;
+            }
+            "--vars" => {
+                vars_src = Some(need(args, i + 1, "--vars"));
+                i += 1;
+            }
+            "--time" => {
+                time_col = Some(need(args, i + 1, "--time"));
+                i += 1;
+            }
+            "--group-by" => {
+                group_col = Some(need(args, i + 1, "--group-by"));
+                i += 1;
+            }
+            "--window" => {
+                let src = need(args, i + 1, "--window");
+                match walkforward::Window::parse(&src) {
+                    Ok(w) => windows.push(w),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+                i += 1;
+            }
+            "--windows" => {
+                windows_file = Some(need(args, i + 1, "--windows"));
+                i += 1;
+            }
+            "--horizon" => {
+                horizon = number(need(args, i + 1, "--horizon"), "--horizon");
+                i += 1;
+            }
+            "--embargo" => {
+                embargo = Some(number(need(args, i + 1, "--embargo"), "--embargo"));
+                i += 1;
+            }
+            "--cost-bps" => {
+                cost_bps = number(need(args, i + 1, "--cost-bps"), "--cost-bps");
+                i += 1;
+            }
+            "--threshold-quantile" => {
+                quantile = number(
+                    need(args, i + 1, "--threshold-quantile"),
+                    "--threshold-quantile",
+                );
+                i += 1;
+            }
+            "--validation-frac" => {
+                validation_frac = number(
+                    need(args, i + 1, "--validation-frac"),
+                    "--validation-frac",
+                );
+                i += 1;
+            }
+            "--periods-per-year" => {
+                periods_per_year = Some(number(
+                    need(args, i + 1, "--periods-per-year"),
+                    "--periods-per-year",
+                ));
+                i += 1;
+            }
+            "--json" => json = true,
+            "--out" => {
+                out = Some(need(args, i + 1, "--out"));
+                i += 1;
+            }
+            "--markdown" => {
+                markdown = Some(need(args, i + 1, "--markdown"));
+                i += 1;
+            }
+            "--quiet" => quiet = true,
+            other if other.starts_with('-') => {
+                eprintln!(
+                    "error: unknown walkforward option '{}'\n\n{}",
+                    other,
+                    walkforward_usage()
+                );
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                eprintln!("error: unexpected argument '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        i += 1;
+    }
+
+    let data_path = data_path.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --data\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let target = target.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --target\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let expression = expression.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    let time_col = time_col.unwrap_or_else(|| {
+        eprintln!("error: walkforward needs --time\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    });
+    if let Some(file) = windows_file {
+        match std::fs::read_to_string(&file) {
+            Ok(text) => {
+                let mut seen = 0usize;
+                for (n, line) in text.lines().enumerate() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    // Skip a header row: it names the columns rather than
+                    // carrying four parseable timestamps.
+                    if seen == 0
+                        && (line.contains("train_start")
+                            || line.contains("train_end")
+                            || line.starts_with("label,"))
+                    {
+                        seen += 1;
+                        continue;
+                    }
+                    seen += 1;
+                    match walkforward::Window::parse(line) {
+                        Ok(w) => windows.push(w),
+                        Err(e) => {
+                            eprintln!("error: {}:{}: {}", file, n + 1, e);
+                            std::process::exit(EXIT_USAGE);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}: {}", file, e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    if windows.is_empty() {
+        eprintln!(
+            "error: walkforward needs at least one --window or --windows file\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    let vars: Vec<String> = vars_src
+        .map(|s| {
+            s.split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let spec = walkforward::EvalSpec {
+        expression,
+        vars,
+        target,
+        time: time_col,
+        group: group_col,
+        windows,
+        horizon,
+        embargo,
+        cost_bps,
+        threshold_quantile: quantile,
+        validation_frac,
+        periods_per_year,
+    };
+    let report = match walkforward::run_path(&data_path, &spec) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    let wrote_out = out.is_some();
+    let wrote_markdown = markdown.is_some();
+    if let Some(path) = out {
+        if let Err(e) = std::fs::write(&path, report.json()) {
+            eprintln!("error: {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if let Some(path) = markdown {
+        if path == "-" {
+            print!("{}", report.markdown());
+        } else if let Err(e) = std::fs::write(&path, report.markdown()) {
+            eprintln!("error: {}: {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if json {
+        println!("{}", report.json());
+    } else if !quiet && !wrote_out && !wrote_markdown {
+        print!("{}", report.text());
+    }
+    std::process::exit(EXIT_OK);
 }
 
 fn import_usage() -> String {
@@ -5007,14 +6301,80 @@ OPTIONS:
   --data <input.csv>       input table (alternative to the positional path)
   --out <store.rcsb>       output store
   --group-rows <N>         rows per I/O group (default {})
+  --time <column>          store this column as exact i64 timestamps
+                           (default: the first integral, time-like column)
   --skip-malformed         drop ragged rows instead of refusing the input
-  --max-memory <size>      refuse before parsing when ~33x the CSV exceeds this
+  --max-memory <size>      refuse before parsing when the rows x columns
+                           estimate exceeds this (not 33x the file size)
   --force                  override --max-memory
   --quiet                  do not print the summary
   -h, --help               show this help
 ",
         store::DEFAULT_GROUP_ROWS
     )
+}
+
+/// `rcsr verify-manifest <path> [--data <file>]` (issue #140).
+///
+/// Exit 0 when every check passes, 1 on any mismatch, 2 on a usage error.
+fn run_verify_manifest(args: &[String]) -> ! {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!(
+            "rcsr verify-manifest <manifest.json> [--data <file>]\n\n\
+             Check a --run-manifest against the current binary, git commit, data\n\
+             file and canonical configuration. Exit 0 when all match, 1 otherwise."
+        );
+        std::process::exit(EXIT_OK);
+    }
+    let mut path: Option<String> = None;
+    let mut data: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--data" | "-d" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => data = Some(v.clone()),
+                    None => {
+                        eprintln!("error: --data requires a value");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            other if other.starts_with('-') => {
+                eprintln!("error: unknown verify-manifest argument '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("error: verify-manifest takes exactly one manifest path");
+                    std::process::exit(EXIT_USAGE);
+                }
+                path = Some(other.to_string());
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = path else {
+        eprintln!("error: verify-manifest needs a manifest path");
+        std::process::exit(EXIT_USAGE);
+    };
+    match manifest::verify(&path, data.as_deref()) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{}", line);
+            }
+            println!("PASS manifest {}", path);
+            std::process::exit(EXIT_OK);
+        }
+        Err(lines) => {
+            for line in lines.lines() {
+                eprintln!("{}", line);
+            }
+            eprintln!("FAIL manifest {}", path);
+            std::process::exit(1);
+        }
+    }
 }
 
 fn run_import(args: &[String]) -> ! {
@@ -5029,6 +6389,7 @@ fn run_import(args: &[String]) -> ! {
     let mut input: Option<String> = None;
     let mut output: Option<String> = None;
     let mut group_rows = store::DEFAULT_GROUP_ROWS;
+    let mut time_name: Option<String> = None;
     let mut skip_malformed = false;
     let mut max_memory: Option<u64> = None;
     let mut force = false;
@@ -5063,6 +6424,16 @@ fn run_import(args: &[String]) -> ! {
                 }
             }
             "--skip-malformed" => skip_malformed = true,
+            "--time" => {
+                i += 1;
+                match args.get(i) {
+                    Some(name) => time_name = Some(name.clone()),
+                    None => {
+                        eprintln!("error: --time requires a column name");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--max-memory" => {
                 i += 1;
                 match args.get(i).map(|s| parse_memory_bytes(s)) {
@@ -5106,37 +6477,63 @@ fn run_import(args: &[String]) -> ! {
         eprintln!("error: '{}' is already a column store", input);
         std::process::exit(EXIT_USAGE);
     }
-    let meta = match std::fs::metadata(&input) {
-        Ok(m) => m,
+    let text = match std::fs::read_to_string(&input) {
+        Ok(text) => text,
         Err(e) => {
             eprintln!("error: {}: {}", input, e);
             std::process::exit(EXIT_INPUT);
         }
     };
     if let Some(limit) = max_memory.or_else(store::detected_hard_budget) {
-        let estimate = meta.len().saturating_mul(33);
+        let shape = data::csv_shape(&text);
+        let estimate = data::estimate_csv_load_bytes(shape);
         if estimate > limit && !force {
-            refuse_for_memory(&input, meta.len(), estimate, limit);
+            refuse_for_memory(&input, shape, estimate, limit, None);
         }
     }
-    let table = match data::read_table_with(&input, skip_malformed) {
+    let table = match data::read_table_with_time(&input, skip_malformed, time_name.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
     };
-    if let Err(e) = store::write_store(&output, &table, group_rows) {
+    let time_col = match &time_name {
+        Some(name) => match table.index_of(name) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("error: --time {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        },
+        None => None,
+    };
+    finish_import(&output, &table, group_rows, quiet, time_col);
+}
+
+fn finish_import(
+    output: &str,
+    table: &data::Table,
+    group_rows: usize,
+    quiet: bool,
+    time_col: Option<usize>,
+) -> ! {
+    if let Err(e) = store::write_store_with_time(output, table, group_rows, time_col) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_INPUT);
     }
     if !quiet {
+        let stored = time_col
+            .or_else(|| (0..table.n_cols()).find(|&c| table.ints(c).is_some()))
+            .map(|c| format!(", time='{}' as i64", table.names[c]))
+            .unwrap_or_default();
         println!(
-            "imported {} rows x {} columns to {} (group_rows={})",
+            "imported {} rows x {} columns to {} (group_rows={}{})",
             table.len(),
             table.n_cols(),
             output,
-            group_rows
+            group_rows,
+            stored
         );
     }
     std::process::exit(EXIT_OK);
@@ -5147,11 +6544,14 @@ mod tests {
     /// #91: a default run must be CPU regardless of build features, so the
     /// same command yields the same archive in a CUDA and a non-CUDA build.
     #[test]
-    fn the_gpu_path_is_opt_in() {
-        assert!(!search::Config::default().gpu);
+    fn the_gpu_default_follows_the_build_and_flags_are_documented() {
+        // #141: a CUDA build prefers the GPU; every other build is CPU.
+        assert_eq!(search::Config::default().gpu, cfg!(feature = "cuda"));
         assert!(usage().contains("--gpu"));
         assert!(schema::json().contains("\"--gpu\""));
         assert!(usage().contains("--no-gpu"));
+        assert!(schema::json().contains("\"backend\""));
+        assert!(usage().contains("not bit-identical"));
     }
 
     use super::*;
@@ -5306,5 +6706,32 @@ mod tests {
         }
         assert!(usage().contains("aggregates:"));
         assert!(Op::parse_list_checked("mean,count").is_ok());
+    }
+
+    /// #134: the phase ledger exposes non-overlapping windows and a separate
+    /// measured total, so a report can never silently quote search time as wall.
+    #[test]
+    fn phase_timings_sum_to_the_measured_total() {
+        let t = PhaseTimings {
+            prep: 0.10,
+            search: 0.20,
+            baselines: 0.30,
+            diagnostics: 0.05,
+            report: 0.02,
+            total: 0.67,
+        };
+        assert!((t.phases_sum() - t.total).abs() <= 0.01 * t.total);
+        let json = t.json();
+        for key in [
+            "prep_seconds",
+            "search_seconds",
+            "baselines_seconds",
+            "diagnostics_seconds",
+            "report_seconds",
+            "total_seconds",
+        ] {
+            assert!(json.contains(key), "timing JSON is missing {key}");
+        }
+        assert!(t.text().contains("total=0.67s"));
     }
 }

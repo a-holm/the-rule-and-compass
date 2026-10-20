@@ -6,6 +6,10 @@ opt-in, and the defaults reproduce the behaviour of a plain run**: no filling
 (a gap is an error, not a silent `NaN`), no outlier removal, no smoothing,
 mean/standard-deviation normalisation and no row filter.
 
+Time columns follow the strict policy in [`time-parsing.md`](time-parsing.md):
+offset-aware ISO 8601, an explicit date-only choice, and numeric s/ms/us/ns
+detection with a refusal on ambiguity.
+
 The one rule that shapes the whole design is the same as for splitting:
 **nothing about the test rows may influence the numbers used to prepare the
 training rows.** See [`data-splitting.md`](data-splitting.md) for the split
@@ -31,6 +35,19 @@ separately in row order, so a training gap can never be filled from a test
 value. Smoothing windows shrink at the train/test boundary for the same reason.
 Rows that preparation removes disappear from both the training and the test
 set; they are never silently kept.
+
+## Copies, ordering and normalisation cost
+
+The default path (no fill, no outlier rule, no smoothing) reads the used
+columns straight from the loaded table: it does not make a row-major copy of
+them (`#133`). Only a *mutating* stage (fill, outlier removal, smoothing) needs
+that copy, and it is made once. The split itself is a selector over the table,
+not a second copy.
+
+Centre/scale still computes the training mean and standard deviation in one
+pass. Median, min, max, IQR and range need an ordered copy; mean/std (the
+default) does not sort. This changes no number: the same training rows produce
+the same constants and the same samples in the same order.
 
 ## Ragged rows
 

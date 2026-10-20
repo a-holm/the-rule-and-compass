@@ -52,6 +52,7 @@ unweighted path is unchanged and still rejects any non-finite prediction.
 | `signed` | `|Σ wᵢ·eᵢ / Σ wᵢ|` |
 | `log_squashed` | `Σ wᵢ·ln(1 + eᵢ²) / Σ wᵢ` |
 | `correlation` | `1 − |r_w|`, weighted Pearson `r_w` |
+| `correlation_signed` | `1 − r_w`, weighted Pearson `r_w` (direction preserved) |
 | `implicit` | `Σ wᵢ·(|f(pᵢ)| / ||∇f(pᵢ)||) / Σ wᵢ` |
 | `implicit_residual` | `Σ wᵢ·|f(pᵢ)| / Σ wᵢ` |
 | `aic`, `aicc`, `bic` | weighted RSS, `n = number of rows with wᵢ > 0` |

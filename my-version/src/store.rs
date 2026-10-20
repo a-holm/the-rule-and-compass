@@ -1,4 +1,4 @@
-//! Versioned, out-of-core column store (issue #71).
+//! Versioned, out-of-core column store (issues #71, #127, #128).
 //!
 //! A store is a small binary container around the same column-major image the
 //! resident [`crate::data::Table`] uses:
@@ -7,11 +7,16 @@
 //! magic "RCSRBIN\0" | u32 version | u32 header_len | JSON header | data blocks
 //! ```
 //!
-//! The JSON header is self-describing (names, dtypes, `n_rows`, `group_rows`,
-//! categorical level tables and per-column, per-group block offsets), and the
-//! blocks are plain little-endian `f64` values. Lower-cardinality numeric and
-//! text columns additionally carry a `u32` code block per group, encoded as
-//! `f64` so the hot representation has one element type.
+//! Version 2 is self-describing per column: value blocks are `f64`
+//! (features/targets), `i64` (the time column, nanosecond-safe) or absent for
+//! a pure dictionary column (`u32`), and dictionary code blocks are `u32`
+//! (4 bytes) instead of the version-1 `f64` codes (8 bytes). Version 1 remains
+//! readable: it is the original all-`f64` layout, and a v1 header with an
+//! explicit `"dtype":"i64"` (the #127 extension) is read as an i64 time block.
+//! Both versions use the same group structure and relative offsets.
+//!
+//! Dictionary levels are the evaluator's view; codes are kept in a separate
+//! [`DictColumn`](crate::data::DictColumn) and never enter arithmetic.
 //!
 //! # Backing policy
 //!
@@ -39,8 +44,42 @@ use std::io::{Read, Write};
 
 /// Eight-byte magic; the trailing NUL makes a truncated file easy to reject.
 pub const MAGIC: &[u8; 8] = b"RCSRBIN\0";
-/// Format version. A mismatch is refused with an actionable message.
-pub const VERSION: u32 = 1;
+/// Current format version. Writers emit v2; readers accept v1 and v2.
+pub const VERSION: u32 = 2;
+/// Original all-`f64` layout, still readable.
+pub const LEGACY_VERSION: u32 = 1;
+
+/// Storage type of one column.
+///
+/// * `F64`: numeric value block (8 B); an optional code block is `u32`.
+/// * `I64`: the time column's value block (8 B), nanosecond-safe.
+/// * `U32`: pure dictionary/text column; no value block, only a `u32` code
+///   block. The evaluator sees levels, never codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DType {
+    F64,
+    I64,
+    U32,
+}
+
+impl DType {
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::F64 => "f64",
+            DType::I64 => "i64",
+            DType::U32 => "u32",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f64" => Some(DType::F64),
+            "i64" => Some(DType::I64),
+            "u32" => Some(DType::U32),
+            _ => None,
+        }
+    }
+}
 /// Default row group, sized for 512 KiB per `f64` column (the measured I/O
 /// block). It is a streaming unit, not an L2 tile.
 pub const DEFAULT_GROUP_ROWS: usize = 65_536;
@@ -54,6 +93,8 @@ pub const RESIDENT_BYTES_PER_CELL: u64 = 300;
 struct ColumnMeta {
     name: String,
     numeric: bool,
+    /// Value-block type. `i64` is used for the time column only.
+    dtype: DType,
     levels: Vec<String>,
     /// `true` when the column has a dictionary and therefore a code block.
     has_codes: bool,
@@ -65,6 +106,7 @@ struct ColumnMeta {
 /// Parsed header of a store. Public so callers can budget before reading data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Header {
+    pub version: u32,
     pub n_rows: usize,
     pub n_cols: usize,
     pub group_rows: usize,
@@ -88,9 +130,60 @@ impl Header {
         self.columns.iter().map(|c| c.numeric).collect()
     }
 
+    /// Value-block type per column, in header order.
+    pub fn dtypes(&self) -> Vec<DType> {
+        self.columns.iter().map(|c| c.dtype).collect()
+    }
+
+    /// Byte width of one value cell in `col`. A pure dictionary column has no
+    /// value block in v2.
+    fn value_width(&self, col: usize) -> u64 {
+        match self.columns[col].dtype {
+            DType::F64 | DType::I64 => 8,
+            DType::U32 => {
+                if self.version >= 2 {
+                    0
+                } else {
+                    8
+                }
+            }
+        }
+    }
+
+    /// Byte width of one dictionary code: v1 stored codes as `f64`, v2 as
+    /// `u32`.
+    fn code_width(&self) -> u64 {
+        if self.version >= 2 {
+            4
+        } else {
+            8
+        }
+    }
+
     pub fn group_len(&self, group: usize) -> usize {
         let lo = group.saturating_mul(self.group_rows);
         (self.n_rows.saturating_sub(lo)).min(self.group_rows)
+    }
+
+    /// Column index by exact name.
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns.iter().position(|c| c.name == name)
+    }
+
+    /// Whether column `col` is numeric (text columns only have dictionary codes).
+    pub fn is_numeric(&self, col: usize) -> Option<bool> {
+        self.columns.get(col).map(|c| c.numeric)
+    }
+
+    /// Dictionary levels for a text (or low-cardinality numeric) column.
+    ///
+    /// The codes returned by [`FileStore::read_codes`] index this slice. `None`
+    /// means the column does not carry a dictionary.
+    pub fn levels(&self, col: usize) -> Option<&[String]> {
+        self.columns
+            .get(col)
+            .filter(|c| c.has_codes)
+            .map(|c| c.levels.as_slice())
     }
 }
 
@@ -121,11 +214,11 @@ impl FileStore {
             ));
         }
         let version = read_u32(&mut file, path)?;
-        if version != VERSION {
+        if version != LEGACY_VERSION && version != VERSION {
             return Err(format!(
-                "{}: column store version {} is not supported by this build (reads version {}); \
+                "{}: column store version {} is not supported by this build (reads versions {} and {}); \
                  re-run `rcsr import` to rewrite the file",
-                path, version, VERSION
+                path, version, LEGACY_VERSION, VERSION
             ));
         }
         let header_len = read_u32(&mut file, path)? as u64;
@@ -140,7 +233,7 @@ impl FileStore {
             .map_err(|_| format!("{}: truncated column store header", path))?;
         let text = std::str::from_utf8(&raw)
             .map_err(|_| format!("{}: column store header is not UTF-8", path))?;
-        let header = parse_header(text).map_err(|e| format!("{}: {}", path, e))?;
+        let header = parse_header(text, version).map_err(|e| format!("{}: {}", path, e))?;
         let data_start = 16 + header_len;
         let mut store = FileStore {
             file,
@@ -206,8 +299,9 @@ impl FileStore {
         }
         for g in 0..n_groups {
             let len = self.header.group_len(g) as u64;
-            for col in &self.header.columns {
-                let values_end = self.data_start + col.offsets[g] + len * 8;
+            for (c, col) in self.header.columns.iter().enumerate() {
+                let values_end =
+                    self.data_start + col.offsets[g] + len * self.header.value_width(c);
                 if values_end > file_len {
                     return Err(format!(
                         "{}: truncated data: group {} column '{}' ends at byte {} but the file is {} bytes",
@@ -215,7 +309,9 @@ impl FileStore {
                     ));
                 }
                 if col.has_codes {
-                    let codes_end = self.data_start + col.code_offsets[g] + len * 8;
+                    let codes_end = self.data_start
+                        + col.code_offsets[g]
+                        + len * self.header.code_width();
                     if codes_end > file_len {
                         return Err(format!(
                             "{}: truncated codes: group {} column '{}' ends at byte {} but the file is {} bytes",
@@ -261,9 +357,45 @@ impl FileStore {
         for (c, col) in self.header.columns.iter().enumerate() {
             let dst = buf.col_mut(c);
             let off = self.data_start + col.offsets[group];
-            read_f64_block(&self.file, &self.path, off, dst, scratch)?;
+            match col.dtype {
+                DType::F64 => read_f64_block(&self.file, &self.path, off, dst, scratch)?,
+                DType::I64 => {
+                    let mut ints = vec![0i64; len];
+                    read_i64_block(&self.file, &self.path, off, &mut ints, scratch)?;
+                    for (dst, v) in dst.iter_mut().zip(ints) {
+                        *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
+                    }
+                }
+                // A pure dictionary column has no value block; the buffer keeps
+                // NaNs and callers read the codes instead.
+                DType::U32 => {}
+            }
         }
         Ok(buf.view_ref())
+    }
+
+    /// Read one group's exact `i64` values for `col` (the time column), or an
+    /// empty vector when the column is stored as `f64`.
+    pub fn read_i64(&self, group: usize, col: usize) -> Result<Vec<i64>, String> {
+        let meta = self
+            .header
+            .columns
+            .get(col)
+            .ok_or_else(|| format!("{}: column {} is out of range", self.path, col))?;
+        if meta.dtype != DType::I64 {
+            return Ok(Vec::new());
+        }
+        let len = self.header.group_len(group);
+        let mut out = vec![0i64; len];
+        let mut scratch = Vec::new();
+        read_i64_block(
+            &self.file,
+            &self.path,
+            self.data_start + meta.offsets[group],
+            &mut out,
+            &mut scratch,
+        )?;
+        Ok(out)
     }
 
     /// Decode a group's dictionary codes for `col`, as `u32` values in a fresh
@@ -278,15 +410,15 @@ impl FileStore {
             return Ok(Vec::new());
         }
         let len = self.header.group_len(group);
-        let mut vals = vec![0.0f64; len];
         let mut scratch = Vec::new();
-        read_f64_block(
-            &self.file,
-            &self.path,
-            self.data_start + meta.code_offsets[group],
-            &mut vals,
-            &mut scratch,
-        )?;
+        let off = self.data_start + meta.code_offsets[group];
+        if self.header.version >= 2 {
+            let mut codes = vec![0u32; len];
+            read_u32_block(&self.file, &self.path, off, &mut codes, &mut scratch)?;
+            return Ok(codes);
+        }
+        let mut vals = vec![0.0f64; len];
+        read_f64_block(&self.file, &self.path, off, &mut vals, &mut scratch)?;
         Ok(vals
             .into_iter()
             .map(|v| {
@@ -328,6 +460,18 @@ impl FileStore {
                 }
             })
             .collect();
+        let mut ints: Vec<Option<Vec<i64>>> = self
+            .header
+            .columns
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::I64 {
+                    Some(Vec::with_capacity(n))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut buf = GroupBuf::new();
         let mut scratch = Vec::new();
         for g in 0..self.header.n_groups() {
@@ -335,6 +479,9 @@ impl FileStore {
             for (c, col) in self.header.columns.iter().enumerate() {
                 if col.numeric {
                     values[c].extend_from_slice(view.col(c));
+                }
+                if col.dtype == DType::I64 {
+                    ints[c].as_mut().unwrap().extend(self.read_i64(g, c)?);
                 }
                 if col.has_codes {
                     let part = self.read_codes(g, c)?;
@@ -349,6 +496,7 @@ impl FileStore {
             .enumerate()
             .map(|(c, col)| Column {
                 values: std::mem::take(&mut values[c]),
+                ints: ints[c].take(),
                 dict: codes[c].take().map(|codes| DictColumn {
                     codes,
                     levels: col.levels.clone(),
@@ -402,6 +550,18 @@ impl FileStore {
                 }
             })
             .collect();
+        let mut ints: Vec<Option<Vec<i64>>> = self
+            .header
+            .columns
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::I64 {
+                    Some(Vec::with_capacity(max_rows))
+                } else {
+                    None
+                }
+            })
+            .collect();
         let mut buf = GroupBuf::new();
         let mut scratch = Vec::new();
         let mut selected_rows = 0usize;
@@ -418,6 +578,13 @@ impl FileStore {
                 if col.numeric {
                     for &r in &keep {
                         values[c].push(view.col(c)[r]);
+                    }
+                }
+                if col.dtype == DType::I64 {
+                    let part = self.read_i64(g, c)?;
+                    let dst = ints[c].as_mut().unwrap();
+                    for &r in &keep {
+                        dst.push(part[r]);
                     }
                 }
             }
@@ -439,6 +606,7 @@ impl FileStore {
             .enumerate()
             .map(|(c, col)| Column {
                 values: std::mem::take(&mut values[c]),
+                ints: ints[c].take(),
                 dict: codes[c].take().map(|codes| DictColumn {
                     codes,
                     levels: col.levels.clone(),
@@ -553,13 +721,47 @@ pub fn detected_hard_budget() -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 /// Write `table` as a version-1 store at `path`.
+///
+/// A column that carries an exact `i64` time view (see
+/// [`crate::data::Table::ints`]) is written as an `i64` block, so nanosecond
+/// timestamps round-trip exactly. Everything else is `f64` as before.
 pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), String> {
+    write_store_with_time(path, table, group_rows, None)
+}
+
+/// [`write_store`] with an explicit time column (`rcsr import --time <col>`).
+/// When `time_col` is `None` the first column with an exact `i64` view is used;
+/// with no such column the store is the historical all-`f64` layout.
+pub fn write_store_with_time(
+    path: &str,
+    table: &Table,
+    group_rows: usize,
+    time_col: Option<usize>,
+) -> Result<(), String> {
     let group_rows = group_rows.max(1);
     let n_rows = table.len();
     let n_cols = table.n_cols();
     if n_rows == 0 {
         return Err("cannot write a column store with no rows".to_string());
     }
+    let time_col = match time_col {
+        Some(c) => {
+            if c >= n_cols {
+                return Err(format!(
+                    "time column {} is out of range ({} columns)",
+                    c, n_cols
+                ));
+            }
+            if table.ints(c).is_none() {
+                return Err(format!(
+                    "time column '{}' is not an integer timestamp; i64 storage needs whole-number cells",
+                    table.names[c]
+                ));
+            }
+            Some(c)
+        }
+        None => (0..n_cols).find(|&c| table.ints(c).is_some()),
+    };
     let n_groups = (n_rows + group_rows - 1) / group_rows;
     let mut columns: Vec<ColumnMeta> = (0..n_cols)
         .map(|c| {
@@ -567,6 +769,13 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
             ColumnMeta {
                 name: table.names[c].clone(),
                 numeric: table.numeric[c],
+                dtype: if Some(c) == time_col {
+                    DType::I64
+                } else if !table.numeric[c] && dict.is_some() {
+                    DType::U32
+                } else {
+                    DType::F64
+                },
                 levels: dict.map(|d| d.levels.clone()).unwrap_or_default(),
                 has_codes: dict.is_some(),
                 offsets: Vec::with_capacity(n_groups),
@@ -581,14 +790,16 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
         let len = group_len(n_rows, group_rows, g) as u64;
         for col in &mut columns {
             col.offsets.push(cursor);
-            cursor = cursor.saturating_add(len * 8);
+            cursor = cursor.saturating_add(len * col_value_width(col.dtype));
             if col.has_codes {
                 col.code_offsets.push(cursor);
-                cursor = cursor.saturating_add(len * 8);
+                cursor = cursor.saturating_add(len * 4);
             }
         }
     }
+    let dtypes: Vec<DType> = columns.iter().map(|c| c.dtype).collect();
     let header = Header {
+        version: VERSION,
         n_rows,
         n_cols,
         group_rows,
@@ -614,10 +825,24 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
         for c in 0..n_cols {
             bytes.clear();
             bytes.reserve((hi - lo) * 8);
-            let values = table.col(c);
-            for r in lo..hi {
-                let v = values.get(r).copied().unwrap_or(f64::NAN);
-                bytes.extend_from_slice(&v.to_le_bytes());
+            match dtypes[c] {
+                DType::F64 => {
+                    let values = table.col(c);
+                    for r in lo..hi {
+                        let v = values.get(r).copied().unwrap_or(f64::NAN);
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                DType::I64 => {
+                    let ints = table.ints(c).ok_or_else(|| {
+                        format!("column '{}' has no i64 view", table.names[c])
+                    })?;
+                    for r in lo..hi {
+                        bytes.extend_from_slice(&ints.get(r).copied().unwrap_or(i64::MIN).to_le_bytes());
+                    }
+                }
+                // Text/categorical: no value block, codes below.
+                DType::U32 => {}
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -625,9 +850,9 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
                 continue;
             };
             bytes.clear();
-            bytes.reserve((hi - lo) * 8);
+            bytes.reserve((hi - lo) * 4);
             for r in lo..hi {
-                bytes.extend_from_slice(&(dict.codes[r] as f64).to_le_bytes());
+                bytes.extend_from_slice(&dict.codes[r].to_le_bytes());
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -640,6 +865,14 @@ pub fn write_store(path: &str, table: &Table, group_rows: usize) -> Result<(), S
 fn group_len(n_rows: usize, group_rows: usize, group: usize) -> usize {
     let lo = group.saturating_mul(group_rows);
     (n_rows.saturating_sub(lo)).min(group_rows)
+}
+
+/// v2 value-block width. A pure dictionary column stores no values.
+fn col_value_width(dtype: DType) -> u64 {
+    match dtype {
+        DType::F64 | DType::I64 => 8,
+        DType::U32 => 0,
+    }
 }
 
 fn header_json(h: &Header) -> String {
@@ -667,9 +900,10 @@ fn header_json(h: &Header) -> String {
             .collect::<Vec<_>>()
             .join(",");
         cols.push_str(&format!(
-            "{{\"name\":{},\"numeric\":{},\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
+            "{{\"name\":{},\"numeric\":{},\"dtype\":\"{}\",\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
             jstr(&c.name),
             c.numeric,
+            c.dtype.name(),
             levels,
             c.has_codes,
             offsets,
@@ -678,7 +912,7 @@ fn header_json(h: &Header) -> String {
     }
     format!(
         "{{\"format\":\"rcsr-column-store\",\"version\":{},\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[{}]}}",
-        VERSION, h.n_rows, h.n_cols, h.group_rows, cols
+        h.version, h.n_rows, h.n_cols, h.group_rows, cols
     )
 }
 
@@ -734,9 +968,54 @@ fn read_f64_block(
     Ok(())
 }
 
+fn read_i64_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [i64],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 8;
+    scratch.resize(bytes, 0);
+    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
+        format!(
+            "{}: reading {} bytes at offset {}: {}",
+            path, bytes, offset, e
+        )
+    })?;
+    for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(8)) {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(src);
+        *dst = i64::from_le_bytes(b);
+    }
+    Ok(())
+}
+
+fn read_u32_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [u32],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 4;
+    scratch.resize(bytes, 0);
+    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
+        format!(
+            "{}: reading {} bytes at offset {}: {}",
+            path, bytes, offset, e
+        )
+    })?;
+    for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(4)) {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(src);
+        *dst = u32::from_le_bytes(b);
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
-fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::FileExt;
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {    use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
 }
 
@@ -811,7 +1090,7 @@ impl Json {
     }
 }
 
-fn parse_header(text: &str) -> Result<Header, String> {
+fn parse_header(text: &str, outer_version: u32) -> Result<Header, String> {
     let mut p = JsonParser {
         bytes: text.as_bytes(),
         pos: 0,
@@ -820,6 +1099,16 @@ fn parse_header(text: &str) -> Result<Header, String> {
     p.ws();
     if p.pos != p.bytes.len() {
         return Err("trailing bytes in column store header".to_string());
+    }
+    let header_version = root
+        .get("version")
+        .and_then(Json::as_usize)
+        .ok_or_else(|| "header is missing version".to_string())? as u32;
+    if header_version != outer_version {
+        return Err(format!(
+            "header version {} disagrees with the file version {}",
+            header_version, outer_version
+        ));
     }
     let n_rows = root
         .get("n_rows")
@@ -856,6 +1145,45 @@ fn parse_header(text: &str) -> Result<Header, String> {
             .get("numeric")
             .and_then(Json::as_bool)
             .ok_or_else(|| format!("column '{}' is missing numeric", name))?;
+        // Absent in the original v1 header, which means all-`f64`.
+        let dtype = match c.get("dtype") {
+            None => DType::F64,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("column '{}' has a non-string dtype", name))?;
+                DType::parse(s).ok_or_else(|| {
+                    format!(
+                        "column '{}' has unknown dtype '{}' (expected f64 or i64)",
+                        name, s
+                    )
+                })?
+            }
+        };
+        if dtype == DType::I64 && !numeric {
+            return Err(format!(
+                "column '{}' has dtype i64 but numeric:false",
+                name
+            ));
+        }
+        let has_codes = c
+            .get("has_codes")
+            .and_then(Json::as_bool)
+            .ok_or_else(|| format!("column '{}' is missing has_codes", name))?;
+        if dtype == DType::U32 {
+            if outer_version < 2 {
+                return Err(format!(
+                    "column '{}' has dtype u32, which needs store version 2 or later",
+                    name
+                ));
+            }
+            if numeric || !has_codes {
+                return Err(format!(
+                    "column '{}' has dtype u32 but is not a dictionary-only column",
+                    name
+                ));
+            }
+        }
         let levels = c
             .get("levels")
             .and_then(Json::as_arr)
@@ -867,15 +1195,12 @@ fn parse_header(text: &str) -> Result<Header, String> {
                     .ok_or_else(|| format!("column '{}' has a non-string level", name))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let has_codes = c
-            .get("has_codes")
-            .and_then(Json::as_bool)
-            .ok_or_else(|| format!("column '{}' is missing has_codes", name))?;
         let offsets = parse_offsets(c.get("offsets"), &name)?;
         let code_offsets = parse_offsets(c.get("code_offsets"), &name)?;
         columns.push(ColumnMeta {
             name,
             numeric,
+            dtype,
             levels,
             has_codes,
             offsets,
@@ -886,6 +1211,7 @@ fn parse_header(text: &str) -> Result<Header, String> {
         return Err("column store has no rows".to_string());
     }
     Ok(Header {
+        version: outer_version,
         n_rows,
         n_cols,
         group_rows,
@@ -1101,6 +1427,7 @@ mod tests {
     #[test]
     fn header_json_round_trips() {
         let h = Header {
+            version: VERSION,
             n_rows: 10,
             n_cols: 2,
             group_rows: 4,
@@ -1108,6 +1435,7 @@ mod tests {
                 ColumnMeta {
                     name: "a\"b".to_string(),
                     numeric: true,
+                    dtype: DType::F64,
                     levels: vec![],
                     has_codes: false,
                     offsets: vec![0, 64, 128],
@@ -1116,6 +1444,7 @@ mod tests {
                 ColumnMeta {
                     name: "label".to_string(),
                     numeric: false,
+                    dtype: DType::U32,
                     levels: vec!["x".to_string(), "y".to_string()],
                     has_codes: true,
                     offsets: vec![0, 32, 64],
@@ -1124,7 +1453,7 @@ mod tests {
             ],
         };
         let text = header_json(&h);
-        let back = parse_header(&text).unwrap();
+        let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
     }
 }

@@ -7,7 +7,10 @@ wrong, but because the model was tested on information it had already seen.
 
 This document explains the four splitting rules `rcsr` implements, why the
 default (a random split) is wrong for anything with a time order, and how the
-extras (`--gap`, `--folds`, `--split auto`) work.
+extras (`--gap`, `--folds`, `--split auto`) work. Once the split is chosen,
+run the full audit in [`time-series.md`](time-series.md): purge/embargo,
+overlapping labels, look-ahead preparation, lockboxes, per-group reporting,
+multiple testing and costs.
 
 ## The one rule that matters: no leakage
 
@@ -73,6 +76,41 @@ rows, in time order:   [ 0 ......................... n-1 ]
 
 Concretely, with 100 rows, `--test-frac 0.25 --gap 5`: rows 0–74 train, rows
 75–79 dropped, rows 80–99 test.
+
+### Validation slice and the test lockbox
+
+The test block answers one question: how well does the chosen law generalise?
+If you rank candidates by `test_error`, you have already spent that block — the
+winner was chosen *because* it looked good on it, so its reported error is
+optimistic. The fix is a second holdout inside the training period:
+
+```sh
+rcsr --data d.csv --target y --vars x1,x2 --split temporal --time t \
+     --test-frac 0.25 --validation-frac 0.2 --gap 5
+```
+
+The training period is now split chronologically into **fit-train** and
+**validation**, with the same embargo `--gap` on both sides of the validation
+slice:
+
+```
+rows, in time order:   [ 0 ......................... n-1 ]
+                        |<----- fit-train ----->|g|<- val ->|g|<- test ->|
+```
+
+Model selection ranks on the validation slice by default (`--select-by
+validation`); `--select-by train` and `--select-by aicc` are also available.
+`test_error` is **scoring-only** and is never a selection criterion. The JSON
+front carries `train_error`, `validation_error`, `test_error` and
+`archive_rank` (the position in the original archive), and the split object
+carries `validation_rows`. If you ask for `--select-by validation` without a
+slice, `rcsr` exits 2 instead of quietly falling back to train.
+
+`--train-select` / `--test-select` still work exactly as before: they replace
+the positional split and are the right tool when the boundary is a date or a
+flag rather than a fraction. A validation slice is carved from the selected
+training rows in the same way, so `--validation-frac` composes with them; the
+purge note is still reported.
 
 For `group`, groups (distinct values of `--group-by`) are ordered by a stable
 hash of their name and whole groups move to the test side until the test share

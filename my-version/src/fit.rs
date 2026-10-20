@@ -14,9 +14,79 @@
 //! engine.
 
 use crate::expr::{self, Node, Op};
+use crate::metrics::{self, Metric};
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
+
+/// #116: which exact constant-fitting arm the search may use.
+///
+/// All three arms minimise the same weighted squared error on the same rows in
+/// `f64`; they differ only in *how* they reach the minimum. `Exact` is the
+/// historical Levenberg–Marquardt path, bit for bit. `Auto` and `Linear` first
+/// try the closed-form linear least-squares arm for trees that are affine in
+/// every constant; every other tree, and every linear system that is
+/// rank-deficient or whose solution is not an improvement, falls back to
+/// `Exact`. The linear arm is an exact global minimiser for its class, not an
+/// approximation, so it cannot make the objective worse on those trees.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitStrategy {
+    /// Today's CPU Levenberg–Marquardt.
+    Exact,
+    /// Linear least squares when eligible, otherwise `Exact`.
+    Auto,
+    /// The linear arm with an `Exact` fallback when a tree is ineligible.
+    Linear,
+}
+
+impl FitStrategy {
+    /// Parse the CLI spelling. `cpu` is accepted as a synonym for `exact`.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "exact" | "cpu" => Some(FitStrategy::Exact),
+            "auto" => Some(FitStrategy::Auto),
+            "linear" => Some(FitStrategy::Linear),
+            _ => None,
+        }
+    }
+
+    /// The spelling used by the CLI, schema and checkpoints.
+    pub fn name(self) -> &'static str {
+        match self {
+            FitStrategy::Exact => "exact",
+            FitStrategy::Auto => "auto",
+            FitStrategy::Linear => "linear",
+        }
+    }
+}
+
+/// #116: the largest design matrix (`rows × constants`) the linear arm will
+/// materialise. Above it the exact LM path runs, so a large dataset never pays
+/// an unbounded allocation. 8M cells is 64 MiB of `f64` at the cap.
+const LINEAR_MAX_CELLS: usize = 8_000_000;
+
+/// #116: largest number of constants the linear arm will solve for.
+const LINEAR_MAX_CONSTANTS: usize = 64;
+
+/// #116: pre-registered rank tolerance for the column-scaled QR. Every column
+/// is normalised to unit 2-norm before factorisation, so a trailing pivot norm
+/// at or below this is treated as rank-deficient and the tree falls back to the
+/// exact LM path.
+const LINEAR_RANK_TOL: f64 = 1e-12;
+
+/// #116: process-wide counters for `--fit-report`. They are diagnostics only;
+/// no search decision reads them, so they cannot change a trajectory.
+static LINEAR_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXACT_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #116: `(linear, exact)` fit-arm calls since process start.
+pub fn fit_arm_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        LINEAR_FITS.load(Ordering::Relaxed),
+        EXACT_FITS.load(Ordering::Relaxed),
+    )
+}
 
 /// Flattened expression: children always precede parents, so index order is a
 /// post-order and the backward (adjoint) sweep is a simple descending loop.
@@ -747,14 +817,17 @@ fn normal_equations(
             return None;
         }
         backward(f, v, adj, grad);
+        // Both the Jacobian and the residual carry sqrt(w), so the accumulated
+        // matrices are `JᵀWJ` and `JᵀWr` (not a half-weighted system).
+        let jw = sw.sqrt();
         for i in 0..k {
-            let gi = grad[i];
+            let gi = jw * grad[i];
             if !gi.is_finite() {
                 return None;
             }
             jtr[i] += gi * r;
             for j in 0..=i {
-                jtj[i][j] += gi * grad[j];
+                jtj[i][j] += gi * (jw * grad[j]);
             }
         }
     }
@@ -764,6 +837,12 @@ fn normal_equations(
         }
     }
     Some(NormalEquations { jtj, jtr })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #135: number of LM/polish trial steps taken on this test thread.
+    static FIT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Solve the cached normal equations for one damping value and score the trial
@@ -780,6 +859,8 @@ fn gn_trial(
     n: &NormalEquations,
     v: &mut [f64],
 ) -> Option<(Vec<f64>, f64)> {
+    #[cfg(test)]
+    FIT_STEPS.with(|n| n.set(n.get() + 1));
     let mut rhs: Vec<f64> = n.jtr.iter().map(|v| -v).collect();
     let step = solve(&n.jtj, &mut rhs, lambda, k)?;
     let trial: Vec<f64> = (0..k)
@@ -817,6 +898,41 @@ fn gn_step(
 ///
 /// This is the unweighted entry point; it delegates to [`fit_weighted`] with an
 /// empty weight vector, so existing results are bit-for-bit unchanged.
+/// Piecewise-constant operators whose adjoint is zero almost everywhere.
+///
+/// A constant fitted through `sign` or `step` has no useful gradient: the
+/// switch position stays wherever the search put it, so the printed threshold
+/// is arbitrary. This function lists the operators found in a tree so the CLI
+/// can warn when a fitted model contains one. `floor`, `ceil`, `round` and the
+/// comparisons have the same zero derivative but are usually deliberate
+/// rounding/structure, so they are not reported here.
+pub fn zero_adjoint_ops(tree: &Node) -> Vec<&'static str> {
+    fn walk(n: &Node, out: &mut Vec<&'static str>) {
+        match n.op {
+            Op::Sign => {
+                if !out.contains(&"sign") {
+                    out.push("sign");
+                }
+            }
+            Op::Step => {
+                if !out.contains(&"step") {
+                    out.push("step");
+                }
+            }
+            _ => {}
+        }
+        for k in &n.kids {
+            walk(k, out);
+        }
+        if let Some(block) = &n.block {
+            walk(&block.body, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, &mut out);
+    out
+}
+
 pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
     fit_weighted(tree, x, y, &[], iters)
 }
@@ -836,6 +952,23 @@ pub fn fit_weighted(
     w: &[f64],
     iters: usize,
 ) -> f64 {
+    fit_weighted_strategy(tree, x, y, w, iters, FitStrategy::Exact)
+}
+
+/// #116: weighted least squares through a selectable exact arm.
+///
+/// `FitStrategy::Exact` is exactly [`fit_weighted`] (the historical LM path),
+/// so every existing caller, fixture and checkpoint trajectory is unchanged.
+/// `Auto`/`Linear` try the closed-form linear arm first and fall back to LM for
+/// any tree it cannot solve exactly.
+pub fn fit_weighted_strategy(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    strategy: FitStrategy,
+) -> f64 {
     // #87: the scorer rejects a prediction/target length mismatch; the fitter
     // must not silently fit only the shorter of the two.
     if x.len() != y.len() {
@@ -844,6 +977,18 @@ pub fn fit_weighted(
     if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
+    if strategy != FitStrategy::Exact {
+        if let Some(s) = fit_linear(tree, x, y, w) {
+            LINEAR_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return s;
+        }
+    }
+    EXACT_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    fit_lm(tree, x, y, w, iters)
+}
+
+/// The historical Levenberg–Marquardt fitter (see [`fit_weighted`]).
+fn fit_lm(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> f64 {
     let f = flatten(tree);
     let k = f.nconst;
     if k == 0 || x.is_empty() {
@@ -861,6 +1006,12 @@ pub fn fit_weighted(
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
+    // #135: `--no-fit` / `--fit-iters 0` must not fit at all. The LM loop
+    // below runs `iters.max(1)` and a four-step polish, so without this early
+    // return a "no fit" search still performs five LM iterations per candidate.
+    if iters == 0 {
+        return sse(&f, x, y, w, &c, &mut v);
+    }
     // #87: this standalone SSE is intentionally kept. The first `gn_step`
     // forms the same residuals, but using them as the acceptance baseline
     // changed the LM trajectory on guard-free trees; exactness beats the one
@@ -925,7 +1076,13 @@ pub fn fit_weighted(
         }
     }
 
-    // write back
+    write_constants(tree, &f, &best_c);
+    best_sse
+}
+
+/// Write fitted constant values back into the tree, including constants shared
+/// inside block bodies.
+fn write_constants(tree: &mut Node, f: &Flat, best_c: &[f64]) {
     let mut positions = Vec::new();
     let mut counter = 0;
     const_positions(tree, &mut positions, &mut counter);
@@ -942,8 +1099,603 @@ pub fn fit_weighted(
         .iter()
         .map(|(key, &ix)| (*key, f.cslot[ix].max(0) as usize))
         .collect();
-    apply_shared_constants(tree, &shared_slots, &best_c);
-    best_sse
+    apply_shared_constants(tree, &shared_slots, best_c);
+}
+
+/// #116: closed-form weighted least squares for a tree that is affine in every
+/// constant.
+///
+/// For such a tree `f(x; c) = f(x; c₀) + Σⱼ (cⱼ − c₀ⱼ)·gⱼ(x)`, and the adjoint
+/// sweep at `c₀` gives the coefficients `gⱼ` exactly and independently of `c₀`.
+/// The arm builds the weighted design matrix `√w·J`, solves it with a
+/// column-scaled, column-pivoted Householder QR (never the normal equations, so
+/// the condition number is not squared), and returns the weighted SSE. It
+/// returns `None` — leaving the tree untouched — when the tree is not affine,
+/// when the design matrix is too large, when the system is rank-deficient, when
+/// a value is non-finite, or when the closed-form solution does not improve on
+/// the starting constants; the caller then runs the exact LM path.
+fn fit_linear(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64]) -> Option<f64> {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) || x.is_empty() {
+        return None;
+    }
+    let f = flatten(tree);
+    let k = f.nconst;
+    if k == 0 || k > LINEAR_MAX_CONSTANTS || x.len().saturating_mul(k) > LINEAR_MAX_CELLS {
+        return None;
+    }
+    if !affine_in_constants(&f) {
+        return None;
+    }
+
+    let n = f.op.len();
+    let mut c0 = vec![0.0; k];
+    for i in 0..n {
+        if f.cslot[i] >= 0 {
+            c0[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut v = vec![0.0; n];
+    let mut adj = vec![0.0; n];
+    let mut grad = vec![0.0; k];
+
+    // One row sweep: weighted Jacobian (row-major) and the negative weighted
+    // residual at c0. Zero-weight rows contribute nothing, exactly as in `sse`.
+    let mut jac = vec![0.0; x.len() * k];
+    let mut rhs = vec![0.0; x.len()];
+    let mut m = 0usize;
+    for (i, (row, &t)) in x.iter().zip(y).enumerate() {
+        let sw = w.get(i).copied().unwrap_or(1.0);
+        if sw == 0.0 {
+            continue;
+        }
+        if !(sw.is_finite() && sw > 0.0) {
+            return None;
+        }
+        eval_row(&f, row, &c0, &mut v);
+        let pred = v[f.root];
+        if !pred.is_finite() {
+            return None;
+        }
+        backward(&f, &v, &mut adj, &mut grad);
+        let root_w = sw.sqrt();
+        let base = m * k;
+        for (j, &g) in grad.iter().enumerate() {
+            if !g.is_finite() {
+                return None;
+            }
+            jac[base + j] = root_w * g;
+        }
+        rhs[m] = -root_w * (pred - t);
+        if !rhs[m].is_finite() {
+            return None;
+        }
+        m += 1;
+    }
+    if m < k {
+        return None;
+    }
+
+    // Column scaling makes the rank test independent of constant magnitude.
+    let mut scale = vec![0.0; k];
+    for j in 0..k {
+        let mut s = 0.0;
+        for i in 0..m {
+            let a = jac[i * k + j];
+            s += a * a;
+        }
+        let norm = s.sqrt();
+        if !(norm.is_finite() && norm > 0.0) {
+            return None;
+        }
+        scale[j] = norm;
+        for i in 0..m {
+            jac[i * k + j] /= norm;
+        }
+    }
+
+    let scaled = qr_least_squares(&mut jac, m, k, &mut rhs[..m])?;
+
+    let mut best_c = c0.clone();
+    for j in 0..k {
+        best_c[j] += scaled[j] / scale[j];
+    }
+    let trial_sse = sse(&f, x, y, w, &best_c, &mut v);
+    if !trial_sse.is_finite() {
+        return None;
+    }
+    // Never let a numerical edge case replace a better starting point; the
+    // exact LM path gets the tree unchanged when this fails.
+    let start_sse = sse(&f, x, y, w, &c0, &mut v);
+    if trial_sse > start_sse {
+        return None;
+    }
+    if !best_c.iter().all(|c| c.is_finite()) {
+        return None;
+    }
+
+    write_constants(tree, &f, &best_c);
+    Some(trial_sse)
+}
+
+/// #116: is the flattened tree affine in every constant?
+///
+/// `has_const[i]` is true when the subtree at `i` reads a constant. `affine[i]`
+/// is true when that subtree's value is an affine function of all constants.
+/// The rules are structural, not numerical: a product of two constant-dependent
+/// factors is bilinear (rejected); every nonlinear operator is accepted only
+/// when its whole subtree is constant-free. `if` may choose between affine
+/// branches only when its condition is constant-free.
+fn affine_in_constants(f: &Flat) -> bool {
+    let n = f.op.len();
+    let mut has_const = vec![false; n];
+    let mut affine = vec![true; n];
+    for i in 0..n {
+        let ks = &f.kids[i];
+        if f.cslot[i] >= 0 {
+            has_const[i] = true;
+            affine[i] = true;
+            continue;
+        }
+        if f.op[i] == Op::Input {
+            continue;
+        }
+        has_const[i] = ks.iter().any(|&j| has_const[j]);
+        affine[i] = match f.op[i] {
+            Op::Neg => affine[ks[0]],
+            Op::Add | Op::Sub => affine[ks[0]] && affine[ks[1]],
+            // Affine only when at most one factor depends on a constant.
+            Op::Mul => {
+                affine[ks[0]] && affine[ks[1]] && !(has_const[ks[0]] && has_const[ks[1]])
+            }
+            Op::Div => affine[ks[0]] && !has_const[ks[1]],
+            Op::If => !has_const[ks[0]] && affine[ks[1]] && affine[ks[2]],
+            // Every other operator is affine only when it ignores the
+            // constants entirely: a function, product, comparison or
+            // constraint applied to a constant-dependent argument is not.
+            _ => !has_const[i],
+        };
+    }
+    affine[f.root]
+}
+
+/// #116: solve `min ||A x − b||₂` by Householder QR with column pivoting.
+///
+/// `a` is row-major `m × n` and already column-scaled; `b` is overwritten. The
+/// returned vector is in the scaled coordinate system (the caller divides by
+/// the column scales). `None` means rank-deficient or non-finite.
+fn qr_least_squares(a: &mut [f64], m: usize, n: usize, b: &mut [f64]) -> Option<Vec<f64>> {
+    let mut piv: Vec<usize> = (0..n).collect();
+    for k in 0..n {
+        // Column pivoting on the trailing block. Columns start at unit norm, so
+        // an absolute tolerance is a condition-number bound.
+        let mut best = k;
+        let mut best_norm = 0.0;
+        for j in k..n {
+            let mut s = 0.0;
+            for i in k..m {
+                let v = a[i * n + j];
+                s += v * v;
+            }
+            let norm = s.sqrt();
+            if norm > best_norm {
+                best_norm = norm;
+                best = j;
+            }
+        }
+        if !(best_norm.is_finite() && best_norm > LINEAR_RANK_TOL) {
+            return None;
+        }
+        if best != k {
+            for i in 0..m {
+                a.swap(i * n + k, i * n + best);
+            }
+            piv.swap(k, best);
+        }
+
+        // Householder reflector for column k below the diagonal.
+        let mut nx = 0.0;
+        for i in k..m {
+            let v = a[i * n + k];
+            nx += v * v;
+        }
+        let nx = nx.sqrt();
+        if !(nx.is_finite() && nx > 0.0) {
+            return None;
+        }
+        let alpha = if a[k * n + k] >= 0.0 { -nx } else { nx };
+        let v0 = a[k * n + k] - alpha;
+        let mut vtv = v0 * v0;
+        for i in (k + 1)..m {
+            let v = a[i * n + k];
+            vtv += v * v;
+        }
+        if !(vtv.is_finite() && vtv > 0.0) {
+            return None;
+        }
+        // Apply H = I − 2vvᵀ/vtv to the trailing columns and to b.
+        for j in (k + 1)..n {
+            let mut dot = v0 * a[k * n + j];
+            for i in (k + 1)..m {
+                dot += a[i * n + k] * a[i * n + j];
+            }
+            let f = 2.0 * dot / vtv;
+            a[k * n + j] -= f * v0;
+            for i in (k + 1)..m {
+                a[i * n + j] -= f * a[i * n + k];
+            }
+        }
+        let mut dot = v0 * b[k];
+        for i in (k + 1)..m {
+            dot += a[i * n + k] * b[i];
+        }
+        let f = 2.0 * dot / vtv;
+        b[k] -= f * v0;
+        for i in (k + 1)..m {
+            b[i] -= f * a[i * n + k];
+        }
+        a[k * n + k] = alpha;
+        for i in (k + 1)..m {
+            a[i * n + k] = 0.0;
+        }
+    }
+
+    // R z = Qᵀb, then undo the column permutation.
+    let mut z = vec![0.0; n];
+    for i in (0..n).rev() {
+        let mut s = b[i];
+        for j in (i + 1)..n {
+            s -= a[i * n + j] * z[j];
+        }
+        let d = a[i * n + i];
+        if !(d.is_finite() && d.abs() > LINEAR_RANK_TOL) {
+            return None;
+        }
+        z[i] = s / d;
+    }
+    let mut out = vec![0.0; n];
+    for k in 0..n {
+        if !z[k].is_finite() {
+            return None;
+        }
+        out[piv[k]] = z[k];
+    }
+    Some(out)
+}
+
+/// Fit constants against the **configured** metric (issue #117).
+///
+/// `fit_weighted` is the squared-error solver and remains the exact default:
+/// `squared`, `aic`, `aicc` and `bic` delegate to it without a single changed
+/// arithmetic operation. The other metrics use the same LM/QR machinery with a
+/// deterministic outer reweighting:
+///
+/// * `absolute` — IRLS with weights `1 / max(|r|, ε)` (the L1 majoriser).
+/// * `log_squashed` — IRLS with weights `1 / (1 + r²)`, the derivative of
+///   `ln(1 + r²)` split over the residual.
+/// * `auc`, `log_loss`, `hinge` — logistic IRLS on the binary label, with the
+///   model output treated as a logit (the convention all three metrics use).
+///   `auc` and `hinge` share the logistic surrogate because their own
+///   objectives are piecewise constant or non-smooth; the surrogate is convex
+///   and the scored metric decides whether a trial is accepted.
+/// * `correlation`, `rank_correlation`, `signed`, `median`, `maximum`,
+///   `interquartile` and `slope` — a squared fit
+///   followed by a deterministic coordinate polish on the configured metric.
+///   These losses have no least-squares normal equations (rank and order
+///   statistics are not differentiable); the polish is the documented fallback.
+///
+/// A trial is written back only when it improves the configured loss, so the
+/// result is never worse than the starting constants. The returned value is the
+/// fitted **sum of squared errors** for the squared family (preserving #87's
+/// exact reuse) and the configured loss otherwise.
+pub fn fit_weighted_metric(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> f64 {
+    use Metric::*;
+    match metric {
+        // The exact historical path. Information criteria fit by least squares
+        // and add their parameter penalty when scoring; they do not change the
+        // constants' objective.
+        Squared | Aic | Aicc | Bic => fit_weighted(tree, x, y, w, iters),
+        Absolute => irls_fit(tree, x, y, w, iters, metric, |r, _| {
+            1.0 / r.abs().max(1e-6)
+        }),
+        LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
+            1.0 / (1.0 + r * r)
+        }),
+        Auc | LogLoss | Hinge => logistic_irls(tree, x, y, w, iters, metric),
+        // Smooth but not reducible to a weighted least-squares problem, and the
+        // non-smooth order/rank/absolute-bias losses: start from the squared
+        // fit, then polish the actual objective.
+        Correlation
+        | CorrelationSigned
+        | RankCorrelation
+        | RankCorrelationSigned
+        | Signed
+        | Median
+        | Maximum
+        | Interquartile
+        | Slope
+        | ImplicitResidual
+        | ImplicitDerivative => {
+            fit_weighted(tree, x, y, w, iters);
+            coordinate_polish(tree, x, y, w, metric, iters.max(1));
+            metric_score(tree, x, y, w, metric)
+        }
+    }
+}
+
+/// #116 + #117: strategy and metric together.
+///
+/// The closed-form linear arm minimises squared error only, so it is used for
+/// the squared/AIC family. Every other metric keeps the IRLS/polish path from
+/// #117, which is the exact objective for that metric.
+pub fn fit_weighted_strategy_metric(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    strategy: FitStrategy,
+    metric: Metric,
+) -> f64 {
+    if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
+        fit_weighted_strategy(tree, x, y, w, iters, strategy)
+    } else {
+        fit_weighted_metric(tree, x, y, w, iters, metric)
+    }
+}
+
+/// Unweighted entry point for [`fit_weighted_metric`].
+pub fn fit_metric(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> f64 {
+    fit_weighted_metric(tree, x, y, &[], iters, metric)
+}
+
+/// Evaluate `tree` on every row.
+fn predictions(tree: &Node, x: &[Vec<f64>]) -> Vec<f64> {
+    x.iter().map(|row| expr::eval(tree, row)).collect()
+}
+
+/// The configured metric at the tree's current constants.
+fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> f64 {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return f64::INFINITY;
+    }
+    let pred = predictions(tree, x);
+    metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
+}
+
+/// One IRLS round: fit weighted least squares to `target` with per-row
+/// `weights`, then keep the trial only if the configured metric improves.
+///
+/// `target` and `weights` have one entry per row; the base `w` vector (if any)
+/// is folded into `weights` before the call.
+fn irls_fit<F>(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+    weight_of: F,
+) -> f64
+where
+    F: Fn(f64, usize) -> f64,
+{
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return f64::INFINITY;
+    }
+    let mut best = metric_score(tree, x, y, w, metric);
+    if !best.is_finite() {
+        return best;
+    }
+    // Keep the total number of LM sweeps close to `--fit-iters`: four weight
+    // updates with `iters/4` inner sweeps each for the default of 8.
+    let rounds = iters.clamp(1, 4);
+    let inner = (iters / rounds).max(1);
+    for _ in 0..rounds {
+        let pred = predictions(tree, x);
+        let mut target = Vec::with_capacity(x.len());
+        let mut weights = Vec::with_capacity(x.len());
+        for i in 0..x.len() {
+            let r = pred[i] - y[i];
+            if !r.is_finite() {
+                return best;
+            }
+            let base = if w.is_empty() { 1.0 } else { w[i] };
+            // A zero-weight row must stay invisible to the fit, exactly as in
+            // `fit_weighted`.
+            weights.push(if base > 0.0 {
+                base * weight_of(r, i).max(0.0)
+            } else {
+                0.0
+            });
+            target.push(y[i]);
+        }
+        let mut trial = tree.clone();
+        fit_weighted(&mut trial, x, &target, &weights, inner);
+        let score = metric_score(&trial, x, y, w, metric);
+        if score.is_finite() && score < best {
+            best = score;
+            *tree = trial;
+        } else {
+            break; // the majoriser no longer moves the objective
+        }
+    }
+    // A final weighted solve at the converged weights removes the LM damping
+    // that the short inner solves deliberately leave behind. It is only kept
+    // when the configured loss improves, so it cannot make the fit worse.
+    let pred = predictions(tree, x);
+    if pred.iter().all(|p| p.is_finite()) {
+        let mut target = Vec::with_capacity(x.len());
+        let mut weights = Vec::with_capacity(x.len());
+        for i in 0..x.len() {
+            let r = pred[i] - y[i];
+            let base = if w.is_empty() { 1.0 } else { w[i] };
+            weights.push(if base > 0.0 {
+                base * weight_of(r, i).max(0.0)
+            } else {
+                0.0
+            });
+            target.push(y[i]);
+        }
+        let mut trial = tree.clone();
+        fit_weighted(&mut trial, x, &target, &weights, iters.max(4));
+        let score = metric_score(&trial, x, y, w, metric);
+        if score.is_finite() && score < best {
+            best = score;
+            *tree = trial;
+        }
+    }
+    best
+}
+
+/// Binary labels at the target midpoint, matching [`Metric::is_classification`].
+fn classification_labels(y: &[f64]) -> Vec<f64> {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &v in y {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let mid = 0.5 * (lo + hi);
+    y.iter().map(|&v| if v > mid { 1.0 } else { 0.0 }).collect()
+}
+
+fn sigmoid(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// Logistic IRLS for the classification metrics.
+///
+/// The model output is the logit `p`; the label is `t ∈ {-1, +1}`. Log loss is
+/// `ln(1 + exp(-t·p))`, whose Newton step is the weighted least-squares problem
+/// `min Σ q(1−q)·(p − z)²` with `q = sigmoid(t·p)` and `z = p + t/q`. The
+/// pseudo-response `z` is bounded because `q` is clamped; every trial is judged
+/// by the configured metric, so `auc` and `hinge` may accept or reject a step
+/// on their own (non-smooth) criterion.
+fn logistic_irls(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> f64 {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return f64::INFINITY;
+    }
+    let mut best = metric_score(tree, x, y, w, metric);
+    if !best.is_finite() {
+        return best;
+    }
+    let labels = classification_labels(y);
+    let rounds = iters.max(1).min(16);
+    for _ in 0..rounds {
+        let pred = predictions(tree, x);
+        if pred.iter().any(|p| !p.is_finite()) {
+            break;
+        }
+        let mut target = Vec::with_capacity(x.len());
+        let mut weights = Vec::with_capacity(x.len());
+        for (i, &p) in pred.iter().enumerate() {
+            let t = 2.0 * labels[i] - 1.0;
+            let q = sigmoid(t * p).clamp(1e-9, 1.0 - 1e-9);
+            let base = if w.is_empty() { 1.0 } else { w[i] };
+            weights.push(if base > 0.0 { base * q * (1.0 - q) } else { 0.0 });
+            target.push((p + t / q).clamp(-1e6, 1e6));
+        }
+        let mut trial = tree.clone();
+        fit_weighted(&mut trial, x, &target, &weights, 2);
+        let score = metric_score(&trial, x, y, w, metric);
+        if score.is_finite() && score < best {
+            best = score;
+            *tree = trial;
+        } else {
+            break;
+        }
+    }
+    best
+}
+
+/// Deterministic coordinate polish on a metric without a least-squares form.
+///
+/// The squared fit supplies the starting point. Each constant is then moved by
+/// one of six geometric steps (`±10%, ±3%, ±1%` of `max(|c|, 1)`) and the move
+/// is kept only if the configured metric strictly improves. Sweeps stop early
+/// when a full pass makes no improvement. No randomness is involved.
+fn coordinate_polish(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+    sweeps: usize,
+) {
+    let mut best = metric_score(tree, x, y, w, metric);
+    if !best.is_finite() {
+        return;
+    }
+    let mut positions = Vec::new();
+    let mut counter = 0;
+    const_positions(tree, &mut positions, &mut counter);
+    if positions.is_empty() {
+        return;
+    }
+    for _ in 0..sweeps.min(12) {
+        let mut improved = false;
+        for &pos in &positions {
+            let Some(node) = expr::nth(tree, pos) else {
+                continue;
+            };
+            let original = node.val;
+            let scale = original.abs().max(1.0);
+            let mut accepted = false;
+            for &(mul, sign) in &[
+                (0.1, 1.0),
+                (0.1, -1.0),
+                (0.03, 1.0),
+                (0.03, -1.0),
+                (0.01, 1.0),
+                (0.01, -1.0),
+            ] {
+                let trial_value = original + sign * mul * scale;
+                if let Some(node) = expr::nth_mut(tree, pos) {
+                    node.val = trial_value;
+                }
+                let score = metric_score(tree, x, y, w, metric);
+                if score.is_finite() && score < best {
+                    best = score;
+                    improved = true;
+                    accepted = true;
+                    break;
+                }
+            }
+            if !accepted {
+                // No candidate improved: put the original value back.
+                if let Some(node) = expr::nth_mut(tree, pos) {
+                    node.val = original;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
 }
 
 /// Write the fitted shared constants back into every block body in `tree`.
@@ -1384,6 +2136,19 @@ mod tests {
     }
 
     #[test]
+    fn zero_adjoint_warning_lists_only_sign_and_step() {
+        let step = node(Op::Step, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert_eq!(zero_adjoint_ops(&step), vec!["step"]);
+        let sign = node(Op::Sign, vec![step.clone()]);
+        assert_eq!(zero_adjoint_ops(&sign), vec!["sign", "step"]);
+        // A smooth tree raises no warning, and rounding is not reported.
+        let smooth = node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert!(zero_adjoint_ops(&smooth).is_empty());
+        let rounded = node(Op::Round, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert!(zero_adjoint_ops(&rounded).is_empty());
+    }
+
+    #[test]
     fn comparisons_and_not_have_zero_gradient() {
         // Comparisons are piecewise constant (0/1) and `not` is too, so their
         // subgradient is 0 a.e., exactly like `step`.
@@ -1647,6 +2412,130 @@ mod tests {
 
     /// #87: the fitter must reject a prediction/target length mismatch instead
     /// of silently fitting the shorter of the two.
+    fn line(a: f64, b: f64) -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(a), input(0)]), constant(b)],
+        )
+    }
+
+    fn values(tree: &Node) -> Vec<f64> {
+        let mut out = Vec::new();
+        let mut counter = 0;
+        let mut positions = Vec::new();
+        const_positions(tree, &mut positions, &mut counter);
+        for pos in positions {
+            out.push(expr::nth(tree, pos).unwrap().val);
+        }
+        out
+    }
+
+    #[test]
+    fn squared_metric_fitting_is_bit_identical_to_the_old_path() {
+        let x: Vec<Vec<f64>> = (0..31)
+            .map(|i| vec![-1.0 + 2.0 * i as f64 / 30.0])
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| 2.0 * r[0].sin() + 0.25 * r[0] * r[0])
+            .collect();
+        let mut old = line(0.5, 0.0);
+        let mut new = old.clone();
+        let old_sse = fit_weighted(&mut old, &x, &y, &[], 8);
+        let new_sse = fit_weighted_metric(&mut new, &x, &y, &[], 8, Metric::Squared);
+        assert_eq!(old_sse.to_bits(), new_sse.to_bits());
+        let (a, b) = (values(&old), values(&new));
+        assert_eq!(a.len(), b.len());
+        for (u, v) in a.iter().zip(&b) {
+            assert_eq!(u.to_bits(), v.to_bits(), "squared changed a constant");
+        }
+    }
+
+    /// An outlier the squared loss chases and the L1 loss ignores.
+    fn outlier_fixture() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let xs = [-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0];
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        for (i, &v) in xs.iter().enumerate() {
+            x.push(vec![v]);
+            y.push(if i == xs.len() - 1 { 20.0 } else { 2.0 * v + 1.0 });
+        }
+        (x, y)
+    }
+
+    #[test]
+    fn l1_fitting_beats_squared_fitting_on_the_l1_objective() {
+        let (x, y) = outlier_fixture();
+        let mut l1 = line(0.5, 0.0);
+        let mut l2 = line(0.5, 0.0);
+        let l1_loss = fit_weighted_metric(&mut l1, &x, &y, &[], 16, Metric::Absolute);
+        fit_weighted_metric(&mut l2, &x, &y, &[], 16, Metric::Squared);
+        let l1_at_l1 = metric_score(&l1, &x, &y, &[], Metric::Absolute);
+        let l1_at_l2 = metric_score(&l2, &x, &y, &[], Metric::Absolute);
+        assert!(l1_at_l1 <= l1_at_l2, "{l1_at_l1} vs {l1_at_l2}");
+        assert!((l1_loss - l1_at_l1).abs() < 1e-12);
+        // The two objectives really do have different optima.
+        assert!(l1_at_l2 > 1e-3, "the fixture must be asymmetric");
+        let sse_l1 = metric_score(&l1, &x, &y, &[], Metric::Squared);
+        let sse_l2 = metric_score(&l2, &x, &y, &[], Metric::Squared);
+        assert!(sse_l2 < sse_l1, "squared should still win on its own loss");
+    }
+
+    #[test]
+    fn log_squashed_fitting_beats_squared_fitting_on_its_objective() {
+        let (x, y) = outlier_fixture();
+        let mut robust = line(0.5, 0.0);
+        let mut l2 = line(0.5, 0.0);
+        fit_weighted_metric(&mut robust, &x, &y, &[], 16, Metric::LogSquashed);
+        fit_weighted_metric(&mut l2, &x, &y, &[], 16, Metric::Squared);
+        let a = metric_score(&robust, &x, &y, &[], Metric::LogSquashed);
+        let b = metric_score(&l2, &x, &y, &[], Metric::LogSquashed);
+        assert!(a < b, "log_squashed fit {a} vs squared fit {b}");
+    }
+
+    #[test]
+    fn logistic_fitting_beats_squared_fitting_on_log_loss() {
+        let x: Vec<Vec<f64>> = (0..21)
+            .map(|i| vec![-1.0 + 2.0 * i as f64 / 20.0])
+            .collect();
+        // A deliberately soft, separable label boundary.
+        let y: Vec<f64> = x.iter().map(|r| if r[0] > 0.1 { 1.0 } else { 0.0 }).collect();
+        let mut logistic = line(0.1, 0.0);
+        let mut l2 = line(0.1, 0.0);
+        fit_weighted_metric(&mut logistic, &x, &y, &[], 16, Metric::LogLoss);
+        fit_weighted_metric(&mut l2, &x, &y, &[], 16, Metric::Squared);
+        let a = metric_score(&logistic, &x, &y, &[], Metric::LogLoss);
+        let b = metric_score(&l2, &x, &y, &[], Metric::LogLoss);
+        assert!(a < b, "logistic fit {a} vs squared fit {b}");
+        // The same fitted logit is also a better hinge classifier.
+        let hinge_a = metric_score(&logistic, &x, &y, &[], Metric::Hinge);
+        let hinge_b = metric_score(&l2, &x, &y, &[], Metric::Hinge);
+        assert!(hinge_a <= hinge_b + 1e-12);
+    }
+
+    #[test]
+    fn correlation_fitting_beats_squared_fitting_on_correlation() {
+        let (x, y) = outlier_fixture();
+        let mut corr = line(0.5, 0.0);
+        let mut l2 = line(0.5, 0.0);
+        fit_weighted_metric(&mut corr, &x, &y, &[], 12, Metric::Correlation);
+        fit_weighted_metric(&mut l2, &x, &y, &[], 12, Metric::Squared);
+        let a = metric_score(&corr, &x, &y, &[], Metric::Correlation);
+        let b = metric_score(&l2, &x, &y, &[], Metric::Correlation);
+        assert!(a < b, "correlation fit {a} vs squared fit {b}");
+    }
+
+    #[test]
+    fn l1_fit_recovers_a_clean_proportional_law() {
+        let x: Vec<Vec<f64>> = (0..21)
+            .map(|i| vec![-1.0 + 2.0 * i as f64 / 20.0])
+            .collect();
+        let y: Vec<f64> = x.iter().map(|r| r[0]).collect();
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let loss = fit_weighted_metric(&mut tree, &x, &y, &[], 8, Metric::Absolute);
+        assert!(loss < 1e-12, "loss={loss}, values={:?}", values(&tree));
+    }
+
     #[test]
     fn fit_rejects_a_length_mismatch() {
         let x = vec![vec![0.0], vec![1.0]];
@@ -1840,7 +2729,9 @@ mod tests {
                 vec![0x4004000000000000, 0x3fe6666666666666, 0x3fd3333333333333],
                 0x0000000000000000,
             ),
-            (vec![0x3ffff2bcc0928dba, 0x3feffb7033cf370d], 0x3fab860d9648079f),
+            // #117: the weighted normal equations now scale both Jacobian and
+            // residual by sqrt(w), so this is a genuinely weighted solve.
+            (vec![0x3ffff2ce37c38d91, 0x3feff88cc309f8c7], 0x3fab8577d7aab41d),
         ];
         let mut got = Vec::new();
         for (name, mut tree, x, y, w) in cases {
@@ -1850,5 +2741,196 @@ mod tests {
             got.push((c, sse.to_bits()));
         }
         assert_eq!(got, expected, "constants/SSE changed");
+    }
+
+    /// #135: `--fit-iters 0` / `--no-fit` must leave the constants exactly as
+    /// generated and perform no LM or polish step. The step counter is bumped
+    /// by every trial, so zero proves `gn_trial`/`gn_step` were never reached.
+    #[test]
+    fn zero_iters_does_not_fit_or_take_a_step() {
+        FIT_STEPS.with(|n| n.set(0));
+        let x: Vec<Vec<f64>> = (0..21).map(|i| vec![i as f64 / 5.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let before = fitted_constants(&tree);
+        let initial_sse = flat_sse(&tree, &x, &y);
+
+        let sse = fit_weighted(&mut tree, &x, &y, &[], 0);
+
+        assert_eq!(fitted_constants(&tree), before, "constants must not move");
+        assert_eq!(sse.to_bits(), initial_sse.to_bits(), "SSE must be the generated one");
+        assert_eq!(FIT_STEPS.with(|n| n.get()), 0, "no LM/polish step may run");
+
+        // The same tree with the default budget must change the constants and
+        // take steps; otherwise the counter assertion above would be vacuous.
+        let fitted = fit_weighted(&mut tree, &x, &y, &[], 8);
+        assert!(FIT_STEPS.with(|n| n.get()) > 0, "positive iters must take steps");
+        assert_ne!(fitted_constants(&tree), before, "positive iters must fit");
+        assert!(fitted < initial_sse, "positive iters must improve the SSE");
+    }
+
+    /// #116: `a*x + b` is affine in both constants and the closed-form arm
+    /// recovers the generating law to machine precision in one solve.
+    #[test]
+    fn linear_arm_recovers_an_exact_affine_law() {
+        let x: Vec<Vec<f64>> = (0..64).map(|i| vec![-2.0 + 4.0 * i as f64 / 63.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 3.0 * r[0] + 2.0).collect();
+        let mut tree = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)],
+        );
+        assert!(affine_in_constants(&flatten(&tree)));
+
+        let sse = fit_weighted_strategy(&mut tree, &x, &y, &[], 8, FitStrategy::Linear);
+        let c = fitted_constants(&tree);
+        assert!(sse < 1e-24, "an exact affine law should fit to rounding: {sse}");
+        assert!((c[0] - 3.0).abs() < 1e-12, "slope {c:?}");
+        assert!((c[1] - 2.0).abs() < 1e-12, "intercept {c:?}");
+    }
+
+    /// #116: on affine trees the closed-form objective is never worse than the
+    /// exact LM objective, and the constants agree to a pre-registered 1e-8
+    /// relative tolerance. The tolerance is deliberately loose for LM: its
+    /// undamped polish stops at a relative SSE reduction rather than solving
+    /// the linear system directly.
+    #[test]
+    fn linear_arm_agrees_with_exact_lm_on_affine_trees() {
+        let x: Vec<Vec<f64>> = (0..101)
+            .map(|i| {
+                let t = -2.0 + 4.0 * i as f64 / 100.0;
+                vec![t, (3.0 * t).sin()]
+            })
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| 0.7 * r[0] * r[0] - 1.3 * r[1] + 2.5 + 0.01 * (7.0 * r[0]).cos())
+            .collect();
+        let build = || {
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Add,
+                        vec![
+                            node(
+                                Op::Mul,
+                                vec![constant(0.3), node(Op::Square, vec![input(0)])],
+                            ),
+                            node(Op::Mul, vec![constant(0.4), input(1)]),
+                        ],
+                    ),
+                    constant(0.5),
+                ],
+            )
+        };
+
+        let mut lm = build();
+        let lm_sse = fit_weighted(&mut lm, &x, &y, &[], 40);
+        let mut qr = build();
+        let qr_sse = fit_weighted_strategy(&mut qr, &x, &y, &[], 40, FitStrategy::Auto);
+        assert!(
+            qr_sse <= lm_sse * (1.0 + 1e-12),
+            "QR {qr_sse} must not be worse than LM {lm_sse}"
+        );
+        let (a, b) = (fitted_constants(&lm), fitted_constants(&qr));
+        for (i, (&u, &v)) in a.iter().zip(&b).enumerate() {
+            let rel = (u - v).abs() / (1.0 + u.abs());
+            assert!(rel <= 1e-8, "constant {i}: LM {u} vs QR {v} (relative {rel:e})");
+        }
+    }
+
+    /// #116: a weighted affine fit ignores zero-weight rows exactly as the
+    /// exact path does, and matches the closed-form weighted solution.
+    #[test]
+    fn linear_arm_is_weighted_least_squares() {
+        let x: Vec<Vec<f64>> = (0..20).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = (0..20).map(|i| 2.0 * i as f64 + 1.0).collect();
+        // Row 19 is a gross outlier with weight zero.
+        let mut y = y;
+        y[19] = 1.0e6;
+        let mut w = vec![1.0; 20];
+        w[19] = 0.0;
+        // Row 0 and row 1 get larger weights, so the solution shifts slightly.
+        w[0] = 4.0;
+        w[1] = 9.0;
+        let mut tree = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)],
+        );
+        let sse = fit_weighted_strategy(&mut tree, &x, &y, &w, 8, FitStrategy::Linear);
+        assert!(sse.is_finite());
+        // Compute the same normal equations directly for the two-parameter model.
+        let (mut sw, mut swx, mut swxx, mut swy, mut swxy) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..20 {
+            let (xi, yi, wi) = (x[i][0], y[i], w[i]);
+            sw += wi;
+            swx += wi * xi;
+            swxx += wi * xi * xi;
+            swy += wi * yi;
+            swxy += wi * xi * yi;
+        }
+        let det = sw * swxx - swx * swx;
+        let b = (sw * swxy - swx * swy) / det;
+        let a = (swy - b * swx) / sw;
+        let c = fitted_constants(&tree);
+        assert!((c[0] - b).abs() <= 1e-10 * (1.0 + b.abs()), "slope {} vs {b}", c[0]);
+        assert!((c[1] - a).abs() <= 1e-10 * (1.0 + a.abs()), "intercept {} vs {a}", c[1]);
+    }
+
+    /// #116: nonlinear, bilinear and otherwise non-affine trees are not
+    /// classified as affine and take the exact LM path unchanged, bit for bit.
+    #[test]
+    fn non_affine_trees_fall_back_to_exact_lm_bit_for_bit() {
+        let x: Vec<Vec<f64>> = (0..41).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.7 * (0.9 * r[0]).sin() + 0.4).collect();
+        let cases = [
+            // a*sin(b*x) + c: b is nonlinear.
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![constant(0.5), node(Op::Sin, vec![node(Op::Mul, vec![constant(0.5), input(0)])])],
+                    ),
+                    constant(0.0),
+                ],
+            ),
+            // a*(b + x): bilinear in a and b.
+            node(
+                Op::Mul,
+                vec![constant(1.0), node(Op::Add, vec![constant(1.0), input(0)])],
+            ),
+            // exp(a*x): nonlinear in a.
+            node(Op::Exp, vec![node(Op::Mul, vec![constant(0.5), input(0)])]),
+        ];
+        for (i, tree) in cases.iter().enumerate() {
+            assert!(!affine_in_constants(&flatten(tree)), "case {i} must not be affine");
+            let mut lm = tree.clone();
+            let mut qr = tree.clone();
+            let a = fit_weighted(&mut lm, &x, &y, &[], 8);
+            let b = fit_weighted_strategy(&mut qr, &x, &y, &[], 8, FitStrategy::Linear);
+            assert_eq!(a.to_bits(), b.to_bits(), "case {i}: SSE changed");
+            let ca: Vec<u64> = fitted_constants(&lm).iter().map(|v| v.to_bits()).collect();
+            let cb: Vec<u64> = fitted_constants(&qr).iter().map(|v| v.to_bits()).collect();
+            assert_eq!(ca, cb, "case {i}: constants changed");
+        }
+    }
+
+    /// #116: a rank-deficient affine system (two indistinguishable constants)
+    /// cannot be solved by the linear arm; it falls back to exact LM without
+    /// touching the tree, and the result is bit-identical.
+    #[test]
+    fn rank_deficient_affine_tree_falls_back_to_exact_lm() {
+        let x: Vec<Vec<f64>> = (0..9).map(|i| vec![i as f64]).collect();
+        let y = vec![3.0, 2.8, 3.1, 2.9, 3.2, 3.0, 3.1, 2.95, 3.05];
+        let tree = node(Op::Add, vec![constant(2.0), constant(1.0)]);
+        let mut lm = tree.clone();
+        let mut linear = tree.clone();
+        let a = fit_weighted(&mut lm, &x, &y, &[], 8);
+        let b = fit_weighted_strategy(&mut linear, &x, &y, &[], 8, FitStrategy::Linear);
+        assert_eq!(a.to_bits(), b.to_bits());
+        let ca: Vec<u64> = fitted_constants(&lm).iter().map(|v| v.to_bits()).collect();
+        let cb: Vec<u64> = fitted_constants(&linear).iter().map(|v| v.to_bits()).collect();
+        assert_eq!(ca, cb);
     }
 }

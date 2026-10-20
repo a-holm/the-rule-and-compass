@@ -24,7 +24,7 @@
 use crate::column::RowSelector;
 use crate::expr::{self, Node};
 use crate::rng::Mt;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Tokens that stand for a missing cell. They are accepted in numeric columns;
 /// anything else that does not parse as a number still makes the column
@@ -227,6 +227,13 @@ impl DictColumn {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Column {
     pub values: Vec<f64>,
+    /// Exact 64-bit integer cells, for columns whose source text is integral
+    /// and whose name marks them as a time axis (`ts`, `timestamp`, ...).
+    /// Nanosecond timestamps exceed binary64's 2^53 exact range, so ordering
+    /// and round-tripping use this view, never `values`. `i64::MIN` marks a
+    /// missing cell; the evaluator still sees `values` (and so never performs
+    /// arithmetic on a time column by accident).
+    pub ints: Option<Vec<i64>>,
     pub dict: Option<DictColumn>,
 }
 
@@ -321,6 +328,11 @@ impl Table {
         self.columns.get(col).and_then(|c| c.dict.as_ref())
     }
 
+    /// Exact integer cells for a time column (see [`Column::ints`]).
+    pub fn ints(&self, col: usize) -> Option<&[i64]> {
+        self.columns.get(col).and_then(|c| c.ints.as_deref())
+    }
+
     /// Copy one row out. Hot loops use [`Table::col`] instead.
     pub fn row(&self, row: usize) -> Vec<f64> {
         self.columns.iter().map(|c| c.values.get(row).copied().unwrap_or(f64::NAN)).collect()
@@ -365,6 +377,7 @@ impl Table {
                 } else {
                     idx.iter().map(|&r| c.values[r]).collect()
                 },
+                ints: c.ints.as_ref().map(|v| idx.iter().map(|&r| v[r]).collect()),
                 dict: c.dict.as_ref().map(|d| DictColumn {
                     codes: idx.iter().map(|&r| d.codes[r]).collect(),
                     levels: d.levels.clone(),
@@ -621,6 +634,7 @@ pub fn apply_dtypes(
                         true,
                         Column {
                             values,
+                            ints: None,
                             dict: Some(DictColumn {
                                 codes,
                                 levels: vec!["1".to_string(), "0".to_string()],
@@ -726,6 +740,118 @@ fn categorical_levels(
     Ok(levels)
 }
 
+/// Shape of a delimited text table, measured without building the `Table`.
+///
+/// `parse_table_with` already scans the whole text twice (header plus column
+/// typing); this scan counts header fields and data rows so the memory guard
+/// can estimate from the table's shape rather than from file size (issue #112).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvShape {
+    /// Data rows (blank and `#` lines excluded).
+    pub rows: usize,
+    /// Header fields.
+    pub cols: usize,
+    /// The text the loader holds while parsing, in bytes.
+    pub bytes: u64,
+}
+
+/// Measure a delimited text buffer: delimiter, header width and data-row count.
+///
+/// The delimiter follows the loader (`\t` if the header contains a tab, else
+/// `,`, else whitespace). The scan allocates nothing per line.
+pub fn csv_shape(text: &str) -> CsvShape {
+    let mut cols = 0usize;
+    let mut rows = 0usize;
+    let mut header_seen = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            let d = if line.contains('\t') {
+                '\t'
+            } else if line.contains(',') {
+                ','
+            } else {
+                ' '
+            };
+            cols = if d == ' ' {
+                line.split_whitespace().count()
+            } else {
+                line.bytes().filter(|&b| b == d as u8).count() + 1
+            };
+            continue;
+        }
+        rows += 1;
+    }
+    CsvShape {
+        rows,
+        cols,
+        bytes: text.len() as u64,
+    }
+}
+
+/// Resident bytes per table cell: one `f64` value plus the `u32` code that a
+/// low-cardinality numeric or text column keeps alongside it.
+pub const CSV_TABLE_BYTES_PER_CELL: u64 = 12;
+
+/// Per-row preparation cost: `Vec` headers and selector bookkeeping for the
+/// row-major `cells`, train and test copies.
+pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 72;
+
+/// Per-row, per-used-column preparation cost: one `f64` in each of the
+/// `cells`, train and test copies, plus each row's `Vec<f64>` header.
+pub const CSV_PREP_BYTES_PER_USED_CELL: u64 = 24;
+
+/// Estimated peak resident bytes for loading and preparing a CSV (issue #112).
+///
+/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus a
+/// per-row preparation overhead and 25 % allocator slack. `used_cols` is the
+/// search's projection (variables plus targets); pass `0` when it is not known
+/// yet and the whole header width is used. The text term matters: the loader
+/// reads the whole file into one `String`, so a wide 17 GB CSV is at least
+/// 17 GB resident.
+pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    let (text, table, rows) = csv_terms(shape);
+    let cols = shape.cols.max(1) as u64;
+    let used = if used_cols == 0 {
+        cols
+    } else {
+        (used_cols as u64).min(cols)
+    };
+    let prep = rows.saturating_mul(
+        used.saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
+            .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
+    );
+    text.saturating_add(table)
+        .saturating_add(prep)
+        .saturating_mul(5)
+        / 4
+}
+
+/// Estimated peak resident bytes for reading a CSV without preparing a search
+/// sample (`rcsr import`): the text plus the resident table.
+pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+    let (text, table, _) = csv_terms(shape);
+    text.saturating_add(table).saturating_mul(5) / 4
+}
+
+/// `(text, table, rows)`; `text` is the whole-file buffer, so an unmeasured
+/// shape falls back to eight resident bytes per text byte.
+fn csv_terms(shape: CsvShape) -> (u64, u64, u64) {
+    let rows = shape.rows as u64;
+    if rows == 0 || shape.cols == 0 {
+        return (shape.bytes.saturating_mul(8), 0, 0);
+    }
+    let cols = shape.cols as u64;
+    let table = rows
+        .saturating_mul(cols)
+        .saturating_mul(CSV_TABLE_BYTES_PER_CELL);
+    (shape.bytes, table, rows)
+}
+
 pub fn read_table(path: &str) -> Result<Table, String> {
     read_table_with(path, false)
 }
@@ -733,17 +859,270 @@ pub fn read_table(path: &str) -> Result<Table, String> {
 /// Like [`read_table`], but `skip_malformed` drops ragged rows instead of
 /// refusing the file. The number dropped is kept on [`Table`].
 pub fn read_table_with(path: &str, skip_malformed: bool) -> Result<Table, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
-    parse_table_with(&text, skip_malformed)
+    parse_stream_with(
+        || {
+            std::fs::File::open(path)
+                .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn std::io::BufRead>)
+                .map_err(|e| format!("{}: {}", path, e))
+        },
+        skip_malformed,
+        None,
+    )
 }
 
-/// Split one delimited line into trimmed fields. Whitespace-delimited input
-/// collapses runs of spaces, as the loader always has.
-fn split_fields(line: &str, delim: char) -> Vec<String> {
+/// Like [`read_table_with`], with an explicit time column name whose integral
+/// cells are kept as an exact `i64` view even when the name is not time-like.
+pub fn read_table_with_time(
+    path: &str,
+    skip_malformed: bool,
+    time_col_name: Option<&str>,
+) -> Result<Table, String> {
+    parse_stream_with(
+        || {
+            std::fs::File::open(path)
+                .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn std::io::BufRead>)
+                .map_err(|e| format!("{}: {}", path, e))
+        },
+        skip_malformed,
+        time_col_name,
+    )
+}
+
+/// One logical CSV record: the fields after quote-aware splitting and the
+/// 1-based physical line on which the record starts.
+struct Record {
+    fields: Vec<String>,
+    line: usize,
+}
+
+/// True when every `"` in `s` opens a quoted region that is closed again.
+/// `""` inside a quoted region is an escaped quote, not a close.
+fn quotes_balanced(s: &str) -> bool {
+    let mut in_quotes = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes && c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            } else {
+                in_quotes = false;
+            }
+        } else if !in_quotes && c == '"' {
+            in_quotes = true;
+        }
+    }
+    !in_quotes
+}
+
+/// Split one logical record into fields, honouring RFC 4180 quoting.
+///
+/// * a delimiter inside quotes is literal;
+/// * CR/LF inside quotes is literal (the caller joins physical lines with
+///   `\n`, so a CRLF file and an LF file produce the same value);
+/// * `""` inside a quoted field is one literal `"`;
+/// * unquoted fields keep the historical trim; quoted fields are exact;
+/// * whitespace-delimited input still collapses runs of spaces.
+fn split_record(record: &str, delim: char) -> Vec<String> {
     if delim == ' ' {
-        line.split_whitespace().map(|s| s.to_string()).collect()
+        return record.split_whitespace().map(|s| s.to_string()).collect();
+    }
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut after_quote = false;
+    let mut quoted = false;
+    let mut chars = record.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                    after_quote = true;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if after_quote {
+            if c == delim {
+                fields.push(std::mem::take(&mut field));
+                after_quote = false;
+                quoted = false;
+            } else if !c.is_whitespace() {
+                // Lenient with junk after a closing quote: keep it rather than
+                // silently dropping data. (RFC 4180 calls this invalid.)
+                field.push(c);
+            }
+        } else if c == '"' && field.trim().is_empty() {
+            field.clear();
+            in_quotes = true;
+            quoted = true;
+        } else if c == delim {
+            fields.push(if quoted {
+                std::mem::take(&mut field)
+            } else {
+                field.trim().to_string()
+            });
+            field.clear();
+            quoted = false;
+        } else {
+            field.push(c);
+        }
+    }
+    fields.push(if quoted {
+        field
     } else {
-        line.split(delim).map(|s| s.trim().to_string()).collect()
+        field.trim().to_string()
+    });
+    fields
+}
+
+/// Streaming record reader: one logical record in memory at a time.
+struct CsvRecords<R: std::io::BufRead> {
+    reader: R,
+    /// 1-based number of the last physical line read.
+    line: usize,
+    /// Chosen delimiter; `None` until the header has been sniffed.
+    delim: Option<char>,
+    /// A record read during sniffing that must be returned next.
+    pending: Option<Record>,
+}
+
+impl<R: std::io::BufRead> CsvRecords<R> {
+    fn new(reader: R) -> Self {
+        CsvRecords {
+            reader,
+            line: 0,
+            delim: None,
+            pending: None,
+        }
+    }
+
+    /// Read one physical line without its `\n`/`\r\n`, advancing the line count.
+    fn physical(&mut self) -> Option<Result<String, String>> {
+        let mut bytes = Vec::new();
+        match self.reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => None,
+            Ok(_) => {
+                self.line += 1;
+                while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+                    bytes.pop();
+                }
+                match String::from_utf8(bytes) {
+                    Ok(s) => Some(Ok(s)),
+                    Err(_) => Some(Err(format!("line {}: input is not valid UTF-8", self.line))),
+                }
+            }
+            Err(e) => Some(Err(format!("line {}: read error: {}", self.line + 1, e))),
+        }
+    }
+
+    /// Read one logical record as raw text, joining physical lines while inside
+    /// quotes. Blank lines and `#` comments between records are skipped.
+    fn raw_record(&mut self) -> Option<Result<(String, usize), String>> {
+        loop {
+            let first = match self.physical()? {
+                Ok(l) => l,
+                Err(e) => return Some(Err(e)),
+            };
+            let trimmed = first.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let start = self.line;
+            let mut raw = first;
+            while !quotes_balanced(&raw) {
+                match self.physical() {
+                    Some(Ok(l)) => {
+                        raw.push('\n');
+                        raw.push_str(&l);
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {
+                        return Some(Err(format!(
+                            "line {}: unterminated quoted field (end of file inside quotes)",
+                            start
+                        )))
+                    }
+                }
+            }
+            return Some(Ok((raw, start)));
+        }
+    }
+
+    /// Pick the delimiter from the first record (and, when present, the second).
+    ///
+    /// Candidates are tab, comma and semicolon; whitespace is the fallback. A
+    /// delimiter that appears inside quotes does not count, and the second
+    /// record breaks ties (a comma file whose header quotes a tab still gets a
+    /// comma, because the counts agree for the comma and not for the tab).
+    fn sniff(first: &str, second: Option<&str>) -> char {
+        let mut best: Option<(char, usize)> = None;
+        for &cand in &['\t', ',', ';'] {
+            let n1 = split_record(first, cand).len();
+            if n1 <= 1 {
+                continue;
+            }
+            if let Some(second) = second {
+                if split_record(second, cand).len() != n1 {
+                    continue;
+                }
+            }
+            match best {
+                // `\t`, `,`, `;` in that order: ties keep the earlier one.
+                Some((_, n)) if n >= n1 => {}
+                _ => best = Some((cand, n1)),
+            }
+        }
+        best.map(|(c, _)| c).unwrap_or(' ')
+    }
+}
+
+impl<R: std::io::BufRead> Iterator for CsvRecords<R> {
+    type Item = Result<Record, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(rec) = self.pending.take() {
+            return Some(Ok(rec));
+        }
+        if self.delim.is_none() {
+            let (first, line) = match self.raw_record()? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            // Sniff with a one-record look-ahead. The look-ahead is at most one
+            // record, so this stays streaming.
+            let second = match self.raw_record() {
+                Some(Ok((raw, line))) => Some((raw, line)),
+                Some(Err(e)) => return Some(Err(e)),
+                None => None,
+            };
+            let delim = CsvRecords::<std::io::Empty>::sniff(
+                &first,
+                second.as_ref().map(|(raw, _)| raw.as_str()),
+            );
+            self.delim = Some(delim);
+            if let Some((raw, line)) = second {
+                self.pending = Some(Record {
+                    fields: split_record(&raw, delim),
+                    line,
+                });
+            }
+            return Some(Ok(Record {
+                fields: split_record(&first, delim),
+                line,
+            }));
+        }
+        let delim = self.delim.unwrap();
+        match self.raw_record()? {
+            Ok((raw, line)) => Some(Ok(Record {
+                fields: split_record(&raw, delim),
+                line,
+            })),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -761,33 +1140,61 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
 /// `skip_malformed`, rows whose field count differs from the header are
 /// dropped and counted (`Table::skipped_malformed`) instead of refused.
 pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, String> {
-    let mut header: Option<&str> = None;
-    let mut nfields = 0usize;
-    let mut delim = ',';
+    parse_stream_with(
+        || {
+            Ok(Box::new(std::io::Cursor::new(text.as_bytes()))
+                as Box<dyn std::io::BufRead + '_>)
+        },
+        skip_malformed,
+        None,
+    )
+}
+
+/// [`parse_table_with`] with an explicit time column name (for
+/// `rcsr import --time <col>`). Integral cells in that column are retained as
+/// exact `i64` values; a non-integral cell falls back to the f64-only layout.
+pub fn parse_table_with_time(
+    text: &str,
+    skip_malformed: bool,
+    time_col_name: Option<&str>,
+) -> Result<Table, String> {
+    parse_stream_with(
+        || {
+            Ok(Box::new(std::io::Cursor::new(text.as_bytes()))
+                as Box<dyn std::io::BufRead + '_>)
+        },
+        skip_malformed,
+        time_col_name,
+    )
+}
+
+/// Two streaming passes over the same source: the first fixes the width,
+/// counts ragged rows and decides each column's type; the second builds the
+/// columns. The source is reopened instead of being held in memory.
+fn parse_stream_with<'a, F>(
+    mut open: F,
+    skip_malformed: bool,
+    time_col_name: Option<&str>,
+) -> Result<Table, String>
+where
+    F: FnMut() -> Result<Box<dyn std::io::BufRead + 'a>, String>,
+{
+    // Pass 1: header, ragged rows, and numeric-vs-categorical.
+    let mut rd = CsvRecords::new(open()?);
+    let header = match rd.next() {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return Err(e),
+        None => return Err("empty input".to_string()),
+    };
+    let names = header.fields;
+    let nfields = names.len();
     let mut skipped_malformed = 0usize;
     let mut data_rows = 0usize;
-
-    // Pass 1: header and delimiter, and reject (or count) ragged rows. Only one
-    // line at a time is resident; there is no `Vec<Vec<String>>` staging copy.
-    for (i, l) in text.lines().enumerate() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if header.is_none() {
-            delim = if l.contains('\t') {
-                '\t'
-            } else if l.contains(',') {
-                ','
-            } else {
-                ' '
-            };
-            nfields = split_fields(l, delim).len();
-            header = Some(l);
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
+    let mut any = vec![false; nfields];
+    let mut all = vec![true; nfields];
+    for rec in rd {
+        let rec = rec?;
+        if rec.fields.len() != nfields {
             if skip_malformed {
                 skipped_malformed += 1;
                 continue;
@@ -795,39 +1202,13 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
             return Err(format!(
                 "line {}: expected {} field(s), found {} (ragged row; pass \
                  --skip-malformed to drop such rows instead)",
-                i + 1,
+                rec.line,
                 nfields,
-                parts.len()
+                rec.fields.len()
             ));
         }
         data_rows += 1;
-    }
-    let header = header.ok_or_else(|| "empty input".to_string())?;
-    if data_rows == 0 {
-        return Err("no data rows".to_string());
-    }
-    let names = split_fields(header, delim);
-
-    // A column is numeric when every non-missing cell parses as a number.
-    // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
-    // and become `NaN` in the numeric view.
-    let mut any = vec![false; nfields];
-    let mut all = vec![true; nfields];
-    let mut seen_header = false;
-    for l in text.lines() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if !seen_header {
-            seen_header = true;
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
-            continue; // accepted by pass 1 (skipped or none)
-        }
-        for (j, cell) in parts.iter().enumerate() {
+        for (j, cell) in rec.fields.iter().enumerate() {
             let cell = cell.trim();
             if is_missing_token(cell) {
                 continue;
@@ -838,10 +1219,22 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
             }
         }
     }
+    if data_rows == 0 {
+        return Err("no data rows".to_string());
+    }
+    // A column is numeric when every non-missing cell parses as a number.
+    // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
+    // and become `NaN` in the numeric view.
     let numeric: Vec<bool> = any.iter().zip(&all).map(|(&a, &b)| a && b).collect();
 
     // Pass 2: one contiguous `f64` block per numeric column and, where the
     // source text is worth keeping, one `u32` code per row plus a level table.
+    let mut rd = CsvRecords::new(open()?);
+    match rd.next() {
+        Some(Ok(_header)) => {}
+        Some(Err(e)) => return Err(e),
+        None => return Err("empty input".to_string()),
+    }
     let mut columns: Vec<Column> = (0..nfields).map(|_| Column::default()).collect();
     for (j, col) in columns.iter_mut().enumerate() {
         if numeric[j] {
@@ -855,21 +1248,32 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     // Once it crosses the cap the map is dropped immediately, so a large random
     // column never builds one `String` key per distinct value.
     let mut dict_live: Vec<bool> = (0..nfields).map(|_| true).collect();
-    seen_header = false;
-    for l in text.lines() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+    // A time-like column whose cells are all integers keeps an exact `i64`
+    // view alongside the `f64` evaluator view. Names are the only signal the
+    // CSV reader has before `--time` is chosen, and a false negative is safe:
+    // the column simply falls back to binary64 (the old behaviour).
+    let mut int_candidate: Vec<bool> = (0..nfields)
+        .map(|j| {
+            numeric[j]
+                && (time_name(&names[j])
+                    || time_col_name.is_some_and(|t| t == names[j]))
+        })
+        .collect();
+    let mut ints: Vec<Vec<i64>> = (0..nfields)
+        .map(|j| {
+            if int_candidate[j] {
+                Vec::with_capacity(data_rows)
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
+    for rec in rd {
+        let rec = rec?;
+        if rec.fields.len() != nfields {
+            continue; // accepted or skipped by pass 1
         }
-        if !seen_header {
-            seen_header = true;
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
-            continue;
-        }
-        for (j, cell) in parts.iter().enumerate() {
+        for (j, cell) in rec.fields.iter().enumerate() {
             let cell = cell.trim();
             if numeric[j] {
                 columns[j].values.push(if is_missing_token(cell) {
@@ -877,6 +1281,19 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
                 } else {
                     cell.parse::<f64>().unwrap_or(f64::NAN)
                 });
+                if int_candidate[j] {
+                    if is_missing_token(cell) {
+                        ints[j].push(i64::MIN);
+                    } else {
+                        match cell.parse::<i64>() {
+                            Ok(v) => ints[j].push(v),
+                            Err(_) => {
+                                int_candidate[j] = false;
+                                ints[j] = Vec::new();
+                            }
+                        }
+                    }
+                }
             }
             if !dict_live[j] {
                 continue;
@@ -902,6 +1319,9 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     }
 
     for (j, col) in columns.iter_mut().enumerate() {
+        if int_candidate[j] {
+            col.ints = Some(std::mem::take(&mut ints[j]));
+        }
         if dict_live[j] {
             col.dict = Some(DictColumn {
                 codes: std::mem::take(&mut codes[j]),
@@ -965,6 +1385,11 @@ pub struct SplitSpec {
     pub test_frac: f64,
     /// Rows dropped immediately after the train/test boundary (embargo).
     pub gap: usize,
+    /// Fraction of the training period held out as a **validation** slice,
+    /// taken chronologically from its end (issue #111). `0` disables the slice.
+    /// Model selection may read train and validation; the test block stays a
+    /// lockbox.
+    pub validation_frac: f64,
     /// Number of contiguous evaluation blocks in the test region.
     pub folds: usize,
     /// Rows where this expression is true are assigned to training (issue #3).
@@ -974,6 +1399,8 @@ pub struct SplitSpec {
     pub test_select: Option<Filter>,
     /// Rows where this expression is true are dropped before splitting (#3).
     pub exclude: Option<Filter>,
+    /// #130: how the time column is parsed.
+    pub time: TimeSpec,
 }
 
 impl Default for SplitSpec {
@@ -984,10 +1411,12 @@ impl Default for SplitSpec {
             group_col: None,
             test_frac: 0.25,
             gap: 0,
+            validation_frac: 0.0,
             folds: 1,
             train_select: None,
             test_select: None,
             exclude: None,
+            time: TimeSpec::default(),
         }
     }
 }
@@ -999,6 +1428,11 @@ pub struct SplitReport {
     pub rows_total: usize,
     pub train_rows: usize,
     pub test_rows: usize,
+    /// Rows carved out of the training period as the validation slice (#111).
+    pub validation_rows: usize,
+    /// Training rows dropped as a purge/embargo between fit-train and
+    /// validation (#111).
+    pub purged_validation_rows: usize,
     pub folds: usize,
     pub gap: usize,
     pub groups_total: usize,
@@ -1021,6 +1455,10 @@ pub struct SplitReport {
 
 pub struct Prepared {
     pub train: Sample,
+    /// Chronological validation slice carved from the end of the training
+    /// period (#111), when `SplitSpec::validation_frac > 0`. Selection may use
+    /// it; the search never fits on it.
+    pub validation: Option<Sample>,
     /// All test folds concatenated, in fold order (what the search evaluates on).
     pub test: Sample,
     /// One sample per evaluation block. With `folds == 1` this is a single
@@ -1179,8 +1617,13 @@ pub struct PrepSpec {
     /// Drop rows more than this many interquartile ranges from the column
     /// median (training rows define the bounds).
     pub outlier_iqr: Option<f64>,
-    /// Moving-average window in rows (`0` disables it).
+    /// Moving-average window in rows (`0` disables it). Trailing by default.
     pub smooth: usize,
+    /// #110: use the centred window (reads future bars). Explicit opt-in only.
+    pub smooth_centred: bool,
+    /// #110: allow `--fill interpolate` on time-ordered data (it reads the
+    /// next bar). Off by default.
+    pub allow_interpolate: bool,
     pub center: Center,
     pub scale: Scale,
     pub filter: Option<Filter>,
@@ -1196,6 +1639,8 @@ impl Default for PrepSpec {
             fill: FillMethod::None,
             outlier_iqr: None,
             smooth: 0,
+            smooth_centred: false,
+            allow_interpolate: false,
             center: Center::Mean,
             scale: Scale::Std,
             filter: None,
@@ -1222,6 +1667,17 @@ pub struct PrepReport {
     /// Data rows dropped by `--skip-malformed` because their field count did
     /// not match the header.
     pub rows_skipped_malformed: usize,
+    /// #110: smoothing window orientation (`trailing` or `centred`).
+    pub smooth_mode: &'static str,
+    /// #110: time-column hazards. Empty unit means no `--time` column.
+    pub time_unit: String,
+    pub time_rows: usize,
+    /// Rows whose numeric instant repeats an earlier row (after unit scaling).
+    pub time_duplicates: usize,
+    /// Rows where the time value decreases relative to the previous row.
+    pub time_non_monotonic: usize,
+    /// Numeric rows rescaled from ms/us/ns to seconds.
+    pub time_converted: usize,
 }
 
 impl Default for PrepReport {
@@ -1236,6 +1692,12 @@ impl Default for PrepReport {
             scale: "std",
             filtered: 0,
             rows_skipped_malformed: 0,
+            smooth_mode: "trailing",
+            time_unit: String::new(),
+            time_rows: 0,
+            time_duplicates: 0,
+            time_non_monotonic: 0,
+            time_converted: 0,
         }
     }
 }
@@ -1251,6 +1713,7 @@ impl PrepReport {
             || self.scale != "std"
             || self.filtered > 0
             || self.rows_skipped_malformed > 0
+            || self.smoothed > 0
     }
 
     /// One short, commented line per active transformation. `params` carries
@@ -1273,9 +1736,15 @@ impl PrepReport {
         }
         if smooth > 0 {
             out.push(format!(
-                "# preparation: smooth={} cells_smoothed={}",
-                smooth, self.smoothed
+                "# preparation: smooth={} mode={} cells_smoothed={}",
+                smooth, self.smooth_mode, self.smoothed
             ));
+            if self.smooth_mode == "centred" {
+                out.push(
+                    "# preparation: warning: centred smoothing reads future bars (look-ahead)"
+                        .to_string(),
+                );
+            }
         }
         if self.center != "mean" || self.scale != "std" {
             out.push(format!(
@@ -1295,24 +1764,148 @@ impl PrepReport {
                 self.rows_skipped_malformed
             ));
         }
+        if !self.time_unit.is_empty() {
+            out.push(format!(
+                "# preparation: time unit={} rows={} duplicates={} non_monotonic={} converted={}",
+                self.time_unit,
+                self.time_rows,
+                self.time_duplicates,
+                self.time_non_monotonic,
+                self.time_converted
+            ));
+            if self.time_duplicates > 0 {
+                out.push(format!(
+                    "# preparation: warning: {} duplicate time instant(s); de-duplicate by \
+                     instant before a temporal split",
+                    self.time_duplicates
+                ));
+            }
+            if self.time_non_monotonic > 0 {
+                out.push(format!(
+                    "# preparation: warning: time is not monotonic in row order ({} step(s)); \
+                     rows were ordered for the split, check the source",
+                    self.time_non_monotonic
+                ));
+            }
+        }
         out
     }
 
     /// The `preparation` object shared by `--json` and `--ndjson`.
     pub fn json(&self) -> String {
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
             self.rows_dropped_outlier,
             self.smoothed,
+            self.smooth_mode,
             self.center,
             self.scale,
             self.filtered,
-            self.rows_skipped_malformed
+            self.rows_skipped_malformed,
+            self.time_unit,
+            self.time_rows,
+            self.time_duplicates,
+            self.time_non_monotonic,
+            self.time_converted
         )
     }
+}
+
+/// #110: describe the time column without changing it: detected unit,
+/// duplicate instants (by numeric instant, so `1673343780` and
+/// `1673343780.0` collide) and non-monotonic steps in row order.
+struct TimeHazards {
+    unit: String,
+    rows: usize,
+    duplicates: usize,
+    non_monotonic: usize,
+    converted: usize,
+}
+
+fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
+    let mut out = TimeHazards {
+        unit: String::new(),
+        rows: 0,
+        duplicates: 0,
+        non_monotonic: 0,
+        converted: 0,
+    };
+    let Some(col) = spec.time_col else {
+        return out;
+    };
+    if col >= t.n_cols() {
+        return out;
+    }
+    let n = t.len();
+    let numeric = t.numeric[col];
+    let mut vals: Vec<f64> = if numeric {
+        t.col(col).to_vec()
+    } else if let Some(d) = t.dict(col) {
+        (0..n).map(|r| parse_time(d.text(r)).unwrap_or(f64::NAN)).collect()
+    } else {
+        t.col(col).to_vec()
+    };
+    out.rows = n;
+    let mut unit = "s";
+    let mut factor = 1.0;
+    if numeric {
+        let (lo, hi) = vals
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        // Same disjoint epoch windows as the strict parser in #130. Small
+        // columns are a plain index/seconds axis and keep their meaning.
+        let units = [
+            ("s", 1.0, 1.0e8, 4.2e9),
+            ("ms", 1e-3, 1.0e11, 4.2e12),
+            ("us", 1e-6, 1.0e14, 4.2e15),
+            ("ns", 1e-9, 1.0e17, 4.2e18),
+        ];
+        if lo >= 0.0 && hi < 1.0e8 {
+            // index-like
+        } else {
+            for (name, f, a, b) in units {
+                if lo >= a && hi <= b {
+                    unit = name;
+                    factor = f;
+                    break;
+                }
+            }
+        }
+        if unit != "s" {
+            out.converted = vals.iter().filter(|v| v.is_finite()).count();
+        }
+    }
+    if factor != 1.0 {
+        for v in vals.iter_mut() {
+            if v.is_finite() {
+                *v *= factor;
+            }
+        }
+    }
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut prev: Option<f64> = None;
+    for &v in &vals {
+        if !v.is_finite() {
+            continue;
+        }
+        if !seen.insert(v.to_bits()) {
+            out.duplicates += 1;
+        }
+        if let Some(p) = prev {
+            if v < p {
+                out.non_monotonic += 1;
+            }
+        }
+        prev = Some(v);
+    }
+    out.unit = unit.to_string();
+    out
 }
 
 /// Build normalised train/test samples. Returns (train, test, means, stds).
@@ -1446,6 +2039,12 @@ fn validate_weights(name: &str, w: &[f64]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+// #133: test-only count of row-major `cells` copies built by preparation.
+#[cfg(test)]
+thread_local! {
+    static CELL_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub fn prepare_full(
@@ -1604,9 +2203,6 @@ pub fn prepare_full_targets_weighted_with(
         &filtered_owned
     };
 
-    let x_raw: Vec<Vec<f64>> = (0..filtered.len())
-        .map(|r| var_idx.iter().map(|&i| filtered.col(i)[r]).collect())
-        .collect();
     // Weights follow the rows through the split; validate them on the surviving
     // population (after --exclude / --filter) rather than on discarded rows.
     let weights_raw: Option<Vec<f64>> = match weight_idx {
@@ -1618,11 +2214,62 @@ pub fn prepare_full_targets_weighted_with(
         }
         None => None,
     };
-    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng, &x_raw)?;
-    drop(x_raw);
+    let (mut train_idx, mut fold_idx, mut report) = build_split(filtered, spec, rng)?;
     report.excluded_rows = excluded_count;
     if train_idx.is_empty() {
         return Err("training split is empty (reduce --test-frac)".to_string());
+    }
+
+    // #111: carve a chronological validation slice from the **end** of the
+    // training period. Selection may use train/validation; the test block is a
+    // lockbox and never influences which candidate wins. A purge of `gap` rows
+    // stands between fit-train and validation, mirroring the test embargo.
+    let mut validation_idx: Vec<usize> = Vec::new();
+    if spec.validation_frac > 0.0 {
+        if !(spec.validation_frac < 1.0) {
+            return Err("--validation-frac must be in (0, 1)".to_string());
+        }
+        let order: Vec<usize> = if let Some(tc) = spec.time_col {
+            let keys = time_keys(filtered, tc);
+            let mut v = train_idx.clone();
+            v.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
+            v
+        } else {
+            // Without a time column the file order is the chronological order.
+            let mut v = train_idx.clone();
+            v.sort_unstable();
+            v
+        };
+        let m = order.len();
+        if m >= 2 {
+            let want = ((m as f64) * spec.validation_frac).round() as usize;
+            let vn = want.clamp(1, m - 1);
+            let cut = m - vn;
+            let gap = spec.gap.min(cut.saturating_sub(1));
+            let fit_cut = cut - gap;
+            validation_idx = order[cut..].to_vec();
+            train_idx = order[..fit_cut].to_vec();
+            report.purged_validation_rows = gap;
+            report.notes.push(format!(
+                "validation: held out the last {} of {} training row(s){}",
+                vn,
+                m,
+                if gap > 0 {
+                    format!(" after a {}-row purge between fit-train and validation", gap)
+                } else {
+                    String::new()
+                }
+            ));
+        } else {
+            report.notes.push(
+                "validation slice requested but the training period has fewer than 2 rows; \
+                 all training rows are used to fit"
+                    .to_string(),
+            );
+        }
+        if train_idx.is_empty() {
+            return Err("--validation-frac left no rows to fit on".to_string());
+        }
     }
 
     let n = filtered.len();
@@ -1630,12 +2277,50 @@ pub fn prepare_full_targets_weighted_with(
     // single-output case; issue #15 keeps all of them row-aligned here).
     let used_cols: Vec<usize> = var_idx.iter().copied().chain(tgt_idx.iter().copied()).collect();
     let nc = used_cols.len();
-    let mut cells: Vec<Vec<f64>> = (0..filtered.len())
-        .map(|r| used_cols.iter().map(|&c| filtered.value(r, c)).collect())
-        .collect();
+    // #133: a full row-major `cells` copy is only needed when a preparation
+    // stage mutates a cell (fill / outlier / smoothing). The default path
+    // (no fill, no outlier rule, no smoothing) reads the table directly, so the
+    // preparation no longer duplicates every used column before sampling.
+    let mutating = !matches!(prep.fill, FillMethod::None)
+        || prep.outlier_iqr.is_some_and(|k| k > 0.0)
+        || prep.smooth > 1;
+    #[cfg(test)]
+    if mutating {
+        CELL_COPIES.with(|n| n.set(n.get() + 1));
+    }
+    let mut cells: Option<Vec<Vec<f64>>> = if mutating {
+        Some(
+            (0..filtered.len())
+                .map(|r| used_cols.iter().map(|&c| filtered.value(r, c)).collect())
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let cell = |cells: &Option<Vec<Vec<f64>>>, r: usize, k: usize| -> f64 {
+        match cells {
+            Some(c) => c[r][k],
+            None => filtered.value(r, used_cols[k]),
+        }
+    };
     let mut keep = vec![true; n];
     let mut row_filled = vec![false; n];
     let mut rows_dropped_missing = 0usize;
+
+    // #110: interpolation reads the next bar in each side. On a time-ordered
+    // table that is look-ahead, so it needs an explicit opt-in.
+    if prep.fill == FillMethod::Interpolate
+        && !prep.allow_interpolate
+        && (spec.time_col.is_some()
+            || matches!(spec.mode, SplitMode::Temporal | SplitMode::TemporalGroup))
+    {
+        return Err(
+            "--fill interpolate reads the next bar, which is look-ahead on time-ordered \
+             data; use --fill previous or --fill drop, or pass --allow-interpolate if the \
+             rows are not a time series"
+                .to_string(),
+        );
+    }
 
     // 2. Missing values.
     match prep.fill {
@@ -1648,7 +2333,7 @@ pub fn prepare_full_targets_weighted_with(
             let mut detail: Vec<String> = Vec::new();
             let mut total = 0usize;
             for (k, &c) in used_cols.iter().enumerate() {
-                let missing = (0..n).filter(|&r| cells[r][k].is_nan()).count();
+                let missing = (0..n).filter(|&r| cell(&cells, r, k).is_nan()).count();
                 if missing > 0 {
                     total += missing;
                     let name = t
@@ -1670,7 +2355,7 @@ pub fn prepare_full_targets_weighted_with(
         }
         FillMethod::Drop => {
             for r in 0..n {
-                if (0..nc).any(|k| cells[r][k].is_nan()) {
+                if (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                     keep[r] = false;
                     rows_dropped_missing += 1;
                 }
@@ -1683,7 +2368,7 @@ pub fn prepare_full_targets_weighted_with(
                     let mut vals: Vec<f64> = train_idx
                         .iter()
                         .filter_map(|&r| {
-                            let v = cells[r][k];
+                            let v = cell(&cells, r, k);
                             if v.is_finite() {
                                 Some(v)
                             } else {
@@ -1716,6 +2401,7 @@ pub fn prepare_full_targets_weighted_with(
 
             match method {
                 FillMethod::Mean | FillMethod::Median | FillMethod::Zero => {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
                     for r in 0..n {
                         for k in 0..nc {
                             if cells[r][k].is_nan() {
@@ -1726,7 +2412,8 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Previous => {
-                    for side in split_sides(&train_idx, &fold_idx) {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
+                    for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         let mut last: Vec<Option<f64>> = vec![None; nc];
                         for &r in &side {
                             for k in 0..nc {
@@ -1743,7 +2430,8 @@ pub fn prepare_full_targets_weighted_with(
                     }
                 }
                 FillMethod::Interpolate => {
-                    for side in split_sides(&train_idx, &fold_idx) {
+                    let cells = cells.as_mut().expect("fill requires a mutable copy");
+                    for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
                         for k in 0..nc {
                             let mut p = 0usize;
                             while p < side.len() {
@@ -1780,7 +2468,7 @@ pub fn prepare_full_targets_weighted_with(
     // it is dropped rather than silently passed to the search.
     if !matches!(prep.fill, FillMethod::None | FillMethod::Drop) {
         for r in 0..n {
-            if keep[r] && (0..nc).any(|k| cells[r][k].is_nan()) {
+            if keep[r] && (0..nc).any(|k| cell(&cells, r, k).is_nan()) {
                 keep[r] = false;
                 rows_dropped_missing += 1;
             }
@@ -1800,7 +2488,7 @@ pub fn prepare_full_targets_weighted_with(
             if !keep[r] {
                 continue;
             }
-            let v = cells[r][j];
+            let v = cell(&cells, r, j);
             if !(v == 0.0 || v == 1.0) {
                 let name = t
                     .names
@@ -1828,7 +2516,7 @@ pub fn prepare_full_targets_weighted_with(
                 let mut vals: Vec<f64> = train_idx
                     .iter()
                     .filter_map(|&r| {
-                        let v = cells[r][col];
+                        let v = cell(&cells, r, col);
                         if keep[r] && v.is_finite() {
                             Some(v)
                         } else {
@@ -1849,7 +2537,7 @@ pub fn prepare_full_targets_weighted_with(
                     continue;
                 }
                 let out = (0..nc).any(|c| {
-                    let v = cells[r][c];
+                    let v = cell(&cells, r, c);
                     v.is_finite() && (v < bounds[c].0 || v > bounds[c].1)
                 });
                 if out {
@@ -1864,7 +2552,7 @@ pub fn prepare_full_targets_weighted_with(
     // value (and vice versa).
     let mut smoothed = 0usize;
     if prep.smooth > 1 {
-        for side in split_sides(&train_idx, &fold_idx) {
+        for side in split_sides(&train_idx, &fold_idx, &validation_idx) {
             let side: Vec<usize> = side.into_iter().filter(|&r| keep[r]).collect();
             for col in 0..nc {
                 // Smoothing a 0/1 column would create fractions and break the
@@ -1873,13 +2561,21 @@ pub fn prepare_full_targets_weighted_with(
                 if col < nv && dtype_at(col) == DType::Boolean {
                     continue;
                 }
-                smoothed += smooth_cells(&mut cells, &side, col, prep.smooth);
+                let cells_mut = cells.as_mut().expect("smoothing requires a mutable copy");
+                smoothed += smooth_cells(
+                    cells_mut,
+                    &side,
+                    col,
+                    prep.smooth,
+                    prep.smooth_centred,
+                );
             }
         }
     }
 
     // Rows dropped by preparation leave both the training and test sets.
     train_idx.retain(|&i| keep[i]);
+    validation_idx.retain(|&i| keep[i]);
     for f in fold_idx.iter_mut() {
         f.retain(|&i| keep[i]);
     }
@@ -1888,6 +2584,7 @@ pub fn prepare_full_targets_weighted_with(
         return Err("preparation removed every training row".to_string());
     }
     report.train_rows = train_idx.len();
+    report.validation_rows = validation_idx.len();
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len().max(1);
 
@@ -1908,12 +2605,21 @@ pub fn prepare_full_targets_weighted_with(
             stds[j] = 1.0;
             continue;
         }
-        let vals: Vec<f64> = train_idx.iter().map(|&i| cells[i][j]).collect();
+        let vals: Vec<f64> = train_idx.iter().map(|&i| cell(&cells, i, j)).collect();
         let m = vals.iter().sum::<f64>() / vals.len() as f64;
         let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
         let s = var.sqrt();
-        let mut sorted = vals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // #133: median/min/max/IQR/range are the only modes that read an
+        // ordered copy. The default mean/std path never clones or sorts.
+        let need_sorted = !matches!(prep.center, Center::Mean | Center::None)
+            || !matches!(prep.scale, Scale::Std | Scale::None);
+        let sorted = if need_sorted {
+            let mut sorted = vals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            sorted
+        } else {
+            Vec::new()
+        };
         means[j] = match prep.center {
             Center::Mean => m,
             Center::Median => quantile(&sorted, 0.5),
@@ -1932,19 +2638,21 @@ pub fn prepare_full_targets_weighted_with(
 
     let make = |idx: &[usize]| -> Sample {
         let mut s = Sample::default();
+        s.x.reserve(idx.len());
+        s.y.reserve(idx.len());
         for &i in idx {
-            s.x.push(
-                (0..nv)
-                    .map(|j| (cells[i][j] - means[j]) / stds[j])
-                    .collect(),
-            );
+            let mut row = Vec::with_capacity(nv);
+            for j in 0..nv {
+                row.push((cell(&cells, i, j) - means[j]) / stds[j]);
+            }
+            s.x.push(row);
             // Target 0 lives in `y`; a multi-output sample also keeps every
             // target (including the first) in `ys` (issue #15).
-            s.y.push(cells[i][nv]);
+            s.y.push(cell(&cells, i, nv));
         }
         if nt > 1 {
             s.ys = (0..nt)
-                .map(|j| idx.iter().map(|&i| cells[i][nv + j]).collect())
+                .map(|j| idx.iter().map(|&i| cell(&cells, i, nv + j)).collect())
                 .collect();
         }
         if let Some(w) = &weights_raw {
@@ -1954,6 +2662,11 @@ pub fn prepare_full_targets_weighted_with(
     };
 
     let train = make(&train_idx);
+    let validation = if validation_idx.is_empty() {
+        None
+    } else {
+        Some(make(&validation_idx))
+    };
     if let (Some(w), Some(name)) = (&weights_raw, weight) {
         let positive = train_idx.iter().filter(|&&i| w[i] > 0.0).count();
         if positive == 0 {
@@ -1979,8 +2692,10 @@ pub fn prepare_full_targets_weighted_with(
         }
     }
 
+    let hazards = time_hazards(t, spec);
     Ok(Prepared {
         train,
+        validation,
         test,
         fold_samples,
         means,
@@ -1996,6 +2711,12 @@ pub fn prepare_full_targets_weighted_with(
             scale: prep.scale.name(),
             filtered: filtered_count,
             rows_skipped_malformed: t.skipped_malformed,
+            smooth_mode: if prep.smooth_centred { "centred" } else { "trailing" },
+            time_unit: hazards.unit,
+            time_rows: hazards.rows,
+            time_duplicates: hazards.duplicates,
+            time_non_monotonic: hazards.non_monotonic,
+            time_converted: hazards.converted,
         },
     })
 }
@@ -2058,11 +2779,22 @@ fn quantile(sorted: &[f64], p: f64) -> f64 {
 
 /// The training and test rows in table order, for operations that walk a
 /// column sequentially. Working per side is what keeps them leak-free.
-fn split_sides(train: &[usize], folds: &[Vec<usize>]) -> Vec<Vec<usize>> {
+fn split_sides(
+    train: &[usize],
+    folds: &[Vec<usize>],
+    validation: &[usize],
+) -> Vec<Vec<usize>> {
     let mut sides = Vec::new();
     let mut tr = train.to_vec();
     tr.sort_unstable();
     sides.push(tr);
+    // Validation is its own side: a forward fill or smoother must not read
+    // across the fit-train/validation boundary either (#111).
+    let mut va = validation.to_vec();
+    va.sort_unstable();
+    if !va.is_empty() {
+        sides.push(va);
+    }
     let mut te: Vec<usize> = folds.iter().flatten().copied().collect();
     te.sort_unstable();
     te.dedup();
@@ -2070,15 +2802,25 @@ fn split_sides(train: &[usize], folds: &[Vec<usize>]) -> Vec<Vec<usize>> {
     sides
 }
 
-/// Moving average over a `k`-wide window, centred on each value and shrinking at
-/// the edges of `side`. Missing cells are skipped; a cell with no observed
-/// neighbours is left missing. Returns the number of cells replaced.
-fn smooth_cells(cells: &mut [Vec<f64>], side: &[usize], col: usize, k: usize) -> usize {
+/// Moving average over a `k`-wide window, shrinking at the edges of `side`.
+///
+/// #110: the default window is **trailing** (`p-k+1 ..= p`), so a row only
+/// reads its own and earlier bars. `centred` keeps the old `p-k/2 ..= p+k/2`
+/// behaviour and therefore reads future bars; it is an explicit opt-in.
+/// Missing cells are skipped; a cell with no observed neighbours is left
+/// missing. Returns the number of cells replaced.
+fn smooth_cells(
+    cells: &mut [Vec<f64>],
+    side: &[usize],
+    col: usize,
+    k: usize,
+    centred: bool,
+) -> usize {
     if side.is_empty() || k < 2 {
         return 0;
     }
-    let before = k / 2;
-    let after = k - before - 1;
+    let before = if centred { k / 2 } else { k - 1 };
+    let after = if centred { k - 1 - k / 2 } else { 0 };
     let orig: Vec<f64> = side.iter().map(|&r| cells[r][col]).collect();
     let mut count = 0usize;
     for p in 0..side.len() {
@@ -2348,7 +3090,6 @@ fn build_split(
     t: &Table,
     spec: &SplitSpec,
     rng: &mut Mt,
-    x_raw: &[Vec<f64>],
 ) -> Result<(Vec<usize>, Vec<Vec<usize>>, SplitReport), String> {
     let n = t.len();
     let folds = spec.folds.max(1);
@@ -2473,17 +3214,19 @@ fn build_split(
             let time_col = spec
                 .time_col
                 .ok_or("temporal split needs a time column (--time <col>)")?;
-            let keys = time_keys(t, time_col);
+            let (keys_f64, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let keys = TimeKeys::F64(keys_f64);
+            report.notes.extend(trep.text_lines());
             let order = sorted_by(&keys);
             match split_ordered(&order, spec, folds) {
                 Some((tr, folds_idx)) => {
                     report.train_time_max = order
                         .get(tr.len().saturating_sub(1))
-                        .map(|&i| keys[i]);
+                        .map(|&i| keys.value(i));
                     report.test_time_min = folds_idx
                         .iter()
                         .flatten()
-                        .map(|&i| keys[i])
+                        .map(|&i| keys.value(i))
                         .fold(None, |acc: Option<f64>, v| {
                             Some(acc.map_or(v, |a| a.min(v)))
                         });
@@ -2557,7 +3300,9 @@ fn build_split(
             let group_col = spec
                 .group_col
                 .ok_or("temporal-group split needs a group column (--group-by <col>)")?;
-            let keys = time_keys(t, time_col);
+            let (keys_f64, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let keys = TimeKeys::F64(keys_f64);
+            report.notes.extend(trep.text_lines());
             let (ids, names) = group_ids(t, group_col);
             report.groups_total = names.len();
             let mut train: Vec<usize> = Vec::new();
@@ -2566,9 +3311,7 @@ fn build_split(
             for g in 0..names.len() {
                 let mut rows: Vec<usize> = (0..n).filter(|&i| ids[i] == g).collect();
                 rows.sort_by(|&a, &b| {
-                    keys[a]
-                        .partial_cmp(&keys[b])
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    keys.cmp(a, b).then(a.cmp(&b))
                 });
                 match split_ordered(&rows, spec, folds) {
                     Some((tr, folds_idx)) => {
@@ -2604,7 +3347,6 @@ fn build_split(
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len();
     report.notes = notes;
-    let _ = x_raw;
     let all_folds: Vec<usize> = fold_idx.iter().flatten().copied().collect();
     report.selector = describe_selector(n, &train, &all_folds);
     Ok((train, fold_idx, report))
@@ -2645,33 +3387,103 @@ fn split_blocks(idx: &[usize], folds: usize) -> Vec<Vec<usize>> {
     out
 }
 
-fn sorted_by(keys: &[f64]) -> Vec<usize> {
+/// Comparable ordering keys for a time column: exact `i64` when the table
+/// carries one (nanosecond-safe), otherwise the historical `f64` seconds.
+#[derive(Clone, Debug)]
+pub enum TimeKeys {
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+}
+
+impl TimeKeys {
+    pub fn len(&self) -> usize {
+        match self {
+            TimeKeys::I64(v) => v.len(),
+            TimeKeys::F64(v) => v.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Total order with a row-stable tie break applied by the caller. A gap
+    /// (`i64::MIN`) sorts last, matching the old `NaN -> +inf` rule.
+    fn cmp(&self, a: usize, b: usize) -> std::cmp::Ordering {
+        match self {
+            TimeKeys::I64(v) => {
+                let key = |i: i64| if i == i64::MIN { i64::MAX } else { i };
+                key(v[a]).cmp(&key(v[b]))
+            }
+            TimeKeys::F64(v) => v[a]
+                .partial_cmp(&v[b])
+                .unwrap_or(std::cmp::Ordering::Equal),
+        }
+    }
+
+    /// Display form for split reports (seconds or raw ticks, whichever unit the
+    /// source used). Precision beyond binary64 is not claimed here.
+    pub fn value(&self, i: usize) -> f64 {
+        match self {
+            TimeKeys::I64(v) => {
+                if v[i] == i64::MIN {
+                    f64::INFINITY
+                } else {
+                    v[i] as f64
+                }
+            }
+            TimeKeys::F64(v) => v[i],
+        }
+    }
+
+    /// Materialise the ordering key as f64 for consumers that only need a
+    /// monotone time axis (values beyond 2^53 are approximate, as documented).
+    pub fn to_f64(&self) -> Vec<f64> {
+        (0..self.len()).map(|i| self.value(i)).collect()
+    }
+
+    fn difference(&self, a: usize, b: usize) -> f64 {
+        match self {
+            TimeKeys::I64(v) => {
+                if v[a] == i64::MIN || v[b] == i64::MIN {
+                    f64::INFINITY
+                } else {
+                    v[b].saturating_sub(v[a]) as f64
+                }
+            }
+            TimeKeys::F64(v) => v[b] - v[a],
+        }
+    }
+}
+
+fn sorted_by(keys: &TimeKeys) -> Vec<usize> {
     let mut order: Vec<usize> = (0..keys.len()).collect();
-    order.sort_by(|&a, &b| {
-        keys[a]
-            .partial_cmp(&keys[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
-    });
+    order.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
     order
 }
 
 /// Comparable ordering key for every row of a time column.
 ///
-/// Numbers and dates are parsed to seconds; if any value cannot be parsed the
-/// whole column falls back to lexicographic order, which is still a valid total
-/// order (and the right one for zero-padded `YYYY-MM-DD`).
-pub fn time_keys(t: &Table, col: usize) -> Vec<f64> {
+/// Integers are used exactly when the table has an `i64` view (a time-like
+/// column parsed from integral text or loaded from an i64 store block), so
+/// two nanosecond prints 1 ns apart stay distinct. Otherwise numbers and dates
+/// are parsed to seconds; if any value cannot be parsed the whole column falls
+/// back to lexicographic order, which is still a valid total order (and the
+/// right one for zero-padded `YYYY-MM-DD`).
+pub fn time_keys(t: &Table, col: usize) -> TimeKeys {
     let n = t.len();
+    if let Some(ints) = t.ints(col) {
+        return TimeKeys::I64(ints.to_vec());
+    }
     // A numeric column without gaps is already in seconds: parsing its text
     // would only round-trip the same `f64`.
     if t.numeric[col] && !t.col(col).iter().any(|v| v.is_nan()) {
-        return t.col(col).to_vec();
+        return TimeKeys::F64(t.col(col).to_vec());
     }
     if let Some(d) = t.dict(col) {
         let parsed: Option<Vec<f64>> = (0..n).map(|r| parse_time(d.text(r))).collect();
         if let Some(v) = parsed {
-            return v;
+            return TimeKeys::F64(v);
         }
         let mut pairs: Vec<(String, usize)> = (0..n)
             .map(|r| (d.text(r).trim().to_string(), r))
@@ -2681,18 +3493,413 @@ pub fn time_keys(t: &Table, col: usize) -> Vec<f64> {
         for (rank, (_s, r)) in pairs.into_iter().enumerate() {
             key[r] = rank as f64;
         }
-        return key;
+        return TimeKeys::F64(key);
     }
     // High-cardinality numeric column with missing cells: compare the values
     // directly and sort gaps last.
-    t.col(col)
-        .iter()
-        .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
-        .collect()
+    TimeKeys::F64(
+        t.col(col)
+            .iter()
+            .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
+            .collect(),
+    )
 }
 
-/// Parse a timestamp to seconds: accepts plain numbers, `YYYY-MM-DD`,
-/// `YYYY/MM/DD` and an optional `T`/space separated `HH:MM[:SS]`.
+// ---------------------------------------------------------------------------
+// #130: strict time parsing
+// ---------------------------------------------------------------------------
+
+/// What to do with a date-only value (`2024-01-02`, no clock).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DateOnlyPolicy {
+    /// Refuse the file: the instant is under-specified. The default.
+    Error,
+    /// The value means 00:00:00 UTC.
+    UtcMidnight,
+    /// The value means the session close, 21:00 UTC (16:00 New York, EST).
+    SessionClose,
+}
+
+impl DateOnlyPolicy {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "error" => Ok(DateOnlyPolicy::Error),
+            "utc-midnight" => Ok(DateOnlyPolicy::UtcMidnight),
+            "session-close" => Ok(DateOnlyPolicy::SessionClose),
+            other => Err(format!(
+                "unknown --date-only policy '{}' (expected error, utc-midnight or session-close)",
+                other
+            )),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            DateOnlyPolicy::Error => "error",
+            DateOnlyPolicy::UtcMidnight => "utc-midnight",
+            DateOnlyPolicy::SessionClose => "session-close",
+        }
+    }
+}
+
+/// Unit of a numeric time column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimeUnit {
+    Seconds,
+    Millis,
+    Micros,
+    Nanos,
+}
+
+impl TimeUnit {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "s" | "sec" | "seconds" => Ok(TimeUnit::Seconds),
+            "ms" | "millis" | "milliseconds" => Ok(TimeUnit::Millis),
+            "us" | "µs" | "micros" | "microseconds" => Ok(TimeUnit::Micros),
+            "ns" | "nanos" | "nanoseconds" => Ok(TimeUnit::Nanos),
+            other => Err(format!(
+                "unknown --time-unit '{}' (expected s, ms, us or ns)",
+                other
+            )),
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            TimeUnit::Seconds => "s",
+            TimeUnit::Millis => "ms",
+            TimeUnit::Micros => "us",
+            TimeUnit::Nanos => "ns",
+        }
+    }
+    /// Multiplier from this unit to seconds.
+    fn to_seconds(self) -> f64 {
+        match self {
+            TimeUnit::Seconds => 1.0,
+            TimeUnit::Millis => 1e-3,
+            TimeUnit::Micros => 1e-6,
+            TimeUnit::Nanos => 1e-9,
+        }
+    }
+}
+
+/// How to interpret a time column. The defaults are deliberately strict:
+/// date-only values are an error and bare clock times are reported as UTC.
+#[derive(Clone, Copy, Debug)]
+pub struct TimeSpec {
+    pub date_only: DateOnlyPolicy,
+    /// Explicit unit for numeric columns; `None` auto-detects.
+    pub unit: Option<TimeUnit>,
+    /// Fixed UTC offset in seconds for timestamps without their own offset.
+    /// `None` means UTC (and is reported, never silent).
+    pub tz: Option<i64>,
+}
+
+impl Default for TimeSpec {
+    fn default() -> Self {
+        TimeSpec {
+            date_only: DateOnlyPolicy::Error,
+            unit: None,
+            tz: None,
+        }
+    }
+}
+
+impl TimeSpec {
+    /// Parse `--tz`: `UTC`/`Z` or a fixed offset such as `+02:00`, `-0500`.
+    ///
+    /// Named zones need a tz database (and DST rules); std has none, so they
+    /// are refused with a suggestion rather than guessed.
+    pub fn parse_tz(s: &str) -> Result<i64, String> {
+        let t = s.trim();
+        if t.eq_ignore_ascii_case("utc") || t.eq_ignore_ascii_case("z") || t == "+00:00" {
+            return Ok(0);
+        }
+        let (sign, rest) = match t.as_bytes().first() {
+            Some(b'+') => (1i64, &t[1..]),
+            Some(b'-') => (-1i64, &t[1..]),
+            _ => {
+                return Err(format!(
+                    "--tz '{}': named time zones need a tz database; pass a fixed offset \
+                     such as --tz -05:00 (or UTC)",
+                    s
+                ))
+            }
+        };
+        let digits: String = rest.chars().filter(|c| *c != ':').collect();
+        if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_digit()) {
+            return Err(format!(
+                "--tz '{}': expected a fixed offset such as -05:00 or +0530",
+                s
+            ));
+        }
+        let hh: i64 = digits[0..2].parse().unwrap_or(99);
+        let mm: i64 = digits[2..4].parse().unwrap_or(99);
+        if hh > 23 || mm > 59 {
+            return Err(format!("--tz '{}': offset out of range", s));
+        }
+        Ok(sign * (hh * 3600 + mm * 60))
+    }
+}
+
+/// What a time column contained and how it was converted, for the preparation
+/// block and the split notes.
+#[derive(Clone, Debug, Default)]
+pub struct TimeReport {
+    pub format: String,
+    pub unit: String,
+    pub date_only: String,
+    pub rows: usize,
+    /// Rows that carried their own UTC offset.
+    pub offset_rows: usize,
+    /// Numeric rows rescaled from ms/us/ns to seconds.
+    pub scaled_rows: usize,
+    pub notes: Vec<String>,
+}
+
+impl TimeReport {
+    pub fn text_lines(&self) -> Vec<String> {
+        let mut out = vec![format!(
+            "# time: format={} unit={} date-only={} offset_rows={} scaled_rows={}",
+            self.format, self.unit, self.date_only, self.offset_rows, self.scaled_rows
+        )];
+        out.extend(self.notes.iter().map(|n| format!("# time: {}", n)));
+        out
+    }
+
+    pub fn json(&self) -> String {
+        format!(
+            "{{\"format\":\"{}\",\"unit\":\"{}\",\"date_only\":\"{}\",\"rows\":{},\"offset_rows\":{},\"scaled_rows\":{},\"notes\":{}}}",
+            self.format,
+            self.unit,
+            self.date_only,
+            self.rows,
+            self.offset_rows,
+            self.scaled_rows,
+            json_note_array(&self.notes)
+        )
+    }
+}
+
+fn json_note_array(notes: &[String]) -> String {
+    let items: Vec<String> = notes
+        .iter()
+        .map(|n| format!("\"{}\"", n.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
+/// Numeric unit windows: the converted instant must land between 1973 and
+/// 2103. The windows are disjoint by a factor of 1000, so realistic data is
+/// unambiguous; tiny values (row indices) are handled separately.
+const EPOCH_MIN_SECS: f64 = 1.0e8;
+const EPOCH_MAX_SECS: f64 = 4.2e9;
+
+fn unit_fits(vmin: f64, vmax: f64, unit: TimeUnit) -> bool {
+    let inv = 1.0 / unit.to_seconds();
+    let lo = EPOCH_MIN_SECS * inv;
+    let hi = EPOCH_MAX_SECS * inv;
+    vmin >= lo && vmax <= hi
+}
+
+fn detect_time_unit(values: &[f64], spec: &TimeSpec) -> Result<(TimeUnit, usize), String> {
+    let mut vmin = f64::INFINITY;
+    let mut vmax = f64::NEG_INFINITY;
+    let mut finite = 0usize;
+    for &v in values {
+        if v.is_finite() {
+            finite += 1;
+            vmin = vmin.min(v);
+            vmax = vmax.max(v);
+        }
+    }
+    if finite == 0 {
+        return Err("time column has no finite values".to_string());
+    }
+    if let Some(u) = spec.unit {
+        return Ok((u, finite));
+    }
+    // Row-index-like columns: too small to be an epoch in any unit. Keep the
+    // historical meaning (seconds) so synthetic integer time axes are
+    // unchanged.
+    if vmin >= 0.0 && vmax < EPOCH_MIN_SECS {
+        return Ok((TimeUnit::Seconds, 0));
+    }
+    let fits: Vec<TimeUnit> = [TimeUnit::Seconds, TimeUnit::Millis, TimeUnit::Micros, TimeUnit::Nanos]
+        .into_iter()
+        .filter(|&u| unit_fits(vmin, vmax, u))
+        .collect();
+    match fits.as_slice() {
+        [one] => Ok((*one, if *one == TimeUnit::Seconds { 0 } else { finite })),
+        [] => Err(format!(
+            "numeric time column spans [{} ..= {}] and fits no single epoch unit \
+             (s/ms/us/ns); pass --time-unit s|ms|us|ns if you know the unit",
+            vmin, vmax
+        )),
+        many => Err(format!(
+            "numeric time column is ambiguous: it fits {} units ({}); pass --time-unit \
+             s|ms|us|ns",
+            many.len(),
+            many.iter().map(|u| u.name()).collect::<Vec<_>>().join(", ")
+        )),
+    }
+}
+
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+struct ParsedTime {
+    secs: f64,
+    /// Comparable signature of the syntactic form: separator, date-only vs
+    /// date-time, and whether the value carried an offset.
+    signature: String,
+    has_offset: bool,
+    date_only: bool,
+}
+
+/// Parse one strict ISO 8601 / RFC 3339 value.
+fn parse_iso(s: &str, spec: &TimeSpec) -> Result<ParsedTime, String> {
+    let (date, clock) = match s.split_once(['T', ' ']) {
+        Some((d, c)) => (d, Some(c.trim())),
+        None => (s, None),
+    };
+    if date.is_empty() {
+        return Err(format!("'{}' has no date", s));
+    }
+    let sep = if date.contains('/') {
+        '/'
+    } else {
+        '-'
+    };
+    let parts: Vec<&str> = date.split(sep).collect();
+    if parts.len() != 3 || parts.iter().any(|p| p.is_empty()) {
+        return Err(format!(
+            "'{}': expected YYYY-MM-DD (or YYYY/MM/DD){}",
+            s,
+            if clock.is_some() { " with an optional clock" } else { "" }
+        ));
+    }
+    let y: i64 = parts[0]
+        .parse()
+        .map_err(|_| format!("'{}': bad year '{}'", s, parts[0]))?;
+    let mo: i64 = parts[1]
+        .parse()
+        .map_err(|_| format!("'{}': bad month '{}'", s, parts[1]))?;
+    let d: i64 = parts[2]
+        .parse()
+        .map_err(|_| format!("'{}': bad day '{}'", s, parts[2]))?;
+    if !(1..=12).contains(&mo) {
+        return Err(format!("'{}': month {} is out of range", s, mo));
+    }
+    if d < 1 || d > days_in_month(y, mo) {
+        return Err(format!("'{}': day {} is out of range for {}-{:02}", s, d, y, mo));
+    }
+    let mut secs = days_from_civil(y, mo, d) as f64 * 86400.0;
+    let mut has_offset = false;
+    let mut has_clock = false;
+    if let Some(mut c) = clock {
+        if c.is_empty() {
+            return Err(format!("'{}': empty clock after T/space", s));
+        }
+        has_clock = true;
+        let mut offset = 0i64;
+        if c.ends_with('Z') || c.ends_with('z') {
+            has_offset = true;
+            c = &c[..c.len() - 1];
+        } else if let Some(pos) = c.rfind(['+', '-']) {
+            if pos > 0 {
+                has_offset = true;
+                let sign = if c.as_bytes()[pos] == b'-' { -1 } else { 1 };
+                let off = &c[pos + 1..];
+                let digits: String = off.chars().filter(|ch| *ch != ':').collect();
+                if digits.len() != 4 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+                    return Err(format!("'{}': bad UTC offset '+{}'", s, &c[pos..]));
+                }
+                let oh: i64 = digits[0..2].parse().unwrap_or(99);
+                let om: i64 = digits[2..4].parse().unwrap_or(99);
+                if oh > 23 || om > 59 {
+                    return Err(format!("'{}': UTC offset out of range", s));
+                }
+                offset = sign * (oh * 3600 + om * 60);
+                c = &c[..pos];
+            }
+        }
+        let tp: Vec<&str> = c.split(':').collect();
+        if tp.len() < 2 || tp.len() > 3 {
+            return Err(format!("'{}': expected HH:MM[:SS[.fff]]", s));
+        }
+        let hh: i64 = tp[0]
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{}': bad hour '{}'", s, tp[0]))?;
+        let mm: i64 = tp[1]
+            .trim()
+            .parse()
+            .map_err(|_| format!("'{}': bad minute '{}'", s, tp[1]))?;
+        let ss: f64 = if tp.len() == 3 {
+            tp[2]
+                .trim()
+                .parse()
+                .map_err(|_| format!("'{}': bad second '{}'", s, tp[2]))?
+        } else {
+            0.0
+        };
+        if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0.0..61.0).contains(&ss) {
+            return Err(format!("'{}': clock component out of range", s));
+        }
+        secs += hh as f64 * 3600.0 + mm as f64 * 60.0 + ss;
+        // An explicit offset converts to UTC. Without one, use --tz or UTC;
+        // the caller records which assumption was used.
+        let applied = if has_offset {
+            offset
+        } else {
+            spec.tz.unwrap_or(0)
+        };
+        secs -= applied as f64;
+    } else {
+        match spec.date_only {
+            DateOnlyPolicy::Error => {
+                return Err(format!(
+                    "'{}' is date-only: its instant is under-specified. Pass \
+                     --date-only utc-midnight or --date-only session-close",
+                    s
+                ))
+            }
+            DateOnlyPolicy::UtcMidnight => {}
+            DateOnlyPolicy::SessionClose => secs += 21.0 * 3600.0,
+        }
+    }
+    // Widths catch the `2024-1-2` vs `2024-01-02` mix that a purely
+    // lexicographic fallback would order wrongly. Offsets are compared
+    // separately: with --tz a mixed offset/plain column is allowed.
+    let signature = format!(
+        "{}{}{}{}",
+        sep,
+        has_clock,
+        parts[1].len(),
+        parts[2].len()
+    );
+    Ok(ParsedTime {
+        secs,
+        signature,
+        has_offset,
+        date_only: !has_clock,
+    })
+}
+
+/// Parse a timestamp to seconds with the strictest defaults.
+///
+/// Accepts plain numbers (returned unchanged), `YYYY-MM-DD` (as UTC midnight,
+/// for backwards compatibility of this helper), `YYYY/MM/DD` and an optional
+/// `T`/space separated `HH:MM[:SS[.fff]]` with `Z` or `±HH:MM` offsets.
+/// [`time_keys_with`] is the column-level entry point and enforces the
+/// date-only policy.
 pub fn parse_time(s: &str) -> Option<f64> {
     let s = s.trim();
     if s.is_empty() {
@@ -2701,33 +3908,146 @@ pub fn parse_time(s: &str) -> Option<f64> {
     if let Ok(v) = s.parse::<f64>() {
         return Some(v);
     }
-    let (date, clock) = match s.split_once(['T', ' ']) {
-        Some((d, c)) => (d, Some(c)),
-        None => (s, None),
+    let spec = TimeSpec {
+        date_only: DateOnlyPolicy::UtcMidnight,
+        ..Default::default()
     };
-    let norm: String = date
-        .chars()
-        .map(|c| if c == '/' { '-' } else { c })
-        .collect();
-    let parts: Vec<&str> = norm.split('-').collect();
-    if parts.len() != 3 {
-        return None;
+    parse_iso(s, &spec).ok().map(|p| p.secs)
+}
+
+/// Comparable ordering keys for a time column, with an explicit [`TimeSpec`].
+///
+/// Numeric columns are unit-detected (s/ms/us/ns) and normalised to seconds;
+/// ISO 8601 columns are offset-aware and must share one format (and one
+/// offset convention unless `--tz` overrides). Every conversion and assumption
+/// is returned in [`TimeReport`].
+pub fn time_keys_with(
+    t: &Table,
+    col: usize,
+    spec: &TimeSpec,
+) -> Result<(Vec<f64>, TimeReport), String> {
+    let n = t.len();
+    let mut report = TimeReport {
+        date_only: spec.date_only.name().to_string(),
+        ..Default::default()
+    };
+    // A full numeric column: detect and normalise its unit. A high-cardinality
+    // numeric column with missing cells takes the same path (NaN is a gap).
+    if t.numeric[col] || t.dict(col).is_none() {
+        let values = t.col(col);
+        let (unit, scaled) = detect_time_unit(values, spec)?;
+        let factor = unit.to_seconds();
+        let keys: Vec<f64> = values
+            .iter()
+            .map(|&v| {
+                if v.is_nan() {
+                    f64::INFINITY
+                } else {
+                    v * factor
+                }
+            })
+            .collect();
+        report.format = "numeric".to_string();
+        report.unit = unit.name().to_string();
+        report.rows = n;
+        report.scaled_rows = scaled;
+        if scaled > 0 {
+            report.notes.push(format!(
+                "numeric time column read as {} and scaled to seconds ({} row(s))",
+                unit.name(),
+                scaled
+            ));
+        } else {
+            report
+                .notes
+                .push(format!("numeric time column read as {}", unit.name()));
+        }
+        return Ok((keys, report));
     }
-    let y: i64 = parts[0].parse().ok()?;
-    let mo: i64 = parts[1].parse().ok()?;
-    let d: i64 = parts[2].parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
-        return None;
+    let dict = t.dict(col).expect("dictionary checked above");
+    let mut keys = Vec::with_capacity(n);
+    let mut signature: Option<String> = None;
+    let mut first_has_offset: Option<bool> = None;
+    let mut offset_rows = 0usize;
+    let mut plain_rows = 0usize;
+    let mut date_only_rows = 0usize;
+    let mut assumed_utc = false;
+    for r in 0..n {
+        let raw = dict.text(r).trim();
+        if raw.is_empty() || is_missing_token(raw) {
+            keys.push(f64::INFINITY);
+            continue;
+        }
+        let parsed = parse_iso(raw, spec)
+            .map_err(|e| format!("data row {} (time column '{}'): {}", r + 1, t.names[col], e))?;
+        if let Some(sig) = &signature {
+            // Mixed formats are refused; an offset/plain mix is refused unless
+            // --tz tells us what the plain values mean.
+            if *sig != parsed.signature {
+                return Err(format!(
+                    "data row {} (time column '{}'): mixed time formats ('{}' after an earlier \
+                     '{}'); normalise the column, or pass --tz/--date-only with one convention",
+                    r + 1,
+                    t.names[col],
+                    raw,
+                    dict.text(0)
+                ));
+            }
+            if first_has_offset != Some(parsed.has_offset) && spec.tz.is_none() {
+                return Err(format!(
+                    "data row {} (time column '{}'): mixes offset-bearing and offset-less \
+                     timestamps ('{}'); pass --tz UTC or a fixed offset to state what the \
+                     offset-less values mean",
+                    r + 1,
+                    t.names[col],
+                    raw
+                ));
+            }
+        } else {
+            signature = Some(parsed.signature.clone());
+            first_has_offset = Some(parsed.has_offset);
+        }
+        if parsed.has_offset {
+            offset_rows += 1;
+        } else {
+            plain_rows += 1;
+        }
+        if parsed.date_only {
+            date_only_rows += 1;
+        }
+        if !parsed.has_offset && spec.tz.is_none() && !assumed_utc && !parsed.date_only {
+            assumed_utc = true;
+        }
+        keys.push(parsed.secs);
     }
-    let mut secs = days_from_civil(y, mo, d) as f64 * 86400.0;
-    if let Some(c) = clock {
-        let tp: Vec<&str> = c.split(':').collect();
-        let hh: f64 = tp.first().and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        let mm: f64 = tp.get(1).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        let ss: f64 = tp.get(2).and_then(|x| x.trim().parse().ok()).unwrap_or(0.0);
-        secs += hh * 3600.0 + mm * 60.0 + ss;
+    let sig = signature.unwrap_or_else(|| "-".to_string());
+    report.format = if sig.contains('/') { "iso8601-slash" } else { "iso8601" }.to_string();
+    report.unit = "s".to_string();
+    report.rows = n;
+    report.offset_rows = offset_rows;
+    if date_only_rows > 0 {
+        report.notes.push(format!(
+            "{} date-only value(s) read as {}",
+            date_only_rows,
+            spec.date_only.name()
+        ));
     }
-    Some(secs)
+    if assumed_utc {
+        report
+            .notes
+            .push("offset-less timestamps interpreted as UTC (no --tz given)".to_string());
+    }
+    if offset_rows > 0 {
+        report
+            .notes
+            .push(format!("{} row(s) converted from their ISO 8601 offset to UTC", offset_rows));
+    }
+    if plain_rows > 0 && offset_rows > 0 {
+        report
+            .notes
+            .push("mixed offset/offset-less input accepted because --tz was given".to_string());
+    }
+    Ok((keys, report))
 }
 
 /// Days since the Unix epoch (Howard Hinnant's `days_from_civil`).
@@ -2796,6 +4116,8 @@ pub struct LagSpec {
     /// Start a new series when the time step exceeds this multiple of the
     /// series' median step (`0` disables gap splitting).
     pub gap_break: f64,
+    /// #130: how the time column is parsed.
+    pub time: TimeSpec,
 }
 
 #[derive(Clone, Default)]
@@ -2847,9 +4169,9 @@ pub fn add_lags(
         }
         None => (vec![0usize; n], 1),
     };
-    let keys: Vec<f64> = match time_col {
+    let keys: TimeKeys = match time_col {
         Some(c) => time_keys(t, c),
-        None => (0..n).map(|i| i as f64).collect(),
+        None => TimeKeys::F64((0..n).map(|i| i as f64).collect()),
     };
 
     let mut by_series: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -2863,17 +4185,12 @@ pub fn add_lags(
     let mut seg_pos = vec![0usize; n];
     let mut seg_rows: Vec<Vec<usize>> = Vec::new();
     for rows in by_series.iter_mut() {
-        rows.sort_by(|&a, &b| {
-            keys[a]
-                .partial_cmp(&keys[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
+        rows.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
         if rows.is_empty() {
             continue;
         }
         let dts: Vec<f64> = if lag.gap_break > 0.0 && rows.len() > 1 {
-            rows.windows(2).map(|w| keys[w[1]] - keys[w[0]]).collect()
+            rows.windows(2).map(|w| keys.difference(w[0], w[1])).collect()
         } else {
             Vec::new()
         };
@@ -2960,6 +4277,7 @@ pub fn add_lags(
             true,
             Column {
                 values,
+                ints: None,
                 dict: None,
             },
         );
@@ -2989,14 +4307,18 @@ fn hash_str(s: &str, seed: u64) -> u64 {
     h
 }
 
+/// True when a column name marks it as a time/ordering axis.
+fn time_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    ["time", "date", "timestamp", "datetime", "ts", "day", "dt"]
+        .iter()
+        .any(|k| name == *k || name.contains(k))
+}
+
 /// True when column `j` looks like a time/ordering axis (by name, or because it
 /// is monotone non-decreasing and almost all distinct).
 pub fn is_time_like(t: &Table, j: usize) -> bool {
-    let name = t.names[j].to_lowercase();
-    if ["time", "date", "timestamp", "datetime", "ts", "day", "dt"]
-        .iter()
-        .any(|k| name == *k || name.contains(k))
-    {
+    if time_name(&t.names[j]) {
         return true;
     }
     if !t.numeric[j] {
@@ -3227,6 +4549,7 @@ mod tests {
             &mut Mt::new(1),
             &PrepSpec {
                 fill: FillMethod::Interpolate,
+                allow_interpolate: true,
                 center: Center::None,
                 scale: Scale::None,
                 ..Default::default()
@@ -3238,5 +4561,49 @@ mod tests {
         // The trailing train gap and the leading test gap cannot interpolate.
         assert_eq!(p.prep.rows_dropped_missing, 2);
         assert_eq!(p.test.x.iter().map(|r| r[0]).collect::<Vec<_>>(), vec![6.0]);
+    }
+
+    /// #133: the default path (no fill, no outlier rule, no smoothing) reads
+    /// the table directly. Only a mutating preparation copies the used columns.
+    #[test]
+    fn the_default_path_does_not_copy_the_used_columns() {
+        let t = table("t,x,y\n0,1,2\n1,2,4\n2,3,6\n3,4,8\n4,5,10\n");
+        let vars = ["x".to_string()];
+
+        CELL_COPIES.with(|n| n.set(0));
+        let p = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec::default(),
+        )
+        .unwrap();
+        assert_eq!(p.train.len() + p.test.len(), 5);
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            0,
+            "the default mean/std path must not materialise a row-major copy"
+        );
+
+        CELL_COPIES.with(|n| n.set(0));
+        let _ = prepare_full_with(
+            &t,
+            &vars,
+            "y",
+            &SplitSpec::default(),
+            &mut Mt::new(1),
+            &PrepSpec {
+                fill: FillMethod::Mean,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            CELL_COPIES.with(|n| n.get()),
+            1,
+            "a fill stage needs one mutable copy"
+        );
     }
 }

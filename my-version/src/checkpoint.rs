@@ -80,11 +80,49 @@ pub struct Fingerprint {
     pub hash: u64,
 }
 
+/// The evaluator that produced a saved search state (issue #140).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Cpu,
+    Gpu,
+    /// A checkpoint written before the backend was recorded. Such a state is
+    /// still resumable: there is no saved identity to check.
+    Unknown,
+}
+
+impl Backend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Backend::Cpu => "cpu",
+            Backend::Gpu => "gpu",
+            Backend::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Backend, String> {
+        match s {
+            "cpu" => Ok(Backend::Cpu),
+            "gpu" => Ok(Backend::Gpu),
+            "unknown" => Ok(Backend::Unknown),
+            other => Err(format!(
+                "backend must be 'cpu', 'gpu' or 'unknown', got '{}'",
+                other
+            )),
+        }
+    }
+}
+
 /// A complete, resumable search state.
 pub struct Checkpoint {
     /// The search settings that produced the saved state (including the
     /// generation budget).
     pub config: Config,
+    /// The evaluator that produced this state: `cpu` or `gpu` (issue #140).
+    pub backend: Backend,
+    /// FNV-1a hash of the canonical, trajectory-relevant configuration
+    /// (issue #140). The generation budget is excluded because resuming may
+    /// raise it.
+    pub config_hash: u64,
     /// Generations completed, i.e. the next generation to run.
     pub generations: usize,
     /// True when the saved run had already stopped (converged, patience or
@@ -346,12 +384,56 @@ pub fn fingerprint(s: &Sample) -> Fingerprint {
     }
 }
 
+/// The canonical configuration text written into a checkpoint (issue #140).
+///
+/// This is the single source of truth for [`config_hash`]: both the writer and
+/// the reader derive the hash from these exact bytes, so a field cannot be
+/// saved without being hashed.
+pub fn config_canonical(cfg: &Config) -> String {
+    let mut out = String::new();
+    write_config(cfg, &mut out);
+    out
+}
+
+/// FNV-1a hash of the trajectory-relevant configuration.
+///
+/// `generations` is a budget, not a property of the trajectory (resuming may
+/// raise it), so it is the one canonical line excluded from the hash.
+pub fn config_hash(cfg: &Config) -> u64 {
+    hash_config_text(&config_canonical(cfg))
+}
+
+/// Hash a canonical configuration block, excluding the `generations` budget
+/// line (see [`config_hash`]).
+pub fn hash_config_text(text: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for line in text.lines() {
+        if line.starts_with("config generations ") {
+            continue;
+        }
+        for &b in line.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+        h ^= b'\n' as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
+}
+
 impl Checkpoint {
     /// Serialise the checkpoint to the versioned text format.
     pub fn to_text(&self) -> String {
         let mut out = String::new();
         writeln!(out, "{}", FORMAT_LINE).unwrap();
         write_config(&self.config, &mut out);
+        // #140: backend identity and the canonical config hash. Both are
+        // optional on read so checkpoints written before this feature still
+        // load; new checkpoints always carry them.
+        writeln!(out, "backend {}", self.backend.as_str()).unwrap();
+        writeln!(out, "config_hash {:016x}", self.config_hash).unwrap();
 
         writeln!(out, "generations {}", self.generations).unwrap();
         writeln!(out, "stopped_early {}", self.stopped_early).unwrap();
@@ -428,6 +510,9 @@ impl Checkpoint {
         }
 
         let mut config_fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut backend = Backend::Unknown;
+        let mut backend_seen = false;
+        let mut stored_config_hash: Option<u64> = None;
         let mut generations: Option<usize> = None;
         let mut stopped_early: Option<bool> = None;
         let mut best_prev: Option<f64> = None;
@@ -462,6 +547,25 @@ impl Checkpoint {
                     {
                         return Err(format!("line {}: duplicate config field '{}'", lineno, key));
                     }
+                }
+                "backend" => {
+                    if backend_seen {
+                        return Err(format!("line {}: duplicate 'backend' record", lineno));
+                    }
+                    backend_seen = true;
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: backend has no value", lineno))?;
+                    backend = Backend::parse(v)
+                        .map_err(|e| format!("line {}: {}", lineno, e))?;
+                }
+                "config_hash" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: config_hash has no value", lineno))?;
+                    let h = u64::from_str_radix(v, 16)
+                        .map_err(|_| format!("line {}: bad config_hash '{}'", lineno, v))?;
+                    set_once(&mut stored_config_hash, h, "config_hash", lineno)?;
                 }
                 "generations" => {
                     set_once(
@@ -635,6 +739,17 @@ impl Checkpoint {
         }
 
         let config = build_config(&config_fields)?;
+        let computed_hash = config_hash(&config);
+        if let Some(stored) = stored_config_hash {
+            if stored != computed_hash {
+                return Err(format!(
+                    "checkpoint config_hash mismatch: file says {:016x}, the saved \
+                     configuration hashes to {:016x}; the checkpoint was modified or \
+                     was written by a build whose configuration encoding differs",
+                    stored, computed_hash
+                ));
+            }
+        }
         let generations = generations
             .ok_or_else(|| "checkpoint is incomplete: missing 'generations'".to_string())?;
         let stopped_early = stopped_early
@@ -704,6 +819,8 @@ impl Checkpoint {
         archive.items = sols;
         Ok(Checkpoint {
             config,
+            backend,
+            config_hash: computed_hash,
             generations,
             stopped_early,
             best_prev,
@@ -731,11 +848,43 @@ impl Checkpoint {
             .map_err(|e| format!("invalid checkpoint '{}': {}", path.display(), e))
     }
 
-    /// Write the checkpoint to a file.
+    /// Write the checkpoint atomically (temp file + fsync + rename).
+    ///
+    /// The previous good generation is retained as `<path>.prev`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
+        self.save_with_fault(path, crate::atomic::Fault::None)
+    }
+
+    /// [`Checkpoint::save`] with a deliberate fault, for the crash-safety test.
+    pub fn save_with_fault(
+        &self,
+        path: impl AsRef<Path>,
+        fault: crate::atomic::Fault,
+    ) -> Result<(), String> {
         let path = path.as_ref();
-        std::fs::write(path, self.to_text())
+        let text = self.to_text();
+        crate::atomic::write_atomic(path, text.as_bytes(), fault)
             .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
+    }
+
+    /// Refuse a resume onto a different backend unless the caller explicitly
+    /// allows the change (issue #140).
+    pub fn check_backend(&self, current: Backend, allow_change: bool) -> Result<(), String> {
+        if self.backend == Backend::Unknown {
+            // A checkpoint from before #140 cannot be checked; resuming is not
+            // silently reinterpreted, because the backend is simply unknown.
+            return Ok(());
+        }
+        if self.backend != current && !allow_change {
+            return Err(format!(
+                "checkpoint backend mismatch: saved run used '{}', this run uses '{}'; \
+                 pass --allow-backend-change to resume across backends (the trajectory \
+                 and reported errors will differ)",
+                self.backend.as_str(),
+                current.as_str()
+            ));
+        }
+        Ok(())
     }
 
     /// Refuse a resume onto data other than the data that produced this state.
@@ -861,6 +1010,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "fit_strategy",  // #116: missing means `exact`
+        "qd_bins",       // #120
+        "qd_cell_cap",   // #120
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1036,12 +1188,39 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    // #116: missing means `exact`, byte-identical to a checkpoint written
+    // before the solver portfolio existed.
+    let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
+        None => crate::fit::FitStrategy::Exact,
+        Some(raw) => crate::fit::FitStrategy::parse(raw).ok_or_else(|| {
+            format!(
+                "config 'fit_strategy' must be exact, auto or linear, got '{}'",
+                raw
+            )
+        })?,
+    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
              the filter needs declared units"
                 .to_string(),
         );
+    }
+    // #120: absent means the QD layer was off.
+    let qd_bins = match fields.get("qd_bins") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'qd_bins': '{}'", raw))?,
+    };
+    let qd_cell_cap = match fields.get("qd_cell_cap") {
+        None => 4,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'qd_cell_cap': '{}'", raw))?,
+    };
+    if qd_cell_cap == 0 {
+        return Err("config 'qd_cell_cap' must be at least 1".to_string());
     }
 
     Ok(Config {
@@ -1057,6 +1236,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         restart_interval: num_usize("restart_interval")?,
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
+        fit_strategy, // #116
+        fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
         patience: num_usize("patience")?,
@@ -1065,12 +1246,16 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         front_parents, // #76
         units,
         require_dimensions,
+        qd_bins,
+        qd_cell_cap,
         progress: None,
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
         simd: true,
         gpu: false,
         gpu_notes: true,
+        // #119: scheduling only, not saved search state.
+        pipeline_depth: 2,
     })
 }
 
@@ -1109,6 +1294,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
+    writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,
@@ -1145,6 +1331,11 @@ fn write_config(cfg: &Config, out: &mut String) {
         writeln!(out, "config units {}", u.encode_vars()).unwrap();
         writeln!(out, "config units.target {}", u.target).unwrap();
         writeln!(out, "config require_dimensions {}", cfg.require_dimensions).unwrap();
+    }
+    // #120: off is the historical default, so only write when enabled.
+    if cfg.qd_bins > 0 {
+        writeln!(out, "config qd_bins {}", cfg.qd_bins).unwrap();
+        writeln!(out, "config qd_cell_cap {}", cfg.qd_cell_cap).unwrap();
     }
 }
 

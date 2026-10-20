@@ -45,24 +45,51 @@ impl Archive {
     }
 
     pub fn try_insert(&mut self, s: Sol) {
-        if !s.error.is_finite() {
+        let Sol {
+            tree,
+            error,
+            complexity,
+            cost,
+        } = s;
+        self.try_insert_view(&tree, error, complexity, cost);
+    }
+
+    /// The same insertion as [`Archive::try_insert`], but borrowing the tree.
+    ///
+    /// The search visits every individual of every generation. Most are
+    /// dominated immediately; cloning their trees first was pure waste. This
+    /// clones only the candidate that actually enters the front, so the
+    /// resulting archive is bit-identical to the owned-tree path.
+    pub fn try_insert_view(
+        &mut self,
+        tree: &Node,
+        error: f64,
+        complexity: usize,
+        cost: f64,
+    ) {
+        if !error.is_finite() {
             return;
         }
         for it in &self.items {
-            if Self::dominates(it.error, it.cost, s.error, s.cost) {
+            if Self::dominates(it.error, it.cost, error, cost) {
                 return;
             }
         }
         self.items
-            .retain(|it| !Self::dominates(s.error, s.cost, it.error, it.cost));
+            .retain(|it| !Self::dominates(error, cost, it.error, it.cost));
         if self
             .items
             .iter()
-            .any(|it| it.cost == s.cost && (it.error - s.error).abs() < 1e-12)
+            .any(|it| it.cost == cost && (it.error - error).abs() < 1e-12)
         {
             return;
         }
-        self.items.push(s);
+        self.items.push(Sol {
+            tree: tree.clone(),
+            error,
+            complexity,
+            cost,
+        });
         if self.items.len() > self.cap {
             self.prune();
         }

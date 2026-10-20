@@ -283,6 +283,11 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
     if k == 0 {
         return rss_of(tree, x, w);
     }
+    // #135: `--no-fit` / `--fit-iters 0` means no fitting at all, including
+    // the implicit-derivative path.
+    if iters == 0 {
+        return rss_of(tree, x, w);
+    }
     let base = tree.clone();
     let base_r = match residuals(&base, x, w) {
         Some(r) => r,

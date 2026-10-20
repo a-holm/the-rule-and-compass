@@ -489,16 +489,77 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 
 
 
-/// The only nondeterministic field in the pre-change JSON output was
-/// `elapsed_seconds`; mask it so the rest of the byte stream can be compared.
+/// Mask the nondeterministic timings: `elapsed_seconds` (the old field) and the
+/// `timing` phase object added in #134, so the rest of the byte stream can be
+/// compared against the recorded golden.
 fn mask_elapsed(src: &str) -> String {
+    let src = mask_timing(src);
+    let src = mask_seconds(&src);
     let key = "\"elapsed_seconds\":";
     let mut out = String::with_capacity(src.len());
-    let mut rest = src;
+    let mut rest = &src[..];
     while let Some(i) = rest.find(key) {
         out.push_str(&rest[..i + key.len()]);
         out.push_str("ELAPSED");
         let after = &rest[i + key.len()..];
+        if after.starts_with("ELAPSED") {
+            rest = &after["ELAPSED".len()..];
+            continue;
+        }
+        let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_timing(src: &str) -> String {
+    let key = "\"timing\":";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = &src[..];
+    while let Some(i) = rest.find(key) {
+        out.push_str(&rest[..i + key.len()]);
+        out.push_str("TIMING");
+        let after = &rest[i + key.len()..];
+        // The golden already contains the placeholder, not an object.
+        if after.starts_with("TIMING") {
+            rest = &after["TIMING".len()..];
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (n, c) in after.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = n + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mask the k-NN baseline's `seconds` field added in #132.
+fn mask_seconds(src: &str) -> String {
+    let key = "\"seconds\":";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = &src[..];
+    while let Some(i) = rest.find(key) {
+        out.push_str(&rest[..i + key.len()]);
+        out.push_str("SECONDS");
+        let after = &rest[i + key.len()..];
+        if after.starts_with("SECONDS") {
+            rest = &after["SECONDS".len()..];
+            continue;
+        }
         let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
         rest = &after[end..];
     }
@@ -519,7 +580,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let base = [
         "--data", "-", "--target", "y", "--vars", "x", "--seed-expr", "x",
         "--generations", "0", "--pop", "1", "--fit-iters", "0", "--test-frac",
-        "0", "--quiet",
+        "0", "--cpu", "--quiet",
     ];
 
     let out = rcsr_stdin(&base, table);

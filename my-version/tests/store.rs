@@ -4,7 +4,7 @@
 //! issue report, not in the test suite.
 
 use rcsr::data::{self, Table};
-use rcsr::store::{self, FileStore, MAGIC};
+use rcsr::store::{self, DType, FileStore, MAGIC};
 use std::process::Command;
 
 fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -110,11 +110,11 @@ fn version_mismatch_is_a_clear_error() {
     let path = dir.join("v.rcsb");
     store::write_store(path.to_str().unwrap(), &full_table(), 4).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     let err = FileStore::open(path.to_str().unwrap()).unwrap_err();
-    assert!(err.contains("version 2"), "{err}");
-    assert!(err.contains("version 1"), "{err}");
+    assert!(err.contains("version 99"), "{err}");
+    assert!(err.contains("versions 1 and 2"), "{err}");
     assert!(err.contains("rcsr import"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -216,6 +216,200 @@ fn import_then_search_is_byte_identical_to_the_csv_path() {
     let b = std::fs::read(&from_store).unwrap();
     assert_eq!(a, b, "the imported store changed the search trajectory");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn nanosecond_table() -> Table {
+    data::parse_table(
+        "ts,symbol,y\n\
+         1700000000000000001,A,1\n\
+         1700000000000000002,A,2\n\
+         1700000000000000003,B,3\n\
+         1700000000000000004,B,4\n\
+         1700000000000000005,A,5\n",
+    )
+    .unwrap()
+}
+
+#[test]
+fn v2_has_per_column_dtypes_and_round_trips_nanoseconds_and_dictionaries() {
+    let table = nanosecond_table();
+    let dir = temp_dir("v2-dtypes");
+    let path = dir.join("t.rcsb");
+    store::write_store(path.to_str().unwrap(), &table, 2).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        store::VERSION
+    );
+    assert_eq!(store::VERSION, 2);
+    let fs = FileStore::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(
+        fs.header().dtypes(),
+        vec![DType::I64, DType::U32, DType::F64]
+    );
+    let back = fs.to_table().unwrap();
+    let exact: Vec<i64> = (1..=5).map(|i| 1_700_000_000_000_000_000 + i).collect();
+    assert_eq!(back.ints(0).unwrap(), &exact[..]);
+    assert_eq!(back.dict(1).unwrap().levels, table.dict(1).unwrap().levels);
+    assert_eq!(back.dict(1).unwrap().codes, table.dict(1).unwrap().codes);
+    // A dictionary column has no evaluator values; its levels are the view and
+    // a code never appears as a number.
+    assert!(back.col(1).is_empty());
+    assert!(back.value(0, 1).is_nan());
+    assert_eq!(back.col(2), table.col(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn v2_code_blocks_are_four_bytes_and_the_file_is_dictionary_heavy_smaller() {
+    let mut csv = String::from("a,b,x\n");
+    for i in 0..1000 {
+        csv.push_str(&format!("L{},{},{}\n", i % 10, i % 7, i));
+    }
+    let table = data::parse_table(&csv).unwrap();
+    let dir = temp_dir("v2-size");
+    let path = dir.join("t.rcsb");
+    store::write_store(path.to_str().unwrap(), &table, 1000).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as usize;
+    // The one-group data section is 2 x 4000 u32 codes for the text column,
+    // 8000 bytes of b values + 4000 codes, and 8000 x values + 4000 codes:
+    // 32,000 bytes, plus a header dominated by the 1000-level dictionary of x.
+    // The v1 layout would add 8-byte value/code blocks throughout (~54 KiB).
+    assert!(size < 36_000, "v2 store is {} bytes", size);
+    let fs = FileStore::open(path.to_str().unwrap()).unwrap();
+    let back = fs.to_table().unwrap();
+    assert_eq!(back.dict(0).unwrap().codes, table.dict(0).unwrap().codes);
+    assert_eq!(back.dict(1).unwrap().codes, table.dict(1).unwrap().codes);
+    assert_eq!(back.col(2), table.col(2));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hundred_symbol_daily_panel_migrates_from_v1_to_v2_identically() {
+    // The shape of the 100-symbol daily panel: 100 symbols, 60 days, a text
+    // dictionary plus numeric features. Written once as a v1-equivalent
+    // hand-built store and once through the v2 writer; decoded rows agree.
+    let mut csv = String::from("ts,symbol,open,r1,y1\n");
+    for day in 0..60 {
+        for s in 0..100 {
+            csv.push_str(&format!(
+                "{},{},{},{},{}\n",
+                1619827200 + day * 86400,
+                format!("SYM{:03}USDT", s),
+                100.0 + s as f64 + day as f64 * 0.5,
+                (s as f64 - 50.0) / 100.0,
+                day as f64 / 60.0
+            ));
+        }
+    }
+    let table = data::parse_table(&csv).unwrap();
+    assert_eq!(table.dict(1).unwrap().levels.len(), 100);
+
+    let dir = temp_dir("daily100");
+    let v2 = dir.join("v2.rcsb");
+    store::write_store(v2.to_str().unwrap(), &table, 997).unwrap();
+    let v1 = dir.join("v1.rcsb");
+    write_v1_from_table(&v1, &table, 997);
+    let a = FileStore::open(v1.to_str().unwrap()).unwrap();
+    let b = FileStore::open(v2.to_str().unwrap()).unwrap();
+    assert_eq!(a.header().version, 1);
+    assert_eq!(b.header().version, 2);
+    let ta = a.to_table().unwrap();
+    let tb = b.to_table().unwrap();
+    for c in [0usize, 2, 3, 4] {
+        let bad = ta
+            .col(c)
+            .iter()
+            .zip(tb.col(c))
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        if let Some(i) = bad {
+            panic!(
+                "column {} differs at row {}: v1={:?} (bits {:x}) v2={:?} (bits {:x})",
+                c,
+                i,
+                ta.col(c)[i],
+                ta.col(c)[i].to_bits(),
+                tb.col(c)[i],
+                tb.col(c)[i].to_bits()
+            );
+        }
+    }
+    assert_eq!(ta.dict(1).unwrap().levels, tb.dict(1).unwrap().levels);
+    assert_eq!(ta.dict(1).unwrap().codes, tb.dict(1).unwrap().codes);
+    assert!(std::fs::metadata(&v2).unwrap().len() < std::fs::metadata(&v1).unwrap().len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write the historical v1 layout (all values and codes as f64) for migration
+/// tests. This mirrors what `rcsr` wrote before #128.
+fn write_v1_from_table(path: &std::path::Path, table: &Table, group_rows: usize) {
+    let n = table.len();
+    let n_cols = table.n_cols();
+    let n_groups = (n + group_rows - 1) / group_rows;
+    let mut cursor = 0u64;
+    let mut metas: Vec<(Vec<u64>, Vec<u64>)> = (0..n_cols)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
+    for g in 0..n_groups {
+        let len = ((n - g * group_rows).min(group_rows)) as u64;
+        for c in 0..n_cols {
+            metas[c].0.push(cursor);
+            cursor += len * 8;
+            if table.dict(c).is_some() {
+                metas[c].1.push(cursor);
+                cursor += len * 8;
+            }
+        }
+    }
+    let mut json = format!(
+        "{{\"format\":\"rcsr-column-store\",\"version\":1,\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[",
+        n, n_cols, group_rows
+    );
+    for c in 0..n_cols {
+        if c > 0 {
+            json.push(',');
+        }
+        let levels = table
+            .dict(c)
+            .map(|d| {
+                d.levels
+                    .iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"numeric\":{},\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
+            table.names[c],
+            table.numeric[c],
+            levels,
+            table.dict(c).is_some(),
+            metas[c].0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+            metas[c].1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        ));
+    }
+    json.push_str("]}");
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(MAGIC);
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(json.as_bytes());
+    for g in 0..n_groups {
+        let lo = g * group_rows;
+        let hi = (lo + group_rows).min(n);
+        for c in 0..n_cols {
+            for r in lo..hi {
+                bytes.extend_from_slice(&table.value(r, c).to_le_bytes());
+            }
+            if let Some(d) = table.dict(c) {
+                for r in lo..hi {
+                    bytes.extend_from_slice(&(d.codes[r] as f64).to_le_bytes());
+                }
+            }
+        }
+    }
+    std::fs::write(path, bytes).unwrap();
 }
 
 #[test]

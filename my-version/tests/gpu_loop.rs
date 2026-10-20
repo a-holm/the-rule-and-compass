@@ -1,9 +1,12 @@
-//! The GPU/search integration (issue #26).
+//! The GPU/search integration (issues #26 and #141).
 //!
-//! Three guarantees are pinned here:
+//! The guarantees pinned here:
 //!
-//! * `--no-gpu` forces the CPU path, with or without the `cuda` feature;
-//! * a CUDA build with no usable device falls back with one visible note;
+//! * a CUDA build with a usable device uses the GPU with no flag (#141);
+//! * a non-CUDA build, or a CUDA build with no usable device, defaults to the
+//!   CPU, warns once and records `backend`/`backend_reason` (#141);
+//! * `--gpu` fails clearly when no device exists; `--no-gpu`/`--cpu` forces the
+//!   CPU with or without the feature and is bit-identical across runs;
 //! * with `--features cuda` the GPU-guided search is deterministic for a seed
 //!   and the *reported* law and errors agree with the CPU backend (the numbers
 //!   a user reads are always re-scored in `f64` on the full training sample).
@@ -101,12 +104,11 @@ fn run_cli(args: &[&str], gpu_env: Option<&str>) -> (Option<i32>, String, String
         cmd.env("RCSR_GPU", v);
     }
     let mut child = cmd.spawn().expect("spawn rcsr");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(csv(60).as_bytes())
-        .unwrap();
+    // An explicit --gpu failure may exit before reading stdin; a broken pipe
+    // is expected and must not mask the exit code/stderr assertion.
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(csv(60).as_bytes());
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
@@ -117,7 +119,7 @@ fn run_cli(args: &[&str], gpu_env: Option<&str>) -> (Option<i32>, String, String
 
 #[test]
 fn forced_cpu_flag_works_with_and_without_the_feature() {
-    let (_code, stdout, stderr) = run_cli(
+    let (code, stdout, stderr) = run_cli(
         &[
             "--data",
             "-",
@@ -133,22 +135,33 @@ fn forced_cpu_flag_works_with_and_without_the_feature() {
             "3",
             "--metric",
             "squared",
-            "--no-gpu",
+            "--cpu",
+            "--json",
         ],
-        None,
+        Some("1"),
     );
-    assert!(!stdout.is_empty(), "the search still reports solutions");
-    // #91: CPU is the default, so `--no-gpu` is accepted but silent — there is
-    // no GPU to report being switched off.
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
+    assert!(
+        stdout.contains("\"backend_reason\":\"--cpu/--no-gpu\""),
+        "json: {stdout}"
+    );
+    assert!(!stdout.contains("\"backend\":\"gpu\""), "json: {stdout}");
+    // #141: an explicit CPU override is silent; the summary still names it.
     assert!(
         !stderr.contains("# gpu:"),
-        "a CPU run must not print a GPU note, got: {stderr}"
+        "a forced CPU run must not print a GPU note, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("# resource: backend=cpu"),
+        "expected the resource summary, got: {stderr}"
     );
 }
 
 #[test]
-fn cuda_build_without_a_device_falls_back_with_one_note() {
+fn unavailable_device_falls_back_by_default_with_a_recorded_reason() {
     // `RCSR_GPU=0` makes a CUDA build behave as if no device were present.
+    // No --gpu: the default must fall back, warn once, and record the reason.
     let (code, stdout, stderr) = run_cli(
         &[
             "--data",
@@ -165,29 +178,145 @@ fn cuda_build_without_a_device_falls_back_with_one_note() {
             "5",
             "--metric",
             "squared",
-            // #91: the GPU is opt-in, so the fallback only happens when asked.
-            "--gpu",
+            "--json",
         ],
         Some("0"),
     );
     assert_eq!(code, Some(0));
-    assert!(!stdout.is_empty());
+    assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
+    assert!(stdout.contains("\"device\":null"), "json: {stdout}");
+    let expected = if cfg!(feature = "cuda") {
+        "RCSR_GPU=0"
+    } else {
+        "built without --features cuda"
+    };
+    assert!(
+        stdout.contains(&format!("\"backend_reason\":\"{}", expected)),
+        "expected a recorded fallback reason, json: {stdout}"
+    );
     if cfg!(feature = "cuda") {
         assert!(
-            stderr.contains("# gpu: unavailable (RCSR_GPU=0"),
+            stderr.contains("# gpu: unavailable") && stderr.contains(expected),
             "expected a visible device fallback, got: {stderr}"
         );
-    } else {
-        assert!(
-            stderr.contains("# gpu: unavailable (built without --features cuda)"),
-            "expected the feature-less note, got: {stderr}"
+        // One note, not one per generation.
+        assert_eq!(
+            stderr.matches("# gpu:").count(),
+            1,
+            "a fallback must be reported once: {stderr}"
         );
     }
-    // One note, not one per generation.
-    assert_eq!(
-        stderr.matches("# gpu:").count(),
-        1,
-        "a fallback must be reported once: {stderr}"
+    assert!(
+        stderr.contains("# resource: backend=cpu"),
+        "expected the resource summary, got: {stderr}"
+    );
+}
+
+#[test]
+fn explicit_gpu_fails_clearly_when_no_device_is_available() {
+    // #141: `--gpu` is an assertion, not a preference. `RCSR_GPU=0` makes it
+    // fail on a CUDA machine; a non-CUDA build fails the same way.
+    let (code, stdout, stderr) = run_cli(
+        &[
+            "--data",
+            "-",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "8",
+            "--pop",
+            "24",
+            "--seed",
+            "5",
+            "--metric",
+            "squared",
+            "--gpu",
+        ],
+        Some("0"),
+    );
+    assert_eq!(code, Some(2), "stderr: {stderr}");
+    assert!(stdout.is_empty(), "no search output on a usage error");
+    assert!(
+        stderr.contains("error: --gpu was requested but no GPU is available"),
+        "got: {stderr}"
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn non_cuda_build_defaults_to_cpu() {
+    let (code, stdout, stderr) = run_cli(
+        &[
+            "--data",
+            "-",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "8",
+            "--pop",
+            "24",
+            "--seed",
+            "6",
+            "--metric",
+            "squared",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
+    assert!(
+        stdout.contains("\"backend_reason\":\"built without --features cuda\""),
+        "json: {stdout}"
+    );
+    assert!(
+        stderr.contains("# resource: backend=cpu"),
+        "got: {stderr}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
+    // On a machine with no usable device this test cannot assert the GPU
+    // default; the fallback test above covers that case. `RCSR_GPU=1` is not
+    // an "off" value, so the probe reads the real device.
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let (code, stdout, stderr) = run_cli(
+        &[
+            "--data",
+            "-",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "8",
+            "--pop",
+            "24",
+            "--seed",
+            "9",
+            "--metric",
+            "squared",
+            "--json",
+        ],
+        Some("1"),
+    );
+    assert_eq!(code, Some(0));
+    assert!(stdout.contains("\"backend\":\"gpu\""), "json: {stdout}");
+    assert!(
+        !stdout.contains("\"device\":null"),
+        "a GPU run must name its device, json: {stdout}"
+    );
+    assert!(
+        stderr.contains("# resource: backend=gpu device="),
+        "got: {stderr}"
     );
 }
 
@@ -234,6 +363,92 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
         g.error < 1e-6,
         "the fixture is recoverable up to its 1e-4 noise, got {}",
         g.error
+    );
+}
+
+/// #119: the overlap pipeline must not change a single scored value. The
+/// synchronous path (`pipeline_depth = 0`) and the bounded overlap path are
+/// compared on the same seed; every archive member, its exact `f64` error bits
+/// and the test errors must match. Arrival order across islands is not fixed,
+/// but each result is keyed by `(island, slot)`, so the mapping is.
+#[cfg(feature = "cuda")]
+#[test]
+fn overlap_pipeline_is_byte_identical_to_the_synchronous_gpu_path() {
+    let train = sample(96);
+    let test = sample(96);
+    let mut sync = config(29, true);
+    sync.pipeline_depth = 0;
+    let mut overlap = config(29, true);
+    overlap.pipeline_depth = 2;
+
+    let a = search::run(&sync, &train, &test);
+    let b = search::run(&overlap, &train, &test);
+    assert_eq!(
+        describe(&a),
+        describe(&b),
+        "the overlap queue changed the archive"
+    );
+    assert_eq!(
+        a.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+        b.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+        "the overlap queue changed the reported test errors"
+    );
+}
+
+/// #119: a CPU-only run cannot be affected by the pipeline depth. With no GPU
+/// the queue is never constructed, so the archive is bit-identical for any
+/// depth.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_depth_is_a_no_op_on_the_cpu_path() {
+    let train = sample(48);
+    let test = sample(48);
+    let mut sync = config(31, false);
+    sync.pipeline_depth = 0;
+    let mut deep = config(31, false);
+    deep.pipeline_depth = 8;
+    let a = search::run(&sync, &train, &test);
+    let b = search::run(&deep, &train, &test);
+    assert_eq!(describe(&a), describe(&b));
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn cpu_override_is_bit_identical_across_runs() {
+    // #141: `--cpu` (Config::gpu = false) is the reproducibility escape hatch.
+    // Two CPU runs must agree bit for bit, including the reported f64 errors.
+    let train = sample(48);
+    let test = sample(48);
+    let a = search::run(&config(23, false), &train, &test);
+    let b = search::run(&config(23, false), &train, &test);
+    assert_eq!(describe(&a), describe(&b));
+    assert_eq!(
+        a.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+        b.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
+    assert!(a.device.is_none());
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn four_island_gpu_run_with_if_is_deterministic() {
+    // Mixes the device pool, the parallel CPU fallback (`if` has no opcode)
+    // and four island threads. Repeating the seed must give the same archive.
+    let train = sample(48);
+    let test = sample(48);
+    let mut cfg = config(29, true);
+    cfg.islands = 4;
+    cfg.pop = 40;
+    cfg.generations = 20;
+    cfg.fit_iters = 0;
+    cfg.ops.push(Op::If);
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(
+        describe(&a),
+        describe(&b),
+        "four islands, the device pool and the if fallback are deterministic"
     );
 }
 

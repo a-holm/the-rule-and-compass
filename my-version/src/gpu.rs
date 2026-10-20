@@ -16,7 +16,7 @@
 //! * FP32 throughout, because on both the RTX 3060 and the GB10 in the DGX Spark
 //!   FP64 runs at 1/64 of FP32.
 
-use crate::expr::{Node, Op};
+use crate::expr::{constant, node, Node, Op};
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -47,17 +47,121 @@ const OP_STEP: u32 = 19;
 const OP_POW: u32 = 20;
 const OP_SINH: u32 = 21;
 const OP_COSH: u32 = 22;
+// #131: native hard operators.
+const OP_FLOOR: u32 = 23;
+const OP_CEIL: u32 = 24;
+const OP_ROUND: u32 = 25;
+const OP_MOD: u32 = 26;
+const OP_ATAN2: u32 = 27;
+const OP_ERF: u32 = 28;
+const OP_ERFC: u32 = 29;
+const OP_MIN: u32 = 30;
+const OP_MAX: u32 = 31;
+const OP_IF: u32 = 32;
+const OP_SIGN: u32 = 33;
+const OP_EQUAL: u32 = 34;
+const OP_LESS: u32 = 35;
+const OP_LESS_OR_EQUAL: u32 = 36;
+const OP_GREATER: u32 = 37;
+const OP_GREATER_OR_EQUAL: u32 = 38;
+const OP_AND: u32 = 39;
+const OP_OR: u32 = 40;
+const OP_XOR: u32 = 41;
+const OP_NOT: u32 = 42;
 const OP_HALT: u32 = 255;
 
+/// `(name, opcode)` for the enum-consistency test and for the per-generation
+/// opcode report. Keep the order identical to `src/cuda/eval.cu`.
+const OPCODE_TABLE: &[(&str, u32)] = &[
+    ("OP_CONST", OP_CONST),
+    ("OP_VAR", OP_VAR),
+    ("OP_ADD", OP_ADD),
+    ("OP_SUB", OP_SUB),
+    ("OP_MUL", OP_MUL),
+    ("OP_DIV", OP_DIV),
+    ("OP_SIN", OP_SIN),
+    ("OP_COS", OP_COS),
+    ("OP_TAN", OP_TAN),
+    ("OP_EXP", OP_EXP),
+    ("OP_LOG", OP_LOG),
+    ("OP_SQRT", OP_SQRT),
+    ("OP_ABS", OP_ABS),
+    ("OP_TANH", OP_TANH),
+    ("OP_SIG", OP_SIG),
+    ("OP_SQUARE", OP_SQUARE),
+    ("OP_CUBE", OP_CUBE),
+    ("OP_NEG", OP_NEG),
+    ("OP_GAUSS", OP_GAUSS),
+    ("OP_STEP", OP_STEP),
+    ("OP_POW", OP_POW),
+    ("OP_SINH", OP_SINH),
+    ("OP_COSH", OP_COSH),
+    ("OP_FLOOR", OP_FLOOR),
+    ("OP_CEIL", OP_CEIL),
+    ("OP_ROUND", OP_ROUND),
+    ("OP_MOD", OP_MOD),
+    ("OP_ATAN2", OP_ATAN2),
+    ("OP_ERF", OP_ERF),
+    ("OP_ERFC", OP_ERFC),
+    ("OP_MIN", OP_MIN),
+    ("OP_MAX", OP_MAX),
+    ("OP_IF", OP_IF),
+    ("OP_SIGN", OP_SIGN),
+    ("OP_EQUAL", OP_EQUAL),
+    ("OP_LESS", OP_LESS),
+    ("OP_LESS_OR_EQUAL", OP_LESS_OR_EQUAL),
+    ("OP_GREATER", OP_GREATER),
+    ("OP_GREATER_OR_EQUAL", OP_GREATER_OR_EQUAL),
+    ("OP_AND", OP_AND),
+    ("OP_OR", OP_OR),
+    ("OP_XOR", OP_XOR),
+    ("OP_NOT", OP_NOT),
+    ("OP_HALT", OP_HALT),
+];
+
 /// Compile one expression to postfix bytecode. Returns `false` if the tree uses
-/// an operator the kernel does not implement (`if`, which is a branch and would
-/// reintroduce divergence).
+/// an operator the kernel does not implement even after [`lower`] (for example
+/// `floor`, `mod` or `atan2`).
+/// an operator the kernel does not implement (for example `asinh`, `mod` on a
+/// platform without the #131 opcodes, or constraints).
 pub fn compile(n: &Node, out: &mut Vec<u32>) -> bool {
     if !emit(n, out) {
         return false;
     }
     out.push(OP_HALT);
     true
+}
+
+/// #121: rewrite operators the kernel lacks into exact equivalents over the
+/// supported instruction set. The identities below are exact for finite values
+/// (NaN semantics differ for a few, so search results are always verified by
+/// the f64 CPU scorer before they are reported).
+fn lower(n: &Node) -> Node {
+    use Op::*;
+    if matches!(n.op, Const | Input) {
+        return n.clone();
+    }
+    let k: Vec<Node> = n.kids.iter().map(lower).collect();
+    let abs_diff = |a: &Node, b: &Node| node(Abs, vec![node(Sub, vec![a.clone(), b.clone()])]);
+    match n.op {
+        Asinh => {
+            // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
+            let x = k[0].clone();
+            let sgn = node(Sub, vec![node(Step, vec![x.clone()]), node(Step, vec![node(Neg, vec![x.clone()])])]);
+            let mag = node(Ln, vec![node(Add, vec![node(Abs, vec![x.clone()]), node(Sqrt, vec![node(Add, vec![node(Mul, vec![x.clone(), x]), constant(1.0)])])])]);
+            node(Mul, vec![sgn, mag])
+        }
+        Acosh => {
+            // factored (x-1)(x+1) survives x -> 1 in f32
+            let x = k[0].clone();
+            node(Ln, vec![node(Add, vec![x.clone(), node(Sqrt, vec![node(Mul, vec![node(Sub, vec![x.clone(), constant(1.0)]), node(Add, vec![x, constant(1.0)])])])])])
+        }
+        Atanh => {
+            let x = k[0].clone();
+            node(Mul, vec![constant(0.5), node(Ln, vec![node(Div, vec![node(Add, vec![constant(1.0), x.clone()]), node(Sub, vec![constant(1.0), x])])])])
+        }
+        _ => node(n.op, k),
+    }
 }
 
 /// Emit the opcodes for a subtree. The `HALT` terminator is added only by
@@ -80,7 +184,7 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
             true
         },
         Exp | Ln | Abs | Sqrt | Sin | Cos | Tan | Sinh | Cosh | Tanh | Logistic | Step | Gauss
-        | Square | Cube => {
+        | Square | Cube | Floor | Ceil | Round | Sign | Erf | Erfc | Not => {
             let op = match n.op {
                 Exp => OP_EXP,
                 Ln => OP_LOG,
@@ -97,6 +201,13 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
                 Gauss => OP_GAUSS,
                 Square => OP_SQUARE,
                 Cube => OP_CUBE,
+                Floor => OP_FLOOR,
+                Ceil => OP_CEIL,
+                Round => OP_ROUND,
+                Sign => OP_SIGN,
+                Erf => OP_ERF,
+                Erfc => OP_ERFC,
+                Not => OP_NOT,
                 _ => unreachable!(),
             };
             emit(&n.kids[0], out) && {
@@ -104,13 +215,26 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
                 true
             }
         }
-        Add | Sub | Mul | Div | Pow => {
+        Add | Sub | Mul | Div | Pow | Mod | Atan2 | Min | Max | Equal | Less | LessOrEqual
+        | Greater | GreaterOrEqual | And | Or | Xor => {
             let op = match n.op {
                 Add => OP_ADD,
                 Sub => OP_SUB,
                 Mul => OP_MUL,
                 Div => OP_DIV,
                 Pow => OP_POW,
+                Mod => OP_MOD,
+                Atan2 => OP_ATAN2,
+                Min => OP_MIN,
+                Max => OP_MAX,
+                Equal => OP_EQUAL,
+                Less => OP_LESS,
+                LessOrEqual => OP_LESS_OR_EQUAL,
+                Greater => OP_GREATER,
+                GreaterOrEqual => OP_GREATER_OR_EQUAL,
+                And => OP_AND,
+                Or => OP_OR,
+                Xor => OP_XOR,
                 _ => unreachable!(),
             };
             emit(&n.kids[0], out) && emit(&n.kids[1], out) && {
@@ -118,7 +242,15 @@ fn emit(n: &Node, out: &mut Vec<u32>) -> bool {
                 true
             }
         }
-        If => false,
+        If => {
+            emit(&n.kids[0], out)
+                && emit(&n.kids[1], out)
+                && emit(&n.kids[2], out)
+                && {
+                    out.push(OP_IF);
+                    true
+                }
+        }
         // Extended primitives have no kernel opcode yet; report them as
         // unsupported so the caller can fall back to the CPU evaluator.
         _ => false,
@@ -140,8 +272,52 @@ extern "C" {
         nprog: i32,
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    fn rc_device_count() -> i32;
+    /* #122: persistent, fixed-capacity, double-buffered program arena. */
+    fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
+    fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
+    fn rc_pool_eval(ctx: *mut RawCtx, which: i32, nprog: i32, width: i32, out: *mut f32) -> f32;
+    fn rc_pool_hash(
+        ctx: *mut RawCtx,
+        which: i32,
+        nprog: i32,
+        width: i32,
+        out: *mut u64,
+    ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+}
+
+/// Probe for a usable CUDA device once (issue #141).
+///
+/// This is the startup decision the CLI records in the resource summary and in
+/// JSON: it asks the CUDA runtime for a device count and, when one answers,
+/// reads the device attributes through [`GpuEvaluator::device_name`]. It does
+/// not allocate or upload anything, so running it before the dataset is loaded
+/// costs no device memory.
+///
+/// `RCSR_GPU=0` (or `false`/`off`/`no`) makes a CUDA build behave as if no
+/// device were present; it is the supported way to exercise the fallback path
+/// on a machine that has a GPU.
+pub fn probe() -> crate::backend::Probe {
+    if matches!(
+        std::env::var("RCSR_GPU").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    ) {
+        return crate::backend::Probe::cpu("RCSR_GPU=0 (device use disabled)");
+    }
+    let count = unsafe { rc_device_count() };
+    if count < 0 {
+        return crate::backend::Probe::cpu("CUDA device query failed (no driver or runtime?)");
+    }
+    if count == 0 {
+        return crate::backend::Probe::cpu("no CUDA device found");
+    }
+    let name = GpuEvaluator::device_name();
+    if name == "unknown" {
+        return crate::backend::Probe::cpu("CUDA device attributes unavailable");
+    }
+    crate::backend::Probe::gpu(name)
 }
 
 /// A compiled population: the postfix programs of many expressions laid out
@@ -151,11 +327,35 @@ extern "C" {
 /// call transfers the whole population and launches one kernel with one block
 /// per program, returning one SSE per program. It is deliberately *not* wired
 /// into the search loop yet; the search owns its own scheduling.
+/// #121: postfix peak stack depth. Leaves push; unary is net zero; an
+/// n-ary operator pops n-1. Reject before emission when the kernel's 64-slot
+/// stack could overflow.
+fn peak_stack(n: &Node) -> usize {
+    fn walk(n: &Node, cur: &mut usize, peak: &mut usize) {
+        for k in &n.kids {
+            walk(k, cur, peak);
+        }
+        match n.kids.len() {
+            0 => {
+                *cur += 1;
+                if *cur > *peak { *peak = *cur; }
+            }
+            1 => {}
+            k => { *cur -= k - 1; }
+        }
+    }
+    let (mut cur, mut peak) = (0, 0);
+    walk(n, &mut cur, &mut peak);
+    peak
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct Population {
     prog: Vec<u32>,
     offsets: Vec<u32>,
     unsupported: usize,
+    /// #131: operator occurrences, used for the per-generation `--json` report.
+    ops: std::collections::BTreeMap<u32, usize>,
 }
 
 impl Population {
@@ -165,6 +365,7 @@ impl Population {
             prog: Vec::new(),
             offsets: vec![0],
             unsupported: 0,
+            ops: std::collections::BTreeMap::new(),
         }
     }
 
@@ -173,9 +374,29 @@ impl Population {
     /// kernel does not implement; the population itself stays valid.
     pub fn add(&mut self, tree: &Node) -> bool {
         let mut buf = Vec::new();
-        if !compile(tree, &mut buf) {
+        let lowered = lower(tree);
+        // #121: the kernel has no stack-bounds check (RC_MAX_STACK=64), so a
+        // lowered program must be rejected before emission if it could overflow.
+        if peak_stack(&lowered) > 56 {
             self.unsupported += 1;
             return false;
+        }
+        if !compile(&lowered, &mut buf) {
+            self.unsupported += 1;
+            return false;
+        }
+        // Count operator words, skipping the operand word after const/var.
+        let mut i = 0;
+        while i < buf.len() {
+            let w = buf[i];
+            if w == OP_CONST || w == OP_VAR {
+                i += 2;
+            } else {
+                if w != OP_HALT {
+                    *self.ops.entry(w).or_default() += 1;
+                }
+                i += 1;
+            }
         }
         self.prog.extend_from_slice(&buf);
         self.offsets.push(self.prog.len() as u32);
@@ -213,12 +434,36 @@ impl Population {
     pub fn programs(&self) -> (&[u32], &[u32]) {
         (&self.prog, &self.offsets)
     }
+
+    /// #131: `(opcode name, occurrences)` for this population, sorted by opcode.
+    /// Const, var and halt are excluded; this is the "which opcodes were used"
+    /// part of the per-generation GPU report.
+    pub fn opcode_usage(&self) -> Vec<(String, usize)> {
+        self.ops
+            .iter()
+            .map(|(&op, &n)| (opcode_name(op).to_string(), n))
+            .collect()
+    }
+}
+
+fn opcode_name(op: u32) -> &'static str {
+    OPCODE_TABLE
+        .iter()
+        .find(|(_, value)| *value == op)
+        .map(|(name, _)| *name)
+        .unwrap_or("OP_UNKNOWN")
 }
 
 /// A resident GPU evaluator: the dataset is uploaded once, then many batches of
 /// candidates can be scored without further host↔device traffic for the data.
 pub struct GpuEvaluator {
     ctx: *mut RawCtx,
+    /// #122: capacity and width of the persistent program arena, or `0` when
+    /// it has not been reserved yet.
+    pool_cap: usize,
+    pool_width: usize,
+    /// Which of the two arena buffers the last upload/evaluation used.
+    pool_last: usize,
 }
 
 impl GpuEvaluator {
@@ -228,7 +473,12 @@ impl GpuEvaluator {
         if ctx.is_null() {
             None
         } else {
-            Some(GpuEvaluator { ctx })
+            Some(GpuEvaluator {
+                ctx,
+                pool_cap: 0,
+                pool_width: 0,
+                pool_last: 0,
+            })
         }
     }
 
@@ -265,6 +515,59 @@ impl GpuEvaluator {
             let mut out = vec![0.0f32; nprog];
             let ms = rc_eval(self.ctx, out.as_mut_ptr());
             (out, ms)
+        }
+    }
+
+    /// #122: evaluate a fixed-capacity [`GenomePool`] through the persistent
+    /// device arena. The arena is reserved once (and only grown if a later
+    /// generation is larger); uploads alternate between its two buffers and no
+    /// `cudaMalloc`/`cudaFree` happens inside the loop.
+    pub fn eval_pool(&mut self, pool: &crate::genome::GenomePool) -> (Vec<f32>, f32) {
+        let n = pool.len();
+        if n == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let width = pool.width();
+        unsafe {
+            if self.pool_cap < pool.capacity() || self.pool_width != width {
+                if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+                    return (Vec::new(), -1.0);
+                }
+                self.pool_cap = pool.capacity();
+                self.pool_width = width;
+            }
+            let which = (self.pool_last ^ 1) as i32;
+            if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+                return (Vec::new(), -1.0);
+            }
+            let mut out = vec![0.0f32; n];
+            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+            self.pool_last = which as usize;
+            (out, ms)
+        }
+    }
+
+    /// #122: canonical postfix hashes of the last [`Self::eval_pool`] batch,
+    /// computed on the device with the same FNV-1a mix as
+    /// [`crate::genome::postfix_hash`]. Used to check the two implementations
+    /// agree and, in the plan, to compact a batch without a host hash pass.
+    pub fn pool_hashes(&mut self, n: usize) -> Vec<u64> {
+        if n == 0 || self.pool_width == 0 {
+            return Vec::new();
+        }
+        unsafe {
+            let mut out = vec![0u64; n];
+            if rc_pool_hash(
+                self.ctx,
+                self.pool_last as i32,
+                n as i32,
+                self.pool_width as i32,
+                out.as_mut_ptr(),
+            ) != 0
+            {
+                return Vec::new();
+            }
+            out
         }
     }
 
@@ -363,19 +666,61 @@ mod tests {
         let mut pop = Population::new();
         assert!(pop.is_empty());
         assert!(pop.add(&trees[0]));
-        // `if` is a branch and has no kernel opcode.
-        assert!(!pop.add(&node(
+        // #131: `if` is native; a constraint has no kernel opcode.
+        assert!(pop.add(&node(
             Op::If,
             vec![input(0), constant(1.0), constant(2.0)]
         )));
+        assert!(!pop.add(&node(Op::Require, vec![input(0)])));
         assert!(pop.add(&trees[1]));
-        assert_eq!(pop.len(), 2);
+        assert_eq!(pop.len(), 3);
         assert_eq!(pop.unsupported(), 1);
         let (prog, offsets) = pop.programs();
         assert_eq!(offsets.len(), pop.len() + 1);
         assert_eq!(offsets[0], 0);
         assert_eq!(*offsets.last().unwrap() as usize, prog.len());
         assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn fixed_slot_pool_matches_the_packed_batch_and_hashes() {
+        use crate::genome::{postfix_hash, GenomeMeta, GenomePool};
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+
+        let width = 16;
+        let mut pool = GenomePool::new(trees.len(), width);
+        let mut expected_hash = Vec::new();
+        for tree in &trees {
+            let mut words = Vec::new();
+            assert!(compile(tree, &mut words));
+            expected_hash.push(postfix_hash(&words));
+            assert!(pool.push(&words, GenomeMeta::default()));
+        }
+        let (slot_sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0, "the fixed-slot kernel ran");
+        assert_eq!(slot_sse.len(), trees.len());
+
+        // The hashes are canonical: the device and host agree bit for bit.
+        let device_hash = ev.pool_hashes(pool.len());
+        assert_eq!(device_hash, expected_hash);
+
+        // The fixed-slot kernel is the same evaluator: batch == one at a time.
+        let pop = Population::from_trees(&trees);
+        let (packed, _) = ev.eval_population(&pop);
+        for i in 0..trees.len() {
+            let tol = 1e-6 * (1.0 + packed[i].abs());
+            assert!(
+                (slot_sse[i] - packed[i]).abs() <= tol,
+                "slot {}: {:.9} vs packed {:.9}",
+                i,
+                slot_sse[i],
+                packed[i]
+            );
+        }
     }
 
     #[test]
@@ -431,5 +776,423 @@ mod tests {
             );
         }
     }
+
+    /// #131: the Rust opcode constants must match the CUDA enum exactly.
+    #[test]
+    fn cuda_opcodes_match_rust_constants() {
+        let src = include_str!("cuda/eval.cu");
+        let mut found = std::collections::BTreeMap::new();
+        for line in src.lines() {
+            let line = line.trim();
+            if !line.starts_with("OP_") {
+                continue;
+            }
+            let Some((name, rest)) = line.split_once('=') else { continue };
+            let name = name.trim();
+            let value: u32 = rest
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+                .expect("opcode value")
+                .parse()
+                .expect("opcode number");
+            if found.insert(name.to_string(), value).is_some() {
+                panic!("duplicate {name} in eval.cu");
+            }
+        }
+        let mut ours = std::collections::BTreeMap::new();
+        for &(name, value) in OPCODE_TABLE {
+            ours.insert(name.to_string(), value);
+        }
+        assert_eq!(found, ours, "gpu.rs and eval.cu opcode enums diverged");
+    }
+
+    /// #131: floor/ceil/round, sign, erf/erfc, min/max and if on special
+    /// values (`NaN`, `±inf`, `±0`, ties, negatives).
+    #[test]
+    fn native_exact_ops_match_cpu_on_special_values() {
+        let a = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            -0.0,
+            2.5,
+            -2.5,
+            3.5,
+            -3.5,
+            7.0,
+            -7.0,
+            1.0,
+            -1.0,
+            1e10,
+            -1e10,
+            0.5,
+            -0.5,
+            3.9196,
+            9.19,
+            10.05,
+            8_388_608.0,
+            -8_388_608.0,
+        ];
+        let b = [
+            3.0,
+            -3.0,
+            3.0,
+            3.0,
+            -3.0,
+            2.5,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.7,
+            -0.7,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            2.0,
+            -2.0,
+            1.0,
+            -1.0,
+            2.0,
+            3.0,
+            -3.0,
+        ];
+        let n = a.len();
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i] as f32;
+            cols[n + i] = b[i] as f32;
+            y[i] = 0.0;
+        }
+        let trees = vec![
+            node(Op::Floor, vec![input(0)]),
+            node(Op::Ceil, vec![input(0)]),
+            node(Op::Round, vec![input(0)]),
+            node(Op::Sign, vec![input(0)]),
+            node(Op::Erf, vec![input(0)]),
+            node(Op::Erfc, vec![input(0)]),
+            node(Op::Min, vec![input(0), input(1)]),
+            node(Op::Max, vec![input(0), input(1)]),
+            node(Op::Min, vec![input(1), input(0)]),
+            node(Op::Max, vec![input(1), input(0)]),
+            node(
+                Op::If,
+                vec![input(0), input(1), node(Op::Neg, vec![input(1)])],
+            ),
+            node(Op::If, vec![input(0), constant(1.0), constant(2.0)]),
+        ];
+        assert_trees_match_cpu(&cols, n, 2, &y, &trees);
+    }
+
+    /// #131: comparisons and logical ops propagate NaN like `expr.rs`, and
+    /// treat only strictly positive values as true.
+    #[test]
+    fn native_comparisons_and_logicals_match_cpu() {
+        let a = [
+            f64::NAN,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            2.5,
+            -2.5,
+        ];
+        let b = [
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            f64::NAN,
+            -2.5,
+        ];
+        let n = a.len();
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i] as f32;
+            cols[n + i] = b[i] as f32;
+            y[i] = 0.0;
+        }
+        let mut trees = Vec::new();
+        for op in [
+            Op::Equal,
+            Op::Less,
+            Op::LessOrEqual,
+            Op::Greater,
+            Op::GreaterOrEqual,
+            Op::And,
+            Op::Or,
+            Op::Xor,
+        ] {
+            trees.push(node(op, vec![input(0), input(1)]));
+        }
+        trees.push(node(Op::Not, vec![input(0)]));
+        assert_trees_match_cpu(&cols, n, 2, &y, &trees);
+    }
+
+    /// #131: `mod` is the floored host formula, including negative divisors.
+    #[test]
+    fn native_mod_matches_floored_semantics() {
+        let a = [
+            -8.0, -7.0, -1.0, 0.0, 1.0, 7.0, 8.0, 8.0, -8.0, 1e6, -1e6, f64::NAN,
+            f64::INFINITY, 3e38, -3e38,
+        ];
+        let b = [
+            2.5, 3.0, 3.0, 3.0, 3.0, 3.0, 2.5, -2.5, -2.5, 7.0, 7.0, 1.0, 1.0, 1.0,
+            1.0,
+        ];
+        let n = a.len();
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = a[i] as f32;
+            cols[n + i] = b[i] as f32;
+            y[i] = 0.0;
+        }
+        let trees = vec![
+            node(Op::Mod, vec![input(0), input(1)]),
+            node(Op::Mod, vec![input(1), input(0)]),
+        ];
+        assert_trees_match_cpu(&cols, n, 2, &y, &trees);
+    }
+
+    /// #131: atan2 on signed zeros, the axes, infinities and NaN.
+    #[test]
+    fn native_atan2_matches_on_axes_and_signed_zero() {
+        let yv = [
+            0.0,
+            -0.0,
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.0,
+            f64::NAN,
+            0.0,
+            -0.0,
+        ];
+        let xv = [
+            0.0,
+            0.0,
+            -0.0,
+            -0.0,
+            0.0,
+            0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            1.0,
+            -1.0,
+            -1.0,
+        ];
+        let n = yv.len();
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = yv[i] as f32;
+            cols[n + i] = xv[i] as f32;
+            y[i] = 0.0;
+        }
+        let trees = vec![node(Op::Atan2, vec![input(0), input(1)])];
+        assert_trees_match_cpu(&cols, n, 2, &y, &trees);
+    }
+
+    /// #131: adding opcodes must not renumber existing programs.
+    #[test]
+    fn existing_program_bytes_are_unchanged() {
+        let t = node(
+            Op::Add,
+            vec![node(Op::Sin, vec![input(0)]), constant(1.0)],
+        );
+        let mut buf = Vec::new();
+        assert!(compile(&t, &mut buf));
+        assert_eq!(
+            buf,
+            vec![
+                OP_VAR,
+                0,
+                OP_SIN,
+                OP_CONST,
+                1.0f32.to_bits(),
+                OP_ADD,
+                OP_HALT
+            ]
+        );
+    }
+
+    /// #131: the per-generation report counts the opcodes that were emitted.
+    #[test]
+    fn opcode_usage_counts_native_ops() {
+        let t = node(
+            Op::Add,
+            vec![
+                node(Op::Floor, vec![input(0)]),
+                node(Op::Min, vec![input(0), input(1)]),
+            ],
+        );
+        let mut pop = Population::new();
+        assert!(pop.add(&t));
+        let usage = pop.opcode_usage();
+        assert_eq!(
+            usage,
+            vec![
+                ("OP_ADD".to_string(), 1),
+                ("OP_FLOOR".to_string(), 1),
+                ("OP_MIN".to_string(), 1),
+            ]
+        );
+    }
+
+    /// Score each tree on the GPU and compare the whole-population SSE with
+    /// the f64 CPU reference. Skips on a machine with no usable device.
+    fn assert_trees_match_cpu(cols: &[f32], n: usize, nv: usize, y: &[f32], trees: &[Node]) {
+        let mut ev = match evaluator_or_skip(cols, n, nv, y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let pop = Population::from_trees(trees.iter());
+        assert_eq!(
+            pop.len(),
+            trees.len(),
+            "every #131 opcode must compile: {} unsupported",
+            pop.unsupported()
+        );
+        let (gpu, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0, "CUDA batch failed");
+        for (i, tree) in trees.iter().enumerate() {
+            let cpu = cpu_sse(tree, cols, n, nv, y);
+            let rel = (gpu[i] as f64 - cpu).abs() / (1.0 + cpu.abs());
+            assert!(
+                rel < 1e-4,
+                "tree {} {:?}: GPU SSE {} vs CPU SSE {} (relative {:.2e})",
+                i,
+                tree.op,
+                gpu[i],
+                cpu,
+                rel
+            );
+        }
+    }
 }
 
+
+#[cfg(test)]
+mod lower_tests {
+    use super::*;
+    use crate::expr::{eval, input};
+
+    fn close(a: f64, b: f64) {
+        if a.is_nan() && b.is_nan() { return; }
+        assert!((a - b).abs() <= 1e-9 * (1.0 + a.abs().max(b.abs())), "{a} vs {b}");
+    }
+
+    fn check(t: Node, rows: &[Vec<f64>]) {
+        let l = lower(&t);
+        let mut buf = Vec::new();
+        assert!(compile(&l, &mut buf), "lowered tree must compile");
+        for r in rows {
+            close(eval(&t, r), eval(&l, r));
+        }
+    }
+
+    #[test]
+    fn lowered_operators_match_the_cpu() {
+        let rows = [
+            vec![-2.0, -0.5], vec![-0.5, 0.0], vec![0.0, 0.0],
+            vec![0.25, 0.75], vec![1.5, 2.0], vec![3.0, -1.0],
+        ];
+        let x = || input(0);
+        let y = || input(1);
+        check(node(Op::Min, vec![x(), y()]), &rows);
+        check(node(Op::Max, vec![x(), y()]), &rows);
+        check(node(Op::If, vec![x(), y(), node(Op::Neg, vec![y()])]), &rows);
+        check(node(Op::Sign, vec![x()]), &rows);
+        check(node(Op::Less, vec![x(), y()]), &rows);
+        check(node(Op::LessOrEqual, vec![x(), y()]), &rows);
+        check(node(Op::Greater, vec![x(), y()]), &rows);
+        check(node(Op::GreaterOrEqual, vec![x(), y()]), &rows);
+        check(node(Op::Equal, vec![x(), y()]), &rows);
+        check(node(Op::And, vec![x(), y()]), &rows);
+        check(node(Op::Or, vec![x(), y()]), &rows);
+        check(node(Op::Xor, vec![x(), y()]), &rows);
+        check(node(Op::Not, vec![x()]), &rows);
+        check(node(Op::Asinh, vec![x()]), &rows);
+        check(node(Op::Atanh, vec![node(Op::Div, vec![x(), constant(4.0)])]), &rows);
+    }
+
+    #[test]
+    fn acosh_matches_on_its_domain() {
+        let t = node(Op::Acosh, vec![input(0)]);
+        let l = lower(&t);
+        for x in [1.0, 1.5, 2.0, 10.0] {
+            close(eval(&t, &[x]), eval(&l, &[x]));
+        }
+    }
+}
+
+#[cfg(test)]
+mod lower_extreme_tests {
+    use super::*;
+    use crate::expr::{constant, eval, input, node, Op};
+
+    #[test]
+    fn min_max_do_not_add_operands() {
+        let cases = [(1e8, 1.0), (3e38, -3e38), (1.0, 1.0), (-0.0, 0.0)];
+        for (a, b) in cases {
+            let mn = node(Op::Min, vec![constant(a), constant(b)]);
+            let mx = node(Op::Max, vec![constant(a), constant(b)]);
+            assert_eq!(eval(&lower(&mn), &[]), a.min(b));
+            assert_eq!(eval(&lower(&mx), &[]), a.max(b));
+        }
+    }
+
+    #[test]
+    fn if_is_exact_for_extreme_arms() {
+        let t = node(Op::If, vec![input(0), constant(1.0), constant(1e8)]);
+        let l = lower(&t);
+        for (x, want) in [(1.0, 1.0), (-1.0, 1e8), (0.0, 1e8)] {
+            assert_eq!(eval(&l, &[x]), want);
+        }
+    }
+
+    #[test]
+    fn asinh_negative_uses_the_odd_form() {
+        let t = node(Op::Asinh, vec![input(0)]);
+        let l = lower(&t);
+        let a = eval(&t, &[-1e8]);
+        let b = eval(&l, &[-1e8]);
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
+    }
+
+    #[test]
+    fn peak_stack_guard_rejects_too_deep() {
+        // right-deep add chain: postfix peak grows with depth
+        let mut t = input(0);
+        for _ in 0..60 {
+            t = node(Op::Add, vec![input(1), t]);
+        }
+        assert!(peak_stack(&t) > 56);
+        let mut pop = Population::new();
+        assert!(!pop.add(&t), "a >56-deep program must be rejected before emission");
+    }
+
+    #[test]
+    fn peak_stack_counts_ternary_pops() {
+        // An `if` pushes 3 and pops 2 (net +1). Two ternaries under one add
+        // peak at 4; counting a ternary as popping one would report 5.
+        let leaf_if = |a: f64, b: f64| {
+            node(Op::If, vec![input(0), constant(a), constant(b)])
+        };
+        let t = node(Op::Add, vec![leaf_if(1.0, 2.0), leaf_if(3.0, 4.0)]);
+        assert_eq!(peak_stack(&t), 4);
+    }
+}

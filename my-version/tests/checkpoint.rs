@@ -5,7 +5,8 @@
 //! archive, bit for bit. The tests also pin down exact tree/RNG round-trips and
 //! the refusal of corrupt checkpoints and mismatched data.
 
-use rcsr::checkpoint::{decode_tree, encode_tree, Checkpoint};
+use rcsr::atomic::Fault;
+use rcsr::checkpoint::{config_hash, decode_tree, encode_tree, Backend, Checkpoint};
 use rcsr::data::Sample;
 use rcsr::expr::{self, constant, input, node, Op};
 use rcsr::rng::Mt;
@@ -231,6 +232,7 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
         // archive-parent feedback keeps this tiny run improving, which is the
         // feature working; the checkpoint round trip is independent of it.
         front_parents: false,
+        gpu: false,
         ..Default::default()
     };
     let text = checkpoint_text(&cfg, &train, &test);
@@ -495,18 +497,180 @@ fn save_alone_does_not_change_the_result() {
 }
 
 #[test]
+fn checkpoint_records_backend_and_canonical_config_hash() {
+    let train = sample(40);
+    let test = sample(10);
+    let mut cfg = config(7);
+    cfg.gpu = false;
+    let text = checkpoint_text(&cfg, &train, &test);
+    assert!(
+        text.contains(&format!("backend {}\n", Backend::Cpu.as_str())),
+        "a CPU checkpoint must record its backend"
+    );
+    assert!(
+        text.contains(&format!("config_hash {:016x}\n", config_hash(&cfg))),
+        "the canonical config hash must be present"
+    );
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(cp.backend, Backend::Cpu);
+    assert_eq!(cp.config_hash, config_hash(&cp.config));
+    // Raising only the generation budget must not change the hash: it is the
+    // one field that a resume may legitimately change.
+    let mut raised = cp.config.clone();
+    raised.generations += 20;
+    assert_eq!(config_hash(&raised), cp.config_hash);
+
+    // Editing a saved setting without updating the hash is refused.
+    let edited = text.replacen("config seed 7", "config seed 8", 1);
+    assert_ne!(edited, text, "fixture must contain the seed line");
+    let err = expect_err(Checkpoint::from_text(&edited), "config edit must fail");
+    assert!(err.contains("config_hash mismatch"), "{}", err);
+}
+
+#[test]
+fn a_gpu_checkpoint_resumed_without_gpu_is_refused_unless_overridden() {
+    let csv = TempPath::new("backend.csv");
+    std::fs::write(&csv.0, line_csv(40)).expect("write csv");
+    let checkpoint = TempPath::new("backend.rcsr");
+
+    let made = rcsr(&[
+        "--data",
+        csv.as_str(),
+        "--target",
+        "y",
+        "--vars",
+        "x",
+        "--seed",
+        "2",
+        "--generations",
+        "3",
+        "--pop",
+        "20",
+        "--save",
+        checkpoint.as_str(),
+        "--cpu",
+        "--quiet",
+    ]);
+    assert!(made.status.success(), "save run failed: {:?}", made);
+
+    // Pretend the checkpoint was produced by the GPU backend. The backend is
+    // deliberately outside config_hash, so only the backend check fires.
+    let text = std::fs::read_to_string(&checkpoint.0).expect("read checkpoint");
+    assert!(text.contains("backend cpu\n"), "fixture must be a CPU run");
+    let text = text.replacen("backend cpu\n", "backend gpu\n", 1);
+    std::fs::write(&checkpoint.0, text).expect("write edited checkpoint");
+
+    let refused = rcsr(&[
+        "--data",
+        csv.as_str(),
+        "--target",
+        "y",
+        "--vars",
+        "x",
+        "--resume",
+        checkpoint.as_str(),
+        "--cpu",
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "backend mismatch is exit 3");
+    let err = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        err.contains("backend mismatch") && err.contains("gpu") && err.contains("cpu"),
+        "the error must name both backends: {}",
+        err
+    );
+
+    let allowed = rcsr(&[
+        "--data",
+        csv.as_str(),
+        "--target",
+        "y",
+        "--vars",
+        "x",
+        "--resume",
+        checkpoint.as_str(),
+        "--allow-backend-change",
+        "--cpu",
+        "--generations",
+        "4",
+        "--quiet",
+    ]);
+    assert!(
+        allowed.status.success(),
+        "the override must let the run proceed: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    let note = String::from_utf8_lossy(&allowed.stderr);
+    assert!(
+        note.contains("backend changed") && note.contains("--allow-backend-change"),
+        "the override must be recorded on stderr: {}",
+        note
+    );
+}
+
+#[test]
+fn a_partial_checkpoint_write_keeps_the_previous_good_generation() {
+    let train = sample(40);
+    let test = sample(10);
+    let cfg = config(13);
+    let text = checkpoint_text(&cfg, &train, &test);
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    let path = TempPath::new("atomic.rcsr");
+    cp.save(&path.0).expect("first save");
+    let good = std::fs::read_to_string(&path.0).expect("first generation");
+
+    let err = cp
+        .save_with_fault(&path.0, Fault::Partial)
+        .expect_err("the injected write must fail");
+    assert!(err.contains("partial"), "{}", err);
+    assert_eq!(
+        std::fs::read_to_string(&path.0).expect("destination after fault"),
+        good,
+        "a killed write must leave the previous checkpoint intact"
+    );
+    assert!(
+        !std::path::Path::new(&format!("{}.prev", path.as_str())).exists(),
+        "a first save has no previous generation to retain"
+    );
+
+    cp.save(&path.0).expect("second save");
+    let prev = format!("{}.prev", path.as_str());
+    assert_eq!(
+        std::fs::read_to_string(&prev).expect("retained previous generation"),
+        good,
+        "the previous good generation must be retained as <path>.prev"
+    );
+    let _ = std::fs::remove_file(prev);
+    let _ = std::fs::remove_file(format!("{}.tmp", path.as_str()));
+}
+
+#[test]
 fn help_and_schema_document_checkpoints() {
     let help = rcsr(&["--help"]);
     assert!(help.status.success());
     let text = String::from_utf8_lossy(&help.stdout);
-    for flag in ["--save", "--save-every", "--resume"] {
+    for flag in [
+        "--save",
+        "--save-every",
+        "--resume",
+        "--allow-backend-change",
+        "--run-manifest",
+        "--json-out",
+        "verify-manifest",
+    ] {
         assert!(text.contains(flag), "--help is missing {flag}");
     }
 
     let schema = rcsr(&["schema"]);
     assert!(schema.status.success());
     let text = String::from_utf8_lossy(&schema.stdout);
-    for flag in ["--save", "--save-every", "--resume"] {
+    for flag in [
+        "--save",
+        "--save-every",
+        "--resume",
+        "--allow-backend-change",
+        "--run-manifest",
+        "--json-out",
+    ] {
         assert!(text.contains(flag), "schema is missing {flag}");
     }
 }

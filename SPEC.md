@@ -18,7 +18,7 @@ short closed-form expressions `f` minimising a chosen error between `f(x)` and
 rcsr --data <file.csv>
      --target <col>
      --vars <c1,c2,...>
-     --metric absolute|squared|correlation
+     --metric absolute|squared|correlation|correlation_signed|...
      --generations <N>          # default 200
      --islands <I>              # default 1
      --pop <P>                  # per-island population, default 200
@@ -270,8 +270,15 @@ For training pairs `(x_k, y_k)`, prediction `p_k = f(x_k)`:
 
 - **absolute** (default): `mean_k |p_k - y_k|`
 - **squared**: `mean_k (p_k - y_k)^2`
-- **correlation**: `1 - corr(p, y)` (minimise is equivalent to maximising the
-  correlation coefficient)
+- **correlation**: `1 - |corr(p, y)|` — shape without direction; an inverted
+  forecast is accepted
+- **correlation_signed**: `1 - corr(p, y)` — shape and direction; an inverted
+  forecast scores 2, not 0
+- **rank_correlation** / **rank_correlation_signed**: the same two conventions
+  on Spearman ranks
+- **auc**, **log_loss**, **hinge**: binary classification; more than two distinct
+  target values are refused with an input error rather than split silently at
+  the midpoint
 
 Any non-finite `p_k` makes the metric `+inf`.
 
@@ -321,6 +328,13 @@ Per generation, per island:
 Every `migration_interval` generations, copy the best member of each island into
 the next island (ring topology). If an island stagnates for `restart_interval`
 generations, restart it from random individuals.
+
+Optional quality-diversity coverage (`--qd`) observes every evaluated
+individual in a rectangular grid over two descriptor axes (variable usage and
+prediction skewness). Each occupied cell keeps a bounded local Pareto front.
+The layer is passive: it does not alter selection, migration, restarts or the
+global archive. `--json` reports the grid size, occupied cells and coverage
+fraction.
 
 Termination: `--generations` reached. Report progress as generations.
 

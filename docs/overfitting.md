@@ -62,7 +62,8 @@ see [`data-splitting.md`](data-splitting.md). Use `--split temporal` or
 (`--gap`) so that near-in-time rows cannot leak across the boundary. The same
 idea is known in the finance literature as **purging and embargo** (López de
 Prado 2018). A random split on a time series is the single most common way to
-fool yourself.
+fool yourself. [`time-series.md`](time-series.md) turns the whole sequence —
+split, purge, preparation, lockbox, trials and costs — into a checklist.
 
 ### 2.3 Keep the model small unless the data pays for it
 Every state-of-the-art method uses some parsimony pressure:
@@ -165,6 +166,29 @@ This is *y-scrambling* (Rücker et al. 2007; Wold & Eriksson), long standard in
 cheminformatics. With `r` control runs the smallest attainable p-value is
 `1/(r+1)`, so use at least 19 runs for p ≤ 0.05 and 99 for p ≤ 0.01.
 
+**Block permutation for autocorrelated series.** Row-by-row shuffling destroys
+serial dependence, so for overlapping labels or autocorrelated returns the i.i.d.
+null is *anti-conservative*: the real fit looks better than a shuffled target
+that no longer resembles the data. `--null-block N` permutes contiguous blocks
+of `N` consecutive target rows instead (all rows are kept exactly once, and the
+same seed reproduces the null):
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2 --split temporal --time t \
+     --null-runs 99 --null-block 24
+# ... null control (99 block-permutation runs, 7 blocks of up to 24 rows,
+#     observed=..., p=0.03) ...
+```
+
+`N` must be at least the label horizon (how many rows a label spans), so each
+block still contains the dependence the label has. The report and JSON record
+`method: "block"`, `block_len`, `blocks`, `observed`, the null distribution and
+`p_value`. `--null-block` without `--null-runs` runs 19 permutations. Use the
+i.i.d. null (`--null-runs` alone) only when rows are genuinely exchangeable;
+use the block null whenever time order or overlapping labels create dependence.
+The calibration test in `my-version/tests/nulls.rs` shows the difference on
+synthetic AR(1) data: i.i.d. shuffling over-rejects, block permutation does not.
+
 **Honest limitation:** it tests the *combination* of data and search power. A
 weak search can fail to beat the control on real data (it simply cannot find the
 law), so a high p-value is not proof of no signal — only that the search has not
@@ -255,9 +279,10 @@ The cutoff is a practical choice, not a theorem: the literature puts k-d trees
 in their intended regime around `d <= 10` and worse than linear search beyond
 about 16.
 
-Only when the exact query cost is unaffordable can the **query rows** be
-sampled: `--baseline-samples N` scores at most `N` deterministic query rows per
-set (training and each test fold), seeded from `--seed`. This is offered only
+The **query rows** are bounded by default: `--baseline-samples N` scores at
+most `N` deterministic query rows per set (training and each test fold), seeded
+from `--seed`, and the default is **512**. On a small panel (at most 512 rows)
+that is every row, so the result is exact. This is offered only
 for the mean-loss metrics **absolute**, **squared** and **log_squashed**, where
 the sample average is an unbiased estimate of the full row-average loss. For
 median, maximum, correlation, rank correlation, interquartile, slope,
@@ -266,9 +291,12 @@ estimator, so the CLI refuses the flag. When sampling happens the text line
 says `sampled=true`, and `--json` carries `baselines.knn.train_query_rows`,
 `train_query_sem`, `test_query_rows` and `test_query_sem`. The SEMs use the
 finite-population correction for sampling without replacement,
-`(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored. The default
-`--baseline-samples 0` means no caps at all: every query row is scored.
-`baselines.knn.reference_rows` is reported too and is always the training size.
+`(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored.
+`--baseline-samples 0` explicitly means no caps at all: every query row is
+scored, which is `O(N_train²·d)` and should be opt-in on large panels.
+`baselines.knn.reference_rows`, `train_query_rows`, `test_query_rows`,
+`capped`, both SEMs and `seconds` are reported. The reference set is always the
+training size.
 
 At 20k rows (15k training) `--baseline-samples 4096` gives a 95% interval of
 roughly ±2.5% of the 5-NN value; ask for about 9.5k queries for ±1%. The
@@ -305,17 +333,27 @@ rcsr ... --null-runs 19
 
 ### 3.8 Pick a metric that matches the loss you care about
 The metric decides what "good" means, so choosing it is itself a modelling
-choice. `--metric` selects one of sixteen objectives:
+choice. `--metric` selects one of twenty objectives:
 
 * `absolute` (default) and `squared` — squared punishes large residuals hard;
 * `median` and `interquartile` — robust to a few outliers;
 * `log_squashed` — squared-like but with bounded influence;
 * `maximum` — minimise the single worst row;
 * `signed` — penalise a consistent bias;
-* `correlation` and `rank_correlation` — care about shape, not level or offset;
+* `correlation` and `rank_correlation` — care about shape, not level, offset or
+  **direction**: both score `1 - |r|`, so a perfectly inverted forecast scores
+  zero. Use them when either sign is a valid law (e.g. an unsigned relation);
+* `correlation_signed` and `rank_correlation_signed` — score `1 - r`, so the
+  sign is part of the objective and an inverted forecast is penalised. Use them
+  for directional signals (returns, demand, a control response) where the
+  forecast has to rise and fall with the target;
 * `slope` — match the trend rather than the level;
-* `auc`, `log_loss`, `hinge` — classification; the target is read as two classes
-  and the model output as a logit;
+* `auc`, `log_loss`, `hinge` — classification; the target must have exactly two
+  distinct values (or one, which scores as chance). The model output is a
+  logit. A `{-1, 0, +1}` target is **rejected** rather than silently split at
+  the midpoint; collapse it to two classes first. `auc` is the only
+  direction-blind classification metric (it rewards rank separation), while
+  `log_loss` and `hinge` also reward the correct logit sign;
 * `aic`, `aicc`, `bic` — fit measured against the number of fitted constants, so
   parsimony drives the front directly instead of only being reported.
 
@@ -463,12 +501,26 @@ summary is bit-identical to the pre-#92 result.
 
 ## 4. What `rcsr` reports today
 
+### The test lockbox and the validation slice
+
+The holdout is a **lockbox**: a block you may look at to report an honest error,
+but not to choose a model. Selecting the best of many candidates by
+`test_error` spends the block and makes the reported number optimistic. With
+`--validation-frac f`, the last `f` share of the chronological training period
+becomes a validation slice, separated from fit-train by the `--gap` embargo.
+Selection ranks on validation by default (`--select-by validation|train|aicc`)
+and `test_error` stays scoring-only. The synthetic test in
+`my-version/tests/validation.rs` demonstrates the leak: ranking by test reports
+a smaller test error than the validation-selected candidate, while the
+test-selected candidate is the worse model on validation.
+
 Every solution carries:
 
 | Field | Meaning |
 |---|---|
 | `train_error` | error on the fitting rows |
-| `test_error` | error on held-out rows (mean over `--folds` blocks) |
+| `validation_error` | error on the chronological validation slice when `--validation-frac` is set; the default selection criterion |
+| `test_error` | error on the held-out **lockbox** (mean over `--folds` blocks). Scoring-only: never rank candidates by it |
 | `fold_errors` | the individual held-out blocks |
 | `k_constants` | fitted constants — the model's free parameters |
 | `aicc`, `bic` | fit vs. constants (lower is better) |
@@ -479,7 +531,9 @@ Every solution carries:
 
 and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
-verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
+verdict. With `--null-block N` the same object adds `method: "block"`,
+`block_len`, `blocks` and the `observed` error, so a report says which null was
+used. With `--bootstrap-error n`, every Pareto row additionally carries a
 `bootstrap_error` object with the `apparent`, `oob`, `no_information`,
 `relative_overfitting`, `weight` and `estimate` values of §3.9, plus
 `source_rows`, `resample_rows` and `capped`, so a BLB-bounded resample is never

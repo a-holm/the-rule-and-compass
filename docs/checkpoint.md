@@ -22,7 +22,8 @@ rcsr --data examples/line.csv --target y --vars x \
 |---|---|
 | `--save <file>` | write a checkpoint on exit and every `--save-every` generations |
 | `--save-every <N>` | generation interval for `--save` (default `25`, requires `--save`) |
-| `--resume <file>` | continue from a checkpoint |
+| `--resume <file>` | continue from a checkpoint, refusing a data or backend mismatch |
+| `--allow-backend-change` | permit a CPU↔GPU resume, recorded on stderr and in the run manifest |
 
 A checkpoint is written at a **generation boundary**, after the generation's
 evolution, migration and island restarts have all completed. The final write on
@@ -30,6 +31,12 @@ exit happens before the full-data archive rebuild, so the saved archive is the
 search archive at the last completed generation. Saving only reads the state; it
 never consumes a random number or mutates a population, so `--save` alone cannot
 change the result.
+
+Each save is **atomic**: the new text is written to `<file>.tmp`, flushed with
+`fsync`, and renamed over `<file>`. The previous good generation is retained as
+`<file>.prev` (hard link where possible, copy otherwise). A process killed
+during a save therefore leaves the last complete checkpoint readable; the
+fault-injection test in `tests/checkpoint.rs` proves this.
 
 `--save` and `--resume` apply to the main search. Auxiliary searches
 (`--cv`, `--stability`, `--null-runs`, `--report benchmark`) are reported as
@@ -61,6 +68,8 @@ config dedup true
 config time_budget none
 config patience 40
 config predictor_samples none
+backend cpu
+config_hash 4f0c2a1c74b1e0a9
 generations 20
 stopped_early false
 best_prev 1.9968344769643271
@@ -80,6 +89,8 @@ Every record:
 | record | contents |
 |---|---|
 | `config <key> <value>` | one search setting. All settings that influence the trajectory are present; `complexity.op_costs` carries one cost per `Op`, in discriminant order. `units`, `units.target` and `require_dimensions` are optional: they are written only when `--units` is active, and a checkpoint without them loads as units-free. `front_parents` is optional too: it is written only when `--no-front-parents` is used, and a checkpoint without it loads with the Pareto-front feedback on. |
+| `backend <cpu\|gpu\|unknown>` | evaluator that produced the state (#140). New checkpoints always write `cpu` or `gpu`; `unknown` only appears when reading a checkpoint from before this record existed. |
+| `config_hash <hex>` | FNV-1a 64-bit hash of the canonical `config` lines, excluding the `generations` budget (resuming may raise it). The loader recomputes it and refuses a checkpoint whose configuration text does not agree. |
 | `generations <n>` | completed generations (the next generation to run). |
 | `stopped_early <bool>` | the saved run had already converged, hit its patience limit or its time budget. Resuming it does not run more generations. |
 | `best_prev <f64>` | lowest error seen so far, used by the patience comparison. |
@@ -130,7 +141,10 @@ different tree encoding) bumps the version to `v2`; a `v1` reader refuses it wit
 `unsupported checkpoint version ...; this build reads 'rcsr-checkpoint v1'`.
 Within `v1`, unknown records and unknown configuration keys are errors rather
 than being ignored, and duplicate records are errors. A future reader may accept
-older versions, but a v1 checkpoint is never silently reinterpreted.
+older versions, but a v1 checkpoint is never silently reinterpreted. The
+`backend` and `config_hash` records added in #140 are optional on read: a v1
+checkpoint written before them loads with `backend unknown` and a freshly
+computed hash, while every new checkpoint writes both.
 
 ## Data fingerprint
 
@@ -167,6 +181,26 @@ The saved configuration is authoritative. On `--resume`:
 Non-search flags (input file, column names, output format, reports, `--top`, …)
 are free to change, subject to the data fingerprint. `--save` may be combined
 with `--resume`; saving to the same path overwrites it at the next boundary.
+
+### Backend identity
+
+The saved `backend` is checked before the search starts. A GPU checkpoint
+resumed without `--gpu` (or a CPU checkpoint resumed with `--gpu`) is refused
+with exit code `3`:
+
+```text
+checkpoint backend mismatch: saved run used 'gpu', this run uses 'cpu';
+pass --allow-backend-change to resume across backends (the trajectory and
+reported errors will differ)
+```
+
+`--allow-backend-change` is the only override. It prints
+`# checkpoint: backend changed gpu -> cpu (allowed by --allow-backend-change)`
+and records the pair under `resume.backend_change` in `--run-manifest`.
+This check exists because a GPU run saves f32 proxy fitness; continuing it with
+the CPU f64 evaluator would silently select against a different objective.
+A checkpoint written before this record existed loads as `backend unknown` and
+is allowed to resume (there is no saved identity to check).
 
 ## Determinism guarantee and its limits
 
@@ -212,6 +246,7 @@ Limits:
 |---|---|
 | checkpoint cannot be read, is truncated, has a bad version/op index/arity, or has a duplicate/missing record | `3` (input) |
 | data fingerprint mismatch | `3` (input) |
+| saved `backend` differs and `--allow-backend-change` was not given | `3` (input) |
 | `--resume` contradicts a saved search setting; `--save-every` without `--save`; invalid flag value | `2` (usage) |
 | checkpoint cannot be written | `3` (input) |
 

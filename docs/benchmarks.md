@@ -286,3 +286,28 @@ above confirm there is no size drift at this budget.
   (the front is large). It answers "was the law on the front?", which is the
   right question for a *generator*, and the recorded numbers should be read that
   way.
+
+## 5. Timing schema (`--json`, `--ndjson`, reports)
+
+Every search run reports a non-overlapping wall-clock ledger in a `timing`
+object (and text reports print a `# time:` line plus a `## Time` section):
+
+| field | covers |
+|---|---|
+| `prep_seconds` | argument parsing, loading, splitting and data preparation |
+| `search_seconds` | the evolutionary search only |
+| `baselines_seconds` | the mean, OLS and k-NN null baselines |
+| `diagnostics_seconds` | Pareto-row diagnostics, bootstrap, stability, CV, null control |
+| `report_seconds` | building the Markdown report |
+| `total_seconds` | measured wall from the start of the command to the end of the phases |
+
+The phases are disjoint and are checked against `total_seconds` (within 1% in
+the test on a real CLI run), so a large baseline or bootstrap cannot hide
+outside the numbers. `elapsed_seconds` is **kept for compatibility and means
+`search_seconds`**; use `total_seconds` for the cost of the whole run. The same
+fields appear in the NDJSON `done` event.
+
+The k-NN baseline reports its own sampling fields (`reference_rows`,
+`query_rows`, `capped`, `sem`, `seconds`); on an uncapped run
+`baselines_seconds` is the magnitude of that exact O(N²·d) work, not zero.
+
