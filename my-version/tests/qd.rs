@@ -106,3 +106,57 @@ fn an_invalid_grid_is_a_usage_error() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("--qd-cells"), "{err}");
 }
+
+#[test]
+fn cvt_mode_is_reported_deterministic_and_updates_centroids() {
+    let a = json(&["--qd-cvt", "--qd-cells", "16"]);
+    let b = json(&["--qd-cvt", "--qd-cells", "16"]);
+    assert_eq!(qd_object(&a), qd_object(&b), "CVT archive is not deterministic");
+    let q = qd_object(&a);
+    assert!(q.contains("\"mode\":\"cvt\""), "{q}");
+    assert!(q.contains("\"cells\":16"), "{q}");
+    assert!(q.contains("\"hypervolume\""), "{q}");
+    assert!(q.contains("\"evaluations\""), "{q}");
+    // CVT updates need observations; a real search must have offered some.
+    let offered: usize = q
+        .split("\"evaluations\":")
+        .nth(1)
+        .and_then(|s| s.split('}').next())
+        .and_then(|s| s.parse().ok())
+        .expect("evaluations");
+    assert!(offered > 0, "{q}");
+}
+
+#[test]
+fn the_qd_policy_is_opt_in_and_does_not_change_the_disabled_trajectory() {
+    let off = json(&[]);
+    let passive = json(&["--qd"]);
+    assert_eq!(pareto(&off), pareto(&passive));
+    let policy = json(&["--qd-policy", "--qd-cells", "16"]);
+    assert!(!policy.contains("\"qd\":null"), "{policy}");
+    let q = qd_object(&policy);
+    assert!(q.contains("\"mode\":\"cvt\""), "{q}");
+    // The policy is deterministic for a seed and reports its own front.
+    let again = json(&["--qd-policy", "--qd-cells", "16"]);
+    assert_eq!(qd_object(&policy), qd_object(&again));
+    assert_eq!(pareto(&policy), pareto(&again));
+}
+
+#[test]
+fn cvt_accepts_the_k512_design_size() {
+    let q = qd_object(&json(&["--qd-cvt", "--qd-cells", "512"]));
+    assert!(q.contains("\"cells\":512"), "{q}");
+}
+
+#[test]
+fn the_two_controls_are_available_and_deterministic() {
+    let uniform = json(&["--qd-uniform", "--qd-cells", "16"]);
+    let again = json(&["--qd-uniform", "--qd-cells", "16"]);
+    assert_eq!(qd_object(&uniform), qd_object(&again));
+    assert!(qd_object(&uniform).contains("\"mode\":\"cvt\""));
+
+    let random = json(&["--qd-random", "--qd-cells", "16"]);
+    assert!(qd_object(&random).contains("\"mode\":\"random\""), "{}", qd_object(&random));
+    let again = json(&["--qd-random", "--qd-cells", "16"]);
+    assert_eq!(qd_object(&random), qd_object(&again));
+}

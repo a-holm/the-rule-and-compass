@@ -395,8 +395,18 @@ SEARCH:
   --qd                       record an opt-in quality-diversity archive over
                              (variable usage x prediction skewness), passive;
                              it never changes parents or the Pareto front
-  --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
+  --qd-cells <N>             descriptor cells (grid bins per axis or CVT K;
+                             2..=512; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
+  --qd-cvt                   use CVT-MAP-Elites (K centroids, Lloyd updates)
+                             instead of the rectangular grid
+  --qd-policy                feed the archive back into parent selection (UCB1
+                             60/25/10/5), stratified migration and least-
+                             occupied restarts; implies --qd --qd-cvt
+  --qd-uniform               control: the policy selects occupied cells
+                             uniformly instead of the UCB1 mix
+  --qd-random                control: hash descriptors to random cells, so the
+                             partition carries no behaviour information
   --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
@@ -515,12 +525,14 @@ fn jnum(v: f64) -> String {
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd: {}/{} cells occupied ({:.1}%), {} entries, best error {}",
+            "# qd ({}): {}/{} cells occupied ({:.1}%), {} entries, best error {}, hypervolume {:.4}",
+            q.mode,
             q.occupied,
             q.cells,
             100.0 * q.coverage,
             q.entries,
-            jnum(q.best_error)
+            jnum(q.best_error),
+            q.hypervolume
         );
     }
 }
@@ -530,14 +542,17 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{}}}",
+            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            q.mode,
             q.bins,
             q.cells,
             q.occupied,
             jnum(q.coverage),
             q.entries,
             jnum(q.best_error),
-            q.cell_cap
+            q.cell_cap,
+            jnum(q.hypervolume),
+            q.evaluations
         ),
     }
 }
@@ -1156,16 +1171,16 @@ fn main() {
             // #120: opt-in quality-diversity coverage archive.
             "--qd" => {
                 if cfg.qd_bins == 0 {
-                    cfg.qd_bins = 16;
+                    cfg.qd_bins = if cfg.qd_cvt { 512 } else { 16 };
                 }
             }
             "--qd-cells" => {
                 let v = val!();
                 match v.parse::<usize>() {
-                    Ok(n) if (2..=256).contains(&n) => cfg.qd_bins = n,
+                    Ok(n) if (2..=512).contains(&n) => cfg.qd_bins = n,
                     _ => {
                         eprintln!(
-                            "error: --qd-cells needs an integer in 2..=256, got '{}'",
+                            "error: --qd-cells needs an integer in 2..=512, got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -1183,6 +1198,34 @@ fn main() {
                         );
                         std::process::exit(EXIT_USAGE);
                     }
+                }
+            }
+            "--qd-cvt" => {
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-policy" => {
+                cfg.qd_policy = true;
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-uniform" => {
+                cfg.qd_policy = true;
+                cfg.qd_control = 1;
+                cfg.qd_cvt = true;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
+                }
+            }
+            "--qd-random" => {
+                cfg.qd_policy = true;
+                cfg.qd_control = 2;
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 512;
                 }
             }
             // #76: exactness escape hatch; the default is on.

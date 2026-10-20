@@ -1013,6 +1013,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_strategy",  // #116: missing means `exact`
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
+        "qd_cvt",        // #120
+        "qd_policy",     // #120
+        "qd_control",    // #120
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1222,6 +1225,35 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
     if qd_cell_cap == 0 {
         return Err("config 'qd_cell_cap' must be at least 1".to_string());
     }
+    let qd_cvt = match fields.get("qd_cvt").map(|s| s.as_str()) {
+        None => false,
+        Some("true") => true,
+        Some("false") => false,
+        Some(raw) => return Err(format!("config 'qd_cvt' must be true or false, got '{}'", raw)),
+    };
+    let qd_policy = match fields.get("qd_policy").map(|s| s.as_str()) {
+        None => false,
+        Some("true") => true,
+        Some("false") => false,
+        Some(raw) => {
+            return Err(format!(
+                "config 'qd_policy' must be true or false, got '{}'",
+                raw
+            ))
+        }
+    };
+    let qd_control = match fields.get("qd_control") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<u8>()
+            .map_err(|_| format!("bad config value for 'qd_control': '{}'", raw))?,
+    };
+    if qd_control > 2 {
+        return Err(format!(
+            "config 'qd_control' must be 0, 1 or 2, got {}",
+            qd_control
+        ));
+    }
 
     Ok(Config {
         generations: num_usize("generations")?,
@@ -1248,6 +1280,9 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         require_dimensions,
         qd_bins,
         qd_cell_cap,
+        qd_cvt,
+        qd_policy,
+        qd_control,
         progress: None,
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
@@ -1336,6 +1371,9 @@ fn write_config(cfg: &Config, out: &mut String) {
     if cfg.qd_bins > 0 {
         writeln!(out, "config qd_bins {}", cfg.qd_bins).unwrap();
         writeln!(out, "config qd_cell_cap {}", cfg.qd_cell_cap).unwrap();
+        writeln!(out, "config qd_cvt {}", cfg.qd_cvt).unwrap();
+        writeln!(out, "config qd_policy {}", cfg.qd_policy).unwrap();
+        writeln!(out, "config qd_control {}", cfg.qd_control).unwrap();
     }
 }
 
