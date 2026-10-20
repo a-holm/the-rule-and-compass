@@ -164,7 +164,16 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                                              subjects, sensors), never both sides
                              temporal-group  a temporal split inside every group
                              auto            infer from the columns and report
-  --time <col>               time/ordering column; implies temporal
+  --time <col>               time/ordering column; implies temporal. Accepts
+                             epoch numbers or ISO 8601 with a Z / +-HH:MM offset
+  --date-only <policy>       date-only time values: error (default, refuses an
+                             under-specified instant), utc-midnight or
+                             session-close (21:00 UTC)
+  --time-unit s|ms|us|ns     unit of a numeric time column (default: detect;
+                             a mixed or out-of-range column is refused)
+  --tz <offset>              fixed offset for timestamps without one (UTC or
+                             +-HH:MM; named zones need a tz database and are
+                             refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
   --gap <rows>               embargo: rows dropped between train and test to stop
@@ -601,6 +610,9 @@ fn main() {
     let mut lags = 0usize;
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
+    let mut date_only = data::DateOnlyPolicy::Error;
+    let mut time_unit: Option<data::TimeUnit> = None;
+    let mut tz: Option<i64> = None;
     let mut null_runs = 0usize;
     // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
     let mut baseline_samples = 0usize;
@@ -842,6 +854,37 @@ fn main() {
             "--lags" => lags = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
+            // #130: strict time parsing. Every choice is reported.
+            "--date-only" => {
+                let v = val!();
+                match data::DateOnlyPolicy::parse(&v) {
+                    Ok(p) => date_only = p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--time-unit" => {
+                let v = val!();
+                match data::TimeUnit::parse(&v) {
+                    Ok(u) => time_unit = Some(u),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--tz" => {
+                let v = val!();
+                match data::TimeSpec::parse_tz(&v) {
+                    Ok(o) => tz = Some(o),
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
             // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
@@ -1770,6 +1813,11 @@ fn main() {
             lags,
             history_frac,
             gap_break,
+            time: data::TimeSpec {
+                date_only,
+                unit: time_unit,
+                tz,
+            },
         };
         match data::add_lags(&table, &vars, &lag_spec, time_col, group_col) {
             Ok((t2, v2, rep)) => {
@@ -1829,6 +1877,11 @@ fn main() {
         train_select,
         test_select,
         exclude,
+        time: data::TimeSpec {
+            date_only,
+            unit: time_unit,
+            tz,
+        },
     };
     let prep = data::PrepSpec {
         fill,
