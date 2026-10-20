@@ -88,6 +88,19 @@ selects rather than branches. Anything non-finite, or larger than a shared
 magnitude limit of 1e30, counts as a hard failure on **both** sides — so the
 GPU and CPU agree on which candidates are hopeless.
 
+**Exact lowering for the common "missing" operators (#121).** Before emission,
+`gpu.rs::lower` rewrites `min`, `max`, `if`, `sign`, comparisons, `and`/`or`/
+`xor`/`not`, `asinh`, `acosh` and `atanh` into the branchless opcode set, using
+`step` gates that never add the two operands (so `min(1e8, 1)` stays `1`). This
+keeps `if`-bearing candidates on the GPU instead of sending each one to the
+serial CPU fallback. The identities are exact for finite operands; NaN
+propagation for comparisons/logicals, an unselected non-finite `if` arm, and an
+infinite `min`/`max` operand still differ from `expr::eval`, and the final f64
+CPU rescore remains the authority. Operators with no exact rewrite (`floor`,
+`ceil`, `round`, `mod`, `atan2`, `erf`, `erfc`, constraints) still take the CPU
+fallback until #131 adds native opcodes. A lowered program is rejected before
+launch when its postfix stack could exceed the kernel's 64 slots.
+
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
 FP64 runs at **1/64 of FP32**, so an FP64 kernel would throw away the whole
 advantage. FP64 is reserved for re-checking the final surviving equations on the
