@@ -90,7 +90,7 @@ pub fn json() -> String {
         ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
         ("--qd-cells", "int", "16", "descriptor grid bins per axis (2..=256; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
-        ("--pipeline-depth", "int", "2", "bounded CPU/GPU overlap depth in batches (0 = synchronous; only with --gpu); results and archive identical to the synchronous path"),
+        ("--pipeline-depth", "int", "2", "split each generation into N chunks (ceil(pop/N) candidates each) and score one chunk while later chunks are generated and fitted; 0 = synchronous. The queue holds at most one generation and results/archive are identical to the synchronous path; only with --gpu"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations; the write is atomic and the previous generation is kept as <file>.prev"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),

@@ -111,11 +111,11 @@ pub struct Config {
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
     pub gpu_notes: bool,
-    /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
-    /// While the GPU scores a batch, the CPU keeps generating and fitting the
-    /// next candidates. This is a scheduling choice only: the scored values,
-    /// candidate order and archive are identical to the synchronous path, so it
-    /// is not saved in a checkpoint.
+    /// #119: split each generation into this many chunks (`0` disables) and
+    /// score one chunk while the CPU generates and fits the next. This is a
+    /// scheduling choice only: the scored values, candidate order and archive
+    /// are identical to the synchronous path, so it is not saved in a
+    /// checkpoint.
     pub pipeline_depth: usize,
 }
 
@@ -380,6 +380,10 @@ struct GpuSearch {
     /// once (grown only if a later batch is larger) and reused every generation,
     /// so a generation never calls `cudaMalloc` for its programs.
     pool: Option<crate::genome::GenomePool>,
+    /// #119: one batch-sized arena for the overlap scorer. It is reused for
+    /// every chunk, so chunking never allocates device memory or re-reserves
+    /// the persistent program arena.
+    chunk_pool: Option<crate::genome::GenomePool>,
     /// #131: per-generation opcode/fallback counts.
     stats: BTreeMap<usize, GpuGenStats>,
 }
@@ -414,6 +418,7 @@ impl GpuSearch {
                 ev,
                 n_rows,
                 pool: None,
+                chunk_pool: None,
                 stats: BTreeMap::new(),
             }),
             None => Err(format!(
@@ -517,6 +522,80 @@ impl GpuSearch {
             rescore_pending_cpu(islands, &train_view, cfg);
         }
         Ok(())
+    }
+
+    /// #119: score one already-fitted chunk of candidates, keyed by
+    /// `(island, slot)`.
+    ///
+    /// This is deliberately the same arithmetic and the same fallback rule as
+    /// [`GpuSearch::score`] — a tree that does not compile is left pending for
+    /// the exact CPU path at the generation barrier — but it touches only the
+    /// jobs handed to it, so the scorer can start before the generation ends.
+    /// Per-generation accounting (#131) is merged into the same map as the
+    /// barrier path, so an overlapped run reports the same program/fallback
+    /// counts as the synchronous one. Returns the number of programs compiled.
+    fn score_chunk(
+        &mut self,
+        jobs: Vec<PipelineJob>,
+        results: &mut [Vec<Option<f64>>],
+        generation: usize,
+        width: usize,
+    ) -> Result<usize, String> {
+        let n_jobs = jobs.len();
+        // Reuse one arena for every chunk of every generation. The width and
+        // capacity come from the same rule as `score`, so a tree is compiled by
+        // exactly the same host path in both schedules.
+        let reuse = self
+            .chunk_pool
+            .as_ref()
+            .map_or(false, |p| p.capacity() >= n_jobs && p.width() == width);
+        if !reuse {
+            self.chunk_pool = Some(crate::genome::GenomePool::new(n_jobs.max(1), width));
+        }
+        let pool = self.chunk_pool.as_mut().expect("a chunk pool was allocated");
+        pool.begin_generation();
+        let mut slots: Vec<(usize, usize)> = Vec::with_capacity(n_jobs);
+        for (i, j, tree) in jobs {
+            let mut buf = Vec::new();
+            let meta = crate::genome::GenomeMeta {
+                island: i as u16,
+                tag: j as u32,
+                ..Default::default()
+            };
+            // Deliberately `gpu::compile`, not `Population::add`: the
+            // synchronous scorer does not lower trees, so lowering here would
+            // put a `f32` result where the other path puts a `f64` fallback.
+            if crate::gpu::compile(&tree, &mut buf)
+                && buf.len() <= width
+                && pool.push(&buf, meta)
+            {
+                slots.push((i, j));
+            }
+        }
+        // #131: the same program accounting `score` performs. Several chunks
+        // belong to one generation, so merge them rather than overwriting.
+        // Fallbacks are deliberately *not* counted here: the candidates left
+        // pending are retried by `score` at the barrier, which is where the
+        // synchronous path counts them. Counting both would double the report.
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
+        stats.programs += pool.len();
+        if pool.is_empty() {
+            return Ok(0);
+        }
+        let (sse, ms) = self.ev.eval_pool(pool);
+        if ms < 0.0 || sse.len() != pool.len() {
+            return Err("CUDA batch evaluation failed".to_string());
+        }
+        let n = self.n_rows as f64;
+        for (&(i, j), &s) in slots.iter().zip(&sse) {
+            results[i][j] = Some(if s.is_finite() {
+                (s as f64) / n
+            } else {
+                f64::INFINITY
+            });
+        }
+        Ok(pool.len())
     }
 
     /// #131: the per-generation report, in generation order.
@@ -650,39 +729,25 @@ fn score_generation(
 /// `None` and scored by the normal barrier path afterwards. A CUDA failure is
 /// returned to the caller, which stops the GPU and re-scores the whole
 /// generation on the CPU.
+///
+/// The batch is fitted on the CPU by its producer. `score_chunk` is the single
+/// seam through which a batched *fit* arm (#169) can enter: when constants are
+/// deferred instead of fitted on the CPU, it must be fitted inside this call,
+/// before the same programs are scored. Until that arm is present the search
+/// disables overlap for a deferring fit strategy (see `fit_defers_to_gpu`), so
+/// this path can never score an unfitted tree.
 #[cfg(feature = "cuda")]
 fn score_pipeline_batch(
     jobs: Vec<PipelineJob>,
     gpu: &mut Option<GpuSearch>,
     results: &mut [Vec<Option<f64>>],
-    n_rows: usize,
-) -> Result<(), String> {
+    generation: usize,
+    width: usize,
+) -> Result<usize, String> {
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
-    let mut pop = crate::gpu::Population::new();
-    let mut slots: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
-    for (i, j, tree) in jobs {
-        if pop.add(&tree) {
-            slots.push((i, j));
-        }
-    }
-    if pop.is_empty() {
-        return Ok(());
-    }
-    let (sse, ms) = g.ev.eval_population(&pop);
-    if ms < 0.0 || sse.len() != pop.len() {
-        return Err("CUDA batch evaluation failed".to_string());
-    }
-    let n = n_rows as f64;
-    for (&(i, j), &s) in slots.iter().zip(&sse) {
-        results[i][j] = Some(if s.is_finite() {
-            (s as f64) / n
-        } else {
-            f64::INFINITY
-        });
-    }
-    Ok(())
+    g.score_chunk(jobs, results, generation, width)
 }
 
 /// #26: whether a run may use the GPU at all.
@@ -1274,6 +1339,39 @@ fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot
     }
 }
 
+/// #119: discard every value the overlap scorer wrote, so a CUDA failure can
+/// rebuild the whole generation exactly in `f64`.
+///
+/// The synchronous path scores a generation in one batch, so its failure
+/// handler only ever sees pending candidates. With overlap, earlier chunks may
+/// already hold `f32` proxy errors when a later chunk fails; mixing those with
+/// a CPU re-score would silently select on two different objectives. Marking
+/// the written slots pending again (and leaving the carried elite untouched)
+/// keeps the failed generation exact.
+#[cfg(any(feature = "cuda", test))]
+fn discard_pipeline_results(results: &[Vec<Option<f64>>], islands: &mut [Vec<Ind>]) {
+    for (i, slots) in results.iter().enumerate() {
+        for (j, value) in slots.iter().enumerate() {
+            if value.is_some() {
+                islands[i][j].error = f64::NAN;
+            }
+        }
+    }
+}
+
+/// #119/#169: whether the configured fitter leaves constants for a batched
+/// GPU arm instead of fitting them on the CPU in the producer.
+///
+/// The overlap queue carries *fitted* trees: the scorer only evaluates them.
+/// A deferring fit must travel with its score in the same batch, so overlap is
+/// switched off for such a strategy until [`GpuSearch::score_chunk`] grows that
+/// combined step. Asking by name keeps this branch independent of #169; today
+/// no arm returns `true`, so the guard is a no-op.
+#[cfg(feature = "cuda")]
+fn fit_defers_to_gpu(cfg: &Config) -> bool {
+    cfg.fit_iters > 0 && cfg.fit_strategy.name() == "gpu"
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
 #[allow(clippy::too_many_arguments)]
@@ -1708,9 +1806,9 @@ fn run_search(
                             "synchronous batches".to_string()
                         } else {
                             format!(
-                                "overlap depth {} (batches of {})",
+                                "overlap depth {} (chunks of {})",
                                 cfg.pipeline_depth,
-                                (cfg.pop / cfg.pipeline_depth.max(1)).max(1)
+                                crate::pipeline::chunk_plan(cfg.pop, cfg.pipeline_depth).batch
                             )
                         };
                         eprintln!(
@@ -2047,14 +2145,17 @@ fn run_search(
             // bounded queue and scores batches. Selection still waits for every
             // result at the barrier, so the trajectory is unchanged.
             #[cfg(feature = "cuda")]
-            let pipeline_active = !screened && defer_gpu && cfg.pipeline_depth > 0;
+            let pipeline_active =
+                !screened && defer_gpu && cfg.pipeline_depth > 0 && !fit_defers_to_gpu(cfg);
             #[cfg(not(feature = "cuda"))]
             let pipeline_active = false;
-            // One batch is `pop / depth` candidates, so `depth` batches queue
-            // ahead of the scorer; live memory is at most `(depth + 1) * batch`
-            // candidate trees plus their compiled programs.
-            let batch_size = (cfg.pop / cfg.pipeline_depth.max(1)).max(1);
-            let queue_capacity = cfg.pipeline_depth.max(1) * batch_size;
+            // One batch is `ceil(pop / depth)` candidates, so `depth` batches
+            // cover the generation and the scorer starts after the first
+            // chunk. Live candidate trees are bounded by one generation plus
+            // the batch in the scorer's hands (see `pipeline::chunk_plan`).
+            let plan = crate::pipeline::chunk_plan(cfg.pop, cfg.pipeline_depth);
+            let batch_size = plan.batch;
+            let queue_capacity = plan.capacity;
             #[cfg(not(feature = "cuda"))]
             let _ = (pipeline_active, batch_size, queue_capacity);
             #[cfg(feature = "cuda")]
@@ -2113,13 +2214,15 @@ fn run_search(
                 #[cfg(feature = "cuda")]
                 if let Some(queue) = queue {
                     pipeline_error = queue.drain(batch_size, |jobs| {
-                        pipeline_scored = true;
-                        score_pipeline_batch(
+                        let compiled = score_pipeline_batch(
                             jobs,
                             &mut gpu,
                             &mut pipeline_results,
-                            gen_train.len(),
-                        )
+                            gen,
+                            crate::genome::width_for(cfg.max_complexity),
+                        )?;
+                        pipeline_scored |= compiled > 0;
+                        Ok(())
                     });
                 }
 
@@ -2149,23 +2252,19 @@ fn run_search(
                         defer_gpu =
                             score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
                     } else {
-                        // Stop the GPU and re-score every still-pending
-                        // candidate in f64 on the CPU; a failed batch must
-                        // never leave a wrong (or missing) number behind.
+                        // Stop the GPU and rebuild the whole generation in
+                        // `f64`. Chunks already scored by the failing run hold
+                        // `f32` proxies, so discard those too; only the carried
+                        // elite keeps its existing value.
                         if cfg.gpu_notes {
                             if let Some(e) = &pipeline_error {
                                 eprintln!("# gpu: unavailable ({})", e);
                             }
                         }
+                        backend_reason = pipeline_error.clone();
+                        discard_pipeline_results(&pipeline_results, &mut islands);
                         gpu = None;
-                        let train_view = EvalSample::new(train, cfg);
-                        for pop in islands.iter_mut() {
-                            for ind in pop.iter_mut() {
-                                if ind.error.is_nan() {
-                                    ind.reeval(&train_view, cfg); // #25
-                                }
-                            }
-                        }
+                        rescore_pending_cpu(&mut islands, eval_data, cfg);
                         defer_gpu = false;
                     }
                 } else if !screened {
@@ -2964,6 +3063,45 @@ mod tests {
         assert!(
             !seen.insert(expr::structural_hash(&parent.tree)),
             "a clone of a parent must be a duplicate"
+        );
+    }
+
+    /// #119: a failed overlap batch must not leave `f32` proxy errors in the
+    /// chunks that already succeeded. Discarding rewinds exactly those slots
+    /// (and only those), so the CPU re-score rebuilds one exact objective.
+    #[test]
+    fn a_failed_overlap_batch_discards_earlier_f32_chunks() {
+        let cfg = Config::default();
+        let s = sample();
+        let view = EvalSample::new(&s, &cfg);
+        let mut islands = vec![
+            vec![
+                Ind::evaluated(node(Op::Add, vec![input(0), constant(1.0)]), &view, &cfg),
+                Ind::evaluated(node(Op::Mul, vec![input(0), constant(2.0)]), &view, &cfg),
+            ],
+            vec![Ind::evaluated(
+                node(Op::Sin, vec![input(0)]),
+                &view,
+                &cfg,
+            )],
+        ];
+        // The elite is slot 0 and was never sent; slot 1 of island 0 and slot 0
+        // of island 1 were scored by the pipeline.
+        let elite_bits = islands[0][0].error.to_bits();
+        let results = vec![vec![None, Some(0.25)], vec![Some(f64::INFINITY)]];
+        discard_pipeline_results(&results, &mut islands);
+        assert_eq!(
+            islands[0][0].error.to_bits(),
+            elite_bits,
+            "the carried elite must keep its value"
+        );
+        assert!(
+            islands[0][1].error.is_nan(),
+            "the pipeline chunk is pending again"
+        );
+        assert!(
+            islands[1][0].error.is_nan(),
+            "the pipeline chunk is pending again"
         );
     }
 

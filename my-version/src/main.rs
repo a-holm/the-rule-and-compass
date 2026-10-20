@@ -397,10 +397,10 @@ SEARCH:
                              it never changes parents or the Pareto front
   --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
-  --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
-                             bounded pending queue of N batches (default 2; 0 =
-                             synchronous). Results and archive are identical;
-                             only effective with --gpu
+  --pipeline-depth <N>       split each generation into N chunks and score them
+                             while later chunks are generated (default 2; 0 =
+                             synchronous). Bounded queue; results, archive and
+                             GPU accounting are identical. Only with --gpu
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every

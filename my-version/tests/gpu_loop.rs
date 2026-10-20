@@ -367,32 +367,94 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
 }
 
 /// #119: the overlap pipeline must not change a single scored value. The
-/// synchronous path (`pipeline_depth = 0`) and the bounded overlap path are
-/// compared on the same seed; every archive member, its exact `f64` error bits
-/// and the test errors must match. Arrival order across islands is not fixed,
-/// but each result is keyed by `(island, slot)`, so the mapping is.
+/// synchronous path (`pipeline_depth = 0`) and every bounded overlap depth are
+/// compared on the same seed; every archive member, its exact `f64` error bits,
+/// the test errors and the per-generation GPU accounting must match. Arrival
+/// order across islands is not fixed, but each result is keyed by
+/// `(island, slot)`, so the mapping is.
 #[cfg(feature = "cuda")]
 #[test]
 fn overlap_pipeline_is_byte_identical_to_the_synchronous_gpu_path() {
     let train = sample(96);
     let test = sample(96);
-    let mut sync = config(29, true);
-    sync.pipeline_depth = 0;
-    let mut overlap = config(29, true);
-    overlap.pipeline_depth = 2;
+    for (depth, islands) in [(2usize, 1usize), (4, 1), (8, 2)] {
+        let mut sync_same = config(29, true);
+        sync_same.pipeline_depth = 0;
+        sync_same.islands = islands;
+        sync_same.pop = 80 / islands;
+        let mut overlap = config(29, true);
+        overlap.pipeline_depth = depth;
+        overlap.islands = islands;
+        overlap.pop = 80 / islands;
+        let expected = search::run(&sync_same, &train, &test);
+        let got = search::run(&overlap, &train, &test);
+        assert_eq!(
+            describe(&expected),
+            describe(&got),
+            "depth {depth}, {islands} island(s): the overlap queue changed the archive"
+        );
+        assert_eq!(
+            expected
+                .test_errors
+                .iter()
+                .map(|e| e.to_bits())
+                .collect::<Vec<_>>(),
+            got.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+            "depth {depth}, {islands} island(s): the test errors changed"
+        );
+        assert_eq!(
+            expected.gpu.as_ref().map(|g| {
+                g.generations
+                    .iter()
+                    .map(|s| (s.generation, s.programs, s.fallbacks, s.opcodes.clone()))
+                    .collect::<Vec<_>>()
+            }),
+            got.gpu.as_ref().map(|g| {
+                g.generations
+                    .iter()
+                    .map(|s| (s.generation, s.programs, s.fallbacks, s.opcodes.clone()))
+                    .collect::<Vec<_>>()
+            }),
+            "depth {depth}, {islands} island(s): the #131 accounting changed"
+        );
+    }
+}
 
-    let a = search::run(&sync, &train, &test);
-    let b = search::run(&overlap, &train, &test);
-    assert_eq!(
-        describe(&a),
-        describe(&b),
-        "the overlap queue changed the archive"
-    );
-    assert_eq!(
-        a.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
-        b.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
-        "the overlap queue changed the reported test errors"
-    );
+/// #119: the chunked scorer must compile trees exactly like the synchronous
+/// scorer. Operators the kernel lacks but `Population::add` knows how to lower
+/// (`asinh`, `acosh`, `atanh`) are a `f64` CPU fallback in the synchronous
+/// path; lowering them only in the overlap path would put `f32` values on one
+/// side of the same seed. The fallback counts must name the same set.
+#[cfg(feature = "cuda")]
+#[test]
+fn overlap_pipeline_falls_back_like_the_synchronous_scorer() {
+    let train = sample(96);
+    let test = sample(96);
+    for islands in [1usize, 2] {
+        let mut sync = config(37, true);
+        sync.pipeline_depth = 0;
+        sync.islands = islands;
+        sync.pop = 60 / islands;
+        sync.generations = 20;
+        sync.ops = vec![Op::Add, Op::Sub, Op::Mul, Op::Div, Op::Asinh];
+        let mut overlap = sync.clone();
+        overlap.pipeline_depth = 4;
+        let a = search::run(&sync, &train, &test);
+        let b = search::run(&overlap, &train, &test);
+        assert_eq!(describe(&a), describe(&b), "{islands} island(s): archive");
+        let fallbacks = |o: &Outcome| {
+            o.gpu
+                .as_ref()
+                .map(|g| g.generations.iter().map(|s| s.fallbacks).sum::<usize>())
+                .unwrap_or(0)
+        };
+        assert!(fallbacks(&a) > 0, "the fixture must exercise the fallback");
+        assert_eq!(
+            fallbacks(&a),
+            fallbacks(&b),
+            "{islands} island(s): the fallback set changed"
+        );
+    }
 }
 
 /// #119: a CPU-only run cannot be affected by the pipeline depth. With no GPU

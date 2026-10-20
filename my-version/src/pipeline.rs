@@ -14,6 +14,37 @@
 
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 
+/// #119: how one generation is split across the overlap queue.
+///
+/// `depth` chunks are produced; the scorer consumes them in `batch`-sized
+/// pieces. The queue never holds more than `capacity` jobs, which is at most
+/// one whole generation (and exactly `depth * batch` when `pop` is a multiple
+/// of `depth`). Sizing is a pure function of `(pop, depth)` so the memory bound
+/// is testable without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkPlan {
+    /// Candidates per scoring call.
+    pub batch: usize,
+    /// Jobs the channel may hold before a producer blocks.
+    pub capacity: usize,
+}
+
+/// Split `pop` candidates into `depth` chunks.
+///
+/// `depth = 0` is never passed here (the caller disables the queue), but is
+/// treated as one chunk for safety. A generation smaller than `depth` gets
+/// one-candidate chunks rather than a zero batch, and the channel is capped at
+/// the generation size so an idle queue cannot reserve more slots than the
+/// search can ever produce.
+pub fn chunk_plan(pop: usize, depth: usize) -> ChunkPlan {
+    let depth = depth.max(1);
+    let batch = pop.div_ceil(depth).max(1);
+    ChunkPlan {
+        batch,
+        capacity: depth.saturating_mul(batch).min(pop.max(1)),
+    }
+}
+
 /// A bounded multi-producer, single-consumer job queue.
 pub struct JobQueue<T> {
     tx: SyncSender<T>,
@@ -161,5 +192,89 @@ mod tests {
         producer.join().expect("producer finishes");
         assert_eq!(error.as_deref(), Some("slow scorer failed"));
         assert_eq!(calls, 1, "the consumer must stop after the first error");
+    }
+
+    /// #119: the chunk plan is total, covers the population and never reserves
+    /// more slots than a generation can fill. The batch shrinks as the depth
+    /// grows, which is what lets the scorer start before the generation ends.
+    #[test]
+    fn chunk_plan_is_bounded_and_covers_the_population() {
+        for pop in [1usize, 3, 24, 400, 2000] {
+            for depth in 1..=64 {
+                let plan = chunk_plan(pop, depth);
+                assert!(plan.batch >= 1, "pop {pop} depth {depth}");
+                assert!(
+                    plan.capacity >= plan.batch,
+                    "a full batch must fit: pop {pop} depth {depth}"
+                );
+                assert!(
+                    plan.capacity <= pop.max(1),
+                    "the queue must not exceed one generation: pop {pop} depth {depth}"
+                );
+                assert!(
+                    depth * plan.batch >= pop,
+                    "depth chunks must cover the population: pop {pop} depth {depth}"
+                );
+            }
+        }
+        // The default: two chunks of 200 for pop 400.
+        assert_eq!(
+            chunk_plan(400, 2),
+            ChunkPlan {
+                batch: 200,
+                capacity: 400
+            }
+        );
+        // A deep queue trades launch size for an earlier start.
+        assert_eq!(
+            chunk_plan(400, 8),
+            ChunkPlan {
+                batch: 50,
+                capacity: 400
+            }
+        );
+        // A generation smaller than the requested depth still makes progress.
+        assert_eq!(
+            chunk_plan(3, 64),
+            ChunkPlan {
+                batch: 1,
+                capacity: 3
+            }
+        );
+    }
+
+    /// #119: several producers (one per island) each keep their own send order
+    /// even though the merged arrival order is a scheduling artefact. Results
+    /// are keyed by `(island, slot)`, so only per-producer order matters.
+    #[test]
+    fn every_producer_keeps_its_own_order() {
+        const PRODUCERS: usize = 4;
+        const PER: usize = 25;
+        let queue = JobQueue::new(8);
+        let producers: Vec<_> = (0..PRODUCERS)
+            .map(|p| {
+                let tx = queue.sender();
+                std::thread::spawn(move || {
+                    for slot in 0..PER {
+                        tx.send((p, slot)).expect("consumer is draining");
+                    }
+                })
+            })
+            .collect();
+        let mut last = [None; PRODUCERS];
+        let error = queue.drain(3, |jobs| {
+            for (p, slot) in jobs {
+                if let Some(prev) = last[p] {
+                    assert_eq!(slot, prev + 1, "producer {p} was reordered");
+                }
+                last[p] = Some(slot);
+            }
+            Ok(())
+        });
+        for p in producers {
+            p.join().expect("producer");
+        }
+        assert!(error.is_none());
+        assert_eq!(last, [Some(PER - 1); PRODUCERS]);
     }
 }
