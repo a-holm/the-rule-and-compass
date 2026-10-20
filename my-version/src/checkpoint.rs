@@ -861,6 +861,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "qd_bins",       // #120
+        "qd_cell_cap",   // #120
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1043,6 +1045,22 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
                 .to_string(),
         );
     }
+    // #120: absent means the QD layer was off.
+    let qd_bins = match fields.get("qd_bins") {
+        None => 0,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'qd_bins': '{}'", raw))?,
+    };
+    let qd_cell_cap = match fields.get("qd_cell_cap") {
+        None => 4,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'qd_cell_cap': '{}'", raw))?,
+    };
+    if qd_cell_cap == 0 {
+        return Err("config 'qd_cell_cap' must be at least 1".to_string());
+    }
 
     Ok(Config {
         generations: num_usize("generations")?,
@@ -1065,6 +1083,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         front_parents, // #76
         units,
         require_dimensions,
+        qd_bins,
+        qd_cell_cap,
         progress: None,
         // #27/#26: evaluator choices are not saved search state; a resumed run
         // picks the backend afresh from the current build/flags.
@@ -1145,6 +1165,11 @@ fn write_config(cfg: &Config, out: &mut String) {
         writeln!(out, "config units {}", u.encode_vars()).unwrap();
         writeln!(out, "config units.target {}", u.target).unwrap();
         writeln!(out, "config require_dimensions {}", cfg.require_dimensions).unwrap();
+    }
+    // #120: off is the historical default, so only write when enabled.
+    if cfg.qd_bins > 0 {
+        writeln!(out, "config qd_bins {}", cfg.qd_bins).unwrap();
+        writeln!(out, "config qd_cell_cap {}", cfg.qd_cell_cap).unwrap();
     }
 }
 

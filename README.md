@@ -719,6 +719,11 @@ list and the recorded results.
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
+- **opt-in quality-diversity coverage** (`--qd`, `--qd-cells`, `--qd-cell-cap`):
+  a rectangular descriptor grid over variable usage × prediction skewness, with
+  a bounded local `(error, cost)` front per cell. The layer is passive and
+  reports occupied-cell coverage in text and `--json`; it does not change the
+  Pareto front. See [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
@@ -812,6 +817,7 @@ docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
+docs/qd.md                    opt-in quality-diversity coverage archive (--qd)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

@@ -19,7 +19,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability, store};
+use rcsr::{data, diagnostics, multi, qd, search, stability, store};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -337,6 +337,16 @@ SEARCH:
                              trajectory, so this is opt-in
   --no-gpu                   force CPU evaluation (alias --cpu); this is the
                              default, so the flag is only for explicitness
+  --qd                       record an opt-in quality-diversity archive over
+                             (variable usage x prediction skewness), 16x16 cells.
+                             Passive: it never changes parents, migration or the
+                             Pareto front. Reported coverage is the fraction of
+                             occupied cells. See docs/qd.md
+  --qd-cells <N>             descriptor grid bins per axis (2..=256; enables
+                             --qd). 16 gives 256 cells; 23 gives 529, closest to
+                             the K=512 design in the issue
+  --qd-cell-cap <N>          maximum local Pareto front per descriptor cell
+                             (default 4)
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -423,6 +433,37 @@ fn jnum(v: f64) -> String {
         format!("{}", v)
     } else {
         "null".to_string()
+    }
+}
+
+/// #120: the quality-diversity coverage object, or `null` when the layer is off.
+fn qd_json(report: Option<&qd::QdReport>) -> String {
+    match report {
+        None => "null".to_string(),
+        Some(q) => format!(
+            "{{\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{}}}",
+            q.bins,
+            q.cells,
+            q.occupied,
+            jnum(q.coverage),
+            q.entries,
+            jnum(q.best_error),
+            q.cell_cap
+        ),
+    }
+}
+
+/// #120: the one-line text summary of QD coverage.
+fn qd_text(report: Option<&qd::QdReport>) {
+    if let Some(q) = report {
+        eprintln!(
+            "# qd: {}/{} descriptor cells occupied ({:.1}%), {} local-front entries, cap {}",
+            q.occupied,
+            q.cells,
+            100.0 * q.coverage,
+            q.entries,
+            q.cell_cap
+        );
     }
 }
 
@@ -883,6 +924,38 @@ fn main() {
             "--no-dedup" => {
                 cfg.dedup = false;
                 dedup_set = true;
+            }
+            // #120: opt-in quality-diversity coverage archive.
+            "--qd" => {
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 16;
+                }
+            }
+            "--qd-cells" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (2..=256).contains(&n) => cfg.qd_bins = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cells needs an integer in 2..=256, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--qd-cell-cap" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if (1..=64).contains(&n) => cfg.qd_cell_cap = n,
+                    _ => {
+                        eprintln!(
+                            "error: --qd-cell-cap needs an integer in 1..=64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             // #76: exactness escape hatch; the default is on.
             "--no-front-parents" => {
@@ -2643,6 +2716,7 @@ fn main() {
                         ""
                     }
                 );
+                qd_text(outcome.qd.as_ref());
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -3121,7 +3195,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 jstr(VERSION),
                 cfg.seed,
@@ -3148,6 +3222,7 @@ fn main() {
                 resid_json,
                 cv_json,
                 stability_json,
+                qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")
             );
@@ -3486,6 +3561,7 @@ fn run_multi_output(
                     },
                     target_names.join(",")
                 );
+                qd_text(outcome.qd.as_ref());
                 eprintln!(
                     "# multi-output: one shared shape, one fitted constant vector per output; \
                      train_err/test_err are the mean over {} target(s)",
@@ -3576,7 +3652,7 @@ fn run_multi_output(
                 })
                 .collect();
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -3588,6 +3664,7 @@ fn run_multi_output(
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                qd_json(outcome.qd.as_ref()),
                 pareto.join(",")
             );
         }

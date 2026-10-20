@@ -322,6 +322,13 @@ Every `migration_interval` generations, copy the best member of each island into
 the next island (ring topology). If an island stagnates for `restart_interval`
 generations, restart it from random individuals.
 
+Optional quality-diversity coverage (`--qd`) observes every evaluated
+individual in a rectangular grid over two descriptor axes (variable usage and
+prediction skewness). Each occupied cell keeps a bounded local Pareto front.
+The layer is passive: it does not alter selection, migration, restarts or the
+global archive. `--json` reports the grid size, occupied cells and coverage
+fraction.
+
 Termination: `--generations` reached. Report progress as generations.
 
 ## 8. Simplification

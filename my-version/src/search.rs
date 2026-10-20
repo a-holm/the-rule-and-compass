@@ -27,6 +27,8 @@ use crate::pareto::{Archive, Sol};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
+// #120: the opt-in quality-diversity archive.
+use crate::qd::{QdArchive, QdReport};
 use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
@@ -81,6 +83,12 @@ pub struct Config {
     /// #25: reject a candidate whose root dimension differs from the target's
     /// (infinite error) instead of merely noting the mismatch.
     pub require_dimensions: bool,
+    /// #120: bins per descriptor axis for the opt-in quality-diversity archive.
+    /// `0` disables it (the default), so every existing trajectory and pinned
+    /// archive is unchanged.
+    pub qd_bins: usize,
+    /// #120: maximum local Pareto front per descriptor cell.
+    pub qd_cell_cap: usize,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
@@ -134,6 +142,8 @@ impl Default for Config {
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
+            qd_bins: 0, // #120: off
+            qd_cell_cap: 4,
             progress: None,
             simd: true, // #27
             // #26: the library defaults to the CPU so every existing caller and
@@ -180,6 +190,8 @@ impl Config {
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(front_parents, "front_parents"); // #76
+        compare!(qd_bins, "qd_bins"); // #120
+        compare!(qd_cell_cap, "qd_cell_cap"); // #120
         // #25: units only change the trajectory when they are required; the
         // declaration itself is still part of the saved configuration.
         compare!(units, "units");
@@ -1157,6 +1169,8 @@ pub struct Outcome {
     /// when the full training sample was used (off, exact no-op, or a request
     /// widened above the break-even).
     pub predictor_samples: usize,
+    /// #120: quality-diversity coverage report, or `None` when the layer is off.
+    pub qd: Option<QdReport>,
 }
 
 /// Run a search once, from a fresh start.
@@ -1604,6 +1618,14 @@ fn run_search(
     // no population state, so it cannot affect the search trajectory.
     let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
     let mut stats_observed = false;
+    // #120: passive descriptor archive. It observes evaluated individuals and
+    // never feeds back into selection, so turning it on cannot change the
+    // trajectory or the Pareto front.
+    let mut qd_archive = if cfg.qd_bins > 0 {
+        Some(QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap))
+    } else {
+        None
+    };
 
     if !converged_early {
         for gen in gens_done..cfg.generations {
@@ -1879,6 +1901,24 @@ fn run_search(
                     score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
             }
 
+            // #120: record this generation's evaluated behaviours. The order
+            // is fixed (island 0..I, population order, then the archive), so
+            // the archive is a deterministic function of the trajectory.
+            if let Some(qd) = qd_archive.as_mut() {
+                let mut items = Vec::new();
+                for pop in &islands {
+                    for ind in pop {
+                        if ind.error.is_finite() {
+                            items.push((ind.tree.clone(), ind.error, ind.complexity));
+                        }
+                    }
+                }
+                for s in &archive.items {
+                    items.push((s.tree.clone(), s.error, s.cost));
+                }
+                qd.record(items, gen_train);
+            }
+
             // A checkpoint is taken only at a generation boundary: all of the
             // generation's work, including migration and restarts, is done.
             if save_every > 0 && gens_done % save_every == 0 {
@@ -1991,6 +2031,8 @@ fn run_search(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
+        // #120: coverage of the descriptor grid for this run.
+        qd: qd_archive.as_ref().map(|q| q.report()),
     })
 }
 
