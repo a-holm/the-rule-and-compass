@@ -644,28 +644,57 @@ noise for the extra rows to average out, so it only spends fewer rows on a
 problem a full fit would solve exactly. Use it when the fitter dominates the
 run and the data are noisy enough that an `N`-row subset is representative.
 
-Measured on the `w2.csv` workload (2 000 rows, 1 500 train, 30 generations,
-pop 100, seed 1, min of three `%U` runs on a shared host), with `m = 200` and a
-1/16 promotion fraction:
+Re-measured on **current `main` (`c4c1d9d`) on 2026-10-20**, on the same
+`w2.csv` fixture (2 000 rows, 1 500 train, md5
+`bcb67700757cebf79ecc26dd954e006e`), 30 generations, pop 100, seed 1,
+`--fit-iters 8`, min and median of four **interleaved** `%U` runs. Host:
+`i7-3770K` (4 cores / 8 threads), load average 18–29 from other agents on the
+same machine, so absolute seconds carry roughly a 10–20 % penalty; every row is
+paired with its full-data run in the same window.
 
-| config | full data | `--fit-samples 200` | speed-up | refitted best error |
+The recorded 2026-10-18 numbers predate #76, which made archive-supplied parents
+the default. The row labelled **recorded workload** therefore passes
+`--no-front-parents`, reproducing the search the target was set on; the
+**current default** row is the same command without that flag:
+
+| config | full data | `--fit-samples 200` | speed-up | best train error |
 |---|---:|---:|---:|---|
-| G=30, absolute | 5.03 s | **2.11 s** | **2.38×** | 0.1633 → **0.0121** (13.5× better) |
-| G=30, squared | 4.58 s | **1.65 s** | **2.78×** | **0.0259 → 0.0398** (1.54× worse) |
-| G=10, absolute | 1.09 s | **0.50 s** | **2.18×** | 0.1762 → **0.2261** (1.28× worse) |
-| G=10, squared | 1.60 s | **0.37 s** | **4.32×** | **0.0259 → 0.0869** (3.36× worse) |
+| recorded workload, G=30, squared | 4.50 s / 4.76 s | **1.59 s / 1.66 s** | **2.83×** | 0.026243 → **0.001723** |
+| current default, G=30, squared | 5.78 s / 5.85 s | **3.93 s / 4.09 s** | **1.47×** | 0.026243 → **0.004474** |
 
-The baselines are the full run's own best shapes **refitted** on all rows, not
-their unrefitted errors (the earlier draft compared against the unrefitted
-0.0865, which was wrong). On the squared metric — the one the 0.0259 baseline
-comes from — the promoted screen is **1.54× worse at G=30** and **3.36× worse
-at G=10**, so the quality cost is visible next to the speed-up. The G=30
-absolute error improves sharply on this seed (0.1633 → 0.0121), which is why
-the delta is reported per metric and not as a general quality claim; the
-recovered squared law is an 11-node expression, while the absolute winner is a
-22-node polynomial/sine form. A larger promotion fraction (1/8) reduced the
-squared error to 0.0042 but erased most of the speed-up (4.03 s, 1.25×), so the
-shipped fraction is 1/16. These are one seed each; the flag stays opt-in.
+The first figure is the minimum, the second the median. The **≤2.0 s** box is
+met on the recorded workload (four runs: 1.59, 1.64, 1.67, 1.75 s) and the
+promoted error is far below the `≤0.05` bound. The binary is also faster there
+than the commit that first shipped the screen (`6bf6679`: 2.17–2.33 s, same
+fixture, same `%U` method), so later work has not regressed this path.
+
+With the **current default** the same command takes 3.93–4.29 s and misses the
+2.0 s bound. That is a different search, not screening overhead: #76's
+archive-supplied parents move the front to promoted trees up to complexity 23
+(the recorded workload's best is complexity 9), and the fitter is ~96 % of the
+run with the 6-per-generation full-data refits about 45 % of the fitting. The
+promoted screen is still 1.47× faster than its **own** full-data baseline on
+this fixture; comparing its absolute seconds with a pre-#76 target would charge
+the trajectory change to the screen. `--fit-samples` remains opt-in.
+
+The **absolute** metric is no longer comparable with the 2026-10-18 `2.11 s`
+row: since #117 the fitter minimises the configured loss, so `absolute` now
+runs IRLS on `|r|` instead of least-squares LM. On this fixture it measures
+10.1 s on the recorded workload (best error 0.015333, well under 0.05); at
+G=10 it is 1.29 s (recorded workload) / 1.17 s (current default) with best
+errors 0.128976 / 0.187767, still under the 0.25 bound. The squared metric
+keeps the exact historical LM path and is therefore the row used for the speed
+re-measurement above. The earlier one-seed quality deltas
+(`0.0259 → 0.0398` etc.) belong to the pre-#76 trajectory and are not
+reproduced here; the current screen recovers a better squared model than the
+full run on this seed (0.001723 vs 0.026243), which is a seed-specific outcome,
+not a general quality claim.
+
+Promoted survivors now also reuse the fitter's final SSE on the squared path
+(#87's exact reuse, applied in `refit_survivor`), removing one full-data scoring
+sweep per survivor. Its measured effect is inside the run-to-run noise; it is
+kept because it removes work without changing a single bit of the reported
+score.
 
 #### Opt-in codegen: `target-cpu=native` and PGO
 
