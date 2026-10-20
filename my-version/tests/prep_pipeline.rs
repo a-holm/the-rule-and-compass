@@ -135,6 +135,62 @@ fn millisecond_microsecond_and_second_inputs_normalise_to_the_same_times() {
 }
 
 #[test]
+fn a_multi_symbol_directory_is_parallel_deterministic_and_keeps_symbols() {
+    let dir = tmp("panel");
+    let _ = std::fs::create_dir_all(&dir);
+    let csv = std::fs::read_to_string(fixture("binance_1m.csv")).unwrap();
+    for sym in ["AAA", "BBB", "CCC"] {
+        // Shift each symbol's prices so a mis-merged panel is visible.
+        let shifted: String = csv
+            .lines()
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                let n = f.len();
+                let bump = match sym {
+                    "AAA" => 0.0,
+                    "BBB" => 10.0,
+                    _ => 20.0,
+                };
+                let mut out = String::new();
+                for (i, x) in f.iter().enumerate() {
+                    if i == 1 || i == 2 || i == 3 || i == 4 || i == 6 {
+                        out.push_str(&format!("{:.4}", x.parse::<f64>().unwrap() + bump));
+                    } else {
+                        out.push_str(x);
+                    }
+                    if i != n - 1 {
+                        out.push(',');
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(format!("{}.csv", sym)), shifted + "\n").unwrap();
+    }
+    let mut opts = base(dir.to_string_lossy().to_string());
+    opts.resample = Some(Timeframe::M15);
+    opts.features = rcsr::features::expand("ta:core").unwrap();
+    opts.jobs = 1;
+    let serial = prep::build(&opts).unwrap();
+    opts.jobs = 3;
+    let parallel = prep::build(&opts).unwrap();
+    assert_eq!(prep::table_csv(&serial.table), prep::table_csv(&parallel.table));
+    assert_eq!(serial.manifest, parallel.manifest);
+    let names = &parallel.table.names;
+    assert_eq!(names[0], "ts");
+    assert_eq!(names[1], "symbol");
+    assert_eq!(names[2], "open");
+    // Three symbols x 60 minutes -> 12 15m rows, symbol-sorted.
+    assert_eq!(parallel.table.len(), 12);
+    let syms: Vec<String> = (0..parallel.table.len())
+        .map(|r| parallel.table.text(r, 1).unwrap().to_string())
+        .collect();
+    assert_eq!(syms, vec!["AAA"; 4].into_iter().chain(vec!["BBB"; 4]).chain(vec!["CCC"; 4]).collect::<Vec<_>>());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_zip_archive_is_read_without_an_intermediate_csv() {
     let dir = tmp("zip");
     let _ = std::fs::create_dir_all(&dir);
