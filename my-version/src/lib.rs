@@ -20,11 +20,13 @@ pub mod gpu;
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
+pub mod lockbox; // #145: the 2026H2 holdout
 pub mod manifest;
 pub mod metrics;
 pub mod multi;
 pub mod ohlcv;
 pub mod pareto;
+pub mod panel; // #145: point-in-time membership and panel
 pub mod parse;
 pub mod pipeline; // #119: bounded producer/scorer overlap
 pub mod progress_stats;

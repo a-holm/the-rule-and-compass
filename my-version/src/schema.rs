@@ -144,7 +144,22 @@ pub fn json() -> String {
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
-{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit a test window overlapping 2026H2 (declared final test only)\"}}]}},\n  \
+         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
+{{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership CSV or panel .rcsb\"}},\
+{{\"name\":\"--top\",\"type\":\"int\",\"default\":\"100\",\"description\":\"names selected per rebalance\"}},\
+{{\"name\":\"--lookback\",\"type\":\"int\",\"default\":\"90\",\"description\":\"trailing liquidity window in days\"}},\
+{{\"name\":\"--min-history\",\"type\":\"int\",\"default\":\"90\",\"description\":\"minimum age before selection\"}},\
+{{\"name\":\"--rebalance\",\"type\":\"int\",\"default\":\"30\",\"description\":\"days between membership decisions\"}},\
+{{\"name\":\"--min-bars\",\"type\":\"int\",\"default\":\"60\",\"description\":\"minimum trailing bars\"}},\
+{{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"86400\",\"description\":\"bar spacing for gap counts (3600 hourly)\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol] verified splice table\"}},\
+{{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
+{{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}}]}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),

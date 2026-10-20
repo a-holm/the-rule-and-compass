@@ -724,6 +724,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
     }
+    // #145: point-in-time membership and the rebuilt panel.
+    if args.first().map(|s| s.as_str()) == Some("panel") {
+        rcsr::panel::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -6018,6 +6022,8 @@ OPTIONS:
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
+  --allow-lockbox            permit a test window overlapping 2026H2
+                             (declared final test only; default refuses)
   --quiet                    reserved; text output stays on stdout
   -h, --help                 show this help
 ",
@@ -6053,6 +6059,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
     let mut quiet = false;
+    let mut allow_lockbox = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -6157,6 +6164,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--quiet" => quiet = true,
+            "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with('-') => {
                 eprintln!(
                     "error: unknown walkforward option '{}'\n\n{}",
@@ -6252,6 +6260,7 @@ fn run_walkforward(args: &[String]) -> ! {
         threshold_quantile: quantile,
         validation_frac,
         periods_per_year,
+        allow_lockbox,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,

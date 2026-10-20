@@ -49,6 +49,7 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         threshold_quantile: 0.70,
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
+        allow_lockbox: false,
     }
 }
 
@@ -81,14 +82,16 @@ fn known_expression_threshold_costs_and_metrics() {
     assert_eq!(w.metrics.entries, 1);
     assert!((w.metrics.exposure - 1.0).abs() < 1e-15);
     assert!((w.metrics.hit_rate - 0.5).abs() < 1e-15);
-    // total cost 0.01 over four active rows = 25 bp per long row
-    assert!((w.metrics.avg_cost_bps - 25.0).abs() < 1e-12);
-    // First net return is 0.01 - 0.01 = 0; the rest follow the target.
-    // equity = 1 * 0.98 * 1.03 * 0.99
-    let equity = 1.0 * 0.98 * 1.03 * 0.99;
+    // #145: entry 100 bp + final exit 100 bp = 0.02 over four active rows
+    // = 50 bp per long row.
+    assert!((w.metrics.avg_cost_bps - 50.0).abs() < 1e-12);
+    // First net return is 0.01 - 0.01 = 0; the last row pays the final exit.
+    // equity = 1 * 0.98 * 1.03 * 0.98
+    let equity = 1.0 * 0.98 * 1.03 * 0.98;
     assert!((w.metrics.total_return - (equity - 1.0)).abs() < 1e-15);
     assert!((w.metrics.cagr - (equity - 1.0)).abs() < 1e-15);
-    // The first period is flat (equity 1), then -2%: the peak is the start.
+    // The first test period is -2% from the start; the final exit makes the
+    // last period -2% as well, so the peak-to-trough is still -2%.
     assert!((w.metrics.max_drawdown - (-0.02)).abs() < 1e-15);
     assert_eq!(w.threshold_source, "train");
 }
@@ -272,9 +275,10 @@ fn costs_and_positions_are_per_group() {
     assert_eq!(w.metrics.entries, 2);
     assert_eq!(w.metrics.trades, 2);
     assert_eq!(w.metrics.active_rows, 2);
-    // One timestamp, the mean net return is 0.01 - 0.01 = 0 in both groups.
-    assert!((w.metrics.mean_return - 0.0).abs() < 1e-15);
-    assert!((w.metrics.avg_cost_bps - 100.0).abs() < 1e-12);
+    // One timestamp: each group pays entry 100 bp and final exit 100 bp, so
+    // the mean net return is 0.01 - 0.02 = -0.01.
+    assert!((w.metrics.mean_return + 0.01).abs() < 1e-15);
+    assert!((w.metrics.avg_cost_bps - 200.0).abs() < 1e-12);
 }
 
 #[test]
