@@ -53,7 +53,11 @@ The other two axes that recur:
 
 * **`--gap N`** — an *embargo*. In `temporal` mode `rcsr` drops `N` rows
   immediately after the boundary between training and testing; in
-  `temporal-group` mode it drops `N` rows in each series. Why: neighbouring rows
+  `temporal-group` mode it drops `N` rows in each series. A suffixed value
+  (`--gap 90m`, `1.5h`, `30s`, `2d`) is **wall time** and is converted with
+  `ceil(seconds / median_dt)`, so an embargo is never silently rounded to zero;
+  if explicit `--train-select`/`--test-select` replace the positional split,
+  the gap is dropped with a warning. Why: neighbouring rows
   in a series are correlated, so the last training row and the first test row
   would otherwise be almost the same observation. Purged, embargoed splits are
   standard practice in financial machine learning for exactly this reason.

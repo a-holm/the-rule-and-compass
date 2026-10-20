@@ -97,7 +97,8 @@ selection replaces the positional mode. `--gap` then does **not** apply; the
 report says so:
 
 ```text
-# note: the embargo gap does not apply to a row selection
+# note: --gap is dropped because explicit --train-select/--test-select replace
+# positional splitting; add the embargo to the selection expressions instead
 ```
 
 **What fails.** A user writes `--train-select "date < 2020" --gap 5` and believes

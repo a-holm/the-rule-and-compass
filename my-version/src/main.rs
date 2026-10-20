@@ -20,7 +20,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{backend, data, diagnostics, multi, qd, search, stability, store, walkforward};
+use rcsr::{backend, data, diagnostics, leakage, multi, qd, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -30,6 +30,9 @@ const EXIT_OK: i32 = 0;
 const EXIT_USAGE: i32 = 2;
 const EXIT_INPUT: i32 = 3;
 const EXIT_NO_SOLUTION: i32 = 4;
+/// #129: a leakage audit failed. Stable so CI can distinguish a real leak from
+/// a usage (2) or input (3) error.
+const EXIT_LEAKAGE: i32 = leakage::AUDIT_EXIT_CODE;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Format {
@@ -92,6 +95,7 @@ USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
+  rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
@@ -192,8 +196,11 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
-  --gap <rows>               embargo: rows dropped between train and test to stop
-                             autocorrelation leaking the future (default 0)
+  --gap <rows|time>          embargo: rows dropped between train and test to stop
+                             autocorrelation leaking the future (default 0).
+                             A suffixed value (90m, 1.5h, 30s, 2d) is wall time,
+                             converted with ceil(seconds / median_dt); it is
+                             dropped with a warning under explicit row selection
   --folds <k>                split the test region into k contiguous blocks and
                              report per-block error as well as the mean (default 1)
 
@@ -604,6 +611,81 @@ fn variables_detail_json(types: &[data::VariableDType]) -> String {
         .join(",")
 }
 
+/// #129: resolve `--gap`. An integer is rows; `90m`, `1.5h`, `30s` or `2d` is
+/// wall time converted with `ceil(seconds / median_dt)`. A wall-time gap needs
+/// a time column; without one the request is a usage error, never a zero-row
+/// embargo.
+fn parse_gap_spec(
+    src: &str,
+    table: &data::Table,
+    time_col: Option<usize>,
+    unit: Option<data::TimeUnit>,
+) -> Result<(usize, Option<String>), String> {
+    let trimmed = src.trim();
+    if let Ok(rows) = trimmed.parse::<usize>() {
+        return Ok((rows, None));
+    }
+    let (num_src, multiplier) = if let Some(v) = trimmed.strip_suffix(&['s', 'S'][..]) {
+        (v, 1.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['m', 'M'][..]) {
+        (v, 60.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['h', 'H'][..]) {
+        (v, 3600.0)
+    } else if let Some(v) = trimmed.strip_suffix(&['d', 'D'][..]) {
+        (v, 86_400.0)
+    } else {
+        return Err(format!(
+            "--gap '{}' is neither a row count nor a wall time (use 90m, 1.5h, 30s or 2d)",
+            src
+        ));
+    };
+    let value: f64 = num_src
+        .trim()
+        .parse()
+        .map_err(|_| format!("--gap '{}' has no numeric value", src))?;
+    if !(value > 0.0) {
+        return Err("--gap must be positive".to_string());
+    }
+    let Some(tc) = time_col else {
+        return Err(format!(
+            "--gap {} needs --time <col> to convert wall time to rows",
+            src
+        ));
+    };
+    let mut raw: Vec<f64> = data::time_keys(table, tc).to_f64();
+    raw.sort_by(f64::total_cmp);
+    let mut diffs: Vec<f64> = raw.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0).collect();
+    diffs.sort_by(f64::total_cmp);
+    if diffs.is_empty() {
+        return Err(format!(
+            "--gap {} cannot be converted: the time column has no positive spacing",
+            src
+        ));
+    }
+    let median = diffs[diffs.len() / 2];
+    let to_seconds = match unit.unwrap_or(data::TimeUnit::Seconds) {
+        data::TimeUnit::Seconds => 1.0,
+        data::TimeUnit::Millis => 1e-3,
+        data::TimeUnit::Micros => 1e-6,
+        data::TimeUnit::Nanos => 1e-9,
+    };
+    let median_seconds = median * to_seconds;
+    let seconds = value * multiplier;
+    let rows = leakage::wall_time_gap(seconds, median_seconds).ok_or_else(|| {
+        format!(
+            "--gap {} cannot be converted: median spacing is {} s",
+            src, median_seconds
+        )
+    })?;
+    Ok((
+        rows,
+        Some(format!(
+            "--gap {} = {:.1} s -> {} rows (ceil({:.1}/{:.4}))",
+            src, seconds, rows, seconds, median_seconds
+        )),
+    ))
+}
+
 /// Parse a boolean row expression (`--filter`, `--exclude`, `--train-select`,
 /// `--test-select`) against every numeric column of the table.
 ///
@@ -735,6 +817,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
         run_verify_manifest(&args[1..]);
     }
+    // #129: differential leakage audit. Exit 5 when any detector fires.
+    if args.first().map(|s| s.as_str()) == Some("audit") {
+        run_audit(&args[1..]);
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!("{}", usage());
         std::process::exit(EXIT_OK);
@@ -779,7 +865,9 @@ fn main() {
     let mut split_arg: Option<String> = None;
     let mut time_name: Option<String> = None;
     let mut group_name: Option<String> = None;
-    let mut gap = 0usize;
+    // #129: a bare integer is rows; a suffixed value (90m, 1.5h) is wall
+    // time and is converted after the time column is known.
+    let mut gap_src: Option<String> = None;
     let mut folds = 1usize;
     let mut lags = 0usize;
     let mut history_frac = 0.0f64;
@@ -1051,7 +1139,7 @@ fn main() {
             "--split" => split_arg = Some(val!()),
             "--time" => time_name = Some(val!()),
             "--group-by" => group_name = Some(val!()),
-            "--gap" => gap = val!().parse().unwrap_or(0),
+            "--gap" => gap_src = Some(val!()),
             "--folds" => folds = val!().parse().unwrap_or(1).max(1),
             "--lags" => lags = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
@@ -2158,8 +2246,34 @@ fn main() {
             }
         }
     }
+    // #129: resolve --gap. Rows pass through; wall time becomes
+    // ceil(seconds / median_dt) and is never silently rounded down to zero.
+    let mut gap = 0usize;
+    if let Some(src) = gap_src.as_deref() {
+        match parse_gap_spec(src, &table, time_col, time_unit) {
+            Ok((rows, note)) => {
+                gap = rows;
+                if let Some(n) = note {
+                    notes.push(n);
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
+    if gap > 0 && (train_select.is_some() || test_select.is_some()) {
+        notes.push(
+            "--gap is dropped because explicit --train-select/--test-select replace \
+             positional splitting; add the embargo to the selection expressions instead"
+                .to_string(),
+        );
+        gap = 0;
+    }
     if gap > 0 && !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup) {
         notes.push("--gap only applies to temporal splits; ignored".to_string());
+        gap = 0;
     }
 
     // Per-variable datatypes (issue #5): validate boolean columns and expand
@@ -6375,6 +6489,486 @@ fn run_verify_manifest(args: &[String]) -> ! {
             std::process::exit(1);
         }
     }
+}
+
+/// #129: `rcsr audit` — the fail-closed leakage suite.
+///
+/// Exit codes: 0 clean, 2 usage, 3 input, 5 leakage. The JSON report always
+/// includes the resolved spec hash (D11), every finding's detector/column/row,
+/// and the effective sample size (D6).
+fn run_audit(args: &[String]) -> ! {
+    let mut data_path: Option<String> = None;
+    let mut target: Option<String> = None;
+    let mut time_name: Option<String> = None;
+    let mut vars: Vec<String> = Vec::new();
+    let mut horizon = 1usize;
+    let mut unit = data::TimeUnit::Seconds;
+    let mut json_out = false;
+    let mut report_path: Option<String> = None;
+    let mut join_on: Option<String> = None;
+    let mut bars_path: Option<String> = None;
+    let mut universe_path: Option<String> = None;
+    let mut actions_path: Option<String> = None;
+    let mut symbol_col: Option<String> = None;
+    let mut price_col: Option<String> = None;
+    let mut resample_small = 15usize;
+    let mut resample_large = 60usize;
+    let mut session_gap: Option<f64> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let take = |i: &mut usize| -> String {
+            *i += 1;
+            args.get(*i).cloned().unwrap_or_default()
+        };
+        match a {
+            "-h" | "--help" => {
+                println!("{}", usage());
+                std::process::exit(EXIT_OK);
+            }
+            "--json" => json_out = true,
+            "--data" => data_path = Some(take(&mut i)),
+            "--target" => target = Some(take(&mut i)),
+            "--time" => time_name = Some(take(&mut i)),
+            "--vars" => {
+                vars = take(&mut i)
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            }
+            "--horizon" | "--label-horizon" => {
+                horizon = take(&mut i).parse().unwrap_or(0);
+            }
+            "--time-unit" => {
+                let v = take(&mut i);
+                match data::TimeUnit::parse(&v) {
+                    Ok(u) => unit = u,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--report" => report_path = Some(take(&mut i)),
+            "--join-on" => join_on = Some(take(&mut i)),
+            "--bars" => bars_path = Some(take(&mut i)),
+            "--universe" => universe_path = Some(take(&mut i)),
+            "--corporate-actions" => actions_path = Some(take(&mut i)),
+            "--symbol" => symbol_col = Some(take(&mut i)),
+            "--price" => price_col = Some(take(&mut i)),
+            "--resample-small" => {
+                resample_small = take(&mut i).parse().unwrap_or(0);
+            }
+            "--resample-large" => {
+                resample_large = take(&mut i).parse().unwrap_or(0);
+            }
+            "--session-gap" => {
+                session_gap = take(&mut i).parse::<f64>().ok();
+            }
+            other => {
+                eprintln!("error: unknown audit option '{}'", other);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+        i += 1;
+    }
+    let Some(path) = data_path else {
+        eprintln!("error: audit needs --data <file>");
+        std::process::exit(EXIT_USAGE);
+    };
+    let Some(target) = target else {
+        eprintln!("error: audit needs --target <col>");
+        std::process::exit(EXIT_USAGE);
+    };
+    if horizon == 0 {
+        eprintln!("error: --horizon must be at least 1");
+        std::process::exit(EXIT_USAGE);
+    }
+    let table = match data::read_table(&path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+    let target_idx = match table.index_of(&target) {
+        Ok(j) if table.numeric[j] => j,
+        Ok(_) => {
+            eprintln!("error: target '{}' is not numeric", target);
+            std::process::exit(EXIT_INPUT);
+        }
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+
+    // Assemble the value columns. The time column is metadata, never a feature.
+    let time_idx = match &time_name {
+        Some(name) => match table.index_of(name) {
+            Ok(j) => Some(j),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        },
+        None => None,
+    };
+    let mut value_idx: Vec<usize> = if vars.is_empty() {
+        (0..table.names.len())
+            .filter(|&j| table.numeric[j] && Some(j) != time_idx)
+            .collect()
+    } else {
+        let mut v = Vec::new();
+        for name in &vars {
+            match table.index_of(name) {
+                Ok(j) if table.numeric[j] => v.push(j),
+                Ok(_) => {
+                    eprintln!("error: input '{}' is not numeric", name);
+                    std::process::exit(EXIT_INPUT);
+                }
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        v
+    };
+    if !value_idx.contains(&target_idx) {
+        value_idx.push(target_idx);
+    }
+    value_idx.sort_unstable();
+    value_idx.dedup();
+    let names: Vec<&str> = value_idx.iter().map(|&j| table.names[j].as_str()).collect();
+
+    let (times, mut time_audit, time_report) = match time_idx {
+        Some(j) => {
+            let raw = data::time_keys(&table, j).to_f64();
+            let (seconds, audit, report) = leakage::time_normalizer(&raw, unit);
+            (seconds, Some(audit), report)
+        }
+        None => {
+            let raw: Vec<f64> = (0..table.len()).map(|i| i as f64).collect();
+            let (seconds, audit, report) = leakage::time_normalizer(&raw, data::TimeUnit::Seconds);
+            (seconds, Some(audit), report)
+        }
+    };
+    let panel = match leakage::Panel::new(
+        times,
+        names
+            .iter()
+            .map(|name| {
+                let j = table.index_of(name).expect("column was resolved above");
+                (name.to_string(), table.col(j).to_vec())
+            })
+            .collect(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    };
+
+    let mut report = time_report;
+    report.merge(leakage::audit_panel(&panel, &target, horizon));
+    // D5 differential learner is already part of audit_panel; run it explicitly
+    // as well so its count is visible even when no name canary exists.
+    report.merge(leakage::differential_suite(&panel, &target, horizon));
+
+    // D10: a repeated key on the probe side would multiply joined rows.
+    if let Some(col) = &join_on {
+        match table.index_of(col) {
+            Ok(j) => {
+                let keys: Vec<u64> = table.col(j).iter().map(|v| v.to_bits()).collect();
+                let (_matched, join_report) = leakage::audit_join_cardinality(&keys, &keys);
+                report.merge(join_report);
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+
+    // D2: reconcile a user-supplied bar table (1m->1h vs 1m->15m->1h).
+    if let Some(path) = bars_path {
+        match data::read_table(&path) {
+            Ok(t) => {
+                let need = |name: &str| -> Result<usize, String> {
+                    t.index_of(name).map_err(|e| e.to_string())
+                };
+                let idx = (|| -> Result<[usize; 6], String> {
+                    Ok([
+                        need("time")?,
+                        need("open")?,
+                        need("high")?,
+                        need("low")?,
+                        need("close")?,
+                        need("volume")?,
+                    ])
+                })();
+                match idx {
+                    Ok([it, io, ih, il, ic, iv]) => {
+                        let vw = t.index_of("vwap").ok();
+                        let bars: Vec<leakage::Ohlcv> = (0..t.len())
+                            .map(|r| leakage::Ohlcv {
+                                time: t.value(r, it),
+                                open: t.value(r, io),
+                                high: t.value(r, ih),
+                                low: t.value(r, il),
+                                close: t.value(r, ic),
+                                volume: t.value(r, iv),
+                                vwap: vw.map(|j| t.value(r, j)).unwrap_or(t.value(r, ic)),
+                            })
+                            .collect();
+                        report.merge(leakage::reconcile_resample(
+                            &bars,
+                            resample_small,
+                            resample_large,
+                            session_gap,
+                        ));
+                    }
+                    Err(e) => {
+                        eprintln!("error: --bars needs columns time,open,high,low,close,volume[,vwap]: {}", e);
+                        std::process::exit(EXIT_INPUT);
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+
+    // D8: point-in-time universe from an event CSV (time,symbol,change[,to]).
+    if let Some(path) = universe_path {
+        let Ok(t) = data::read_table(&path) else {
+            eprintln!("error: cannot read universe '{}'", path);
+            std::process::exit(EXIT_INPUT);
+        };
+        let (it, isym, ich) = match (t.index_of("time"), t.index_of("symbol"), t.index_of("change")) {
+            (Ok(a), Ok(b), Ok(c)) => (a, b, c),
+            _ => {
+                eprintln!("error: --universe needs columns time,symbol,change[,to]");
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let ito = t.index_of("to").ok();
+        let mut events = Vec::new();
+        for r in 0..t.len() {
+            let change = match t.cell_text(r, ich).to_ascii_lowercase().as_str() {
+                "listed" | "list" | "add" => leakage::UniverseChange::Listed,
+                "delisted" | "delist" | "remove" => leakage::UniverseChange::Delisted,
+                "renamed" | "rename" => leakage::UniverseChange::Renamed,
+                other => {
+                    eprintln!("error: unknown universe change '{}'", other);
+                    std::process::exit(EXIT_INPUT);
+                }
+            };
+            events.push(leakage::UniverseEvent {
+                time: t.value(r, it),
+                symbol: t.cell_text(r, isym),
+                change,
+                to: ito.map(|j| t.cell_text(r, j)),
+            });
+        }
+        let Some(sym_name) = symbol_col.as_deref() else {
+            eprintln!("error: --universe needs --symbol <col> to identify panel rows");
+            std::process::exit(EXIT_USAGE);
+        };
+        let sym_idx = match table.index_of(sym_name) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let rows: Vec<leakage::UniverseRow> = (0..panel.len())
+            .map(|r| leakage::UniverseRow {
+                time: panel.time[r],
+                symbol: table.cell_text(r, sym_idx),
+            })
+            .collect();
+        report.merge(leakage::audit_universe(&rows, &events));
+    }
+
+    // D9: corporate actions from an event CSV (time,symbol,kind,value).
+    if let Some(path) = actions_path {
+        let Ok(t) = data::read_table(&path) else {
+            eprintln!("error: cannot read corporate actions '{}'", path);
+            std::process::exit(EXIT_INPUT);
+        };
+        let (it, isym, ikind, ival) = match (
+            t.index_of("time"),
+            t.index_of("symbol"),
+            t.index_of("kind"),
+            t.index_of("value"),
+        ) {
+            (Ok(a), Ok(b), Ok(c), Ok(d)) => (a, b, c, d),
+            _ => {
+                eprintln!("error: --corporate-actions needs columns time,symbol,kind,value");
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let Some(price_name) = price_col.as_deref() else {
+            eprintln!("error: --corporate-actions needs --price <col>");
+            std::process::exit(EXIT_USAGE);
+        };
+        let pj = match table.index_of(price_name) {
+            Ok(j) => j,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let mut actions = Vec::new();
+        let mut symbols: Vec<String> = Vec::new();
+        for r in 0..t.len() {
+            let symbol = t.cell_text(r, isym);
+            if !symbols.contains(&symbol) {
+                symbols.push(symbol.clone());
+            }
+            let v = t.value(r, ival);
+            let kind = match t.cell_text(r, ikind).to_ascii_lowercase().as_str() {
+                "split" => leakage::CorporateActionKind::Split(v),
+                "dividend" => leakage::CorporateActionKind::Dividend(v),
+                other => {
+                    eprintln!("error: unknown corporate action '{}'", other);
+                    std::process::exit(EXIT_INPUT);
+                }
+            };
+            actions.push(leakage::CorporateAction {
+                time: t.value(r, it),
+                symbol,
+                kind,
+            });
+        }
+        let prices = table.col(pj);
+        let cuts = leakage::cut_points(&panel, 10);
+        for symbol in symbols {
+            report.merge(leakage::corporate_action_replay(
+                &panel.time,
+                prices,
+                &actions,
+                &symbol,
+                &cuts,
+            ));
+        }
+    }
+
+    // D0/D11: resolved spec and its deterministic hash.
+    let digest = match manifest::sha256_file(&path) {
+        Ok(h) => h,
+        Err(_) => "stdin".to_string(),
+    };
+    let horizon_s = horizon.to_string();
+    let rows_s = table.len().to_string();
+    let target_s = target.clone();
+    let time_s = time_name.clone().unwrap_or_else(|| "<row-index>".to_string());
+    let unit_s = unit.name().to_string();
+    let spec: Vec<(&str, &str)> = vec![
+        ("tool", "rcsr"),
+        ("command", "audit"),
+        ("data_sha256", &digest),
+        ("rows", &rows_s),
+        ("target", &target_s),
+        ("time", &time_s),
+        ("time_unit", &unit_s),
+        ("horizon", &horizon_s),
+        ("tzdb_version", leakage::TZDB_VERSION),
+    ];
+    let required = [("target", target_s.as_str()), ("tzdb_version", leakage::TZDB_VERSION)];
+    let defaults = [("horizon", "1"), ("time_unit", "s")];
+    report.merge(leakage::audit_spec(&spec, &required, &defaults));
+    report.merge(leakage::audit_determinism(&spec, &spec));
+    let hash = leakage::spec_hash(&spec);
+
+    let clean = report.is_clean();
+    let n_eff = leakage::effective_n(panel.len(), horizon);
+    let leaks_json: Vec<String> = report
+        .leaks
+        .iter()
+        .map(|l| {
+            format!(
+                "{{\"detector\":{},\"column\":{},\"row\":{},\"message\":{}}}",
+                jstr(l.detector),
+                l.column.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                l.row.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string()),
+                jstr(&l.message)
+            )
+        })
+        .collect();
+    let ta = time_audit.take().unwrap_or(leakage::TimeAudit {
+        rows: panel.len(),
+        median_dt: 0.0,
+        min_dt: 0.0,
+        max_dt: 0.0,
+        duplicate_instants: 0,
+        non_monotonic_rows: 0,
+    });
+    let out = format!(
+        "{{\"tool\":\"rcsr\",\"version\":{},\"command\":\"audit\",\"clean\":{},\
+         \"checks\":{},\"exit_code\":{},\"spec_hash\":\"{:016x}\",\
+         \"tzdb_version\":{},\"rows\":{},\"target\":{},\"time\":{},\
+         \"time_unit\":{},\"horizon\":{},\"overlap_rows\":{},\"effective_n\":{},\
+         \"time_audit\":{{\"rows\":{},\"median_dt\":{},\"min_dt\":{},\"max_dt\":{},\
+         \"duplicate_instants\":{},\"non_monotonic_rows\":{}}},\
+         \"leaks\":[{}]}}",
+        jstr(VERSION),
+        clean,
+        report.checks,
+        if clean { EXIT_OK } else { EXIT_LEAKAGE },
+        hash,
+        jstr(leakage::TZDB_VERSION),
+        table.len(),
+        jstr(&target),
+        jstr(&time_s),
+        jstr(&unit_s),
+        horizon,
+        horizon.saturating_sub(1),
+        n_eff,
+        ta.rows,
+        ta.median_dt,
+        ta.min_dt,
+        ta.max_dt,
+        ta.duplicate_instants,
+        ta.non_monotonic_rows,
+        leaks_json.join(",")
+    );
+    if let Some(path) = report_path {
+        if let Err(e) = std::fs::write(&path, format!("{out}\n")) {
+            eprintln!("error: cannot write audit report '{}': {}", path, e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    if json_out {
+        println!("{}", out);
+    } else if clean {
+        println!(
+            "audit clean: {} checks, {} rows, N_eff {:.1}, spec {:016x}",
+            report.checks,
+            panel.len(),
+            n_eff,
+            hash
+        );
+    } else {
+        eprintln!("audit failed ({} finding(s)):", report.leaks.len());
+        for leak in &report.leaks {
+            eprintln!(
+                "  [{}]{}{}: {}",
+                leak.detector,
+                leak.column.as_deref().map(|c| format!(" column '{}'", c)).unwrap_or_default(),
+                leak.row.map(|r| format!(" row {}", r)).unwrap_or_default(),
+                leak.message
+            );
+        }
+        eprintln!("report: {}", out);
+    }
+    std::process::exit(if clean { EXIT_OK } else { EXIT_LEAKAGE });
 }
 
 fn run_import(args: &[String]) -> ! {
