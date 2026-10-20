@@ -15,6 +15,7 @@ pub mod fit;
 pub mod gpu;
 pub mod gui;
 pub mod implicit;
+pub mod leakage; // #129: differential leakage detectors
 pub mod metrics;
 pub mod multi;
 pub mod pareto;
