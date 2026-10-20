@@ -733,17 +733,254 @@ pub fn read_table(path: &str) -> Result<Table, String> {
 /// Like [`read_table`], but `skip_malformed` drops ragged rows instead of
 /// refusing the file. The number dropped is kept on [`Table`].
 pub fn read_table_with(path: &str, skip_malformed: bool) -> Result<Table, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
-    parse_table_with(&text, skip_malformed)
+    // #126: stream the file one record at a time. The table still materialises
+    // its columns (that is the point of importing), but no whole-file `String`
+    // is ever built, so a malformed 10 GB file fails early with bounded RSS.
+    parse_stream_with(
+        || {
+            std::fs::File::open(path)
+                .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn std::io::BufRead>)
+                .map_err(|e| format!("{}: {}", path, e))
+        },
+        skip_malformed,
+    )
 }
 
-/// Split one delimited line into trimmed fields. Whitespace-delimited input
-/// collapses runs of spaces, as the loader always has.
-fn split_fields(line: &str, delim: char) -> Vec<String> {
+/// One logical CSV record: the fields after quote-aware splitting and the
+/// 1-based physical line on which the record starts.
+struct Record {
+    fields: Vec<String>,
+    line: usize,
+}
+
+/// True when every `"` in `s` opens a quoted region that is closed again.
+/// `""` inside a quoted region is an escaped quote, not a close.
+fn quotes_balanced(s: &str) -> bool {
+    let mut in_quotes = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes && c == '"' {
+            if chars.peek() == Some(&'"') {
+                chars.next();
+            } else {
+                in_quotes = false;
+            }
+        } else if !in_quotes && c == '"' {
+            in_quotes = true;
+        }
+    }
+    !in_quotes
+}
+
+/// Split one logical record into fields, honouring RFC 4180 quoting.
+///
+/// * a delimiter inside quotes is literal;
+/// * CR/LF inside quotes is literal (the caller joins physical lines with
+///   `\n`, so a CRLF file and an LF file produce the same value);
+/// * `""` inside a quoted field is one literal `"`;
+/// * unquoted fields keep the historical trim; quoted fields are exact;
+/// * whitespace-delimited input still collapses runs of spaces.
+fn split_record(record: &str, delim: char) -> Vec<String> {
     if delim == ' ' {
-        line.split_whitespace().map(|s| s.to_string()).collect()
+        return record.split_whitespace().map(|s| s.to_string()).collect();
+    }
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+    let mut after_quote = false;
+    let mut quoted = false;
+    let mut chars = record.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    chars.next();
+                    field.push('"');
+                } else {
+                    in_quotes = false;
+                    after_quote = true;
+                }
+            } else {
+                field.push(c);
+            }
+        } else if after_quote {
+            if c == delim {
+                fields.push(std::mem::take(&mut field));
+                after_quote = false;
+                quoted = false;
+            } else if !c.is_whitespace() {
+                // Lenient with junk after a closing quote: keep it rather than
+                // silently dropping data. (RFC 4180 calls this invalid.)
+                field.push(c);
+            }
+        } else if c == '"' && field.trim().is_empty() {
+            field.clear();
+            in_quotes = true;
+            quoted = true;
+        } else if c == delim {
+            fields.push(if quoted {
+                std::mem::take(&mut field)
+            } else {
+                field.trim().to_string()
+            });
+            field.clear();
+            quoted = false;
+        } else {
+            field.push(c);
+        }
+    }
+    fields.push(if quoted {
+        field
     } else {
-        line.split(delim).map(|s| s.trim().to_string()).collect()
+        field.trim().to_string()
+    });
+    fields
+}
+
+/// Streaming record reader: one logical record in memory at a time.
+struct CsvRecords<R: std::io::BufRead> {
+    reader: R,
+    /// 1-based number of the last physical line read.
+    line: usize,
+    /// Chosen delimiter; `None` until the header has been sniffed.
+    delim: Option<char>,
+    /// A record read during sniffing that must be returned next.
+    pending: Option<Record>,
+}
+
+impl<R: std::io::BufRead> CsvRecords<R> {
+    fn new(reader: R) -> Self {
+        CsvRecords {
+            reader,
+            line: 0,
+            delim: None,
+            pending: None,
+        }
+    }
+
+    /// Read one physical line without its `\n`/`\r\n`, advancing the line count.
+    fn physical(&mut self) -> Option<Result<String, String>> {
+        let mut bytes = Vec::new();
+        match self.reader.read_until(b'\n', &mut bytes) {
+            Ok(0) => None,
+            Ok(_) => {
+                self.line += 1;
+                while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
+                    bytes.pop();
+                }
+                match String::from_utf8(bytes) {
+                    Ok(s) => Some(Ok(s)),
+                    Err(_) => Some(Err(format!("line {}: input is not valid UTF-8", self.line))),
+                }
+            }
+            Err(e) => Some(Err(format!("line {}: read error: {}", self.line + 1, e))),
+        }
+    }
+
+    /// Read one logical record as raw text, joining physical lines while inside
+    /// quotes. Blank lines and `#` comments between records are skipped.
+    fn raw_record(&mut self) -> Option<Result<(String, usize), String>> {
+        loop {
+            let first = match self.physical()? {
+                Ok(l) => l,
+                Err(e) => return Some(Err(e)),
+            };
+            let trimmed = first.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let start = self.line;
+            let mut raw = first;
+            while !quotes_balanced(&raw) {
+                match self.physical() {
+                    Some(Ok(l)) => {
+                        raw.push('\n');
+                        raw.push_str(&l);
+                    }
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => {
+                        return Some(Err(format!(
+                            "line {}: unterminated quoted field (end of file inside quotes)",
+                            start
+                        )))
+                    }
+                }
+            }
+            return Some(Ok((raw, start)));
+        }
+    }
+
+    /// Pick the delimiter from the first record (and, when present, the second).
+    ///
+    /// Candidates are tab, comma and semicolon; whitespace is the fallback. A
+    /// delimiter that appears inside quotes does not count, and the second
+    /// record breaks ties (a comma file whose header quotes a tab still gets a
+    /// comma, because the counts agree for the comma and not for the tab).
+    fn sniff(first: &str, second: Option<&str>) -> char {
+        let mut best: Option<(char, usize)> = None;
+        for &cand in &['\t', ',', ';'] {
+            let n1 = split_record(first, cand).len();
+            if n1 <= 1 {
+                continue;
+            }
+            if let Some(second) = second {
+                if split_record(second, cand).len() != n1 {
+                    continue;
+                }
+            }
+            match best {
+                // `\t`, `,`, `;` in that order: ties keep the earlier one.
+                Some((_, n)) if n >= n1 => {}
+                _ => best = Some((cand, n1)),
+            }
+        }
+        best.map(|(c, _)| c).unwrap_or(' ')
+    }
+}
+
+impl<R: std::io::BufRead> Iterator for CsvRecords<R> {
+    type Item = Result<Record, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(rec) = self.pending.take() {
+            return Some(Ok(rec));
+        }
+        if self.delim.is_none() {
+            let (first, line) = match self.raw_record()? {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e)),
+            };
+            // Sniff with a one-record look-ahead. The look-ahead is at most one
+            // record, so this stays streaming.
+            let second = match self.raw_record() {
+                Some(Ok((raw, line))) => Some((raw, line)),
+                Some(Err(e)) => return Some(Err(e)),
+                None => None,
+            };
+            let delim = CsvRecords::<std::io::Empty>::sniff(
+                &first,
+                second.as_ref().map(|(raw, _)| raw.as_str()),
+            );
+            self.delim = Some(delim);
+            if let Some((raw, line)) = second {
+                self.pending = Some(Record {
+                    fields: split_record(&raw, delim),
+                    line,
+                });
+            }
+            return Some(Ok(Record {
+                fields: split_record(&first, delim),
+                line,
+            }));
+        }
+        let delim = self.delim.unwrap();
+        match self.raw_record()? {
+            Ok((raw, line)) => Some(Ok(Record {
+                fields: split_record(&raw, delim),
+                line,
+            })),
+            Err(e) => Some(Err(e)),
+        }
     }
 }
 
@@ -761,33 +998,38 @@ pub fn parse_table(text: &str) -> Result<Table, String> {
 /// `skip_malformed`, rows whose field count differs from the header are
 /// dropped and counted (`Table::skipped_malformed`) instead of refused.
 pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, String> {
-    let mut header: Option<&str> = None;
-    let mut nfields = 0usize;
-    let mut delim = ',';
+    parse_stream_with(
+        || {
+            Ok(Box::new(std::io::Cursor::new(text.as_bytes()))
+                as Box<dyn std::io::BufRead + '_>)
+        },
+        skip_malformed,
+    )
+}
+
+/// Two streaming passes over the same source: the first fixes the width,
+/// counts ragged rows and decides each column's type; the second builds the
+/// columns. The source is reopened instead of being held in memory.
+fn parse_stream_with<'a, F>(mut open: F, skip_malformed: bool) -> Result<Table, String>
+where
+    F: FnMut() -> Result<Box<dyn std::io::BufRead + 'a>, String>,
+{
+    // Pass 1: header, ragged rows, and numeric-vs-categorical.
+    let mut rd = CsvRecords::new(open()?);
+    let header = match rd.next() {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return Err(e),
+        None => return Err("empty input".to_string()),
+    };
+    let names = header.fields;
+    let nfields = names.len();
     let mut skipped_malformed = 0usize;
     let mut data_rows = 0usize;
-
-    // Pass 1: header and delimiter, and reject (or count) ragged rows. Only one
-    // line at a time is resident; there is no `Vec<Vec<String>>` staging copy.
-    for (i, l) in text.lines().enumerate() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if header.is_none() {
-            delim = if l.contains('\t') {
-                '\t'
-            } else if l.contains(',') {
-                ','
-            } else {
-                ' '
-            };
-            nfields = split_fields(l, delim).len();
-            header = Some(l);
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
+    let mut any = vec![false; nfields];
+    let mut all = vec![true; nfields];
+    for rec in rd {
+        let rec = rec?;
+        if rec.fields.len() != nfields {
             if skip_malformed {
                 skipped_malformed += 1;
                 continue;
@@ -795,39 +1037,13 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
             return Err(format!(
                 "line {}: expected {} field(s), found {} (ragged row; pass \
                  --skip-malformed to drop such rows instead)",
-                i + 1,
+                rec.line,
                 nfields,
-                parts.len()
+                rec.fields.len()
             ));
         }
         data_rows += 1;
-    }
-    let header = header.ok_or_else(|| "empty input".to_string())?;
-    if data_rows == 0 {
-        return Err("no data rows".to_string());
-    }
-    let names = split_fields(header, delim);
-
-    // A column is numeric when every non-missing cell parses as a number.
-    // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
-    // and become `NaN` in the numeric view.
-    let mut any = vec![false; nfields];
-    let mut all = vec![true; nfields];
-    let mut seen_header = false;
-    for l in text.lines() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if !seen_header {
-            seen_header = true;
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
-            continue; // accepted by pass 1 (skipped or none)
-        }
-        for (j, cell) in parts.iter().enumerate() {
+        for (j, cell) in rec.fields.iter().enumerate() {
             let cell = cell.trim();
             if is_missing_token(cell) {
                 continue;
@@ -838,10 +1054,22 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
             }
         }
     }
+    if data_rows == 0 {
+        return Err("no data rows".to_string());
+    }
+    // A column is numeric when every non-missing cell parses as a number.
+    // Missing tokens (`''`, `NA`, `NaN`, `null`, case-insensitively) are skipped
+    // and become `NaN` in the numeric view.
     let numeric: Vec<bool> = any.iter().zip(&all).map(|(&a, &b)| a && b).collect();
 
     // Pass 2: one contiguous `f64` block per numeric column and, where the
     // source text is worth keeping, one `u32` code per row plus a level table.
+    let mut rd = CsvRecords::new(open()?);
+    match rd.next() {
+        Some(Ok(_header)) => {}
+        Some(Err(e)) => return Err(e),
+        None => return Err("empty input".to_string()),
+    }
     let mut columns: Vec<Column> = (0..nfields).map(|_| Column::default()).collect();
     for (j, col) in columns.iter_mut().enumerate() {
         if numeric[j] {
@@ -855,21 +1083,12 @@ pub fn parse_table_with(text: &str, skip_malformed: bool) -> Result<Table, Strin
     // Once it crosses the cap the map is dropped immediately, so a large random
     // column never builds one `String` key per distinct value.
     let mut dict_live: Vec<bool> = (0..nfields).map(|_| true).collect();
-    seen_header = false;
-    for l in text.lines() {
-        let trimmed = l.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+    for rec in rd {
+        let rec = rec?;
+        if rec.fields.len() != nfields {
+            continue; // accepted or skipped by pass 1
         }
-        if !seen_header {
-            seen_header = true;
-            continue;
-        }
-        let parts = split_fields(l, delim);
-        if parts.len() != nfields {
-            continue;
-        }
-        for (j, cell) in parts.iter().enumerate() {
+        for (j, cell) in rec.fields.iter().enumerate() {
             let cell = cell.trim();
             if numeric[j] {
                 columns[j].values.push(if is_missing_token(cell) {
