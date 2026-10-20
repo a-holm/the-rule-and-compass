@@ -19,7 +19,11 @@ accurate equation at each level of complexity.
 
 Constants inside a candidate are not guessed: each candidate's constants are
 fitted by **Levenberg–Marquardt**, so a candidate with the right *shape* is
-immediately usable even if its numbers started out wrong.
+immediately usable even if its numbers started out wrong. Candidates that are
+**affine in every constant** can instead be fitted in closed form by a
+column-pivoted QR (`--fit-strategy auto|linear`), which reaches the exact
+global optimum in one solve and falls back to LM for every other tree; the
+default remains the historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -339,7 +343,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
+     [--fit-iters N] [--fit-strategy exact|auto|linear] [--fit-report] [--no-fit]
+     [--no-dedup] [--no-simd] [--predictor-samples N]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]

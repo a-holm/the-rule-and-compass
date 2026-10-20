@@ -66,6 +66,8 @@ pub fn json() -> String {
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--function", "string", "none", "user-defined building block name(a,b)=expr or name=expr (repeatable, at most four; parameters inferred from free variables; constants in a body are shared by every call)"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations"),
+        ("--fit-strategy", "enum", "exact", "exact | auto | linear: the exact constant-fitting arm. exact is the historical CPU LM, bit for bit; auto/linear use a closed-form column-pivoted QR for trees affine in every constant and fall back to exact LM otherwise (cpu is an alias for exact)"),
+        ("--fit-report", "flag", "false", "print constant-fitting arm counts after the run (diagnostics only)"),
         ("--no-fit", "flag", "false", "disable constant fitting"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),
         ("--no-front-parents", "flag", "false", "draw every parent from the island tournament; disables the 15% Pareto-front feedback and restores the pre-#76 trajectory exactly"),

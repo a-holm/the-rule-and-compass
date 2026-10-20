@@ -307,6 +307,20 @@ SEARCH:
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
   --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
+  --fit-strategy <name>      exact | auto | linear (default exact). `exact` is
+                             the historical CPU Levenberg–Marquardt path, bit
+                             for bit. `auto`/`linear` solve trees that are
+                             affine in every constant by a closed-form
+                             column-pivoted QR and fall back to exact LM
+                             otherwise. The linear arm is an exact global
+                             minimiser for its class, not an approximation;
+                             it may still change the search trajectory because
+                             it reaches the optimum in one solve instead of
+                             iterating, so it is opt-in and saved in
+                             checkpoints. `cpu` is an alias for `exact`
+  --fit-report               print the constant-fitting arm counts at the end
+                             of the run (diagnostics only; never changes the
+                             search)
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -643,6 +657,9 @@ fn main() {
     let mut seed_set = false;
     let mut ops_set = false;
     let mut fit_iters_set = false;
+    // #116: remember an explicit --fit-strategy so a resume can refuse a
+    // contradiction with the saved configuration.
+    let mut fit_strategy_set = false;
     let mut dedup_set = false;
     let mut patience_set = false;
     let mut time_budget_set = false;
@@ -879,6 +896,26 @@ fn main() {
             "--no-fit" => {
                 cfg.fit_iters = 0;
                 fit_iters_set = true;
+            }
+            // #116: reporting-only arm counts.
+            "--fit-report" => cfg.fit_report = true,
+            // #116: exact constant-fitting arm.
+            "--fit-strategy" => {
+                let v = val!();
+                match fit::FitStrategy::parse(&v) {
+                    Some(s) => {
+                        cfg.fit_strategy = s;
+                        fit_strategy_set = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --fit-strategy needs exact, auto or linear (cpu is an \
+                             alias for exact), got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             "--no-dedup" => {
                 cfg.dedup = false;
@@ -1183,6 +1220,14 @@ fn main() {
             conflicts.push(format!(
                 "--fit-iters {} (saved {})",
                 cfg.fit_iters, saved.fit_iters
+            ));
+        }
+        // #116: the fitting arm is saved search state.
+        if fit_strategy_set && cfg.fit_strategy != saved.fit_strategy {
+            conflicts.push(format!(
+                "--fit-strategy {} (saved {})",
+                cfg.fit_strategy.name(),
+                saved.fit_strategy.name()
             ));
         }
         if dedup_set && cfg.dedup != saved.dedup {
@@ -2227,6 +2272,9 @@ fn main() {
         std::process::exit(EXIT_OK);
     }
 
+    // #116: arm counts are process-wide diagnostics; take a delta around this
+    // run so repeated runs in one process (`--report benchmark`) stay readable.
+    let fit_before = fit::fit_arm_counts();
     let mut last_saved: Option<(usize, String)> = None;
     let outcome_result = if let Some(path) = save_path.clone() {
         let resumed = resume_checkpoint.take();
@@ -2287,6 +2335,28 @@ fn main() {
         }
     };
     let elapsed = start.elapsed().as_secs_f64();
+
+    // #116: opt-in arm counts. This line is diagnostics only and never feeds
+    // back into the search.
+    if cfg.fit_report {
+        let (linear, exact) = fit::fit_arm_counts();
+        let linear = linear.saturating_sub(fit_before.0);
+        let exact = exact.saturating_sub(fit_before.1);
+        let total = linear + exact;
+        let share = if total == 0 {
+            0.0
+        } else {
+            100.0 * linear as f64 / total as f64
+        };
+        eprintln!(
+            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls)",
+            cfg.fit_strategy.name(),
+            linear,
+            exact,
+            share,
+            total
+        );
+    }
 
     // Seeded solutions, reported once each. The search holds them in
     // normalised-input space; show the original-units form, exactly like a
