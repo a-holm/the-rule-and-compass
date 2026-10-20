@@ -483,6 +483,12 @@ impl GpuSearch {
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
         let mut lowered = 0usize;
+        // #131: record what the batch actually emitted. Several calls can belong
+        // to one generation (initial screening, refit, restarts); merge them.
+        // The counts come from `compile_program`, i.e. from the words that were
+        // uploaded to the device, so an opcode is reported only if it ran.
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
         // #122: one fixed-width slot per genome. A tree whose postfix exceeds
         // the configured bound is scored on the CPU (the existing fallback), so
         // a wide seed can never truncate or corrupt the arena.
@@ -497,18 +503,24 @@ impl GpuSearch {
         let pool = self.pool.as_mut().expect("a pool was just allocated");
         pool.begin_generation();
         for &(i, j) in &pending {
-            let mut buf = Vec::new();
             let meta = crate::genome::GenomeMeta {
                 island: i as u16,
                 tag: j as u32,
                 ..Default::default()
             };
-            // #121: the same compile + exact-lowering + stack gate as
-            // `Population::add`, with a report of whether lowering rewrote it.
-            match crate::gpu::compile_with_report(&islands[i][j].tree, &mut buf) {
-                Some(was_lowered) if buf.len() <= width && pool.push(&buf, meta) => {
-                    if was_lowered {
+            // #131: one guarded entry point (lower + stack bound) for the
+            // synchronous pool path; #121's lowering/stack split is kept.
+            let compiled = crate::gpu::compile_program(&islands[i][j].tree).ok();
+            let pushed = compiled
+                .as_ref()
+                .map_or(false, |c| c.words().len() <= width && pool.push(c.words(), meta));
+            match compiled {
+                Some(c) if pushed => {
+                    if c.lowered() {
                         lowered += 1;
+                    }
+                    for (name, n) in c.opcodes() {
+                        *stats.opcodes.entry(name.clone()).or_default() += *n;
                     }
                     slots.push((i, j));
                 }
@@ -516,11 +528,6 @@ impl GpuSearch {
             }
         }
 
-        // #131/#121: record what the batch actually used. Several calls can
-        // belong to one generation (initial screening, refit, restarts); merge
-        // them.
-        let stats = self.stats.entry(generation).or_default();
-        stats.generation = generation;
         stats.programs += pool.len();
         stats.native += pool.len() - lowered;
         stats.lowered += lowered;
@@ -946,6 +953,7 @@ fn score_pipeline_batch(
     }
     // #121: the overlap path uses the same lowering and reports the same
     // supported/lowered/unsupported split as the synchronous path.
+    // #131: it also reports the opcodes of the programs actually uploaded.
     let stats = g.stats.entry(generation).or_default();
     stats.generation = generation;
     stats.programs += pop.len();
@@ -953,6 +961,9 @@ fn score_pipeline_batch(
     stats.lowered += pop.lowered();
     stats.fallbacks += pop.unsupported();
     stats.unsupported_programs += pop.unsupported();
+    for (name, n) in pop.opcode_usage() {
+        *stats.opcodes.entry(name).or_default() += n;
+    }
     if pop.is_empty() {
         return Ok(());
     }
@@ -1830,8 +1841,9 @@ pub struct SeedResult {
 pub struct GpuGenStats {
     /// Generation number this batch belongs to.
     pub generation: usize,
-    /// Operator occurrences in the programs that ran on the GPU.
-    pub opcodes: Vec<(String, usize)>,
+    /// Operator occurrences in the programs that ran on the GPU, sorted by
+    /// opcode name. Empty only when the batch contained no operator words.
+    pub opcodes: BTreeMap<String, usize>,
     /// Programs compiled into the batch.
     pub programs: usize,
     /// #121: compiled programs the kernel accepted verbatim.
