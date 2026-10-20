@@ -39,7 +39,8 @@ Each seed is processed once, in this order, **before generation 1**:
    identities such as `+ 0`;
 3. **fit** its numeric constants on the full training sample with
    `--fit-iters` Levenberg–Marquardt iterations (the same fitter offspring
-   use; `--no-fit` leaves constants untouched);
+   use; `--no-fit` and `--fit-iters 0` leave constants untouched and take no
+   LM or polish step at all);
 4. **evaluate** its error on the full training sample under `--metric`;
 5. **insert** it into the Pareto archive and into the initial population of
    **every** island, so the seed cannot be lost before migration.
