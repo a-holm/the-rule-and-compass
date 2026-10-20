@@ -9,9 +9,17 @@ use crate::expr::Op;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// The schema document, identical for the CLI and the server.
-pub fn json() -> String {
-    let opts = [
+/// Whether `name` is one of the documented root search options.
+pub fn has_option(name: &str) -> bool {
+    OPTIONS.iter().any(|(n, _, _, _)| *n == name)
+}
+
+/// The one option table used by `rcsr schema`, the GUI and the tests.
+///
+/// Each row is `(name, type, default, description)`. Adding a flag here is the
+/// only edit needed for the document; [`has_option`] lets a surface reject a
+/// known CLI flag explicitly rather than calling it unknown.
+pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
         ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A streaming CSV is estimated from calibrated rows x columns (table + preparation, no resident text) once the header and row count are known; the estimate and basis appear in the preparation block and it exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
         ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
@@ -26,16 +34,16 @@ pub fn json() -> String {
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, signed, log_squashed, implicit, implicit_residual, aic, aicc, bic)"),
         ("--fill", "enum", "none", "missing-value method: none | drop | mean | median | zero | previous | interpolate"),
         ("--outlier-iqr", "float", "none", "drop rows beyond k interquartile ranges from the training median"),
-        ("--smooth", "int", "0", "trailing moving-average window in rows (0 = off; a row reads only itself and earlier rows)"),
-        ("--smooth-centred", "int", "0", "CENTRED moving-average window in rows; reads future bars and is reported as look-ahead"),
-        ("--allow-interpolate", "flag", "false", "permit --fill interpolate on time-ordered data (it reads the next bar; refused otherwise)"),
+        ("--smooth", "int", "0", "trailing moving-average window in rows (0 = off; a row reads only itself and earlier rows); causal, see docs/time-series.md"),
+        ("--smooth-centred", "int", "0", "CENTRED moving-average window in rows; reads future bars and is reported as look-ahead (opt-in, see docs/time-series.md)"),
+        ("--allow-interpolate", "flag", "false", "permit --fill interpolate on time-ordered data (it reads the next bar; refused otherwise; see docs/time-series.md)"),
         ("--center", "enum", "mean", "subtract mean | median | min | max | none before the search"),
         ("--scale", "enum", "std", "divide by std | iqr | range | none before the search"),
         ("--filter", "string", "none", "keep rows where this expression is > 0"),
         ("--exclude", "string", "none", "drop rows where this expression is > 0"),
         ("--train-select", "string", "none", "rows where this expression is > 0 go to training (overrides --split)"),
         ("--test-select", "string", "none", "rows where this expression is > 0 go to test (overrides --split)"),
-        ("--split", "enum", "random", "random | temporal | group | temporal-group | auto"),
+        ("--split", "enum", "random", "random | temporal | group | temporal-group | auto; temporal/panel choices and purge rules are in docs/time-series.md"),
         ("--time", "string", "none", "time/ordering column (implies temporal); epoch numbers or ISO 8601 with Z/+-HH:MM offsets"),
         ("--date-only", "enum", "error", "date-only values: error | utc-midnight | session-close (21:00 UTC)"),
         ("--time-unit", "enum", "auto", "numeric time unit: s | ms | us | ns (default auto-detect; mixed/out-of-range refuses)"),
@@ -88,6 +96,7 @@ pub fn json() -> String {
         ("--time-budget", "float", "none", "wall-clock seconds"),
         ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical. JSON reports the measured kernel/sync/alloc/copy wall and kernel-time duty; SM occupancy is null unless measured separately with ncu"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
+        ("--cpu", "flag", "false", "alias for --no-gpu: force CPU evaluation"),
         ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
         ("--qd-cells", "int", "16", "descriptor cells: grid bins per axis or CVT K (2..=512; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
@@ -105,15 +114,21 @@ pub fn json() -> String {
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
         ("--json-out", "string", "none", "write the final JSON result to this file atomically instead of stdout (implies --json); progress stays on stderr/NDJSON"),
         ("--format", "enum", "text", "text | json | ndjson"),
+        ("--json", "flag", "false", "shorthand for --format json: one JSON result object"),
+        ("--ndjson", "flag", "false", "shorthand for --format ndjson: one event per line"),
         ("--progress", "flag", "false", "emit per-generation progress with convergence statistics (confidence, stability, maturity, percent_converged); see docs/convergence.md"),
+        ("--quiet", "flag", "false", "suppress the human-readable header, the GPU fallback note and the one-line resource summary"),
         ("--top", "int", "0", "limit reported Pareto rows (0 = all)"),
         ("--out", "string", "none", "write Pareto front TSV to this path"),
         ("--report", "enum", "none", "Markdown report: summary | sensitivity | benchmark (single value; last wins)"),
         ("--report-out", "string", "none", "write the Markdown report to this path (otherwise text=stdout, json/ndjson=stderr)"),
         ("--report-repeats", "int", "5", "independent searches for --report benchmark"),
-    ];
+];
+
+/// The schema document, identical for the CLI and the server.
+pub fn json() -> String {
     let mut items = String::new();
-    for (i, (name, ty, default, desc)) in opts.iter().enumerate() {
+    for (i, (name, ty, default, desc)) in OPTIONS.iter().enumerate() {
         if i > 0 {
             items.push(',');
         }
@@ -171,6 +186,47 @@ pub fn json() -> String {
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+         \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
+ {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\
+ {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"rows per I/O group\"}},\
+ {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto-detected\",\"description\":\"store this column as exact i64 timestamps\"}},\
+ {{\"name\":\"--skip-malformed\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"drop ragged rows instead of refusing the input\"}},\
+ {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse before parsing when the estimate exceeds this\"}},\
+ {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory\"}},\
+ {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
+         \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
+ {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
+         \"prep\":{{\"command\":\"rcsr prep\",\"summary\":\"raw OHLCV CSV/ZIP archives to a .rcsb store with no intermediate CSV\",\"options\":[\
+{{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
+{{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"derived\",\"description\":\"symbol override for a single-file input\"}},\
+{{\"name\":\"--tz\",\"type\":\"string\",\"default\":\"UTC\",\"description\":\"UTC, +HH:MM, America/New_York or Europe/London\"}},\
+{{\"name\":\"--calendar\",\"type\":\"enum\",\"default\":\"24x7\",\"description\":\"24x7 | nyse | lse\"}},\
+{{\"name\":\"--resample\",\"type\":\"enum\",\"default\":\"none\",\"description\":\"1m..1w, calendar-aware; OHLC exact, flows summed\"}},\
+{{\"name\":\"--mtf\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"higher timeframes joined as of their last closed bar\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"ta:core, ta:full, exotic:cheap, candle:geometry, cross:btc, calendar or names\"}},\
+{{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>\"}},\
+{{\"name\":\"--spec\",\"type\":\"path\",\"default\":\"none\",\"description\":\"key=value spec file; its SHA-256 is recorded in the manifest\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol],... with a verified boundary ratio\"}},\
+{{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"parallel symbol workers; output order stays deterministic\"}},\
+{{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"column-store group size\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
+{{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}}]}},\n  \
+         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
+{{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership CSV or panel .rcsb\"}},\
+{{\"name\":\"--top\",\"type\":\"int\",\"default\":\"100\",\"description\":\"names selected per rebalance\"}},\
+{{\"name\":\"--lookback\",\"type\":\"int\",\"default\":\"90\",\"description\":\"trailing liquidity window in days\"}},\
+{{\"name\":\"--min-history\",\"type\":\"int\",\"default\":\"90\",\"description\":\"minimum age before selection\"}},\
+{{\"name\":\"--rebalance\",\"type\":\"int\",\"default\":\"30\",\"description\":\"days between membership decisions\"}},\
+{{\"name\":\"--min-bars\",\"type\":\"int\",\"default\":\"60\",\"description\":\"minimum trailing bars\"}},\
+{{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"86400\",\"description\":\"bar spacing for gap counts (3600 hourly)\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol] verified splice table\"}},\
+{{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
+{{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}}]}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),

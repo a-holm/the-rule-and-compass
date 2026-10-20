@@ -47,7 +47,8 @@ the server refuses anything but the address it was bound to.
   the top; every other option the schema declares is rendered under **More
   options**. The widget is chosen from the declared `type` (`enum` → select,
   `int`/`float` → number, `flag` → checkbox, `string`/`csv` → text). There is
-  no hand-written list of the non-pinned flags.
+  no hand-written list for rendering; execution support is declared separately
+  and tested for every flag.
 * **Run pane** — `POST /api/run` streams `application/x-ndjson`; the page
   parses one event per line and updates the progress line and a canvas Pareto
   chart (x = complexity, y = train and test error on a log axis). Solution
@@ -122,9 +123,10 @@ a socket and exercises the real endpoints:
 
 1. `/api/schema` returns 200 and valid JSON with `options`, `operators` and
    `exit_codes`.
-2. The library's schema copy is compared field-for-field (name, type, default,
-   description and order) with the `let opts = [...]` table in `src/main.rs`, so
-   a new CLI flag cannot silently drift out of the generated form.
+2. `/api/schema` is compared byte-for-byte with `rcsr::schema::json()`, and a
+   behavioural test feeds every documented root option to the GUI parser. Each
+   one must be either implemented or appear in the explicit unsupported list —
+   never "unknown argument".
 3. `POST /api/run` over a 20-row table returns lines that all parse as JSON and
    end with `done`.
 4. Malformed HTTP and malformed JSON both return 400 without hanging.
@@ -375,7 +377,7 @@ The engine has no pause primitive; it has `--time-budget`, `--generations`,
 `--patience` and `--seed`. The GUI therefore models a run as **bounded and
 deterministic**:
 
-* **Run** launches `rcsr … --ndjson --progress` as a child process and parses one
+* **Run** starts the library pipeline with the same `--ndjson` event contract and parses one
   JSON object per line. Nothing is scraped from prose.
 * A small control set: **Run**, **Stop**, and for the *next* run a
   `--time-budget` / `--generations` cap. "Pause" is offered honestly as "Stop
@@ -619,31 +621,37 @@ highlights the offending form field where it can and otherwise shows the log.
 
 ### 6.2 Driving the stream
 
-A run is a child process:
+The as-built server runs the same library pipeline in-process (see
+"As-built screens and deviations" above) and emits the NDJSON event objects
+directly:
 
 ```
-rcsr --data <path> --target <col> --vars … --ndjson --progress …
+prepare-full-weighted-with → search::run → start / progress / solution … / done
 ```
 
-The GUI reads stdout line by line and dispatches on the `event` field. Because
-the stream is line-oriented NDJSON, a partial final line is buffered, never
-parsed. stdout-only-is-result and stderr-only-is-log are respected: results
-come from stdout, the human log from stderr, and they are shown in different
-places. Kill = close the child; there is no protocol to speak, which keeps the
-integration trivial and the binary reusable.
+It still dispatches on the `event` field and never parses human-readable text.
+There is no child process or pipe to manage; the CLI's `--ndjson` stream and the
+server's stream carry the same event names and payloads (the server adds `bic`
+to `solution`). Cancelling the HTTP request stops the run through the server's
+shutdown flag.
 
 ### 6.3 Schema-driven forms (how a new flag reaches the GUI)
 
-1. A developer adds `--weight` to `main.rs` and to the `schema()` options list.
+1. A developer adds `--weight` to `schema::OPTIONS` in `src/schema.rs`.
 2. The GUI, on next launch, reads the new option from `rcsr schema`.
 3. The generic renderer maps its `type` to a widget and, because it is not in
    the GUI's layout table, places it in the **"Other"** group automatically.
-4. It is immediately settable and immediately appears in the CLI bar.
+4. It appears in the form immediately. Whether the server can execute it is
+   decided by `parse_args` (or the explicit `UNSUPPORTED` table), and the
+   contract test fails if the answer is neither "supported" nor a named,
+   reasoned rejection.
 
-No GUI change was required. The layout table only *improves* the placement of
-options the GUI author has chosen to group; it is never required for
-correctness. The rule for GUI authors: **never hard-code an option name to make
-it appear — that is the path back to a GUI that lags the engine.**
+The renderer needs no GUI change, but the execution parser is still a separate
+match in `gui.rs`: a new flag must be added to that match or to the explicit
+`UNSUPPORTED` table, with the reason shown to the user. `tests/gui.rs` enforces
+this for every documented root option, so "rendered but rejected as unknown"
+cannot ship. The layout table only *improves* placement; it is never required
+for the form to render a flag.
 
 ### 6.4 Version skew
 
@@ -673,12 +681,14 @@ right chart from this JSON?" a checkable question.
 
 ### 6.6 Language and process
 
-The engine is Rust; the GUI should be too, sharing the crate's data types where
-that avoids drift. The GUI must **not** link the search itself for its main
-path: it drives the `rcsr` binary so that (a) an out-of-date GUI can drive a
-newer engine, and (b) the same binary is the only thing to install on a server.
-Linking the library is acceptable only for pure presentation helpers (parsing a
-`schema` document, formatting an equation) — never for the search.
+The engine is Rust; the GUI is too, sharing the crate's data types to avoid
+drift. The as-built server deliberately **links the library and runs the search
+in-process** instead of spawning `rcsr`: one local HTTP response, no
+process/pipe layer, and the same functions the CLI uses. This is the documented
+deviation above. It means the server is not a way to drive a *newer* binary,
+but it does share one schema document and one search implementation. The CLI
+remains the canonical interface, and every action still has a Copy-as-CLI
+equivalent.
 
 ---
 
@@ -744,9 +754,9 @@ Operationally:
 
 ### 8.1 Non-goals (v1)
 
-* **No built-in search engine.** The GUI never links the search loop; it drives
-  `rcsr`. Linking the library for the search is explicitly out of scope, so the
-  GUI can never diverge from the CLI's results.
+* **No second search engine.** The GUI does not reimplement the search; it
+  calls the same library entry point as the CLI. That is the as-built
+  in-process design, not a fork of the algorithm.
 * **No mid-run pause/resume.** The engine has no pause primitive; until #17,
   "pause" is honestly "stop"; runs are bounded and deterministic instead.
 * **No cloud or remote execution.** Renting compute, accounts, credentials and

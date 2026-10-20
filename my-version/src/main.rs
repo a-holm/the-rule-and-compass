@@ -93,6 +93,7 @@ fn usage() -> String {
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
+  rcsr prep --input <file|dir> --out <store.rcsb> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
@@ -152,6 +153,7 @@ ROW WEIGHTS:
                              rank_correlation, auc, log_loss, hinge).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
+  See docs/time-series.md for which preparation steps read ahead.
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
                              null). Default none: leave it, as before.
                              drop        drop the row
@@ -179,6 +181,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              counted, one matching neither is reported unused
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
+  See docs/time-series.md for the full purge/embargo/look-ahead checklist.
   --split random|temporal|group|temporal-group|auto   (default random)
                              random          shuffled i.i.d. holdout
                              temporal        train on the past, test on the future
@@ -989,6 +992,14 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("import") {
         run_import(&args[1..]);
     }
+    // #123: stream raw klines/CSV archives straight to a column store.
+    if args.first().map(|s| s.as_str()) == Some("prep") {
+        rcsr::prep::run(&args[1..]);
+    }
+    // #145: point-in-time membership and the rebuilt panel.
+    if args.first().map(|s| s.as_str()) == Some("panel") {
+        rcsr::panel::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -1016,10 +1027,6 @@ fn main() {
         print!("{}", schema::json());
         std::process::exit(EXIT_OK);
     }
-    // #134: everything before the search is `prep`, including argument parsing,
-    // loading and data preparation.
-    let run_start = std::time::Instant::now();
-
     let mut cfg = search::Config::default();
     // #141: whether the user asserted a backend explicitly. `None` means the
     // run follows the build/device default; `Some(true)` is `--gpu` and
@@ -6550,6 +6557,8 @@ OPTIONS:
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
+  --allow-lockbox            permit a test window overlapping 2026H2
+                             (declared final test only; default refuses)
   --quiet                    reserved; text output stays on stdout
   -h, --help                 show this help
 ",
@@ -6586,6 +6595,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
     let mut quiet = false;
+    let mut allow_lockbox = false;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -6691,6 +6701,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--quiet" => quiet = true,
+            "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with('-') => {
                 eprintln!(
                     "error: unknown walkforward option '{}'\n\n{}",
@@ -6794,6 +6805,7 @@ fn run_walkforward(args: &[String]) -> ! {
         periods_per_year,
         candidates,
         pool_reset_flat,
+        allow_lockbox,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
@@ -7665,6 +7677,28 @@ mod tests {
                 m
             );
         }
+    }
+
+    /// #115: the time-series checklist must be reachable from the CLI contract,
+    /// and the smoothing flags must describe the causal default correctly.
+    #[test]
+    fn help_and_schema_link_the_time_series_checklist() {
+        for surface in [usage(), schema::json()] {
+            assert!(
+                surface.contains("docs/time-series.md"),
+                "the time-series checklist is not linked from the CLI contract"
+            );
+        }
+        assert!(usage().contains("--smooth-centred"));
+        assert!(schema::json().contains("--smooth-centred"));
+        assert!(
+            schema::json().contains("trailing moving-average"),
+            "schema must describe --smooth as trailing"
+        );
+        assert!(
+            !schema::json().contains("centred moving average per column"),
+            "the stale README wording must not reappear in schema"
+        );
     }
 
     /// Data preparation stayed opt-in, but every flag must be documented.

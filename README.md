@@ -332,6 +332,21 @@ atomically instead of streaming it. See
   that can be scanned group by group and searched from a bounded hash sample
   when it does not fit; v1 stores still load. See
   [`docs/data-format.md`](docs/data-format.md).
+* **Market data as a typed layer**: `rcsr::ohlcv` resamples OHLCV exactly
+  (open=first, high=max, low=min, close=last, flows summed), keeps gaps and
+  flags zero-volume/partial bars, understands crypto 24/7 and NYSE/LSE
+  sessions with holidays, half-days and DST, applies splits/dividends while
+  keeping raw prices, verifies symbol splices, and joins higher timeframes
+  only after their bucket has closed. `rcsr::features` supplies causal
+  `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
+  a next-open forward label with symmetric cost. See
+  [`docs/ohlcv.md`](docs/ohlcv.md).
+* **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
+  trailing liquidity **as of** each rebalance, keeps delisted names while they
+  trade, never forward-fills across a listing/delisting/migration, verifies
+  splice ratios, charges both sides and the final exit, supplies a
+  matched-exposure random-long benchmark, refuses 2026H2 in every runner and
+  emits a checksummed provenance manifest. See [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -390,15 +405,20 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
+     [--max-memory size] [--force] [--skip-malformed]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
+     [--weight col]
      [--metric <name>] [--generations N] [--islands I]
      [--pop P] [--max-complexity K] [--seed S] [--test-frac f] [--ops list]
      [--seed-expr expr] [--seed-file path]
+     [--implicit] [--implicit-derivative] [--function def]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
+     [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
-     [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
+     [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
+     [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
@@ -410,12 +430,18 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--no-front-parents]
      [--fit-samples N]
      [--patience N]
+     [--gpu] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
-     [--format text|json|ndjson] [--progress]
+     [--allow-backend-change] [--run-manifest file] [--json-out file]
+     [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
 ```
+
+Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
+their own option lists in `rcsr schema` under `import`, `walkforward` and
+`verify-manifest`; the block above is the root search command.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
@@ -503,7 +529,9 @@ run:
 |---|---|
 | `--fill <method>` | what to do with a missing cell: `none` (default), `drop`, `mean`, `median`, `zero`, `previous`, `interpolate` |
 | `--outlier-iqr k` | drop rows beyond `k` interquartile ranges from the column median |
-| `--smooth k` | `k`-wide centred moving average per column; edges shrink |
+| `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
+| `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
+| `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |

@@ -20,7 +20,7 @@
 //! `bic` field on `solution` (the CLI's JSON object carries it, the CLI's
 //! NDJSON event does not). The front end never parses human-readable output.
 
-use crate::data::{self, Center, DType, FillMethod, Scale, SplitMode};
+use crate::data::{self, Center, DType, DateOnlyPolicy, FillMethod, Scale, SplitMode, TimeUnit};
 use crate::diagnostics;
 use crate::expr::{self, Op};
 use crate::fit;
@@ -43,17 +43,9 @@ const APP_JS: &str = include_str!("../gui/app.js");
 const STYLE_CSS: &str = include_str!("../gui/style.css");
 const EXAMPLE_CSV: &str = "x,y\n0,1\n1,3\n2,5\n3,7\n4,9\n5,11\n6,13\n7,15\n8,17\n9,19\n10,21\n11,23\n12,25\n13,27\n14,29\n15,31\n16,33\n17,35\n18,37\n19,39\n";
 
-/// The schema options, kept in the same order and with the same types,
-/// defaults and descriptions as `schema()` in `src/main.rs`.
-///
-/// The CLI binary is not a library, so its private `schema()` cannot be called
-/// from here. The integration test `tests/gui.rs` reads the `let opts = [...]`
-/// table from `src/main.rs` and fails if this slice drifts in name, type,
-/// default, description or order. That keeps the web form generated from the
-/// same public contract while leaving `main.rs` untouched.
-
-/// `rcsr schema` as a JSON document, built from [`SCHEMA_OPTIONS`] and
-/// [`Op::names`] so no flag is listed twice by hand.
+/// `rcsr schema` as a JSON document. The option table lives in
+/// [`crate::schema::OPTIONS`]; this endpoint serves exactly that document, so
+/// there is no second copy to drift.
 pub fn schema_json() -> String {
     // Single source of truth: the same document `rcsr schema` prints.
     crate::schema::json()
@@ -701,6 +693,13 @@ struct RawOptions {
     fill: FillMethod,
     outlier_iqr: Option<f64>,
     smooth: usize,
+    smooth_centred: bool,
+    allow_interpolate: bool,
+    validation_frac: f64,
+    date_only: DateOnlyPolicy,
+    time_unit: Option<TimeUnit>,
+    tz: Option<i64>,
+    skip_malformed: bool,
     center: Center,
     scale: Scale,
     filter: Option<String>,
@@ -737,6 +736,13 @@ impl Default for RawOptions {
             fill: FillMethod::None,
             outlier_iqr: None,
             smooth: 0,
+            smooth_centred: false,
+            allow_interpolate: false,
+            validation_frac: 0.0,
+            date_only: DateOnlyPolicy::Error,
+            time_unit: None,
+            tz: None,
+            skip_malformed: false,
             center: Center::Mean,
             scale: Scale::Std,
             filter: None,
@@ -760,6 +766,58 @@ impl Default for RawOptions {
             eval_expr: None,
         }
     }
+}
+
+/// CLI options the browser UI deliberately does not implement, with the reason
+/// shown to the user. Every other schema option has an arm in [`parse_args`].
+const UNSUPPORTED: &[(&str, &str)] = &[
+    ("--max-memory", "the server does not enforce the CLI memory guard"),
+    ("--force", "the server does not enforce the CLI memory guard"),
+    ("--select-by", "the GUI uses the engine's default selection criterion"),
+    ("--baseline-samples", "the GUI baseline uses the engine's default sample size"),
+    ("--null-block", "the GUI null control only shuffles single rows"),
+    ("--implicit", "the implicit target-as-input transform is not wired into the form"),
+    ("--implicit-derivative", "the implicit target-as-input transform is not wired into the form"),
+    ("--units", "unit declarations are not wired into the browser form"),
+    ("--require-dimensions", "unit declarations are not wired into the browser form"),
+    ("--seed-expr", "seed expressions are not parsed by the server"),
+    ("--seed-file", "seed files are not parsed by the server"),
+    ("--function", "building-block definitions are not parsed by the server"),
+    ("--allow-backend-change", "the GUI does not resume checkpoints"),
+    ("--run-manifest", "the server owns the response stream; use the CLI to write a manifest"),
+    ("--json-out", "the server owns the response stream; use the CLI to write a result file"),
+    ("--out", "the server owns the response stream; use the CLI to write the Pareto TSV"),
+    ("--save", "checkpoints depend on a process lifecycle the stream does not have"),
+    ("--save-every", "checkpoints depend on a process lifecycle the stream does not have"),
+    ("--resume", "checkpoints depend on a process lifecycle the stream does not have"),
+    ("--report", "Markdown reports are produced by the CLI"),
+    ("--report-out", "Markdown reports are produced by the CLI"),
+    ("--report-repeats", "Markdown benchmark reports are produced by the CLI"),
+];
+
+/// The user-facing rejection for a documented CLI option the browser does not
+/// implement. Keeping it in one place avoids a "rendered but unknown" message.
+fn unsupported_error(flag: &str) -> String {
+    let reason = UNSUPPORTED
+        .iter()
+        .find(|(name, _)| *name == flag)
+        .map(|(_, reason)| *reason)
+        .unwrap_or("not supported by the web front end");
+    format!(
+        "{flag} is a CLI option but is not supported by the web front end; use the rcsr CLI for it ({reason})"
+    )
+}
+
+/// Parse the arguments the browser sends. Public so the schema-contract test
+/// can prove every documented option is either accepted or explicitly
+/// rejected, instead of only comparing JSON documents.
+pub fn parse_web_args_for_test(args: &[String]) -> Result<(), String> {
+    parse_args(args).map(|_| ())
+}
+
+/// The documented options the browser rejects, with the reason.
+pub fn rejected_options() -> &'static [(&'static str, &'static str)] {
+    UNSUPPORTED
 }
 
 fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
@@ -787,7 +845,11 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             }
             "--dtype" => raw.dtype = Some(take(&mut i)?),
             "--max-levels" => raw.max_levels = int(&take(&mut i)?, "--max-levels", 1)?,
+            "--skip-malformed" => raw.skip_malformed = true,
             "--test-frac" => raw.test_frac = float(&take(&mut i)?, "--test-frac")?,
+            "--validation-frac" => {
+                raw.validation_frac = float(&take(&mut i)?, "--validation-frac")?
+            },
             "--weight" => raw.weight = Some(take(&mut i)?),
             "--fill" => raw.fill = FillMethod::parse(&take(&mut i)?)?,
             "--outlier-iqr" => {
@@ -795,6 +857,11 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                 raw.outlier_iqr = if v > 0.0 { Some(v) } else { None };
             }
             "--smooth" => raw.smooth = int(&take(&mut i)?, "--smooth", 0)?,
+            "--smooth-centred" => {
+                raw.smooth = int(&take(&mut i)?, "--smooth-centred", 0)?;
+                raw.smooth_centred = raw.smooth > 0;
+            }
+            "--allow-interpolate" => raw.allow_interpolate = true,
             "--center" => raw.center = Center::parse(&take(&mut i)?)?,
             "--scale" => raw.scale = Scale::parse(&take(&mut i)?)?,
             "--filter" => raw.filter = Some(take(&mut i)?),
@@ -803,6 +870,9 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--test-select" => raw.test_select = Some(take(&mut i)?),
             "--split" => raw.split = Some(take(&mut i)?),
             "--time" => raw.time = Some(take(&mut i)?),
+            "--date-only" => raw.date_only = DateOnlyPolicy::parse(&take(&mut i)?)?,
+            "--time-unit" => raw.time_unit = Some(TimeUnit::parse(&take(&mut i)?)?),
+            "--tz" => raw.tz = Some(data::TimeSpec::parse_tz(&take(&mut i)?)?),
             "--group-by" => raw.group_by = Some(take(&mut i)?),
             "--gap" => raw.gap = int(&take(&mut i)?, "--gap", 0)?,
             "--folds" => raw.folds = int(&take(&mut i)?, "--folds", 1)?,
@@ -835,8 +905,37 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--ops" => cfg.ops = Op::parse_list(&take(&mut i)?),
             "--eval-expr" => raw.eval_expr = Some(take(&mut i)?),
             "--fit-iters" => cfg.fit_iters = int(&take(&mut i)?, "--fit-iters", 0)?,
+            "--fit-report" => cfg.fit_report = true,
+            "--fit-samples" => cfg.fit_samples = int(&take(&mut i)?, "--fit-samples", 0)?,
+            "--fit-strategy" => {
+                let v = take(&mut i)?;
+                cfg.fit_strategy = fit::FitStrategy::parse(&v)
+                    .ok_or_else(|| format!("unknown --fit-strategy '{}'", v))?;
+            }
             "--no-fit" => cfg.fit_iters = 0,
             "--no-dedup" => cfg.dedup = false,
+            "--no-front-parents" => cfg.front_parents = false,
+            "--no-simd" => cfg.simd = false,
+            "--qd" => {
+                if cfg.qd_bins == 0 {
+                    cfg.qd_bins = 16;
+                }
+            }
+            "--qd-cells" => {
+                let v = int(&take(&mut i)?, "--qd-cells", 2)?;
+                if v > 256 {
+                    return Err(format!("--qd-cells needs an integer in 2..=256, got '{}'", v));
+                }
+                cfg.qd_bins = v;
+            }
+            "--qd-cell-cap" => {
+                let v = int(&take(&mut i)?, "--qd-cell-cap", 1)?;
+                if v > 64 {
+                    return Err(format!("--qd-cell-cap needs an integer in 1..=64, got '{}'", v));
+                }
+                cfg.qd_cell_cap = v;
+            }
+            "--pipeline-depth" => cfg.pipeline_depth = int(&take(&mut i)?, "--pipeline-depth", 0)?,
             "--gpu" => cfg.gpu = true,
             "--no-gpu" | "--cpu" => cfg.gpu = false,
             "--predictor-samples" => {
@@ -851,20 +950,41 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                     let _ = take(&mut i)?;
                 }
             }
+            // Documented CLI options the browser deliberately does not
+            // implement. They are rejected by name with a reason, never called
+            // "unknown"; tests/gui.rs covers every schema option.
+            other if UNSUPPORTED.iter().any(|(name, _)| *name == other) => {
+                return Err(unsupported_error(other));
+            }
             // Not part of the browser MVP: these either write server-side
             // files or depend on a process lifecycle the stream does not have.
             "--out" | "--save" | "--save-every" | "--resume" | "--report"
             | "--report-out" | "--report-repeats" => {
                 return Err(format!(
-                    "{} is not available from the web front end; use the rcsr CLI for it",
-                    flag
+                    "{flag} is a CLI option but is not supported by the web front end; use the rcsr CLI for it"
                 ))
             }
-            other => return Err(format!("unknown argument '{}'", other)),
+            other => {
+                // #58: a documented CLI option must never be reported as
+                // "unknown" just because the browser UI has not wired it yet.
+                if crate::schema::has_option(other) {
+                    return Err(format!(
+                        "{other} is a CLI option but is not supported by the web front end; use the rcsr CLI for it"
+                    ));
+                }
+                return Err(format!("unknown argument '{}'", other));
+            }
         }
         i += 1;
     }
     Ok((raw, cfg))
+}
+
+/// Parse the arguments the browser sends. Public so the schema-contract test
+/// can prove every documented option is either accepted or explicitly
+/// rejected, instead of only comparing JSON documents.
+pub fn parse_web_args(args: &[String]) -> Result<(), String> {
+    parse_args(args).map(|_| ())
 }
 
 fn int(text: &str, flag: &str, min: usize) -> Result<usize, String> {
@@ -952,7 +1072,7 @@ impl RunPlan {
             std::fs::read_to_string(&data_path)
                 .map_err(|e| format!("{}: {}", data_path, e))?
         };
-        let table = data::parse_table(&text)?;
+        let table = data::parse_table_with(&text, raw.skip_malformed)?;
 
         if raw.weight.is_some() && !metrics::weights_supported(cfg.metric) {
             return Err(format!(
@@ -1126,13 +1246,18 @@ impl RunPlan {
         vars = typed.vars;
         let mut dtypes = typed.dtypes;
         let mut variable_types = typed.variables;
+        let time_spec = data::TimeSpec {
+            date_only: raw.date_only,
+            unit: raw.time_unit,
+            tz: raw.tz,
+        };
         let mut lag_report = data::LagReport::default();
         if raw.lags > 0 || raw.history_frac > 0.0 {
             let lag_spec = data::LagSpec {
                 lags: raw.lags,
                 history_frac: raw.history_frac,
                 gap_break: raw.gap_break,
-                time: data::TimeSpec::default(),
+                time: time_spec.clone(),
             };
             let (t2, v2, rep) = data::add_lags(&table, &vars, &lag_spec, time_col, group_col)?;
             table = t2;
@@ -1173,20 +1298,20 @@ impl RunPlan {
             group_col,
             test_frac: raw.test_frac,
             gap: raw.gap,
-            validation_frac: 0.0,
+            validation_frac: raw.validation_frac,
             folds: raw.folds.max(1),
             train_select,
             test_select,
             exclude,
-            time: data::TimeSpec::default(),
+            time: time_spec,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {
             fill: raw.fill,
             outlier_iqr: raw.outlier_iqr,
             smooth: raw.smooth,
-            smooth_centred: false,
-            allow_interpolate: false,
+            smooth_centred: raw.smooth_centred,
+            allow_interpolate: raw.allow_interpolate,
             center: raw.center,
             scale: raw.scale,
             filter,
