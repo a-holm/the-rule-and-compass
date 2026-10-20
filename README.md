@@ -890,7 +890,11 @@ threads and training rows/columns, and `--json` records `backend`,
 Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
 change the search trajectory. Reported metrics, constants and diagnostics are
 always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. See [`docs/gpu-backend.md`](docs/gpu-backend.md).
+reproduction. A GPU run also reports a measured `gpu` block (allocation, H2D,
+launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
+`sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
+sampled utilisation is not occupancy. See
+[`docs/gpu-backend.md`](docs/gpu-backend.md).
 
 ## Is the search converging?
 

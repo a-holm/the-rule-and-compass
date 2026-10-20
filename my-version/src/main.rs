@@ -408,7 +408,10 @@ SEARCH:
                              --gpu/--cpu, a CUDA build with a usable device uses
                              the GPU automatically. Reported errors stay CPU
                              f64, but f32 fitness can change the trajectory
-                             (cross-backend runs are not bit-identical)
+                             (cross-backend runs are not bit-identical). JSON
+                             reports the measured kernel/sync/alloc/copy wall
+                             and kernel-time duty; SM occupancy is null unless
+                             measured separately with ncu
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -538,6 +541,94 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #118: best reported error and constant-mean baseline error, the two inputs
+/// to quality-per-GPU-hour. Both are on the same full-data f64 scale as the
+/// archive. `inf`/`nan` yields `quality_per_gpu_hour = null` rather than a
+/// fabricated number.
+fn gpu_best_error(outcome: &rcsr::search::Outcome) -> f64 {
+    outcome
+        .archive
+        .items
+        .iter()
+        .map(|s| s.error)
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn gpu_baseline_error(train: &rcsr::data::Sample) -> f64 {
+    let n = train.len();
+    if n == 0 {
+        return f64::NAN;
+    }
+    let mean = train.y.iter().sum::<f64>() / n as f64;
+    train.y.iter().map(|y| (y - mean) * (y - mean)).sum()
+}
+
+/// #118: the GPU block shared by `--json` and the final NDJSON event. It keeps
+/// #131's per-generation opcode/fallback report and adds the measured full-path
+/// accounting. `sm_occupancy` is explicitly `null`: it needs `ncu`, and
+/// `nvidia-smi`'s sampled utilisation is neither occupancy nor duty.
+fn gpu_json(
+    g: &Option<rcsr::search::GpuRunStats>,
+    best_error: f64,
+    baseline_error: f64,
+) -> String {
+    let Some(g) = g else {
+        return "null".to_string();
+    };
+    let a = &g.accounting;
+    let quality = a
+        .quality_per_gpu_hour(best_error, baseline_error)
+        .map(jnum)
+        .unwrap_or_else(|| "null".to_string());
+    let gens: Vec<String> = g
+        .generations
+        .iter()
+        .map(|s| {
+            let ops: Vec<String> = s
+                .opcodes
+                .iter()
+                .map(|(name, n)| format!("{}:{}", jstr(name), n))
+                .collect();
+            format!(
+                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                s.generation,
+                s.programs,
+                s.fallbacks,
+                ops.join(",")
+            )
+        })
+        .collect();
+    format!(
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}]}}",
+        jnum(a.kernel_s),
+        jnum(a.launch_s),
+        jnum(a.sync_s),
+        jnum(a.alloc_s),
+        jnum(a.h2d_s),
+        jnum(a.d2h_s),
+        jnum(a.transfer_s()),
+        jnum(a.window_s()),
+        jnum(a.host_s),
+        jnum(a.accounted_s()),
+        jnum(a.wall_s),
+        jnum(a.idle_s()),
+        jnum(a.residual_fraction()),
+        a.h2d_bytes,
+        a.d2h_bytes,
+        a.batches,
+        a.failed_batches,
+        a.programs,
+        a.evals,
+        a.row_evals,
+        jnum(a.evals_per_s()),
+        jnum(a.row_evals_per_s()),
+        jnum(a.generations_per_s()),
+        jnum(a.duty_cycle()),
+        quality,
+        gens.join(",")
+    )
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
@@ -582,25 +673,29 @@ struct PhaseTimings {
     diagnostics: f64,
     report: f64,
     total: f64,
+    /// #118: GPU full-path wall measured inside `search`. Informational: it is a
+    /// subset of `search`, not another additive phase.
+    gpu: f64,
 }
 
 impl PhaseTimings {
     fn json(&self) -> String {
         format!(
-            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{}}}",
+            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{},\"gpu_seconds\":{}}}",
             jnum(self.prep),
             jnum(self.search),
             jnum(self.baselines),
             jnum(self.diagnostics),
             jnum(self.report),
-            jnum(self.total)
+            jnum(self.total),
+            jnum(self.gpu)
         )
     }
 
     fn text(&self) -> String {
         format!(
-            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s",
-            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total
+            "prep={:.2}s search={:.2}s baselines={:.2}s diagnostics={:.2}s report={:.2}s total={:.2}s gpu={:.2}s",
+            self.prep, self.search, self.baselines, self.diagnostics, self.report, self.total, self.gpu
         )
     }
 
@@ -3390,6 +3485,13 @@ fn main() {
         diagnostics: diagnostics_seconds,
         report: report_seconds,
         total: run_start.elapsed().as_secs_f64(),
+        // #118: the GPU full-path wall is a subset of `search`; it is not added
+        // to `phases_sum`.
+        gpu: outcome
+            .gpu
+            .as_ref()
+            .map(|g| g.accounting.wall_s)
+            .unwrap_or(0.0),
     };
     if let Some(md) = report_md.as_mut() {
         md.push_str(&time_markdown(&timing));
@@ -3432,6 +3534,28 @@ fn main() {
                                 .unwrap_or(0)
                         );
                     }
+                }
+                if let Some(g) = &outcome.gpu {
+                    let a = &g.accounting;
+                    eprintln!(
+                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | duty={:.1}% (kernel/wall, not occupancy) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
+                        a.kernel_s,
+                        a.sync_s,
+                        a.alloc_s,
+                        a.h2d_s,
+                        a.d2h_s,
+                        a.launch_s,
+                        a.host_s,
+                        a.wall_s,
+                        100.0 * a.duty_cycle(),
+                        a.evals_per_s(),
+                        a.row_evals_per_s(),
+                        a.quality_per_gpu_hour(
+                            gpu_best_error(&outcome),
+                            gpu_baseline_error(&prepared.train)
+                        )
+                        .unwrap_or(f64::NAN)
+                    );
                 }
                 qd_text(outcome.qd.as_ref());
             }
@@ -3948,61 +4072,6 @@ fn main() {
                 String::new()
             };
             let search_meta_json = format!("{}{}", predictor_json, fit_json);
-            // #131: only a GPU-guided run emits this key, so CPU output stays
-            // byte-identical. Each entry is one generation's scoring batch(es).
-            let gpu_json = match &outcome.gpu {
-                Some(g) => {
-                    let gens: Vec<String> = g
-                        .generations
-                        .iter()
-                        .map(|s| {
-                            let ops: Vec<String> = s
-                                .opcodes
-                                .iter()
-                                .map(|(name, n)| format!("{}:{}", jstr(name), n))
-                                .collect();
-                            format!(
-                                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
-                                s.generation,
-                                s.programs,
-                                s.native,
-                                s.native,
-                                s.lowered,
-                                s.fallbacks,
-                                s.unsupported_programs,
-                                jnum(s.fallback_seconds),
-                                s.fallback_workers,
-                                ops.join(",")
-                            )
-                        })
-                        .collect();
-                    let sum = |f: fn(&rcsr::search::GpuGenStats) -> usize| {
-                        g.generations.iter().map(f).sum::<usize>()
-                    };
-                    let fallback_seconds: f64 =
-                        g.generations.iter().map(|s| s.fallback_seconds).sum();
-                    let totals = format!(
-                        "{{\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
-                        sum(|s| s.programs),
-                        sum(|s| s.native),
-                        sum(|s| s.native),
-                        sum(|s| s.lowered),
-                        sum(|s| s.fallbacks),
-                        sum(|s| s.unsupported_programs),
-                        jnum(fallback_seconds),
-                        g.generations
-                            .last()
-                            .map(|s| s.fallback_workers)
-                            .unwrap_or(0)
-                    );
-                    format!(
-                        "\"gpu\":{{\"generations\":[{}],\"totals\":{}}},",
-                        gens.join(","),
-                        totals
-                    )
-                }
-                None => String::new(),
-            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -4060,10 +4129,9 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
-                gpu_json,         // #131
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -4085,6 +4153,11 @@ fn main() {
                 outcome.convergence.json(),
                 jnum(elapsed),
                 timing.json(),
+                gpu_json(
+                    &outcome.gpu,
+                    gpu_best_error(&outcome),
+                    gpu_baseline_error(&prepared.train),
+                ),
                 checkpoint_json,
                 null_json,
                 baselines_json,
@@ -4301,13 +4374,18 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
                 timing.json(),
+                gpu_json(
+                    &outcome.gpu,
+                    gpu_best_error(&outcome),
+                    gpu_baseline_error(&prepared.train),
+                ),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );
@@ -6842,6 +6920,7 @@ mod tests {
             diagnostics: 0.05,
             report: 0.02,
             total: 0.67,
+            gpu: 0.12,
         };
         assert!((t.phases_sum() - t.total).abs() <= 0.01 * t.total);
         let json = t.json();
@@ -6852,9 +6931,11 @@ mod tests {
             "diagnostics_seconds",
             "report_seconds",
             "total_seconds",
+            "gpu_seconds",
         ] {
             assert!(json.contains(key), "timing JSON is missing {key}");
         }
         assert!(t.text().contains("total=0.67s"));
+        assert!(t.text().contains("gpu=0.12s"), "GPU wall is a subset, not a phase");
     }
 }

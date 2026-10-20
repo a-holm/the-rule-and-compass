@@ -16,6 +16,7 @@ pub mod fit;
 pub mod genome;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod gpu_stats;
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors

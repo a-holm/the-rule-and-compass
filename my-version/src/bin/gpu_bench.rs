@@ -4,10 +4,11 @@
 //! single launch, then scores the same batch on the CPU, and reports the
 //! speed-up and the agreement between the two. Requires `--features cuda`.
 
+use rcsr::data;
+use rcsr::eval_soa;
 use rcsr::expr::{self, complexity, random_tree, Op};
 use rcsr::gpu::{cpu_sse, GpuEvaluator, Population};
 use rcsr::rng::Mt;
-use rcsr::data;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut path = "examples/sine.csv".to_string();
@@ -117,16 +118,21 @@ fn main() {
 
     // Warm up, then time the GPU batch (averaged over several runs to hide the
     // single-launch overhead). `eval_population` scores every program in the
-    // population in one call and one kernel launch.
+    // population in one call and one kernel launch. #118: the reported time is
+    // the full evaluator path (alloc/upload/launch/sync/download), not the
+    // kernel event alone.
     let _ = ev.eval_population(&population);
     let reps = 25;
+    let before = ev.stats();
     let t_gpu = std::time::Instant::now();
     let mut gpu_err = Vec::new();
     for _ in 0..reps {
         let (e, _ms) = ev.eval_population(&population);
         gpu_err = e;
     }
-    let ms = t_gpu.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+    let wall = t_gpu.elapsed().as_secs_f64();
+    let gpu_stats = ev.stats().since(&before);
+    let ms = wall * 1000.0 / reps as f64;
 
     // CPU reference: same batch, f64 tree walk.
     let t0 = std::time::Instant::now();
@@ -135,6 +141,29 @@ fn main() {
         cpu_err.push(cpu_sse(t, &cols, n, nv, &y32));
     }
     let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+    // #27/#118: the gate is the engine's own SoA/AVX path, not the interpreted
+    // scalar walk. Compile once and time the same batch over all rows. Trees
+    // the SoA evaluator cannot compile are counted, not silently included.
+    let mut cols64: Vec<Vec<f64>> = vec![Vec::with_capacity(n); nv];
+    for r in 0..n {
+        for v in 0..nv {
+            cols64[v].push(cols[v * n + r] as f64);
+        }
+    }
+    let programs_soa: Vec<_> = trees.iter().map(eval_soa::compile).collect();
+    let soa_n = programs_soa.iter().filter(|p| p.is_some()).count();
+    let mut soa_out = vec![0.0; n];
+    let soa_ms = if soa_n == 0 {
+        0.0
+    } else {
+        let start = std::time::Instant::now();
+        for p in programs_soa.iter().flatten() {
+            eval_soa::eval_batch(p, &cols64, n, &mut soa_out);
+            std::hint::black_box(&soa_out);
+        }
+        start.elapsed().as_secs_f64() * 1000.0
+    };
 
     // Agreement check (f32 GPU vs f64 CPU), over pairs that both produced an
     // ordinary finite result. f32 has ~7 significant digits and a narrower
@@ -156,7 +185,8 @@ fn main() {
     let p99 = rel.get(rel.len() * 99 / 100).copied().unwrap_or(0.0);
     let within = rel.iter().filter(|d| **d < 1e-3).count();
 
-    let evals = (trees.len() * n) as f64;
+    let row_evals = (trees.len() * n) as f64;
+    let evals = trees.len() as f64;
     println!("device           : {}", device);
     println!(
         "memory           : {}",
@@ -183,16 +213,80 @@ fn main() {
     }
     println!();
     println!(
-        "GPU batch        : {:>8.3} ms   ({:>12.0} evals/s)",
+        "GPU batch        : {:>8.3} ms   ({:>10.0} candidate evals/s, {:>10.3e} row-evals/s, full path incl. alloc/sync/copy)",
         ms,
-        evals / (ms / 1000.0)
+        gpu_stats.evals_per_s(),
+        gpu_stats.row_evals_per_s()
     );
     println!(
-        "CPU batch (f64)  : {:>8.3} ms   ({:>12.0} evals/s)",
+        "CPU batch (f64)  : {:>8.3} ms   ({:>10.0} candidates/s, {:>10.3e} row-evals/s, interpreted tree walk)",
         cpu_ms,
-        evals / (cpu_ms / 1000.0)
+        evals / (cpu_ms / 1000.0).max(1e-12),
+        row_evals / (cpu_ms / 1000.0).max(1e-12)
     );
-    println!("speed-up         : {:>8.1}x  (vs interpreted f64 tree walk)", cpu_ms / ms.max(1e-9));
+    println!(
+        "CPU batch (SoA)  : {:>8.3} ms   ({:>10.0} candidates/s, {:>10.3e} row-evals/s, AVX SoA path, {}/{} compiled)",
+        soa_ms,
+        if soa_ms > 0.0 {
+            soa_n as f64 / (soa_ms / 1000.0)
+        } else {
+            0.0
+        },
+        if soa_ms > 0.0 {
+            (soa_n * n) as f64 / (soa_ms / 1000.0)
+        } else {
+            0.0
+        },
+        soa_n,
+        trees.len()
+    );
+    println!(
+        "speed-up         : {:>8.1}x vs interpreted walk | {:>8.1}x vs SoA/AVX",
+        cpu_ms / ms.max(1e-9),
+        soa_ms / ms.max(1e-9)
+    );
+    let host = gpu_stats.host_s;
+    println!(
+        "accounting       : kernel={:.3}ms sync={:.3}ms alloc={:.3}ms h2d={:.3}ms d2h={:.3}ms launch={:.3}ms host={:.3}ms | wall={:.3}ms",
+        gpu_stats.kernel_s * 1e3,
+        gpu_stats.sync_s * 1e3,
+        gpu_stats.alloc_s * 1e3,
+        gpu_stats.h2d_s * 1e3,
+        gpu_stats.d2h_s * 1e3,
+        gpu_stats.launch_s * 1e3,
+        host * 1e3,
+        gpu_stats.wall_s * 1e3,
+    );
+    println!(
+        "decomposition    : C windows {:>6.2}% + host {:>5.2}% = {:>6.2}% of wall (residual {:+.2}%); H2D {} B, D2H {} B per {} batches",
+        100.0 * gpu_stats.window_s() / gpu_stats.wall_s.max(1e-12),
+        100.0 * gpu_stats.host_s / gpu_stats.wall_s.max(1e-12),
+        100.0 * gpu_stats.accounted_s() / gpu_stats.wall_s.max(1e-12),
+        100.0 * gpu_stats.residual_fraction(),
+        gpu_stats.h2d_bytes,
+        gpu_stats.d2h_bytes,
+        gpu_stats.batches
+    );
+    println!(
+        "duty / occupancy : kernel-time duty {:.1}% (kernel/wall); SM occupancy requires ncu (not sampled, never fabricated)",
+        100.0 * gpu_stats.duty_cycle()
+    );
+    let best = gpu_err
+        .iter()
+        .filter(|v| v.is_finite() && **v > 0.0)
+        .fold(f64::INFINITY, |a, b| a.min(*b as f64));
+    let mean_y = y32.iter().map(|&y| y as f64).sum::<f64>() / y32.len().max(1) as f64;
+    let baseline = y32
+        .iter()
+        .map(|y| (*y as f64 - mean_y) * (*y as f64 - mean_y))
+        .sum::<f64>();
+    match gpu_stats.quality_per_gpu_hour(best, baseline) {
+        Some(q) => println!(
+            "quality/GPU-hour : {:.3} decades vs constant-mean baseline per measured full-path GPU-hour",
+            q
+        ),
+        None => println!("quality/GPU-hour : n/a (no finite positive SSE or no GPU wall)"),
+    }
     println!(
         "agreement        : median {:.1e}, p99 {:.1e} rel. error; {}/{} within 1e-3 ({} hard failures)",
         med,
@@ -200,5 +294,8 @@ fn main() {
         within,
         rel.len(),
         penalised
+    );
+    println!(
+        "provenance       : duty from the harness ledger; for CUPTI/nsys/ncu commands see docs/gpu-backend.md"
     );
 }

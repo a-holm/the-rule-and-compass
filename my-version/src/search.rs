@@ -581,7 +581,8 @@ impl GpuSearch {
         Ok(())
     }
 
-    /// #131: the per-generation report, in generation order.
+    /// #131: the per-generation report, in generation order. #118 adds the
+    /// accumulated full-path accounting from the same evaluator.
     fn run_stats(&self) -> GpuRunStats {
         GpuRunStats {
             generations: self
@@ -589,6 +590,7 @@ impl GpuSearch {
                 .values()
                 .cloned()
                 .collect(),
+            accounting: self.ev.stats(),
         }
     }
 
@@ -1734,6 +1736,10 @@ pub struct GpuGenStats {
 #[derive(Clone, Debug, Default)]
 pub struct GpuRunStats {
     pub generations: Vec<GpuGenStats>,
+    /// #118: measured full-path accounting for every GPU batch in the run.
+    /// Unlike `generations`, this is present even when the pipeline path (not
+    /// the per-generation barrier) did the scoring.
+    pub accounting: crate::gpu_stats::GpuStats,
 }
 
 pub struct Outcome {

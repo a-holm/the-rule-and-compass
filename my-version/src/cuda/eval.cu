@@ -26,6 +26,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 /* Opcodes. Keep in sync with src/gpu.rs. */
 enum {
@@ -83,6 +84,33 @@ enum {
 #define RC_MAX_THREADS 256
 #define RC_MIN_THREADS 32
 
+/* #118: host-side ledger for one batch, in milliseconds. The windows are
+ * disjoint: allocation (including synchronising cudaMalloc/cudaFree), H2D
+ * upload, kernel launch, event synchronisation and D2H download. Their sum is
+ * the measured wall, so a report can check the decomposition instead of
+ * assuming it. `kernel_ms` is GPU-event time *inside* that wall; it is the
+ * numerator of the duty estimate, never another additive host phase. */
+typedef struct RcStats {
+    double kernel_ms;
+    double launch_ms;
+    double sync_ms;
+    double alloc_ms;
+    double h2d_ms;
+    double d2h_ms;
+    double wall_ms;
+    unsigned long long h2d_bytes;
+    unsigned long long d2h_bytes;
+    int batch;
+    int failed;
+} RcStats;
+
+static double rc_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
+}
+
 struct RcCtx {
     float *d_cols;
     float *d_y;
@@ -100,6 +128,10 @@ struct RcCtx {
     int nprog;
     int out_cap;
     cudaEvent_t t0, t1;
+    /* #118: the current batch's ledger and its start on the same monotonic
+       clock, so `wall_ms` covers the whole begin..download path. */
+    RcStats stats;
+    double batch_start_ms;
 };
 
 __device__ __forceinline__ float logisticf(float x) { return 1.0f / (1.0f + expf(-x)); }
@@ -445,53 +477,87 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
+    RcStats *st = &c->stats;
+    double t = rc_now_ms();
     if (c->d_prog) { cudaFree(c->d_prog); c->d_prog = 0; }
     if (c->d_off) { cudaFree(c->d_off); c->d_off = 0; }
     c->nprog = nprog;
     size_t prog_bytes = sizeof(unsigned int) * (size_t)off[nprog];
     rc_alloc((void **)&c->d_prog, prog_bytes);
     rc_alloc((void **)&c->d_off, sizeof(unsigned int) * (size_t)(nprog + 1));
-    if (!c->d_prog || !c->d_off) return -1;
-    rc_upload(c->d_prog, prog, prog_bytes);
-    rc_upload(c->d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    if (!c->d_prog || !c->d_off) {
+        st->alloc_ms += rc_now_ms() - t;
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1;
+    }
     if (c->out_cap < nprog) {
         if (c->d_out) cudaFree(c->d_out);
         if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
             c->d_out = 0;
             c->out_cap = 0;
+            st->alloc_ms += rc_now_ms() - t;
+            st->failed = 1;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
             return -1;
         }
         c->out_cap = nprog;
     }
+    /* cudaMalloc/cudaFree synchronise, so this window includes the real cost
+       of (re)allocating the program and output buffers. */
+    st->alloc_ms += rc_now_ms() - t;
+
+    t = rc_now_ms();
+    rc_upload(c->d_prog, prog, prog_bytes);
+    rc_upload(c->d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    st->h2d_ms += rc_now_ms() - t;
+    st->h2d_bytes += (unsigned long long)(prog_bytes + sizeof(unsigned int) * (size_t)(nprog + 1));
+    st->batch = nprog;
+    st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return 0;
 }
 
-/* Returns elapsed milliseconds; writes nprog errors into `out`. */
+/* Returns elapsed milliseconds; writes nprog errors into `out`. The context's
+   RcStats records the full launch+sync+download path. */
 float rc_eval(void *ctx, float *out)
 {
     RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1.0f;
+    RcStats *st = &c->stats;
     /* One block per expression; threads spread over rows. Size the block to the
        row count (rounded up to a power of two) so short datasets do not launch
        mostly-idle warps. */
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    double t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
     eval_kernel<<<c->nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
                                        c->d_prog, c->d_off, c->d_out);
     cudaEventRecord(c->t1, 0);
+    st->launch_ms += rc_now_ms() - t;
     /* Wait for the kernel before reading the result. In the unified build the
        output lives in managed memory, so a plain memcpy (page migration) is the
        download; there is no explicit device-to-host copy. */
+    t = rc_now_ms();
     cudaEventSynchronize(c->t1);
+    st->sync_ms += rc_now_ms() - t;
     /* A launch or execution error must be visible to the caller: the search
        turns it into a CPU fallback instead of trusting a stale output buffer.
        A negative time is the error marker; the benchmark treats it the same. */
     if (cudaGetLastError() != cudaSuccess) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1.0f;
     }
+    t = rc_now_ms();
     rc_download(out, c->d_out, sizeof(float) * (size_t)c->nprog);
+    st->d2h_ms += rc_now_ms() - t;
+    st->d2h_bytes += sizeof(float) * (unsigned long long)c->nprog;
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    st->kernel_ms = (double)ms;
+    st->batch = c->nprog;
+    st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
 }
 
@@ -503,12 +569,18 @@ int rc_pool_reserve(void *ctx, int nprog, int width)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nprog <= 0 || width <= 0) return -1;
-    if (c->pool_cap >= nprog && c->pool_width == width) return 0;
+    double t = rc_now_ms();
+    if (c->pool_cap >= nprog && c->pool_width == width) {
+        c->stats.alloc_ms += rc_now_ms() - t;
+        return 0;
+    }
     if (c->d_pool[0]) { cudaFree(c->d_pool[0]); c->d_pool[0] = 0; }
     if (c->d_pool[1]) { cudaFree(c->d_pool[1]); c->d_pool[1] = 0; }
     size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)width;
     if (rc_alloc((void **)&c->d_pool[0], bytes) != 0 ||
         rc_alloc((void **)&c->d_pool[1], bytes) != 0) {
+        c->stats.failed = 1;
+        c->stats.alloc_ms += rc_now_ms() - t;
         return -1;
     }
     if (c->hash_cap < nprog) {
@@ -516,12 +588,15 @@ int rc_pool_reserve(void *ctx, int nprog, int width)
         if (rc_alloc((void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
             c->d_hash = 0;
             c->hash_cap = 0;
+            c->stats.failed = 1;
+            c->stats.alloc_ms += rc_now_ms() - t;
             return -1;
         }
         c->hash_cap = nprog;
     }
     c->pool_cap = nprog;
     c->pool_width = width;
+    c->stats.alloc_ms += rc_now_ms() - t;
     return 0;
 }
 
@@ -531,7 +606,11 @@ int rc_pool_upload(void *ctx, int which, const unsigned int *prog, int nprog)
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1;
     size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)c->pool_width;
+    double t = rc_now_ms();
     rc_upload(c->d_pool[which & 1], prog, bytes);
+    c->stats.h2d_ms += rc_now_ms() - t;
+    c->stats.h2d_bytes += (unsigned long long)bytes;
+    c->stats.batch = nprog;
     return 0;
 }
 
@@ -541,27 +620,77 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1.0f;
+    RcStats *st = &c->stats;
+    double t = rc_now_ms();
     if (c->out_cap < nprog) {
         if (c->d_out) cudaFree(c->d_out);
         if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
             c->d_out = 0;
             c->out_cap = 0;
+            st->failed = 1;
+            st->alloc_ms += rc_now_ms() - t;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
             return -1.0f;
         }
         c->out_cap = nprog;
     }
+    st->alloc_ms += rc_now_ms() - t;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
     eval_pool_kernel<<<nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
                                          c->d_pool[which & 1], width, c->d_out);
     cudaEventRecord(c->t1, 0);
+    st->launch_ms += rc_now_ms() - t;
+    t = rc_now_ms();
     cudaEventSynchronize(c->t1);
-    if (cudaGetLastError() != cudaSuccess) return -1.0f;
+    st->sync_ms += rc_now_ms() - t;
+    if (cudaGetLastError() != cudaSuccess) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
+    t = rc_now_ms();
     rc_download(out, c->d_out, sizeof(float) * (size_t)nprog);
+    st->d2h_ms += rc_now_ms() - t;
+    st->d2h_bytes += sizeof(float) * (unsigned long long)nprog;
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    st->kernel_ms = (double)ms;
+    st->batch = nprog;
+    st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
+}
+
+/* #118: start a fresh batch ledger. The Rust evaluator calls this once before
+   reserve+upload+eval, so allocation, upload, launch, sync and download are all
+   in one window and `wall_ms` is their independently measured envelope. */
+void rc_stats_begin(void *ctx)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return;
+    c->stats.kernel_ms = 0.0;
+    c->stats.launch_ms = 0.0;
+    c->stats.sync_ms = 0.0;
+    c->stats.alloc_ms = 0.0;
+    c->stats.h2d_ms = 0.0;
+    c->stats.d2h_ms = 0.0;
+    c->stats.wall_ms = 0.0;
+    c->stats.h2d_bytes = 0;
+    c->stats.d2h_bytes = 0;
+    c->stats.batch = 0;
+    c->stats.failed = 0;
+    c->batch_start_ms = rc_now_ms();
+}
+
+/* #118: copy the current (last) batch's ledger. Returns 0 on success. */
+int rc_last_stats(void *ctx, RcStats *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    *out = c->stats;
+    return 0;
 }
 
 /* Canonical postfix hashes of the last uploaded buffer. */
