@@ -312,6 +312,15 @@ atomically instead of streaming it. See
   that can be scanned group by group and searched from a bounded hash sample
   when it does not fit; v1 stores still load. See
   [`docs/data-format.md`](docs/data-format.md).
+* **Market data as a typed layer**: `rcsr::ohlcv` resamples OHLCV exactly
+  (open=first, high=max, low=min, close=last, flows summed), keeps gaps and
+  flags zero-volume/partial bars, understands crypto 24/7 and NYSE/LSE
+  sessions with holidays, half-days and DST, applies splits/dividends while
+  keeping raw prices, verifies symbol splices, and joins higher timeframes
+  only after their bucket has closed. `rcsr::features` supplies causal
+  `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
+  a next-open forward label with symmetric cost. See
+  [`docs/ohlcv.md`](docs/ohlcv.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 

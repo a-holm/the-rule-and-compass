@@ -12,6 +12,7 @@ pub mod data;
 pub mod diagnostics;
 pub mod eval_soa;
 pub mod expr;
+pub mod features;
 pub mod fit;
 pub mod genome;
 #[cfg(feature = "cuda")]
@@ -22,6 +23,7 @@ pub mod leakage; // #129: differential leakage detectors
 pub mod manifest;
 pub mod metrics;
 pub mod multi;
+pub mod ohlcv;
 pub mod pareto;
 pub mod parse;
 pub mod pipeline; // #119: bounded producer/scorer overlap
