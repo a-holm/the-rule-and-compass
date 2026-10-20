@@ -385,6 +385,8 @@ fn cpu_override_is_bit_identical_across_runs() {
     assert!(a.device.is_none());
 }
 
+#[cfg(feature = "cuda")]
+#[test]
 fn four_island_gpu_run_with_if_is_deterministic() {
     // Mixes the device pool, the parallel CPU fallback (`if` has no opcode)
     // and four island threads. Repeating the seed must give the same archive.

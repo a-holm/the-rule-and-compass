@@ -118,7 +118,7 @@ impl Panel {
     /// are the feature/target columns the pipeline is allowed to read.
     pub fn from_table(t: &Table, time_col: &str, value_cols: &[&str]) -> Result<Panel, String> {
         let ti = t.index_of(time_col)?;
-        let time = data::time_keys(t, ti);
+        let time = data::time_keys(t, ti).to_f64();
         let mut columns = Vec::with_capacity(value_cols.len());
         for name in value_cols {
             let j = t.index_of(name)?;

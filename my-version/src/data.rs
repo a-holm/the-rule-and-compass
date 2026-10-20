@@ -1273,7 +1273,6 @@ where
         if rec.fields.len() != nfields {
             continue; // accepted or skipped by pass 1
         }
-        }
         for (j, cell) in rec.fields.iter().enumerate() {
             let cell = cell.trim();
             if numeric[j] {
@@ -2078,12 +2077,7 @@ pub fn prepare_full_targets_weighted_with(
         let order: Vec<usize> = if let Some(tc) = spec.time_col {
             let keys = time_keys(filtered, tc);
             let mut v = train_idx.clone();
-            v.sort_by(|&a, &b| {
-                keys[a]
-                    .partial_cmp(&keys[b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.cmp(&b))
-            });
+            v.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
             v
         } else {
             // Without a time column the file order is the chronological order.
@@ -3031,7 +3025,8 @@ fn build_split(
             let time_col = spec
                 .time_col
                 .ok_or("temporal split needs a time column (--time <col>)")?;
-            let (keys, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let (keys_f64, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let keys = TimeKeys::F64(keys_f64);
             report.notes.extend(trep.text_lines());
             let order = sorted_by(&keys);
             match split_ordered(&order, spec, folds) {
@@ -3116,7 +3111,8 @@ fn build_split(
             let group_col = spec
                 .group_col
                 .ok_or("temporal-group split needs a group column (--group-by <col>)")?;
-            let (keys, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let (keys_f64, trep) = time_keys_with(t, time_col, &spec.time)?;
+            let keys = TimeKeys::F64(keys_f64);
             report.notes.extend(trep.text_lines());
             let (ids, names) = group_ids(t, group_col);
             report.groups_total = names.len();
@@ -3251,6 +3247,12 @@ impl TimeKeys {
         }
     }
 
+    /// Materialise the ordering key as f64 for consumers that only need a
+    /// monotone time axis (values beyond 2^53 are approximate, as documented).
+    pub fn to_f64(&self) -> Vec<f64> {
+        (0..self.len()).map(|i| self.value(i)).collect()
+    }
+
     fn difference(&self, a: usize, b: usize) -> f64 {
         match self {
             TimeKeys::I64(v) => {
@@ -3312,6 +3314,7 @@ pub fn time_keys(t: &Table, col: usize) -> TimeKeys {
             .map(|&v| if v.is_nan() { f64::INFINITY } else { v })
             .collect(),
     )
+}
 
 // ---------------------------------------------------------------------------
 // #130: strict time parsing

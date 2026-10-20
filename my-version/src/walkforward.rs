@@ -227,7 +227,7 @@ pub fn run_table(table: &Table, spec: &EvalSpec, source: &str) -> Result<Report,
     let mut acc = Accum::new(spec)?;
     let mut features = Vec::with_capacity(layout.vars.len());
     for r in 0..table.len() {
-        let t = times[r];
+        let t = times.value(r);
         if !acc.wants(t) {
             continue;
         }
