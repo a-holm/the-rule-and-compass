@@ -306,8 +306,9 @@ SEARCH:
                              consistent with the target's (infinite error);
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
-  --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
-  --no-fit                   disable constant fitting
+  --fit-iters <N>            Levenberg–Marquardt iterations for constants
+                             (default 8; 0 = no fitting at all)
+  --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
                              turns off the 15% Pareto-front feedback (#76)

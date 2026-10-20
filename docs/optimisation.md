@@ -225,6 +225,17 @@ reached (`squared` metric unless noted).
 | `y = 2x + 1` | 40 | — | — | **5.3 × 10⁻⁷** (rounding floor) | 1.8 s | 200 |
 | `y = sin x` | 60 | — | — | **3 × 10⁻³⁰** | 2.2 s | 300 |
 
+### 3.2 The constant-fitting budget
+
+`--fit-iters N` sets the Levenberg–Marquardt budget for every candidate, and the
+budget is honoured literally: `--fit-iters 0` (the same as `--no-fit`) performs
+**no fitting at all** — no damped LM iteration and no undamped Gauss–Newton
+polish — so the constants stay exactly as the tree was generated. Earlier
+releases silently ran five steps per candidate under `--no-fit` (one forced LM
+iteration plus a four-step polish); after the #135 fix the same daily-panel
+search went from about 3 200 to 7 240 candidate evaluations per second. With the
+default `--fit-iters 8` the fit is bit-for-bit unchanged.
+
 Three effects are visible. First, **accuracy**: constant fitting turns
 "approximately right" into "exact", which is why the errors drop by 13–20 orders
 of magnitude on the first two problems. Second, **speed**: the third problem is

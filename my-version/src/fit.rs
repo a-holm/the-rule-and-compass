@@ -766,6 +766,12 @@ fn normal_equations(
     Some(NormalEquations { jtj, jtr })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// #135: number of LM/polish trial steps taken on this test thread.
+    static FIT_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Solve the cached normal equations for one damping value and score the trial
 /// constants. This is the old `gn_step` without the row sweep.
 #[allow(clippy::too_many_arguments)]
@@ -780,6 +786,8 @@ fn gn_trial(
     n: &NormalEquations,
     v: &mut [f64],
 ) -> Option<(Vec<f64>, f64)> {
+    #[cfg(test)]
+    FIT_STEPS.with(|n| n.set(n.get() + 1));
     let mut rhs: Vec<f64> = n.jtr.iter().map(|v| -v).collect();
     let step = solve(&n.jtj, &mut rhs, lambda, k)?;
     let trial: Vec<f64> = (0..k)
@@ -861,6 +869,12 @@ pub fn fit_weighted(
     let mut adj = vec![0.0; n];
     let mut grad = vec![0.0; k];
     let mut best_c = c.clone();
+    // #135: `--no-fit` / `--fit-iters 0` must not fit at all. The LM loop
+    // below runs `iters.max(1)` and a four-step polish, so without this early
+    // return a "no fit" search still performs five LM iterations per candidate.
+    if iters == 0 {
+        return sse(&f, x, y, w, &c, &mut v);
+    }
     // #87: this standalone SSE is intentionally kept. The first `gn_step`
     // forms the same residuals, but using them as the acceptance baseline
     // changed the LM trajectory on guard-free trees; exactness beats the one
@@ -1850,5 +1864,31 @@ mod tests {
             got.push((c, sse.to_bits()));
         }
         assert_eq!(got, expected, "constants/SSE changed");
+    }
+
+    /// #135: `--fit-iters 0` / `--no-fit` must leave the constants exactly as
+    /// generated and perform no LM or polish step. The step counter is bumped
+    /// by every trial, so zero proves `gn_trial`/`gn_step` were never reached.
+    #[test]
+    fn zero_iters_does_not_fit_or_take_a_step() {
+        FIT_STEPS.with(|n| n.set(0));
+        let x: Vec<Vec<f64>> = (0..21).map(|i| vec![i as f64 / 5.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 1.0).collect();
+        let mut tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+        let before = fitted_constants(&tree);
+        let initial_sse = flat_sse(&tree, &x, &y);
+
+        let sse = fit_weighted(&mut tree, &x, &y, &[], 0);
+
+        assert_eq!(fitted_constants(&tree), before, "constants must not move");
+        assert_eq!(sse.to_bits(), initial_sse.to_bits(), "SSE must be the generated one");
+        assert_eq!(FIT_STEPS.with(|n| n.get()), 0, "no LM/polish step may run");
+
+        // The same tree with the default budget must change the constants and
+        // take steps; otherwise the counter assertion above would be vacuous.
+        let fitted = fit_weighted(&mut tree, &x, &y, &[], 8);
+        assert!(FIT_STEPS.with(|n| n.get()) > 0, "positive iters must take steps");
+        assert_ne!(fitted_constants(&tree), before, "positive iters must fit");
+        assert!(fitted < initial_sse, "positive iters must improve the SSE");
     }
 }
