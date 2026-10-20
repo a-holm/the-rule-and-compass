@@ -144,49 +144,6 @@ fn lower(n: &Node) -> Node {
     let k: Vec<Node> = n.kids.iter().map(lower).collect();
     let abs_diff = |a: &Node, b: &Node| node(Abs, vec![node(Sub, vec![a.clone(), b.clone()])]);
     match n.op {
-        Min | Max => {
-            // #121: gated tie form. `(a+b-|a-b|)/2` overflows in f32
-            // (min(1e8, 1) -> 0), so never add the operands.
-            let a = k[0].clone(); let b = k[1].clone();
-            let u = node(Step, vec![node(Sub, vec![b.clone(), a.clone()])]);
-            let v = node(Step, vec![node(Sub, vec![a.clone(), b.clone()])]);
-            let w = node(Sub, vec![node(Sub, vec![constant(1.0), u.clone()]), v.clone()]);
-            if matches!(n.op, Min) {
-                node(Add, vec![
-                    node(Add, vec![node(Mul, vec![u, a.clone()]), node(Mul, vec![v, b])]),
-                    node(Mul, vec![w, a]),
-                ])
-            } else {
-                node(Add, vec![
-                    node(Add, vec![node(Mul, vec![u, b]), node(Mul, vec![v, a.clone()])]),
-                    node(Mul, vec![w, a]),
-                ])
-            }
-        }
-        If => {
-            // #121: symmetric gate; the compact b + step(c)(a-b) is not exact
-            // for extreme arms. Both arms are evaluated, so this is only used
-            // when both are finite (the compiler's totality check is follow-up).
-            let c = node(Step, vec![k[0].clone()]);
-            let nc = node(Sub, vec![constant(1.0), c.clone()]);
-            node(Add, vec![node(Mul, vec![c, k[1].clone()]), node(Mul, vec![nc, k[2].clone()])])
-        }
-        Sign => node(Sub, vec![node(Step, vec![k[0].clone()]), node(Step, vec![node(Neg, vec![k[0].clone()])])]),
-        Less => node(Step, vec![node(Sub, vec![k[1].clone(), k[0].clone()])]),
-        LessOrEqual => node(Sub, vec![constant(1.0), node(Step, vec![node(Sub, vec![k[0].clone(), k[1].clone()])])]),
-        Greater => node(Step, vec![node(Sub, vec![k[0].clone(), k[1].clone()])]),
-        GreaterOrEqual => node(Sub, vec![constant(1.0), node(Step, vec![node(Sub, vec![k[1].clone(), k[0].clone()])])]),
-        Equal => {
-            let d = abs_diff(&k[0], &k[1]);
-            node(Sub, vec![
-                node(Sub, vec![constant(1.0), node(Step, vec![d.clone()])]),
-                node(Step, vec![node(Neg, vec![d])]),
-            ])
-        }
-        Not => node(Sub, vec![constant(1.0), node(Step, vec![k[0].clone()])]),
-        And => node(Mul, vec![node(Step, vec![k[0].clone()]), node(Step, vec![k[1].clone()])]),
-        Or => node(Step, vec![node(Add, vec![k[0].clone(), k[1].clone()])]),
-        Xor => node(Abs, vec![node(Sub, vec![node(Step, vec![k[0].clone()]), node(Step, vec![k[1].clone()])])]),
         Asinh => {
             // odd form: the naive ln(x + sqrt(x^2+1)) is wrong for negative x
             let x = k[0].clone();
@@ -709,12 +666,12 @@ mod tests {
         let mut pop = Population::new();
         assert!(pop.is_empty());
         assert!(pop.add(&trees[0]));
-        // #131: `if` is native now, but `asinh` still has no kernel opcode.
+        // #131: `if` is native; a constraint has no kernel opcode.
         assert!(pop.add(&node(
             Op::If,
             vec![input(0), constant(1.0), constant(2.0)]
         )));
-        assert!(!pop.add(&node(Op::Asinh, vec![input(0)])));
+        assert!(!pop.add(&node(Op::Require, vec![input(0)])));
         assert!(pop.add(&trees[1]));
         assert_eq!(pop.len(), 3);
         assert_eq!(pop.unsupported(), 1);
