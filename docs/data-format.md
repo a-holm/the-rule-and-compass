@@ -39,7 +39,7 @@ limits, to decide whether a `.rcsb` store is loaded resident or streamed.
 ## Import
 
 ```sh
-rcsr import data.csv data.rcsb [--group-rows 65536]
+rcsr import data.csv data.rcsb [--group-rows 65536] [--time ts]
 rcsr --data data.rcsb --target y --vars x1,x2
 ```
 
@@ -102,17 +102,20 @@ The header is self-describing and deterministic:
 ```json
 {"format":"rcsr-column-store","version":1,"n_rows":100000,
  "n_cols":3,"group_rows":65536,"columns":[
-  {"name":"x1","numeric":true,"levels":[],"has_codes":false,
+  {"name":"x1","numeric":true,"dtype":"f64","levels":[],"has_codes":false,
    "offsets":[0,524288],"code_offsets":[]},
-  {"name":"site","numeric":false,"levels":["A","B"],"has_codes":true,
+  {"name":"site","numeric":false,"dtype":"f64","levels":["A","B"],"has_codes":true,
    "offsets":[1048576,1572864],"code_offsets":[2097152,2621440]},
-  {"name":"y","numeric":true,"levels":[],"has_codes":false,
+  {"name":"y","numeric":true,"dtype":"f64","levels":[],"has_codes":false,
    "offsets":[3145728,3670016],"code_offsets":[]}]}
 ```
 
 * `n_rows`, `n_cols`, `group_rows`: the logical shape. `n_groups` is
   `ceil(n_rows / group_rows)`; the last group is short, never padded.
-* `numeric`: the column has an `f64` value block.
+* `numeric`: the column has a value block.
+* `dtype`: the value block's element type, `"f64"` (default) or `"i64"`.
+  The time column is `i64` so nanosecond prints survive exactly; every
+  feature and target column stays `f64`.
 * `levels`: the dictionary (empty when the column has no dictionary).
 * `has_codes`: the column also has a `u32` code block per group, stored as
   `f64` (small integers are exact in binary64) so the hot representation has
@@ -126,9 +129,30 @@ Blocks are written in this order, for every group `g`:
 
 ```text
 for column c in 0..n_cols:
-    value block   group_len(g) * 8 bytes   (NaN when the column has no values)
+    value block   group_len(g) * 8 bytes   (NaN when the column has no values;
+                                            i64::MIN when an i64 time cell is missing)
     code block    group_len(g) * 8 bytes   (only when has_codes)
 ```
+
+### dtypes and the version rule
+
+`dtype` is an **additive** field: a version-1 header that omits it is the
+original all-`f64` layout, and both forms are read by this build. The version
+stays `1` because the block sizes do not change — only the interpretation of
+the same eight bytes for the time column. `rcsr import` selects the time
+column in this order:
+
+1. `--time <column>`, if given. Its cells must be whole numbers; otherwise
+   the import refuses rather than silently writing a lossy store.
+2. The first column whose name is time-like (`ts`, `timestamp`, `time`,
+   `date`, `datetime`, `day`, `dt`) and whose cells are all integers.
+3. No `i64` column: the store is byte-compatible with the old all-`f64`
+   layout.
+
+A column stored as `i64` is exposed to the evaluator as `f64` (for split
+reports and accidental use), but ordering, duplicate handling and gap checks
+read the exact `i64` view. The evaluator never performs arithmetic on the
+integer view.
 
 `group_rows = 65_536` is 512 KiB per `f64` column, the measured I/O block from
 #70. It is a streaming unit, not an L2 tile.
@@ -199,4 +223,7 @@ exit 3
 numeric dictionaries and text dictionaries), a hand-built store read with
 correct short/last groups, a version mismatch, truncation, hash sampling and
 row alignment, the CSV-vs-store search front, the guard (exit 3) for both
-search and import, and magic detection without the `.rcsb` extension.
+search and import, magic detection without the `.rcsb` extension, and the
+`i64` time path: exact ms/us/ns round trips, two prints 1 ns apart, duplicate
+instants, gap detection, and an old v1 header with no `dtype` reading as
+`f64`.
