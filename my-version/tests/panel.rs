@@ -238,6 +238,8 @@ fn every_runner_refuses_2026h2_unless_overridden() {
         threshold_quantile: 0.7,
         validation_frac: 0.0,
         periods_per_year: None,
+        candidates: Vec::new(),
+        pool_reset_flat: false,
         allow_lockbox: false,
     };
     // A synthetic table is enough: validation refuses before reading rows.
