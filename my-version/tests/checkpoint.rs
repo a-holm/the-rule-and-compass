@@ -588,6 +588,7 @@ fn a_gpu_checkpoint_resumed_without_gpu_is_refused_unless_overridden() {
         "--resume",
         checkpoint.as_str(),
         "--allow-backend-change",
+        "--cpu",
         "--generations",
         "4",
         "--quiet",
