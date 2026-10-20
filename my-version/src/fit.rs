@@ -1412,7 +1412,9 @@ pub fn fit_weighted_metric(
         // non-smooth order/rank/absolute-bias losses: start from the squared
         // fit, then polish the actual objective.
         Correlation
+        | CorrelationSigned
         | RankCorrelation
+        | RankCorrelationSigned
         | Signed
         | Median
         | Maximum
