@@ -499,7 +499,8 @@ fn save_alone_does_not_change_the_result() {
 fn checkpoint_records_backend_and_canonical_config_hash() {
     let train = sample(40);
     let test = sample(10);
-    let cfg = config(7);
+    let mut cfg = config(7);
+    cfg.gpu = false;
     let text = checkpoint_text(&cfg, &train, &test);
     assert!(
         text.contains(&format!("backend {}\n", Backend::Cpu.as_str())),
@@ -546,6 +547,7 @@ fn a_gpu_checkpoint_resumed_without_gpu_is_refused_unless_overridden() {
         "20",
         "--save",
         checkpoint.as_str(),
+        "--cpu",
         "--quiet",
     ]);
     assert!(made.status.success(), "save run failed: {:?}", made);
@@ -566,6 +568,7 @@ fn a_gpu_checkpoint_resumed_without_gpu_is_refused_unless_overridden() {
         "x",
         "--resume",
         checkpoint.as_str(),
+        "--cpu",
     ]);
     assert_eq!(refused.status.code(), Some(3), "backend mismatch is exit 3");
     let err = String::from_utf8_lossy(&refused.stderr);
