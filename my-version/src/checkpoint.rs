@@ -248,10 +248,22 @@ fn write_tree(n: &Node, out: &mut String) {
 /// Decode a tree written by [`encode_tree`], checking every operator index and
 /// every arity. Trailing tokens are an error, so a corrupt line cannot decode
 /// into a plausible-looking tree.
+///
+/// The tree is subject to the same [`Limits`](crate::parse::Limits) as parsed
+/// text: at most 4096 nodes and a root-to-leaf depth of 256 (issue #153).
 pub fn decode_tree(text: &str) -> Result<Node, String> {
+    decode_tree_with_limits(text, crate::parse::Limits::default())
+}
+
+/// [`decode_tree`] with explicit node and depth limits.
+pub fn decode_tree_with_limits(
+    text: &str,
+    limits: crate::parse::Limits,
+) -> Result<Node, String> {
     let tokens: Vec<&str> = text.split_whitespace().collect();
     let mut pos = 0usize;
-    let tree = parse_tree(&tokens, &mut pos)?;
+    let mut nodes = 0usize;
+    let tree = parse_tree(&tokens, &mut pos, 1, &mut nodes, limits)?;
     if pos != tokens.len() {
         return Err(format!(
             "tree has {} trailing token(s) after the root",
@@ -261,7 +273,26 @@ pub fn decode_tree(text: &str) -> Result<Node, String> {
     Ok(tree)
 }
 
-fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
+fn parse_tree(
+    tokens: &[&str],
+    pos: &mut usize,
+    depth: usize,
+    nodes: &mut usize,
+    limits: crate::parse::Limits,
+) -> Result<Node, String> {
+    if depth > limits.depth {
+        return Err(format!(
+            "checkpoint tree depth {} exceeds the limit of {}",
+            depth, limits.depth
+        ));
+    }
+    *nodes += 1;
+    if *nodes > limits.nodes {
+        return Err(format!(
+            "checkpoint tree has more than {} nodes",
+            limits.nodes
+        ));
+    }
     let op_tok = next_token(tokens, pos, "operator index")?;
     let index: usize = op_tok
         .parse()
@@ -291,7 +322,7 @@ fn parse_tree(tokens: &[&str], pos: &mut usize) -> Result<Node, String> {
     }
     let mut kids = Vec::with_capacity(arity);
     for _ in 0..arity {
-        kids.push(parse_tree(tokens, pos)?);
+        kids.push(parse_tree(tokens, pos, depth + 1, nodes, limits)?);
     }
     Ok(Node {
         op,

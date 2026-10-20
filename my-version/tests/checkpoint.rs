@@ -75,6 +75,39 @@ fn checkpoint_text(cfg: &Config, train: &Sample, test: &Sample) -> String {
 }
 
 #[test]
+fn checkpoint_tree_depth_and_node_limits_are_enforced() {
+    use rcsr::parse::Limits;
+    // Depth 256 (255 Neg nodes plus the leaf) is accepted; one more is not.
+    let mut tree = input(0);
+    for _ in 0..(Limits::MAX_DEPTH - 1) {
+        tree = node(Op::Neg, vec![tree]);
+    }
+    let text = encode_tree(&tree);
+    assert!(decode_tree(&text).is_ok(), "depth 256 must round-trip");
+
+    let too_deep = node(Op::Neg, vec![tree]);
+    let e = expect_err(decode_tree(&encode_tree(&too_deep)), "depth 257");
+    assert!(e.contains("depth") && e.contains("256"), "{e}");
+
+    // An exactly-4096-node balanced tree is accepted; 4097 nodes is rejected.
+    // 4095 nodes is a full-ish binary tree (2047 + 2047 + root); one Neg
+    // wrapper makes exactly 4096.
+    fn balanced(nodes: usize) -> expr::Node {
+        if nodes == 1 {
+            return input(0);
+        }
+        let left = (nodes - 1) / 2;
+        let right = nodes - 1 - left;
+        node(Op::Add, vec![balanced(left), balanced(right)])
+    }
+    let chain = node(Op::Neg, vec![balanced(Limits::MAX_NODES - 1)]);
+    assert!(decode_tree(&encode_tree(&chain)).is_ok());
+    let over = node(Op::Neg, vec![chain]);
+    let e = expect_err(decode_tree(&encode_tree(&over)), "4097 nodes");
+    assert!(e.contains("more than 4096 nodes"), "{e}");
+}
+
+#[test]
 fn rng_state_round_trip_produces_the_identical_stream() {
     let mut original = Mt::new(0xDEAD_BEEF);
     // Advance across at least one twist and stop at an arbitrary index.

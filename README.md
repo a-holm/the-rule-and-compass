@@ -185,6 +185,14 @@ input error (exit 3). `--json` reports a `seeds` array and `--ndjson` a `seed`
 event per seed. See [`docs/seeds.md`](docs/seeds.md) for the processing order,
 the elite rule, the file format and the measured before/after numbers.
 
+Every user-written formula (seeds, `--eval-expr`, filters, `--function` bodies
+and the HTTP body) is bounded to **4096 nodes** and a root-to-leaf **depth of
+256** (a single node has depth 1), and checkpoint tree decoding uses the same
+limits. An over-limit or pathologically nested input is rejected with a normal
+parser/checkpoint error that names the limit and, for text, the 1-based column;
+it never overflows the process stack. `rcsr schema` reports the limits as
+`expression_limits`.
+
 ## Building blocks
 
 `--function` (repeatable, up to four) supplies a sub-formula the search may

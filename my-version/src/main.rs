@@ -273,6 +273,14 @@ MODE:
                              --op-complexity. Constants inside a body are shared
                              by every call. See docs/building-blocks.md.
 
+LIMITS:
+  Every expression read from text (--eval-expr, --filter, --exclude,
+  --train-select, --test-select, --seed-expr, --seed-file, --function and the
+  HTTP body) and every tree decoded from a checkpoint is bounded to 4096 nodes
+  and a root-to-leaf depth of 256 (a single node has depth 1). A deeper or
+  larger tree is a normal usage/input error with a parser column or a
+  checkpoint message; it is never a stack overflow or abort.
+
 MULTI-OUTPUT (--target y1,y2):
   Candidates share one tree shape; each target gets its own fitted constants.
   The combined error is the mean of the per-target errors, and the Pareto front
