@@ -6,18 +6,21 @@
 //! command on a fixed table, so any future trajectory shift fails loudly. The
 //! pinned SHA-256 of the file is
 //!
-//! `e4140058d01882540e877259014b07559bf1b9d1805b4d4e7c776220d18c2992`
+//! `5e6afa6a00a1c5113f39e9e967a2c0d009d4ca0966b3f0e7278b41fe66747bbf`
 //!
-//! (the FNV-1a 64 hash is `e73a628e49150567`).
+//! (the FNV-1a 64 hash is `b3b1621318563c4c`). #117 moved the default
+//! `absolute` metric onto L1 fitting, so this documented baseline was
+//! re-measured; `squared` remains bit-identical and is pinned separately in
+//! `fit.rs`.
 
 use std::process::Command;
 
 const FRONT: &str = "rank\tcomplexity\ttrain_error\ttest_error\texpression\n\
 1\t1\t2.97670764\t3.66924796\t(0.5726 * (0.1305 + x))\n\
 2\t2\t2.17852613\t2.42006255\texp((0.5726 * (0.1305 + x)))\n\
-3\t3\t1.61569133\t1.58832256\t(3.9597 ^ (0.5726 * (0.1305 + x)))\n\
-4\t4\t1.14507499\t1.12247276\t(8.6931 ^ sin((0.5726 * (0.1305 + x))))\n\
-5\t5\t0.00000048\t0.00000067\t(3.4928 * (0.7842 + (0.5726 * (0.1305 + x))))\n";
+3\t3\t1.61548182\t1.58571020\t(3.983 ^ (0.5726 * (0.1305 + x)))\n\
+4\t4\t1.08190580\t1.01614512\t(10.3194 ^ tanh((0.5726 * (0.1305 + x))))\n\
+5\t5\t0.00000047\t0.00000067\t(2.7389 + (2 * (0.1305 + x)))\n";
 
 #[test]
 fn documented_baseline_front_is_pinned() {
@@ -79,7 +82,7 @@ fn documented_baseline_front_is_pinned() {
     }
     assert_eq!(
         format!("{hash:016x}"),
-        "e73a628e49150567",
+        "b3b1621318563c4c",
         "the front hash changed"
     );
 }

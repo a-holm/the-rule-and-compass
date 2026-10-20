@@ -18,12 +18,13 @@ complexity)**, and returns the front of non-dominated equations — the most
 accurate equation at each level of complexity.
 
 Constants inside a candidate are not guessed: each candidate's constants are
-fitted by **Levenberg–Marquardt**, so a candidate with the right *shape* is
-immediately usable even if its numbers started out wrong. Candidates that are
-**affine in every constant** can instead be fitted in closed form by a
-column-pivoted QR (`--fit-strategy auto|linear`), which reaches the exact
-global optimum in one solve and falls back to LM for every other tree; the
-default remains the historical LM path bit for bit.
+fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
+candidate with the right *shape* is immediately usable even if its numbers
+started out wrong, and the fitted numbers minimise the same loss that ranks the
+front. Candidates affine in every constant can instead use the closed-form
+column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
+error and falls back to the metric-aware path otherwise; the default remains
+the historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -763,15 +764,13 @@ list and the recorded results.
   [`docs/meta-operators.md`](docs/meta-operators.md); the aggregates are
   training-column statistics cached once per search — see
   [`docs/aggregation.md`](docs/aggregation.md));
-- **twenty error metrics** (`--metric`): absolute, squared, correlation and
-  signed correlation, median, maximum, signed, log-squashed, rank correlation
-  and signed rank correlation, interquartile, slope, the two implicit
-  objectives, AUC, log loss, hinge, and AIC/AICc/BIC as search objectives.
-  The unsigned correlations accept an inverted model; the `_signed` variants
-  require the right direction, and the binary metrics reject targets with more
-  than two distinct values;
-- **Levenberg–Marquardt constant fitting** using adjoint (backpropagation)
-  derivatives — one backward sweep gives every constant's gradient, with
+fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
+candidate with the right *shape* is immediately usable even if its numbers
+started out wrong, and the fitted numbers minimise the same loss that ranks the
+front. Candidates affine in every constant can instead use the closed-form
+column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
+error and falls back to the metric-aware path otherwise; the default remains
+the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant

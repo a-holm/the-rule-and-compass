@@ -793,7 +793,7 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
     data.sample.x.iter().map(|row| eval(tree, row)).collect()
 }
 
-/// #14: fit a candidate's constants on the objective its metric actually
+/// #14, #117: fit a candidate's constants on the objective its metric actually
 /// scores.
 ///
 /// The implicit-derivative metric is scale-free. Fitting `f` against the zero
@@ -801,9 +801,12 @@ fn predictions(tree: &Node, data: &EvalSample) -> Vec<f64> {
 /// constant towards zero, collapsing the level set into the trivial `f == 0`;
 /// the guard rightly rejects that candidate, so a good shape would be destroyed
 /// before it could be scored. In this one case [`crate::implicit::fit`]
-/// minimises the signed geometric residual `f / ||grad f||` instead. Every
-/// other metric (including `implicit_residual`, which by definition scores
-/// `|f|`) keeps the historical `fit_weighted` path bit for bit.
+/// minimises the signed geometric residual `f / ||grad f||` instead.
+///
+/// Every explicit metric goes through [`crate::fit::fit_weighted_metric`], which
+/// keeps `squared`/AIC/AICc/BIC on the exact historical least-squares path and
+/// fits the configured loss for the others (IRLS, logistic IRLS, or a
+/// documented coordinate polish for rank/order losses).
 ///
 /// #85: `fit` is the (possibly screening) sample the constants are fitted on;
 /// `score` is the sample that will score the candidate. They are the same
@@ -832,18 +835,15 @@ fn fit_constants_with_iters(
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
-        // #116: the configured exact arm; `Exact` is `fit_weighted` bit for bit.
-        let sse = crate::fit::fit_weighted_strategy(
+        // #116 + #117: strategy and metric together.
+        let sse = crate::fit::fit_weighted_strategy_metric(
             tree,
             &fit.x,
             &fit.y,
             &fit.w,
             iters,
-            cfg.fit_strategy,
-        );
-        // #87: remember the tree the SSE belongs to. Simplification after the
-        // fit may fold constants, in which case the SSE is stale and the
-        // caller must score normally.
+        // #116 + #117: strategy and metric together.
+        let sse = crate::fit::fit_weighted_strategy_metric(
         Some(FitResult {
             sse,
             hash: expr::structural_hash(tree),
@@ -854,8 +854,9 @@ fn fit_constants_with_iters(
     }
 }
 
-/// #87: the fitter's own residual sum of squares at the constants it wrote
-/// back, plus the structural hash of the tree at that moment.
+/// #87: the fitter's own value at the constants it wrote back (the residual
+/// sum of squares for the squared family, the configured loss otherwise), plus
+/// the structural hash of the tree at that moment.
 struct FitResult {
     sse: f64,
     hash: u64,
