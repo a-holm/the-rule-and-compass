@@ -93,9 +93,27 @@ A launcher should:
 * resume with `--resume checkpoint.rcsr` and, only if intentional, with
   `--allow-backend-change`.
 
-A tracked example is [`scripts/run-long.sh`](../scripts/run-long.sh). It
-requires an explicit backend and manifest path, derives a stable seed, and
-writes a non-empty progress/error log.
+Two tracked examples implement the contract:
+
+* [`scripts/run-long.sh`](../scripts/run-long.sh) — one uninterrupted or
+  resumed run; requires `--gpu`/`--cpu` and writes a manifest, atomic result,
+  command record and progress log.
+* [`scripts/launch-windows.py`](../scripts/launch-windows.py) — several
+  walk-forward windows; derives `SHA-256(label:seed)`, reuses the same backend
+  on resume, and writes one manifest/log/result set per window. `--dry-run`
+  prints the resolved commands without searching.
+
+The scratch launchers in the git-ignored `arbeidsmappe/crypto-rcsr/pilot/`
+directory are legacy. They are **not tracked and not supported**: several were
+written before this contract (`hash(label)` seeds, `/dev/null` stderr, plain
+`--json` redirected to a file without a manifest). Do not resume a long run
+with them. Use the tracked launchers above, or port the window list into
+`scripts/launch-windows.py`.
+
+`my-version/tests/launchers.rs` enforces the contract on every tracked
+`scripts/*.sh`/`*.py`: no `DEVNULL`, no Python `hash(`, an explicit backend, and
+`--run-manifest`/`--json-out`/`--progress`. It also runs `run-long.sh`
+end-to-end and checks the manifest with `rcsr verify-manifest`.
 
 ## Acceptance checks
 
