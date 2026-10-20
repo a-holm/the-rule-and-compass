@@ -138,6 +138,20 @@ fn temporal_group_tests_every_series_and_uses_whole_series_history() {
 }
 
 #[test]
+fn a_single_fold_uses_the_pooled_test_block_without_a_second_copy() {
+    let t = series_csv(12);
+    let mut s = spec(SplitMode::Temporal);
+    s.time_col = Some(0);
+    s.folds = 1;
+    let mut rng = Mt::new(1);
+    let p = data::prepare_full(&t, &["x".into()], "y", &s, &mut rng).unwrap();
+    // #133: the pooled test block is the single fold; `fold_samples` only
+    // materialises per-fold copies when there is more than one fold.
+    assert!(p.fold_samples.is_empty());
+    assert!(!p.test.is_empty());
+}
+
+#[test]
 fn folds_partition_the_test_region() {
     let t = series_csv(12);
     let mut s = spec(SplitMode::Temporal);

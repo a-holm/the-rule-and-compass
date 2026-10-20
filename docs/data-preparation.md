@@ -44,10 +44,42 @@ them (`#133`). Only a *mutating* stage (fill, outlier removal, smoothing) needs
 that copy, and it is made once. The split itself is a selector over the table,
 not a second copy.
 
-Centre/scale still computes the training mean and standard deviation in one
-pass. Median, min, max, IQR and range need an ordered copy; mean/std (the
-default) does not sort. This changes no number: the same training rows produce
-the same constants and the same samples in the same order.
+Centre/scale still computes the training mean and standard deviation in the
+same two-pass order, but it reads the column slices directly instead of
+collecting a per-column copy. Median, min, max, IQR and range need an ordered
+copy; mean/std (the default) does not sort. This changes no number: the same
+training rows produce the same constants and the same samples in the same
+order, including the final `(x - mean) / std` division (not a reciprocal
+multiply).
+
+Sample construction allocates the row vectors once and fills them in 256-row
+blocks, so each source column is read sequentially rather than through 53
+distant cache lines per row. For a single fold the pooled test block is built
+directly and `Prepared::fold_samples` stays empty; consumers fall back to
+`test`. With `--folds K > 1` the per-fold samples are still materialised, in
+fold order.
+
+## Measured (#133)
+
+Release binary, Intel i7-3770K (8 threads), 31 GiB, Linux; fixture
+`/mnt/lager/tmp/opencode/panel_hourly_v2.rcsb` (1.81 GB, 3,943,856 x 56) via
+`examples/prep_measure`:
+
+| fixture | load | prepare | total | peak RSS |
+|---|---:|---:|---:|---:|
+| 3,943,856 x 56 `.rcsb`, target `y60`, `--fill drop` | 2.12 s | **8.46 s** | 10.59 s | **3.64 GB** |
+| 76,695 x 56 CSV, default split | 2.95 s | **0.21 s** | 3.16 s | 74 MB |
+
+The 3.94M-row preparation target was `<= 12 s` and `<= 5.5 GB`; both are met.
+A full 76k-row search (`--generations 1 --pop 30 --fit-iters 0`,
+`--baseline-samples 64`) runs in **4.05 s** wall with 145 MB RSS, inside the
+`<= 8 s` target. The earlier dead `x_raw`, the unconditional per-column sort,
+the row-major copy for `--fill drop`, the table clone for an all-numeric fill,
+and the duplicate pooled-test build are gone.
+
+The SoA transpose count is pinned by a unit test: a five-generation run builds
+the full-training view once and the pooled test view once — **2 transposes**,
+not the previous 8 (the test prints the count).
 
 ## Ragged rows
 
