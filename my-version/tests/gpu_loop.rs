@@ -385,6 +385,26 @@ fn cpu_override_is_bit_identical_across_runs() {
     assert!(a.device.is_none());
 }
 
+fn four_island_gpu_run_with_if_is_deterministic() {
+    // Mixes the device pool, the parallel CPU fallback (`if` has no opcode)
+    // and four island threads. Repeating the seed must give the same archive.
+    let train = sample(48);
+    let test = sample(48);
+    let mut cfg = config(29, true);
+    cfg.islands = 4;
+    cfg.pop = 40;
+    cfg.generations = 20;
+    cfg.fit_iters = 0;
+    cfg.ops.push(Op::If);
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(
+        describe(&a),
+        describe(&b),
+        "four islands, the device pool and the if fallback are deterministic"
+    );
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn batched_generation_is_deterministic_given_the_seed() {

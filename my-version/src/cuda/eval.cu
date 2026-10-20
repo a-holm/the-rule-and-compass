@@ -65,6 +65,12 @@ struct RcCtx {
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
+    /* #122: fixed-capacity, double-buffered genome arena. */
+    unsigned int *d_pool[2];
+    unsigned long long *d_hash;
+    int pool_cap;
+    int pool_width;
+    int hash_cap;
     int n;
     int v;
     int nprog;
@@ -169,7 +175,117 @@ __global__ void eval_kernel(const float *__restrict__ cols,
     if (threadIdx.x == 0) out[p] = sh[0];
 }
 
-extern "C" {
+/* #122: the same evaluator over a fixed-stride genome pool. One block per
+   program; slot `p` starts at `p * width` and ends at its HALT word. */
+__global__ void eval_pool_kernel(const float *__restrict__ cols,
+                                 const float *__restrict__ y,
+                                 int n,
+                                 int v,
+                                 const unsigned int *__restrict__ prog,
+                                 int width,
+                                 float *__restrict__ out)
+{
+    const int p = blockIdx.x;
+    const unsigned int *slot = prog + (size_t)p * (size_t)width;
+    float acc = 0.0f;
+
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float s[RC_MAX_STACK];
+        int sp = 0;
+        int q = 0;
+        for (;;) {
+            unsigned int w = slot[q++];
+            if (w == OP_CONST) {
+                s[sp++] = __uint_as_float(slot[q++]);
+            } else if (w == OP_VAR) {
+                unsigned int k = slot[q++];
+                s[sp++] = cols[(size_t)k * (size_t)n + (size_t)i];
+            } else if (w == OP_HALT) {
+                break;
+            } else if (w == OP_ADD) {
+                float b = s[--sp];
+                s[sp - 1] += b;
+            } else if (w == OP_SUB) {
+                float b = s[--sp];
+                s[sp - 1] -= b;
+            } else if (w == OP_MUL) {
+                float b = s[--sp];
+                s[sp - 1] *= b;
+            } else if (w == OP_DIV) {
+                float b = s[--sp];
+                s[sp - 1] = (fabsf(b) < 1e-12f) ? CUDART_NAN_F : s[sp - 1] / b;
+            } else if (w == OP_POW) {
+                float b = s[--sp];
+                float a = s[sp - 1];
+                s[sp - 1] = (a < 0.0f && fabsf(b - roundf(b)) > 1e-9f)
+                                ? CUDART_NAN_F
+                                : powf(a, b);
+            } else {
+                float a = s[sp - 1];
+                float r = a;
+                switch (w) {
+                    case OP_SIN: r = sinf(a); break;
+                    case OP_COS: r = cosf(a); break;
+                    case OP_TAN: {
+                        float t = tanf(a);
+                        r = isfinite(t) ? t : CUDART_NAN_F;
+                    } break;
+                    case OP_EXP: r = expf(a); break;
+                    case OP_LOG: r = (a > 0.0f) ? logf(a) : CUDART_NAN_F; break;
+                    case OP_SQRT: r = (a >= 0.0f) ? sqrtf(a) : CUDART_NAN_F; break;
+                    case OP_ABS: r = fabsf(a); break;
+                    case OP_TANH: r = tanhf(a); break;
+                    case OP_SIG: r = logisticf(a); break;
+                    case OP_SQUARE: r = a * a; break;
+                    case OP_CUBE: r = a * a * a; break;
+                    case OP_NEG: r = -a; break;
+                    case OP_GAUSS: r = expf(-a * a); break;
+                    case OP_STEP: r = a > 0.0f ? 1.0f : 0.0f; break;
+                    case OP_SINH: r = sinhf(a); break;
+                    case OP_COSH: r = coshf(a); break;
+                    default: r = 0.0f; break;
+                }
+                s[sp - 1] = r;
+            }
+        }
+        float pred = s[0];
+        if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            acc += 1e30f;
+            continue;
+        }
+        float r = pred - y[i];
+        acc += r * r;
+    }
+
+    __shared__ float sh[RC_MAX_THREADS];
+    sh[threadIdx.x] = acc;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int)threadIdx.x < st) sh[threadIdx.x] += sh[threadIdx.x + st];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[p] = sh[0];
+}
+
+/* #122: canonical postfix hash, FNV-1a over the words up to and including
+   HALT. Mirrors `genome::postfix_hash` exactly. */
+__global__ void hash_kernel(const unsigned int *__restrict__ prog,
+                            int width,
+                            int nprog,
+                            unsigned long long *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= nprog) return;
+    const unsigned int *slot = prog + (size_t)p * (size_t)width;
+    unsigned long long h = 0xcbf29ce484222325ULL;
+    for (int q = 0; q < width; ++q) {
+        unsigned int w = slot[q];
+        h ^= (unsigned long long)w;
+        h *= 0x00000100000001b3ULL;
+        if (w == OP_HALT) break;
+    }
+    out[p] = h;
+}
 
 /* Allocation strategy.
  *
@@ -209,6 +325,8 @@ static void rc_download(void *dst, const void *src, size_t bytes)
 }
 #endif
 
+extern "C" {
+
 void *rc_create(const float *cols, int n, int v, const float *y)
 {
     RcCtx *c = (RcCtx *)calloc(1, sizeof(RcCtx));
@@ -242,6 +360,9 @@ void rc_destroy(void *ctx)
     if (c->d_prog) cudaFree(c->d_prog);
     if (c->d_off) cudaFree(c->d_off);
     if (c->d_out) cudaFree(c->d_out);
+    if (c->d_pool[0]) cudaFree(c->d_pool[0]);
+    if (c->d_pool[1]) cudaFree(c->d_pool[1]);
+    if (c->d_hash) cudaFree(c->d_hash);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -299,6 +420,88 @@ float rc_eval(void *ctx, float *out)
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
+}
+
+/* --- #122: persistent fixed-capacity program pool ------------------------ */
+
+/* Reserve both arena buffers once. A later, larger batch may grow the arena;
+   a generation never allocates or frees it. */
+int rc_pool_reserve(void *ctx, int nprog, int width)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nprog <= 0 || width <= 0) return -1;
+    if (c->pool_cap >= nprog && c->pool_width == width) return 0;
+    if (c->d_pool[0]) { cudaFree(c->d_pool[0]); c->d_pool[0] = 0; }
+    if (c->d_pool[1]) { cudaFree(c->d_pool[1]); c->d_pool[1] = 0; }
+    size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)width;
+    if (rc_alloc((void **)&c->d_pool[0], bytes) != 0 ||
+        rc_alloc((void **)&c->d_pool[1], bytes) != 0) {
+        return -1;
+    }
+    if (c->hash_cap < nprog) {
+        if (c->d_hash) { cudaFree(c->d_hash); c->d_hash = 0; }
+        if (rc_alloc((void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
+            c->d_hash = 0;
+            c->hash_cap = 0;
+            return -1;
+        }
+        c->hash_cap = nprog;
+    }
+    c->pool_cap = nprog;
+    c->pool_width = width;
+    return 0;
+}
+
+/* Upload `nprog` fixed-width programs into buffer `which` (0 or 1). */
+int rc_pool_upload(void *ctx, int which, const unsigned int *prog, int nprog)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1;
+    size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)c->pool_width;
+    rc_upload(c->d_pool[which & 1], prog, bytes);
+    return 0;
+}
+
+/* Evaluate the programs already uploaded to `which`; same return contract as
+   rc_eval (milliseconds, negative on failure). */
+float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1.0f;
+    if (c->out_cap < nprog) {
+        if (c->d_out) cudaFree(c->d_out);
+        if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
+            c->d_out = 0;
+            c->out_cap = 0;
+            return -1.0f;
+        }
+        c->out_cap = nprog;
+    }
+    int threads = RC_MIN_THREADS;
+    while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    cudaEventRecord(c->t0, 0);
+    eval_pool_kernel<<<nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
+                                         c->d_pool[which & 1], width, c->d_out);
+    cudaEventRecord(c->t1, 0);
+    cudaEventSynchronize(c->t1);
+    if (cudaGetLastError() != cudaSuccess) return -1.0f;
+    rc_download(out, c->d_out, sizeof(float) * (size_t)nprog);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
+    return ms;
+}
+
+/* Canonical postfix hashes of the last uploaded buffer. */
+int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !c->d_pool[which & 1] || !c->d_hash || nprog <= 0) return -1;
+    int threads = 128;
+    int blocks = (nprog + threads - 1) / threads;
+    hash_kernel<<<blocks, threads>>>(c->d_pool[which & 1], width, nprog, c->d_hash);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    rc_download(out, c->d_hash, sizeof(unsigned long long) * (size_t)nprog);
+    return 0;
 }
 
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.

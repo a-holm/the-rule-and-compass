@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod eval_soa;
 pub mod expr;
 pub mod fit;
+pub mod genome;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod gui;

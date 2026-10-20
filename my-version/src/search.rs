@@ -346,6 +346,10 @@ impl Ind {
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
     n_rows: usize,
+    /// #122: the fixed-capacity, double-buffered postfix arena. It is allocated
+    /// once (grown only if a later batch is larger) and reused every generation,
+    /// so a generation never calls `cudaMalloc` for its programs.
+    pool: Option<crate::genome::GenomePool>,
 }
 
 #[cfg(feature = "cuda")]
@@ -374,7 +378,11 @@ impl GpuSearch {
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
         match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
-            Some(ev) => Ok(GpuSearch { ev, n_rows }),
+            Some(ev) => Ok(GpuSearch {
+                ev,
+                n_rows,
+                pool: None,
+            }),
             None => Err(format!(
                 "no usable CUDA device ({})",
                 crate::gpu::GpuEvaluator::device_name()
@@ -409,20 +417,41 @@ impl GpuSearch {
             return Ok(());
         }
 
-        let mut pop = crate::gpu::Population::new();
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        // #122: one fixed-width slot per genome. A tree whose postfix exceeds
+        // the configured bound is scored on the CPU (the existing fallback), so
+        // a wide seed can never truncate or corrupt the arena.
+        let width = crate::genome::width_for(cfg.max_complexity);
+        let reuse = self
+            .pool
+            .as_ref()
+            .map_or(false, |p| p.capacity() >= pending.len() && p.width() == width);
+        if !reuse {
+            self.pool = Some(crate::genome::GenomePool::new(pending.len().max(1), width));
+        }
+        let pool = self.pool.as_mut().expect("a pool was just allocated");
+        pool.begin_generation();
         for &(i, j) in &pending {
-            if pop.add(&islands[i][j].tree) {
+            let mut buf = Vec::new();
+            let meta = crate::genome::GenomeMeta {
+                island: i as u16,
+                tag: j as u32,
+                ..Default::default()
+            };
+            if crate::gpu::compile(&islands[i][j].tree, &mut buf)
+                && buf.len() <= width
+                && pool.push(&buf, meta)
+            {
                 slots.push((i, j));
             } else {
                 on_cpu.push((i, j));
             }
         }
 
-        if !pop.is_empty() {
-            let (sse, ms) = self.ev.eval_population(&pop);
-            if ms < 0.0 || sse.len() != pop.len() {
+        if !pool.is_empty() {
+            let (sse, ms) = self.ev.eval_pool(pool);
+            if ms < 0.0 || sse.len() != pool.len() {
                 return Err("CUDA batch evaluation failed".to_string());
             }
             let n = self.n_rows as f64;
@@ -433,16 +462,95 @@ impl GpuSearch {
                     f64::INFINITY
                 };
             }
+            // The generation is complete: the just-evaluated arena becomes the
+            // readable front, and the next generation writes into the other one.
+            pool.commit();
         }
         if !on_cpu.is_empty() {
             // #27: the CPU fallback uses the same SoA view as the live search.
             let train_view = EvalSample::new(train, cfg);
-            for (i, j) in on_cpu {
-                islands[i][j].reeval(&train_view, cfg); // #25
-            }
+            // #122: unsupported programs used to be scored serially after the
+            // kernel (the measured 2 s tail at P=10 000, 5 % `if`). Score them
+            // on a bounded CPU pool instead; each tree is independent, so the
+            // result is bit-identical to the serial walk.
+            rescore_pending_cpu(islands, &train_view, cfg);
         }
         Ok(())
     }
+}
+
+/// Score every still-pending (`error.is_nan()`) individual on the CPU.
+///
+/// Work is split into contiguous slices of each island's population and scored
+/// on up to [`fallback_workers`] threads. A tree's error depends only on the
+/// tree and the sample, never on a neighbour or on completion order, so the
+/// parallel and serial paths return the same bits. Small batches stay serial:
+/// the thread round trip would cost more than it saves.
+fn rescore_pending_cpu(islands: &mut [Vec<Ind>], train: &EvalSample, cfg: &Config) {
+    rescore_pending_cpu_with(islands, train, cfg, fallback_workers());
+}
+
+/// The worker count is a parameter so the determinism test can compare one
+/// thread with many without touching the process environment.
+fn rescore_pending_cpu_with(
+    islands: &mut [Vec<Ind>],
+    train: &EvalSample,
+    cfg: &Config,
+    workers: usize,
+) {
+    let pending: usize = islands
+        .iter()
+        .map(|pop| pop.iter().filter(|ind| ind.error.is_nan()).count())
+        .sum();
+    if pending == 0 {
+        return;
+    }
+    let workers = workers.min(pending);
+    if workers <= 1 {
+        for pop in islands.iter_mut() {
+            for ind in pop.iter_mut() {
+                if ind.error.is_nan() {
+                    ind.reeval(train, cfg); // #25
+                }
+            }
+        }
+        return;
+    }
+    let islands_n = islands.len().max(1);
+    let per_island = (workers / islands_n).max(1);
+    let blocks = expr::current_blocks();
+    std::thread::scope(|scope| {
+        for pop in islands.iter_mut() {
+            let per = pop.len().div_ceil(per_island).max(1);
+            for chunk in pop.chunks_mut(per) {
+                let blocks = blocks.clone();
+                scope.spawn(move || {
+                    // #10: custom blocks are thread-local, exactly as in an
+                    // island's evolution thread.
+                    expr::set_blocks(blocks);
+                    for ind in chunk.iter_mut() {
+                        if ind.error.is_nan() {
+                            ind.reeval(train, cfg); // #25
+                        }
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// #122: size of the bounded CPU fallback pool.
+fn fallback_workers() -> usize {
+    const MAX: usize = 8;
+    if let Ok(v) = std::env::var("RCSR_CPU_FALLBACK_THREADS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.clamp(1, 64);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX)
 }
 
 /// #26: score the pending individuals, falling back to the CPU on any error.
@@ -477,13 +585,8 @@ fn score_generation(
             *gpu = None;
             // #27: re-scoring the pending batch goes through the SoA view.
             let train_view = EvalSample::new(train, cfg);
-            for pop in islands.iter_mut() {
-                for ind in pop.iter_mut() {
-                    if ind.error.is_nan() {
-                        ind.reeval(&train_view, cfg); // #25
-                    }
-                }
-            }
+            // #122: the same bounded CPU pool as the per-batch fallback.
+            rescore_pending_cpu(islands, &train_view, cfg);
             false
         }
     }
@@ -1844,12 +1947,12 @@ fn run_search(
                     if ind.error < gen_best {
                         gen_best = ind.error;
                     }
-                    archive.try_insert(Sol {
-                        complexity: expr::complexity(&ind.tree),
-                        cost: ind.complexity,
-                        tree: ind.tree.clone(),
-                        error: ind.error,
-                    });
+                    archive.try_insert_view(
+                        &ind.tree,
+                        ind.error,
+                        expr::complexity(&ind.tree),
+                        ind.complexity,
+                    );
                 }
             }
 
@@ -2572,5 +2675,55 @@ mod tests {
             !seen.insert(expr::structural_hash(&parent.tree)),
             "a clone of a parent must be a duplicate"
         );
+    }
+
+    /// #122: the bounded CPU fallback must be a pure parallelisation, not a
+    /// change of result. One thread and four threads score the same unsupported
+    /// (`if`) and supported trees to the same bits.
+    #[test]
+    fn cpu_fallback_is_identical_for_one_and_many_threads() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let trees = vec![
+            node(
+                Op::If,
+                vec![
+                    node(Op::Mul, vec![input(0), constant(2.0)]),
+                    input(1),
+                    constant(0.5),
+                ],
+            ),
+            node(Op::Sin, vec![input(0)]),
+            node(Op::Div, vec![constant(1.0), input(0)]),
+            node(
+                Op::Add,
+                vec![node(Op::Square, vec![input(1)]), constant(1.0)],
+            ),
+        ];
+        let make = || {
+            vec![
+                trees
+                    .iter()
+                    .cloned()
+                    .map(|t| Ind::pending(t, &cfg))
+                    .collect::<Vec<_>>(),
+                trees
+                    .iter()
+                    .cloned()
+                    .map(|t| Ind::pending(t, &cfg))
+                    .collect::<Vec<_>>(),
+            ]
+        };
+        let mut one = make();
+        let mut many = make();
+        rescore_pending_cpu_with(&mut one, &view, &cfg, 1);
+        rescore_pending_cpu_with(&mut many, &view, &cfg, 4);
+        for (a, b) in one.iter().flatten().zip(many.iter().flatten()) {
+            assert_eq!(a.error.to_bits(), b.error.to_bits());
+            assert_eq!(a.complexity.to_bits(), b.complexity.to_bits());
+            assert!(expr::same(&a.tree, &b.tree));
+        }
+        assert!(one[0][0].error.is_finite(), "the unsupported tree was scored");
     }
 }

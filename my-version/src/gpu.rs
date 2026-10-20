@@ -216,6 +216,17 @@ extern "C" {
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
     fn rc_device_count() -> i32;
+    /* #122: persistent, fixed-capacity, double-buffered program arena. */
+    fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
+    fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
+    fn rc_pool_eval(ctx: *mut RawCtx, which: i32, nprog: i32, width: i32, out: *mut f32) -> f32;
+    fn rc_pool_hash(
+        ctx: *mut RawCtx,
+        which: i32,
+        nprog: i32,
+        width: i32,
+        out: *mut u64,
+    ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
 }
@@ -356,6 +367,12 @@ impl Population {
 /// candidates can be scored without further host↔device traffic for the data.
 pub struct GpuEvaluator {
     ctx: *mut RawCtx,
+    /// #122: capacity and width of the persistent program arena, or `0` when
+    /// it has not been reserved yet.
+    pool_cap: usize,
+    pool_width: usize,
+    /// Which of the two arena buffers the last upload/evaluation used.
+    pool_last: usize,
 }
 
 impl GpuEvaluator {
@@ -365,7 +382,12 @@ impl GpuEvaluator {
         if ctx.is_null() {
             None
         } else {
-            Some(GpuEvaluator { ctx })
+            Some(GpuEvaluator {
+                ctx,
+                pool_cap: 0,
+                pool_width: 0,
+                pool_last: 0,
+            })
         }
     }
 
@@ -402,6 +424,59 @@ impl GpuEvaluator {
             let mut out = vec![0.0f32; nprog];
             let ms = rc_eval(self.ctx, out.as_mut_ptr());
             (out, ms)
+        }
+    }
+
+    /// #122: evaluate a fixed-capacity [`GenomePool`] through the persistent
+    /// device arena. The arena is reserved once (and only grown if a later
+    /// generation is larger); uploads alternate between its two buffers and no
+    /// `cudaMalloc`/`cudaFree` happens inside the loop.
+    pub fn eval_pool(&mut self, pool: &crate::genome::GenomePool) -> (Vec<f32>, f32) {
+        let n = pool.len();
+        if n == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let width = pool.width();
+        unsafe {
+            if self.pool_cap < pool.capacity() || self.pool_width != width {
+                if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+                    return (Vec::new(), -1.0);
+                }
+                self.pool_cap = pool.capacity();
+                self.pool_width = width;
+            }
+            let which = (self.pool_last ^ 1) as i32;
+            if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+                return (Vec::new(), -1.0);
+            }
+            let mut out = vec![0.0f32; n];
+            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+            self.pool_last = which as usize;
+            (out, ms)
+        }
+    }
+
+    /// #122: canonical postfix hashes of the last [`Self::eval_pool`] batch,
+    /// computed on the device with the same FNV-1a mix as
+    /// [`crate::genome::postfix_hash`]. Used to check the two implementations
+    /// agree and, in the plan, to compact a batch without a host hash pass.
+    pub fn pool_hashes(&mut self, n: usize) -> Vec<u64> {
+        if n == 0 || self.pool_width == 0 {
+            return Vec::new();
+        }
+        unsafe {
+            let mut out = vec![0u64; n];
+            if rc_pool_hash(
+                self.ctx,
+                self.pool_last as i32,
+                n as i32,
+                self.pool_width as i32,
+                out.as_mut_ptr(),
+            ) != 0
+            {
+                return Vec::new();
+            }
+            out
         }
     }
 
@@ -514,6 +589,47 @@ mod tests {
         assert_eq!(offsets[0], 0);
         assert_eq!(*offsets.last().unwrap() as usize, prog.len());
         assert!(offsets.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn fixed_slot_pool_matches_the_packed_batch_and_hashes() {
+        use crate::genome::{postfix_hash, GenomeMeta, GenomePool};
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+
+        let width = 16;
+        let mut pool = GenomePool::new(trees.len(), width);
+        let mut expected_hash = Vec::new();
+        for tree in &trees {
+            let mut words = Vec::new();
+            assert!(compile(tree, &mut words));
+            expected_hash.push(postfix_hash(&words));
+            assert!(pool.push(&words, GenomeMeta::default()));
+        }
+        let (slot_sse, ms) = ev.eval_pool(&pool);
+        assert!(ms >= 0.0, "the fixed-slot kernel ran");
+        assert_eq!(slot_sse.len(), trees.len());
+
+        // The hashes are canonical: the device and host agree bit for bit.
+        let device_hash = ev.pool_hashes(pool.len());
+        assert_eq!(device_hash, expected_hash);
+
+        // The fixed-slot kernel is the same evaluator: batch == one at a time.
+        let pop = Population::from_trees(&trees);
+        let (packed, _) = ev.eval_population(&pop);
+        for i in 0..trees.len() {
+            let tol = 1e-6 * (1.0 + packed[i].abs());
+            assert!(
+                (slot_sse[i] - packed[i]).abs() <= tol,
+                "slot {}: {:.9} vs packed {:.9}",
+                i,
+                slot_sse[i],
+                packed[i]
+            );
+        }
     }
 
     #[test]
