@@ -104,12 +104,11 @@ fn run_cli(args: &[&str], gpu_env: Option<&str>) -> (Option<i32>, String, String
         cmd.env("RCSR_GPU", v);
     }
     let mut child = cmd.spawn().expect("spawn rcsr");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(csv(60).as_bytes())
-        .unwrap();
+    // An explicit --gpu failure may exit before reading stdin; a broken pipe
+    // is expected and must not mask the exit code/stderr assertion.
+    if let Some(stdin) = child.stdin.as_mut() {
+        let _ = stdin.write_all(csv(60).as_bytes());
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.code(),
