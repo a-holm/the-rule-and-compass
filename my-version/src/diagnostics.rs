@@ -1136,28 +1136,54 @@ pub struct NullControl {
     /// `(#{null ≤ observed} + 1) / (runs + 1)`. Small ⇒ the real fit is not
     /// something the search can produce from noise.
     pub p_value: f64,
+    /// The observed error the null is compared against.
+    pub observed: f64,
+    /// `"iid"` for a row shuffle, `"block"` for a block permutation (#114).
+    pub method: &'static str,
+    /// Block length in rows; `0` for the i.i.d. null.
+    pub block_len: usize,
+    /// Number of contiguous blocks permuted; `runs` for the i.i.d. null.
+    pub blocks: usize,
 }
 
 impl NullControl {
     pub fn summarise(observed: f64, mut best: Vec<f64>) -> NullControl {
-        best.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = best.len();
-        let null_min = best.first().copied().unwrap_or(f64::NAN);
-        let null_median = if n == 0 {
-            f64::NAN
-        } else if n % 2 == 1 {
-            best[n / 2]
-        } else {
-            0.5 * (best[n / 2 - 1] + best[n / 2])
-        };
-        let count = best.iter().filter(|&&e| e <= observed).count();
-        let p_value = (count as f64 + 1.0) / (n as f64 + 1.0);
+        let runs = best.len();
+        let c = summarise_sorted(observed, &mut best);
         NullControl {
-            runs: n,
+            runs,
             best,
-            null_min,
-            null_median,
-            p_value,
+            null_min: c.0,
+            null_median: c.1,
+            p_value: c.2,
+            observed,
+            method: "iid",
+            block_len: 0,
+            blocks: runs,
+        }
+    }
+
+    /// Summary of a **block-permutation** null (#114). `block_len` is the
+    /// contiguous block length (at least the label horizon) and `blocks` the
+    /// number of blocks that were permuted.
+    pub fn summarise_block(
+        observed: f64,
+        mut best: Vec<f64>,
+        block_len: usize,
+        blocks: usize,
+    ) -> NullControl {
+        let runs = best.len();
+        let c = summarise_sorted(observed, &mut best);
+        NullControl {
+            runs,
+            best,
+            null_min: c.0,
+            null_median: c.1,
+            p_value: c.2,
+            observed,
+            method: "block",
+            block_len,
+            blocks,
         }
     }
 
@@ -1175,6 +1201,76 @@ impl NullControl {
         } else {
             "the search fits shuffled targets as well: suspect overfitting"
         }
+    }
+}
+
+/// Sort a null distribution and return `(min, median, p)`.
+fn summarise_sorted(observed: f64, best: &mut [f64]) -> (f64, f64, f64) {
+    best.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = best.len();
+    let null_min = best.first().copied().unwrap_or(f64::NAN);
+    let null_median = if n == 0 {
+        f64::NAN
+    } else if n % 2 == 1 {
+        best[n / 2]
+    } else {
+        0.5 * (best[n / 2 - 1] + best[n / 2])
+    };
+    let count = best.iter().filter(|&&e| e <= observed).count();
+    let p = (count as f64 + 1.0) / (n as f64 + 1.0);
+    (null_min, null_median, p)
+}
+
+/// Permute a target by moving **contiguous blocks** instead of individual rows.
+///
+/// `block_len` is in rows and must be at least the label horizon, so that a
+/// block still contains every overlap structure the real labelling has. Blocks
+/// are permuted with the same deterministic MT19937 stream the i.i.d. shuffle
+/// uses, so a seed reproduces the null exactly. A `block_len <= 1` is the
+/// ordinary row shuffle.
+///
+/// The last block may be shorter; every row is kept exactly once, so the
+/// permuted series has the same length and the same marginal distribution.
+pub fn block_permute(y: &[f64], block_len: usize, rng: &mut Mt) -> Vec<f64> {
+    let n = y.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let b = block_len.max(1);
+    if b == 1 || b >= n {
+        let mut out = y.to_vec();
+        for j in (1..n).rev() {
+            let k = rng.usize_below(j + 1);
+            out.swap(j, k);
+        }
+        return out;
+    }
+    // Block boundaries: [0, b), [b, 2b), ..., last block to n.
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + b).min(n);
+        blocks.push((lo, hi));
+        lo = hi;
+    }
+    for j in (1..blocks.len()).rev() {
+        let k = rng.usize_below(j + 1);
+        blocks.swap(j, k);
+    }
+    let mut out = Vec::with_capacity(n);
+    for (lo, hi) in blocks {
+        out.extend_from_slice(&y[lo..hi]);
+    }
+    out
+}
+
+/// Number of blocks [`block_permute`] creates for `n` rows.
+pub fn block_count(n: usize, block_len: usize) -> usize {
+    let b = block_len.max(1);
+    if b >= n.max(1) {
+        1
+    } else {
+        n.div_ceil(b)
     }
 }
 

@@ -214,6 +214,12 @@ OVERFITTING DIAGNOSTICS (always on):
                              (y-randomisation control) and report the null error
                              distribution and a p-value; inferential, costs n
                              extra searches
+  --null-block <N>           permute contiguous blocks of N rows instead of
+                             single rows (N >= 2, and at least the label
+                             horizon). For autocorrelated series the i.i.d.
+                             shuffle is anti-conservative; the report records
+                             method, block length and number of blocks. With no
+                             --null-runs it runs 19 permutations
   --bootstrap-error <n>      refit each solution's constants on n bootstrap
                              resamples and report the apparent, out-of-bag and
                              .632+ error estimates (Efron & Tibshirani 1997);
@@ -602,6 +608,9 @@ fn main() {
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut null_runs = 0usize;
+    // #114: block length for a block-permutation null; 0 selects the i.i.d.
+    // row shuffle. `--null-block` without `--null-runs` runs 19 permutations.
+    let mut null_block = 0usize;
     // #69: query-row cap for the k-NN null baseline; 0 = no caps at all.
     let mut baseline_samples = 0usize;
     let mut bootstrap_resamples = 0usize;
@@ -843,6 +852,7 @@ fn main() {
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             "--null-runs" => null_runs = val!().parse().unwrap_or(0),
+            "--null-block" => null_block = val!().parse().unwrap_or(0),
             // #69: 0 = no caps; a positive N samples only the query rows.
             "--baseline-samples" => baseline_samples = val!().parse().unwrap_or(baseline_samples),
             "--bootstrap-error" => bootstrap_resamples = val!().parse().unwrap_or(0),
@@ -1093,8 +1103,15 @@ fn main() {
     // A y-randomisation control shuffles the target. In implicit mode the target
     // is an input and the scored target is all zeros, so every null run would be
     // the real run: refuse rather than report a meaningless p-value.
+    if null_block > 0 && null_runs == 0 {
+        null_runs = 19;
+    }
+    if null_block == 1 {
+        eprintln!("error: --null-block must be at least 2 rows (use --null-runs for the i.i.d. shuffle)");
+        std::process::exit(EXIT_USAGE);
+    }
     if implicit_mode && null_runs > 0 {
-        eprintln!("error: --implicit cannot be combined with --null-runs");
+        eprintln!("error: --implicit cannot be combined with --null-runs/--null-block");
         eprintln!("  the null control shuffles the target, which is an input here");
         std::process::exit(EXIT_USAGE);
     }
@@ -1355,6 +1372,7 @@ fn main() {
             (resume_path.is_some(), "--resume"),
             (cv_mode.is_some(), "--cv"),
             (null_runs > 0, "--null-runs"),
+            (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
@@ -2548,11 +2566,18 @@ fn main() {
         let mut best_null = Vec::with_capacity(null_runs);
         for r in 0..null_runs {
             let mut rng = Mt::new(cfg.seed ^ (0x51ED_2701u32.wrapping_mul(r as u32 + 1)));
-            let mut y = prepared.train.y.clone();
-            for j in (1..y.len()).rev() {
-                let t = rng.usize_below(j + 1);
-                y.swap(j, t);
-            }
+            // #114: a block null is seeded from the same stream, so it is as
+            // reproducible as the i.i.d. shuffle.
+            let y = if null_block > 1 {
+                diagnostics::block_permute(&prepared.train.y, null_block, &mut rng)
+            } else {
+                let mut y = prepared.train.y.clone();
+                for j in (1..y.len()).rev() {
+                    let t = rng.usize_below(j + 1);
+                    y.swap(j, t);
+                }
+                y
+            };
             let shuffled = data::Sample {
                 x: prepared.train.x.clone(),
                 y,
@@ -2567,12 +2592,31 @@ fn main() {
                 .map(|s| s.error)
                 .fold(f64::INFINITY, f64::min);
             if !quiet {
-                eprintln!("# null run {}/{}: best train error {:.6}", r + 1, null_runs, b);
+                eprintln!(
+                    "# null run {}/{} ({}): best train error {:.6}",
+                    r + 1,
+                    null_runs,
+                    if null_block > 1 {
+                        format!("block {}", null_block)
+                    } else {
+                        "iid".to_string()
+                    },
+                    b
+                );
             }
             best_null.push(b);
         }
         cfg.progress = saved_progress;
-        null_control = Some(diagnostics::NullControl::summarise(observed, best_null));
+        null_control = Some(if null_block > 1 {
+            diagnostics::NullControl::summarise_block(
+                observed,
+                best_null,
+                null_block,
+                diagnostics::block_count(prepared.train.len(), null_block),
+            )
+        } else {
+            diagnostics::NullControl::summarise(observed, best_null)
+        });
     }
 
     let finite = rows.iter().any(|r| r.train_error.is_finite());
@@ -2680,8 +2724,16 @@ fn main() {
             }
             if let Some(c) = &null_control {
                 eprintln!(
-                    "# null control ({} shuffled-target runs): best={:.6} median={:.6} p={:.3} — {}",
-                    c.runs,
+                    "# null control ({}, observed={:.6}): best={:.6} median={:.6} p={:.3} — {}",
+                    if c.method == "block" {
+                        format!(
+                            "{} block-permutation runs, {} blocks of up to {} rows",
+                            c.runs, c.blocks, c.block_len
+                        )
+                    } else {
+                        format!("{} i.i.d. shuffled-target runs", c.runs)
+                    },
+                    c.observed,
                     c.null_min,
                     c.null_median,
                     c.p_value,
@@ -2963,8 +3015,12 @@ fn main() {
                 .collect();
             let null_json = match &null_control {
                 Some(c) => format!(
-                    "{{\"runs\":{},\"best\":[{}],\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    "{{\"runs\":{},\"method\":{},\"block_len\":{},\"blocks\":{},\"observed\":{},\"best\":[{}],\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
                     c.runs,
+                    jstr(c.method),
+                    c.block_len,
+                    c.blocks,
+                    jnum(c.observed),
                     c.best.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     jnum(c.null_min),
                     jnum(c.null_median),
@@ -3192,8 +3248,12 @@ fn main() {
             }
             if let Some(c) = &null_control {
                 println!(
-                    "{{\"event\":\"null_control\",\"runs\":{},\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
+                    "{{\"event\":\"null_control\",\"runs\":{},\"method\":{},\"block_len\":{},\"blocks\":{},\"observed\":{},\"min\":{},\"median\":{},\"p_value\":{},\"verdict\":{}}}",
                     c.runs,
+                    jstr(c.method),
+                    c.block_len,
+                    c.blocks,
+                    jnum(c.observed),
                     jnum(c.null_min),
                     jnum(c.null_median),
                     jnum(c.p_value),
@@ -4128,6 +4188,16 @@ fn summary_markdown(
         let _ = writeln!(s, "## Null control\n");
         match null_control {
             Some(c) => {
+                let _ = writeln!(
+                    s,
+                    "_Null: {}; observed error {}._\n",
+                    if c.method == "block" {
+                        format!("block permutation, {} blocks of up to {} rows", c.blocks, c.block_len)
+                    } else {
+                        "i.i.d. target shuffle".to_string()
+                    },
+                    md_num(c.observed)
+                );
                 let _ = writeln!(s, "| shuffled runs | best null error | median null error | p-value | verdict |");
                 let _ = writeln!(s, "|---:|---:|---:|---:|---|");
                 let _ = writeln!(
@@ -4347,9 +4417,14 @@ fn trust_paragraph(
         Some(c) => {
             let _ = write!(
                 out,
-                "Across {} shuffled-target runs the search reached a best error of {} \
+                "Across {} {} the search reached a best error of {} \
                  (median {}); the permutation p-value is {}, which means ",
                 c.runs,
+                if c.method == "block" {
+                    format!("block-permutation runs ({} blocks of up to {} rows)", c.blocks, c.block_len)
+                } else {
+                    "shuffled-target runs".to_string()
+                },
                 md_num(c.null_min),
                 md_num(c.null_median),
                 md_num(c.p_value)

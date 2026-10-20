@@ -165,6 +165,29 @@ This is *y-scrambling* (Rücker et al. 2007; Wold & Eriksson), long standard in
 cheminformatics. With `r` control runs the smallest attainable p-value is
 `1/(r+1)`, so use at least 19 runs for p ≤ 0.05 and 99 for p ≤ 0.01.
 
+**Block permutation for autocorrelated series.** Row-by-row shuffling destroys
+serial dependence, so for overlapping labels or autocorrelated returns the i.i.d.
+null is *anti-conservative*: the real fit looks better than a shuffled target
+that no longer resembles the data. `--null-block N` permutes contiguous blocks
+of `N` consecutive target rows instead (all rows are kept exactly once, and the
+same seed reproduces the null):
+
+```sh
+rcsr --data data.csv --target y --vars x1,x2 --split temporal --time t \
+     --null-runs 99 --null-block 24
+# ... null control (99 block-permutation runs, 7 blocks of up to 24 rows,
+#     observed=..., p=0.03) ...
+```
+
+`N` must be at least the label horizon (how many rows a label spans), so each
+block still contains the dependence the label has. The report and JSON record
+`method: "block"`, `block_len`, `blocks`, `observed`, the null distribution and
+`p_value`. `--null-block` without `--null-runs` runs 19 permutations. Use the
+i.i.d. null (`--null-runs` alone) only when rows are genuinely exchangeable;
+use the block null whenever time order or overlapping labels create dependence.
+The calibration test in `my-version/tests/nulls.rs` shows the difference on
+synthetic AR(1) data: i.i.d. shuffling over-rejects, block permutation does not.
+
 **Honest limitation:** it tests the *combination* of data and search power. A
 weak search can fail to beat the control on real data (it simply cannot find the
 law), so a high p-value is not proof of no signal — only that the search has not
@@ -479,7 +502,9 @@ Every solution carries:
 
 and, with `--null-runs n`, a top-level `null_control` object with the shuffled
 error distribution, its minimum and median, the permutation p-value and a plain
-verdict. With `--bootstrap-error n`, every Pareto row additionally carries a
+verdict. With `--null-block N` the same object adds `method: "block"`,
+`block_len`, `blocks` and the `observed` error, so a report says which null was
+used. With `--bootstrap-error n`, every Pareto row additionally carries a
 `bootstrap_error` object with the `apparent`, `oob`, `no_information`,
 `relative_overfitting`, `weight` and `estimate` values of §3.9, plus
 `source_rows`, `resample_rows` and `capped`, so a BLB-bounded resample is never

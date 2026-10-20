@@ -336,7 +336,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--gap-break f] [--fill method] [--outlier-iqr k] [--smooth k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
      [--filter expr] [--exclude expr] [--train-select expr] [--test-select expr]
-     [--null-runs N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
+     [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
      [--fit-iters N] [--no-fit] [--no-dedup] [--no-simd] [--predictor-samples N]
@@ -568,6 +568,11 @@ rcsr --data data.csv --target y --vars x1,x2 --null-runs 19
 # null baselines (absolute): mean train=0.88 test=0.91 | linear train=0.42 test=0.46 | 5-NN train=0.31 test=0.35
 # null control (19 shuffled-target runs): best=0.61 median=0.72 p=0.05 — the real fit beats the noise control
 ```
+
+For autocorrelated series or overlapping labels, add `--null-block N` (N at
+least the label horizon) to permute contiguous blocks instead of rows; the
+report names the method, block length and block count, and the i.i.d. shuffle is
+anti-conservative there. See [`docs/overfitting.md`](docs/overfitting.md).
 
 | check | question it answers |
 |---|---|
