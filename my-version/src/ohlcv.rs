@@ -807,15 +807,14 @@ pub fn join_column_causal(
         ));
     }
     let joined = join_causal(base, higher, higher_tf)?;
+    let index: BTreeMap<i64, f64> = higher
+        .iter()
+        .map(|b| b.time)
+        .zip(higher_values.iter().copied())
+        .collect();
     let mut out = Vec::with_capacity(base.len());
     for slot in joined {
-        out.push(slot.map(|b| {
-            higher
-                .iter()
-                .position(|x| x.time == b.time)
-                .map(|i| higher_values[i])
-                .unwrap_or(f64::NAN)
-        }));
+        out.push(slot.map(|b| index.get(&b.time).copied().unwrap_or(f64::NAN)));
     }
     Ok(out)
 }

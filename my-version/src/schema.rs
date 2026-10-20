@@ -196,6 +196,22 @@ pub fn json() -> String {
  {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
          \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
+         \"prep\":{{\"command\":\"rcsr prep\",\"summary\":\"raw OHLCV CSV/ZIP archives to a .rcsb store with no intermediate CSV\",\"options\":[\
+{{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV/TSV/ZIP file or a directory searched recursively\"}},\
+{{\"name\":\"--format\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | binance | bitstamp | ohlcv (aliased header)\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"derived\",\"description\":\"symbol override for a single-file input\"}},\
+{{\"name\":\"--tz\",\"type\":\"string\",\"default\":\"UTC\",\"description\":\"UTC, +HH:MM, America/New_York or Europe/London\"}},\
+{{\"name\":\"--calendar\",\"type\":\"enum\",\"default\":\"24x7\",\"description\":\"24x7 | nyse | lse\"}},\
+{{\"name\":\"--resample\",\"type\":\"enum\",\"default\":\"none\",\"description\":\"1m..1w, calendar-aware; OHLC exact, flows summed\"}},\
+{{\"name\":\"--mtf\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"higher timeframes joined as of their last closed bar\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"ta:core, ta:full, exotic:cheap, candle:geometry, cross:btc, calendar or names\"}},\
+{{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>\"}},\
+{{\"name\":\"--spec\",\"type\":\"path\",\"default\":\"none\",\"description\":\"key=value spec file; its SHA-256 is recorded in the manifest\"}},\
+{{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol],... with a verified boundary ratio\"}},\
+{{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"parallel symbol workers; output order stays deterministic\"}},\
+{{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"column-store group size\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
+{{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}}]}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),

@@ -139,6 +139,65 @@ sample selected by the pinned one-multiply hash while scanning groups. The
 sample is a sample: report it as such. (The full-data re-score of the Pareto
 front on a streamed store is follow-up work, not silently claimed here.)
 
+## `rcsr prep`: raw archives to a store, no intermediate CSV
+
+```sh
+rcsr prep --input raw_15m/ --format binance --resample 15m \
+  --features ta:core,exotic:cheap,candle:geometry \
+  --label fwd:1h,cost=10bp,volnorm=96 --mtf 1h,4h,1d \
+  --out crypto_15m.rcsb --jobs 8
+```
+
+`prep` is the raw-market-data front-end of #123. It reads:
+
+* Binance Vision headerless klines (12 columns, including `quote_volume`,
+  `trades`, taker-buy base/quote);
+* Bitstamp headerless klines (6/7 columns);
+* an aliased OHLCV header (`Date`/`Timestamp`/`time`, `Open`/`O`, `Vol`/`Volume`,
+  ...), case- and space-insensitive;
+* CSV, TSV or monthly ZIP archives (stored or deflate), with no intermediate
+  CSV written. A directory is searched recursively and grouped by symbol.
+
+Timestamps are normalised to UTC **seconds** with unit detection by magnitude:
+seconds `|t| < 1e11`, milliseconds `< 1e14`, microseconds `< 1e17`, otherwise
+nanoseconds. `--tz` accepts `UTC`, a fixed `+HH:MM` offset, or
+`America/New_York`/`Europe/London` resolved through the DST calendar. Duplicate
+instants are aggregated (`open` first, `high` max, `low` min, `close` last,
+flows summed), never silently dropped; non-monotonic input is sorted and
+counted.
+
+The transforms are the OHLCV layer's (`docs/ohlcv.md`): calendar-aware
+resampling with exact OHLC and summed flows, causal `--mtf` joins as of the last
+closed higher bar, the named feature groups, and a next-open forward label with
+symmetric cost. A window that spans a gap is `NaN`, never bridged. A panel of
+more than one symbol gets a `symbol` column; a single series keeps the canonical
+`ts,open,high,low,close,volume,quote_volume,trades,taker_buy_base,taker_buy_quote`
+layout, which is byte-identical to `rcsr import` on the same values (pinned by
+`tests/prep_pipeline.rs`).
+
+Symbol migrations are spliced before resampling:
+
+```sh
+rcsr prep ... --migrations 'TOMO->VIC:1.0169,MATIC->POL:1'
+```
+
+Each boundary is measured (`old_close / new_open`) and `|ln(ratio/k)|` must be
+inside the tolerance (default 0.005); a wrong `k` is a hard error, not a fake
+return. Prices are divided by `k`, base volume and taker-buy base multiplied by
+`k`, and the overlap is removed.
+
+`--spec <file>` reads `key=value` lines (`features`, `label`, `resample`, `mtf`,
+`calendar`, `tz`, `migrations`); its SHA-256 is recorded in the manifest and the
+same inputs plus the same spec reproduce the same store bytes. `--dry-run`
+prints the audit and manifest without writing. The manifest (`<out>.manifest.json`)
+records the format, calendar, timezone, timeframe, features, label, migration
+table, input paths/sizes/checksums, audit counters (duplicates, gaps,
+zero-volume rows, units converted, zero-variance features, NaNs) and the output
+checksum.
+
+`--jobs N` parallelises by symbol; symbols are merged in sorted order, so the
+output does not depend on scheduling.
+
 ## File format, versions 1 and 2
 
 All integers and floating-point values are little-endian. The layout is:
