@@ -1792,6 +1792,11 @@ fn run_postfix_search(
     let t0 = std::time::Instant::now();
 
     for gen in gens_done..cfg.generations {
+        // A checkpoint saved after an early stop stays stopped even when the
+        // generation budget is raised, exactly like the owned-tree loop.
+        if converged_early {
+            break;
+        }
         gens_done = gen + 1;
         let mut next = variation.next_generation(&pool, gen as u32, &restart_flags);
         next.evaluate(&mut gpu.ev, train.len())?;
