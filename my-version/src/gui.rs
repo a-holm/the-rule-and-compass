@@ -856,15 +856,30 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--out" | "--save" | "--save-every" | "--resume" | "--report"
             | "--report-out" | "--report-repeats" => {
                 return Err(format!(
-                    "{} is not available from the web front end; use the rcsr CLI for it",
-                    flag
+                    "{flag} is a CLI option but is not supported by the web front end; use the rcsr CLI for it"
                 ))
             }
-            other => return Err(format!("unknown argument '{}'", other)),
+            other => {
+                // #58: a documented CLI option must never be reported as
+                // "unknown" just because the browser UI has not wired it yet.
+                if crate::schema::has_option(other) {
+                    return Err(format!(
+                        "{other} is a CLI option but is not supported by the web front end; use the rcsr CLI for it"
+                    ));
+                }
+                return Err(format!("unknown argument '{}'", other));
+            }
         }
         i += 1;
     }
     Ok((raw, cfg))
+}
+
+/// Parse the arguments the browser sends. Public so the schema-contract test
+/// can prove every documented option is either accepted or explicitly
+/// rejected, instead of only comparing JSON documents.
+pub fn parse_web_args(args: &[String]) -> Result<(), String> {
+    parse_args(args).map(|_| ())
 }
 
 fn int(text: &str, flag: &str, min: usize) -> Result<usize, String> {

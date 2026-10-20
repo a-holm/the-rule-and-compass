@@ -976,10 +976,6 @@ fn main() {
         print!("{}", schema::json());
         std::process::exit(EXIT_OK);
     }
-    // #134: everything before the search is `prep`, including argument parsing,
-    // loading and data preparation.
-    let run_start = std::time::Instant::now();
-
     let mut cfg = search::Config::default();
     // #141: whether the user asserted a backend explicitly. `None` means the
     // run follows the build/device default; `Some(true)` is `--gpu` and
