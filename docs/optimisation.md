@@ -589,7 +589,84 @@ approximation. The pre-registered acceptance rules are:
 Because the linear arm reaches the optimum in one solve instead of iterating,
 it **can** change the search trajectory (usually by fitting a linear candidate
 better than an 8-iteration LM run). It is therefore opt-in, and it is saved in
-checkpoints as search state; `auto` currently has exactly these two arms.
+checkpoints as search state.
+
+#### Variable projection for separable models (#116)
+
+`a*sin(b*x) + c` is not affine in all three constants, but it is affine in
+`{a, c}` for every fixed `b`. `--fit-strategy varpro` (and `auto`) finds that
+split structurally with the same affine classifier restricted to a candidate
+constant set, then runs Golub–Pereyra variable projection:
+
+* the inner problem is one column-scaled, column-pivoted QR solve for the
+  linear block `beta` at fixed nonlinear `theta`;
+* the outer problem optimises only `theta` on the **projected** residual: each
+  `J_theta` column is orthogonalised against the span of `J_beta` (modified
+  Gram–Schmidt with reorthogonalisation), so the outer step cannot undo the
+  inner solve;
+* damping is Levenberg-style (accepted steps shrink `lambda`, rejected steps
+  grow it), and the arm writes constants only when the result is finite and no
+  worse than the starting point.
+
+For `a*sin(b*x) + c` that turns a 3-parameter LM problem into a 1-parameter
+outer search plus an exact 2-parameter linear solve. `a*(b + x)` is admitted
+with one factor linear and the other nonlinear; a product of two selected
+constants is refused because it is bilinear. Rank deficiency, a non-finite row,
+a failed inner solve or a non-improving result returns `None` and the tree goes
+to exact LM untouched.
+
+#### Out-of-core / row-sharded fitting (#116)
+
+`--fit-strategy stream` keeps only the sufficient statistics of the weighted
+problem — `S = Σ wᵢ gᵢgᵢᵀ`, `b = Σ wᵢ gᵢrᵢ` and `sse = Σ wᵢrᵢ²` — and builds
+them in fixed 8,192-row blocks. Blocks merge by addition, so resident state is
+`O(p²)` (231 doubles at `p = 20`), independent of `N`; the Jacobian is never
+materialised. Sums use Neumaier compensation and a fixed block/merge order, so
+the merger is numerically stable and deterministic. The public `RowSource`
+trait feeds the same code from a resident slice, a disk-backed `.rcsb` reader,
+a memory map or a generated stream; `fit_stream_with` never asks for more than
+one row at a time. `--fit-strategy auto` does not select `stream` yet: the
+dispatcher stays deterministic and does not guess that data is out of core.
+Use `--fit-strategy stream` explicitly.
+
+#### Batched GPU fitting (#169)
+
+The CUDA LM kernel is #169, not this change. #116 supplies the integration
+point and the exactness gate in `src/fit/gpu.rs`:
+
+* a `BatchedFitter` returns constants per candidate, or `None` for an
+  unsupported/ill-conditioned/non-finite candidate;
+* every proposal is applied to a clone and scored in exact `f64` on the same
+  rows, and accepted only if it is finite and no worse than the starting
+  constants;
+* every rejection is refit by the exact CPU arm on the untouched tree;
+* `refit_finalists_exact` reruns the historical LM before reporting.
+
+`--fit-strategy gpu` without a batch backend (a direct call, a checkpoint
+resume, a non-CUDA build) uses the exact CPU arms and records the fallback; it
+is never a silent no-op. `--fit-report` prints GPU accepted/fallback/refit
+counts and whether a CUDA build is present.
+
+#### Exactness and fallbacks
+
+| rule | tolerance / behaviour |
+|---|---|
+| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
+| linear objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
+| linear constants versus exact LM | relative difference `<= 1e-8` on affine tests |
+| VarPro objective versus exact LM | projected SSE `<=` LM SSE × `(1 + 1e-9)` on separable tests |
+| rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
+| size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
+| non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
+| streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
+| GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
+
+`auto` is deterministic: it chooses by tree structure and size only, never by
+wall-clock timing, so a seed cannot change path between runs. For separable
+trees `auto` also runs the exact LM reference from the same starting tree and
+keeps the lower objective, so the adaptive path is never worse than the
+reference; the explicit `varpro` arm skips that verification. The default
+`exact` remains the reference arm and is byte-identical to the pre-#116 path.
 
 `--fit-report` prints the arm counts for the run. On the daily panel
 (`panel_daily_100.csv`, 154,675 rows, target `y1`, inputs `r1,r3,r7,ma7`,
@@ -610,9 +687,50 @@ and test error (`0.30848993 / 0.31136481` versus the `exact` front's best
 `0.30861096 / 0.31146704` at a larger complexity), because the linear arm
 solved candidates that LM's eight iterations left short of the optimum.
 
-**Not yet implemented** (tracked on #116): VarPro for separable nonlinear
-models, batched GPU LM and the adaptive cost-model dispatcher. This PR lands
-only the exact CPU linear arm plus its classifier, fallback and reporting.
+Synthetic fit-only cells (`cargo test --release --test fit_portfolio_bench --
+--ignored`, median of three, `--fit-iters 8`, one shared host) show where each
+new arm pays:
+
+| cell | exact LM | portfolio arm | ratio |
+|---|---:|---:|---:|
+| affine `N=1e3, p=8` | 33.8 ms | 3.4 ms (auto/QR) | **10.1×** |
+| affine `N=1e4, p=4` | 103.4 ms | 12.7 ms (auto/QR) | **8.2×** |
+| affine `N=1e5, p=8` | 1.75 s | 0.32 s (auto/QR) | **5.4×** |
+| affine `N=1e5, p=16` | 1.99 s | 1.42 s (auto/QR) | **1.4×** |
+| separable `N=1e3, p=3` | 7.8 ms | 4.2 ms (VarPro) | **1.9×** |
+| separable `N=1e4, p=3` | 14.1 ms | 41.2 ms (VarPro) | 0.3× |
+| separable `N=1e5, p=3` | 171 ms | 478 ms (VarPro) | 0.4× |
+| streamed `N=1e6` generated rows | 3.99 s | 2.56 s (stream) | **1.56×** |
+
+All VarPro cells reached `sse = 0` at 8 iterations. On a three-constant problem
+the inner beta solve and its line-search trials cost more sweeps than LM's
+three parameters, so VarPro is a correctness/conditioning arm there rather than
+a speed win; it is the structural choice that matters for larger nonlinear
+blocks. The stream arm is 0.83× the resident fit at 1e5 rows (setup dominates)
+and 1.56× faster at 1e6 while keeping only `O(p²)` state. The 1e8-row and
+100-input cells in the issue's matrix were not run on this shared host; the
+implementation does not depend on `N`, but the measurement claim stops here.
+
+#### `--fit-rows`: fit on a subsample, score and archive on all rows
+
+`--fit-rows N` draws a fresh deterministic `N`-row subset each generation and
+fits constants there, while every candidate is scored on the generation's full
+sample. The archive is refit on every training row before it is reported, so a
+reported constant or error is never the subsample estimate. `N >= train rows`
+(and `N = 0`) is an exact no-op, and `--fit-rows` takes precedence over
+`--fit-samples` when both are set. It is a screening lever like
+`--fit-samples`, not an optimisation: the summary says how many rows were used
+and that the archive was refit. On `examples/sine.csv` (`--metric squared
+--generations 8 --pop 200 --fit-iters 8 --seed 3`, three runs) `--fit-rows 10`
+took 0.04–0.05 s user CPU against 0.10 s for the full 45-row fit; the reported
+archive was the same shape class and was refit on all rows. The subsample fit
+can change the *ranking* during the generation, so the final constants are the
+full-row refit, not the screen's numbers.
+
+The issue's cost model goes beyond this deterministic structural dispatch:
+timing-calibrated path selection and automatic subsampling were not adopted,
+because a wall-clock-dependent choice would make a seed non-reproducible. The
+measured cells below justify keeping the dispatcher structural.
 
 #### Subsampled scoring: `--predictor-samples`
 

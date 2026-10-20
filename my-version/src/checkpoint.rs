@@ -1042,6 +1042,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_samples",
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
+        "fit_rows",      // #116: missing means 0 (off)
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
     ];
@@ -1176,6 +1177,20 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         }
     };
 
+    // #116: fit-only row screening; missing means off.
+    let fit_rows = match fields.get("fit_rows").map(|s| s.as_str()) {
+        None => 0,
+        Some(raw) => {
+            let n: usize = raw
+                .parse()
+                .map_err(|_| format!("bad config value for 'fit_rows': '{}'", raw))?;
+            if n == 1 {
+                return Err("config 'fit_rows' must be 0 (off) or at least 2, got 1".to_string());
+            }
+            n
+        }
+    };
+
     // #25: optional fields. Missing means "no units, no filter", which is
     // bit-identical to a checkpoint written before this feature existed.
     if fields.contains_key("units.target") && !fields.contains_key("units") {
@@ -1225,7 +1240,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         None => crate::fit::FitStrategy::Exact,
         Some(raw) => crate::fit::FitStrategy::parse(raw).ok_or_else(|| {
             format!(
-                "config 'fit_strategy' must be exact, auto or linear, got '{}'",
+                "config 'fit_strategy' must be exact, auto, linear, varpro, stream or gpu, got '{}'",
                 raw
             )
         })?,
@@ -1274,6 +1289,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         patience: num_usize("patience")?,
         predictor_samples,
         fit_samples, // #85
+        fit_rows,     // #116
         front_parents, // #76
         units,
         require_dimensions,
@@ -1326,6 +1342,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
+    writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,
