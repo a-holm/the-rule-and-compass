@@ -88,6 +88,23 @@ selects rather than branches. Anything non-finite, or larger than a shared
 magnitude limit of 1e30, counts as a hard failure on **both** sides — so the
 GPU and CPU agree on which candidates are hopeless.
 
+**Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
+`sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
+are compiled to native opcodes instead of falling back to the serial CPU
+evaluator. `floor`/`ceil` are one `FRND`; `round` is `roundf` (ties away from
+zero, matching Rust — not `cvt.rni`, which is ties-to-even); `min`/`max` guard
+NaN explicitly so either NaN operand yields NaN like `expr.rs`; `if` evaluates
+both arms but a true select discards the unselected one; `mod` uses the host's
+floored `a - b*floor(a/b)` with the `|b|<1e-12` and finite-quotient guards;
+`atan2`, `erf` and `erfc` call libdevice (2/2/4 ulp documented; `erf(-0)` is
+normalised to `+0` to match the host). The static kernel grew from 1000 to 1312
+SASS (+31%), registers from 26 to 27, and the 288-byte stack frame is unchanged
+on `sm_86`. A CUDA-guided run reports the opcode and fallback counts for each
+generation under `gpu.generations` in `--json`; a CPU run's JSON is unchanged.
+Operators without an opcode (`asinh`, `acosh`, `atanh`, constraints, aggregates)
+still take the CPU fallback, and the final f64 CPU rescore remains the
+exactness guarantee for reported results.
+
 **FP32 throughout.** On the RTX 3060 (Ampere) and on the GB10 in the DGX Spark,
 FP64 runs at **1/64 of FP32**, so an FP64 kernel would throw away the whole
 advantage. FP64 is reserved for re-checking the final surviving equations on the

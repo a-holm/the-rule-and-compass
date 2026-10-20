@@ -3108,6 +3108,32 @@ fn main() {
                 String::new()
             };
             let search_meta_json = format!("{}{}", predictor_json, fit_json);
+            // #131: only a GPU-guided run emits this key, so CPU output stays
+            // byte-identical. Each entry is one generation's scoring batch(es).
+            let gpu_json = match &outcome.gpu {
+                Some(g) => {
+                    let gens: Vec<String> = g
+                        .generations
+                        .iter()
+                        .map(|s| {
+                            let ops: Vec<String> = s
+                                .opcodes
+                                .iter()
+                                .map(|(name, n)| format!("{}:{}", jstr(name), n))
+                                .collect();
+                            format!(
+                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                                s.generation,
+                                s.programs,
+                                s.fallbacks,
+                                ops.join(",")
+                            )
+                        })
+                        .collect();
+                    format!("\"gpu\":{{\"generations\":[{}]}},", gens.join(","))
+                }
+                None => String::new(),
+            };
             let checkpoint_json = format!(
                 "{{\"resumed_from\":{},\"saved_to\":{},\"generation\":{}}}",
                 resume_path
@@ -3121,8 +3147,9 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
+                gpu_json,         // #131
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
