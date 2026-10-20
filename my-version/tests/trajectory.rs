@@ -45,6 +45,10 @@ fn documented_baseline_front_is_pinned() {
             // #76: this pin is the pre-front-feedback trajectory, so the
             // feature is explicitly off here.
             "--no-front-parents",
+            // #141: the pin is a CPU f64 trajectory. A CUDA build now prefers
+            // the GPU, whose f32 fitness is not bit-identical, so the
+            // reproducibility escape hatch is explicit here.
+            "--cpu",
             "--out",
             out.to_str().expect("utf-8 path"),
             "--quiet",

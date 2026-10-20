@@ -3,6 +3,7 @@
 //! See ../SPEC.md for the behaviour spec and ../docs/ for an overview.
 
 pub mod atomic;
+pub mod backend;
 pub mod bench;
 pub mod checkpoint;
 pub mod column;

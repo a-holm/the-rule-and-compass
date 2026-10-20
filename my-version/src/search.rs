@@ -136,10 +136,12 @@ impl Default for Config {
             require_dimensions: false,
             progress: None,
             simd: true, // #27
-            // #26: the library defaults to the CPU so every existing caller and
-            // test keeps its trajectory; the `rcsr` CLI opts in automatically.
-            // `--no-gpu` turns it off again.
-            gpu: false,
+            // #141: the GPU is the default backend when the binary is built
+            // with CUDA and a device is available. The probe happens once at
+            // startup; a non-CUDA build, a missing device or an unsupported
+            // objective falls back to the CPU. `--no-gpu`/`--cpu` is the
+            // deliberate override and `--gpu` asserts that a device exists.
+            gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
         }
     }
@@ -455,6 +457,7 @@ fn score_generation(
     islands: &mut [Vec<Ind>],
     train: &Sample,
     cfg: &Config,
+    backend_reason: &mut Option<String>,
 ) -> bool {
     let Some(g) = gpu.as_mut() else {
         return false;
@@ -468,6 +471,9 @@ fn score_generation(
             if cfg.gpu_notes {
                 eprintln!("# gpu: unavailable ({})", e);
             }
+            // #141: the backend report must record the runtime fallback, not
+            // just the startup choice.
+            *backend_reason = Some(e);
             *gpu = None;
             // #27: re-scoring the pending batch goes through the SoA view.
             let train_view = EvalSample::new(train, cfg);
@@ -1180,6 +1186,15 @@ pub struct Outcome {
     /// when the full training sample was used (off, exact no-op, or a request
     /// widened above the break-even).
     pub predictor_samples: usize,
+    /// #141: the backend that actually guided the generations, recorded from
+    /// what ran rather than inferred from the flags. Reported errors are
+    /// always rebuilt on the CPU in `f64` regardless of this value.
+    pub backend: crate::backend::Kind,
+    /// #141: why the CPU ran instead of the GPU (missing feature, no device,
+    /// unsupported objective or a CUDA error).
+    pub backend_reason: Option<String>,
+    /// #141: the device that guided the search, when `backend` is `gpu`.
+    pub device: Option<String>,
 }
 
 /// Run a search once, from a fresh start.
@@ -1384,10 +1399,16 @@ fn run_search(
     // definitions; the list is empty unless --function was supplied.
     let blocks = expr::current_blocks();
 
-    // #26: one resident evaluator for the full training sample, used for whole
-    // generations. Constants were already fitted on the CPU; this only chooses
-    // where the tree evaluation runs. A missing feature, a missing device or an
-    // unsupported objective leaves `defer_gpu` false and the CPU path runs.
+    // #26/#141: one resident evaluator for the full training sample, used for
+    // whole generations. Constants were already fitted on the CPU; this only
+    // chooses where the tree evaluation runs. The backend report below records
+    // what actually ran: a missing feature, a missing device, an unsupported
+    // objective or a runtime CUDA error leaves the CPU path and a reason.
+    #[cfg(feature = "cuda")]
+    let mut backend_device: Option<String> = None;
+    #[cfg(not(feature = "cuda"))]
+    let backend_device: Option<String> = None;
+    let mut backend_reason: Option<String> = None;
     #[cfg(feature = "cuda")]
     let mut gpu: Option<GpuSearch> = if !cfg.gpu {
         None
@@ -1397,30 +1418,39 @@ fn run_search(
                 if cfg.gpu_notes {
                     eprintln!("# gpu: off ({})", reason);
                 }
+                backend_reason = Some(reason.to_string());
                 None
             }
             None => match GpuSearch::new(train) {
                 Ok(g) => {
+                    let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
                         eprintln!(
                             "# gpu: {} (one batch per generation; f32 fitness, reported numbers stay f64)",
-                            crate::gpu::GpuEvaluator::device_name()
+                            device
                         );
                     }
+                    backend_device = Some(device);
                     Some(g)
                 }
                 Err(e) => {
                     if cfg.gpu_notes {
                         eprintln!("# gpu: unavailable ({})", e);
                     }
+                    backend_reason = Some(e);
                     None
                 }
             },
         }
     };
     #[cfg(not(feature = "cuda"))]
-    if cfg.gpu && cfg.gpu_notes {
-        eprintln!("# gpu: unavailable (built without --features cuda)");
+    {
+        if cfg.gpu {
+            backend_reason = Some("built without --features cuda".to_string());
+            if cfg.gpu_notes {
+                eprintln!("# gpu: unavailable (built without --features cuda)");
+            }
+        }
     }
     #[cfg(feature = "cuda")]
     let mut defer_gpu = gpu.is_some();
@@ -1623,7 +1653,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg);
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason);
     }
 
     // #18: one tracker, updated once per generation from the archive. It holds
@@ -1727,7 +1757,7 @@ fn run_search(
             {
                 if !screened {
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason);
                 }
             }
 
@@ -1902,7 +1932,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -2029,6 +2059,16 @@ fn run_search(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
+        // #141: the backend that actually guided the search. `gpu_used` is set
+        // only when a CUDA batch completed, so a failed probe, an unsupported
+        // objective or a first-batch error reports `cpu`.
+        backend: if gpu_used {
+            crate::backend::Kind::Gpu
+        } else {
+            crate::backend::Kind::Cpu
+        },
+        backend_reason,
+        device: if gpu_used { backend_device } else { None },
     })
 }
 
@@ -2047,6 +2087,28 @@ mod tests {
             y.push(a);
         }
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    /// #141: the library default follows the build: a CUDA binary prefers the
+    /// GPU, every other build is CPU. Selection still depends on the probe.
+    #[test]
+    fn gpu_default_follows_the_cuda_feature() {
+        assert_eq!(Config::default().gpu, cfg!(feature = "cuda"));
+    }
+
+    /// #141: a CPU outcome reports the reason and never a stale device. The
+    /// CPU is forced here so this test is deterministic on a GPU machine.
+    #[test]
+    fn cpu_outcome_reports_backend_and_reason() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.gpu = false;
+        cfg.generations = 2;
+        cfg.pop = 12;
+        cfg.patience = 0;
+        let out = run(&cfg, &s, &s);
+        assert_eq!(out.backend, crate::backend::Kind::Cpu);
+        assert!(out.device.is_none());
     }
 
     // #76: two distinguishable front members.

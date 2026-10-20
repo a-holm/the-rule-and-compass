@@ -81,8 +81,8 @@ pub fn json() -> String {
         ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
-        ("--gpu", "flag", "false", "let the GPU guide the search when built with --features cuda (opt-in; reported errors stay CPU f64 but f32 fitness can change the trajectory)"),
-        ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); this is the default"),
+        ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical"),
+        ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations; the write is atomic and the previous generation is kept as <file>.prev"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),
@@ -118,6 +118,7 @@ pub fn json() -> String {
          \"operators\":[{}],\n  \
          \"complexity\":{{\"formula\":\"sum(op_cost) + var_weight*n_vars + const_weight*n_consts + depth_weight*max_depth\",\"defaults\":{{\"op_cost\":1,\"var_weight\":1,\"const_weight\":1,\"depth_weight\":0}},\"operator_nodes_only\":true,\"depth\":\"edges from the root; a single node has depth 0\"}},\n  \
          \"convergence\":{{\"window\":20,\"confidence\":\"exp(-max(0,(e[g-w]-e[g])/(1+|e[g-w]|))/1e-3)\",\"stability\":\"mean Jaccard overlap of the front's structural forms over the last w comparisons\",\"maturity\":\"(g - first_generation_of_oldest_surviving_form) / max(g,1)\",\"percent_converged\":\"0.5*confidence + 0.3*stability + 0.2*maturity\",\"converged_threshold\":0.75,\"doc\":\"docs/convergence.md\"}},\n  \
+         \"backend\":{{\"default\":\"gpu when built with --features cuda and a usable device is probed at startup; cpu otherwise\",\"device_probe\":\"once at startup\",\"override\":\"--no-gpu/--cpu forces cpu; --gpu asserts a device and exits 2 when unavailable\",\"reporting\":\"backend, backend_reason and device are recorded from the probe/outcome, never inferred from flags\",\"exactness\":\"cross-backend runs are not bit-identical; reported metrics and constants are rebuilt from exact CPU f64 and --cpu is the reproducible escape hatch\",\"doc\":\"docs/gpu-backend.md\"}},,\n  \
          \"walkforward\":{{\"command\":\"rcsr walkforward\",\"summary\":\"walk-forward evaluation/backtest of one expression over a .rcsb column store or CSV\",\"doc\":\"docs/walkforward.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\

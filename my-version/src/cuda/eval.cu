@@ -323,4 +323,14 @@ const char *rc_device_name(void)
     return name;
 }
 
+/* Number of CUDA devices, or a negative value when the runtime/driver query
+   itself fails. Used by the one-time startup probe (issue #141); it allocates
+   nothing, so it can run before the dataset is uploaded. */
+int rc_device_count(void)
+{
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) return -1;
+    return n;
+}
+
 } /* extern "C" */

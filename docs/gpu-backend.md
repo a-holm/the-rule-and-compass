@@ -6,8 +6,11 @@ This document describes the backend in `src/cuda/eval.cu` + `src/gpu.rs`, how to
 build and run it, what it measured on the available hardware, and how the same
 design maps onto an NVIDIA DGX Spark.
 
-The backend is **opt-in**. The default build remains pure `std` with no
-dependencies and no CUDA requirement.
+The backend is **preferred automatically**: a binary built with
+`--features cuda` probes the device once at startup and uses the GPU when one is
+available; a build without the feature, or a machine with no usable device,
+falls back to the CPU with a recorded reason. The default build remains pure
+`std` with no dependencies and no CUDA requirement.
 
 ## Backend identity and resumes
 
@@ -35,8 +38,12 @@ RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
     --batch 8000 --depth 5 --seed 5
 
 # opt in to GPU-guided search when a device is present (--gpu is required)
+# no flag: a CUDA build with a device uses the GPU automatically
 ./target/release/rcsr --data examples/sine.csv --target y --vars x \
     --generations 200 --pop 200 --islands 4 --seed 7 --metric squared --gpu
+
+# assert that the GPU must exist (exit 2 when it does not)
+./target/release/rcsr ... --gpu
 
 # force the CPU evaluator (alias: --cpu), or simulate a missing device
 ./target/release/rcsr ... --gpu --cpu
@@ -197,11 +204,12 @@ measured here**.
 
 ## Inside the search loop (issue #26)
 
-When the crate is built with `--features cuda` and a device opens, `run_search`
-creates one resident `GpuSearch` context for the full training sample. The
-`rcsr` CLI and the web front end require `--gpu`; library callers set
-`Config::gpu = true`, whose default stays `false` so an embedded search keeps
-the CPU trajectory unless it asks for the GPU. Each generation then runs as:
+When the crate is built with `--features cuda`, `run_search` probes for a
+device once at startup. If a device answers, it creates one resident
+`GpuSearch` context for the full training sample. Library callers get `gpu = true`
+by default in a CUDA build (`Config::default()` follows `cfg!(feature = "cuda")`),
+and `false` otherwise; the CLI resolves the same preference through the probe.
+Each generation then runs as:
 
 1. the island threads generate, mutate, de-duplicate and simplify candidates,
    and fit their constants with the existing **CPU** Levenberg–Marquardt code;
@@ -225,19 +233,51 @@ implicit metrics, classification metrics, AIC/AICc/BIC and
 prediction per row or a different set of rows every generation; the reason is
 printed in the one-line note.
 
-Fallback and the flag:
+Fallback and the flags:
 
-* `--no-gpu` (alias `--cpu`) forces the CPU and prints
-  `# gpu: off (--no-gpu)`.
-* A build without the feature prints
-  `# gpu: unavailable (built without --features cuda)`.
-* A CUDA build with no usable device prints
-  `# gpu: unavailable (no usable CUDA device (...))`.
+* With neither flag, a CUDA build with a usable device selects the GPU. A build
+  without the feature prints
+  `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
+  build with no usable device prints the same line with the probe's reason.
+* `--gpu` is an **assertion**: it exits 2 with a clear error when the build or
+  the device cannot provide a GPU. It no longer silently falls back.
+* `--no-gpu` (alias `--cpu`) forces the CPU. This is the reproducibility escape
+  hatch: it is silent and yields the byte-identical CPU trajectory.
 * `RCSR_GPU=0` makes a CUDA build behave as if no device were present, which is
   how the fallback test runs on a machine that has one.
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
   note, re-scores the pending generation on the CPU and disables the GPU for the
   rest of the run. There is no panic and no stale result.
+
+### Reported backend and the startup summary
+
+The probe runs once, before the dataset is uploaded, and the effective backend
+is recorded from what ran rather than inferred from the flags. Non-quiet runs
+print one line:
+
+```
+# resource: backend=gpu device="NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 12288 MB)" threads=8 rows=2048 cols=3
+# resource: backend=cpu device=- threads=8 rows=2048 cols=3 (no CUDA device found)
+```
+
+`rows`/`cols` are the training table. `threads` is the machine's available
+parallelism; the current search loop uses one thread per island, and a
+`--threads` control and the #132 baseline cap are separate workstreams.
+
+`--json` carries `"backend": "gpu"|"cpu"`, `"device": <name>|null` and
+`"backend_reason": <why the CPU ran>|null`; NDJSON emits one
+`{"event":"backend",...}` object before the results. The run manifest from
+#140 will carry the same fields when it lands; until then JSON is the record.
+
+### Exactness
+
+Cross-backend runs are **not bit-identical by construction**. The GPU scores a
+generation in `f32` and that fitness can change selection, so a CUDA default run
+may reach a different (often algebraically equivalent) form than `--cpu`. Every
+number a user reads — train/test error, constants, diagnostics and the Pareto
+front — is still rebuilt from the surviving trees on the full training sample
+with the exact CPU `f64` path. Use `--cpu` when a byte-identical reproduction
+across machines or binary builds is required.
 
 The failure marker is part of the C API: `rc_eval` returns a negative time when
 `cudaGetLastError` reports a launch or execution failure, and `eval_batch`
