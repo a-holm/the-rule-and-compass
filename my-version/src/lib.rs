@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod multi;
 pub mod pareto;
 pub mod parse;
+pub mod pipeline; // #119: bounded producer/scorer overlap
 pub mod progress_stats;
 pub mod resample; // #92: index-based resampling with a BLB cap
 pub mod rng;

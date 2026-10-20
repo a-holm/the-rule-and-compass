@@ -337,6 +337,13 @@ SEARCH:
                              trajectory, so this is opt-in
   --no-gpu                   force CPU evaluation (alias --cpu); this is the
                              default, so the flag is only for explicitness
+  --pipeline-depth <N>       #119: overlap CPU generation with GPU scoring
+                             using a bounded pending queue of N batches
+                             (default 2; 0 restores the synchronous path).
+                             One batch is pop/N candidates, so live memory is
+                             at most (N+1) batches. Results, candidate order
+                             and the archive are identical to the synchronous
+                             path; only with --gpu does it have any effect
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -896,6 +903,20 @@ fn main() {
             // performance choice, not saved search state.
             "--gpu" => cfg.gpu = true,
             "--no-gpu" | "--cpu" => cfg.gpu = false,
+            // #119: bounded CPU/GPU overlap depth in batches (0 = off).
+            "--pipeline-depth" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n <= 64 => cfg.pipeline_depth = n,
+                    _ => {
+                        eprintln!(
+                            "error: --pipeline-depth needs an integer from 0 to 64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {

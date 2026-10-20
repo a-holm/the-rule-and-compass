@@ -77,6 +77,7 @@ pub fn json() -> String {
         ("--time-budget", "float", "none", "wall-clock seconds"),
         ("--gpu", "flag", "false", "let the GPU guide the search when built with --features cuda (opt-in; reported errors stay CPU f64 but f32 fitness can change the trajectory)"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); this is the default"),
+        ("--pipeline-depth", "int", "2", "bounded CPU/GPU overlap depth in batches (0 = synchronous; only with --gpu). Results and archive are identical to the synchronous path"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data must match"),
