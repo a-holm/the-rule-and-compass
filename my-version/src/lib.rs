@@ -18,6 +18,7 @@ pub mod implicit;
 pub mod metrics;
 pub mod multi;
 pub mod pareto;
+pub mod ohlcv;
 pub mod parse;
 pub mod progress_stats;
 pub mod resample; // #92: index-based resampling with a BLB cap
