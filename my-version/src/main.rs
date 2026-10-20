@@ -279,8 +279,9 @@ MULTI-OUTPUT (--target y1,y2):
   ranks on that mean and the shape's complexity. Text prints one line per
   target; --json carries a targets array with each expression, constants and
   error plus the combined error. k_constants is the total across outputs.
-  Not available with --ndjson, --cv, --null-runs, --bootstrap-error,
-  --stability, --report, --save/--resume, or seed expressions.
+  --ndjson emits one closing done event with the timing ledger. Not available
+  with --cv, --null-runs, --bootstrap-error, --stability, --report,
+  --save/--resume, or seed expressions.
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
@@ -1759,7 +1760,6 @@ fn main() {
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
-            (format == Format::Ndjson, "--ndjson"),
         ];
         for (present, flag) in unsupported {
             if present {
@@ -2770,6 +2770,7 @@ fn main() {
             top,
             out_path,
             json_out.clone(),
+            run_start,
             start,
         );
         std::process::exit(EXIT_OK);
@@ -4281,10 +4282,13 @@ fn run_multi_output(
     top: usize,
     out_path: Option<String>,
     json_out: Option<String>,
+    run_start: std::time::Instant,
     start: std::time::Instant,
 ) {
     let outcome = search::run(cfg, &prepared.train, &prepared.test);
-    let elapsed = start.elapsed().as_secs_f64();
+    let search_seconds = start.elapsed().as_secs_f64();
+    let elapsed = search_seconds;
+    let report_start = std::time::Instant::now();
     let sorted = outcome.archive.sorted();
     let fold_samples: Vec<data::Sample> = if prepared.fold_samples.is_empty() {
         vec![prepared.test.clone()]
@@ -4356,6 +4360,20 @@ fn run_multi_output(
         rows.truncate(top);
     }
 
+    // #134: the multi-output path gets the same non-overlapping ledger as a
+    // single-target run. It does not run the single-target baseline or
+    // diagnostics phases, so those two windows are explicitly zero rather than
+    // silently excluded. `total` is measured independently at the end of the
+    // report phase, exactly like the single-output path.
+    let timing = PhaseTimings {
+        prep: (start - run_start).as_secs_f64(),
+        search: search_seconds,
+        baselines: 0.0,
+        diagnostics: 0.0,
+        report: report_start.elapsed().as_secs_f64(),
+        total: run_start.elapsed().as_secs_f64(),
+    };
+
     match format {
         Format::Text => {
             if !quiet {
@@ -4372,6 +4390,7 @@ fn run_multi_output(
                     target_names.join(",")
                 );
                 qd_text(outcome.qd.as_ref());
+                eprintln!("# time: {}", timing.text());
                 eprintln!(
                     "# multi-output: one shared shape, one fitted constant vector per output; \
                      train_err/test_err are the mean over {} target(s)",
@@ -4471,7 +4490,7 @@ fn run_multi_output(
                 jnum(best_fit_loss)
             );
             let result_json = format!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -4484,6 +4503,7 @@ fn run_multi_output(
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                timing.json(),
                 // #141: the effective backend, never inferred from flags.
                 outcome.backend.name(),
                 outcome
@@ -4509,10 +4529,28 @@ fn run_multi_output(
             }
         }
         Format::Ndjson => {
-            // Refused earlier; kept exhaustive so a future change cannot
-            // silently emit a misleading stream.
-            eprintln!("error: --ndjson is not supported with multiple targets");
-            std::process::exit(EXIT_USAGE);
+            // #134: the closing event carries the same timing ledger as the
+            // single-output stream and the multi-output JSON object.
+            println!(
+                "{{\"event\":\"done\",\"multi_output\":true,\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{},\"targets\":[{}],\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                outcome.generations,
+                outcome.converged_early,
+                jnum(elapsed),
+                timing.json(),
+                outcome.archive.items.len(),
+                target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
+                outcome.backend.name(),
+                outcome
+                    .backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
         }
     }
 

@@ -213,6 +213,127 @@ fn json_has_one_entry_per_target_and_a_combined_error() {
     assert!(pareto.contains("\"k_constants\":"), "{pareto}");
 }
 
+/// #134: the multi-output ledger has the same six fields as a single-target
+/// run, its phases cover the independently measured wall within 1%, and
+/// `elapsed_seconds` still means the search phase alone.
+#[test]
+fn timing_phases_sum_to_wall_in_text_json_and_ndjson() {
+    let csv = write_shared_csv();
+    let base = [
+        "--data",
+        csv.0.to_str().unwrap(),
+        "--target",
+        "y1,y2",
+        "--vars",
+        "x1,x2",
+        "--generations",
+        "3",
+        "--pop",
+        "24",
+        "--seed",
+        "1",
+    ];
+
+    let text = rcsr(&base);
+    assert!(
+        text.status.success(),
+        "text run failed: {}",
+        String::from_utf8_lossy(&text.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&text.stderr);
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("# time:"))
+        .unwrap_or_else(|| panic!("missing '# time:' line in: {stderr}"));
+    let mut fields = std::collections::HashMap::new();
+    for part in line
+        .trim_start_matches("# time:")
+        .split_whitespace()
+    {
+        if let Some((k, v)) = part.split_once('=') {
+            fields.insert(
+                k.to_string(),
+                v.trim_end_matches('s').parse::<f64>().expect("seconds"),
+            );
+        }
+    }
+    for key in [
+        "prep",
+        "search",
+        "baselines",
+        "diagnostics",
+        "report",
+        "total",
+    ] {
+        assert!(fields.contains_key(key), "text timing is missing {key}: {line}");
+    }
+    // The text line rounds to hundredths, so it cannot carry a 1% arithmetic
+    // check on a sub-second fixture; the JSON numbers below do that.
+    assert!(
+        fields["total"] > 0.0,
+        "text total wall must be positive: {line}"
+    );
+    assert!(
+        fields["prep"] + fields["search"] <= fields["total"] + 0.01,
+        "text phases must not exceed the wall: {line}"
+    );
+
+    let mut json_args = base.to_vec();
+    json_args.push("--json");
+    let json = rcsr(&json_args);
+    assert!(
+        json.status.success(),
+        "json run failed: {}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let body = String::from_utf8(json.stdout).unwrap();
+    assert!(body.contains("\"timing\":{"), "JSON is missing timing: {body}");
+    let num_after = |key: &str| -> f64 {
+        let needle = format!("\"{key}\":");
+        let start = body.find(&needle).unwrap_or_else(|| panic!("missing {key}")) + needle.len();
+        let rest = &body[start..];
+        let end = rest
+            .find(|c: char| c == ',' || c == '}')
+            .expect("number terminator");
+        rest[..end].parse::<f64>().expect("timing number")
+    };
+    let phases = [
+        "prep_seconds",
+        "search_seconds",
+        "baselines_seconds",
+        "diagnostics_seconds",
+        "report_seconds",
+    ];
+    let json_sum: f64 = phases.iter().map(|k| num_after(k)).sum();
+    let json_total = num_after("total_seconds");
+    assert!(json_total > 0.0, "JSON total wall must be positive: {body}");
+    assert!(
+        (json_sum - json_total).abs() <= 0.01 * json_total,
+        "JSON phases must sum to wall within 1%: {json_sum} vs {json_total}"
+    );
+    assert_eq!(
+        num_after("elapsed_seconds"),
+        num_after("search_seconds"),
+        "elapsed_seconds must stay the search phase"
+    );
+
+    let mut nd_args = base.to_vec();
+    nd_args.push("--ndjson");
+    let nd = rcsr(&nd_args);
+    assert!(
+        nd.status.success(),
+        "ndjson run failed: {}",
+        String::from_utf8_lossy(&nd.stderr)
+    );
+    let stream = String::from_utf8(nd.stdout).unwrap();
+    let done = stream
+        .lines()
+        .find(|l| l.contains("\"event\":\"done\""))
+        .unwrap_or_else(|| panic!("missing done event: {stream}"));
+    assert!(done.contains("\"timing\":{"), "NDJSON done has no timing: {done}");
+    assert!(done.contains("\"multi_output\":true"), "{done}");
+}
+
 #[test]
 fn a_single_target_keeps_the_historical_shape() {
     let csv = write_shared_csv();
