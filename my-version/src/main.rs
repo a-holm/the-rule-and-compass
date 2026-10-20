@@ -401,6 +401,12 @@ SEARCH:
                              bounded pending queue of N batches (default 2; 0 =
                              synchronous). Results and archive are identical;
                              only effective with --gpu
+  --variation auto|node|postfix
+                             variation engine. auto (default) uses the flat
+                             postfix arena for --no-fit GPU runs with a
+                             population >= 4096; node keeps the owned-tree loop;
+                             postfix requires the flat path and refuses a run
+                             that does not qualify
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -1211,6 +1217,17 @@ fn main() {
                             "error: --pipeline-depth needs an integer from 0 to 64, got '{}'",
                             v
                         );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            // #122: variation engine selection.
+            "--variation" => {
+                let v = val!();
+                match crate::search::VariationMode::parse(&v) {
+                    Ok(mode) => cfg.variation = mode,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
                         std::process::exit(EXIT_USAGE);
                     }
                 }

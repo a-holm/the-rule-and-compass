@@ -381,58 +381,83 @@ evaluation, rather than constant fitting, is the bottleneck. Making the fit
 cheaper or moving it to the GPU is a separate workstream; batch size and launch
 overhead are addressed by the fixed-capacity pool below.
 
-### Fixed-capacity genome pool and the unsupported tail (#122)
+### Fixed-capacity genome pool and flat postfix variation (#122)
 
-The first dehosting stage removes two pieces of host work that did not depend on
-the GPU at all:
+The GPU search keeps the historical owned-tree loop for fitting runs and for
+configurations the flat engine cannot reproduce exactly. A second engine removes
+the per-child tree work from the fit-free, large-population path:
 
 * **One persistent program arena.** `genome::GenomePool` is a fixed-capacity,
   double-buffered postfix arena. Every genome occupies exactly
   `width_for(max_complexity) = 2*max_complexity + 4` words (64 words = 256 B at
   the default 30), so a slot never moves and there is no free list. The CUDA
-  context now reserves `d_pool[2]` once; a generation uploads into the back
-  buffer and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is
-  2.6 MB per buffer, bounded by capacity and flat across generations.
+  context reserves `d_pool[2]` once; a generation uploads into the back buffer
+  and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is 2.6 MB per
+  buffer, bounded by capacity and flat across generations.
 * **Device-canonical hash.** `rc_pool_hash` computes the same FNV-1a postfix
-  hash as `genome::postfix_hash`, bit for bit; the pool can therefore dedup in
-  stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
-  implemented with the same positional `(seed, island, generation, slot, draw)`
-  contract the full device-variation stage will use.
-* **Unsupported programs no longer serialise the batch.** `if` has no kernel
-  opcode, and the old `GpuSearch::score` scored every such tree one after
-  another on the calling thread. They are now split into contiguous slices and
-  scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
-  `min(cores, 8)`). Each tree is independent, so the result is bit-identical;
-  `search::tests::cpu_fallback_is_identical_for_one_and_many_threads` pins the
-  one-thread and four-thread results together.
-* **Archive insertion without a pre-emptive clone.** `Archive::try_insert_view`
-  tests dominance on `(cost, error)` first and clones the tree only for a
-  candidate that enters the front.
+  hash as `genome::postfix_hash`, bit for bit.
+* **Flat variation arena.** `postfix::Arena` holds `islands × pop` fixed-width
+  programs plus SoA length/cost/hash/error arrays. `postfix::Variation` performs
+  tournament selection, subtree crossover, point/terminal/subtree mutation,
+  complexity and width bounds, structural hashing and duplicate rejection
+  directly on the arena. It allocates no tree and calls no simplifier per child.
+  Every random decision comes from Philox4x32-10 keyed by
+  `(seed, island, generation, slot)`.
+* **Survivor-only archive hand-off.** The archive is tested on `(error, cost)`
+  first (`Archive::admits`); a tree is rebuilt from postfix only when the
+  candidate actually enters the front. `Archive::canonicalize` then rebuilds a
+  monotone `(cost, error)` staircase, and `Archive::hash` is the determinism
+  gate. The final reported front is rebuilt from those survivors only and
+  rescored in `f64` on the full training sample.
+* **The full opcode set in the pool kernel.** The fixed-slot kernel used to fall
+  through to `r = 0` for `min`, `max`, `mod`, comparisons, logical operators and
+  `if`; it now shares the packed kernel's semantics
+  (`gpu::tests::pool_kernel_implements_every_emitted_opcode`).
+* **Unsupported programs do not serialise the batch.** Operators without a
+  kernel opcode make the flat path decline as a whole; the owned-tree path
+  scores them on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
+  `min(cores, 8)`), never one after another on the calling thread.
 
-Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 5 000`,
-`--no-fit --gpu --seed 1`, `P = 10 000`, default operators (including `if`),
-three interleaved runs each, wall for 10 generations:
+The path is selected before generation 0 and recorded in the backend note:
 
-| Run | min / median |
-|---|---:|
-| `origin/main` | 18.3 s / 22.8 s |
-| #122 stage | 8.8 s / 10.7 s (**2.1–2.4×**) |
+```sh
+rcsr ... --no-fit --gpu --variation auto      # flat arena when it qualifies
+rcsr ... --variation node                      # historical owned-tree loop
+rcsr ... --variation postfix                   # require the flat path
+```
 
-The per-generation CPU fallback for 8 521 unsupported trees fell from 2.15 s
-(serial) to 0.73 s on the 8-thread pool (3.0× on 4 physical cores). With the
-operator set that has no unsupported opcode (`--ops` without `if`) the same
-`P = 10 000`, 20-generation cell is unchanged (5.44 s vs 5.34 s): the pool
-removes allocation and clone overhead there, but variation and the startup
-population dominate. The kernel itself stays ~1–3 ms per generation: at the
-`--no-fit` slope this is under 1 % duty, which is why the remaining plan targets
-full device variation and fitting (#116), not the launch path. Exactness: the `P = 2 000`, 5-generation JSON
-report is byte-identical to `origin/main` apart from `elapsed_seconds`, i.e.
-the same constants, expressions and errors.
+`auto` requires a GPU, `--fit-iters 0`, `islands × pop >= 4096`, the default
+complexity model, no aggregates/custom blocks/dimension constraints, no
+screening or predictor subsampling and no QD layer. The flat engine draws parents
+from the island tournament only: the archive-guided `--front-parents` draw is
+not ported, so `auto` can produce a different (but deterministic) trajectory. Everything else stays on the
+owned-tree path, including all constant fitting (#116), simplification of
+reported expressions, checkpoints and exact `f64` reporting. A fitting run can
+therefore never be silently approximated by the flat engine.
 
-What remains staged: device-side mutation/crossover and a fused device
-selection/archive. The pool, hash and Philox contracts above are the interface
-those stages consume; the CPU variation, simplification, fitting, checkpoints
-and f64 reporting stay authoritative meanwhile.
+Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 3 750` training rows from
+a 5 000-row two-input sample, `--no-fit --gpu --seed 1`, `P = 10 000`, default
+operators, 10 generations, three interleaved runs each on a busy shared host
+(the absolute numbers are noisy; the ratio is pairwise):
+
+| Run | wall, s | search, s | generations/s |
+|---|---:|---:|---:|
+| `--variation node` (historical default pipeline) | 5.71 / 6.82 / 7.20 | 3.54–7.24 | 1.47 |
+| `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
+
+At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
+of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10
+generations. A 2-D hypervolume over `(complexity, train error)` with reference
+point `(40, 1)` was 34.6 for the 40-generation flat run at 2.2 s against 31.6
+for the 10-generation tree run at 3.5 s. The archive is deterministic for a
+seed, repeats across 1 and 4 islands, and a checkpoint/resume trip reproduces
+the uninterrupted archive hash (`tests/postfix_loop.rs`).
+
+What remains staged: the splice itself still runs on the CPU over the flat
+arena, not as a CUDA kernel, and there is no fused device selection/archive or
+survivor `FitReq/FitRes` ring. The pool, hash and Philox contracts above are the
+interface those stages consume; CPU fitting, simplification, checkpoints and
+`f64` reporting stay authoritative meanwhile.
 
 ## The DGX Spark path
 

@@ -24,6 +24,8 @@ use crate::metrics::{score_weighted, Metric};
 // #15: multi-output combined error and per-output constant fitting.
 use crate::multi;
 use crate::pareto::{Archive, Sol};
+#[cfg(feature = "cuda")]
+use crate::postfix::{Arena, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
@@ -34,6 +36,39 @@ use crate::rng::Mt;
 // `Config::accepts_dimensions`.
 use crate::units::Units;
 use std::collections::{BTreeMap, HashSet};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VariationMode {
+    /// Use the flat postfix engine when the run qualifies, else the `Node` path.
+    #[default]
+    Auto,
+    /// Always use the historical owned-tree loop.
+    Node,
+    /// Require the flat postfix engine; refuse the run when it does not qualify.
+    Postfix,
+}
+
+impl VariationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VariationMode::Auto => "auto",
+            VariationMode::Node => "node",
+            VariationMode::Postfix => "postfix",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "auto" => Ok(VariationMode::Auto),
+            "node" => Ok(VariationMode::Node),
+            "postfix" => Ok(VariationMode::Postfix),
+            other => Err(format!(
+                "variation must be 'auto', 'node' or 'postfix', got '{}'",
+                other
+            )),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Config {
@@ -117,6 +152,9 @@ pub struct Config {
     /// candidate order and archive are identical to the synchronous path, so it
     /// is not saved in a checkpoint.
     pub pipeline_depth: usize,
+    /// #122: which variation engine to use. `auto` selects the flat postfix
+    /// engine only for a large, fit-free GPU run.
+    pub variation: VariationMode,
 }
 
 /// A per-generation progress report.
@@ -170,6 +208,7 @@ impl Default for Config {
             gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
             pipeline_depth: 2, // #119: only used when the GPU path is active
+            variation: VariationMode::Auto,
         }
     }
 }
@@ -1653,6 +1692,338 @@ fn prepare_seeds(
     out
 }
 
+
+/// #122: whether a run can use the flat postfix variation engine.
+///
+/// The engine owns variation, structural hashing and duplicate rejection. It
+/// deliberately refuses configurations whose semantics it cannot reproduce
+/// exactly, rather than silently changing them:
+///
+/// * constant fitting (`--fit-iters > 0`) stays on the owned-tree path (#116);
+/// * aggregates, custom blocks and dimension constraints need the full `Node`
+///   machinery and fall back to it as a whole;
+/// * a custom complexity model or a population below the 4 096-genome gate
+///   keeps the historical loop, where it is already cheap.
+#[cfg(feature = "cuda")]
+fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, String> {
+    if cfg.fit_iters != 0 {
+        return Err("constant fitting is enabled".to_string());
+    }
+    if cfg.islands.max(1) * cfg.pop < 4096 {
+        return Err(format!(
+            "population {} is below the 4096-genome gate",
+            cfg.islands.max(1) * cfg.pop
+        ));
+    }
+    if train.is_multi() {
+        return Err("multi-output objective".to_string());
+    }
+    if cfg.complexity_model != crate::complexity::ComplexityModel::default() {
+        return Err("custom complexity model".to_string());
+    }
+    if cfg.units.is_some() || cfg.require_dimensions {
+        return Err("dimension constraints".to_string());
+    }
+    if cfg.fit_samples > 0 || cfg.predictor_samples.is_some() {
+        return Err("screening or predictor subsampling".to_string());
+    }
+    if cfg.qd_bins > 0 {
+        return Err("quality-diversity archive".to_string());
+    }
+    if !expr::current_blocks().is_empty() {
+        return Err("custom building blocks".to_string());
+    }
+    let width = crate::genome::width_for(cfg.max_complexity);
+    Variation::new(
+        width,
+        train.x.first().map(|r| r.len()).unwrap_or(0),
+        cfg.max_complexity,
+        cfg.seed,
+        &cfg.ops,
+        cfg.init_depth,
+        cfg.dedup,
+    )
+}
+
+/// #122: the generation loop over the flat postfix arena.
+///
+/// The device evaluates the whole arena in one upload and one launch; the host
+/// only varies compact arrays, tests the archive with `(error, cost)` and
+/// rebuilds an owned tree for a candidate that actually enters the front.
+/// Fitting, simplification of reported expressions, checkpoints and every
+/// reported number remain on the CPU in `f64`.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn run_postfix_search(
+    cfg: &Config,
+    train: &Sample,
+    test: &Sample,
+    train_data: &EvalSample,
+    variation: Variation,
+    mut gpu: GpuSearch,
+    mut archive: Archive,
+    islands: Vec<Vec<Ind>>,
+    rngs: Vec<Mt>,
+    main_rng: Mt,
+    mut stagnant: Vec<usize>,
+    mut gens_done: usize,
+    mut converged_early: bool,
+    mut best_prev: f64,
+    mut no_improve: usize,
+    save_every: usize,
+    mut on_checkpoint: Option<CheckpointFn<'_>>,
+    backend_reason: Option<String>,
+    device: Option<String>,
+) -> Result<Outcome, String> {
+    let pop = cfg.pop;
+    let n_islands = cfg.islands.max(1);
+    let trees: Vec<Vec<crate::expr::Node>> = islands
+        .iter()
+        .map(|p| p.iter().map(|ind| ind.tree.clone()).collect())
+        .collect();
+    let errors: Vec<Vec<f64>> = islands
+        .iter()
+        .map(|p| p.iter().map(|ind| ind.error).collect())
+        .collect();
+    let mut pool = Arena::from_trees(&trees, &errors, variation.width)?;
+    let mut progress_stats = ProgressStats::new(crate::progress_stats::DEFAULT_WINDOW);
+    let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
+    let mut restart_flags = vec![false; n_islands];
+    let t0 = std::time::Instant::now();
+
+    for gen in gens_done..cfg.generations {
+        gens_done = gen + 1;
+        let mut next = variation.next_generation(&pool, gen as u32, &restart_flags);
+        next.evaluate(&mut gpu.ev, train.len())?;
+        restart_flags = vec![false; n_islands];
+
+        // Archive: test `(error, cost)` first and rebuild a tree only for a
+        // candidate that survives. This is the survivor-only hand-off.
+        let mut gen_best = f64::INFINITY;
+        for i in 0..n_islands {
+            for j in 0..pop {
+                let idx = next.slot_index(i, j);
+                let error = next.err[idx];
+                if error < gen_best {
+                    gen_best = error;
+                }
+                let cost = next.cost[idx] as f64;
+                if !archive.admits(error, cost) {
+                    continue;
+                }
+                let Some(tree) = next.decode(idx) else { continue };
+                archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
+            }
+        }
+        gpu_stats.push(GpuGenStats {
+            generation: gen,
+            opcodes: Vec::new(),
+            programs: n_islands * pop,
+            fallbacks: 0,
+        });
+
+        if let Some(budget) = cfg.time_budget {
+            if t0.elapsed().as_secs_f64() >= budget {
+                converged_early = true;
+            }
+        }
+
+        let convergence = progress_stats.observe(gens_done, gen_best, &archive);
+        if let Some(report) = &cfg.progress {
+            report(Progress {
+                generation: gens_done,
+                total_generations: cfg.generations,
+                best_error: gen_best,
+                pareto_members: archive.items.len(),
+                convergence,
+            });
+        }
+
+        if gen_best.is_finite() {
+            if gen_best <= 1e-24 {
+                converged_early = true;
+            }
+            let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
+            if rel <= 1e-9 {
+                no_improve += 1;
+            } else {
+                no_improve = 0;
+            }
+            best_prev = best_prev.min(gen_best);
+            if cfg.patience > 0 && no_improve >= cfg.patience {
+                converged_early = true;
+            }
+        }
+
+        if n_islands > 1 && cfg.migration_interval > 0 && (gen + 1) % cfg.migration_interval == 0
+        {
+            next.migrate();
+        }
+
+        // Stagnation and restart, exactly as the owned-tree loop: measured at
+        // the generation boundary, applied before the checkpoint so a saved
+        // state never carries the pre-restart population.
+        if cfg.restart_interval > 0 && (gen + 1) % cfg.restart_interval == 0 {
+            let arch_best = archive
+                .items
+                .iter()
+                .map(|s| s.error)
+                .fold(f64::INFINITY, f64::min);
+            let mut restarted = false;
+            for i in 0..n_islands {
+                let cur_best = (0..pop)
+                    .map(|j| next.err[next.slot_index(i, j)])
+                    .fold(f64::INFINITY, f64::min);
+                if cur_best > arch_best + 1e-9 {
+                    stagnant[i] += 1;
+                } else {
+                    stagnant[i] = 0;
+                }
+                if stagnant[i] >= 2 {
+                    variation.restart_island(&mut next, i, gen as u32);
+                    stagnant[i] = 0;
+                    restarted = true;
+                }
+            }
+            if restarted {
+                next.evaluate(&mut gpu.ev, train.len())?;
+            }
+        }
+
+        if save_every > 0 && gens_done % save_every == 0 {
+            let trees = next
+                .to_trees()
+                .ok_or_else(|| "postfix pool could not be decoded for a checkpoint".to_string())?;
+            let islands_now: Vec<Vec<Ind>> = trees
+                .into_iter()
+                .enumerate()
+                .map(|(i, pop_trees)| {
+                    pop_trees
+                        .into_iter()
+                        .enumerate()
+                        .map(|(j, tree)| Ind {
+                            error: next.err[next.slot_index(i, j)],
+                            complexity: next.cost[next.slot_index(i, j)] as f64,
+                            tree,
+                        })
+                        .collect()
+                })
+                .collect();
+            let cp = snapshot(
+                cfg,
+                Backend::Gpu,
+                gens_done,
+                converged_early,
+                best_prev,
+                no_improve,
+                &archive,
+                &islands_now,
+                &rngs,
+                &stagnant,
+                &main_rng,
+                train,
+                test,
+            );
+            emit(&mut on_checkpoint, &cp);
+        }
+
+        pool = next;
+        if converged_early {
+            break;
+        }
+    }
+
+    if on_checkpoint.is_some() {
+        let trees = pool
+            .to_trees()
+            .ok_or_else(|| "postfix pool could not be decoded for the final checkpoint".to_string())?;
+        let islands_now: Vec<Vec<Ind>> = trees
+            .into_iter()
+            .enumerate()
+            .map(|(i, pop_trees)| {
+                pop_trees
+                    .into_iter()
+                    .enumerate()
+                    .map(|(j, tree)| Ind {
+                        error: pool.err[pool.slot_index(i, j)],
+                        complexity: pool.cost[pool.slot_index(i, j)] as f64,
+                        tree,
+                    })
+                    .collect()
+            })
+            .collect();
+        let cp = snapshot(
+            cfg,
+            Backend::Gpu,
+            gens_done,
+            converged_early,
+            best_prev,
+            no_improve,
+            &archive,
+            &islands_now,
+            &rngs,
+            &stagnant,
+            &main_rng,
+            train,
+            test,
+        );
+        emit(&mut on_checkpoint, &cp);
+    }
+
+    // Exact f64 rebuild over the surviving front only. The generation errors
+    // were the f32 kernel proxy; every number the user reads comes from here.
+    let mut final_archive = Archive::new(archive.cap);
+    for sol in std::mem::take(&mut archive.items) {
+        let tree = expr::simplify(&sol.tree);
+        let error = if cfg.accepts_dimensions(&tree) {
+            score_tree(&tree, train_data, cfg)
+        } else {
+            f64::INFINITY
+        };
+        final_archive.try_insert(Sol {
+            complexity: expr::complexity(&tree),
+            cost: cfg.complexity_model.complexity(&tree),
+            tree,
+            error,
+        });
+    }
+    final_archive.canonicalize();
+    let sorted = final_archive.sorted();
+    let test_data = EvalSample::new(test, cfg);
+    let test_errors: Vec<f64> = sorted
+        .iter()
+        .map(|s| eval_error_on(&s.tree, &test_data, cfg.metric))
+        .collect();
+    let mut final_archive = Archive::new(final_archive.cap);
+    final_archive.items = sorted;
+
+    let best = final_archive
+        .items
+        .iter()
+        .map(|s| s.error)
+        .fold(f64::INFINITY, f64::min);
+    let convergence = progress_stats.observe(gens_done, best, &final_archive);
+
+    Ok(Outcome {
+        archive: final_archive,
+        test_errors,
+        generations: gens_done,
+        converged_early,
+        seeds: Vec::new(),
+        convergence,
+        fit_samples: 0,
+        archive_refit: false,
+        predictor_samples: 0,
+        backend: crate::backend::Kind::Gpu,
+        backend_reason,
+        device,
+        gpu: Some(GpuRunStats {
+            generations: gpu_stats,
+        }),
+        qd: None,
+    })
+}
+
 fn run_search(
     cfg: &Config,
     train: &Sample,
@@ -1704,7 +2075,11 @@ fn run_search(
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
-                        let scheduling = if cfg.pipeline_depth == 0 {
+                        let scheduling = if cfg.variation != VariationMode::Node
+                            && postfix_variation_for(cfg, train).is_ok()
+                        {
+                            "flat postfix variation".to_string()
+                        } else if cfg.pipeline_depth == 0 {
                             "synchronous batches".to_string()
                         } else {
                             format!(
@@ -1734,6 +2109,9 @@ fn run_search(
     };
     #[cfg(not(feature = "cuda"))]
     {
+        if cfg.variation == VariationMode::Postfix {
+            return Err("--variation postfix needs a build with --features cuda".to_string());
+        }
         if cfg.gpu {
             backend_reason = Some("built without --features cuda".to_string());
             if cfg.gpu_notes {
@@ -1957,6 +2335,64 @@ fn run_search(
     #[cfg(feature = "cuda")]
     {
         defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done);
+    }
+
+    // #122: the flat postfix generation loop. It is selected before the first
+    // generation and never changes mid-run; everything it cannot represent
+    // stays on the historical owned-tree path.
+    #[cfg(feature = "cuda")]
+    if cfg.variation != VariationMode::Node {
+        if let Some(g) = gpu.take() {
+            match postfix_variation_for(cfg, train) {
+                Ok(variation) if seeds.is_empty() => {
+                    return run_postfix_search(
+                        cfg,
+                        train,
+                        test,
+                        &train_data,
+                        variation,
+                        g,
+                        archive,
+                        islands,
+                        rngs,
+                        rng,
+                        stagnant,
+                        gens_done,
+                        converged_early,
+                        best_prev,
+                        no_improve,
+                        save_every,
+                        on_checkpoint,
+                        backend_reason,
+                        backend_device.clone(),
+                    );
+                }
+                Ok(_) => {
+                    gpu = Some(g);
+                    if cfg.variation == VariationMode::Postfix {
+                        return Err(
+                            "--variation postfix cannot carry --seed-expr/--seed-file; \
+                             use --variation auto"
+                                .to_string(),
+                        );
+                    }
+                    if cfg.gpu_notes {
+                        eprintln!("# gpu: node variation (seeded start)");
+                    }
+                }
+                Err(reason) => {
+                    if cfg.variation == VariationMode::Postfix {
+                        return Err(format!("--variation postfix: {}", reason));
+                    }
+                    gpu = Some(g);
+                    if cfg.gpu_notes {
+                        eprintln!("# gpu: node variation ({})", reason);
+                    }
+                }
+            }
+        } else if cfg.variation == VariationMode::Postfix {
+            return Err("--variation postfix needs a usable CUDA device".to_string());
+        }
     }
 
     // #18: one tracker, updated once per generation from the archive. It holds
