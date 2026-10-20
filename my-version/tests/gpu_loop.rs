@@ -366,6 +366,52 @@ fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {
     );
 }
 
+/// #119: the overlap pipeline must not change a single scored value. The
+/// synchronous path (`pipeline_depth = 0`) and the bounded overlap path are
+/// compared on the same seed; every archive member, its exact `f64` error bits
+/// and the test errors must match. Arrival order across islands is not fixed,
+/// but each result is keyed by `(island, slot)`, so the mapping is.
+#[cfg(feature = "cuda")]
+#[test]
+fn overlap_pipeline_is_byte_identical_to_the_synchronous_gpu_path() {
+    let train = sample(96);
+    let test = sample(96);
+    let mut sync = config(29, true);
+    sync.pipeline_depth = 0;
+    let mut overlap = config(29, true);
+    overlap.pipeline_depth = 2;
+
+    let a = search::run(&sync, &train, &test);
+    let b = search::run(&overlap, &train, &test);
+    assert_eq!(
+        describe(&a),
+        describe(&b),
+        "the overlap queue changed the archive"
+    );
+    assert_eq!(
+        a.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+        b.test_errors.iter().map(|e| e.to_bits()).collect::<Vec<_>>(),
+        "the overlap queue changed the reported test errors"
+    );
+}
+
+/// #119: a CPU-only run cannot be affected by the pipeline depth. With no GPU
+/// the queue is never constructed, so the archive is bit-identical for any
+/// depth.
+#[cfg(feature = "cuda")]
+#[test]
+fn pipeline_depth_is_a_no_op_on_the_cpu_path() {
+    let train = sample(48);
+    let test = sample(48);
+    let mut sync = config(31, false);
+    sync.pipeline_depth = 0;
+    let mut deep = config(31, false);
+    deep.pipeline_depth = 8;
+    let a = search::run(&sync, &train, &test);
+    let b = search::run(&deep, &train, &test);
+    assert_eq!(describe(&a), describe(&b));
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn cpu_override_is_bit_identical_across_runs() {

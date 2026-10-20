@@ -111,6 +111,12 @@ pub struct Config {
     /// #26: print the one-line `# gpu: ...` note. The CLI clears this with
     /// `--quiet`, which promises an empty stderr for machine-readable output.
     pub gpu_notes: bool,
+    /// #119: bounded producer/scorer overlap depth in batches (`0` disables).
+    /// While the GPU scores a batch, the CPU keeps generating and fitting the
+    /// next candidates. This is a scheduling choice only: the scored values,
+    /// candidate order and archive are identical to the synchronous path, so it
+    /// is not saved in a checkpoint.
+    pub pipeline_depth: usize,
 }
 
 /// A per-generation progress report.
@@ -163,6 +169,7 @@ impl Default for Config {
             // deliberate override and `--gpu` asserts that a device exists.
             gpu: cfg!(feature = "cuda"),
             gpu_notes: true,
+            pipeline_depth: 2, // #119: only used when the GPU path is active
         }
     }
 }
@@ -636,6 +643,46 @@ fn score_generation(
             false
         }
     }
+}
+
+/// #119: score one overlap batch, writing each result into its fixed
+/// `(island, slot)` destination. Candidates the kernel cannot compile are left
+/// `None` and scored by the normal barrier path afterwards. A CUDA failure is
+/// returned to the caller, which stops the GPU and re-scores the whole
+/// generation on the CPU.
+#[cfg(feature = "cuda")]
+fn score_pipeline_batch(
+    jobs: Vec<PipelineJob>,
+    gpu: &mut Option<GpuSearch>,
+    results: &mut [Vec<Option<f64>>],
+    n_rows: usize,
+) -> Result<(), String> {
+    let Some(g) = gpu.as_mut() else {
+        return Err("pipeline scoring without a GPU evaluator".to_string());
+    };
+    let mut pop = crate::gpu::Population::new();
+    let mut slots: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
+    for (i, j, tree) in jobs {
+        if pop.add(&tree) {
+            slots.push((i, j));
+        }
+    }
+    if pop.is_empty() {
+        return Ok(());
+    }
+    let (sse, ms) = g.ev.eval_population(&pop);
+    if ms < 0.0 || sse.len() != pop.len() {
+        return Err("CUDA batch evaluation failed".to_string());
+    }
+    let n = n_rows as f64;
+    for (&(i, j), &s) in slots.iter().zip(&sse) {
+        results[i][j] = Some(if s.is_finite() {
+            (s as f64) / n
+        } else {
+            f64::INFINITY
+        });
+    }
+    Ok(())
 }
 
 /// #26: whether a run may use the GPU at all.
@@ -1212,8 +1259,24 @@ fn seed_seen(seen: &mut HashSet<u64>, next: &[Ind], parents: &[Ind]) {
     }
 }
 
+/// #119: one candidate job for the overlap queue: island, destination slot in
+/// that island's `next` vector, and the tree to score.
+type PipelineJob = (usize, usize, Node);
+
+/// #119: offer a freshly generated candidate to the overlap queue. Sending is
+/// best-effort by design: the consumer drains until every sender is dropped, so
+/// a send can only fail if the whole pipeline has already stopped (it never
+/// does while producers run). The candidate itself stays in the producer's
+/// `next`, so a dropped job is simply scored at the barrier.
+fn offer(sink: &Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>, slot: usize, ind: &Ind) {
+    if let Some((tx, island)) = sink {
+        let _ = tx.send((*island, slot, ind.tree.clone()));
+    }
+}
+
 /// Evolve one island by a single generation. Pure with respect to the rest of
 /// the world, so it can run on its own thread.
+#[allow(clippy::too_many_arguments)]
 fn evolve_island(
     isl: &mut Vec<Ind>,
     rng: &mut Mt,
@@ -1235,6 +1298,10 @@ fn evolve_island(
     // still run in parallel. `front_p == 0.0` makes it a no-op.
     front: &[Sol],
     front_p: f64,
+    // #119: when present, every pending candidate is also offered to the
+    // bounded GPU queue as soon as it is fitted, so scoring overlaps the rest
+    // of this generation. `None` is the synchronous path exactly.
+    sink: Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -1306,7 +1373,9 @@ fn evolve_island(
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
+        let slot = next.len();
         next.push(ind);
+        offer(&sink, slot, &next[slot]); // #119
     }
 
     // Fill any remainder with fresh random trees.
@@ -1326,11 +1395,13 @@ fn evolve_island(
             tree = expr::simplify(&tree);
         }
         // #26: same deferral for the random fill.
+        let slot = next.len();
         next.push(if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
             Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
         });
+        offer(&sink, slot, &next[slot]); // #119
     }
 
     *isl = next;
@@ -1633,9 +1704,19 @@ fn run_search(
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
+                        let scheduling = if cfg.pipeline_depth == 0 {
+                            "synchronous batches".to_string()
+                        } else {
+                            format!(
+                                "overlap depth {} (batches of {})",
+                                cfg.pipeline_depth,
+                                (cfg.pop / cfg.pipeline_depth.max(1)).max(1)
+                            )
+                        };
                         eprintln!(
-                            "# gpu: {} (one batch per generation; f32 fitness, reported numbers stay f64)",
-                            device
+                            "# gpu: {} ({}; f32 fitness, reported numbers stay f64)",
+                            crate::gpu::GpuEvaluator::device_name(),
+                            scheduling
                         );
                     }
                     backend_device = Some(device);
@@ -1961,11 +2042,52 @@ fn run_search(
             } else {
                 0.0
             };
+            // #119: overlap the GPU with the rest of this generation. The CPU
+            // threads keep generating and fitting; the main thread drains a
+            // bounded queue and scores batches. Selection still waits for every
+            // result at the barrier, so the trajectory is unchanged.
+            #[cfg(feature = "cuda")]
+            let pipeline_active = !screened && defer_gpu && cfg.pipeline_depth > 0;
+            #[cfg(not(feature = "cuda"))]
+            let pipeline_active = false;
+            // One batch is `pop / depth` candidates, so `depth` batches queue
+            // ahead of the scorer; live memory is at most `(depth + 1) * batch`
+            // candidate trees plus their compiled programs.
+            let batch_size = (cfg.pop / cfg.pipeline_depth.max(1)).max(1);
+            let queue_capacity = cfg.pipeline_depth.max(1) * batch_size;
+            #[cfg(not(feature = "cuda"))]
+            let _ = (pipeline_active, batch_size, queue_capacity);
+            #[cfg(feature = "cuda")]
+            let mut pipeline_results: Vec<Vec<Option<f64>>> =
+                vec![vec![None; cfg.pop.max(1)]; islands.len()];
+            #[cfg(feature = "cuda")]
+            let mut pipeline_error: Option<String> = None;
+            #[cfg(feature = "cuda")]
+            let mut pipeline_scored = false;
             std::thread::scope(|s| {
+                // The queue lives in the scope: producers take a clone of the
+                // sender, and `drain` consumes the original so it can end.
+                #[cfg(feature = "cuda")]
+                let queue = if pipeline_active {
+                    Some(crate::pipeline::JobQueue::new(queue_capacity))
+                } else {
+                    None
+                };
+                #[cfg(feature = "cuda")]
+                let senders: Vec<Option<std::sync::mpsc::SyncSender<PipelineJob>>> =
+                    (0..islands.len())
+                        .map(|_| queue.as_ref().map(|q| q.sender()))
+                        .collect();
+                #[cfg(not(feature = "cuda"))]
+                let senders: Vec<Option<std::sync::mpsc::SyncSender<PipelineJob>>> =
+                    vec![None; islands.len()];
+
                 let handles: Vec<_> = islands
                     .iter_mut()
                     .zip(rngs.iter_mut())
-                    .map(|(isl, r)| {
+                    .zip(senders.into_iter())
+                    .enumerate()
+                    .map(|(i, ((isl, r), sender))| {
                         // #10: carry the block registry into the island thread.
                         let blocks = blocks.clone();
                         s.spawn(move || {
@@ -1982,19 +2104,73 @@ fn run_search(
                                 defer_gpu && !screened,
                                 front,   // #76
                                 front_p, // #76
+                                sender.as_ref().map(|t| (t, i)), // #119
                             ) // #85
                         })
                     })
                     .collect();
+
+                #[cfg(feature = "cuda")]
+                if let Some(queue) = queue {
+                    pipeline_error = queue.drain(batch_size, |jobs| {
+                        pipeline_scored = true;
+                        score_pipeline_batch(
+                            jobs,
+                            &mut gpu,
+                            &mut pipeline_results,
+                            gen_train.len(),
+                        )
+                    });
+                }
+
                 for h in handles {
                     let _ = h.join();
                 }
             });
 
-            // #26: one batched call covers every candidate of the generation.
             #[cfg(feature = "cuda")]
             {
-                if !screened {
+                if pipeline_active {
+                    // Results are keyed by (island, slot), so the arrival order
+                    // across concurrent island threads cannot change them.
+                    for (i, slots) in pipeline_results.iter().enumerate() {
+                        for (j, value) in slots.iter().enumerate() {
+                            if let Some(e) = value {
+                                islands[i][j].error = *e;
+                            }
+                        }
+                    }
+                    if pipeline_error.is_none() {
+                        if pipeline_scored {
+                            gpu_used = true;
+                        }
+                        // Score anything the kernel could not compile (left
+                        // pending) through the normal CPU fallback.
+                        defer_gpu =
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg);
+                    } else {
+                        // Stop the GPU and re-score every still-pending
+                        // candidate in f64 on the CPU; a failed batch must
+                        // never leave a wrong (or missing) number behind.
+                        if cfg.gpu_notes {
+                            if let Some(e) = &pipeline_error {
+                                eprintln!("# gpu: unavailable ({})", e);
+                            }
+                        }
+                        gpu = None;
+                        let train_view = EvalSample::new(train, cfg);
+                        for pop in islands.iter_mut() {
+                            for ind in pop.iter_mut() {
+                                if ind.error.is_nan() {
+                                    ind.reeval(&train_view, cfg); // #25
+                                }
+                            }
+                        }
+                        defer_gpu = false;
+                    }
+                } else if !screened {
+                    // #26: one batched call covers every candidate of the
+                    // generation (the pre-#119 synchronous path).
                     defer_gpu =
                         score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
                 }
@@ -2498,6 +2674,7 @@ mod tests {
                 false,
                 front,
                 0.0,
+                None, // #119: synchronous test path
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();

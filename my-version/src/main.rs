@@ -397,6 +397,10 @@ SEARCH:
                              it never changes parents or the Pareto front
   --qd-cells <N>             descriptor grid bins per axis (2..=256; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
+  --pipeline-depth <N>       overlap CPU generation with GPU scoring using a
+                             bounded pending queue of N batches (default 2; 0 =
+                             synchronous). Results and archive are identical;
+                             only effective with --gpu
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -1189,10 +1193,6 @@ fn main() {
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
             "--no-simd" => cfg.simd = false,
-            // #26/#141: `--gpu` asserts that a device exists (it is an error
-            // when the probe found none); `--no-gpu`/`--cpu` is the deliberate
-            // CPU override. The absence of both follows the build/device
-            // default, resolved once after option parsing.
             "--gpu" => {
                 cfg.gpu = true;
                 gpu_explicit = Some(true);
@@ -1200,6 +1200,20 @@ fn main() {
             "--no-gpu" | "--cpu" => {
                 cfg.gpu = false;
                 gpu_explicit = Some(false);
+            }
+            // #119: bounded CPU/GPU overlap depth in batches (0 = off).
+            "--pipeline-depth" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n <= 64 => cfg.pipeline_depth = n,
+                    _ => {
+                        eprintln!(
+                            "error: --pipeline-depth needs an integer from 0 to 64, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             "--predictor-samples" => {
                 let v = val!();

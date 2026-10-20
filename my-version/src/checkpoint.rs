@@ -1254,6 +1254,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         simd: true,
         gpu: false,
         gpu_notes: true,
+        // #119: scheduling only, not saved search state.
+        pipeline_depth: 2,
     })
 }
 
