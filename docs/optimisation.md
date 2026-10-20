@@ -560,6 +560,7 @@ approximation. The pre-registered acceptance rules are:
 | size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
 | ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
 | `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+| `--fit-strategy gpu` (#169) | kernel p ≤ 16, nodes ≤ 96, squared/AIC metrics; median constant error ≤ 1e-5 and SSE relative ≤ 1e-8 vs CPU LM on well-conditioned fixtures; every ill-conditioned/non-finite/unsupported candidate falls back and is labelled; finalists refit in exact CPU f64 |
 
 Because the linear arm reaches the optimum in one solve instead of iterating,
 it **can** change the search trajectory (usually by fitting a linear candidate
@@ -585,9 +586,24 @@ and test error (`0.30848993 / 0.31136481` versus the `exact` front's best
 `0.30861096 / 0.31146704` at a larger complexity), because the linear arm
 solved candidates that LM's eight iterations left short of the optimum.
 
+**Batched GPU LM (#169, opt-in `--fit-strategy gpu`).** A CUDA build can move
+the constants of a whole generation with one block per candidate: value and
+reverse-mode Jacobian for the p constants, `JᵀJ`/`Jᵀr`/SSE accumulation, a
+damped f64 Cholesky solve with a conditioning gate, and ordered trial steps.
+The search phase uses f32 row arithmetic with f64 accumulators and the solve;
+the final undamped polish runs in f64 on an exact f64 copy of the training rows.
+Candidates with no analytic GPU derivative, more than 16 constants, more than
+96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
+are refit by the exact CPU arm and counted as fallbacks. `--fit-strategy gpu`
+applies to the squared/AIC family (the kernel minimises squared error); other
+metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
+training rows in CPU f64 before it is scored and reported, so reported constants
+and metrics never come from f32. The arm is opt-in and saved in checkpoints;
+`exact` remains the default, bit for bit.
+
 **Not yet implemented** (tracked on #116): VarPro for separable nonlinear
-models, batched GPU LM and the adaptive cost-model dispatcher. This PR lands
-only the exact CPU linear arm plus its classifier, fallback and reporting.
+models and the adaptive cost-model dispatcher. #169 lands the batched GPU LM
+described above.
 
 #### Subsampled scoring: `--predictor-samples`
 

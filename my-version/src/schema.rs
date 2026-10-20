@@ -74,7 +74,7 @@ pub fn json() -> String {
         ("--eval-expr", "string", "none", "score this formula on the split instead of searching"),
         ("--function", "string", "none", "user-defined building block name(a,b)=expr or name=expr (repeatable, at most four; parameters inferred from free variables; constants in a body are shared by every call)"),
         ("--fit-iters", "int", "8", "LM constant-fitting iterations; 0 disables fitting entirely and leaves constants as generated. Constants are fitted to the configured --metric (squared/aic/aicc/bic exact least squares, absolute/log_squashed IRLS, auc/log_loss/hinge logistic IRLS, rank/order/correlation a deterministic coordinate polish)"),
-        ("--fit-strategy", "enum", "exact", "exact | auto | linear: the exact constant-fitting arm. exact is the historical CPU LM, bit for bit; auto/linear use closed-form QR for trees affine in every constant and fall back to exact otherwise (linear is exact for squared error only)"),
+        ("--fit-strategy", "enum", "exact", "exact | auto | linear | gpu: the constant-fitting arm. exact is the historical CPU LM, bit for bit; auto/linear use closed-form QR for trees affine in every constant and fall back to exact otherwise (linear is exact for squared error only); gpu batches non-affine trees p<=16 into one CUDA block per candidate, falls back per candidate to exact CPU f64 and refits finalists exactly before reporting (opt-in, CUDA builds only)"),
         ("--fit-report", "flag", "false", "print constant-fitting arm counts after the run (diagnostics only)"),
         ("--no-fit", "flag", "false", "disable constant fitting entirely (same as --fit-iters 0)"),
         ("--no-dedup", "flag", "false", "disable structural de-duplication"),

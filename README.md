@@ -23,8 +23,12 @@ candidate with the right *shape* is immediately usable even if its numbers
 started out wrong, and the fitted numbers minimise the same loss that ranks the
 front. Candidates affine in every constant can instead use the closed-form
 column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
-error and falls back to the metric-aware path otherwise; the default remains
-the historical LM path bit for bit.
+error and falls back to the metric-aware path otherwise. A CUDA build can also
+batch non-affine candidates into one GPU block per candidate
+(`--fit-strategy gpu`, p ≤ 16): the kernel moves the constants on the device,
+unsupported or ill-conditioned candidates fall back per candidate, and every
+finalist is refit exactly in CPU f64 before reporting. The default remains the
+historical CPU LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -384,7 +388,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear] [--fit-report] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|gpu] [--fit-report] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N]
      [--no-front-parents]
@@ -774,8 +778,12 @@ candidate with the right *shape* is immediately usable even if its numbers
 started out wrong, and the fitted numbers minimise the same loss that ranks the
 front. Candidates affine in every constant can instead use the closed-form
 column-pivoted QR arm (`--fit-strategy auto|linear`), which is exact for squared
-error and falls back to the metric-aware path otherwise; the default remains
-the historical LM path bit for bit.
+error and falls back to the metric-aware path otherwise. A CUDA build can also
+batch non-affine candidates into one GPU block per candidate
+(`--fit-strategy gpu`, p ≤ 16): the kernel moves the constants on the device,
+unsupported or ill-conditioned candidates fall back per candidate, and every
+finalist is refit exactly in CPU f64 before reporting. The default remains the
+historical CPU LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant

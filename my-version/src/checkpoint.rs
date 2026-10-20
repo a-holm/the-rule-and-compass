@@ -1194,7 +1194,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         None => crate::fit::FitStrategy::Exact,
         Some(raw) => crate::fit::FitStrategy::parse(raw).ok_or_else(|| {
             format!(
-                "config 'fit_strategy' must be exact, auto or linear, got '{}'",
+                "config 'fit_strategy' must be exact, auto, linear or gpu, got '{}'",
                 raw
             )
         })?,

@@ -286,6 +286,32 @@ extern "C" {
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+    fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64) -> i32;
+    /* #169: batched LM constant fitting over the resident dataset. */
+    fn rc_fit_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nprog: i32,
+        kmax: i32,
+        c0: *const f64,
+        iters: i32,
+        outc: *mut f64,
+        outsse: *mut f64,
+        outstatus: *mut i32,
+    ) -> f32;
+}
+
+/// #169: one candidate's batched-GPU fit result.
+#[derive(Clone, Debug)]
+pub struct GpuFitOutput {
+    /// Fitted constants (exact slots, length is the candidate's `p`).
+    pub c: Vec<f64>,
+    /// The kernel's final SSE (recomputed exactly on the CPU for finalists).
+    pub sse: f64,
+    /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
+    pub status: i32,
 }
 
 /// Probe for a usable CUDA device once (issue #141).
@@ -482,6 +508,13 @@ impl GpuEvaluator {
         }
     }
 
+    /// #169: upload exact f64 training columns for the batched fit's final
+    /// polish. Column-major `cols[var * n_rows + row]`. Returns `false` when
+    /// the device allocation fails (the CPU arm then remains authoritative).
+    pub(crate) fn set_fit_data(&mut self, cols: &[f64], y: &[f64]) -> bool {
+        unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr()) == 0 }
+    }
+
     pub fn device_name() -> String {
         unsafe {
             let p = rc_device_name();
@@ -569,6 +602,70 @@ impl GpuEvaluator {
             }
             out
         }
+    }
+
+    /// #169: fit the constants of a whole batch of candidates on the device.
+    ///
+    /// One block per candidate runs its own Levenberg–Marquardt loop over the
+    /// resident rows; the host only uploads the small programs and start
+    /// constants and downloads the results. A negative time means the launch
+    /// failed and every result must be discarded (the caller falls back to the
+    /// CPU for the whole batch).
+    pub(crate) fn fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        let nprog = plans.len();
+        if nprog == 0 {
+            return (Vec::new(), 0.0);
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max().unwrap_or(0);
+        if kmax == 0 {
+            return (Vec::new(), -1.0);
+        }
+        let mut words: Vec<u32> = Vec::new();
+        let mut off: Vec<u32> = Vec::with_capacity(nprog + 1);
+        let mut pcount: Vec<i32> = Vec::with_capacity(nprog);
+        let mut c0 = vec![0.0f64; nprog * kmax];
+        off.push(0);
+        for (k, plan) in plans.iter().enumerate() {
+            words.extend_from_slice(&plan.words);
+            off.push(words.len() as u32);
+            pcount.push(plan.nconst as i32);
+            c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+        }
+        let mut outc = vec![0.0f64; nprog * kmax];
+        let mut outsse = vec![0.0f64; nprog];
+        let mut outstatus = vec![0i32; nprog];
+        let ms = unsafe {
+            rc_fit_batch(
+                self.ctx,
+                words.as_ptr(),
+                off.as_ptr(),
+                pcount.as_ptr(),
+                nprog as i32,
+                kmax as i32,
+                c0.as_ptr(),
+                iters as i32,
+                outc.as_mut_ptr(),
+                outsse.as_mut_ptr(),
+                outstatus.as_mut_ptr(),
+            )
+        };
+        if ms < 0.0 {
+            return (Vec::new(), ms);
+        }
+        let out = plans
+            .iter()
+            .enumerate()
+            .map(|(k, plan)| GpuFitOutput {
+                c: outc[k * kmax..k * kmax + plan.nconst].to_vec(),
+                sse: outsse[k],
+                status: outstatus[k],
+            })
+            .collect();
+        (out, ms)
     }
 
     /// Score a whole [`Population`] in one call: one program upload and one
@@ -1194,5 +1291,491 @@ mod lower_extreme_tests {
         };
         let t = node(Op::Add, vec![leaf_if(1.0, 2.0), leaf_if(3.0, 4.0)]);
         assert_eq!(peak_stack(&t), 4);
+    }
+}
+
+/// #169: correctness of the batched GPU Levenberg–Marquardt arm.
+///
+/// These tests compare the kernel against the historical CPU LM on the same
+/// starting constants and rows. The reported SSE is recomputed on the CPU in
+/// f64 at the fitted constants, so the comparison measures the constants rather
+/// than the kernel's f32 row arithmetic.
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+    use crate::expr::{constant, eval, input, node, Node, Op};
+
+    /// One basis function with no fitted constants of its own.
+    fn basis(k: usize) -> Node {
+        let x = input(0);
+        match k {
+            0 => constant(1.0),
+            1 => x,
+            2 => node(Op::Square, vec![x]),
+            3 => node(Op::Cube, vec![x]),
+            4 => node(Op::Sin, vec![x]),
+            5 => node(Op::Cos, vec![x]),
+            6 => node(Op::Tanh, vec![x]),
+            7 => node(Op::Logistic, vec![x]),
+            8 => node(Op::Gauss, vec![x]),
+            9 => node(Op::Erf, vec![x]),
+            10 => node(Op::Sinh, vec![x]),
+            11 => node(Op::Cosh, vec![x]),
+            12 => node(Op::Abs, vec![x]),
+            13 => node(Op::Mul, vec![x.clone(), node(Op::Sin, vec![x])]),
+            14 => node(Op::Mul, vec![x.clone(), node(Op::Cos, vec![x])]),
+            _ => node(Op::Mul, vec![x.clone(), node(Op::Tanh, vec![x])]),
+        }
+    }
+
+    /// `Σ coeffs[k] · basis(k)`, one constant per term.
+    fn model(coeffs: &[f64]) -> Node {
+        let mut terms = Vec::new();
+        for (k, &c) in coeffs.iter().enumerate() {
+            if k == 0 {
+                // The intercept is a bare constant; multiplying it by a
+                // constant-one basis would add a second (unidentified) slot.
+                terms.push(constant(c));
+            } else {
+                terms.push(node(Op::Mul, vec![constant(c), basis(k)]));
+            }
+        }
+        let mut tree = terms.pop().expect("at least one term");
+        while let Some(t) = terms.pop() {
+            tree = node(Op::Add, vec![t, tree]);
+        }
+        tree
+    }
+
+    fn dataset(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let mut x = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = (i as f64 / (n - 1) as f64) * 5.0 - 2.5;
+            x.push(vec![a]);
+        }
+        let y = x.iter().map(|r| 0.0 + eval(&model(&[1.5]), r)).collect();
+        (x, y)
+    }
+
+    fn cols_from(x: &[Vec<f64>], y: &[f64]) -> (Vec<f32>, Vec<f32>) {
+        let n = x.len();
+        let mut cols = vec![0.0f32; n];
+        for i in 0..n {
+            cols[i] = x[i][0] as f32;
+        }
+        (cols, y.iter().map(|&v| v as f32).collect())
+    }
+
+    fn constants(tree: &Node) -> Vec<f64> {
+        fn walk(n: &Node, out: &mut Vec<f64>) {
+            if n.op == Op::Const {
+                out.push(n.val);
+            }
+            for k in &n.kids {
+                walk(k, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(tree, &mut out);
+        out
+    }
+
+    fn sse_at(tree: &mut Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
+        crate::fit::fit_weighted(tree, x, y, &[], 0)
+    }
+
+    /// A deliberately well-conditioned design: one independent input column per
+    /// constant (sinusoids at distinct frequencies over a full period, so the
+    /// columns are orthogonal). The optimum is unique and the CPU/GPU constants
+    /// are comparable at 1e-5.
+    fn linear_fixture(
+        p: usize,
+        n: usize,
+    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>, Vec<f64>, Vec<f64>) {
+        let target: Vec<f64> = (0..p).map(|k| df64(1.0 + 0.31 * k as f64)).collect();
+        let start: Vec<f64> = (0..p).map(|k| df64(0.25 + 0.07 * k as f64)).collect();
+        let mut x = vec![vec![0.0; p]; n];
+        let mut cols = vec![0.0f32; n * p];
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = std::f64::consts::TAU * i as f64 / (n - 1) as f64;
+            let mut v = 0.0;
+            for k in 0..p {
+                let a = df64(((k + 1) as f64 * t).sin());
+                x[i][k] = a;
+                cols[k * n + i] = a as f32;
+                v += target[k] * a;
+            }
+            let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+            y.push(v + noise);
+        }
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        (x, y, cols, y32, target, start)
+    }
+
+    fn df64(v: f64) -> f64 {
+        v
+    }
+
+    fn linear_model(coeffs: &[f64]) -> Node {
+        let mut terms = Vec::new();
+        for (k, &c) in coeffs.iter().enumerate() {
+            terms.push(node(Op::Mul, vec![constant(c), input(k)]));
+        }
+        let mut tree = terms.pop().expect("at least one term");
+        while let Some(t) = terms.pop() {
+            tree = node(Op::Add, vec![t, tree]);
+        }
+        tree
+    }
+
+    #[test]
+    fn gpu_fit_matches_the_cpu_lm_for_p_1_to_16() {
+        let n = 800;
+        let mut errors: Vec<f64> = Vec::new();
+        let mut worst_sse_rel = 0.0f64;
+        for p in 1..=16usize {
+            let (x, y, cols, y32, _target, start) = linear_fixture(p, n);
+            let mut ev = match GpuEvaluator::new(&cols, n, p, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU test: no usable CUDA device");
+                    return;
+                }
+            };
+
+            let mut cols64 = vec![0.0f64; n * p];
+            for i in 0..n {
+                for k in 0..p {
+                    cols64[k * n + i] = x[i][k];
+                }
+            }
+            assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+
+            let mut cpu_tree = linear_model(&start);
+            crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+            let cpu_sse = crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+            let cpu_c = constants(&cpu_tree);
+
+            let mut gpu_tree = linear_model(&start);
+            let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("well-conditioned plan");
+            assert_eq!(plan.nconst, p, "p={}", p);
+            let (out, ms) = ev.fit_batch(&[&plan], 8);
+            assert!(ms >= 0.0, "fit kernel ran for p={}", p);
+            assert_eq!(out.len(), 1);
+            let res = &out[0];
+            assert_eq!(res.status, 0, "p={} must be well conditioned", p);
+            let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("plan");
+            plan.apply(&mut gpu_tree, &res.c);
+            let gpu_c = constants(&gpu_tree);
+            assert_eq!(gpu_c.len(), p);
+
+            let mut gpu_sse_tree = gpu_tree.clone();
+            let gpu_sse = sse_at(&mut gpu_sse_tree, &x, &y);
+            let rel = (gpu_sse - cpu_sse).abs() / cpu_sse.abs().max(1e-8);
+            worst_sse_rel = worst_sse_rel.max(rel);
+            for (a, b) in gpu_c.iter().zip(&cpu_c) {
+                errors.push((a - b).abs() / (1.0 + b.abs()));
+            }
+            assert!(
+                rel <= 1e-8,
+                "p={}: SSE relative {:.3e} (gpu {:.12e}, cpu {:.12e})",
+                p,
+                rel,
+                gpu_sse,
+                cpu_sse
+            );
+        }
+        errors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = errors[errors.len() / 2];
+        assert!(
+            median <= 1e-5,
+            "median constant error {:.3e} (worst SSE rel {:.3e})",
+            median,
+            worst_sse_rel
+        );
+    }
+
+    #[test]
+    fn gpu_fit_matches_a_nonlinear_cpu_fit() {
+        let n = 800;
+        let (x, _) = dataset(n);
+        let target = model(&[2.0, -0.5, 0.8, 0.0, 1.0]);
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+                eval(&target, r) + noise
+            })
+            .collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        let mut cpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
+        let cpu_sse = crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
+        let cpu_c = constants(&cpu_tree);
+
+        let mut gpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
+        let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("nonlinear plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8);
+        assert_eq!(out[0].status, 0, "the nonlinear fixture is well conditioned");
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu_c = constants(&gpu_tree);
+        assert_eq!(cpu_c.len(), 5);
+        assert_eq!(gpu_c.len(), 5);
+        for (a, b) in gpu_c.iter().zip(&cpu_c) {
+            let e = (a - b).abs() / (1.0 + b.abs());
+            assert!(e <= 1e-5, "constant error {:.3e}: {} vs {}", e, a, b);
+        }
+        let mut gpu_sse_tree = gpu_tree.clone();
+        let gpu_sse = sse_at(&mut gpu_sse_tree, &x, &y);
+        let rel = (gpu_sse - cpu_sse).abs() / cpu_sse.abs().max(1e-8);
+        assert!(rel <= 1e-8, "SSE relative {:.3e}", rel);
+    }
+
+    #[test]
+    fn p_above_the_kernel_cap_is_rejected_for_cpu_fallback() {
+        for p in 17..=20usize {
+            let start: Vec<f64> = vec![0.1; p];
+            assert!(
+                crate::fit::gpu_fit_plan(&model(&start)).is_none(),
+                "p={} must stay on the CPU",
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn rank_deficient_and_non_finite_fixtures_are_labelled() {
+        let n = 400;
+        let (x, _) = dataset(n);
+        let (cols, y32) = cols_from(&x, &vec![0.0; n]);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+
+        // Two identical columns: J^T J is exactly rank deficient.
+        let x0 = input(0);
+        let collinear = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.1), x0.clone()]),
+                node(Op::Mul, vec![constant(0.2), x0.clone()]),
+            ],
+        );
+        let tree = collinear;
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("collinear plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
+
+        // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
+        let bad = node(
+            Op::Sqrt,
+            vec![node(
+                Op::Sub,
+                vec![constant(0.25), node(Op::Square, vec![input(0)])],
+            )],
+        );
+        let y: Vec<f64> = x.iter().map(|r| eval(&bad, r)).collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
+        let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
+        let (out, _) = ev.fit_batch(&[&plan], 4);
+        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+
+        // Unsupported (piecewise-constant) operators never reach the kernel.
+        let floor = node(Op::Floor, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
+        assert!(crate::fit::gpu_fit_plan(&floor).is_none());
+    }
+
+
+    /// #169 measurement (ignored): fit-stage throughput of the batched kernel
+    /// versus the CPU LM on `P` candidates over `N = 154k` rows. Run with
+    /// `cargo test --release --features cuda --lib bench_batched_fit -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_batched_fit() {
+        fn nl(c: &[f64]) -> Node {
+            let x = input(0);
+            let trig = |coef: f64, freq: f64, cos: bool| {
+                let arg = node(Op::Mul, vec![constant(freq), x.clone()]);
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(coef),
+                        node(if cos { Op::Cos } else { Op::Sin }, vec![arg]),
+                    ],
+                )
+            };
+            match c.len() {
+                4 => node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(c[3]), x.clone()]),
+                        node(
+                            Op::Add,
+                            vec![
+                                trig(c[1], c[2], false),
+                                constant(c[0]),
+                            ],
+                        ),
+                    ],
+                ),
+                8 => node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(c[7]), x.clone()]),
+                        node(
+                            Op::Add,
+                            vec![
+                                trig(c[1], c[2], false),
+                                node(
+                                    Op::Add,
+                                    vec![
+                                        trig(c[3], c[4], true),
+                                        node(
+                                            Op::Add,
+                                            vec![
+                                                node(
+                                                    Op::Mul,
+                                                    vec![
+                                                        constant(c[5]),
+                                                        node(Op::Tanh, vec![node(
+                                                            Op::Mul,
+                                                            vec![constant(c[6]), x.clone()],
+                                                        )]),
+                                                    ],
+                                                ),
+                                                constant(c[0]),
+                                            ],
+                                        ),
+                                    ],
+                                ),
+                            ],
+                        ),
+                    ],
+                ),
+                _ => unreachable!(),
+            }
+        }
+
+        let n = 154_000usize;
+        let threads = 8usize;
+        let (x, _) = dataset(n);
+        for p in [4usize, 8] {
+            // The issue's gate is P >= 512; measure a quarter of that for the
+            // 8-thread CPU wall while keeping this benchmark under a minute.
+            let candidates: usize = if p == 4 { 256 } else { 64 };
+            let target: Vec<f64> = (0..p).map(|k| 0.5 + 0.23 * k as f64).collect();
+            let start: Vec<f64> = target.iter().map(|&v| 0.9 * v).collect();
+            let target_tree = nl(&target);
+            let y: Vec<f64> = x
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+                    eval(&target_tree, r) + noise
+                })
+                .collect();
+            let (cols, y32) = cols_from(&x, &y);
+
+            let t0 = std::time::Instant::now();
+            let per = candidates.div_ceil(threads);
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    let x = &x;
+                    let y = &y;
+                    let start = &start;
+                    scope.spawn(move || {
+                        for _ in 0..per {
+                            let mut t = nl(start);
+                            crate::fit::fit_weighted(&mut t, x, y, &[], 8);
+                        }
+                    });
+                }
+            });
+            let cpu = t0.elapsed().as_secs_f64();
+
+            let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU benchmark: no usable device");
+                    return;
+                }
+            };
+            let mut cols64 = vec![0.0f64; n];
+            for i in 0..n {
+                cols64[i] = x[i][0];
+            }
+            ev.set_fit_data(&cols64, &y);
+            let plan = crate::fit::gpu_fit_plan(&nl(&start)).expect("plan");
+            let plans: Vec<&crate::fit::GpuFitPlan> =
+                (0..candidates).map(|_| &plan).collect();
+            let t1 = std::time::Instant::now();
+            let (out, ms) = ev.fit_batch(&plans, 8);
+            let gpu = t1.elapsed().as_secs_f64();
+            let ok = out.iter().filter(|r| r.status == 0).count();
+            eprintln!(
+                "p={} N={} P={} cpu={:.3}s gpu={:.3}s (kernel {:.1}ms, ok {}/{}) fit speedup={:.1}x",
+                p,
+                n,
+                candidates,
+                cpu,
+                gpu,
+                ms,
+                ok,
+                out.len(),
+                cpu / gpu.max(1e-9)
+            );
+        }
+    }
+
+    #[test]
+    fn a_fitted_tree_is_independent_of_batch_composition() {
+        let n = 400;
+        let (x, _) = dataset(n);
+        let target = model(&[2.0, -0.5, 1.0]);
+        let y: Vec<f64> = x.iter().map(|r| eval(&target, r)).collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let start = model(&[0.3, 0.2, 0.1]);
+        let alone = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (out_alone, _) = ev.fit_batch(&[&alone], 6);
+        assert_eq!(out_alone[0].status, 0);
+
+        // Same candidate repeated four times: every block owns one candidate,
+        // so every result must be bit-identical to the lone fit.
+        let plans: Vec<_> = (0..4)
+            .map(|_| crate::fit::gpu_fit_plan(&start).expect("plan"))
+            .collect();
+        let plan_refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (out, _) = ev.fit_batch(&plan_refs, 6);
+        for r in &out {
+            assert_eq!(r.status, 0);
+            assert_eq!(r.c, out_alone[0].c, "batch composition changed constants");
+            assert_eq!(r.sse.to_bits(), out_alone[0].sse.to_bits());
+        }
     }
 }

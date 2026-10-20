@@ -382,11 +382,17 @@ struct GpuSearch {
     pool: Option<crate::genome::GenomePool>,
     /// #131: per-generation opcode/fallback counts.
     stats: BTreeMap<usize, GpuGenStats>,
+    /// #169: batched GPU-fit outcomes for this run.
+    fit_attempts: usize,
+    fit_gpu: usize,
+    fit_fallback: usize,
+    /// #169: wall time spent in the batched fit kernels, milliseconds.
+    fit_ms: f64,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
-    fn new(train: &Sample) -> Result<Self, String> {
+    fn new(train: &Sample, fit_data: bool) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -410,17 +416,117 @@ impl GpuSearch {
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
         match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
-            Some(ev) => Ok(GpuSearch {
+            Some(mut ev) => {
+                // #169: the batched fit's final polish runs on the exact f64
+                // rows, so its constants are not limited by the f32 evaluator
+                // copy. Only the GPU-fit arm pays this second resident copy.
+                if fit_data {
+                    let mut cols64 = vec![0.0f64; n_rows * n_vars];
+                    for (r, row) in train.x.iter().enumerate() {
+                        for (v, &x) in row.iter().enumerate().take(n_vars) {
+                            cols64[v * n_rows + r] = x;
+                        }
+                    }
+                    let _ = ev.set_fit_data(&cols64, &train.y);
+                }
+                Ok(GpuSearch {
                 ev,
                 n_rows,
                 pool: None,
                 stats: BTreeMap::new(),
-            }),
+                    fit_attempts: 0,
+                    fit_gpu: 0,
+                    fit_fallback: 0,
+                    fit_ms: 0.0,
+                })
+            }
             None => Err(format!(
                 "no usable CUDA device ({})",
                 crate::gpu::GpuEvaluator::device_name()
             )),
         }
+    }
+
+    /// #169: move the constants of every pending candidate with the batched
+    /// GPU Levenberg–Marquardt kernel.
+    ///
+    /// A candidate is offered to the kernel only when its tree has an analytic
+    /// GPU derivative, at most [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants,
+    /// at most [`crate::fit::GPU_FIT_MAX_NODES`] nodes, and at least `32p`
+    /// rows. Everything else — and every result the kernel marks ill-conditioned
+    /// or non-finite — is refit by the exact CPU f64 arm, seeded with whatever
+    /// constants the kernel produced. Returns `(attempts, gpu, fallback)` for
+    /// this batch.
+    fn fit_pending(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        train: &Sample,
+        cfg: &Config,
+    ) -> (usize, usize, usize) {
+        let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
+        let mut fallbacks: Vec<(usize, usize)> = Vec::new();
+        for (i, pop) in islands.iter().enumerate() {
+            for (j, ind) in pop.iter().enumerate() {
+                if !ind.error.is_nan() {
+                    continue;
+                }
+                let eligible = crate::fit::gpu_fit_plan(&ind.tree)
+                    .filter(|p| train.len() >= 32 * p.nconst);
+                match eligible {
+                    Some(plan) => jobs.push((i, j, plan)),
+                    None => fallbacks.push((i, j)),
+                }
+            }
+        }
+        let attempts = jobs.len() + fallbacks.len();
+        let mut gpu_ok = 0usize;
+
+        if !jobs.is_empty() {
+            let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
+            let (out, ms) = self.ev.fit_batch(&plans, cfg.fit_iters);
+            if ms > 0.0 {
+                self.fit_ms += ms as f64;
+            }
+            if out.len() == jobs.len() {
+                for ((i, j, plan), res) in jobs.iter().zip(out) {
+                    let usable = res.status == 0 && res.c.iter().all(|v| v.is_finite());
+                    if res.c.iter().all(|v| v.is_finite()) {
+                        plan.apply(&mut islands[*i][*j].tree, &res.c);
+                    }
+                    if usable {
+                        gpu_ok += 1;
+                        crate::fit::note_gpu_fit(true);
+                    } else {
+                        fallbacks.push((*i, *j));
+                        crate::fit::note_gpu_fit(false);
+                    }
+                }
+            } else {
+                // The launch failed: every offered candidate goes to the CPU.
+                for (i, j, _) in &jobs {
+                    fallbacks.push((*i, *j));
+                    crate::fit::note_gpu_fit(false);
+                }
+            }
+        }
+
+        // Exact CPU fallback, seeded with the GPU constants when there were any.
+        for &(i, j) in &fallbacks {
+            let tree = &mut islands[i][j].tree;
+            crate::fit::fit_weighted_metric(
+                tree,
+                &train.x,
+                &train.y,
+                &train.w,
+                cfg.fit_iters,
+                cfg.metric,
+            );
+        }
+
+        self.fit_attempts += attempts;
+        self.fit_gpu += gpu_ok;
+        self.fit_fallback += fallbacks.len();
+        (attempts, gpu_ok, fallbacks.len())
     }
 
     /// Score every pending (`error.is_nan()`) individual in every island in one
@@ -450,6 +556,14 @@ impl GpuSearch {
         if pending.is_empty() {
             return Ok(());
         }
+
+        // #169: the GPU-fit arm leaves offspring with their search constants;
+        // move them with the batched kernel before compiling the score batch.
+        let fit_counts = if defers_fit_to_gpu(cfg, true) {
+            Some(self.fit_pending(islands, train, cfg))
+        } else {
+            None
+        };
 
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
@@ -489,6 +603,11 @@ impl GpuSearch {
         stats.generation = generation;
         stats.programs += pool.len();
         stats.fallbacks += on_cpu.len();
+        if let Some((attempts, gpu, fallback)) = fit_counts {
+            stats.fit_attempts += attempts;
+            stats.fit_gpu += gpu;
+            stats.fit_fallback += fallback;
+        }
 
         if !pool.is_empty() {
             let (sse, ms) = self.ev.eval_pool(pool);
@@ -527,6 +646,11 @@ impl GpuSearch {
                 .values()
                 .cloned()
                 .collect(),
+            fit_attempts: self.fit_attempts,
+            fit_gpu: self.fit_gpu,
+            fit_fallback: self.fit_fallback,
+            fit_refits: 0,
+            fit_ms: self.fit_ms,
         }
     }
 }
@@ -1072,6 +1196,19 @@ fn training_for_generation(cfg: &Config, train: &Sample, generation: usize) -> O
 /// rows a generation is scored on.
 const FIT_SUBSET_SALT: u32 = 0x85F1_7A5B;
 
+/// #169: true when this generation's offspring are left unfitted for the
+/// batched GPU LM arm. The kernel minimises squared error, so only that metric
+/// qualifies; every other configuration keeps the CPU fit path it had before.
+fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
+    defer_gpu
+        && cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0
+        && matches!(
+            cfg.metric,
+            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
+        )
+}
+
 /// #85: true when constants are fitted on fewer rows than the generation's
 /// scoring sample. A request at least as large as the sample is a no-op.
 fn fit_sampling_active(cfg: &Config, sample: &Sample) -> bool {
@@ -1155,20 +1292,76 @@ fn full_data_archive(
     islands: &[Vec<Ind>],
     train: &EvalSample, // #27 sample + cached SoA columns
     cfg: &Config,       // #15 refit per-output constants; #25 dimensional filter
-) -> Archive {
+    // #169: refit every finalist with the exact CPU f64 arm because the search
+    // used the batched GPU constants.
+    refit_gpu_fit: bool,
+) -> (Archive, usize) {
     let trees: Vec<&Node> = archive
         .items
         .iter()
         .map(|s| &s.tree)
         .chain(islands.iter().flat_map(|pop| pop.iter().map(|ind| &ind.tree)))
         .collect();
-    let mut out = Archive::new(archive.cap);
+    let mut unique: Vec<Node> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     for tree in trees {
-        if !seen.insert(expr::structural_hash(tree)) {
-            continue;
+        if seen.insert(expr::structural_hash(tree)) {
+            unique.push(expr::simplify(tree));
         }
-        let tree = expr::simplify(tree);
+    }
+    let mut refits = 0usize;
+    // #169: reported constants must come from the exact CPU f64 arm, not from
+    // the f32 row arithmetic of the batched kernel. This is a warm start from
+    // the GPU constants on the full training sample. Trees are independent, so
+    // the refit is split across workers; the result order is unchanged.
+    if refit_gpu_fit && cfg.fit_iters > 0 && !train.sample.is_multi() {
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(unique.len().max(1));
+        let blocks = expr::current_blocks();
+        if workers > 1 && unique.len() > 1 {
+            let per = unique.len().div_ceil(workers);
+            std::thread::scope(|scope| {
+                for chunk in unique.chunks_mut(per) {
+                    let blocks = blocks.clone();
+                    scope.spawn(move || {
+                        expr::set_blocks(blocks);
+                        for t in chunk.iter_mut() {
+                            crate::fit::fit_weighted_metric(
+                                t,
+                                &train.sample.x,
+                                &train.sample.y,
+                                &train.sample.w,
+                                cfg.fit_iters,
+                                cfg.metric,
+                            );
+                            *t = expr::simplify(t);
+                        }
+                    });
+                }
+            });
+        } else {
+            for t in unique.iter_mut() {
+                crate::fit::fit_weighted_metric(
+                    t,
+                    &train.sample.x,
+                    &train.sample.y,
+                    &train.sample.w,
+                    cfg.fit_iters,
+                    cfg.metric,
+                );
+                *t = expr::simplify(t);
+            }
+        }
+        for _ in 0..unique.len() {
+            crate::fit::note_gpu_refit();
+        }
+        refits = unique.len();
+    }
+    let mut out = Archive::new(archive.cap);
+    for tree in unique {
         // #15: combined error on a multi-output sample; #25: a rejected
         // candidate must not sneak back in on the full-data rebuild.
         let error = if cfg.accepts_dimensions(&tree) {
@@ -1183,7 +1376,7 @@ fn full_data_archive(
             error,
         });
     }
-    out
+    (out, refits)
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
@@ -1358,7 +1551,10 @@ fn evolve_island(
         // outputs need; it is fitted per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
-        if cfg.fit_iters > 0 && !train.sample.is_multi() {
+        // #169: with the GPU-fit arm active the constants are moved by the
+        // batched kernel before scoring; fitting them here would hide the
+        // offload behind a CPU LM pass.
+        if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
             fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
@@ -1390,7 +1586,7 @@ fn evolve_island(
         // #15: multi-output fits per output inside the evaluator.
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
-        if cfg.fit_iters > 0 && !train.sample.is_multi() {
+        if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
             fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
@@ -1433,12 +1629,27 @@ pub struct GpuGenStats {
     pub programs: usize,
     /// Candidates sent to the CPU fallback in the same batch.
     pub fallbacks: usize,
+    /// #169: candidates offered to the batched GPU fit.
+    pub fit_attempts: usize,
+    /// #169: candidates the batched GPU fit returned usable constants for.
+    pub fit_gpu: usize,
+    /// #169: candidates refit by the exact CPU arm (unsupported, ill-conditioned
+    /// or non-finite).
+    pub fit_fallback: usize,
 }
 
 /// #131: aggregate GPU usage for a run.
 #[derive(Clone, Debug, Default)]
 pub struct GpuRunStats {
     pub generations: Vec<GpuGenStats>,
+    /// #169: batched GPU-fit totals for the run.
+    pub fit_attempts: usize,
+    pub fit_gpu: usize,
+    pub fit_fallback: usize,
+    /// #169: exact CPU f64 refits of finalists before reporting.
+    pub fit_refits: usize,
+    /// #169: wall time spent in the batched fit kernels, milliseconds.
+    pub fit_ms: f64,
 }
 
 pub struct Outcome {
@@ -1679,8 +1890,8 @@ fn run_search(
     let blocks = expr::current_blocks();
 
     // #26/#141: one resident evaluator for the full training sample, used for
-    // whole generations. Constants were already fitted on the CPU; this only
-    // chooses where the tree evaluation runs. The backend report below records
+    // whole generations. With the default `exact` arm constants are fitted on
+    // the CPU before the batch; `--fit-strategy gpu` adds a fit batch (#169). The backend report below records
     // what actually ran: a missing feature, a missing device, an unsupported
     // objective or a runtime CUDA error leaves the CPU path and a reason.
     #[cfg(feature = "cuda")]
@@ -1700,11 +1911,17 @@ fn run_search(
                 backend_reason = Some(reason.to_string());
                 None
             }
-            None => match GpuSearch::new(train) {
+            None => match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu()) {
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
-                        let scheduling = if cfg.pipeline_depth == 0 {
+                        // #169: the GPU-fit arm runs at the generation
+                        // barrier, so the overlap pipeline is off for it.
+                        let scheduling = if cfg.fit_strategy.defers_to_gpu()
+                            && defers_fit_to_gpu(cfg, true)
+                        {
+                            "GPU-fit batches (synchronous)".to_string()
+                        } else if cfg.pipeline_depth == 0 {
                             "synchronous batches".to_string()
                         } else {
                             format!(
@@ -1740,6 +1957,13 @@ fn run_search(
                 eprintln!("# gpu: unavailable (built without --features cuda)");
             }
         }
+    }
+    #[cfg(feature = "cuda")]
+    if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
+        eprintln!(
+            "# gpu-fit: off (the batched kernel minimises squared error; \
+             --metric must be squared, aic, aicc or bic)"
+        );
     }
     #[cfg(feature = "cuda")]
     let mut defer_gpu = gpu.is_some();
@@ -2047,7 +2271,13 @@ fn run_search(
             // bounded queue and scores batches. Selection still waits for every
             // result at the barrier, so the trajectory is unchanged.
             #[cfg(feature = "cuda")]
-            let pipeline_active = !screened && defer_gpu && cfg.pipeline_depth > 0;
+            // #169: the overlap pipeline scores a tree as soon as it is offered,
+            // before the barrier fit batch runs, so it cannot carry GPU-fitted
+            // constants. The GPU-fit arm uses the synchronous batch instead.
+            let pipeline_active = !screened
+                && defer_gpu
+                && cfg.pipeline_depth > 0
+                && !defers_fit_to_gpu(cfg, defer_gpu);
             #[cfg(not(feature = "cuda"))]
             let pipeline_active = false;
             // One batch is `pop / depth` candidates, so `depth` batches queue
@@ -2325,7 +2555,10 @@ fn run_search(
                             );
                             // #15: multi-output fits per output inside the evaluator.
                             let mut fitted = None;
-                            if cfg.fit_iters > 0 && !gen_train.is_multi() {
+                            if cfg.fit_iters > 0
+                                && !gen_train.is_multi()
+                                && !defers_fit_to_gpu(cfg, defer_gpu)
+                            {
                                 fitted = fit_constants(&mut t, cfg, fit_train, gen_train); // #85 #87
                             }
                             // #26: restart trees are batched with the next GPU
@@ -2423,12 +2656,18 @@ fn run_search(
         emit(&mut on_checkpoint, &cp);
     }
 
+    // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
+    // f64 LM before it is scored on all training rows.
+    let gpu_fit_used = cfg.fit_strategy.defers_to_gpu() && gpu_used;
+    let mut gpu_fit_refits = 0usize;
     if subsampling_active(cfg, train) || gpu_used || resumed || fit_screened {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
         // training row with the CPU in f64. From here on the archive and every
         // number derived from it are full-data and match the CPU backend.
-        archive = full_data_archive(&archive, &islands, &train_data, cfg); // #25 #85
+        let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
+        archive = rebuilt.0;
+        gpu_fit_refits = rebuilt.1;
     } else {
         for pop in &islands {
             for ind in pop {
@@ -2478,9 +2717,20 @@ fn run_search(
     // #131: the GPU report is emitted only for a run that actually used the
     // device, so a CPU run's JSON is byte-identical to before.
     #[cfg(feature = "cuda")]
-    let gpu_stats = if gpu_used { gpu.as_ref().map(|g| g.run_stats()) } else { None };
+    let gpu_stats = if gpu_used {
+        gpu.as_ref().map(|g| {
+            let mut s = g.run_stats();
+            s.fit_refits = gpu_fit_refits;
+            s
+        })
+    } else {
+        None
+    };
     #[cfg(not(feature = "cuda"))]
-    let gpu_stats: Option<GpuRunStats> = None;
+    let gpu_stats: Option<GpuRunStats> = {
+        let _ = gpu_fit_refits;
+        None
+    };
 
     Ok(Outcome {
         archive: final_archive,

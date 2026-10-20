@@ -21,7 +21,7 @@ const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 
 /// #116: which exact constant-fitting arm the search may use.
 ///
-/// All three arms minimise the same weighted squared error on the same rows in
+/// All arms minimise the same weighted squared error on the same rows in
 /// `f64`; they differ only in *how* they reach the minimum. `Exact` is the
 /// historical Levenberg–Marquardt path, bit for bit. `Auto` and `Linear` first
 /// try the closed-form linear least-squares arm for trees that are affine in
@@ -29,6 +29,14 @@ const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
 /// rank-deficient or whose solution is not an improvement, falls back to
 /// `Exact`. The linear arm is an exact global minimiser for its class, not an
 /// approximation, so it cannot make the objective worse on those trees.
+///
+/// #169: `Gpu` is the opt-in batched GPU arm. During a CUDA-guided search the
+/// offspring are left unfitted for [`GpuFitPlan`] and a whole generation is
+/// fitted in one block-per-candidate kernel; every unsupported, ill-conditioned
+/// or non-finite candidate is refit on the CPU, and every finalist is refit
+/// exactly in `f64` before reporting. When no batch context exists (a direct
+/// [`fit_weighted_strategy`] call, a checkpoint resume, a non-CUDA build) the
+/// arm behaves like `Exact`; it is never silently a no-op inside the search.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FitStrategy {
     /// Today's CPU Levenberg–Marquardt.
@@ -37,6 +45,8 @@ pub enum FitStrategy {
     Auto,
     /// The linear arm with an `Exact` fallback when a tree is ineligible.
     Linear,
+    /// #169: batched GPU LM with a per-candidate CPU fallback.
+    Gpu,
 }
 
 impl FitStrategy {
@@ -46,6 +56,7 @@ impl FitStrategy {
             "exact" | "cpu" => Some(FitStrategy::Exact),
             "auto" => Some(FitStrategy::Auto),
             "linear" => Some(FitStrategy::Linear),
+            "gpu" => Some(FitStrategy::Gpu),
             _ => None,
         }
     }
@@ -56,7 +67,14 @@ impl FitStrategy {
             FitStrategy::Exact => "exact",
             FitStrategy::Auto => "auto",
             FitStrategy::Linear => "linear",
+            FitStrategy::Gpu => "gpu",
         }
+    }
+
+    /// #169: whether the search should leave offspring unfitted for the
+    /// batched GPU arm instead of fitting each candidate on the CPU.
+    pub fn defers_to_gpu(self) -> bool {
+        matches!(self, FitStrategy::Gpu)
     }
 }
 
@@ -86,6 +104,172 @@ pub fn fit_arm_counts() -> (u64, u64) {
         LINEAR_FITS.load(Ordering::Relaxed),
         EXACT_FITS.load(Ordering::Relaxed),
     )
+}
+
+// #169: batched-GPU fit accounting. `GPU_FITS` counts candidates the kernel
+// completed with a usable result; `GPU_FALLBACKS` counts candidates the search
+// then refit on the CPU (unsupported tree, non-finite row, ill-conditioned
+// normal equations, or no device). `GPU_REFITS` counts the exact finalist
+// refits performed before reporting. Diagnostics only; no decision reads them.
+static GPU_FITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_FALLBACKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GPU_REFITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #169: `(gpu, fallback, exact_refit)` counts since process start.
+pub fn gpu_fit_counts() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering;
+    (
+        GPU_FITS.load(Ordering::Relaxed),
+        GPU_FALLBACKS.load(Ordering::Relaxed),
+        GPU_REFITS.load(Ordering::Relaxed),
+    )
+}
+
+/// #169: record one GPU-fit outcome (`true` = usable, `false` = fallback).
+pub fn note_gpu_fit(usable: bool) {
+    use std::sync::atomic::Ordering;
+    if usable {
+        GPU_FITS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        GPU_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// #169: record one exact CPU `f64` finalist refit.
+pub fn note_gpu_refit() {
+    GPU_REFITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// #169: largest number of constants the batched GPU kernel fits.
+pub const GPU_FIT_MAX_CONSTANTS: usize = 16;
+
+/// #169: largest flattened program (nodes) the batched GPU kernel fits.
+pub const GPU_FIT_MAX_NODES: usize = 96;
+
+/// #169: fit-plan opcodes, kept numerically identical to the evaluator
+/// opcodes in `src/gpu.rs` / `src/cuda/eval.cu` so the two kernels share the
+/// arithmetic cases.
+pub(crate) mod gpu_op {
+    pub const CONST: u32 = 0;
+    pub const VAR: u32 = 1;
+    pub const ADD: u32 = 2;
+    pub const SUB: u32 = 3;
+    pub const MUL: u32 = 4;
+    pub const DIV: u32 = 5;
+    pub const SIN: u32 = 6;
+    pub const COS: u32 = 7;
+    pub const TAN: u32 = 8;
+    pub const EXP: u32 = 9;
+    pub const LOG: u32 = 10;
+    pub const SQRT: u32 = 11;
+    pub const ABS: u32 = 12;
+    pub const TANH: u32 = 13;
+    pub const SIG: u32 = 14;
+    pub const SQUARE: u32 = 15;
+    pub const CUBE: u32 = 16;
+    pub const NEG: u32 = 17;
+    pub const GAUSS: u32 = 18;
+    pub const POW: u32 = 20;
+    pub const SINH: u32 = 21;
+    pub const COSH: u32 = 22;
+    pub const ERF: u32 = 28;
+    pub const ERFC: u32 = 29;
+}
+
+/// #169: map an operator to the fit kernel's opcode. Only operators with a
+/// well-defined analytic derivative in both the value and adjoint sweeps are
+/// eligible; everything else (piecewise-constant, logical, constraint, block,
+/// aggregate and meta operators) makes the candidate fall back to the CPU.
+fn gpu_fit_opcode(op: Op) -> Option<u32> {
+    use gpu_op as g;
+    use Op::*;
+    Some(match op {
+        Const => g::CONST,
+        Input => g::VAR,
+        Add => g::ADD,
+        Sub => g::SUB,
+        Mul => g::MUL,
+        Div => g::DIV,
+        Sin => g::SIN,
+        Cos => g::COS,
+        Tan => g::TAN,
+        Exp => g::EXP,
+        Ln => g::LOG,
+        Sqrt => g::SQRT,
+        Abs => g::ABS,
+        Tanh => g::TANH,
+        Logistic => g::SIG,
+        Square => g::SQUARE,
+        Cube => g::CUBE,
+        Neg => g::NEG,
+        Gauss => g::GAUSS,
+        Pow => g::POW,
+        Sinh => g::SINH,
+        Cosh => g::COSH,
+        Erf => g::ERF,
+        Erfc => g::ERFC,
+        _ => return None,
+    })
+}
+
+/// #169: a candidate flattened for the batched GPU fit kernel.
+///
+/// The program is a postorder array of `4`-word records `[op, kid0, kid1,
+/// slot]`; constants are kept in `c0` so the kernel can move them, and `flat`
+/// is retained so the fitted values can be written back into the tree exactly
+/// like the CPU LM path does.
+pub(crate) struct GpuFitPlan {
+    pub(crate) words: Vec<u32>,
+    pub(crate) nconst: usize,
+    pub(crate) c0: Vec<f64>,
+    flat: Flat,
+}
+
+impl GpuFitPlan {
+    /// Write `c` back into `tree`'s constant slots.
+    pub(crate) fn apply(&self, tree: &mut Node, c: &[f64]) {
+        write_constants(tree, &self.flat, c);
+    }
+}
+
+/// #169: build the GPU fit plan for `tree`, or `None` when the candidate must
+/// stay on the CPU (non-affine block bodies, too many constants or nodes, or an
+/// operator without an analytic GPU derivative).
+pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
+    let f = flatten(tree);
+    if f.nconst == 0 || f.nconst > GPU_FIT_MAX_CONSTANTS || f.op.len() > GPU_FIT_MAX_NODES {
+        return None;
+    }
+    if !f.shared.is_empty() {
+        return None; // block bodies share constants; the CPU path owns those
+    }
+    let mut words = Vec::with_capacity(f.op.len() * 4);
+    for i in 0..f.op.len() {
+        let op = gpu_fit_opcode(f.op[i])?;
+        let kids = &f.kids[i];
+        let k0 = kids.first().copied().unwrap_or(0) as u32;
+        let k1 = kids.get(1).copied().unwrap_or(0) as u32;
+        let slot = if f.cslot[i] >= 0 {
+            f.cslot[i] as u32
+        } else if f.op[i] == Op::Input {
+            f.val[i] as u32
+        } else {
+            u32::MAX
+        };
+        words.extend_from_slice(&[op, k0, k1, slot]);
+    }
+    let mut c0 = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c0[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    Some(GpuFitPlan {
+        words,
+        nconst: f.nconst,
+        c0,
+        flat: f,
+    })
 }
 
 /// Flattened expression: children always precede parents, so index order is a
@@ -977,6 +1161,10 @@ pub fn fit_weighted_strategy(
     if !w.is_empty() && w.len() != x.len() {
         return f64::INFINITY;
     }
+    // #169: `Gpu` only changes the search's *scheduling* (offspring are left
+    // for the batched kernel). Any direct call lacks that batch context, so it
+    // uses the same exact CPU arms as `Auto`: the linear minimiser when it
+    // applies, otherwise the historical LM. It is never a no-op.
     if strategy != FitStrategy::Exact {
         if let Some(s) = fit_linear(tree, x, y, w) {
             LINEAR_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

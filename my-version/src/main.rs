@@ -350,12 +350,16 @@ SEARCH:
                              log_squashed use IRLS; auc/log_loss/hinge use
                              logistic IRLS; rank/order/correlation losses use a
                              deterministic coordinate polish
-  --fit-strategy <name>      exact | auto | linear (default exact). `exact` is
-                             the historical CPU Levenberg–Marquardt path, bit
-                             for bit. `auto`/`linear` solve trees affine in
-                             every constant by closed-form QR and fall back to
-                             exact otherwise; the linear arm is an exact global
-                             minimiser for squared error only
+  --fit-strategy <name>      exact | auto | linear | gpu (default exact).
+                             `exact` is the historical CPU Levenberg–Marquardt
+                             path, bit for bit. `auto`/`linear` solve trees
+                             affine in every constant by closed-form QR and fall
+                             back to exact otherwise; the linear arm is an exact
+                             global minimiser for squared error only. `gpu`
+                             fits a whole generation with the batched CUDA LM
+                             kernel (one block per candidate, p <= 16), falls
+                             back per candidate to exact CPU f64, and refits
+                             every finalist exactly before reporting
   --fit-report               print the constant-fitting arm counts at the end
                              of the run (diagnostics only)
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
@@ -1141,8 +1145,8 @@ fn main() {
                     }
                     None => {
                         eprintln!(
-                            "error: --fit-strategy needs exact, auto or linear (cpu is an \
-                             alias for exact), got '{}'",
+                            "error: --fit-strategy needs exact, auto, linear or gpu (cpu is \
+                             an alias for exact), got '{}'",
                             v
                         );
                         std::process::exit(EXIT_USAGE);
@@ -2860,7 +2864,12 @@ fn main() {
     let diagnostics_start = std::time::Instant::now();
 
     // #140: atomically finish the manifest with an end timestamp and timings.
-    if let (Some(path), Some(m)) = (&run_manifest_path, &manifest_state) {
+    if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
+        // #169: record the fit arm's ledger when the GPU fit ran.
+        if outcome.gpu.is_some() {
+            let (gpu, fallback, refits) = fit::gpu_fit_counts();
+            m.fit = Some((gpu, fallback, refits));
+        }
         let total_secs = run_start.elapsed().as_secs_f64();
         let phases = [
             ("data_prepare", data_prepare_secs),
@@ -2885,13 +2894,18 @@ fn main() {
         } else {
             100.0 * linear as f64 / total as f64
         };
+        let (gpu, fallback, refits) = fit::gpu_fit_counts();
         eprintln!(
-            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls)",
+            "# fit: strategy={} linear={} exact={} ({:.1}% linear, {} calls) \
+             gpu={} gpu_fallback={} exact_refits={}",
             cfg.fit_strategy.name(),
             linear,
             exact,
             share,
-            total
+            total,
+            gpu,
+            fallback,
+            refits
         );
     }
 
@@ -3893,15 +3907,33 @@ fn main() {
                                 .map(|(name, n)| format!("{}:{}", jstr(name), n))
                                 .collect();
                             format!(
-                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"opcodes\":{{{}}}}}",
+                                "{{\"generation\":{},\"programs\":{},\"fallbacks\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"opcodes\":{{{}}}}}",
                                 s.generation,
                                 s.programs,
                                 s.fallbacks,
+                                s.fit_attempts,
+                                s.fit_gpu,
+                                s.fit_fallback,
                                 ops.join(",")
                             )
                         })
                         .collect();
-                    format!("\"gpu\":{{\"generations\":[{}]}},", gens.join(","))
+                    // #169: the run-level fit-arm ledger. Only emitted for a
+                    // GPU run, so CPU JSON stays byte-identical.
+                    let fit = format!(
+                        "\"fit\":{{\"strategy\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"seconds\":{}}}",
+                        jstr(cfg.fit_strategy.name()),
+                        g.fit_attempts,
+                        g.fit_gpu,
+                        g.fit_fallback,
+                        g.fit_refits,
+                        jnum(g.fit_ms / 1000.0)
+                    );
+                    format!(
+                        "\"gpu\":{{\"generations\":[{}],{}}},",
+                        gens.join(","),
+                        fit
+                    )
                 }
                 None => String::new(),
             };

@@ -434,6 +434,75 @@ selection/archive. The pool, hash and Philox contracts above are the interface
 those stages consume; the CPU variation, simplification, fitting, checkpoints
 and f64 reporting stay authoritative meanwhile.
 
+## Batched constant fitting (issue #169)
+
+Scoring was on the GPU long before fitting was: non-affine candidates still ran
+the scalar CPU Levenberg–Marquardt loop, which dominated wall time at large `N`.
+`--fit-strategy gpu` (opt-in; `exact` remains the default) moves that loop into
+one CUDA block per candidate:
+
+1. The postorder tree is flattened into 4-word records `[op, kid0, kid1, slot]`.
+   Only operators with an analytic value and adjoint are eligible.
+2. The block evaluates the value and the reverse-mode Jacobian for its `p`
+   constants, and accumulates `JᵀJ`, `Jᵀr` and SSE. Each statistic is owned by
+   one thread and summed in fixed chunk order, so the reduction is deterministic
+   and needs no atomics.
+3. Thread 0 solves `(JᵀJ + λ diag) δ = −Jᵀr` in f64 with a Cholesky
+   conditioning gate, then the block scores the trial and accepts/rejects in the
+   same order as the CPU loop. Damping retries reuse the cached normal
+   equations.
+4. After the damped loop, four undamped Gauss–Newton steps polish the constants
+   in f64 on an exact f64 copy of the training rows (uploaded once, only when
+   this arm is selected), so the returned constants are not limited by the f32
+   evaluator copy or by f32 row arithmetic.
+
+**Eligibility and fallback.** A candidate is offered to the kernel only for the
+squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no shared block
+constants, an analytic derivative for every operator, and at least `32p` rows.
+The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
+(the undamped Cholesky diagonal ratio exceeds `1e4` or a pivot hits the
+`1e-12` floor), `2` a non-finite value or residual. Status `1`/`2`, unsupported
+trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
+constants. `--fit-report` and the `gpu.fit` JSON object count
+`attempts`/`gpu`/`fallback`/`refits`; the run manifest records the same ledger.
+
+**Exactness.** Search fitness is still f32 and only guides selection. Every
+finalist is refit by the exact CPU f64 LM on all training rows before the final
+archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
+constants and metrics therefore never come from f32. The unit tests upload the
+same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
+LM to machine precision (median `2e-15` in the p=1..16 test, median relative
+constant error `<= 1e-5` and SSE relative `<= 1e-8` asserted) and every
+ill-conditioned/non-finite candidate carries a fallback status. Without the f64
+copy (a device-allocation failure) the polish runs on f32-rounded inputs and the
+constants differ by roughly `1e-7` relative; the finalist refit still makes the
+reported numbers exact.
+
+**Measurements (RTX 3060, i7-3770K, this host).** Fit stage at `N = 154 000`,
+8-thread CPU wall versus the whole GPU batch (upload + kernel + download):
+
+| p | P | CPU wall | GPU wall | fit speed-up |
+|---:|---:|---:|---:|---:|
+| 4 | 256 | 28.0 s | 1.63 s | 17.1× |
+| 8 | 64 | 20.5 s | 0.82 s | 25.2× |
+
+`P = 256` is a quarter of the issue's `P >= 512` gate (a full run would exceed
+the one-minute benchmark budget); the p=4 cell therefore falls just short of the
+20× gate while p=8 clears it. End-to-end, N=154k, 4 islands, `--pop 64`, two
+generations, `--metric squared`, smooth finite operators: **12.53 s (`exact`) ->
+10.46 s (`gpu`), 1.20x**. The fit kernel itself was 1.38 s, i.e. about 13 % of
+end-to-end wall; 454 candidates were fitted on the device and 306 fell back (the
+random population contains many rank-deficient or non-finite starts), and 235
+finalists were refit exactly on the CPU. The `>= 1.3x` end-to-end and `>= 85 %`
+duty gates are therefore **not met by this first arm**; the measured lever is
+the fit-stage ratio on eligible candidates, and the fallback/refit share is what
+limits Amdahl. A dispatcher that avoids offering degenerate candidates and a
+lower-cost finalist refit are the follow-ups, not a default change.
+
+**Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
+arm yet: it scores a tree as soon as it is offered, before the barrier fit
+batch, so the GPU-fit path uses synchronous generation batches.
+
 ## The DGX Spark path
 
 | | |
