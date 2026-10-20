@@ -554,6 +554,8 @@ struct EvalSample<'a> {
 
 impl<'a> EvalSample<'a> {
     fn new(sample: &'a Sample, cfg: &Config) -> Self {
+        #[cfg(test)]
+        note_transpose();
         EvalSample {
             sample,
             cols: if cfg.simd {
@@ -563,6 +565,29 @@ impl<'a> EvalSample<'a> {
             },
         }
     }
+}
+
+// #133: test-only count of SoA transposes on this thread. The search builds
+// these views on the main thread (island threads share the view), so a unit
+// test can assert "once per distinct sample" instead of "once per use".
+#[cfg(test)]
+thread_local! {
+    static TRANSPOSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_transpose() {
+    TRANSPOSES.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+fn transpose_count() -> usize {
+    TRANSPOSES.with(|n| n.get())
+}
+
+#[cfg(test)]
+fn reset_transpose_count() {
+    TRANSPOSES.with(|n| n.set(0));
 }
 
 fn eval_error_on(tree: &Node, data: &EvalSample, metric: Metric) -> f64 {
@@ -1498,14 +1523,22 @@ fn run_search(
         // Generation 0's subset also scores the initial population, so nothing
         // is evaluated on the full table before the first generation.
         let init_sample = training_for_generation(cfg, train, 0);
-        let init_train = init_sample.as_ref().unwrap_or(train);
-        let init_data = EvalSample::new(init_train, cfg); // #27
+        // #133: with no predictor subset, generation 0 scores the full training
+        // sample whose SoA view already exists; do not transpose it again.
+        let init_data_owned;
+        let init_data = match &init_sample {
+            Some(sample) => {
+                init_data_owned = EvalSample::new(sample, cfg);
+                &init_data_owned
+            }
+            None => &train_data,
+        };
         // #85: with screening on, the initial population is the first set of
         // full-data parents, so it must not start on a predictor subset.
         let init_eval = if fit_sampling_active(cfg, train) {
             &train_data
         } else {
-            &init_data
+            init_data
         };
         for isl in 0..cfg.islands.max(1) {
             let depth = cfg.init_depth.min(1 + isl % 3);
@@ -1535,11 +1568,10 @@ fn run_search(
     // loaded populations is deterministic, so an ordinary CPU resume keeps the
     // exact same trajectory.
     if resumed && !defer_gpu {
-        // #27: re-scoring goes through the same SoA view as the live search.
-        let train_view = EvalSample::new(train, cfg);
+        // #27/#133: re-scoring shares the SoA view built once above.
         for pop in islands.iter_mut() {
             for ind in pop.iter_mut() {
-                ind.reeval(&train_view, cfg); // #25
+                ind.reeval(&train_data, cfg); // #25
             }
         }
     }
@@ -1556,9 +1588,16 @@ fn run_search(
         // The population is being inserted before generation 0, whose subset
         // (if any) already scores the initial individuals; use the same sample
         // so every individual competes on identical rows.
-        let init_sample = training_for_generation(cfg, train, 0);
-        let init_train = init_sample.as_ref().unwrap_or(train);
-        let init_data = EvalSample::new(init_train, cfg); // #27
+        let seed_sample = training_for_generation(cfg, train, 0);
+        // #133: no subset means the full-data view already exists.
+        let seed_data_owned;
+        let seed_data = match &seed_sample {
+            Some(sample) => {
+                seed_data_owned = EvalSample::new(sample, cfg);
+                &seed_data_owned
+            }
+            None => &train_data,
+        };
         for (k, ind) in prepare_seeds(cfg, &train_data, seeds, &aggs)
             .into_iter()
             .enumerate()
@@ -1570,8 +1609,8 @@ fn run_search(
                 error: ind.error,
             });
             if k < cfg.pop {
-                let in_pop = if init_sample.is_some() {
-                    Ind::evaluated(ind.tree.clone(), &init_data, cfg) // #25
+                let in_pop = if seed_sample.is_some() {
+                    Ind::evaluated(ind.tree.clone(), seed_data, cfg) // #25
                 } else if defer_gpu {
                     // #26: the archive keeps the CPU error; the population copy
                     // is scored with the rest of generation 0.
@@ -1613,7 +1652,16 @@ fn run_search(
             // `None` means the full training sample, exactly as before.
             let gen_sample = training_for_generation(cfg, train, gen);
             let gen_train = gen_sample.as_ref().unwrap_or(train);
-            let gen_data = EvalSample::new(gen_train, cfg); // #27
+            // #133: transpose once per distinct sample, not once per use. With
+            // no predictor subset the generation shares the full-data view.
+            let gen_data_owned;
+            let gen_data: &EvalSample = match &gen_sample {
+                Some(sample) => {
+                    gen_data_owned = EvalSample::new(sample, cfg);
+                    &gen_data_owned
+                }
+                None => &train_data,
+            };
             // #85: a fresh screening subset for constant fitting, drawn from
             // this generation's sample. `None` keeps the whole sample.
             let fit_sample = fit_for_generation(cfg, gen_train, gen);
@@ -1630,7 +1678,7 @@ fn run_search(
             } else {
                 None
             };
-            let eval_data = screen_data.as_ref().unwrap_or(&gen_data);
+            let eval_data = screen_data.as_ref().unwrap_or(gen_data);
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -1641,7 +1689,7 @@ fn run_search(
             if gen > 0 && gen_sample.is_some() && !screened {
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
-                        ind.refit_and_reeval(&gen_data, fit_train, cfg); // #25
+                        ind.refit_and_reeval(gen_data, fit_train, cfg); // #25
                     }
                 }
             }
@@ -1818,7 +1866,7 @@ fn run_search(
                             *worst = if defer_gpu {
                                 Ind::pending(t.clone(), cfg)
                             } else {
-                                Ind::evaluated(t.clone(), &gen_data, cfg) // #25
+                                Ind::evaluated(t.clone(), gen_data, cfg) // #25
                             };
                         }
                     }
@@ -1862,7 +1910,7 @@ fn run_search(
                             *ind = if defer_gpu {
                                 Ind::pending(t, cfg)
                             } else {
-                                Ind::evaluated_fitted(t, fitted, &gen_data, cfg) // #87
+                                Ind::evaluated_fitted(t, fitted, gen_data, cfg) // #87
                             };
                         }
                         rngs[ii] = r;
@@ -2009,6 +2057,29 @@ mod tests {
             y.push(a);
         }
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    /// #133: the full training view is built once for the run and reused by
+    /// generation 0 and every generation that draws no predictor subset. The
+    /// pooled test view is built once at the end.
+    #[test]
+    fn the_full_train_view_is_transposed_once_per_run() {
+        let s = sample();
+        let mut cfg = Config::default();
+        cfg.generations = 4;
+        cfg.pop = 8;
+        cfg.fit_iters = 0;
+        cfg.islands = 1;
+        cfg.predictor_samples = None;
+        assert!(cfg.simd);
+        reset_transpose_count();
+        let _ = run(&cfg, &s, &s);
+        assert_eq!(
+            transpose_count(),
+            2,
+            "expected one full-train and one test transpose, got {}",
+            transpose_count()
+        );
     }
 
     // #76: two distinguishable front members.
