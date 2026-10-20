@@ -506,6 +506,37 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #120: QD coverage in the human-readable log.
+fn qd_text(q: Option<&qd::QdReport>) {
+    if let Some(q) = q {
+        eprintln!(
+            "# qd: {}/{} cells occupied ({:.1}%), {} entries, best error {}",
+            q.occupied,
+            q.cells,
+            100.0 * q.coverage,
+            q.entries,
+            jnum(q.best_error)
+        );
+    }
+}
+
+/// #120: QD coverage in the JSON result (`null` when the layer is off).
+fn qd_json(q: Option<&qd::QdReport>) -> String {
+    match q {
+        None => "null".to_string(),
+        Some(q) => format!(
+            "{{\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{}}}",
+            q.bins,
+            q.cells,
+            q.occupied,
+            jnum(q.coverage),
+            q.entries,
+            jnum(q.best_error),
+            q.cell_cap
+        ),
+    }
+}
+
 /// #134: non-overlapping wall-clock phases for one search run. `prep` covers
 /// argument parsing, loading and preparation; `search` is the evolutionary
 /// run; the rest are the post-search work. `total` is measured independently at
