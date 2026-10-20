@@ -300,11 +300,12 @@ atomically instead of streaming it. See
   echoed in the output.
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
-* **Bounded memory**: `--max-memory 2GB` refuses a CSV whose estimated
-  footprint (from rows x columns, not `33 x` the file) would exceed the budget,
-  with exit 3 and a fix, instead of being SIGABRT/SIGKILL'ed. `rcsr import`
-  writes a versioned `.rcsb` store that can be scanned group by group and
-  searched from a bounded hash sample when it does not fit; see
+* **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
+  (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
+  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
+  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
+  that can be scanned group by group and searched from a bounded hash sample
+  when it does not fit; v1 stores still load. See
   [`docs/data-format.md`](docs/data-format.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.

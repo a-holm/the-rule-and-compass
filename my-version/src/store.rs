@@ -1,4 +1,4 @@
-//! Versioned, out-of-core column store (issue #71).
+//! Versioned, out-of-core column store (issues #71, #127, #128).
 //!
 //! A store is a small binary container around the same column-major image the
 //! resident [`crate::data::Table`] uses:
@@ -7,11 +7,16 @@
 //! magic "RCSRBIN\0" | u32 version | u32 header_len | JSON header | data blocks
 //! ```
 //!
-//! The JSON header is self-describing (names, dtypes, `n_rows`, `group_rows`,
-//! categorical level tables and per-column, per-group block offsets), and the
-//! blocks are plain little-endian `f64` values. Lower-cardinality numeric and
-//! text columns additionally carry a `u32` code block per group, encoded as
-//! `f64` so the hot representation has one element type.
+//! Version 2 is self-describing per column: value blocks are `f64`
+//! (features/targets), `i64` (the time column, nanosecond-safe) or absent for
+//! a pure dictionary column (`u32`), and dictionary code blocks are `u32`
+//! (4 bytes) instead of the version-1 `f64` codes (8 bytes). Version 1 remains
+//! readable: it is the original all-`f64` layout, and a v1 header with an
+//! explicit `"dtype":"i64"` (the #127 extension) is read as an i64 time block.
+//! Both versions use the same group structure and relative offsets.
+//!
+//! Dictionary levels are the evaluator's view; codes are kept in a separate
+//! [`DictColumn`](crate::data::DictColumn) and never enter arithmetic.
 //!
 //! # Backing policy
 //!
@@ -39,21 +44,22 @@ use std::io::{Read, Write};
 
 /// Eight-byte magic; the trailing NUL makes a truncated file easy to reject.
 pub const MAGIC: &[u8; 8] = b"RCSRBIN\0";
-/// Format version. A mismatch is refused with an actionable message.
-///
-/// Version 1 is the original all-`f64` layout. Issue #127 adds an optional
-/// per-column `"dtype"` field *without* bumping the version: a v1 header
-/// without `dtype` is the old all-`f64` store, and a header with
-/// `"dtype":"i64"` stores that column's blocks as little-endian `i64`. This
-/// keeps every existing store readable while new stores can be
-/// nanosecond-safe.
-pub const VERSION: u32 = 1;
+/// Current format version. Writers emit v2; readers accept v1 and v2.
+pub const VERSION: u32 = 2;
+/// Original all-`f64` layout, still readable.
+pub const LEGACY_VERSION: u32 = 1;
 
-/// Storage type of one column's value blocks.
+/// Storage type of one column.
+///
+/// * `F64`: numeric value block (8 B); an optional code block is `u32`.
+/// * `I64`: the time column's value block (8 B), nanosecond-safe.
+/// * `U32`: pure dictionary/text column; no value block, only a `u32` code
+///   block. The evaluator sees levels, never codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
     F64,
     I64,
+    U32,
 }
 
 impl DType {
@@ -61,6 +67,7 @@ impl DType {
         match self {
             DType::F64 => "f64",
             DType::I64 => "i64",
+            DType::U32 => "u32",
         }
     }
 
@@ -68,6 +75,7 @@ impl DType {
         match s {
             "f64" => Some(DType::F64),
             "i64" => Some(DType::I64),
+            "u32" => Some(DType::U32),
             _ => None,
         }
     }
@@ -98,6 +106,7 @@ struct ColumnMeta {
 /// Parsed header of a store. Public so callers can budget before reading data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Header {
+    pub version: u32,
     pub n_rows: usize,
     pub n_cols: usize,
     pub group_rows: usize,
@@ -126,10 +135,28 @@ impl Header {
         self.columns.iter().map(|c| c.dtype).collect()
     }
 
-    /// Byte width of one value cell in `col`.
+    /// Byte width of one value cell in `col`. A pure dictionary column has no
+    /// value block in v2.
     fn value_width(&self, col: usize) -> u64 {
         match self.columns[col].dtype {
             DType::F64 | DType::I64 => 8,
+            DType::U32 => {
+                if self.version >= 2 {
+                    0
+                } else {
+                    8
+                }
+            }
+        }
+    }
+
+    /// Byte width of one dictionary code: v1 stored codes as `f64`, v2 as
+    /// `u32`.
+    fn code_width(&self) -> u64 {
+        if self.version >= 2 {
+            4
+        } else {
+            8
         }
     }
 
@@ -187,11 +214,11 @@ impl FileStore {
             ));
         }
         let version = read_u32(&mut file, path)?;
-        if version != VERSION {
+        if version != LEGACY_VERSION && version != VERSION {
             return Err(format!(
-                "{}: column store version {} is not supported by this build (reads version {}); \
+                "{}: column store version {} is not supported by this build (reads versions {} and {}); \
                  re-run `rcsr import` to rewrite the file",
-                path, version, VERSION
+                path, version, LEGACY_VERSION, VERSION
             ));
         }
         let header_len = read_u32(&mut file, path)? as u64;
@@ -206,7 +233,7 @@ impl FileStore {
             .map_err(|_| format!("{}: truncated column store header", path))?;
         let text = std::str::from_utf8(&raw)
             .map_err(|_| format!("{}: column store header is not UTF-8", path))?;
-        let header = parse_header(text).map_err(|e| format!("{}: {}", path, e))?;
+        let header = parse_header(text, version).map_err(|e| format!("{}: {}", path, e))?;
         let data_start = 16 + header_len;
         let mut store = FileStore {
             file,
@@ -282,7 +309,9 @@ impl FileStore {
                     ));
                 }
                 if col.has_codes {
-                    let codes_end = self.data_start + col.code_offsets[g] + len * 8;
+                    let codes_end = self.data_start
+                        + col.code_offsets[g]
+                        + len * self.header.code_width();
                     if codes_end > file_len {
                         return Err(format!(
                             "{}: truncated codes: group {} column '{}' ends at byte {} but the file is {} bytes",
@@ -337,6 +366,9 @@ impl FileStore {
                         *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
                     }
                 }
+                // A pure dictionary column has no value block; the buffer keeps
+                // NaNs and callers read the codes instead.
+                DType::U32 => {}
             }
         }
         Ok(buf.view_ref())
@@ -378,15 +410,15 @@ impl FileStore {
             return Ok(Vec::new());
         }
         let len = self.header.group_len(group);
-        let mut vals = vec![0.0f64; len];
         let mut scratch = Vec::new();
-        read_f64_block(
-            &self.file,
-            &self.path,
-            self.data_start + meta.code_offsets[group],
-            &mut vals,
-            &mut scratch,
-        )?;
+        let off = self.data_start + meta.code_offsets[group];
+        if self.header.version >= 2 {
+            let mut codes = vec![0u32; len];
+            read_u32_block(&self.file, &self.path, off, &mut codes, &mut scratch)?;
+            return Ok(codes);
+        }
+        let mut vals = vec![0.0f64; len];
+        read_f64_block(&self.file, &self.path, off, &mut vals, &mut scratch)?;
         Ok(vals
             .into_iter()
             .map(|v| {
@@ -739,6 +771,8 @@ pub fn write_store_with_time(
                 numeric: table.numeric[c],
                 dtype: if Some(c) == time_col {
                     DType::I64
+                } else if !table.numeric[c] && dict.is_some() {
+                    DType::U32
                 } else {
                     DType::F64
                 },
@@ -756,15 +790,16 @@ pub fn write_store_with_time(
         let len = group_len(n_rows, group_rows, g) as u64;
         for col in &mut columns {
             col.offsets.push(cursor);
-            cursor = cursor.saturating_add(len * 8);
+            cursor = cursor.saturating_add(len * col_value_width(col.dtype));
             if col.has_codes {
                 col.code_offsets.push(cursor);
-                cursor = cursor.saturating_add(len * 8);
+                cursor = cursor.saturating_add(len * 4);
             }
         }
     }
     let dtypes: Vec<DType> = columns.iter().map(|c| c.dtype).collect();
     let header = Header {
+        version: VERSION,
         n_rows,
         n_cols,
         group_rows,
@@ -806,6 +841,8 @@ pub fn write_store_with_time(
                         bytes.extend_from_slice(&ints.get(r).copied().unwrap_or(i64::MIN).to_le_bytes());
                     }
                 }
+                // Text/categorical: no value block, codes below.
+                DType::U32 => {}
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -813,9 +850,9 @@ pub fn write_store_with_time(
                 continue;
             };
             bytes.clear();
-            bytes.reserve((hi - lo) * 8);
+            bytes.reserve((hi - lo) * 4);
             for r in lo..hi {
-                bytes.extend_from_slice(&(dict.codes[r] as f64).to_le_bytes());
+                bytes.extend_from_slice(&dict.codes[r].to_le_bytes());
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -828,6 +865,14 @@ pub fn write_store_with_time(
 fn group_len(n_rows: usize, group_rows: usize, group: usize) -> usize {
     let lo = group.saturating_mul(group_rows);
     (n_rows.saturating_sub(lo)).min(group_rows)
+}
+
+/// v2 value-block width. A pure dictionary column stores no values.
+fn col_value_width(dtype: DType) -> u64 {
+    match dtype {
+        DType::F64 | DType::I64 => 8,
+        DType::U32 => 0,
+    }
 }
 
 fn header_json(h: &Header) -> String {
@@ -867,7 +912,7 @@ fn header_json(h: &Header) -> String {
     }
     format!(
         "{{\"format\":\"rcsr-column-store\",\"version\":{},\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[{}]}}",
-        VERSION, h.n_rows, h.n_cols, h.group_rows, cols
+        h.version, h.n_rows, h.n_cols, h.group_rows, cols
     )
 }
 
@@ -942,6 +987,29 @@ fn read_i64_block(
         let mut b = [0u8; 8];
         b.copy_from_slice(src);
         *dst = i64::from_le_bytes(b);
+    }
+    Ok(())
+}
+
+fn read_u32_block(
+    file: &File,
+    path: &str,
+    offset: u64,
+    out: &mut [u32],
+    scratch: &mut Vec<u8>,
+) -> Result<(), String> {
+    let bytes = out.len() * 4;
+    scratch.resize(bytes, 0);
+    read_exact_at(file, &mut scratch[..], offset).map_err(|e| {
+        format!(
+            "{}: reading {} bytes at offset {}: {}",
+            path, bytes, offset, e
+        )
+    })?;
+    for (dst, src) in out.iter_mut().zip(scratch.chunks_exact(4)) {
+        let mut b = [0u8; 4];
+        b.copy_from_slice(src);
+        *dst = u32::from_le_bytes(b);
     }
     Ok(())
 }
@@ -1022,7 +1090,7 @@ impl Json {
     }
 }
 
-fn parse_header(text: &str) -> Result<Header, String> {
+fn parse_header(text: &str, outer_version: u32) -> Result<Header, String> {
     let mut p = JsonParser {
         bytes: text.as_bytes(),
         pos: 0,
@@ -1031,6 +1099,16 @@ fn parse_header(text: &str) -> Result<Header, String> {
     p.ws();
     if p.pos != p.bytes.len() {
         return Err("trailing bytes in column store header".to_string());
+    }
+    let header_version = root
+        .get("version")
+        .and_then(Json::as_usize)
+        .ok_or_else(|| "header is missing version".to_string())? as u32;
+    if header_version != outer_version {
+        return Err(format!(
+            "header version {} disagrees with the file version {}",
+            header_version, outer_version
+        ));
     }
     let n_rows = root
         .get("n_rows")
@@ -1088,6 +1166,24 @@ fn parse_header(text: &str) -> Result<Header, String> {
                 name
             ));
         }
+        let has_codes = c
+            .get("has_codes")
+            .and_then(Json::as_bool)
+            .ok_or_else(|| format!("column '{}' is missing has_codes", name))?;
+        if dtype == DType::U32 {
+            if outer_version < 2 {
+                return Err(format!(
+                    "column '{}' has dtype u32, which needs store version 2 or later",
+                    name
+                ));
+            }
+            if numeric || !has_codes {
+                return Err(format!(
+                    "column '{}' has dtype u32 but is not a dictionary-only column",
+                    name
+                ));
+            }
+        }
         let levels = c
             .get("levels")
             .and_then(Json::as_arr)
@@ -1099,10 +1195,6 @@ fn parse_header(text: &str) -> Result<Header, String> {
                     .ok_or_else(|| format!("column '{}' has a non-string level", name))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let has_codes = c
-            .get("has_codes")
-            .and_then(Json::as_bool)
-            .ok_or_else(|| format!("column '{}' is missing has_codes", name))?;
         let offsets = parse_offsets(c.get("offsets"), &name)?;
         let code_offsets = parse_offsets(c.get("code_offsets"), &name)?;
         columns.push(ColumnMeta {
@@ -1119,6 +1211,7 @@ fn parse_header(text: &str) -> Result<Header, String> {
         return Err("column store has no rows".to_string());
     }
     Ok(Header {
+        version: outer_version,
         n_rows,
         n_cols,
         group_rows,
@@ -1334,6 +1427,7 @@ mod tests {
     #[test]
     fn header_json_round_trips() {
         let h = Header {
+            version: VERSION,
             n_rows: 10,
             n_cols: 2,
             group_rows: 4,
@@ -1350,7 +1444,7 @@ mod tests {
                 ColumnMeta {
                     name: "label".to_string(),
                     numeric: false,
-                    dtype: DType::F64,
+                    dtype: DType::U32,
                     levels: vec!["x".to_string(), "y".to_string()],
                     has_codes: true,
                     offsets: vec![0, 32, 64],
@@ -1359,7 +1453,7 @@ mod tests {
             ],
         };
         let text = header_json(&h);
-        let back = parse_header(&text).unwrap();
+        let back = parse_header(&text, VERSION).unwrap();
         assert_eq!(h, back);
     }
 }

@@ -90,7 +90,7 @@ fn usage() -> String {
 
 USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
-  rcsr import <input.csv> [<store.rcsb>] [--group-rows N]
+  rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr schema                 print a machine-readable description of this tool

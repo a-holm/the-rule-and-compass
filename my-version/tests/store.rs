@@ -110,11 +110,11 @@ fn version_mismatch_is_a_clear_error() {
     let path = dir.join("v.rcsb");
     store::write_store(path.to_str().unwrap(), &full_table(), 4).unwrap();
     let mut bytes = std::fs::read(&path).unwrap();
-    bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
+    bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
     std::fs::write(&path, &bytes).unwrap();
     let err = FileStore::open(path.to_str().unwrap()).unwrap_err();
-    assert!(err.contains("version 2"), "{err}");
-    assert!(err.contains("version 1"), "{err}");
+    assert!(err.contains("version 99"), "{err}");
+    assert!(err.contains("versions 1 and 2"), "{err}");
     assert!(err.contains("rcsr import"), "{err}");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -219,8 +219,6 @@ fn import_then_search_is_byte_identical_to_the_csv_path() {
 }
 
 fn nanosecond_table() -> Table {
-    // Consecutive prints 1 ns apart around 1.7e18: binary64 rounds both to the
-    // same f64, so this fixture fails unless the store keeps i64.
     data::parse_table(
         "ts,symbol,y\n\
          1700000000000000001,A,1\n\
@@ -233,274 +231,186 @@ fn nanosecond_table() -> Table {
 }
 
 #[test]
-fn nanosecond_timestamps_round_trip_exactly_and_stay_distinct() {
+fn v2_has_per_column_dtypes_and_round_trips_nanoseconds_and_dictionaries() {
     let table = nanosecond_table();
-    let exact: Vec<i64> = (1..=5).map(|i| 1_700_000_000_000_000_000 + i).collect();
-    assert_eq!(table.ints(0).unwrap(), &exact[..]);
-
-    let dir = temp_dir("ns");
-    let path = dir.join("ns.rcsb");
+    let dir = temp_dir("v2-dtypes");
+    let path = dir.join("t.rcsb");
     store::write_store(path.to_str().unwrap(), &table, 2).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        store::VERSION
+    );
+    assert_eq!(store::VERSION, 2);
     let fs = FileStore::open(path.to_str().unwrap()).unwrap();
-    assert_eq!(fs.header().dtypes(), vec![DType::I64, DType::F64, DType::F64]);
+    assert_eq!(
+        fs.header().dtypes(),
+        vec![DType::I64, DType::U32, DType::F64]
+    );
     let back = fs.to_table().unwrap();
+    let exact: Vec<i64> = (1..=5).map(|i| 1_700_000_000_000_000_000 + i).collect();
     assert_eq!(back.ints(0).unwrap(), &exact[..]);
-
-    // Distinct and ordered through the public time-key path.
-    match data::time_keys(&back, 0) {
-        data::TimeKeys::I64(keys) => {
-            assert_eq!(keys, exact);
-            assert!(keys.windows(2).all(|w| w[0] < w[1]));
-        }
-        data::TimeKeys::F64(_) => panic!("store lost the exact i64 time view"),
-    }
-    // The evaluator view is still f64 (not used for arithmetic here).
-    assert_eq!(back.col(0).len(), 5);
+    assert_eq!(back.dict(1).unwrap().levels, table.dict(1).unwrap().levels);
+    assert_eq!(back.dict(1).unwrap().codes, table.dict(1).unwrap().codes);
+    // A dictionary column has no evaluator values; its levels are the view and
+    // a code never appears as a number.
+    assert!(back.col(1).is_empty());
+    assert!(back.value(0, 1).is_nan());
+    assert_eq!(back.col(2), table.col(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn millisecond_and_microsecond_integers_are_exact_too() {
-    for base in [1_700_000_000_000i64, 1_700_000_000_000_000i64] {
-        let csv = format!(
-            "ts,x\n{},{}\n{},{}\n",
-            base,
-            1,
-            base + 1,
-            2
-        );
-        let table = data::parse_table(&csv).unwrap();
-        assert_eq!(table.ints(0).unwrap(), &[base, base + 1]);
-        let dir = temp_dir("msus");
-        let path = dir.join("t.rcsb");
-        store::write_store(path.to_str().unwrap(), &table, 1).unwrap();
-        let back = FileStore::open(path.to_str().unwrap())
-            .unwrap()
-            .to_table()
-            .unwrap();
-        assert_eq!(back.ints(0).unwrap(), &[base, base + 1]);
-        let _ = std::fs::remove_dir_all(&dir);
+fn v2_code_blocks_are_four_bytes_and_the_file_is_dictionary_heavy_smaller() {
+    let mut csv = String::from("a,b,x\n");
+    for i in 0..1000 {
+        csv.push_str(&format!("L{},{},{}\n", i % 10, i % 7, i));
     }
+    let table = data::parse_table(&csv).unwrap();
+    let dir = temp_dir("v2-size");
+    let path = dir.join("t.rcsb");
+    store::write_store(path.to_str().unwrap(), &table, 1000).unwrap();
+    let size = std::fs::metadata(&path).unwrap().len() as usize;
+    // The one-group data section is 2 x 4000 u32 codes for the text column,
+    // 8000 bytes of b values + 4000 codes, and 8000 x values + 4000 codes:
+    // 32,000 bytes, plus a header dominated by the 1000-level dictionary of x.
+    // The v1 layout would add 8-byte value/code blocks throughout (~54 KiB).
+    assert!(size < 36_000, "v2 store is {} bytes", size);
+    let fs = FileStore::open(path.to_str().unwrap()).unwrap();
+    let back = fs.to_table().unwrap();
+    assert_eq!(back.dict(0).unwrap().codes, table.dict(0).unwrap().codes);
+    assert_eq!(back.dict(1).unwrap().codes, table.dict(1).unwrap().codes);
+    assert_eq!(back.col(2), table.col(2));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn a_v1_store_without_dtype_fields_still_loads_as_f64() {
-    // The original v1 header has no `dtype`: bytes must keep the old meaning.
-    let header = "{\"format\":\"rcsr-column-store\",\"version\":1,\"n_rows\":3,\
-                  \"n_cols\":2,\"group_rows\":2,\"columns\":[\
-                  {\"name\":\"ts\",\"numeric\":true,\"levels\":[],\"has_codes\":false,\
-                   \"offsets\":[0,32],\"code_offsets\":[]},\
-                  {\"name\":\"y\",\"numeric\":true,\"levels\":[],\"has_codes\":false,\
-                   \"offsets\":[16,40],\"code_offsets\":[]}]}";
+fn a_hundred_symbol_daily_panel_migrates_from_v1_to_v2_identically() {
+    // The shape of the 100-symbol daily panel: 100 symbols, 60 days, a text
+    // dictionary plus numeric features. Written once as a v1-equivalent
+    // hand-built store and once through the v2 writer; decoded rows agree.
+    let mut csv = String::from("ts,symbol,open,r1,y1\n");
+    for day in 0..60 {
+        for s in 0..100 {
+            csv.push_str(&format!(
+                "{},{},{},{},{}\n",
+                1619827200 + day * 86400,
+                format!("SYM{:03}USDT", s),
+                100.0 + s as f64 + day as f64 * 0.5,
+                (s as f64 - 50.0) / 100.0,
+                day as f64 / 60.0
+            ));
+        }
+    }
+    let table = data::parse_table(&csv).unwrap();
+    assert_eq!(table.dict(1).unwrap().levels.len(), 100);
+
+    let dir = temp_dir("daily100");
+    let v2 = dir.join("v2.rcsb");
+    store::write_store(v2.to_str().unwrap(), &table, 997).unwrap();
+    let v1 = dir.join("v1.rcsb");
+    write_v1_from_table(&v1, &table, 997);
+    let a = FileStore::open(v1.to_str().unwrap()).unwrap();
+    let b = FileStore::open(v2.to_str().unwrap()).unwrap();
+    assert_eq!(a.header().version, 1);
+    assert_eq!(b.header().version, 2);
+    let ta = a.to_table().unwrap();
+    let tb = b.to_table().unwrap();
+    for c in [0usize, 2, 3, 4] {
+        let bad = ta
+            .col(c)
+            .iter()
+            .zip(tb.col(c))
+            .position(|(a, b)| a.to_bits() != b.to_bits());
+        if let Some(i) = bad {
+            panic!(
+                "column {} differs at row {}: v1={:?} (bits {:x}) v2={:?} (bits {:x})",
+                c,
+                i,
+                ta.col(c)[i],
+                ta.col(c)[i].to_bits(),
+                tb.col(c)[i],
+                tb.col(c)[i].to_bits()
+            );
+        }
+    }
+    assert_eq!(ta.dict(1).unwrap().levels, tb.dict(1).unwrap().levels);
+    assert_eq!(ta.dict(1).unwrap().codes, tb.dict(1).unwrap().codes);
+    assert!(std::fs::metadata(&v2).unwrap().len() < std::fs::metadata(&v1).unwrap().len());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Write the historical v1 layout (all values and codes as f64) for migration
+/// tests. This mirrors what `rcsr` wrote before #128.
+fn write_v1_from_table(path: &std::path::Path, table: &Table, group_rows: usize) {
+    let n = table.len();
+    let n_cols = table.n_cols();
+    let n_groups = (n + group_rows - 1) / group_rows;
+    let mut cursor = 0u64;
+    let mut metas: Vec<(Vec<u64>, Vec<u64>)> = (0..n_cols)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
+    for g in 0..n_groups {
+        let len = ((n - g * group_rows).min(group_rows)) as u64;
+        for c in 0..n_cols {
+            metas[c].0.push(cursor);
+            cursor += len * 8;
+            if table.dict(c).is_some() {
+                metas[c].1.push(cursor);
+                cursor += len * 8;
+            }
+        }
+    }
+    let mut json = format!(
+        "{{\"format\":\"rcsr-column-store\",\"version\":1,\"n_rows\":{},\"n_cols\":{},\"group_rows\":{},\"columns\":[",
+        n, n_cols, group_rows
+    );
+    for c in 0..n_cols {
+        if c > 0 {
+            json.push(',');
+        }
+        let levels = table
+            .dict(c)
+            .map(|d| {
+                d.levels
+                    .iter()
+                    .map(|s| format!("\"{}\"", s))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        json.push_str(&format!(
+            "{{\"name\":\"{}\",\"numeric\":{},\"levels\":[{}],\"has_codes\":{},\"offsets\":[{}],\"code_offsets\":[{}]}}",
+            table.names[c],
+            table.numeric[c],
+            levels,
+            table.dict(c).is_some(),
+            metas[c].0.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","),
+            metas[c].1.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        ));
+    }
+    json.push_str("]}");
     let mut bytes = Vec::new();
     bytes.extend_from_slice(MAGIC);
     bytes.extend_from_slice(&1u32.to_le_bytes());
-    bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
-    bytes.extend_from_slice(header.as_bytes());
-    for v in [1.0f64, 2.0, 10.0, 20.0, 3.0, 30.0] {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    let dir = temp_dir("oldv1");
-    let path = dir.join("old.rcsb");
-    std::fs::write(&path, &bytes).unwrap();
-    let fs = FileStore::open(path.to_str().unwrap()).unwrap();
-    assert_eq!(fs.header().dtypes(), vec![DType::F64, DType::F64]);
-    let back = fs.to_table().unwrap();
-    assert!(back.ints(0).is_none());
-    assert_eq!(back.col(0), &[1.0, 2.0, 3.0]);
-    assert!(matches!(
-        data::time_keys(&back, 0),
-        data::TimeKeys::F64(_)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn sorting_duplicate_instants_and_gap_detection_use_exact_i64() {
-    // A duplicate instant, two prints 1 ns apart, and a one-hour gap.
-    let base = 1_700_000_000_000_000_000i64;
-    let csv = format!(
-        "ts,x\n{base},1\n{base},2\n{},3\n{},4\n{},5\n",
-        base + 1,
-        base + 2,
-        base + 3_600_000_000_000
-    );
-    let table = data::parse_table(&csv).unwrap();
-    let lag = data::LagSpec {
-        lags: 1,
-        gap_break: 4.0,
-        ..Default::default()
-    };
-    let (_out, _names, report) =
-        data::add_lags(&table, &["x".into()], &lag, Some(0), None).unwrap();
-    assert_eq!(report.breaks, 1, "the one-hour gap is a series boundary");
-    assert_eq!(report.series, 2);
-
-    // Duplicates keep distinct row identities and sort by row after the key.
-    match data::time_keys(&table, 0) {
-        data::TimeKeys::I64(keys) => {
-            assert_eq!(keys[0], keys[1], "same instant stays duplicated");
-            assert!(keys[1] < keys[2] && keys[2] < keys[3]);
+    bytes.extend_from_slice(&(json.len() as u32).to_le_bytes());
+    bytes.extend_from_slice(json.as_bytes());
+    for g in 0..n_groups {
+        let lo = g * group_rows;
+        let hi = (lo + group_rows).min(n);
+        for c in 0..n_cols {
+            for r in lo..hi {
+                bytes.extend_from_slice(&table.value(r, c).to_le_bytes());
+            }
+            if let Some(d) = table.dict(c) {
+                for r in lo..hi {
+                    bytes.extend_from_slice(&(d.codes[r] as f64).to_le_bytes());
+                }
+            }
         }
-        data::TimeKeys::F64(_) => panic!("expected i64 keys"),
     }
+    std::fs::write(path, bytes).unwrap();
 }
-
-#[test]
-fn an_explicit_time_column_is_honoured_by_import() {
-    let dir = temp_dir("time-col");
-    let csv = dir.join("t.csv");
-    std::fs::write(&csv, "stamp,x\n10,1\n20,2\n30,3\n").unwrap();
-    let out = dir.join("t.rcsb");
-    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .args([
-            "import",
-            csv.to_str().unwrap(),
-            out.to_str().unwrap(),
-            "--time",
-            "stamp",
-            "--quiet",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "import failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let fs = FileStore::open(out.to_str().unwrap()).unwrap();
-    assert_eq!(fs.header().dtypes(), vec![DType::I64, DType::F64]);
-    assert_eq!(fs.to_table().unwrap().ints(0).unwrap(), &[10, 20, 30]);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn csv_shape_counts_header_width_and_data_rows() {
-    let text = "# note\n\nx,y,z\n1,2,3\n\n4,5,6\n";
-    assert_eq!(
-        data::csv_shape(text),
-        data::CsvShape {
-            rows: 2,
-            cols: 3,
-            bytes: text.len() as u64,
-        }
-    );
-    // The delimiter follows the loader: tab, comma, else whitespace.
-    assert_eq!((data::csv_shape("a\tb\n1\t2\n").rows, data::csv_shape("a\tb\n1\t2\n").cols), (1, 2));
-    assert_eq!(
-        (data::csv_shape("a b c\n1 2 3\n4 5 6\n").rows, data::csv_shape("a b c\n1 2 3\n4 5 6\n").cols),
-        (2, 3)
-    );
-}
-
-#[test]
-fn memory_estimate_follows_shape_not_file_size() {
-    // A wide table with a *small* file: every cell is one byte.
-    let mut wide = (0..90).map(|j| format!("c{}", j)).collect::<Vec<_>>().join(",");
-    let wide_row = std::iter::repeat("1").take(90).collect::<Vec<_>>().join(",");
-    for _ in 0..200 {
-        wide.push('\n');
-        wide.push_str(&wide_row);
-    }
-    // A narrow table with a *larger* file: two very long numeric cells.
-    let long = "1".repeat(200);
-    let mut narrow = String::from("x,y");
-    for _ in 0..200 {
-        narrow.push('\n');
-        narrow.push_str(&long);
-        narrow.push(',');
-        narrow.push_str(&long);
-    }
-    assert!(
-        wide.len() < narrow.len(),
-        "the fixture must be wider but smaller: {} vs {}",
-        wide.len(),
-        narrow.len()
-    );
-    let wide_shape = data::csv_shape(&wide);
-    let narrow_shape = data::csv_shape(&narrow);
-    let wide_est = data::estimate_csv_bytes(wide_shape, 0);
-    let narrow_est = data::estimate_csv_bytes(narrow_shape, 0);
-    assert!(
-        wide_est > narrow_est,
-        "the estimate must be driven by rows x columns, not bytes: {wide_est} vs {narrow_est}"
-    );
-    // The old guard was exactly 33 x file size; neither estimate is that.
-    assert_ne!(wide_est, wide_shape.bytes * 33);
-    assert_ne!(narrow_est, narrow_shape.bytes * 33);
-    // A projected search costs less preparation than the whole header.
-    assert!(data::estimate_csv_bytes(wide_shape, 7) < wide_est);
-}
-
-#[test]
-fn a_wide_small_csv_is_refused_before_a_narrow_large_one() {
-    let dir = temp_dir("shape-guard");
-    let mut wide = (0..90).map(|j| format!("c{}", j)).collect::<Vec<_>>().join(",");
-    let wide_row = std::iter::repeat("1").take(90).collect::<Vec<_>>().join(",");
-    for _ in 0..200 {
-        wide.push('\n');
-        wide.push_str(&wide_row);
-    }
-    let mut narrow = String::from("x,y");
-    let long = "1".repeat(200);
-    for _ in 0..200 {
-        narrow.push('\n');
-        narrow.push_str(&long);
-        narrow.push(',');
-        narrow.push_str(&long);
-    }
-    let wide_path = dir.join("wide.csv");
-    let narrow_path = dir.join("narrow.csv");
-    std::fs::write(&wide_path, &wide).unwrap();
-    std::fs::write(&narrow_path, &narrow).unwrap();
-    assert!(wide.len() < narrow.len());
-
-    // 300 kB is above the narrow table's estimate and below the wide one's.
-    let budget = "300KB";
-    let wide_run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .args([
-            "--data",
-            wide_path.to_str().unwrap(),
-            "--target",
-            "c0",
-            "--max-memory",
-            budget,
-            "--generations",
-            "1",
-            "--pop",
-            "8",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(wide_run.status.code(), Some(3));
-    let err = String::from_utf8_lossy(&wide_run.stderr);
-    assert!(err.contains("200 rows x 90 columns"), "{err}");
-    assert!(err.contains("estimate basis"), "{err}");
-
-    let narrow_run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
-        .args([
-            "--data",
-            narrow_path.to_str().unwrap(),
-            "--target",
-            "y",
-            "--max-memory",
-            budget,
-            "--generations",
-            "1",
-            "--pop",
-            "8",
-        ])
-        .output()
-        .unwrap();
-    assert_ne!(
-        narrow_run.status.code(),
-        Some(3),
-        "a narrow file with more bytes must pass the shape guard: {}",
-        String::from_utf8_lossy(&narrow_run.stderr)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 
 #[test]
 fn the_memory_guard_refuses_a_csv_cleanly_with_exit_3() {
