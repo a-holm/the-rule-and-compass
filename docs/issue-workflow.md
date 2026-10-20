@@ -124,11 +124,15 @@ cd "worktrees/issue-$N-$SLUG"
 `git worktree`, the same rule applies: the directory must live under
 `worktrees/` and the branch must be `issue/<number>-<slug>`.
 
-Optional: share the build cache to save disk and compile time. Do this only when
-you are the only one building, because Cargo locks the target directory.
+Leave `target/` at its default inside this worktree. Do **not** point several
+worktrees at one `CARGO_TARGET_DIR`: Cargo's fingerprints do not distinguish
+two checkouts of the same crate and version, so a build can link an artifact
+produced from a different source tree (see §6). The shared lock, not a shared
+build directory, is what serialises builds:
 
 ```sh
-export CARGO_TARGET_DIR=/mnt/lager/tmp/opencode/target
+/mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
+  'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
 ```
 
 ---
