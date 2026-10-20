@@ -305,17 +305,27 @@ rcsr ... --null-runs 19
 
 ### 3.8 Pick a metric that matches the loss you care about
 The metric decides what "good" means, so choosing it is itself a modelling
-choice. `--metric` selects one of sixteen objectives:
+choice. `--metric` selects one of twenty objectives:
 
 * `absolute` (default) and `squared` — squared punishes large residuals hard;
 * `median` and `interquartile` — robust to a few outliers;
 * `log_squashed` — squared-like but with bounded influence;
 * `maximum` — minimise the single worst row;
 * `signed` — penalise a consistent bias;
-* `correlation` and `rank_correlation` — care about shape, not level or offset;
+* `correlation` and `rank_correlation` — care about shape, not level, offset or
+  **direction**: both score `1 - |r|`, so a perfectly inverted forecast scores
+  zero. Use them when either sign is a valid law (e.g. an unsigned relation);
+* `correlation_signed` and `rank_correlation_signed` — score `1 - r`, so the
+  sign is part of the objective and an inverted forecast is penalised. Use them
+  for directional signals (returns, demand, a control response) where the
+  forecast has to rise and fall with the target;
 * `slope` — match the trend rather than the level;
-* `auc`, `log_loss`, `hinge` — classification; the target is read as two classes
-  and the model output as a logit;
+* `auc`, `log_loss`, `hinge` — classification; the target must have exactly two
+  distinct values (or one, which scores as chance). The model output is a
+  logit. A `{-1, 0, +1}` target is **rejected** rather than silently split at
+  the midpoint; collapse it to two classes first. `auc` is the only
+  direction-blind classification metric (it rewards rank separation), while
+  `log_loss` and `hinge` also reward the correct logit sign;
 * `aic`, `aicc`, `bic` — fit measured against the number of fitted constants, so
   parsimony drives the front directly instead of only being reported.
 

@@ -126,8 +126,8 @@ INPUT:
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
                              positive. A weight of 2 means \"this row twice\":
-                             absolute, squared, correlation, signed,
-                             log_squashed, implicit, implicit_residual become
+                             absolute, squared, correlation, correlation_signed,
+                             signed, log_squashed, implicit, implicit_residual become
                              weighted means, and aic/aicc/bic use the weighted
                              RSS. Refused for metrics with no weighted definition
                              (median, maximum, interquartile, slope,
@@ -252,11 +252,16 @@ MULTI-OUTPUT (--target y1,y2):
 
 SEARCH:
   --metric <name>            error to minimise, lower is better (default absolute)
-                             absolute  squared  correlation  median  maximum
-                             signed  log_squashed  rank_correlation  interquartile
-                             slope  auc  log_loss  hinge  aic  aicc  bic
+                             absolute  squared  correlation  correlation_signed
+                             median  maximum  signed  log_squashed
+                             rank_correlation  rank_correlation_signed
+                             interquartile  slope  auc  log_loss  hinge  aic  aicc  bic
                              implicit  implicit_residual  (implicit model)
-                             (auc/log_loss/hinge treat the target as two classes)
+                             correlation/rank_correlation score 1-|r| and accept an
+                             inverted model; the _signed variants score 1-r and
+                             require the right direction. auc/log_loss/hinge treat
+                             the target as two classes and reject targets with
+                             more than two distinct values.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -1857,6 +1862,37 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
 
+    // #113: a binary metric needs a binary target. Reject a multi-valued target
+    // here, before any search, instead of silently merging its classes at the
+    // midpoint and reporting a number that means something else.
+    if cfg.metric.is_classification() {
+        for j in 0..prepared.train.target_count() {
+            let name = target_names.get(j).map(|s| s.as_str()).unwrap_or(target.as_str());
+            // Check the union of both sides: a distinct class that happens to
+            // sit only in the held-out rows still makes the target multi-valued.
+            let values: Vec<f64> = prepared
+                .train
+                .target(j)
+                .iter()
+                .chain(prepared.test.target(j))
+                .copied()
+                .collect();
+            if let Some(why) = metrics::classification_target_error(&values) {
+                eprintln!(
+                    "error: --metric {} treats '{}' as a binary target, but {}",
+                    cfg.metric.name(),
+                    name,
+                    why
+                );
+                eprintln!(
+                    "  collapse the target to two classes yourself, or pick a regression metric \
+                     (absolute, squared, log_squashed, ...)"
+                );
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+
     // #14: implicit relations. The target becomes one more input (normalised
     // with its training mean/std, so denormalisation prints original units) and
     // the target itself becomes the constant 0. From here on every search,
@@ -2443,6 +2479,32 @@ fn main() {
             }
         })
         .collect();
+
+    // #113: sign/step have a zero adjoint, so a constant behind one cannot be
+    // fitted. Say so once, rather than letting the printed threshold look
+    // optimised.
+    if cfg.fit_iters > 0 {
+        let mut zero_ops: Vec<&'static str> = Vec::new();
+        for s in &sorted {
+            if expr::count_constants(&s.tree) > 0 {
+                for op in fit::zero_adjoint_ops(&s.tree) {
+                    if !zero_ops.contains(&op) {
+                        zero_ops.push(op);
+                    }
+                }
+            }
+        }
+        if !zero_ops.is_empty() {
+            eprintln!(
+                "# warning: the Pareto front contains fitted constants behind {}: the adjoint \
+                 is zero there, so their position is not optimised. Fit a smooth surrogate \
+                 (e.g. logistic or tanh) and threshold only at inference, or pin the threshold \
+                 as a fixed constant. See docs/optimisation.md.",
+                zero_ops.join(" and ")
+            );
+        }
+    }
+
     // Residual diagnostics for the best (lowest training-error) solution: the
     // one a reader would quote.
     let best_resid = rows

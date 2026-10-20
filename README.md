@@ -506,8 +506,9 @@ influence on the fit or the error.
 rcsr --data d.csv --target y --vars x --weight w --metric squared
 ```
 
-`absolute`, `squared`, `signed`, `log_squashed` and `correlation` become
-weighted means (weighted Pearson for the correlation); `aic`, `aicc` and `bic`
+`absolute`, `squared`, `signed`, `log_squashed`, `correlation` and
+`correlation_signed` become weighted means (weighted Pearson for the
+correlations); `aic`, `aicc` and `bic`
 use the weighted RSS and the number of positive-weight rows as `n`. A weight of
 2 is exactly a duplicated row because the normalisation is `Σwᵢ·lossᵢ / Σwᵢ`,
 not division by the row count. The fitter solves the weighted least-squares
@@ -698,9 +699,13 @@ list and the recorded results.
   [`docs/meta-operators.md`](docs/meta-operators.md); the aggregates are
   training-column statistics cached once per search — see
   [`docs/aggregation.md`](docs/aggregation.md));
-- **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
-  maximum, signed, log-squashed, rank correlation, interquartile, slope,
-  AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
+- **twenty error metrics** (`--metric`): absolute, squared, correlation and
+  signed correlation, median, maximum, signed, log-squashed, rank correlation
+  and signed rank correlation, interquartile, slope, the two implicit
+  objectives, AUC, log loss, hinge, and AIC/AICc/BIC as search objectives.
+  The unsigned correlations accept an inverted model; the `_signed` variants
+  require the right direction, and the binary metrics reject targets with more
+  than two distinct values;
 - **Levenberg–Marquardt constant fitting** using adjoint (backpropagation)
   derivatives — one backward sweep gives every constant's gradient, with
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
