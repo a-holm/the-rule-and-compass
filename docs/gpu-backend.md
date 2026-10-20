@@ -333,8 +333,13 @@ only about **2–3 %** of wall time on `d5k` (a 30-generation `--no-fit` run tak
 scoring alone at about 1.03×. The **≥1.1× end-to-end target in #119 is therefore
 not met on this workload**; the gain is 1.08–1.09× only when evaluation, not
 constant fitting, dominates. Closing the gap needs work *inside* the CPU
-generation (fitting on the SoA layout, or the GPU LM in #116), not more overlap
-against a 2 % GPU phase.
+generation (fitting on the SoA layout, or the batched GPU LM), not more overlap
+against a 2 % GPU phase. The batched LM kernel is #169; #116 supplies the
+`BatchedFitter` integration point and the exact `f64` verifier in
+`src/fit/gpu.rs`, so a GPU proposal is accepted only when it is finite, has the
+right shape and scores no worse than the starting constants, and every
+rejection is refit on the CPU. See
+[`optimisation.md`](optimisation.md#batched-gpu-fitting-169).
 
 ### Measured end to end
 
