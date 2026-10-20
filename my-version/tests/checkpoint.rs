@@ -232,6 +232,7 @@ fn checkpoint_text_is_a_fixed_point_of_serialise_then_parse() {
         // archive-parent feedback keeps this tiny run improving, which is the
         // feature working; the checkpoint round trip is independent of it.
         front_parents: false,
+        gpu: false,
         ..Default::default()
     };
     let text = checkpoint_text(&cfg, &train, &test);
