@@ -334,7 +334,8 @@ SEARCH:
   --gpu                      let the GPU guide the search when built with
                              --features cuda and a device is present. Reported
                              errors stay CPU f64, but f32 fitness can change the
-                             trajectory, so this is opt-in
+                             trajectory, so this is opt-in. JSON reports the
+                             measured kernel/sync/alloc/copy ledger and duty
   --no-gpu                   force CPU evaluation (alias --cpu); this is the
                              default, so the flag is only for explicitness
 
@@ -424,6 +425,46 @@ fn jnum(v: f64) -> String {
     } else {
         "null".to_string()
     }
+}
+
+/// #118: the GPU phase ledger. `sm_occupancy` is explicitly null: it needs
+/// `ncu`, and `nvidia-smi`'s sampled utilisation is not occupancy. `duty_cycle`
+/// is the measured kernel-time fraction of the full upload+launch+sync+copy
+/// path, not a fabricated hardware counter.
+fn gpu_json(
+    g: &Option<rcsr::gpu_stats::GpuStats>,
+    best_error: f64,
+    baseline_error: f64,
+) -> String {
+    let Some(g) = g else {
+        return "null".to_string();
+    };
+    let quality = g
+        .quality_per_gpu_hour(best_error, baseline_error)
+        .map(jnum)
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"programs\":{},\"evals\":{},\"evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"sm_occupancy\":null,\"quality_per_gpu_hour\":{}}}",
+        jnum(g.kernel_s),
+        jnum(g.launch_s),
+        jnum(g.sync_s),
+        jnum(g.alloc_s),
+        jnum(g.h2d_s),
+        jnum(g.d2h_s),
+        jnum(g.transfer_s()),
+        jnum(g.accounted_s()),
+        jnum(g.wall_s),
+        jnum(g.idle_s()),
+        g.h2d_bytes,
+        g.d2h_bytes,
+        g.batches,
+        g.programs,
+        g.evals,
+        jnum(g.evals_per_s()),
+        jnum(g.generations_per_s()),
+        jnum(g.duty_cycle()),
+        quality
+    )
 }
 
 /// The `variables_detail` array shared by `--json`, `--ndjson` and
@@ -2628,6 +2669,27 @@ fn main() {
     if top > 0 && rows.len() > top {
         rows.truncate(top);
     }
+    let best_error = outcome
+        .archive
+        .items
+        .iter()
+        .map(|s| s.error)
+        .fold(f64::INFINITY, f64::min);
+    // #118: quality is relative to the constant-mean predictor, so it is a
+    // positive number of error decades removed rather than an arbitrary value.
+    let baseline_error = {
+        let n = prepared.train.len();
+        if n == 0 {
+            f64::NAN
+        } else {
+            let mean = prepared.train.y.iter().sum::<f64>() / n as f64;
+            prepared.train
+                .y
+                .iter()
+                .map(|y| (y - mean) * (y - mean))
+                .sum()
+        }
+    };
 
     match format {
         Format::Text => {
@@ -2643,6 +2705,20 @@ fn main() {
                         ""
                     }
                 );
+                if let Some(g) = &outcome.gpu {
+                    eprintln!(
+                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s wall={:.3}s | duty={:.1}% (kernel/wall, not occupancy) | evals/s={:.0} | {:.3} decades/GPU-h",
+                        g.kernel_s,
+                        g.sync_s,
+                        g.alloc_s,
+                        g.h2d_s,
+                        g.d2h_s,
+                        g.wall_s,
+                        100.0 * g.duty_cycle(),
+                        g.evals_per_s(),
+                        g.quality_per_gpu_hour(best_error, baseline_error).unwrap_or(0.0)
+                    );
+                }
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -3121,7 +3197,7 @@ fn main() {
                 outcome.generations
             );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 jstr(VERSION),
                 cfg.seed,
@@ -3142,6 +3218,7 @@ fn main() {
                 // #18: the four convergence numbers.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                gpu_json(&outcome.gpu, best_error, baseline_error),
                 checkpoint_json,
                 null_json,
                 baselines_json,
@@ -3311,12 +3388,13 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"gpu\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
+                gpu_json(&outcome.gpu, best_error, baseline_error),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );

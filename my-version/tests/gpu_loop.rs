@@ -191,6 +191,57 @@ fn cuda_build_without_a_device_falls_back_with_one_note() {
     );
 }
 
+/// #118: a CPU run reports `"gpu":null` (never fabricated zeros), and a GPU
+/// run reports the full measured ledger with a duty estimate, not occupancy.
+#[test]
+fn cpu_json_reports_gpu_null() {
+    let (code, stdout, _stderr) = run_cli(
+        &[
+            "--data",
+            "-",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "2",
+            "--pop",
+            "16",
+            "--seed",
+            "3",
+            "--no-gpu",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, Some(0));
+    assert!(
+        stdout.contains("\"gpu\":null"),
+        "a CPU run must report gpu:null, got: {stdout}"
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_run_reports_measured_accounting_not_occupancy() {
+    let train = sample(64);
+    let test = sample(64);
+    let out = search::run(&config(11, true), &train, &test);
+    let g = out.gpu.expect("the GPU path scored generations");
+    assert!(g.wall_s > 0.0, "the full path wall must be measured");
+    assert!(g.batches > 0 && g.programs > 0 && g.evals > 0);
+    assert!(g.kernel_s >= 0.0 && g.sync_s >= 0.0 && g.alloc_s >= 0.0);
+    assert!(g.d2h_bytes > 0, "the SSE output must be downloaded");
+    assert!(
+        g.decomposition_within(0.05),
+        "host windows should explain the wall: accounted {} vs wall {}",
+        g.accounted_s(),
+        g.wall_s
+    );
+    assert!((0.0..=1.0).contains(&g.duty_cycle()));
+    assert!(g.quality_per_gpu_hour(1.0, 10.0).is_some());
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {

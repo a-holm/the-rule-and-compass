@@ -1157,6 +1157,9 @@ pub struct Outcome {
     /// when the full training sample was used (off, exact no-op, or a request
     /// widened above the break-even).
     pub predictor_samples: usize,
+    /// #118: accumulated GPU accounting when the GPU scored any generation.
+    /// `None` on the CPU path, including a CUDA build that fell back.
+    pub gpu: Option<crate::gpu_stats::GpuStats>,
 }
 
 /// Run a search once, from a fresh start.
@@ -1974,6 +1977,11 @@ fn run_search(
         convergence = progress_stats.observe(gens_done, best, &final_archive);
     }
 
+    #[cfg(feature = "cuda")]
+    let gpu_stats = gpu.as_ref().map(|g| g.ev.stats());
+    #[cfg(not(feature = "cuda"))]
+    let gpu_stats = None;
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
@@ -1991,6 +1999,7 @@ fn run_search(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
+        gpu: gpu_stats,
     })
 }
 

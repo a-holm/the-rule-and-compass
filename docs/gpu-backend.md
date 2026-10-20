@@ -325,6 +325,62 @@ evaluation is **10–40×** (reported figures for this style of workload range f
 ~18× to ~40×; the 201–1 678× measured above is against a much slower
 single-threaded reference), rising further with row tiling and CUDA graphs.
 
+## Measuring the full GPU path (issue #118)
+
+The old benchmark timed an event pair placed immediately after the launch, so
+`cudaEventElapsedTime` reported only kernel execution. Sync, the device-to-host
+copy of the SSEs and the per-generation `cudaMalloc`/`cudaFree` happened outside
+that window — the overhead that made the end-to-end loop look worse than the
+kernel table.
+
+`rc_set_programs` and `rc_eval` now record disjoint host windows in
+`RcStats`: allocation (including the synchronising `cudaMalloc`/`cudaFree`),
+H2D upload, kernel launch, `cudaEventSynchronize`, and D2H download. `wall` is
+the sum of those windows plus unmeasured host glue, so the decomposition can be
+checked rather than assumed. `rc_last_stats` exposes the ledger; the Rust
+`GpuStats` (`src/gpu_stats.rs`) accumulates it per run.
+
+`rcsr-gpu-bench` prints the ledger and the derived numbers:
+
+* **evals/s** uses the full-path wall, not the kernel event;
+* **duty** is `kernel_s / wall_s`, a kernel-time fraction. It is *not*
+  `nvidia-smi utilization.gpu` (a 1 Hz sample of "some kernel resident") and it
+  is not SM occupancy;
+* **quality/GPU-hour** is decades of error reduction against the constant-mean
+  baseline per measured GPU-hour: `-log10(best_sse / mean_baseline_sse) / hours`.
+  A throughput gain is not a search gain; compare quality at matched cumulative
+  evaluations and paired seeds;
+* `sm_occupancy` is `null` in `--json`. Occupancy requires `ncu` and is never
+  fabricated from sampled utilisation.
+
+The `--gpu` JSON block reports `kernel_s`, `launch_s`, `sync_s`, `alloc_s`,
+`h2d_s`, `d2h_s`, `transfer_s`, `accounted_s`, `wall_s`, `idle_s`,
+`h2d_bytes`, `d2h_bytes`, `batches`, `programs`, `evals`, `evals_per_s`,
+`generations_per_s`, `duty_cycle`, `sm_occupancy: null` and
+`quality_per_gpu_hour`.
+
+How to measure properly:
+
+```sh
+# full-path ledger from the harness itself
+RCSR_CUDA_ARCH=sm_86 ./target/release/rcsr-gpu-bench \
+  --data examples/sine.csv --batch 8000 --depth 4
+
+# duty/timeline: nsys sees the real launch/sync/copy sequence
+nsys profile --stats=true -t cuda,nvtx \
+  ./target/release/rcsr-gpu-bench --data examples/sine.csv --batch 8000
+
+# achieved occupancy / SM throughput: ncu, one or two launches
+ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,\
+sm__throughput.avg.pct_of_peak_sustained_elapsed \
+  ./target/release/rcsr-gpu-bench --data examples/sine.csv --batch 512
+
+# A/B the evaluator that matters: --no-simd (scalar walk), default (SoA/AVX), --gpu
+./target/release/rcsr --data examples/sine.csv --target y --vars x --no-simd ...
+./target/release/rcsr --data examples/sine.csv --target y --vars x ...
+./target/release/rcsr --data examples/sine.csv --target y --vars x --gpu ...
+```
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
@@ -341,6 +397,9 @@ single-threaded reference), rising further with row tiling and CUDA graphs.
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
 | `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
+| Full-path ledger (alloc/H2D/launch/sync/D2H) and duty | RTX 3060, `src/gpu_stats.rs` test + `rcsr-gpu-bench` | **verified** (host windows 97% of wall on a 2 000-program batch) |
+| Speed-up against the SoA/AVX path | RTX 3060, `rcsr-gpu-bench` | **measured** (reported by the binary; compare on your fixture) |
+| SM occupancy | needs `ncu` | **unverified here** — reported as `null`, never invented |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 
 What would close the gaps: on a DGX Spark (or any `sm_121` + CUDA 13 machine),

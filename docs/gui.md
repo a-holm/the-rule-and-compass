@@ -590,6 +590,9 @@ tool version seed metric target variables train_rows test_rows
 split { mode rows train_rows test_rows folds[] gap groups_total
         groups_train groups_test lags series history_rows notes[] }
 generations_run converged_early elapsed_seconds
+gpu { kernel_s launch_s sync_s alloc_s h2d_s d2h_s transfer_s accounted_s
+      wall_s idle_s h2d_bytes d2h_bytes batches programs evals evals_per_s
+      generations_per_s duty_cycle sm_occupancy quality_per_gpu_hour } | null
 null_control { runs best[] min median p_value verdict } | null
 baselines { mean{train_error,test_error} linear{…} knn{k,train_error,test_error} }
 residual_tests { n lags durbin_watson

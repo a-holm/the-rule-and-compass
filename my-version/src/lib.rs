@@ -13,6 +13,7 @@ pub mod expr;
 pub mod fit;
 #[cfg(feature = "cuda")]
 pub mod gpu;
+pub mod gpu_stats;
 pub mod gui;
 pub mod implicit;
 pub mod metrics;

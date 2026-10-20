@@ -75,7 +75,7 @@ pub fn json() -> String {
         ("--fit-samples", "int", "0", "training rows per generation used to screen constants (0 = off, >=2); all offspring are fitted/scored on the subset, the top 1/16 are refit and scored on all training rows before selection and archiving"),
         ("--patience", "int", "40", "stop after N gens without improvement"),
         ("--time-budget", "float", "none", "wall-clock seconds"),
-        ("--gpu", "flag", "false", "let the GPU guide the search when built with --features cuda (opt-in; reported errors stay CPU f64 but f32 fitness can change the trajectory)"),
+        ("--gpu", "flag", "false", "let the GPU guide the search when built with --features cuda (opt-in; reported errors stay CPU f64 but f32 fitness can change the trajectory; JSON reports measured kernel/sync/alloc/copy time and kernel-time duty, not occupancy)"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); this is the default"),
         ("--save", "string", "none", "write a checkpoint on exit and every --save-every generations"),
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),

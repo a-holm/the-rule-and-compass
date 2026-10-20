@@ -17,6 +17,7 @@
 //!   FP64 runs at 1/64 of FP32.
 
 use crate::expr::{Node, Op};
+use crate::gpu_stats::GpuStats;
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -130,6 +131,25 @@ struct RawCtx {
     _private: [u8; 0],
 }
 
+/// #118: the C-side ledger for one `rc_set_programs` + `rc_eval` batch, in
+/// milliseconds. The host windows are disjoint: allocation, H2D copy, launch,
+/// event sync and D2H copy. `kernel_ms` is GPU-event time *inside* the wall and
+/// the numerator of the duty estimate, not another additive host phase.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct RawStats {
+    kernel_ms: f64,
+    launch_ms: f64,
+    sync_ms: f64,
+    alloc_ms: f64,
+    h2d_ms: f64,
+    d2h_ms: f64,
+    wall_ms: f64,
+    h2d_bytes: u64,
+    d2h_bytes: u64,
+    batch: i32,
+}
+
 extern "C" {
     fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32) -> *mut RawCtx;
     fn rc_destroy(ctx: *mut RawCtx);
@@ -142,6 +162,7 @@ extern "C" {
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+    fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
 }
 
 /// A compiled population: the postfix programs of many expressions laid out
@@ -219,6 +240,8 @@ impl Population {
 /// candidates can be scored without further host↔device traffic for the data.
 pub struct GpuEvaluator {
     ctx: *mut RawCtx,
+    n_rows: u64,
+    stats: GpuStats,
 }
 
 impl GpuEvaluator {
@@ -228,7 +251,11 @@ impl GpuEvaluator {
         if ctx.is_null() {
             None
         } else {
-            Some(GpuEvaluator { ctx })
+            Some(GpuEvaluator {
+                ctx,
+                n_rows: n_rows as u64,
+                stats: GpuStats::default(),
+            })
         }
     }
 
@@ -264,8 +291,31 @@ impl GpuEvaluator {
             }
             let mut out = vec![0.0f32; nprog];
             let ms = rc_eval(self.ctx, out.as_mut_ptr());
+            let mut raw = RawStats::default();
+            // The ledger is read after the batch, so a failed eval still records
+            // the time it spent before reporting its negative error marker.
+            if rc_last_stats(self.ctx, &mut raw) == 0 {
+                self.stats.add_batch(
+                    raw.kernel_ms,
+                    raw.launch_ms,
+                    raw.sync_ms,
+                    raw.alloc_ms,
+                    raw.h2d_ms,
+                    raw.d2h_ms,
+                    raw.wall_ms,
+                    raw.h2d_bytes,
+                    raw.d2h_bytes,
+                    raw.batch.max(0) as u64,
+                    self.n_rows,
+                );
+            }
             (out, ms)
         }
+    }
+
+    /// Accumulated accounting for every batch scored through this evaluator.
+    pub fn stats(&self) -> GpuStats {
+        self.stats
     }
 
     /// Score a whole [`Population`] in one call: one program upload and one
@@ -431,5 +481,5 @@ mod tests {
             );
         }
     }
-}
 
+}
