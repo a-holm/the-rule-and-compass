@@ -20,20 +20,53 @@ The estimate is derived from the table's **shape**, not its file size (issue
 #112): once the header and row count are known, the guard models
 
 ```text
-text     = bytes read into one String
+text     = bytes read into one String (the current loader; a streaming path
+           removes this term -- see issue #126)
 table    = rows x columns x 12 B          (f64 value + u32 dictionary code)
 prep     = rows x used_columns x 24 B      (cells, train and test copies)
-         + rows x 72 B                     (Vec headers and selectors)
+         + rows x 240 B                    (sample headers, selectors, row copies)
 estimate = (text + table + prep) x 1.25    (allocator slack)
 ```
 
 `used_columns` is the search's projection (`--vars`, `--target`, `--weight`);
 with no `--vars` the whole header is assumed. `rcsr import` has no search
-preparation, so its guard uses the `text + table` terms only. The old `33 x file size` factor
-was calibrated on ~6-column data and predicted 560 GB for a 17 GB, 93-column
-panel that is at most ~27 GB resident. The text term is not optional: the
-loader reads the whole CSV into one `String`, so a 17 GB CSV cannot be less
-than 17 GB resident.
+preparation, so its guard uses the `text + table` terms only. The old
+`33 x file size` factor was calibrated on ~6-column data and predicted 560 GB
+for a 17 GB, 93-column panel that is at most ~27 GB resident. The guard reports
+its estimate **and this basis** (rows x columns, the three terms and slack) in
+the normal preparation block, in text and in `--json`/`--ndjson`, not only when
+it refuses a file.
+
+### Calibration (issue #112)
+
+The fixed preparation term was **72 B/row** before this calibration. On the
+1M-row x 6-column fixture that model predicted 378 MiB, but the search run
+peaked at 552 MiB, so the fixed term was raised to **240 B/row**. The 12 B/cell
+and 24 B/used-cell terms were left unchanged. The raise is justified by the
+measurements below: the estimate is now above the measured peak everywhere,
+but never more than 1.55x it.
+
+Machine: 31 GiB RAM, 8 threads, `/mnt/lager`. `old` is the `read_to_string`
+loader; `stream` is the #126 streaming loader (same estimator without the text
+term). The `search` command is `--target y --generations 1 --pop 8
+--baseline-samples 16 --seed 1`; `import` is `rcsr import ... --quiet`.
+
+| fixture | rows x cols | file | path | peak RSS | estimate | estimate / peak |
+|---|---|---:|---|---:|---:|---:|
+| 6-column | 1,000,000 x 6 | 29.0 MiB | old import | 91.6 MiB | 122.0 MiB | 1.33 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | stream import | 61.8 MiB | 85.8 MiB | 1.39 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | old search | 552.2 MiB | 579.8 MiB | 1.05 |
+| 6-column | 1,000,000 x 6 | 29.0 MiB | stream search | 422.1 MiB | 543.7 MiB | 1.29 |
+| 90-column | 150,000 x 90 | 88.4 MiB | old import | 196.1 MiB | 303.6 MiB | 1.55 |
+| 90-column | 150,000 x 90 | 88.4 MiB | stream import | 140.0 MiB | 193.1 MiB | 1.38 |
+| 90-column | 150,000 x 90 | 88.4 MiB | old search | 553.9 MiB | 732.8 MiB | 1.32 |
+| 90-column | 150,000 x 90 | 88.4 MiB | stream search | 452.5 MiB | 622.3 MiB | 1.38 |
+
+The narrow fixture is 30,364,090 bytes; the wide one is 92,696,166 bytes. A
+wide but small-on-disk file is therefore no longer mistaken for cheap: the
+estimate grows with rows x columns, and a narrow but large file is no longer
+multiplied by 33. Tests for both shapes live in
+`my-version/tests/memory_estimate.rs`.
 
 When the estimate is above the budget, `rcsr` prints the file size, the
 rows x columns basis, the estimate and the budget, suggests `--force` and
@@ -244,6 +277,9 @@ error: input would exceed the memory budget
     rcsr import <input.csv> <store.rcsb>
 exit 3
 ```
+
+That refusal predates the #112 fixed-row calibration; the same shape is now
+estimated higher (the calibration above records the current numbers).
 
 ## Measured: v1 versus v2
 
