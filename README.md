@@ -18,8 +18,10 @@ complexity)**, and returns the front of non-dominated equations — the most
 accurate equation at each level of complexity.
 
 Constants inside a candidate are not guessed: each candidate's constants are
-fitted by **Levenberg–Marquardt**, so a candidate with the right *shape* is
-immediately usable even if its numbers started out wrong.
+fitted by **Levenberg–Marquardt** against the configured `--metric`, so a
+candidate with the right *shape* is immediately usable even if its numbers
+started out wrong, and the fitted numbers minimise the same loss that ranks the
+front.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -701,8 +703,11 @@ list and the recorded results.
 - **sixteen error metrics** (`--metric`): absolute, squared, correlation, median,
   maximum, signed, log-squashed, rank correlation, interquartile, slope,
   AUC, log loss, hinge, and AIC/AICc/BIC as search objectives;
-- **Levenberg–Marquardt constant fitting** using adjoint (backpropagation)
-  derivatives — one backward sweep gives every constant's gradient, with
+- **Levenberg–Marquardt constant fitting to the configured metric** using
+  adjoint (backpropagation) derivatives — exact least squares for
+  squared/AIC/AICc/BIC, IRLS for absolute and log-squashed, logistic IRLS for
+  AUC/log-loss/hinge, and a deterministic coordinate polish for rank/order
+  losses; one backward sweep gives every constant's gradient, with
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant

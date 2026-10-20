@@ -116,9 +116,11 @@ Jacobian with respect to the constants is obtained by central differences of
 that residual, which also carries the derivative of `||∇f||` without needing a
 second-order adjoint.
 
-`implicit_residual` (and every explicit metric) keeps the historical fit: the
-constants minimise `Σ wᵢ·(f(pᵢ) − 0)²`. That is the plain-residual objective by
-definition; it is not silently mixed with the geometric one.
+`implicit_residual` starts from the historical least-squares fit
+(`Σ wᵢ·(f(pᵢ) − 0)²`) and then polishes `mean |f|`, the metric it scores
+(issue #117). Explicit metrics similarly fit their configured loss; see
+[`docs/optimisation.md`](optimisation.md) §3.0. None of them is silently mixed
+with the geometric objective.
 
 ## Smoothing: why `--implicit` warns
 

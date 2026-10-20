@@ -19,8 +19,23 @@ use crate::fit;
 use crate::metrics::{score_weighted, Metric};
 
 /// Fit a copy of `shape` to every target of `s`, returning one tree per output
-/// in target order. The input tree is never modified.
+/// in target order. The input tree is never modified. This historical entry
+/// point keeps squared-error fitting.
 pub fn fitted_outputs(shape: &Node, s: &Sample, fit_iters: usize) -> Vec<Node> {
+    fitted_outputs_metric(shape, s, Metric::Squared, fit_iters)
+}
+
+/// Fit every output against the configured metric (issue #117).
+///
+/// Each output still gets its own constants and the same shared shape; only the
+/// per-output fitting objective changes. `Metric::Squared` is the exact
+/// historical path.
+pub fn fitted_outputs_metric(
+    shape: &Node,
+    s: &Sample,
+    metric: Metric,
+    fit_iters: usize,
+) -> Vec<Node> {
     (0..s.target_count())
         .map(|j| {
             let mut tree = shape.clone();
@@ -30,7 +45,14 @@ pub fn fitted_outputs(shape: &Node, s: &Sample, fit_iters: usize) -> Vec<Node> {
                 // zero for that output (`c + 0` -> `c`), which would make the
                 // outputs look like different structures. The structural
                 // identity of the shared shape is the point of this mode.
-                fit::fit_weighted(&mut tree, &s.x, s.target(j), &s.w, fit_iters);
+                fit::fit_weighted_metric(
+                    &mut tree,
+                    &s.x,
+                    s.target(j),
+                    &s.w,
+                    fit_iters,
+                    metric,
+                );
             }
             tree
         })
@@ -99,7 +121,7 @@ pub fn mean_error(errors: &[f64]) -> f64 {
 /// Fit the shared shape per output on `s` and return the combined training
 /// error. This is the value the search and the Pareto archive rank on.
 pub fn combined_error(shape: &Node, s: &Sample, metric: Metric, fit_iters: usize) -> f64 {
-    let trees = fitted_outputs(shape, s, fit_iters);
+    let trees = fitted_outputs_metric(shape, s, metric, fit_iters);
     mean_error(&output_errors(&trees, s, metric))
 }
 
@@ -114,7 +136,7 @@ pub fn combined_test_error(
     metric: Metric,
     fit_iters: usize,
 ) -> f64 {
-    let trees = fitted_outputs(shape, train, fit_iters);
+    let trees = fitted_outputs_metric(shape, train, metric, fit_iters);
     mean_error(&output_errors(&trees, test, metric))
 }
 

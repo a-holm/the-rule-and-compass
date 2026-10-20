@@ -211,6 +211,35 @@ library methods only to *seed* or *pre-process*.
 | **Parallel islands** | Islands are independent, so they evolve on separate threads. |
 | **Convergence / time-budget stopping** | Stop when there is nothing left to gain, or when a caller's deadline arrives. |
 
+### 3.0 Constants are fitted to the scoring loss
+
+The constants of a candidate are fitted against the **configured `--metric`**,
+not always against squared error (issue #117). The objective that ranks the
+front and the objective that moves the constants are now the same wherever that
+is mathematically well posed:
+
+| metric | fitting strategy |
+|---|---|
+| `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
+| `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
+| `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
+| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
+| `correlation`, `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
+
+Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
+and writes a trial back only when the configured loss improves. `squared`
+results are bit-identical to the pre-#117 engine (`tests` pin the constants and
+SSE). The weighted normal equations now scale **both** the Jacobian and the
+residual by `sqrt(w)`; before this change the weighted fit mixed a weighted
+Jacobian with a half-weighted gradient, which is corrected as part of the same
+work.
+
+The fitted loss is reported in `--json` under `fitting` (`loss` names the
+objective, `value` is the best fitted training loss). A non-smooth metric whose
+polish cannot improve on the squared fit keeps the squared constants and the same
+reported score.
+
 ### 3.1 Measured results
 
 Same seeds, same generations, same population; wall-clock on the development

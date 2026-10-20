@@ -306,7 +306,13 @@ SEARCH:
                              consistent with the target's (infinite error);
                              requires --units (usage error without it). Without
                              this flag, units only report and never reject
-  --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8)
+  --fit-iters <N>            Levenberg–Marquardt iterations for constants (default 8).
+                             Constants are fitted to the configured --metric:
+                             squared/aic/aicc/bic use the exact least-squares path;
+                             absolute and log_squashed use IRLS on the same solver;
+                             auc/log_loss/hinge use logistic IRLS with the output as
+                             a logit; rank/order/correlation losses fall back to a
+                             deterministic coordinate polish after the squared fit
   --no-fit                   disable constant fitting
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -3120,12 +3126,22 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string()),
                 outcome.generations
             );
+            let best_fit_loss = rows
+                .iter()
+                .map(|r| r.train_error)
+                .fold(f64::INFINITY, f64::min);
+            let fitting_json = format!(
+                "{{\"loss\":{},\"value\":{}}}",
+                jstr(cfg.metric.name()),
+                jnum(best_fit_loss)
+            );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
+                fitting_json,
                 jstr(&target),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),
                 variables_detail_json(&variable_types),
@@ -3419,7 +3435,12 @@ fn run_multi_output(
         .map(|(k, s)| {
             // Fit one constant vector per output on the training rows, then
             // score every output on the same fitted trees (no test leakage).
-            let trees = multi::fitted_outputs(&s.tree, &prepared.train, cfg.fit_iters);
+            let trees = multi::fitted_outputs_metric(
+                &s.tree,
+                &prepared.train,
+                cfg.metric,
+                cfg.fit_iters,
+            );
             let train_errors = multi::output_errors(&trees, &prepared.train, cfg.metric);
             let test_errors = multi::output_errors(&trees, &prepared.test, cfg.metric);
             let targets = target_names
@@ -3575,11 +3596,21 @@ fn run_multi_output(
                     )
                 })
                 .collect();
+            let best_fit_loss = rows
+                .iter()
+                .map(|r| r.train_error)
+                .fold(f64::INFINITY, f64::min);
+            let fitting_json = format!(
+                "{{\"loss\":{},\"value\":{}}}",
+                jstr(cfg.metric.name()),
+                jnum(best_fit_loss)
+            );
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
+                fitting_json,
                 jstr(&target_names.join(",")),
                 target_names.iter().map(|t| jstr(t)).collect::<Vec<_>>().join(","),
                 vars.iter().map(|v| jstr(v)).collect::<Vec<_>>().join(","),

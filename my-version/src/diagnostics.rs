@@ -1316,7 +1316,7 @@ pub fn bootstrap_error(
             }
             // Constants-only refit on the resample (the shape is fixed).
             let mut t = tree.clone();
-            crate::fit::fit(&mut t, &bx, &by, fit_iters);
+            crate::fit::fit_metric(&mut t, &bx, &by, fit_iters, metric);
             let scored = Sample {
                 x: oob.iter().map(|&j| train.x[j].clone()).collect(),
                 y: oob.iter().map(|&j| train.y[j]).collect(),
@@ -2033,7 +2033,7 @@ mod tests {
                     continue;
                 }
                 let mut t = tree.clone();
-                crate::fit::fit(&mut t, &bx, &by, fit_iters);
+                crate::fit::fit_metric(&mut t, &bx, &by, fit_iters, metric);
                 let scored = Sample {
                     x: oob.iter().map(|&j| train.x[j].clone()).collect(),
                     y: oob.iter().map(|&j| train.y[j]).collect(),
