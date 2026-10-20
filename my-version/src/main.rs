@@ -23,7 +23,6 @@ use rcsr::units::{Unit, Units};
 use rcsr::{backend, data, diagnostics, leakage, multi, qd, search, stability, store, walkforward};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::io::Read;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXIT_OK: i32 = 0;
@@ -108,9 +107,10 @@ INPUT:
                              larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
                              512MB, 2GiB). Exit 3 with the rows x columns
                              estimate and an actionable message instead of
-                             SIGABRT/SIGKILL. A `.rcsb` store that does not fit
-                             is searched from a hash sample with bounded RSS;
-                             a CSV is refused before parsing.
+                             SIGABRT/SIGKILL. The CSV reader streams, so the
+                             file text is not resident. A `.rcsb` store that
+                             does not fit is searched from a hash sample with
+                             bounded RSS; a CSV is refused before parsing.
   --force                    override --max-memory and try the resident path
                              anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
@@ -2064,19 +2064,31 @@ fn main() {
     };
     let mut out_of_core_note: Option<String> = None;
     let table = if data_path == "-" {
-        let mut buf = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut buf) {
-            eprintln!("error reading stdin: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-        let shape = data::csv_shape(&buf);
+        // #126: stdin cannot be reopened for the streaming parser's two passes,
+        // so spool it to a temporary file. A whole-file `String` is never built.
+        let spooled = match spool_stdin() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let shape = match data::csv_shape_path(spooled.path_str()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
         if let Some(limit) = guard_budget {
-            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            // The parser streams from the spool, so the text is not resident.
+            let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {
+                let _ = std::fs::remove_file(&spooled.path);
                 refuse_for_memory("<stdin>", shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::parse_table_with(&buf, skip_malformed)
+        data::read_table_with(spooled.path_str(), skip_malformed)
     } else if store::is_store_path(&data_path) {
         match store::FileStore::open(&data_path) {
             Ok(fs) => {
@@ -2110,21 +2122,21 @@ fn main() {
             Err(e) => Err(e),
         }
     } else {
-        let text = match std::fs::read_to_string(&data_path) {
-            Ok(text) => text,
+        // #126: measure and parse by streaming the file; never `read_to_string`.
+        let shape = match data::csv_shape_path(&data_path) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("error: {}: {}", data_path, e);
+                eprintln!("error: {}", e);
                 std::process::exit(EXIT_INPUT);
             }
         };
-        let shape = data::csv_shape(&text);
         if let Some(limit) = guard_budget {
-            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {
                 refuse_for_memory(&data_path, shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::parse_table_with(&text, skip_malformed)
+        data::read_table_with(&data_path, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -6322,6 +6334,61 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// A temporary file that removes itself when the CSV load finishes (issue
+/// #126: stdin is spooled so the streaming reader can reopen it).
+struct TempCsv {
+    path: std::path::PathBuf,
+}
+
+impl TempCsv {
+    fn path_str(&self) -> &str {
+        self.path.to_str().unwrap_or("")
+    }
+}
+
+impl Drop for TempCsv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Copy standard input into a temporary CSV file. This keeps `--data -`
+/// streaming: the two parser passes reopen the file instead of a whole-file
+/// `String` staying resident.
+fn spool_stdin() -> Result<TempCsv, String> {
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..64u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!("rcsr-stdin-{}-{}-{}.csv", pid, nanos, attempt));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(format!(
+                    "cannot spool stdin to {}: {}",
+                    path.display(),
+                    e
+                ))
+            }
+        };
+        let mut input = std::io::stdin().lock();
+        if let Err(e) = std::io::copy(&mut input, &mut file) {
+            let _ = std::fs::remove_file(&path);
+            return Err(format!("error reading stdin: {}", e));
+        }
+        return Ok(TempCsv { path });
+    }
+    Err("error reading stdin: could not create a temporary file".to_string())
+}
+
 fn refuse_for_memory(
     path: &str,
     shape: data::CsvShape,
@@ -6702,8 +6769,8 @@ OPTIONS:
   --time <column>          store this column as exact i64 timestamps
                            (default: the first integral, time-like column)
   --skip-malformed         drop ragged rows instead of refusing the input
-  --max-memory <size>      refuse before parsing when the rows x columns
-                           estimate exceeds this (not 33x the file size)
+  --max-memory <size>      refuse before parsing when the streamed rows x
+                           columns estimate exceeds this (not 33x file size)
   --force                  override --max-memory
   --quiet                  do not print the summary
   -h, --help               show this help
@@ -7355,16 +7422,17 @@ fn run_import(args: &[String]) -> ! {
         eprintln!("error: '{}' is already a column store", input);
         std::process::exit(EXIT_USAGE);
     }
-    let text = match std::fs::read_to_string(&input) {
-        Ok(text) => text,
-        Err(e) => {
-            eprintln!("error: {}: {}", input, e);
-            std::process::exit(EXIT_INPUT);
-        }
-    };
+    // #126: shape and guard come from a streaming scan; the table is then read
+    // by the streaming parser. The file text is never materialised.
     if let Some(limit) = max_memory.or_else(store::detected_hard_budget) {
-        let shape = data::csv_shape(&text);
-        let estimate = data::estimate_csv_load_bytes(shape);
+        let shape = match data::csv_shape_path(&input) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let estimate = data::estimate_csv_load_stream_bytes(shape);
         if estimate > limit && !force {
             refuse_for_memory(&input, shape, estimate, limit, None);
         }

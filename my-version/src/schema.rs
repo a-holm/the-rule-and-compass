@@ -13,7 +13,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn json() -> String {
     let opts = [
         ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
-        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A CSV is estimated from rows x columns (text + table + preparation) once the header and row count are known, and exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
+        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A streaming CSV is estimated from rows x columns (table + preparation) once the header and row count are known, so the file text is not resident; it exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
         ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
         ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
         ("--vars", "csv", "all-except-targets", "input column names"),

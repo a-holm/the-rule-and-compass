@@ -751,7 +751,8 @@ pub struct CsvShape {
     pub rows: usize,
     /// Header fields.
     pub cols: usize,
-    /// The text the loader holds while parsing, in bytes.
+    /// Bytes of source text read (a resident `String` only when measured with
+    /// [`csv_shape`]; the CLI measures the same field from a stream).
     pub bytes: u64,
 }
 
@@ -793,6 +794,55 @@ pub fn csv_shape(text: &str) -> CsvShape {
     }
 }
 
+/// Measure a delimited source **while reading it**, with the same quote-aware
+/// record reader that builds the table (issue #126).
+///
+/// The scan holds one logical record at a time. It returns the table shape and
+/// the number of bytes consumed, so the memory guard no longer needs a
+/// whole-file `String` (or a whole-file `read_to_string`) to estimate a run.
+pub fn csv_shape_stream<'a, F>(mut open: F) -> Result<CsvShape, String>
+where
+    F: FnMut() -> Result<Box<dyn std::io::BufRead + 'a>, String>,
+{
+    let mut rd = CsvRecords::new(open()?);
+    let header = match rd.next() {
+        Some(Ok(record)) => record,
+        Some(Err(e)) => return Err(e),
+        None => {
+            return Ok(CsvShape {
+                rows: 0,
+                cols: 0,
+                bytes: 0,
+            })
+        }
+    };
+    let cols = header.fields.len();
+    let mut rows = 0usize;
+    for record in &mut rd {
+        let record = record?;
+        // A ragged row is still a record the source contains; counting it keeps
+        // the fallback estimate an upper bound before the parser refuses it.
+        if !record.fields.is_empty() {
+            rows += 1;
+        }
+    }
+    Ok(CsvShape {
+        rows,
+        cols,
+        bytes: rd.bytes,
+    })
+}
+
+/// [`csv_shape_stream`] for a path, opening the file a second time (the parser
+/// reopens it for its typing and building passes as well).
+pub fn csv_shape_path(path: &str) -> Result<CsvShape, String> {
+    csv_shape_stream(|| {
+        std::fs::File::open(path)
+            .map(|f| Box::new(std::io::BufReader::new(f)) as Box<dyn std::io::BufRead>)
+            .map_err(|e| format!("{}: {}", path, e))
+    })
+}
+
 /// Resident bytes per table cell: one `f64` value plus the `u32` code that a
 /// low-cardinality numeric or text column keeps alongside it.
 pub const CSV_TABLE_BYTES_PER_CELL: u64 = 12;
@@ -810,9 +860,9 @@ pub const CSV_PREP_BYTES_PER_USED_CELL: u64 = 24;
 /// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus a
 /// per-row preparation overhead and 25 % allocator slack. `used_cols` is the
 /// search's projection (variables plus targets); pass `0` when it is not known
-/// yet and the whole header width is used. The text term matters: the loader
-/// reads the whole file into one `String`, so a wide 17 GB CSV is at least
-/// 17 GB resident.
+/// yet and the whole header width is used. This function keeps the text term
+/// for callers that measured a resident buffer with [`csv_shape`]; the CLI
+/// streams and calls [`estimate_csv_stream_bytes`] instead.
 pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
     let (text, table, rows) = csv_terms(shape);
     let cols = shape.cols.max(1) as u64;
@@ -829,6 +879,34 @@ pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
         .saturating_add(prep)
         .saturating_mul(5)
         / 4
+}
+
+/// Estimated peak resident bytes for the **streaming** CSV path (issue #126).
+///
+/// The CLI no longer keeps the file text in memory, so the text term is zero;
+/// the shape is measured from the stream and the table/preparation terms are
+/// the same as [`estimate_csv_bytes`]. `bytes` on the shape is still the number
+/// of bytes read, for reporting, not a resident term.
+pub fn estimate_csv_stream_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    let (_text, table, rows) = csv_terms(shape);
+    let cols = shape.cols.max(1) as u64;
+    let used = if used_cols == 0 {
+        cols
+    } else {
+        (used_cols as u64).min(cols)
+    };
+    let prep = rows.saturating_mul(
+        used.saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
+            .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
+    );
+    table.saturating_add(prep).saturating_mul(5) / 4
+}
+
+/// Estimated peak resident bytes for a streaming `rcsr import`: the resident
+/// table plus allocator slack, with no whole-file text and no search sample.
+pub fn estimate_csv_load_stream_bytes(shape: CsvShape) -> u64 {
+    let (_text, table, _rows) = csv_terms(shape);
+    table.saturating_mul(5) / 4
 }
 
 /// Estimated peak resident bytes for reading a CSV without preparing a search
@@ -984,6 +1062,8 @@ struct CsvRecords<R: std::io::BufRead> {
     reader: R,
     /// 1-based number of the last physical line read.
     line: usize,
+    /// Bytes consumed from the source, including record separators.
+    bytes: u64,
     /// Chosen delimiter; `None` until the header has been sniffed.
     delim: Option<char>,
     /// A record read during sniffing that must be returned next.
@@ -995,6 +1075,7 @@ impl<R: std::io::BufRead> CsvRecords<R> {
         CsvRecords {
             reader,
             line: 0,
+            bytes: 0,
             delim: None,
             pending: None,
         }
@@ -1005,7 +1086,8 @@ impl<R: std::io::BufRead> CsvRecords<R> {
         let mut bytes = Vec::new();
         match self.reader.read_until(b'\n', &mut bytes) {
             Ok(0) => None,
-            Ok(_) => {
+            Ok(n) => {
+                self.bytes = self.bytes.saturating_add(n as u64);
                 self.line += 1;
                 while matches!(bytes.last(), Some(b'\n') | Some(b'\r')) {
                     bytes.pop();
