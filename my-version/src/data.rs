@@ -726,6 +726,118 @@ fn categorical_levels(
     Ok(levels)
 }
 
+/// Shape of a delimited text table, measured without building the `Table`.
+///
+/// `parse_table_with` already scans the whole text twice (header plus column
+/// typing); this scan counts header fields and data rows so the memory guard
+/// can estimate from the table's shape rather than from file size (issue #112).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CsvShape {
+    /// Data rows (blank and `#` lines excluded).
+    pub rows: usize,
+    /// Header fields.
+    pub cols: usize,
+    /// The text the loader holds while parsing, in bytes.
+    pub bytes: u64,
+}
+
+/// Measure a delimited text buffer: delimiter, header width and data-row count.
+///
+/// The delimiter follows the loader (`\t` if the header contains a tab, else
+/// `,`, else whitespace). The scan allocates nothing per line.
+pub fn csv_shape(text: &str) -> CsvShape {
+    let mut cols = 0usize;
+    let mut rows = 0usize;
+    let mut header_seen = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if !header_seen {
+            header_seen = true;
+            let d = if line.contains('\t') {
+                '\t'
+            } else if line.contains(',') {
+                ','
+            } else {
+                ' '
+            };
+            cols = if d == ' ' {
+                line.split_whitespace().count()
+            } else {
+                line.bytes().filter(|&b| b == d as u8).count() + 1
+            };
+            continue;
+        }
+        rows += 1;
+    }
+    CsvShape {
+        rows,
+        cols,
+        bytes: text.len() as u64,
+    }
+}
+
+/// Resident bytes per table cell: one `f64` value plus the `u32` code that a
+/// low-cardinality numeric or text column keeps alongside it.
+pub const CSV_TABLE_BYTES_PER_CELL: u64 = 12;
+
+/// Per-row preparation cost: `Vec` headers and selector bookkeeping for the
+/// row-major `cells`, train and test copies.
+pub const CSV_PREP_FIXED_BYTES_PER_ROW: u64 = 72;
+
+/// Per-row, per-used-column preparation cost: one `f64` in each of the
+/// `cells`, train and test copies, plus each row's `Vec<f64>` header.
+pub const CSV_PREP_BYTES_PER_USED_CELL: u64 = 24;
+
+/// Estimated peak resident bytes for loading and preparing a CSV (issue #112).
+///
+/// The model is `text + rows x columns x 12 + rows x used_columns x 24` plus a
+/// per-row preparation overhead and 25 % allocator slack. `used_cols` is the
+/// search's projection (variables plus targets); pass `0` when it is not known
+/// yet and the whole header width is used. The text term matters: the loader
+/// reads the whole file into one `String`, so a wide 17 GB CSV is at least
+/// 17 GB resident.
+pub fn estimate_csv_bytes(shape: CsvShape, used_cols: usize) -> u64 {
+    let (text, table, rows) = csv_terms(shape);
+    let cols = shape.cols.max(1) as u64;
+    let used = if used_cols == 0 {
+        cols
+    } else {
+        (used_cols as u64).min(cols)
+    };
+    let prep = rows.saturating_mul(
+        used.saturating_mul(CSV_PREP_BYTES_PER_USED_CELL)
+            .saturating_add(CSV_PREP_FIXED_BYTES_PER_ROW),
+    );
+    text.saturating_add(table)
+        .saturating_add(prep)
+        .saturating_mul(5)
+        / 4
+}
+
+/// Estimated peak resident bytes for reading a CSV without preparing a search
+/// sample (`rcsr import`): the text plus the resident table.
+pub fn estimate_csv_load_bytes(shape: CsvShape) -> u64 {
+    let (text, table, _) = csv_terms(shape);
+    text.saturating_add(table).saturating_mul(5) / 4
+}
+
+/// `(text, table, rows)`; `text` is the whole-file buffer, so an unmeasured
+/// shape falls back to eight resident bytes per text byte.
+fn csv_terms(shape: CsvShape) -> (u64, u64, u64) {
+    let rows = shape.rows as u64;
+    if rows == 0 || shape.cols == 0 {
+        return (shape.bytes.saturating_mul(8), 0, 0);
+    }
+    let cols = shape.cols as u64;
+    let table = rows
+        .saturating_mul(cols)
+        .saturating_mul(CSV_TABLE_BYTES_PER_CELL);
+    (shape.bytes, table, rows)
+}
+
 pub fn read_table(path: &str) -> Result<Table, String> {
     read_table_with(path, false)
 }

@@ -99,10 +99,11 @@ INPUT:
                              for CSV ('-' reads the table from standard input)
   --max-memory <size>        refuse when the estimated resident footprint is
                              larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
-                             512MB, 2GiB). Exit 3 with an actionable message
-                             instead of SIGABRT/SIGKILL. A `.rcsb` store that
-                             does not fit is searched from a hash sample with
-                             bounded RSS; a CSV is refused before parsing.
+                             512MB, 2GiB). Exit 3 with the rows x columns
+                             estimate and an actionable message instead of
+                             SIGABRT/SIGKILL. A `.rcsb` store that does not fit
+                             is searched from a hash sample with bounded RSS;
+                             a CSV is refused before parsing.
   --force                    override --max-memory and try the resident path
                              anyway (the kernel may still kill the process)
   --target <col>[,<col>..]   target column; a comma-separated list enables
@@ -1372,14 +1373,22 @@ fn main() {
         }
     }
 
-    // #71: the guard and the backing choice happen before any resident Table
-    // or search sample is built.
+    // #71/#112: the guard and the backing choice happen before any resident
+    // Table or search sample is built. A CSV estimate uses the table's shape
+    // (rows x columns) once the text has been read, never `33 x file size`.
     let detected_budget = store::detected_memory_budget();
     let budget = max_memory.or(detected_budget);
     // A CSV refusal uses only a hard wall (`--max-memory`, `ulimit -v` or a
-    // cgroup limit), never the soft MemAvailable figure: the 33x estimate is
-    // deliberately conservative.
+    // cgroup limit), never the soft MemAvailable figure.
     let guard_budget = max_memory.or_else(store::detected_hard_budget);
+    // The search touches every explicitly named variable plus every target and
+    // the weight column. With no `--vars` the projection is not known yet, so
+    // the estimate assumes the whole header.
+    let projected_cols = if vars.is_empty() {
+        0
+    } else {
+        vars.len() + target_names.len() + usize::from(weight_name.is_some())
+    };
     let mut out_of_core_note: Option<String> = None;
     let table = if data_path == "-" {
         let mut buf = String::new();
@@ -1387,10 +1396,11 @@ fn main() {
             eprintln!("error reading stdin: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        let shape = data::csv_shape(&buf);
         if let Some(limit) = guard_budget {
-            let estimate = (buf.len() as u64).saturating_mul(33);
+            let estimate = data::estimate_csv_bytes(shape, projected_cols);
             if estimate > limit && !force {
-                refuse_for_memory("<stdin>", buf.len() as u64, estimate, limit);
+                refuse_for_memory("<stdin>", shape, estimate, limit, Some(projected_cols));
             }
         }
         data::parse_table_with(&buf, skip_malformed)
@@ -1427,15 +1437,21 @@ fn main() {
             Err(e) => Err(e),
         }
     } else {
-        if let Ok(meta) = std::fs::metadata(&data_path) {
-            if let Some(limit) = guard_budget {
-                let estimate = meta.len().saturating_mul(33);
-                if estimate > limit && !force {
-                    refuse_for_memory(&data_path, meta.len(), estimate, limit);
-                }
+        let text = match std::fs::read_to_string(&data_path) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("error: {}: {}", data_path, e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let shape = data::csv_shape(&text);
+        if let Some(limit) = guard_budget {
+            let estimate = data::estimate_csv_bytes(shape, projected_cols);
+            if estimate > limit && !force {
+                refuse_for_memory(&data_path, shape, estimate, limit, Some(projected_cols));
             }
         }
-        data::read_table_with(&data_path, skip_malformed)
+        data::parse_table_with(&text, skip_malformed)
     };
     let table = match table {
         Ok(t) => t,
@@ -4970,14 +4986,48 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-fn refuse_for_memory(path: &str, file_bytes: u64, estimate: u64, limit: u64) -> ! {
+fn refuse_for_memory(
+    path: &str,
+    shape: data::CsvShape,
+    estimate: u64,
+    limit: u64,
+    prep_cols: Option<usize>,
+) -> ! {
     eprintln!("error: input would exceed the memory budget");
     eprintln!(
-        "  {}: {} on disk; estimated resident footprint {} (~33x, measured 1.75 KiB/row)",
+        "  {}: {} on disk, {} rows x {} columns; estimated resident footprint {}",
         path,
-        human_bytes(file_bytes),
+        human_bytes(shape.bytes),
+        shape.rows,
+        shape.cols,
         human_bytes(estimate)
     );
+    let table_bytes = (shape.rows as u64)
+        .saturating_mul(shape.cols as u64)
+        .saturating_mul(data::CSV_TABLE_BYTES_PER_CELL);
+    match prep_cols {
+        Some(projected) => {
+            let used = if projected == 0 {
+                shape.cols
+            } else {
+                projected.min(shape.cols)
+            };
+            eprintln!(
+                "  estimate basis: text {} + table {} cells (12 B/cell) + preparation {} used \
+                 columns (24 B/cell, 72 B/row)",
+                human_bytes(shape.bytes),
+                human_bytes(table_bytes),
+                used
+            );
+        }
+        None => {
+            eprintln!(
+                "  estimate basis: text {} + table {} cells (12 B/cell), no search preparation",
+                human_bytes(shape.bytes),
+                human_bytes(table_bytes)
+            );
+        }
+    }
     eprintln!(
         "  memory budget is {} ({} bytes; set it with --max-memory)",
         human_bytes(limit),
@@ -5008,7 +5058,8 @@ OPTIONS:
   --out <store.rcsb>       output store
   --group-rows <N>         rows per I/O group (default {})
   --skip-malformed         drop ragged rows instead of refusing the input
-  --max-memory <size>      refuse before parsing when ~33x the CSV exceeds this
+  --max-memory <size>      refuse before parsing when the rows x columns
+                           estimate exceeds this (not 33x the file size)
   --force                  override --max-memory
   --quiet                  do not print the summary
   -h, --help               show this help
@@ -5106,27 +5157,32 @@ fn run_import(args: &[String]) -> ! {
         eprintln!("error: '{}' is already a column store", input);
         std::process::exit(EXIT_USAGE);
     }
-    let meta = match std::fs::metadata(&input) {
-        Ok(m) => m,
+    let text = match std::fs::read_to_string(&input) {
+        Ok(text) => text,
         Err(e) => {
             eprintln!("error: {}: {}", input, e);
             std::process::exit(EXIT_INPUT);
         }
     };
     if let Some(limit) = max_memory.or_else(store::detected_hard_budget) {
-        let estimate = meta.len().saturating_mul(33);
+        let shape = data::csv_shape(&text);
+        let estimate = data::estimate_csv_load_bytes(shape);
         if estimate > limit && !force {
-            refuse_for_memory(&input, meta.len(), estimate, limit);
+            refuse_for_memory(&input, shape, estimate, limit, None);
         }
     }
-    let table = match data::read_table_with(&input, skip_malformed) {
+    let table = match data::parse_table_with(&text, skip_malformed) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
     };
-    if let Err(e) = store::write_store(&output, &table, group_rows) {
+    finish_import(&output, &table, group_rows, quiet);
+}
+
+fn finish_import(output: &str, table: &data::Table, group_rows: usize, quiet: bool) -> ! {
+    if let Err(e) = store::write_store(output, table, group_rows) {
         eprintln!("error: {}", e);
         std::process::exit(EXIT_INPUT);
     }
