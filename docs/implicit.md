@@ -128,9 +128,11 @@ An implicit law is recovered from *where* the points are, and the derivative
 metric divides by a slope. On raw, unsmoothed measurements the slope of the
 fitted surface is contaminated by row-to-row noise: the distance can be made
 small by a nearly flat function, or inflated by a steep artifact that exists
-only between two noisy samples. A centred moving average (`--smooth k`, `k ≥ 3`)
+only between two noisy samples. A moving average (`--smooth k`, `k ≥ 3`)
 denoises before the gradient is estimated and makes the level-set distance
-meaningful.
+meaningful. `--smooth` is **trailing** and therefore causal; the old centred
+window is only available as the explicit `--smooth-centred k`, which reads
+future rows and is reported as look-ahead.
 
 The engine therefore prints
 

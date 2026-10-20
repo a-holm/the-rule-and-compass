@@ -146,6 +146,7 @@ ROW WEIGHTS:
                              rank_correlation, auc, log_loss, hinge).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
+  See docs/time-series.md for which preparation steps read ahead.
   --fill <method>            what to do with a missing cell (empty, NA, NaN or
                              null). Default none: leave it, as before.
                              drop        drop the row
@@ -173,6 +174,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              counted, one matching neither is reported unused
 
 HOW ROWS ARE SPLIT (important for time series and panel data):
+  See docs/time-series.md for the full purge/embargo/look-ahead checklist.
   --split random|temporal|group|temporal-group|auto   (default random)
                              random          shuffled i.i.d. holdout
                              temporal        train on the past, test on the future
@@ -6641,6 +6643,28 @@ mod tests {
                 m
             );
         }
+    }
+
+    /// #115: the time-series checklist must be reachable from the CLI contract,
+    /// and the smoothing flags must describe the causal default correctly.
+    #[test]
+    fn help_and_schema_link_the_time_series_checklist() {
+        for surface in [usage(), schema::json()] {
+            assert!(
+                surface.contains("docs/time-series.md"),
+                "the time-series checklist is not linked from the CLI contract"
+            );
+        }
+        assert!(usage().contains("--smooth-centred"));
+        assert!(schema::json().contains("--smooth-centred"));
+        assert!(
+            schema::json().contains("trailing moving-average"),
+            "schema must describe --smooth as trailing"
+        );
+        assert!(
+            !schema::json().contains("centred moving average per column"),
+            "the stale README wording must not reappear in schema"
+        );
     }
 
     /// Data preparation stayed opt-in, but every flag must be documented.

@@ -483,7 +483,9 @@ run:
 |---|---|
 | `--fill <method>` | what to do with a missing cell: `none` (default), `drop`, `mean`, `median`, `zero`, `previous`, `interpolate` |
 | `--outlier-iqr k` | drop rows beyond `k` interquartile ranges from the column median |
-| `--smooth k` | `k`-wide centred moving average per column; edges shrink |
+| `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
+| `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
+| `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
