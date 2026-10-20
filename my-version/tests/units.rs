@@ -555,7 +555,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let base = [
         "--data", "-", "--target", "y", "--vars", "x", "--seed-expr", "x",
         "--generations", "0", "--pop", "1", "--fit-iters", "0", "--test-frac",
-        "0", "--quiet",
+        "0", "--cpu", "--quiet",
     ];
 
     let out = rcsr_stdin(&base, table);
