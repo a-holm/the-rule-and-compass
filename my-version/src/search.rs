@@ -31,7 +31,7 @@ use crate::rng::Mt;
 // #25: the dimensional algebra lives in its own module; the search only asks
 // `Config::accepts_dimensions`.
 use crate::units::Units;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone)]
 pub struct Config {
@@ -350,6 +350,8 @@ struct GpuSearch {
     /// once (grown only if a later batch is larger) and reused every generation,
     /// so a generation never calls `cudaMalloc` for its programs.
     pool: Option<crate::genome::GenomePool>,
+    /// #131: per-generation opcode/fallback counts.
+    stats: BTreeMap<usize, GpuGenStats>,
 }
 
 #[cfg(feature = "cuda")]
@@ -382,6 +384,7 @@ impl GpuSearch {
                 ev,
                 n_rows,
                 pool: None,
+                stats: BTreeMap::new(),
             }),
             None => Err(format!(
                 "no usable CUDA device ({})",
@@ -402,6 +405,7 @@ impl GpuSearch {
         islands: &mut [Vec<Ind>],
         train: &Sample,
         cfg: &Config,
+        generation: usize,
     ) -> Result<(), String> {
         let pending: Vec<(usize, usize)> = islands
             .iter()
@@ -449,6 +453,13 @@ impl GpuSearch {
             }
         }
 
+        // #131: record what the batch actually used. Several calls can belong
+        // to one generation (initial screening, refit, restarts); merge them.
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
+        stats.programs += pool.len();
+        stats.fallbacks += on_cpu.len();
+
         if !pool.is_empty() {
             let (sse, ms) = self.ev.eval_pool(pool);
             if ms < 0.0 || sse.len() != pool.len() {
@@ -476,6 +487,17 @@ impl GpuSearch {
             rescore_pending_cpu(islands, &train_view, cfg);
         }
         Ok(())
+    }
+
+    /// #131: the per-generation report, in generation order.
+    fn run_stats(&self) -> GpuRunStats {
+        GpuRunStats {
+            generations: self
+                .stats
+                .values()
+                .cloned()
+                .collect(),
+        }
     }
 }
 
@@ -566,11 +588,12 @@ fn score_generation(
     train: &Sample,
     cfg: &Config,
     backend_reason: &mut Option<String>,
+    generation: usize,
 ) -> bool {
     let Some(g) = gpu.as_mut() else {
         return false;
     };
-    match g.score(islands, train, cfg) {
+    match g.score(islands, train, cfg, generation) {
         Ok(()) => {
             *used = true;
             true
@@ -1295,6 +1318,25 @@ pub struct SeedResult {
     pub error: f64,
 }
 
+/// #131: one GPU scoring batch, reported in `--json` under `gpu.generations`.
+#[derive(Clone, Debug, Default)]
+pub struct GpuGenStats {
+    /// Generation number this batch belongs to.
+    pub generation: usize,
+    /// Operator occurrences in the programs that ran on the GPU.
+    pub opcodes: Vec<(String, usize)>,
+    /// Programs compiled into the batch.
+    pub programs: usize,
+    /// Candidates sent to the CPU fallback in the same batch.
+    pub fallbacks: usize,
+}
+
+/// #131: aggregate GPU usage for a run.
+#[derive(Clone, Debug, Default)]
+pub struct GpuRunStats {
+    pub generations: Vec<GpuGenStats>,
+}
+
 pub struct Outcome {
     pub archive: Archive,
     pub test_errors: Vec<f64>,
@@ -1323,6 +1365,9 @@ pub struct Outcome {
     pub backend_reason: Option<String>,
     /// #141: the device that guided the search, when `backend` is `gpu`.
     pub device: Option<String>,
+    /// #131: which native opcodes and how many CPU fallbacks each GPU batch
+    /// used. `None` when the run did not use the GPU.
+    pub gpu: Option<GpuRunStats>,
 }
 
 /// Run a search once, from a fresh start.
@@ -1795,7 +1840,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason);
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done);
     }
 
     // #18: one tracker, updated once per generation from the archive. It holds
@@ -1908,7 +1953,7 @@ fn run_search(
             {
                 if !screened {
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason);
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
                 }
             }
 
@@ -2083,7 +2128,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason);
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -2193,6 +2238,13 @@ fn run_search(
         convergence = progress_stats.observe(gens_done, best, &final_archive);
     }
 
+    // #131: the GPU report is emitted only for a run that actually used the
+    // device, so a CPU run's JSON is byte-identical to before.
+    #[cfg(feature = "cuda")]
+    let gpu_stats = if gpu_used { gpu.as_ref().map(|g| g.run_stats()) } else { None };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_stats: Option<GpuRunStats> = None;
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
@@ -2210,9 +2262,6 @@ fn run_search(
         archive_refit: fit_screened,
         // #86: the effective subset actually used, after the break-even rule.
         predictor_samples: effective_predictor_samples(cfg, train).unwrap_or(0),
-        // #141: the backend that actually guided the search. `gpu_used` is set
-        // only when a CUDA batch completed, so a failed probe, an unsupported
-        // objective or a first-batch error reports `cpu`.
         backend: if gpu_used {
             crate::backend::Kind::Gpu
         } else {
@@ -2220,6 +2269,7 @@ fn run_search(
         },
         backend_reason,
         device: if gpu_used { backend_device } else { None },
+        gpu: gpu_stats,
     })
 }
 
