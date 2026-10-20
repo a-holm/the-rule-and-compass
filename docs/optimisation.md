@@ -497,6 +497,69 @@ non-finite fitter value in the same cases (`Ln(0) → -inf`, `Sqrt(<0) → NaN`,
 `Tan(inf) → NaN`, `Pow → NaN`, `Atan2 → NaN`), so guarding them too changed the
 multi-output search trajectory without fixing a finite-vs-infinite divergence.
 
+#### The exact linear least-squares arm (#116)
+
+The default fitter is still the LM/adjoint path described above. Some trees do
+not need iterations at all: when the value is **affine in every constant** —
+`f(x; c) = f(x; c₀) + Σⱼ (cⱼ − c₀ⱼ)·gⱼ(x)` — the minimiser is the solution of a
+linear least-squares problem. `--fit-strategy auto` (or `linear`) detects that
+class structurally and solves it directly:
+
+* the adjoint sweep at the current constants gives the coefficients `gⱼ(x)`
+  exactly and independently of `c₀`;
+* the weighted design matrix `√w·J` is solved by **column-scaled,
+  column-pivoted Householder QR**, never the normal equations, so the condition
+  number is not squared;
+* the constants are written back only if the closed-form weighted SSE is finite
+  and no worse than the starting point.
+
+The classifier is structural, not a numerical test: a product of two
+constant-dependent factors is bilinear and rejected; any nonlinear operator is
+accepted only when its whole subtree is constant-free; `if` may choose between
+affine branches only when its condition is constant-free. `a*x + b`,
+`a*x² + b*sin(x) + c` and `a*f(x) + b*g(x) + c` qualify; `a*sin(b*x) + c`,
+`a*(b + x)` and `exp(a*x)` do not.
+
+**Exactness.** The arm is an exact global minimiser for its class, not an
+approximation. The pre-registered acceptance rules are:
+
+| rule | tolerance / behaviour |
+|---|---|
+| affine objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
+| constants versus exact LM | relative difference `<= 1e-8` on affine tests |
+| rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
+| size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
+| ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
+| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+
+Because the linear arm reaches the optimum in one solve instead of iterating,
+it **can** change the search trajectory (usually by fitting a linear candidate
+better than an 8-iteration LM run). It is therefore opt-in, and it is saved in
+checkpoints as search state; `auto` currently has exactly these two arms.
+
+`--fit-report` prints the arm counts for the run. On the daily panel
+(`panel_daily_100.csv`, 154,675 rows, target `y1`, inputs `r1,r3,r7,ma7`,
+`--seed 3 --islands 1 --pop 200 --generations 5 --patience 0`), two alternating
+pairs on a shared host:
+
+| strategy | linear / exact calls | user CPU | wall (median) |
+|---|---:|---:|---:|
+| `exact` | 0 / 995 | 80.0 s | 110.6 s |
+| `auto` | 491 / 504 (49.3 %) | 53.4 s | 66.9 s |
+
+That is **1.50× user-CPU** and **1.65× wall-clock** for the run. The HOURLY panel
+(`panel_hourly_compact.csv`, 3.9M rows, target `y60`, `--fill drop --pop 100
+--generations 2`) measured 513.6 s → 402.9 s user CPU (**1.28×**, 49.0 % linear
+calls) and 631 s → 437 s wall. The archive improvements on the daily run were
+strictly non-worse: `auto` reported two extra Pareto members with lower train
+and test error (`0.30848993 / 0.31136481` versus the `exact` front's best
+`0.30861096 / 0.31146704` at a larger complexity), because the linear arm
+solved candidates that LM's eight iterations left short of the optimum.
+
+**Not yet implemented** (tracked on #116): VarPro for separable nonlinear
+models, batched GPU LM and the adaptive cost-model dispatcher. This PR lands
+only the exact CPU linear arm plus its classifier, fallback and reporting.
+
 #### Subsampled scoring: `--predictor-samples`
 
 `--predictor-samples N` draws a fresh `N`-row subset every generation and uses

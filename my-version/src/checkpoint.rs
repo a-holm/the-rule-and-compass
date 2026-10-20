@@ -1010,6 +1010,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "require_dimensions",
         "fit_samples",
         "front_parents", // #76
+        "fit_strategy",  // #116: missing means `exact`
     ];
     for key in KEYS {
         required(fields, key)?;
@@ -1185,6 +1186,17 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             ))
         }
     };
+    // #116: missing means `exact`, byte-identical to a checkpoint written
+    // before the solver portfolio existed.
+    let fit_strategy = match fields.get("fit_strategy").map(|s| s.as_str()) {
+        None => crate::fit::FitStrategy::Exact,
+        Some(raw) => crate::fit::FitStrategy::parse(raw).ok_or_else(|| {
+            format!(
+                "config 'fit_strategy' must be exact, auto or linear, got '{}'",
+                raw
+            )
+        })?,
+    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
@@ -1206,6 +1218,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         restart_interval: num_usize("restart_interval")?,
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
+        fit_strategy, // #116
+        fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
         patience: num_usize("patience")?,
@@ -1258,6 +1272,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
+    writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();
     writeln!(
         out,

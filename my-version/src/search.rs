@@ -50,6 +50,14 @@ pub struct Config {
     pub init_depth: usize,
     /// Levenberg–Marquardt iterations for constant fitting (0 disables).
     pub fit_iters: usize,
+    /// #116: exact constant-fitting arm. `Exact` is the historical CPU LM;
+    /// `Auto`/`Linear` use the closed-form linear least-squares arm for trees
+    /// affine in every constant and fall back to LM otherwise. Changing it
+    /// changes the trajectory, so it is a saved search setting.
+    pub fit_strategy: crate::fit::FitStrategy,
+    /// #116: print one `# fit:` line with the arm counts. Reporting only; it is
+    /// not saved in a checkpoint and is ignored by the search settings check.
+    pub fit_report: bool,
     /// Discard structurally duplicated offspring before evaluating them.
     pub dedup: bool,
     /// Wall-clock budget in seconds; `None` means no limit.
@@ -126,6 +134,8 @@ impl Default for Config {
             restart_interval: 60,
             init_depth: 3,
             fit_iters: 8,
+            fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_report: false,
             dedup: true,
             time_budget: None,
             patience: 40,
@@ -174,6 +184,7 @@ impl Config {
         compare!(restart_interval, "restart_interval");
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
+        compare!(fit_strategy, "fit_strategy"); // #116
         compare!(dedup, "dedup");
         if self.time_budget.map(f64::to_bits) != other.time_budget.map(f64::to_bits) {
             diff.push("time_budget");
@@ -821,7 +832,15 @@ fn fit_constants_with_iters(
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
-        let sse = crate::fit::fit_weighted(tree, &fit.x, &fit.y, &fit.w, iters);
+        // #116: the configured exact arm; `Exact` is `fit_weighted` bit for bit.
+        let sse = crate::fit::fit_weighted_strategy(
+            tree,
+            &fit.x,
+            &fit.y,
+            &fit.w,
+            iters,
+            cfg.fit_strategy,
+        );
         // #87: remember the tree the SSE belongs to. Simplification after the
         // fit may fold constants, in which case the SSE is stale and the
         // caller must score normally.
