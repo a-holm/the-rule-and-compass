@@ -19,7 +19,7 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{data, diagnostics, multi, search, stability, store};
+use rcsr::{backend, data, diagnostics, multi, search, stability, store};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io::Read;
@@ -331,12 +331,16 @@ SEARCH:
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
   --time-budget <seconds>    wall-clock limit (default: none)
-  --gpu                      let the GPU guide the search when built with
-                             --features cuda and a device is present. Reported
-                             errors stay CPU f64, but f32 fitness can change the
-                             trajectory, so this is opt-in
-  --no-gpu                   force CPU evaluation (alias --cpu); this is the
-                             default, so the flag is only for explicitness
+  --gpu                      assert that the GPU must guide the search: an
+                             error (exit 2) when the binary was not built with
+                             --features cuda or no device is present. Without
+                             --gpu/--cpu, a CUDA build with a usable device uses
+                             the GPU automatically. Reported errors stay CPU
+                             f64, but f32 fitness can change the trajectory
+                             (cross-backend runs are not bit-identical)
+  --no-gpu                   force CPU evaluation (alias --cpu); also the
+                             reproducibility escape hatch for a byte-identical
+                             CPU trajectory
 
 CHECKPOINTS:
   --save <file>              write a checkpoint on exit and every --save-every
@@ -356,7 +360,8 @@ OUTPUT:
                              maturity, percent_converged); stderr, or stdout in
                              ndjson. See docs/convergence.md
   --top <N>                  report at most N Pareto rows (default: all)
-  --quiet                    suppress the human-readable header
+  --quiet                    suppress the human-readable header, the GPU
+                             fallback note and the one-line resource summary
   --out <file>               also write the Pareto front as TSV
 
 REPORTS (Markdown, issue #29):
@@ -575,9 +580,10 @@ fn main() {
     }
 
     let mut cfg = search::Config::default();
-    // #91: the GPU path is opt-in. A default run is CPU, so the same command
-    // produces the same archive whether or not the binary was built with
-    // `--features cuda`. Pass `--gpu` to let f32 fitness guide the search.
+    // #141: whether the user asserted a backend explicitly. `None` means the
+    // run follows the build/device default; `Some(true)` is `--gpu` and
+    // `Some(false)` is `--no-gpu`/`--cpu`.
+    let mut gpu_explicit: Option<bool> = None;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -892,10 +898,18 @@ fn main() {
             // #27: evaluator path only; deliberately not a saved search
             // setting, because both paths produce identical errors.
             "--no-simd" => cfg.simd = false,
-            // #26: force the CPU evaluator even in a CUDA build. A
-            // performance choice, not saved search state.
-            "--gpu" => cfg.gpu = true,
-            "--no-gpu" | "--cpu" => cfg.gpu = false,
+            // #26/#141: `--gpu` asserts that a device exists (it is an error
+            // when the probe found none); `--no-gpu`/`--cpu` is the deliberate
+            // CPU override. The absence of both follows the build/device
+            // default, resolved once after option parsing.
+            "--gpu" => {
+                cfg.gpu = true;
+                gpu_explicit = Some(true);
+            }
+            "--no-gpu" | "--cpu" => {
+                cfg.gpu = false;
+                gpu_explicit = Some(false);
+            }
             "--predictor-samples" => {
                 let v = val!();
                 match v.parse::<usize>() {
@@ -1274,6 +1288,40 @@ fn main() {
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
+    }
+
+    // #141: probe the device once, before the dataset is loaded. The probe
+    // allocates nothing; the search opens its own resident context later. This
+    // is the single runtime decision behind the startup summary and JSON.
+    let gpu_probe = backend::probe();
+    match gpu_explicit {
+        Some(true) => {
+            if !gpu_probe.available() {
+                let why = gpu_probe
+                    .reason
+                    .as_deref()
+                    .unwrap_or("no usable CUDA device");
+                eprintln!(
+                    "error: --gpu was requested but no GPU is available ({})",
+                    why
+                );
+                eprintln!("       omit --gpu (or pass --cpu) to run on the CPU");
+                std::process::exit(EXIT_USAGE);
+            }
+            cfg.gpu = true;
+        }
+        Some(false) => cfg.gpu = false,
+        None => {
+            cfg.gpu = gpu_probe.available();
+            // A non-CUDA build is CPU by design; only a CUDA-capable binary
+            // that failed to find a device needs a fallback warning.
+            if !cfg.gpu && !quiet && cfg!(feature = "cuda") {
+                eprintln!(
+                    "# gpu: unavailable ({}); using the CPU",
+                    gpu_probe.reason.as_deref().unwrap_or("no usable CUDA device")
+                );
+            }
+        }
     }
 
     // User-defined building blocks (issue #10). The definitions are parsed
@@ -2189,9 +2237,43 @@ fn main() {
         }
     }
 
-    // #26: the backend note belongs to the CLI, not to the library. `--quiet`
-    // promises an empty stderr for machine-readable output, so it suppresses it.
+    // #26/#141: the backend note belongs to the CLI, not to the library.
+    // `--quiet` promises an empty stderr for machine-readable output, so it
+    // suppresses the note and the one-line resource summary.
     cfg.gpu_notes = !quiet;
+
+    // #141: one line stating the resources this run will use. `rows`/`cols`
+    // are the training table (the search's hot loop); test rows are in the
+    // split object. The backend is the startup decision; a per-objective
+    // fallback is still reported once by the search itself.
+    if !quiet {
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let cols = prepared.train.x.first().map(|r| r.len()).unwrap_or(0);
+        let (kind, device, reason) = if cfg.gpu && gpu_probe.available() {
+            ("gpu", gpu_probe.device.as_deref().unwrap_or("unknown"), None)
+        } else {
+            (
+                "cpu",
+                "-",
+                gpu_explicit
+                    .filter(|explicit| !*explicit)
+                    .map(|_| "--cpu/--no-gpu")
+                    .or(gpu_probe.reason.as_deref()),
+            )
+        };
+        match reason {
+            Some(why) => eprintln!(
+                "# resource: backend={} device={} threads={} rows={} cols={} ({})",
+                kind, device, threads, prepared.train.len(), cols, why
+            ),
+            None => eprintln!(
+                "# resource: backend={} device={} threads={} rows={} cols={}",
+                kind, device, threads, prepared.train.len(), cols
+            ),
+        }
+    }
 
     // #15: multi-output reporting has its own shape (one entry per target);
     // the single-output path below is untouched.
@@ -3120,9 +3202,31 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string()),
                 outcome.generations
             );
+            // #141: report the backend that actually guided the search, with
+            // the device name and a reason when the CPU ran. This is derived
+            // from the probe/outcome, never from the flags alone.
+            let backend_reason = if gpu_explicit == Some(false) {
+                Some("--cpu/--no-gpu".to_string())
+            } else {
+                outcome
+                    .backend_reason
+                    .clone()
+                    .or_else(|| gpu_probe.reason.clone())
+            };
+            let backend_json = format!(
+                "\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},",
+                outcome.backend.name(),
+                backend_reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
             println!(
-                "{{{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
+                backend_json,     // #141
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -3153,6 +3257,28 @@ fn main() {
             );
         }
         Format::Ndjson => {
+            // #141: state the effective backend before the stream of results.
+            let nd_backend_reason = if gpu_explicit == Some(false) {
+                Some("--cpu/--no-gpu".to_string())
+            } else {
+                outcome
+                    .backend_reason
+                    .clone()
+                    .or_else(|| gpu_probe.reason.clone())
+            };
+            println!(
+                "{{\"event\":\"backend\",\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                outcome.backend.name(),
+                nd_backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string())
+            );
             for (expression, complexity, error) in &seed_rows {
                 println!(
                     "{{\"event\":\"seed\",\"expression\":{},\"complexity\":{},\"train_error\":{}}}",
@@ -3576,7 +3702,7 @@ fn run_multi_output(
                 })
                 .collect();
             println!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -3588,6 +3714,18 @@ fn run_multi_output(
                 outcome.generations,
                 outcome.converged_early,
                 jnum(elapsed),
+                // #141: the effective backend, never inferred from flags.
+                outcome.backend.name(),
+                outcome
+                    .backend_reason
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
+                outcome
+                    .device
+                    .as_deref()
+                    .map(jstr)
+                    .unwrap_or_else(|| "null".to_string()),
                 pareto.join(",")
             );
         }
@@ -5147,11 +5285,14 @@ mod tests {
     /// #91: a default run must be CPU regardless of build features, so the
     /// same command yields the same archive in a CUDA and a non-CUDA build.
     #[test]
-    fn the_gpu_path_is_opt_in() {
-        assert!(!search::Config::default().gpu);
+    fn the_gpu_default_follows_the_build_and_flags_are_documented() {
+        // #141: a CUDA build prefers the GPU; every other build is CPU.
+        assert_eq!(search::Config::default().gpu, cfg!(feature = "cuda"));
         assert!(usage().contains("--gpu"));
         assert!(schema::json().contains("\"--gpu\""));
         assert!(usage().contains("--no-gpu"));
+        assert!(schema::json().contains("\"backend\""));
+        assert!(usage().contains("not bit-identical"));
     }
 
     use super::*;

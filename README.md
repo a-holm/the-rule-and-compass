@@ -780,6 +780,22 @@ list and the recorded results.
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.
 
+## Backends: GPU by default when available
+
+A binary built with `--features cuda` probes the device once at startup and uses
+the GPU to guide the search whenever one is available; a build without the
+feature, or a machine with no usable device, falls back to the CPU and records
+the reason. `--gpu` asserts that a device must exist (exit 2 otherwise),
+`--no-gpu`/`--cpu` forces the CPU, and `RCSR_GPU=0` simulates a missing device.
+Non-quiet runs print one resource line with the backend, device, available
+threads and training rows/columns, and `--json` records `backend`,
+`backend_reason` and `device`.
+
+Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
+change the search trajectory. Reported metrics, constants and diagnostics are
+always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
+reproduction. See [`docs/gpu-backend.md`](docs/gpu-backend.md).
+
 ## Is the search converging?
 
 `--progress` reports four bounded numbers every generation — **confidence**

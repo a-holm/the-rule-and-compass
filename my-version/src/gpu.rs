@@ -140,8 +140,41 @@ extern "C" {
         nprog: i32,
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    fn rc_device_count() -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+}
+
+/// Probe for a usable CUDA device once (issue #141).
+///
+/// This is the startup decision the CLI records in the resource summary and in
+/// JSON: it asks the CUDA runtime for a device count and, when one answers,
+/// reads the device attributes through [`GpuEvaluator::device_name`]. It does
+/// not allocate or upload anything, so running it before the dataset is loaded
+/// costs no device memory.
+///
+/// `RCSR_GPU=0` (or `false`/`off`/`no`) makes a CUDA build behave as if no
+/// device were present; it is the supported way to exercise the fallback path
+/// on a machine that has a GPU.
+pub fn probe() -> crate::backend::Probe {
+    if matches!(
+        std::env::var("RCSR_GPU").as_deref(),
+        Ok("0") | Ok("false") | Ok("off") | Ok("no")
+    ) {
+        return crate::backend::Probe::cpu("RCSR_GPU=0 (device use disabled)");
+    }
+    let count = unsafe { rc_device_count() };
+    if count < 0 {
+        return crate::backend::Probe::cpu("CUDA device query failed (no driver or runtime?)");
+    }
+    if count == 0 {
+        return crate::backend::Probe::cpu("no CUDA device found");
+    }
+    let name = GpuEvaluator::device_name();
+    if name == "unknown" {
+        return crate::backend::Probe::cpu("CUDA device attributes unavailable");
+    }
+    crate::backend::Probe::gpu(name)
 }
 
 /// A compiled population: the postfix programs of many expressions laid out
