@@ -289,52 +289,91 @@ returns an empty result when the program upload fails.
 
 ### Overlapping generation with scoring (issue #119)
 
-Steps 1 and 2 above share no data except the candidate trees: variation,
-simplification, fitting and de-duplication are CPU work, and a candidate's SSE
-is a function of its tree alone. Since #119 the main thread therefore drains a
-bounded queue while the island threads keep producing, instead of waiting for
-every island before compiling the whole population:
+Variation, simplification, fitting and de-duplication are CPU work; a
+candidate's SSE is a function of its tree alone. The only legal overlap is
+therefore **inside one generation**: produce chunk `c+1` while chunk `c` is on
+the device. Selection, migration, restart and the archive still happen at the
+generation barrier, after every result has been received. Overlapping
+*generations* (generating `g+1` while `g` scores) is not legal without changing
+the trajectory, because `vary(g+1)` needs the population that `select(g)`
+produces from the completed errors of `g`.
+
+Since #119 the main thread drains a bounded queue while the island threads keep
+producing:
 
 * each island thread offers a candidate to a `SyncSender` immediately after it
   is fitted and pushed into the next population (its own FIFO order);
-* the main thread takes batches of `pop / depth` candidates from the queue, so
-  one batch is always being scored while later ones are still being generated
-  and fitted;
+* `pipeline::chunk_plan(pop, depth)` splits the generation into `depth` chunks of
+  `ceil(pop / depth)` candidates. The scorer takes one chunk at a time, so one
+  chunk is on the device while later ones are still being generated and fitted;
+* the channel holds at most `min(pop, depth * batch)` jobs and the scorer holds
+  one more batch. Beyond the population the search already owns, the queue adds
+  at most one generation of cloned trees plus one batch — independent of the
+  generation count. The `(island, slot)` result table is `O(pop)` bits and is
+  what makes the mapping order-independent;
 * selection, migration, restart and the archive still happen at the generation
   barrier, after every result has been received.
 
-`--pipeline-depth N` (default 2) sets the queue depth; `0` restores the
-synchronous path. The queue holds at most `N` batches, plus at most one batch in
-the scorer's hands, so live candidate trees are bounded by
-`(N + 1) * ceil(pop / N)` — independent of the number of generations. A scoring
-error stops further GPU work, keeps draining (so no producer can block), and
-re-scores every still-pending candidate on the CPU in `f64`.
+`--pipeline-depth N` (default 2) sets the number of chunks; `0` restores the
+synchronous path. A larger depth starts the device earlier (smaller first chunk)
+at the cost of more launches; it does not change the ceiling below. A scoring
+error discards every `f32` value the overlap scorer already wrote, stops further
+GPU work, keeps draining (so no producer can block), and re-scores the whole
+generation in `f64` on the CPU through the same bounded fallback as the
+synchronous path. A tree the kernel cannot compile is left pending and scored
+exactly at the barrier, so the fallback set and the #131 program/fallback
+accounting are identical to the synchronous path (asserted in
+`tests/gpu_loop.rs`).
 
-The result mapping is fixed by `(island, slot)`; the arrival order of concurrent
-island threads is not part of the result. `tests/gpu_loop.rs` pins the whole
-archive and every `f64` test-error bit against `pipeline_depth = 0`, and the two
-queue unit tests force a slow consumer to show FIFO ordering and the
-`capacity + batch` memory bound. A CPU-only run constructs no queue, so any
-depth is an exact no-op.
+**Ceiling.** Let `F` be CPU seconds per generation (variation + simplify + fit +
+dedup) and `E` the GPU seconds. The synchronous cycle is `F + E`; chunked
+overlap is `F + E/depth` at best (the last chunk still tails), so
 
-Measured on the RTX 3060 (`sm_86`, CUDA 12.0), shared host with another GPU
-process active, alternating depths:
+```
+speed-up <= (F + E) / (F + E/depth) <= 1 + E/F .
+```
 
-| workload | depth 0 | depth 2 | speed-up |
+With the default fitter on the target cell (`d5k.csv`, 5 000 rows, pop 400) the
+GPU phase is a fraction of a percent of the generation, so the measured ceiling
+is about `1.02×` (below). The obstruction is Amdahl's, not the queue's: constant
+fitting is ~98 % of the generation and is not work the evaluator can absorb.
+Raising `--pipeline-depth` buys at most the last `E/depth` tail; it cannot move
+the fit fraction. The `score_chunk` seam in `search.rs` is where a deferred-fit
+arm joins the same batch; until #169 lands, `fit_defers_to_gpu` keeps overlap off
+for a fit strategy that would otherwise hand an unfitted tree to the scorer.
+
+Measured on the RTX 3060 (`sm_86`, CUDA 12.0), shared host with other processes
+active (load average 16–25), alternating depths. Absolute seconds are noisy; the
+useful numbers are the user time and the no-fit baseline:
+
+| workload (`d5k.csv`, 5 000 rows, pop 400, 12 generations, `--fit-iters 8`) | depth 0 | depth 2 | depth 4 |
 |---|---:|---:|---:|
-| `d5k.csv`, 5 000 rows, pop 400, 20 generations, `--fit-iters 8` | 106.6 s wall, 95.1 s user | 100.2 s wall, 93.0 s user | **1.06× wall, 1.02× user** |
-| `d5k.csv`, same but `--no-fit` (evaluator-bound), 30 generations | 6.10 s wall | 5.66 s wall (depth 4) | **1.08×** |
-| `d200k.csv`, 200 000 rows, pop 400, `--no-fit`, 30 generations | 167.6 s wall, 150.2 s user | 153.0 s wall, 144.2 s user (depth 4) | **1.09× wall, 1.04× user** |
+| search wall, round 1 / round 2 (s) | 30.4 / 21.1 | 27.6 / 30.5 | 37.5 / 19.3 |
+| user CPU, round 1 / round 2 (s) | 17.3 / 16.2 | 17.4 / 16.7 | 17.4 / 15.6 |
+| same, `--no-fit` (8 generations, search s) | 0.31 | — | 0.22 (depth 8) |
 
-The archives are byte-identical between depths (single- and two-island runs),
-including the exact `f64` test errors. With the default fitter the GPU batch is
-only about **2–3 %** of wall time on `d5k` (a 30-generation `--no-fit` run takes
-6.1 s against 101 s for 20 fitted generations), so Amdahl caps any overlap of
-scoring alone at about 1.03×. The **≥1.1× end-to-end target in #119 is therefore
-not met on this workload**; the gain is 1.08–1.09× only when evaluation, not
-constant fitting, dominates. Closing the gap needs work *inside* the CPU
-generation (fitting on the SoA layout, or the GPU LM in #116), not more overlap
-against a 2 % GPU phase.
+The depth-to-depth spread is host noise: no depth shows a repeatable wall gain,
+and user CPU does not increase (the ~1–2 s spread is contention, not removed
+work), which is the point — overlap moves *when* the scoring happens, it does
+not remove work. The no-fit run puts the whole generation at ~38 ms; an
+event-timed `rcsr-gpu-bench` batch of the same 400 programs × 5 000 rows takes
+**0.238 ms**. Against a fitted generation of ~1.76 s that leaves the fitter at
+≈98 % of wall and an overlap ceiling of
+
+```
+1 + E/F <= 1 + 0.038/1.76 ~= 1.02.
+```
+
+**The ≥1.1× end-to-end target is not reachable by any amount of overlap at this
+budget.** Reaching it requires the fit stage to leave the CPU (the batched GPU LM
+in #169, whose own target is a ≥20× fit-stage speed-up) or the fit budget to
+fall; more chunks against a 0.24 ms GPU phase cannot buy 10 %.
+
+The archives are byte-identical between depths (single- and two-island runs,
+depths 0/2/4/8), including the exact `f64` test errors. So are the #131
+per-generation program and fallback counts; a tree the kernel cannot compile
+(e.g. `asinh`, which the kernel does not lower in either path) is a `f64` CPU
+fallback in both schedules (`tests/gpu_loop.rs`).
 
 ### Measured end to end
 
@@ -504,9 +543,11 @@ single-threaded reference), rising further with row tiling and CUDA graphs.
 | Whole-population batch equals one-at-a-time SSEs | RTX 3060, `cargo test --features cuda` | **verified** |
 | GPU-vs-CPU agreement | RTX 3060, test + benchmark | **verified** (tables above) |
 | One GPU batch per generation in the search loop | RTX 3060, `tests/gpu_loop.rs` + end-to-end table | **verified** |
-| Bounded CPU/GPU overlap: archive and every `f64` error identical to the synchronous path | RTX 3060, `tests/gpu_loop.rs` (`pipeline_depth` 0 vs 2), single and two islands | **verified** |
-| Queue FIFO order and `capacity + batch + 1` memory bound under a forced slow consumer | `src/pipeline.rs` unit tests, any machine | **verified** |
-| ≥1.1× end-to-end with the default fitter at pop 400, N ≥ 5 000 | RTX 3060, `d5k.csv`, shared host | **not met** — 1.02–1.06×; GPU phase is only 2–3 % of wall |
+| Bounded CPU/GPU overlap: archive, every `f64` error and #131 accounting identical to the synchronous path | RTX 3060, `tests/gpu_loop.rs` (`pipeline_depth` 0 vs 2/4/8), single and two islands | **verified** |
+| Queue FIFO order per producer, consumer-error propagation and the `capacity + batch` memory bound under a forced slow consumer | `src/pipeline.rs` unit tests, any machine | **verified** |
+| A failed overlap batch discards earlier `f32` chunks before the `f64` re-score | `search::tests::a_failed_overlap_batch_discards_earlier_f32_chunks`, any machine | **verified** |
+| `chunk_plan` is total, covers the population and bounds the queue by one generation | `src/pipeline.rs` unit test, any machine | **verified** |
+| ≥1.1× end-to-end with the default fitter at pop 400, N ≥ 5 000 | RTX 3060, `d5k.csv`, shared host | **not reachable by overlap** — fit is ≈98 % of wall; measured ceiling ≈1.02×; needs fit offload (#169) |
 | Reported law/train/test errors agree with the CPU backend | RTX 3060, `tests/gpu_loop.rs` | **verified** (law predictions within 1e-12; errors within 1e-9, observed 0) |
 | `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
