@@ -306,8 +306,10 @@ atomically instead of streaming it. See
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
 * **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
-  (about 33× the file) would exceed the budget, with exit 3 and a fix, instead
-  of being SIGABRT/SIGKILL'ed. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
+  (rows × columns plus preparation, not a multiple of the file size) would
+  exceed the budget, with exit 3 and a fix, instead of being
+  SIGABRT/SIGKILL'ed. The CSV reader streams, so the file text itself is not
+  held in memory. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
   that can be scanned group by group and searched from a bounded hash sample
   when it does not fit; v1 stores still load. See

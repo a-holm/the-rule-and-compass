@@ -17,23 +17,25 @@ rcsr --data large.csv --target y --max-memory 2GB
 ```
 
 The estimate is derived from the table's **shape**, not its file size (issue
-#112): once the header and row count are known, the guard models
+#112), and the CSV path **streams** it (issue #126): a quote-aware scan reads the
+file once to measure the header width, data-row count and byte count, then the
+parser makes its two streaming passes. No whole-file `String` is built, so the
+text is not a resident term:
 
 ```text
-text     = bytes read into one String
 table    = rows x columns x 12 B          (f64 value + u32 dictionary code)
 prep     = rows x used_columns x 24 B      (cells, train and test copies)
          + rows x 72 B                     (Vec headers and selectors)
-estimate = (text + table + prep) x 1.25    (allocator slack)
+estimate = (table + prep) x 1.25           (allocator slack)
 ```
 
 `used_columns` is the search's projection (`--vars`, `--target`, `--weight`);
 with no `--vars` the whole header is assumed. `rcsr import` has no search
-preparation, so its guard uses the `text + table` terms only. The old `33 x file size` factor
-was calibrated on ~6-column data and predicted 560 GB for a 17 GB, 93-column
-panel that is at most ~27 GB resident. The text term is not optional: the
-loader reads the whole CSV into one `String`, so a 17 GB CSV cannot be less
-than 17 GB resident.
+preparation, so its guard uses the `table` term only. The old `33 x file size`
+factor was calibrated on ~6-column data and predicted 560 GB for a 17 GB,
+93-column panel that is at most ~27 GB resident. Because the file is streamed,
+a 17 GB CSV can be searched under a much smaller budget than its on-disk size;
+`--data -` spools stdin to a temporary file so the same two passes work.
 
 When the estimate is above the budget, `rcsr` prints the file size, the
 rows x columns basis, the estimate and the budget, suggests `--force` and
@@ -215,6 +217,27 @@ pinned one-multiply `Hash` predicate. The hashed sample and the split selector
 are the same function, so row selection is reproducible across passes.
 
 ## Measured
+
+### Streaming CSV (issue #126)
+
+Machine: 31 GiB RAM, 8 threads, `/mnt/lager`. Fixture: a generated
+**1,000,000 rows × 6 columns** CSV, **30,364,090 bytes (29.0 MiB)**. Both
+binaries are release builds; `import` writes the same 58 MiB store.
+
+| path | command | wall | peak RSS |
+|---|---|---|---|
+| old `read_to_string` | `rcsr import rows1m.csv out.rcsb --quiet` | 6.28 s | 93,316 KiB (91.1 MiB) |
+| streaming | `rcsr import rows1m.csv out.rcsb --quiet` | 5.50 s | 63,492 KiB (62.0 MiB) |
+| old `read_to_string` | `rcsr --data rows1m.csv --target y --generations 1 --pop 8 --baseline-samples 16 --seed 1` | 21.71 s | 565,812 KiB (552.5 MiB) |
+| streaming | same command | 25.26 s | 432,164 KiB (422.0 MiB) |
+
+The import difference is the 29 MiB whole-file `String` (plus allocator
+growth); the search difference is larger because the peak included both the
+file text and the prepared samples. The streaming path still builds the
+resident `Table` and search samples, so the guard estimates those terms from the
+measured shape.
+
+### Column store
 
 Machine: 31 GiB RAM, 8 threads, `/mnt/lager` on a spinning disk. Fixture: a
 directly generated version-1 store, **100,000,000 rows × 5 columns = 4.0 GB**,
