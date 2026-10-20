@@ -592,8 +592,10 @@ contain. The k-NN baseline's reference set is always all training rows; for up
 to eight inputs a k-d tree answers exact queries, and above that the exact
 brute-force path reuses one buffer (still `O(query_rows × reference_rows × d)`,
 so the 200k-under-a-minute result is a `d <= 8` claim). Only query rows can be
-sampled, with `--baseline-samples N` (default `0` = every row, and only for
-absolute/squared/log_squashed). That is an unbiased estimate of the row-average
+sampled, with `--baseline-samples N` (default `512`; `0` = every row, and only
+for absolute/squared/log_squashed). The default cap keeps the exact
+`O(train²·d)` query bounded on large panels; the JSON reports reference/query
+rows, `capped`, SEMs and seconds. That is an unbiased estimate of the row-average
 loss, and `--json` reports train/test query rows and SEMs with the
 finite-population correction. The residual tests (Ljung–Box, Breusch–Pagan,
 skewness, excess kurtosis) are reported for the best solution; a small p-value

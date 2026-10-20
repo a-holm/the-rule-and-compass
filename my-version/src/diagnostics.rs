@@ -111,7 +111,17 @@ pub struct Baselines {
     /// #69: true when the query rows were subsampled. The reference set is
     /// always exact.
     pub knn_capped: bool,
+    /// #132: wall time spent building the index and answering the k-NN
+    /// queries (train plus test folds), in seconds.
+    pub knn_seconds: f64,
 }
+
+/// #132: the CLI's default query-row cap for the k-NN baseline. Large panels
+/// make the exact every-row query `O(N_train²·d)` and it used to dominate the
+/// run; 512 deterministic query rows keep the estimate bounded while still
+/// reporting the finite-population SEM. Library `Baselines::fit` stays exact,
+/// and `--baseline-samples 0` explicitly asks for every row.
+pub const DEFAULT_BASELINE_SAMPLES: usize = 512;
 
 /// #69: k-d trees answer exact k-NN queries for up to this many inputs. Above
 /// it the exact brute-force path is used, with a reused distance buffer and
@@ -190,6 +200,7 @@ impl Baselines {
 
         // k-NN. The index is built once over the full training set and reused
         // for the training queries and every test fold.
+        let knn_start = std::time::Instant::now();
         let k = knn_k(train.len());
         let mut index = KnnIndex::new(train);
         let sample = if knn_sampling_supported(metric) {
@@ -234,6 +245,7 @@ impl Baselines {
             f64::NAN
         };
         let sampled = train_q.rows < train.len() || test_sampled;
+        let knn_seconds = knn_start.elapsed().as_secs_f64();
 
         Baselines {
             mean: mean_err,
@@ -249,6 +261,7 @@ impl Baselines {
             knn_test_query_rows: test_rows,
             knn_test_query_sem: test_sem,
             knn_capped: sampled,
+            knn_seconds,
         }
     }
 
@@ -263,13 +276,14 @@ impl Baselines {
             }
         }
         format!(
-            "\"reference_rows\":{},\"train_query_rows\":{},\"train_query_sem\":{},\"test_query_rows\":{},\"test_query_sem\":{},\"capped\":{}",
+            "\"reference_rows\":{},\"train_query_rows\":{},\"train_query_sem\":{},\"test_query_rows\":{},\"test_query_sem\":{},\"capped\":{},\"seconds\":{}",
             self.knn_reference_rows,
             self.knn_train_query_rows,
             sem_json(self.knn_train_query_sem),
             self.knn_test_query_rows,
             sem_json(self.knn_test_query_sem),
-            self.knn_capped
+            self.knn_capped,
+            self.knn_seconds
         )
     }
 }

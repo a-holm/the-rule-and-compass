@@ -255,9 +255,10 @@ The cutoff is a practical choice, not a theorem: the literature puts k-d trees
 in their intended regime around `d <= 10` and worse than linear search beyond
 about 16.
 
-Only when the exact query cost is unaffordable can the **query rows** be
-sampled: `--baseline-samples N` scores at most `N` deterministic query rows per
-set (training and each test fold), seeded from `--seed`. This is offered only
+The **query rows** are bounded by default: `--baseline-samples N` scores at
+most `N` deterministic query rows per set (training and each test fold), seeded
+from `--seed`, and the default is **512**. On a small panel (at most 512 rows)
+that is every row, so the result is exact. This is offered only
 for the mean-loss metrics **absolute**, **squared** and **log_squashed**, where
 the sample average is an unbiased estimate of the full row-average loss. For
 median, maximum, correlation, rank correlation, interquartile, slope,
@@ -266,9 +267,12 @@ estimator, so the CLI refuses the flag. When sampling happens the text line
 says `sampled=true`, and `--json` carries `baselines.knn.train_query_rows`,
 `train_query_sem`, `test_query_rows` and `test_query_sem`. The SEMs use the
 finite-population correction for sampling without replacement,
-`(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored. The default
-`--baseline-samples 0` means no caps at all: every query row is scored.
-`baselines.knn.reference_rows` is reported too and is always the training size.
+`(s/√q)·√((N−q)/(N−1))`; they are `null` when every row was scored.
+`--baseline-samples 0` explicitly means no caps at all: every query row is
+scored, which is `O(N_train²·d)` and should be opt-in on large panels.
+`baselines.knn.reference_rows`, `train_query_rows`, `test_query_rows`,
+`capped`, both SEMs and `seconds` are reported. The reference set is always the
+training size.
 
 At 20k rows (15k training) `--baseline-samples 4096` gives a 95% interval of
 roughly ±2.5% of the 5-NN value; ask for about 9.5k queries for ±1%. The

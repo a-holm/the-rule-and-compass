@@ -489,21 +489,30 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 
 
 
-/// The only nondeterministic field in the pre-change JSON output was
-/// `elapsed_seconds`; mask it so the rest of the byte stream can be compared.
-fn mask_elapsed(src: &str) -> String {
-    let key = "\"elapsed_seconds\":";
+/// Mask a nondeterministic numeric field. `elapsed_seconds` was the only one
+/// before #132; the k-NN baseline now also reports its own `seconds`.
+fn mask_number(src: &str, key: &str, placeholder: &str) -> String {
+    let key = format!("\"{key}\":");
     let mut out = String::with_capacity(src.len());
-    let mut rest = src;
-    while let Some(i) = rest.find(key) {
+    let mut rest = &src[..];
+    while let Some(i) = rest.find(&key) {
         out.push_str(&rest[..i + key.len()]);
-        out.push_str("ELAPSED");
+        out.push_str(placeholder);
         let after = &rest[i + key.len()..];
+        if after.starts_with(placeholder) {
+            rest = &after[placeholder.len()..];
+            continue;
+        }
         let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
         rest = &after[end..];
     }
     out.push_str(rest);
     out
+}
+
+fn mask_elapsed(src: &str) -> String {
+    let src = mask_number(src, "elapsed_seconds", "ELAPSED");
+    mask_number(&src, "seconds", "SECONDS")
 }
 
 /// Layer 1: a units-free run is byte-identical to the recorded golden,
