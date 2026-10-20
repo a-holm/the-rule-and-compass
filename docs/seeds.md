@@ -35,8 +35,8 @@ syntax error names the 1-based column.
 Each seed is processed once, in this order, **before generation 1**:
 
 1. **parse** against the `--vars` names (a bad expression is exit code `2`);
-2. **simplify** (`expr::simplify`) — folds constants and removes algebraic
-   identities such as `+ 0`;
+2. **simplify** (`expr::simplify`) — folds constants and removes the
+   algebraic identities it can prove safe, such as an exact `+ 0`;
 3. **fit** its numeric constants on the full training sample with
    `--fit-iters` Levenberg–Marquardt iterations (the same fitter offspring
    use; `--no-fit` and `--fit-iters 0` leave constants untouched and take no
@@ -47,6 +47,33 @@ Each seed is processed once, in this order, **before generation 1**:
 
 Structurally identical seeds (for example `sqrt(m/k)` and `sqrt(m/k) + 0`) are
 inserted once. The reported error and the archived error are the same number.
+
+### Canonical seed form
+
+A seed is canonicalised after fitting so that neutral terms in the user's text
+cannot make it structurally different from the expression the search generates.
+This matters when the simplifier is deliberately conservative: a domain-safe
+rewrite may keep `0 + x`, `x * 1` or `-(-x)` because it cannot prove `x` finite,
+and a fitted offset such as `+ 0` lands on `6e-18` rather than exact zero. A
+fitted constant within `1e-12` of `0` or `1` is therefore treated as neutral
+and dropped. This is an explicit tolerance, not an unlabelled approximation:
+the change in the seed's value is below `1e-12`, while any surviving neutral
+term would raise its complexity and let a smaller, equal-error tree dominate and
+remove it from the Pareto front (issue #197).
+
+With that canonical form, a seed's tree is present in the final archive unless
+another expression strictly dominates it on the error/complexity front. The
+reported `# seeded:` line always describes the fitted seed itself.
+
+### CPU and GPU paths
+
+Seeds are fitted and scored on the CPU in `f64` before either backend runs. GPU
+fitness is an `f32` proxy that may guide the search to a different final front,
+but it cannot change the seed's structure, constants or reported error: the
+same seed has the same structural hash and the same error bits with the GPU on
+and with `RCSR_GPU=0`. The reported archive is rebuilt on the CPU in `f64` on
+both paths. This is asserted by
+`seed_is_canonical_and_present_on_cpu_and_gpu_paths` in `tests/seeds.rs`.
 
 Because the search standardises inputs (and only inputs) before it runs, a seed
 is rewritten into that space internally: each raw variable `x_i` becomes

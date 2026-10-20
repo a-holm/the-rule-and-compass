@@ -1612,6 +1612,89 @@ fn emit(on_checkpoint: &mut Option<CheckpointFn<'_>>, cp: &Checkpoint) {
     }
 }
 
+/// #197: how close to `0` or `1` a fitted constant must be to count as a
+/// neutral identity. This is the explicit seed-canonicalisation tolerance.
+const SEED_IDENTITY_TOL: f64 = 1e-12;
+
+/// #197: remove neutral identity nodes from a fitted seed.
+///
+/// A domain-safe simplifier may keep `0 + x`, `x - 0`, `1 * x`, `x / 1`,
+/// `x ^ 1` and `-(-x)` because it cannot prove the operand finite, or because
+/// it is preserving the sign of a zero. For a user-supplied seed those nodes
+/// are noise: they make the seed's structural hash and complexity differ from
+/// the identical expression the search itself generates. The search then finds
+/// the smaller tree, which correctly dominates and removes the seed from the
+/// Pareto front, and the seed appears to have been lost.
+///
+/// Seeds are canonicalised here, after fitting, so that `2 * sqrt(m / k) + 0`
+/// is the same tree as `sqrt(m / k)` regardless of how conservative the
+/// simplifier is. A neutral constant is one within [`SEED_IDENTITY_TOL`] of
+/// `0` or `1`, because the fitter lands on `6e-18` rather than exact zero for
+/// an offset it has driven to zero. That tolerance is an explicit, documented
+/// approximation: the dropped term changes the seed's value by less than
+/// `1e-12`, far below the error the search compares. The rewrite otherwise
+/// preserves the value for finite inputs, `NaN` and the infinities.
+fn canonicalize_seed(n: &Node) -> Node {
+    use Op::*;
+    let mut m = Node {
+        op: n.op,
+        val: n.val,
+        kids: n.kids.iter().map(canonicalize_seed).collect(),
+        block: n.block.clone(),
+    };
+    if m.op == Const || m.op == Input {
+        return m;
+    }
+    if m.op.is_custom() {
+        if let Some(block) = &mut m.block {
+            block.body = canonicalize_seed(&block.body);
+        }
+        return m;
+    }
+    let zero = |k: &Node| k.op == Const && k.val.abs() < SEED_IDENTITY_TOL;
+    let one = |k: &Node| k.op == Const && (k.val - 1.0).abs() < SEED_IDENTITY_TOL;
+    match m.op {
+        Add => {
+            if zero(&m.kids[0]) {
+                return m.kids[1].clone();
+            }
+            if zero(&m.kids[1]) {
+                return m.kids[0].clone();
+            }
+        }
+        Sub => {
+            if zero(&m.kids[1]) {
+                return m.kids[0].clone();
+            }
+        }
+        Mul => {
+            if one(&m.kids[0]) {
+                return m.kids[1].clone();
+            }
+            if one(&m.kids[1]) {
+                return m.kids[0].clone();
+            }
+        }
+        Div => {
+            if one(&m.kids[1]) {
+                return m.kids[0].clone();
+            }
+        }
+        Pow => {
+            if one(&m.kids[1]) {
+                return m.kids[0].clone();
+            }
+        }
+        Neg => {
+            if m.kids[0].op == Neg && m.kids[0].kids.len() == 1 {
+                return m.kids[0].kids[0].clone();
+            }
+        }
+        _ => {}
+    }
+    m
+}
+
 /// Simplify each seed, fit its constants on the training sample and evaluate
 /// it, in that order. A seed that is structurally identical to an earlier one
 /// (after simplification and again after fitting) is dropped: the archive and
@@ -1645,6 +1728,11 @@ fn prepare_seeds(
             fitted = fit_constants(&mut tree, cfg, train.sample, train.sample); // #85 #87
             tree = expr::simplify(&tree);
         }
+        // #197: make the fitted seed the same canonical tree the search would
+        // generate, so a neutral term in the user's text cannot make the seed
+        // structurally distinct (and therefore dominated) later.
+        tree = canonicalize_seed(&tree);
+        tree = expr::simplify(&tree);
         if !seen_fitted.insert(expr::structural_hash(&tree)) {
             continue;
         }
