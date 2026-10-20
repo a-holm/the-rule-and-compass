@@ -167,6 +167,75 @@ fn report_out_writes_a_file_and_keeps_stdout_clean() {
     let _ = std::fs::remove_file(&out_path);
 }
 
+/// #134: the JSON timing block is complete, non-overlapping and its phases
+/// account for the independently measured wall total within 1%.
+#[test]
+fn json_timing_phases_sum_to_the_measured_wall() {
+    let csv = TempCsv::new(&line_csv(1200));
+    let out = run(&[
+        "--data",
+        csv.as_str(),
+        "--target",
+        "y",
+        "--vars",
+        "x",
+        "--seed",
+        "3",
+        "--generations",
+        "4",
+        "--pop",
+        "24",
+        "--max-complexity",
+        "9",
+        "--baseline-samples",
+        "0",
+        "--json",
+    ]);
+    assert!(
+        out.status.success(),
+        "json run failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let parsed = parse_json(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    let Json::Obj(items) = parsed else {
+        panic!("top-level JSON must be an object")
+    };
+    let timing = match obj_get(&items, "timing") {
+        Some(Json::Obj(t)) => t,
+        _ => panic!("JSON is missing the timing object"),
+    };
+    let get = |key: &str| match obj_get(timing, key) {
+        Some(Json::Num(v)) => *v,
+        other => panic!("timing.{key} missing or not a number: {other:?}"),
+    };
+    let prep = get("prep_seconds");
+    let search = get("search_seconds");
+    let baselines = get("baselines_seconds");
+    let diagnostics = get("diagnostics_seconds");
+    let report = get("report_seconds");
+    let total = get("total_seconds");
+    assert!(
+        prep >= 0.0 && search >= 0.0 && baselines >= 0.0 && diagnostics >= 0.0 && report >= 0.0,
+        "phases must be non-negative"
+    );
+    assert!(total > 0.0, "total wall must be positive");
+    assert!(
+        (prep + search + baselines + diagnostics + report - total).abs() <= 0.01 * total,
+        "phases must sum to total wall within 1%: {prep}+{search}+{baselines}+{diagnostics}+{report} vs {total}"
+    );
+    // The uncapped 1200-row k-NN baseline is real work, not a zero placeholder.
+    assert!(
+        baselines > 0.0,
+        "an uncapped baseline must report a positive baselines_seconds, got {baselines}"
+    );
+    // Compatibility: `elapsed_seconds` is the search phase, and it is explicit.
+    match obj_get(&items, "elapsed_seconds") {
+        Some(Json::Num(v)) => assert_eq!(*v, search),
+        other => panic!("elapsed_seconds missing or not a number: {other:?}"),
+    }
+}
+
 #[test]
 fn json_stays_valid_when_a_report_is_requested() {
     let csv = TempCsv::new(&line_csv(40));

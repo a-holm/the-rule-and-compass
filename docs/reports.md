@@ -313,3 +313,13 @@ which is the honest answer for a noiseless straight line.
 Median and IQR use the same linear-interpolation (Hyndman–Fan type 7) definition
 as `--fill median` and `--outlier-iqr`, so the statistics mean the same thing
 everywhere in the tool.
+
+## Timing
+
+Summary reports end with a `## Time` section listing the measured phases of the
+run: preparation, search, baselines, diagnostics and report generation, plus the
+independently measured total wall. The fields are defined in
+[`benchmarks.md`](benchmarks.md#5-timing-schema-json-ndjson-reports). The
+`# elapsed:` line and JSON `elapsed_seconds` remain the **search** phase for
+compatibility; the total is the number to quote for runtime.
+

@@ -590,6 +590,8 @@ tool version seed metric target variables train_rows test_rows
 split { mode rows train_rows test_rows folds[] gap groups_total
         groups_train groups_test lags series history_rows notes[] }
 generations_run converged_early elapsed_seconds
+timing { prep_seconds search_seconds baselines_seconds diagnostics_seconds
+         report_seconds total_seconds }
 null_control { runs best[] min median p_value verdict } | null
 baselines { mean{train_error,test_error} linear{…} knn{k,train_error,test_error} }
 residual_tests { n lags durbin_watson

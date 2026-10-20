@@ -489,17 +489,53 @@ fn without_required_dimensions_the_result_is_bit_identical() {
 
 
 
-/// The only nondeterministic field in the pre-change JSON output was
-/// `elapsed_seconds`; mask it so the rest of the byte stream can be compared.
+/// Mask the nondeterministic timings: `elapsed_seconds` (the old field) and the
+/// `timing` phase object added in #134, so the rest of the byte stream can be
+/// compared against the recorded golden.
 fn mask_elapsed(src: &str) -> String {
+    let src = mask_timing(src);
     let key = "\"elapsed_seconds\":";
     let mut out = String::with_capacity(src.len());
-    let mut rest = src;
+    let mut rest = &src[..];
     while let Some(i) = rest.find(key) {
         out.push_str(&rest[..i + key.len()]);
         out.push_str("ELAPSED");
         let after = &rest[i + key.len()..];
         let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn mask_timing(src: &str) -> String {
+    let key = "\"timing\":";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = &src[..];
+    while let Some(i) = rest.find(key) {
+        out.push_str(&rest[..i + key.len()]);
+        out.push_str("TIMING");
+        let after = &rest[i + key.len()..];
+        // The golden already contains the placeholder, not an object.
+        if after.starts_with("TIMING") {
+            rest = &after["TIMING".len()..];
+            continue;
+        }
+        let mut depth = 0usize;
+        let mut end = after.len();
+        for (n, c) in after.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = n + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
         rest = &after[end..];
     }
     out.push_str(rest);
