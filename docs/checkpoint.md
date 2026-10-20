@@ -47,6 +47,11 @@ usual but are not checkpointed.
 The format is plain UTF-8 text, one record per line. It is hand-written and
 read by the engine itself; no third-party parser is involved.
 
+Every encoded tree is bounded to **4096 nodes** and a root-to-leaf **depth of
+256** (a single node has depth 1). `decode_tree` returns an error such as
+`checkpoint tree depth 257 exceeds the limit of 256` or `checkpoint tree has
+more than 4096 nodes`; it never recurses without a bound.
+
 ```text
 rcsr-checkpoint v1
 config generations 40

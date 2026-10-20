@@ -94,6 +94,35 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Resource limits applied to every untrusted tree, whether it arrives as text
+/// or from a checkpoint (issue #153).
+///
+/// `nodes` counts tree nodes, not characters; `depth` is the number of nodes on
+/// the longest root-to-leaf path (a single node has depth 1). The limits keep
+/// every recursive catamorphism (`eval`, `simplify`, `Drop`, ...) bounded once
+/// the tree has passed the boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub nodes: usize,
+    pub depth: usize,
+}
+
+impl Limits {
+    /// Maximum number of nodes in a parsed or decoded tree.
+    pub const MAX_NODES: usize = 4096;
+    /// Maximum root-to-leaf depth (a single node has depth 1).
+    pub const MAX_DEPTH: usize = 256;
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits {
+            nodes: Limits::MAX_NODES,
+            depth: Limits::MAX_DEPTH,
+        }
+    }
+}
+
 /// Parse `src` into an expression tree. Variable names are resolved against
 /// `vars` (see the module docs for the resolution rules). User-defined blocks
 /// installed on the current thread (see [`crate::expr::set_blocks`]) are
@@ -107,11 +136,25 @@ pub fn parse(src: &str, vars: &[String]) -> Result<Node, ParseError> {
 /// under either that name or the canonical `customN` for its slot, and the
 /// argument count must equal the block's arity.
 pub fn parse_with(src: &str, vars: &[String], blocks: &[Block]) -> Result<Node, ParseError> {
+    parse_with_limits(src, vars, blocks, Limits::default())
+}
+
+/// [`parse_with`] with explicit resource limits, for tests and for callers that
+/// need a tighter budget than the default 4096 nodes / 256 depth.
+pub fn parse_with_limits(
+    src: &str,
+    vars: &[String],
+    blocks: &[Block],
+    limits: Limits,
+) -> Result<Node, ParseError> {
     let mut p = Parser {
         src: src.as_bytes(),
         pos: 0,
         vars,
         blocks,
+        limits,
+        nodes: 0,
+        recursion: 0,
     };
     p.skip_ws();
     if p.peek().is_none() {
@@ -130,6 +173,13 @@ struct Parser<'a> {
     pos: usize,
     vars: &'a [String],
     blocks: &'a [Block],
+    limits: Limits,
+    nodes: usize,
+    /// Number of `primary` calls currently on the stack. This is the guard that
+    /// stops a 100k-character parenthesised input before the Rust stack
+    /// overflows; the tree-depth check in [`Parser::make`] is the semantic
+    /// boundary.
+    recursion: usize,
 }
 
 fn is_ident_start(c: u8) -> bool {
@@ -138,6 +188,11 @@ fn is_ident_start(c: u8) -> bool {
 
 fn is_ident_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
+}
+
+/// Number of nodes on the longest root-to-leaf path (a leaf has depth 1).
+fn tree_depth(n: &Node) -> usize {
+    1 + n.kids.iter().map(tree_depth).max().unwrap_or(0)
 }
 
 impl<'a> Parser<'a> {
@@ -158,6 +213,58 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Build a parsed node, charging the node budget and checking tree depth.
+    fn make(&mut self, op: Op, kids: Vec<Node>) -> Result<Node, ParseError> {
+        self.charge_node()?;
+        let depth = 1 + kids.iter().map(tree_depth).max().unwrap_or(0);
+        if depth > self.limits.depth {
+            return Err(self.err(&format!(
+                "expression depth {} exceeds the limit of {}",
+                depth, self.limits.depth
+            )));
+        }
+        Ok(node(op, kids))
+    }
+
+    /// Build a user-defined block call, charging the same node budget.
+    fn make_custom(
+        &mut self,
+        op: Op,
+        kids: Vec<Node>,
+        block: Block,
+    ) -> Result<Node, ParseError> {
+        self.charge_node()?;
+        let depth = 1 + kids.iter().map(tree_depth).max().unwrap_or(0);
+        if depth > self.limits.depth {
+            return Err(self.err(&format!(
+                "expression depth {} exceeds the limit of {}",
+                depth, self.limits.depth
+            )));
+        }
+        Ok(custom_node(op, kids, block))
+    }
+
+    fn charge_node(&mut self) -> Result<(), ParseError> {
+        self.nodes += 1;
+        if self.nodes > self.limits.nodes {
+            return Err(self.err(&format!(
+                "expression has more than {} nodes",
+                self.limits.nodes
+            )));
+        }
+        Ok(())
+    }
+
+    fn make_const(&mut self, value: f64) -> Result<Node, ParseError> {
+        self.charge_node()?;
+        Ok(constant(value))
+    }
+
+    fn make_input(&mut self, index: usize) -> Result<Node, ParseError> {
+        self.charge_node()?;
+        Ok(input(index))
+    }
+
     fn expr(&mut self) -> Result<Node, ParseError> {
         self.or_expr()
     }
@@ -168,7 +275,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.infix();
             let rhs = self.xor_expr()?;
-            lhs = node(Op::Or, vec![lhs, rhs]);
+            lhs = self.make(Op::Or, vec![lhs, rhs])?;
         }
         Ok(lhs)
     }
@@ -179,7 +286,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.infix();
             let rhs = self.and_expr()?;
-            lhs = node(Op::Xor, vec![lhs, rhs]);
+            lhs = self.make(Op::Xor, vec![lhs, rhs])?;
         }
         Ok(lhs)
     }
@@ -190,7 +297,7 @@ impl<'a> Parser<'a> {
             self.skip_ws();
             self.infix();
             let rhs = self.cmp_expr()?;
-            lhs = node(Op::And, vec![lhs, rhs]);
+            lhs = self.make(Op::And, vec![lhs, rhs])?;
         }
         Ok(lhs)
     }
@@ -228,7 +335,7 @@ impl<'a> Parser<'a> {
             _ => return Ok(lhs),
         };
         let rhs = self.sum()?;
-        let n = node(op, vec![lhs, rhs]);
+        let n = self.make(op, vec![lhs, rhs])?;
         // Comparisons do not chain: `a < b < c` is a syntax error.
         self.skip_ws();
         if matches!(self.peek(), Some(b'<') | Some(b'>') | Some(b'=')) {
@@ -309,12 +416,12 @@ impl<'a> Parser<'a> {
                 Some(b'+') => {
                     self.pos += 1;
                     let rhs = self.term()?;
-                    lhs = node(Op::Add, vec![lhs, rhs]);
+                    lhs = self.make(Op::Add, vec![lhs, rhs])?;
                 }
                 Some(b'-') => {
                     self.pos += 1;
                     let rhs = self.term()?;
-                    lhs = node(Op::Sub, vec![lhs, rhs]);
+                    lhs = self.make(Op::Sub, vec![lhs, rhs])?;
                 }
                 _ => break,
             }
@@ -330,12 +437,12 @@ impl<'a> Parser<'a> {
                 Some(b'*') => {
                     self.pos += 1;
                     let rhs = self.unary()?;
-                    lhs = node(Op::Mul, vec![lhs, rhs]);
+                    lhs = self.make(Op::Mul, vec![lhs, rhs])?;
                 }
                 Some(b'/') => {
                     self.pos += 1;
                     let rhs = self.unary()?;
-                    lhs = node(Op::Div, vec![lhs, rhs]);
+                    lhs = self.make(Op::Div, vec![lhs, rhs])?;
                 }
                 _ => break,
             }
@@ -344,24 +451,36 @@ impl<'a> Parser<'a> {
     }
 
     fn unary(&mut self) -> Result<Node, ParseError> {
-        self.skip_ws();
-        match self.peek() {
-            Some(b'-') => {
-                self.pos += 1;
-                Ok(node(Op::Neg, vec![self.unary()?]))
-            }
-            Some(b'+') => {
-                self.pos += 1;
-                self.unary()
-            }
-            _ => {
-                if self.at_keyword("not") {
-                    self.ident();
-                    return Ok(node(Op::Not, vec![self.unary()?]));
+        // Consume the whole prefix run iteratively. A chain of 100k `-`
+        // characters must not cost 100k stack frames (issue #153); wrapping is
+        // bottom-up and the node budget stops it after `limits.nodes`.
+        let mut minus = 0usize;
+        let mut nots = 0usize;
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'-') => {
+                    self.pos += 1;
+                    minus += 1;
                 }
-                self.power()
+                Some(b'+') => {
+                    self.pos += 1;
+                }
+                _ if self.at_keyword("not") => {
+                    self.ident();
+                    nots += 1;
+                }
+                _ => break,
             }
         }
+        let mut n = self.power()?;
+        for _ in 0..nots {
+            n = self.make(Op::Not, vec![n])?;
+        }
+        for _ in 0..minus {
+            n = self.make(Op::Neg, vec![n])?;
+        }
+        Ok(n)
     }
 
     fn power(&mut self) -> Result<Node, ParseError> {
@@ -371,13 +490,30 @@ impl<'a> Parser<'a> {
             self.pos += 1;
             // Right associative; the exponent may itself be unary (`2^-3`).
             let exp = self.unary()?;
-            return Ok(node(Op::Pow, vec![base, exp]));
+            return self.make(Op::Pow, vec![base, exp]);
         }
         Ok(base)
     }
 
     fn primary(&mut self) -> Result<Node, ParseError> {
         self.skip_ws();
+        // A parenthesised input costs several Rust frames per tree level. The
+        // guard stops the descent at `limits.depth` primary calls, before the
+        // 8 MiB or island stack can overflow.
+        self.recursion += 1;
+        if self.recursion > self.limits.depth {
+            self.recursion -= 1;
+            return Err(self.err(&format!(
+                "expression nesting exceeds the depth limit of {}",
+                self.limits.depth
+            )));
+        }
+        let out = self.primary_inner();
+        self.recursion -= 1;
+        out
+    }
+
+    fn primary_inner(&mut self) -> Result<Node, ParseError> {
         match self.peek() {
             Some(b'(') => {
                 self.pos += 1;
@@ -424,10 +560,11 @@ impl<'a> Parser<'a> {
             }
         }
         let text = std::str::from_utf8(&self.src[start..self.pos]).unwrap_or("");
-        text.parse::<f64>().map(constant).map_err(|_| ParseError {
+        let value = text.parse::<f64>().map_err(|_| ParseError {
             message: format!("invalid number '{text}'"),
             column: start + 1,
-        })
+        })?;
+        self.make_const(value)
     }
 
     fn ident(&mut self) -> String {
@@ -446,14 +583,14 @@ impl<'a> Parser<'a> {
             // A bare name: a declared variable, then the `xN` fallback, then a
             // named constant.
             if let Some(i) = self.vars.iter().position(|v| v == &name) {
-                return Ok(input(i));
+                return self.make_input(i);
             }
             if let Some(i) = x_index(&name) {
-                return Ok(input(i));
+                return self.make_input(i);
             }
             match name.as_str() {
-                "pi" => return Ok(constant(std::f64::consts::PI)),
-                "e" => return Ok(constant(std::f64::consts::E)),
+                "pi" => return self.make_const(std::f64::consts::PI),
+                "e" => return self.make_const(std::f64::consts::E),
                 _ => {}
             }
             return Err(ParseError {
@@ -502,7 +639,7 @@ impl<'a> Parser<'a> {
                     column: start + 1,
                 });
             }
-            return Ok(custom_node(Op::Custom(slot), args, block));
+            return self.make_custom(Op::Custom(slot), args, block);
         }
         // Aggregate names share the `--ops` table. `min`/`max` with exactly one
         // argument are the column reductions; with two they stay binary.
@@ -564,7 +701,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        Ok(node(op, args))
+        self.make(op, args)
     }
 }
 
@@ -771,6 +908,62 @@ mod tests {
         assert!(same(&parse("x1", &v).unwrap(), &input(0)));
         assert!(same(&parse("e", &v).unwrap(), &input(1)));
         assert!(same(&parse("pi", &[]).unwrap(), &constant(std::f64::consts::PI)));
+    }
+
+    #[test]
+    fn depth_limit_accepts_the_boundary_and_rejects_one_more() {
+        let v = vars();
+        let ok = format!("{}x", "-".repeat(Limits::MAX_DEPTH - 1));
+        let tree = parse(&ok, &v).expect("depth 256 is allowed");
+        assert_eq!(crate::expr::complexity(&tree), Limits::MAX_DEPTH);
+        let too_deep = format!("{}x", "-".repeat(Limits::MAX_DEPTH));
+        let e = parse(&too_deep, &v).expect_err("depth 257 must be rejected");
+        assert!(e.message.contains("depth"), "{}", e.message);
+
+        // Function calls add one tree node per level.
+        let calls = |n: usize| format!("{}x{}", "sin(".repeat(n), ")".repeat(n));
+        assert!(parse(&calls(Limits::MAX_DEPTH - 1), &v).is_ok());
+        let e = parse(&calls(Limits::MAX_DEPTH), &v).expect_err("depth 257 must be rejected");
+        assert!(e.message.contains("depth"), "{}", e.message);
+    }
+
+    #[test]
+    fn node_limit_accepts_the_boundary_and_rejects_one_more() {
+        let v = vars();
+        // A balanced binary tree keeps depth small while reaching the node
+        // budget: 2048 leaves make 2048 + 2047 = 4095 nodes, and one leading
+        // `-` makes exactly 4096.
+        fn balanced(leaves: usize) -> String {
+            if leaves == 1 {
+                return "x".to_string();
+            }
+            let left = leaves / 2;
+            format!("({}+{})", balanced(left), balanced(leaves - left))
+        }
+        let exact = format!("-{}", balanced(2048));
+        let tree = parse(&exact, &v).expect("4096 nodes are allowed");
+        assert_eq!(crate::expr::complexity(&tree), Limits::MAX_NODES);
+        let over = format!("--{}", balanced(2048));
+        let e = parse(&over, &v).expect_err("4097 nodes must be rejected");
+        assert!(e.message.contains("more than 4096 nodes"), "{}", e.message);
+    }
+
+    #[test]
+    fn pathological_nesting_and_unary_runs_are_errors_not_crashes() {
+        let v = vars();
+        // 100k open parentheses and 100k leading minus signs both used to
+        // overflow the process stack.
+        let parens = format!("{}x{}", "(".repeat(100_000), ")".repeat(100_000));
+        let e = parse(&parens, &v).expect_err("100k nesting must be rejected");
+        assert!(e.message.contains("depth") || e.message.contains("nodes"), "{}", e.message);
+
+        let minus = format!("{}x", "-".repeat(100_000));
+        let e = parse(&minus, &v).expect_err("100k unary signs must be rejected");
+        assert!(
+            e.message.contains("depth") || e.message.contains("more than 4096 nodes"),
+            "{}",
+            e.message
+        );
     }
 
     #[test]
