@@ -41,7 +41,7 @@ pub fn json() -> String {
         ("--time-unit", "enum", "auto", "numeric time unit: s | ms | us | ns (default auto-detect; mixed/out-of-range refuses)"),
         ("--tz", "string", "UTC", "fixed UTC offset for offset-less timestamps: UTC or +-HH:MM; named zones are refused"),
         ("--group-by", "string", "none", "group column (implies group)"),
-        ("--gap", "int", "0", "embargo rows between train and test"),
+        ("--gap", "rows-or-time", "0", "embargo between train and test; an integer is rows, 90m/1.5h/30s/2d is wall time converted by ceil(seconds/median_dt); dropped with a warning under explicit row selection"),
         ("--folds", "int", "1", "contiguous test blocks to report"),
         ("--lags", "int", "0", "delayed copies per input (time-delay embedding)"),
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
@@ -129,6 +129,24 @@ pub fn json() -> String {
          \"convergence\":{{\"window\":20,\"confidence\":\"exp(-max(0,(e[g-w]-e[g])/(1+|e[g-w]|))/1e-3)\",\"stability\":\"mean Jaccard overlap of the front's structural forms over the last w comparisons\",\"maturity\":\"(g - first_generation_of_oldest_surviving_form) / max(g,1)\",\"percent_converged\":\"0.5*confidence + 0.3*stability + 0.2*maturity\",\"converged_threshold\":0.75,\"doc\":\"docs/convergence.md\"}},\n  \
          \"backend\":{{\"default\":\"gpu when built with --features cuda and a usable device is probed at startup; cpu otherwise\",\"device_probe\":\"once at startup\",\"override\":\"--no-gpu/--cpu forces cpu; --gpu asserts a device and exits 2 when unavailable\",\"reporting\":\"backend, backend_reason and device are recorded from the probe/outcome, never inferred from flags\",\"fallback\":\"a program with no device opcode (or one whose exact lowering would exceed the 56-slot host stack gate) is scored by a persistent bounded CPU worker pool, never on the scoring thread; results merge in candidate order and are bit-identical to the serial walk; RCSR_CPU_FALLBACK_THREADS sets the worker count (default min(cores,8), max 64)\",\"json\":\"gpu.generations[] carries generation, programs, native/supported, lowered, fallbacks, unsupported_programs, fallback_seconds, fallback_workers and opcodes; gpu.totals aggregates them\",\"stack_guard\":\"host peak_stack <= 56 before emission; the device guards RC_MAX_STACK=64 on every push\",\"exactness\":\"cross-backend runs are not bit-identical; reported metrics and constants are rebuilt from exact CPU f64 and --cpu is the reproducible escape hatch\",\"doc\":\"docs/gpu-backend.md\"}},\n  \
          \"expression_limits\":{{\"nodes\":4096,\"depth\":256,\"depth_definition\":\"nodes on the longest root-to-leaf path; a single node has depth 1\",\"applies_to\":\"text parsing (--eval-expr, filters, seeds, --function, HTTP body) and checkpoint tree decoding\",\"error\":\"a normal parser/checkpoint error naming the limit; never a stack overflow\"}},\n  \
+         \"audit\":{{\"command\":\"rcsr audit\",\"summary\":\"differential leakage audit (D0-D6, D8-D12); exit 5 on any finding\",\"doc\":\"docs/leakage.md\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"CSV/TSV table to audit\"}},\
+{{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"target/label column\"}},\
+{{\"name\":\"--time\",\"type\":\"string\",\"default\":\"row index\",\"description\":\"time/ordering column\"}},\
+{{\"name\":\"--time-unit\",\"type\":\"enum\",\"default\":\"s\",\"description\":\"s | ms | us | ns for a numeric time column\"}},\
+{{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except time\",\"description\":\"feature columns to probe\"}},\
+{{\"name\":\"--horizon\",\"type\":\"int\",\"default\":\"1\",\"description\":\"label horizon in rows (D5/D6)\"}},\
+{{\"name\":\"--join-on\",\"type\":\"string\",\"default\":\"none\",\"description\":\"check this key column for row-multiplying duplicates (D10)\"}},\
+{{\"name\":\"--bars\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OHLCV CSV time,open,high,low,close,volume[,vwap] for D2 resample reconciliation\"}},\
+{{\"name\":\"--resample-small\",\"type\":\"int\",\"default\":\"15\",\"description\":\"small factor for the D2 cascade\"}},\
+{{\"name\":\"--resample-large\",\"type\":\"int\",\"default\":\"60\",\"description\":\"large factor for the D2 cascade\"}},\
+{{\"name\":\"--session-gap\",\"type\":\"float\",\"default\":\"none\",\"description\":\"D2 session fold threshold in time units\"}},\
+{{\"name\":\"--universe\",\"type\":\"string\",\"default\":\"none\",\"description\":\"listing CSV time,symbol,change[,to] for D8\"}},\
+{{\"name\":\"--corporate-actions\",\"type\":\"string\",\"default\":\"none\",\"description\":\"action CSV time,symbol,kind,value for D9\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel symbol column for D8\"}},\
+{{\"name\":\"--price\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel price column for D9\"}},\
+{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"machine-readable report on stdout\"}},\
+{{\"name\":\"--report\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to this path\"}}]}},\n  \
          \"walkforward\":{{\"command\":\"rcsr walkforward\",\"summary\":\"walk-forward evaluation/backtest of one expression over a .rcsb column store or CSV\",\"doc\":\"docs/walkforward.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
@@ -147,7 +165,7 @@ pub fn json() -> String {
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
-         \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\"}},\n  \
+         \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
         jstr("symbolic regression: find an interpretable f(x) ~ y"),

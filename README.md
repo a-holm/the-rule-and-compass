@@ -606,11 +606,20 @@ and `previous`/`interpolate` never cross the train/test boundary. See
 ### Checking for leakage
 
 Leakage is caught differentially, not by a significance test. The
-[`leakage` module](docs/leakage.md) provides truncation replay (recompute at
-cut points; every completed row must be bit-identical), a future-shift probe,
-canary detection and synthetic leak/no-leak fixtures. They run in
-`cargo test --release --test leakage` and can be pointed at your own panel with
-`Panel::from_csv`; `assert_clean()` panics on a real leak instead of logging it.
+[`leakage` suite](docs/leakage.md) implements the Tier-A auditors D0–D2 and
+D8–D11 (spec/time/resample, universe, corporate actions, join cardinality and
+determinism), the differential D5 learner, truncation replay (recompute at cut
+points; every completed row must be bit-identical), canaries, as-of joins, the
+wall-time `--gap` conversion and `N_eff` for overlapping labels.
+
+```sh
+rcsr audit --data panel.csv --target y --time ts --horizon 24 --json
+```
+
+`rcsr audit` writes a machine-readable report and exits **5** on any finding.
+The same detectors run in `cargo test --release --test leakage` and can be
+pointed at your own panel with `Panel::from_csv`; `assert_clean()` panics on a
+real leak instead of logging it, naming the detector, column and row.
 
 ### Forecasting: history and delayed variables
 
@@ -808,11 +817,14 @@ historical LM path bit for bit.
   and **72 → 74/75**, with `pythagoras` recovered in **7/9** cells instead of
   **0/9**, for about 5% more wall time. `--no-front-parents` disables it and
   restores the previous trajectory exactly;
-- **opt-in quality-diversity coverage** (`--qd`, `--qd-cells`, `--qd-cell-cap`):
-  a rectangular descriptor grid over variable usage × prediction skewness, with
-  a bounded local `(error, cost)` front per cell. The layer is passive and
-  reports occupied-cell coverage in text and `--json`; it does not change the
-  Pareto front. See [`docs/qd.md`](docs/qd.md);
+- **opt-in quality-diversity search** (`--qd`, `--qd-cvt`, `--qd-policy`,
+  `--qd-cells`, `--qd-cell-cap`): CVT-MAP-Elites over variable usage ×
+  prediction skewness, with deterministic Halton initialisation, Lloyd
+  centroid updates, a bounded local `(error, cost)` front per cell, UCB1
+  parent selection, stratified migration and least-occupied restarts. The
+  passive layer reports coverage and hypervolume in text and `--json` without
+  changing the Pareto front; `--qd-policy` is the opt-in search change. See
+  [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a
   nesting-depth penalty, with the node-count default preserved exactly;
@@ -932,7 +944,7 @@ docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
-docs/qd.md                    opt-in quality-diversity coverage archive (--qd)
+docs/qd.md                    opt-in CVT-MAP-Elites quality-diversity layer (--qd/--qd-policy)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
 my-version/

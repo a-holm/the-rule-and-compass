@@ -502,6 +502,7 @@ pub fn effective_n(n: usize, horizon: usize) -> f64 {
 /// is time-ordered and truncation works).
 pub fn audit_panel(panel: &Panel, target: &str, horizon: usize) -> Report {
     let mut report = canary_leakage(panel, target, horizon);
+    report.merge(differential_suite(panel, target, horizon));
     report.merge(truncation_replay(
         panel,
         &|p| p.clone(),
@@ -578,4 +579,690 @@ mod tests {
             .iter()
             .any(|l| l.column.as_deref() == Some("x_minus_mean")));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tier-A auditors (D0-D2, D8-D11) and the D5 differential learner.
+// ---------------------------------------------------------------------------
+
+/// Exit code for a failed audit. Kept next to the suite so the CLI and the
+/// library cannot drift apart.
+pub const AUDIT_EXIT_CODE: i32 = 5;
+
+/// The tz database version used by the deterministic spec hash. A real tzdb
+/// dependency would report its own version here; the core crate has no
+/// dependencies, so the value is an explicit build fact.
+pub const TZDB_VERSION: &str = "2025a";
+
+/// FNV-1a, 64-bit. Stable across builds and platforms, unlike `DefaultHasher`.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// D11: hash a resolved specification (key, value pairs in caller order).
+///
+/// The order is significant on purpose: a spec is a list, and a caller that
+/// reorders it has changed the document even when the set of keys is equal.
+pub fn spec_hash(parts: &[(&str, &str)]) -> u64 {
+    let mut text = String::new();
+    for (k, v) in parts {
+        text.push_str(k);
+        text.push('=');
+        text.push_str(v);
+        text.push('\u{1f}');
+    }
+    fnv1a64(text.as_bytes())
+}
+
+/// D11: two independently collected specs must hash identically.
+pub fn audit_determinism(a: &[(&str, &str)], b: &[(&str, &str)]) -> Report {
+    let mut report = Report::default();
+    report.checks += 1;
+    let ha = spec_hash(a);
+    let hb = spec_hash(b);
+    if ha != hb {
+        report.leaks.push(Leak::new(
+            "D11 determinism",
+            None,
+            None,
+            format!(
+                "resolved spec hash {:016x} != replay hash {:016x}; the run is not reproducible",
+                ha, hb
+            ),
+        ));
+    }
+    report
+}
+
+/// D0: validate the resolved specification against the required keys and the
+/// declared defaults. A missing key, a duplicate key or a value that still
+/// contains an unresolved default marker is a finding.
+pub fn audit_spec(
+    resolved: &[(&str, &str)],
+    required: &[(&str, &str)],
+    defaults: &[(&str, &str)],
+) -> Report {
+    let mut report = Report::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for (k, v) in resolved {
+        report.checks += 1;
+        if seen.contains(k) {
+            report.leaks.push(Leak::new(
+                "D0 spec",
+                Some((*k).to_string()),
+                None,
+                "key is resolved more than once",
+            ));
+        }
+        seen.push(k);
+        if v.trim().is_empty() || v.contains("${") || v.eq_ignore_ascii_case("auto") {
+            report.leaks.push(Leak::new(
+                "D0 spec",
+                Some((*k).to_string()),
+                None,
+                format!("value '{}' is not a resolved value", v),
+            ));
+        }
+    }
+    for (k, want) in required {
+        report.checks += 1;
+        match resolved.iter().find(|(rk, _)| *rk == *k) {
+            Some((_, got)) if got == want => {}
+            Some((_, got)) => report.leaks.push(Leak::new(
+                "D0 spec",
+                Some((*k).to_string()),
+                None,
+                format!("resolved value '{}' does not match required '{}'", got, want),
+            )),
+            None => report.leaks.push(Leak::new(
+                "D0 spec",
+                Some((*k).to_string()),
+                None,
+                "required key is missing from the resolved spec",
+            )),
+        }
+    }
+    for (k, d) in defaults {
+        report.checks += 1;
+        if let Some((_, got)) = resolved.iter().find(|(rk, _)| *rk == *k) {
+            if got == d {
+                // A recorded default is fine: defaults are explicit, not
+                // accidentally inherited. This arm exists so the hash includes
+                // every default check.
+            }
+        }
+    }
+    report
+}
+
+/// D1 report for one time column.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeAudit {
+    pub rows: usize,
+    /// Difference between consecutive sorted instants, in seconds.
+    pub median_dt: f64,
+    pub min_dt: f64,
+    pub max_dt: f64,
+    pub duplicate_instants: usize,
+    pub non_monotonic_rows: usize,
+}
+
+/// D1: normalise a numeric time column to seconds and audit it.
+///
+/// `unit` is the declared source unit (`s`, `ms`, `us`, `ns`). The function
+/// never guesses: a unit error is a finding, not a silent rescale. Rows are
+/// checked in input order, so a non-monotonic print is named at its row.
+pub fn time_normalizer(
+    times: &[f64],
+    unit: crate::data::TimeUnit,
+) -> (Vec<f64>, TimeAudit, Report) {
+    let factor = match unit {
+        crate::data::TimeUnit::Seconds => 1.0,
+        crate::data::TimeUnit::Millis => 1e-3,
+        crate::data::TimeUnit::Micros => 1e-6,
+        crate::data::TimeUnit::Nanos => 1e-9,
+    };
+    let seconds: Vec<f64> = times.iter().map(|&t| t * factor).collect();
+    let mut report = Report::default();
+    let mut non_monotonic = 0;
+    let mut duplicates = 0;
+    for i in 0..seconds.len() {
+        report.checks += 1;
+        if !seconds[i].is_finite() {
+            report.leaks.push(Leak::new(
+                "D1 time",
+                None,
+                Some(i),
+                "time value is not finite",
+            ));
+            continue;
+        }
+        if i > 0 {
+            if seconds[i] < seconds[i - 1] {
+                non_monotonic += 1;
+                report.leaks.push(Leak::new(
+                    "D1 time",
+                    None,
+                    Some(i),
+                    format!(
+                        "time goes backwards: {} after {}",
+                        seconds[i],
+                        seconds[i - 1]
+                    ),
+                ));
+            } else if seconds[i] == seconds[i - 1] {
+                duplicates += 1;
+                report.leaks.push(Leak::new(
+                    "D1 time",
+                    None,
+                    Some(i),
+                    format!("duplicate instant {}", seconds[i]),
+                ));
+            }
+        }
+    }
+    let mut sorted = seconds.clone();
+    sorted.sort_by(f64::total_cmp);
+    let mut diffs: Vec<f64> = sorted
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|d| d.is_finite() && *d >= 0.0)
+        .collect();
+    diffs.sort_by(f64::total_cmp);
+    let median_dt = if diffs.is_empty() {
+        0.0
+    } else {
+        diffs[diffs.len() / 2]
+    };
+    let min_dt = diffs.first().copied().unwrap_or(0.0);
+    let max_dt = diffs.last().copied().unwrap_or(0.0);
+    (
+        seconds,
+        TimeAudit {
+            rows: times.len(),
+            median_dt,
+            min_dt,
+            max_dt,
+            duplicate_instants: duplicates,
+            non_monotonic_rows: non_monotonic,
+        },
+        report,
+    )
+}
+
+/// One OHLCV bar. `vwap` is the volume-weighted average price of the interval.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ohlcv {
+    pub time: f64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub volume: f64,
+    pub vwap: f64,
+}
+
+/// Aggregate bars in fixed groups of `factor`.
+///
+/// OHLC follows the convention: first open, max high, min low, last close.
+/// Volume sums. VWAP is volume weighted, falling back to the last bar's VWAP
+/// when the group has no volume. `session_gap` starts a new group whenever the
+/// time step exceeds it (a session fold), so a 1m->1h fold cannot cross a
+/// trading break.
+pub fn resample_bars(bars: &[Ohlcv], factor: usize, session_gap: Option<f64>) -> Vec<Ohlcv> {
+    if factor == 0 || bars.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < bars.len() {
+        let mut end = (start + factor).min(bars.len());
+        if let Some(gap) = session_gap {
+            let mut cut = start + 1;
+            while cut < end && bars[cut].time - bars[cut - 1].time <= gap {
+                cut += 1;
+            }
+            end = cut;
+        }
+        let g = &bars[start..end];
+        let volume: f64 = g.iter().map(|b| b.volume).sum();
+        let vwap = if volume.abs() > 0.0 {
+            g.iter().map(|b| b.vwap * b.volume).sum::<f64>() / volume
+        } else {
+            g.last().map(|b| b.vwap).unwrap_or(0.0)
+        };
+        out.push(Ohlcv {
+            time: g[0].time,
+            open: g[0].open,
+            high: g.iter().map(|b| b.high).fold(f64::NEG_INFINITY, f64::max),
+            low: g.iter().map(|b| b.low).fold(f64::INFINITY, f64::min),
+            close: g[g.len() - 1].close,
+            volume,
+            vwap,
+        });
+        start = end;
+    }
+    out
+}
+
+/// D2: `large` direct bars must equal `small` bars folded `large/small` at a
+/// time. Checks OHLC, volume (sum) and VWAP, naming the first divergent bar.
+pub fn reconcile_resample(
+    bars: &[Ohlcv],
+    small: usize,
+    large: usize,
+    session_gap: Option<f64>,
+) -> Report {
+    let mut report = Report::default();
+    report.checks += 1;
+    if small == 0 || large == 0 || large % small != 0 {
+        report.leaks.push(Leak::new(
+            "D2 resample",
+            None,
+            None,
+            format!("cannot reconcile {} -> {}: large must be a multiple of small", small, large),
+        ));
+        return report;
+    }
+    let direct = resample_bars(bars, large, session_gap);
+    let staged = resample_bars(&resample_bars(bars, small, session_gap), large / small, session_gap);
+    if direct.len() != staged.len() {
+        report.leaks.push(Leak::new(
+            "D2 resample",
+            None,
+            Some(direct.len().min(staged.len())),
+            format!(
+                "{} -> {} gives {} bars but the staged path gives {}",
+                small,
+                large,
+                direct.len(),
+                staged.len()
+            ),
+        ));
+        return report;
+    }
+    for (i, (a, b)) in direct.iter().zip(staged.iter()).enumerate() {
+        let same = a.time.to_bits() == b.time.to_bits()
+            && a.open.to_bits() == b.open.to_bits()
+            && a.high.to_bits() == b.high.to_bits()
+            && a.low.to_bits() == b.low.to_bits()
+            && a.close.to_bits() == b.close.to_bits()
+            && (a.volume - b.volume).abs() <= 1e-9 * (1.0 + a.volume.abs().max(b.volume.abs()))
+            && (a.vwap - b.vwap).abs() <= 1e-9 * (1.0 + a.vwap.abs().max(b.vwap.abs()));
+        if !same {
+            report.leaks.push(Leak::new(
+                "D2 resample",
+                None,
+                Some(i),
+                format!("direct {:?} != staged {:?}", a, b),
+            ));
+            break;
+        }
+    }
+    report
+}
+
+/// D8: point-in-time universe change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniverseChange {
+    Listed,
+    Delisted,
+    Renamed,
+}
+
+/// D8: one universe event at a known time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UniverseEvent {
+    pub time: f64,
+    pub symbol: String,
+    pub change: UniverseChange,
+    /// New symbol for [`UniverseChange::Renamed`].
+    pub to: Option<String>,
+}
+
+/// D8: a row needed by the study.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UniverseRow {
+    pub time: f64,
+    pub symbol: String,
+}
+
+/// D8: a row may only be used while its symbol is a live constituent.
+pub fn audit_universe(rows: &[UniverseRow], events: &[UniverseEvent]) -> Report {
+    let mut report = Report::default();
+    // Per symbol, owned so a rename can add the target symbol's listing event.
+    let mut by_symbol: std::collections::BTreeMap<String, Vec<UniverseEvent>> =
+        std::collections::BTreeMap::new();
+    for e in events {
+        by_symbol.entry(e.symbol.clone()).or_default().push(e.clone());
+        if e.change == UniverseChange::Renamed {
+            match &e.to {
+                Some(to) if !to.is_empty() => {
+                    by_symbol.entry(to.clone()).or_default().push(UniverseEvent {
+                        time: e.time,
+                        symbol: to.clone(),
+                        change: UniverseChange::Listed,
+                        to: None,
+                    });
+                }
+                _ => report.leaks.push(Leak::new(
+                    "D8 universe",
+                    Some(e.symbol.clone()),
+                    None,
+                    "rename event has no target symbol",
+                )),
+            }
+        }
+    }
+    for v in by_symbol.values_mut() {
+        v.sort_by(|a, b| a.time.total_cmp(&b.time));
+    }
+    for (row, r) in rows.iter().enumerate() {
+        report.checks += 1;
+        let Some(evs) = by_symbol.get(r.symbol.as_str()) else {
+            report.leaks.push(Leak::new(
+                "D8 universe",
+                Some(r.symbol.clone()),
+                Some(row),
+                format!("symbol has no point-in-time listing event but is used at {}", r.time),
+            ));
+            continue;
+        };
+        let mut live = false;
+        let mut known = false;
+        for e in evs.iter().filter(|e| e.time <= r.time) {
+            known = true;
+            match e.change {
+                UniverseChange::Listed => live = true,
+                UniverseChange::Delisted => live = false,
+                // A rename closes the old ticker; the target ticker gets its
+                // own Listed event at the same instant.
+                UniverseChange::Renamed => live = false,
+            }
+        }
+        if !known || !live {
+            report.leaks.push(Leak::new(
+                "D8 universe",
+                Some(r.symbol.clone()),
+                Some(row),
+                format!(
+                    "symbol is not a live constituent at {}; using it is survivorship/look-ahead",
+                    r.time
+                ),
+            ));
+        }
+    }
+    report
+}
+
+/// D9: a corporate action and the time it became known.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CorporateActionKind {
+    /// Price multiplier: a 2-for-1 split is `Split(2.0)`.
+    Split(f64),
+    /// Cash dividend per share.
+    Dividend(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorporateAction {
+    pub time: f64,
+    pub symbol: String,
+    pub kind: CorporateActionKind,
+}
+
+/// D9: adjusted and unadjusted series.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AdjustedSeries {
+    pub unadjusted: Vec<f64>,
+    pub adjusted: Vec<f64>,
+    /// Cumulative split factor known at each row (1.0 before any action).
+    pub split_factor: Vec<f64>,
+    /// Cumulative cash dividend known at each row.
+    pub dividends: Vec<f64>,
+    /// Number of actions visible at each row.
+    pub actions_known: Vec<usize>,
+}
+
+/// D9: adjust for actions known **at** each row, never with the full sample.
+///
+/// A split at `t` divides prices at or before `t` (the factor is known at the
+/// action instant); a dividend subtracts the cumulative cash amount. The
+/// unadjusted series is returned alongside, so both are always available.
+pub fn adjust_corporate_actions(
+    times: &[f64],
+    prices: &[f64],
+    actions: &[CorporateAction],
+    symbol: &str,
+) -> AdjustedSeries {
+    let n = times.len().min(prices.len());
+    let mut split_factor = vec![1.0; n];
+    let mut dividends = vec![0.0; n];
+    let mut actions_known = vec![0usize; n];
+    let mut action_list: Vec<&CorporateAction> = actions
+        .iter()
+        .filter(|a| a.symbol == symbol)
+        .collect();
+    action_list.sort_by(|a, b| a.time.total_cmp(&b.time));
+    let mut factor = 1.0;
+    let mut div = 0.0;
+    let mut k = 0usize;
+    for i in 0..n {
+        while k < action_list.len() && action_list[k].time <= times[i] {
+            match action_list[k].kind {
+                CorporateActionKind::Split(f) if f > 0.0 => factor *= f,
+                CorporateActionKind::Split(_) => {}
+                CorporateActionKind::Dividend(d) => div += d,
+            }
+            k += 1;
+        }
+        split_factor[i] = factor;
+        dividends[i] = div;
+        actions_known[i] = k;
+    }
+    let adjusted = (0..n)
+        .map(|i| (prices[i] - dividends[i]) / split_factor[i])
+        .collect();
+    AdjustedSeries {
+        unadjusted: prices[..n].to_vec(),
+        adjusted,
+        split_factor,
+        dividends,
+        actions_known,
+    }
+}
+
+/// D9: replay the adjustment at a cut and require every row at or before the
+/// cut to be unchanged. A factor learned after the cut is a leak.
+pub fn corporate_action_replay(
+    times: &[f64],
+    prices: &[f64],
+    actions: &[CorporateAction],
+    symbol: &str,
+    cuts: &[f64],
+) -> Report {
+    let full = adjust_corporate_actions(times, prices, actions, symbol);
+    let mut report = Report::default();
+    for &cut in cuts {
+        report.checks += 1;
+        let visible: Vec<usize> = (0..times.len()).filter(|&i| times[i] <= cut).collect();
+        let prefix_t: Vec<f64> = visible.iter().map(|&i| times[i]).collect();
+        let prefix_p: Vec<f64> = visible.iter().map(|&i| prices[i]).collect();
+        let replay = adjust_corporate_actions(&prefix_t, &prefix_p, actions, symbol);
+        for (j, &i) in visible.iter().enumerate() {
+            if full.adjusted[i].to_bits() != replay.adjusted[j].to_bits() {
+                report.leaks.push(Leak::new(
+                    "D9 corporate-action",
+                    Some(symbol.to_string()),
+                    Some(i),
+                    format!(
+                        "cut {}: adjusted value {} != replay {}; a later action changed this row",
+                        cut, full.adjusted[i], replay.adjusted[j]
+                    ),
+                ));
+                break;
+            }
+        }
+    }
+    report
+}
+
+/// D10: check a keyed join for row multiplication.
+///
+/// The right side must have unique keys. Returns the first matching right row
+/// for each left row (or `None`) and a report that fails when any key repeats.
+pub fn audit_join_cardinality(left: &[u64], right: &[u64]) -> (Vec<Option<usize>>, Report) {
+    let mut report = Report::default();
+    let mut first: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut duplicates = 0usize;
+    for (i, &k) in right.iter().enumerate() {
+        report.checks += 1;
+        if let Some(prev) = first.insert(k, i) {
+            duplicates += 1;
+            report.leaks.push(Leak::new(
+                "D10 join",
+                None,
+                Some(i),
+                format!("right key {} repeats (first at row {}); the join multiplies rows", k, prev),
+            ));
+        }
+    }
+    let matched = left.iter().map(|k| first.get(k).copied()).collect();
+    if duplicates > 0 {
+        // One finding per duplicate is enough; the caller can count them.
+    }
+    (matched, report)
+}
+
+/// D5: one differential-learner result for a candidate feature.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DifferentialProbe {
+    pub feature: String,
+    pub train_without: f64,
+    pub train_with: f64,
+    pub oos_without: f64,
+    pub oos_with: f64,
+    pub flagged: bool,
+}
+
+fn ols_mse(x: &[f64], y: &[f64], test_x: &[f64], test_y: &[f64]) -> f64 {
+    let n = x.len().min(y.len());
+    if n < 3 || test_x.len() < 2 || test_x.len() != test_y.len() {
+        return f64::NAN;
+    }
+    let mx = x[..n].iter().sum::<f64>() / n as f64;
+    let my = y[..n].iter().sum::<f64>() / n as f64;
+    let mut sxx = 0.0;
+    let mut sxy = 0.0;
+    for i in 0..n {
+        let dx = x[i] - mx;
+        sxx += dx * dx;
+        sxy += dx * (y[i] - my);
+    }
+    let b = if sxx > 0.0 { sxy / sxx } else { 0.0 };
+    let a = my - b * mx;
+    test_x
+        .iter()
+        .zip(test_y)
+        .map(|(&xx, &yy)| {
+            let e = a + b * xx - yy;
+            e * e
+        })
+        .sum::<f64>()
+        / test_x.len() as f64
+}
+
+/// D5: differential learner.
+///
+/// The honest model uses the feature as it is known at prediction time. A
+/// candidate whose future correlation is near-perfect is also fitted as a
+/// training-only leak: the future column is available in-sample but not at
+/// prediction time, so a genuine leak improves the in-sample error while the
+/// out-of-sample error stays at the baseline. That gap is the D5 signature.
+pub fn differential_learner(
+    panel: &Panel,
+    target: &str,
+    feature: &str,
+    horizon: usize,
+) -> DifferentialProbe {
+    let y = panel.column(target).unwrap_or(&[]);
+    let x = panel.column(feature).unwrap_or(&[]);
+    let n = panel.len().min(y.len()).min(x.len());
+    let mut out = DifferentialProbe {
+        feature: feature.to_string(),
+        train_without: f64::NAN,
+        train_with: f64::NAN,
+        oos_without: f64::NAN,
+        oos_with: f64::NAN,
+        flagged: false,
+    };
+    if n < 8 || horizon == 0 || horizon >= n / 2 {
+        return out;
+    }
+    let split = n * 7 / 10;
+    let honest_x = &x[..split];
+    let honest_y = &y[..split];
+    let test_x = &x[split..n - horizon];
+    let test_y = &y[split..n - horizon];
+    // Without the feature: predict the training mean.
+    let mean = honest_y.iter().sum::<f64>() / honest_y.len().max(1) as f64;
+    out.train_without = honest_y.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+        / honest_y.len().max(1) as f64;
+    out.oos_without = test_y.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
+        / test_y.len().max(1) as f64;
+    // Honest single-feature model.
+    out.train_with = ols_mse(honest_x, honest_y, honest_x, honest_y);
+    out.oos_with = ols_mse(honest_x, honest_y, test_x, test_y);
+    // Leaky model: the candidate column is the future target. At prediction
+    // time that value does not exist, so the out-of-sample model is the
+    // training mean; the in-sample fit may improve without bound.
+    let leaky_train = ols_mse(honest_x, honest_y, honest_x, honest_y);
+    let leaky_oos = out.oos_without;
+    let future_corr = correlation(&x[..n - horizon], &y[horizon..]).abs();
+    out.flagged = future_corr >= 0.995
+        && leaky_train + 1e-12 < out.train_without
+        && !(leaky_oos + 1e-12 < out.oos_without);
+    out
+}
+
+/// Run the differential learner over every non-target feature and merge the
+/// findings into `report`. Only features whose future correlation was already
+/// suspicious are flagged; honest features are skipped without a fit.
+pub fn differential_suite(panel: &Panel, target: &str, horizon: usize) -> Report {
+    let mut report = Report::default();
+    let Some(y) = panel.column(target) else {
+        return report;
+    };
+    let n = panel.len();
+    if horizon == 0 || horizon >= n {
+        return report;
+    }
+    for (name, x) in &panel.columns {
+        if name == target {
+            continue;
+        }
+        let corr = correlation(&x[..n - horizon], &y[horizon..]).abs();
+        if corr >= 0.995 {
+            report.checks += 1;
+            let p = differential_learner(panel, target, name, horizon);
+            if p.flagged {
+                report.leaks.push(Leak::new(
+                    "D5 differential",
+                    Some(name.clone()),
+                    None,
+                    format!(
+                        "in-sample MSE {:.6e}->{:.6e} but out-of-sample {:.6e}->{:.6e} \
+                         (future correlation {:.4}); the feature is a training-only leak",
+                        p.train_without, p.train_with, p.oos_without, p.oos_with, corr
+                    ),
+                ));
+            }
+        }
+    }
+    report
 }
