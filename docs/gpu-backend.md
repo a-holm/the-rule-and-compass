@@ -263,8 +263,60 @@ what it should (`--no-fit --patience 0`, two runs each):
 So the GPU path pays off exactly where the issue says it should — when
 evaluation, rather than constant fitting, is the bottleneck. Making the fit
 cheaper or moving it to the GPU is a separate workstream; batch size and launch
-overhead could also be improved by reusing the device program buffer instead of
-freeing and reallocating it every generation.
+overhead are addressed by the fixed-capacity pool below.
+
+### Fixed-capacity genome pool and the unsupported tail (#122)
+
+The first dehosting stage removes two pieces of host work that did not depend on
+the GPU at all:
+
+* **One persistent program arena.** `genome::GenomePool` is a fixed-capacity,
+  double-buffered postfix arena. Every genome occupies exactly
+  `width_for(max_complexity) = 2*max_complexity + 4` words (64 words = 256 B at
+  the default 30), so a slot never moves and there is no free list. The CUDA
+  context now reserves `d_pool[2]` once; a generation uploads into the back
+  buffer and never calls `cudaMalloc`/`cudaFree`. At 10 000 genomes that is
+  2.6 MB per buffer, bounded by capacity and flat across generations.
+* **Device-canonical hash.** `rc_pool_hash` computes the same FNV-1a postfix
+  hash as `genome::postfix_hash`, bit for bit; the pool can therefore dedup in
+  stable `(hash, slot)` order without a host hash pass. `Philox4x32-10` is
+  implemented with the same positional `(seed, island, generation, slot, draw)`
+  contract the full device-variation stage will use.
+* **Unsupported programs no longer serialise the batch.** `if` has no kernel
+  opcode, and the old `GpuSearch::score` scored every such tree one after
+  another on the calling thread. They are now split into contiguous slices and
+  scored on a bounded CPU pool (`RCSR_CPU_FALLBACK_THREADS`, default
+  `min(cores, 8)`). Each tree is independent, so the result is bit-identical;
+  `search::tests::cpu_fallback_is_identical_for_one_and_many_threads` pins the
+  one-thread and four-thread results together.
+* **Archive insertion without a pre-emptive clone.** `Archive::try_insert_view`
+  tests dominance on `(cost, error)` first and clones the tree only for a
+  candidate that enters the front.
+
+Measured on the RTX 3060 host (i7-3770K, 4C/8T), `N = 5 000`,
+`--no-fit --gpu --seed 1`, `P = 10 000`, default operators (including `if`),
+three interleaved runs each, wall for 10 generations:
+
+| Run | min / median |
+|---|---:|
+| `origin/main` | 18.3 s / 22.8 s |
+| #122 stage | 8.8 s / 10.7 s (**2.1–2.4×**) |
+
+The per-generation CPU fallback for 8 521 unsupported trees fell from 2.15 s
+(serial) to 0.73 s on the 8-thread pool (3.0× on 4 physical cores). With the
+operator set that has no unsupported opcode (`--ops` without `if`) the same
+`P = 10 000`, 20-generation cell is unchanged (5.44 s vs 5.34 s): the pool
+removes allocation and clone overhead there, but variation and the startup
+population dominate. The kernel itself stays ~1–3 ms per generation: at the
+`--no-fit` slope this is under 1 % duty, which is why the remaining plan targets
+full device variation and fitting (#116), not the launch path. Exactness: the `P = 2 000`, 5-generation JSON
+report is byte-identical to `origin/main` apart from `elapsed_seconds`, i.e.
+the same constants, expressions and errors.
+
+What remains staged: device-side mutation/crossover and a fused device
+selection/archive. The pool, hash and Philox contracts above are the interface
+those stages consume; the CPU variation, simplification, fitting, checkpoints
+and f64 reporting stay authoritative meanwhile.
 
 ## The DGX Spark path
 

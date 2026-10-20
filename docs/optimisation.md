@@ -592,6 +592,39 @@ instruction dispatch; the explicit AVX intrinsics do not depend on it. As with
 committed configuration, so a release built on one machine still runs on
 another.
 
+### 3.4 Dehosting stage 1: pool, canonical hash, parallel fallback (#122)
+
+The fit-free search is host-bound: at `N = 5 000`, `P = 10 000` the evaluation
+kernel is ~2 % of a generation, and the rest is variation, simplification,
+hashing and — with the default operator set — the **serial** CPU scoring of
+`if` programs the kernel cannot compile. Stage 1 of #122 attacks the parts that
+do not change the search trajectory:
+
+* `genome::GenomePool` — a fixed-capacity, double-buffered postfix arena with
+  SoA metadata. Width is `2*max_complexity + 4` words (64 words = 256 B at the
+  default), so slots never move and peak memory is constant (2.6 MB per 10 000
+  genomes per buffer).
+* a persistent CUDA arena with the same layout (`rc_pool_reserve`,
+  `rc_pool_upload`, `rc_pool_eval`): no `cudaMalloc`/`cudaFree` inside the
+  generation loop;
+* a device canonical hash (`rc_pool_hash`) matching `genome::postfix_hash`, and
+  Philox4x32-10 with the positional `(seed, island, generation, slot, draw)`
+  contract, both tested;
+* a bounded CPU pool for unsupported programs, replacing the serial tail
+  (`RCSR_CPU_FALLBACK_THREADS`, default `min(cores, 8)`);
+* `Archive::try_insert_view`, which clones a tree only after it survives the
+  dominance test.
+
+Measured (RTX 3060, i7-3770K, `N = 5 000`, `--no-fit`, `--gpu`, default
+operators, `P = 10 000`, 10 generations, three interleaved runs):
+**18.3/22.8 s → 8.8/10.7 s (min/median, 2.1–2.4×)**. The unsupported tail
+alone fell from 2.15 s to 0.73 s for 8 521 trees (3.0× on four physical cores);
+without `if` the same cell is flat (5.44 s → 5.34 s), since variation and the
+startup population dominate there. The JSON report for a 5-generation
+`P = 2 000` run is byte-identical to the pre-#122 build apart from
+`elapsed_seconds`. Device variation and a device archive remain the next
+stages; fitting and all f64 reporting stay on the CPU.
+
 ---
 
 ## 4. Hardware
