@@ -48,6 +48,28 @@ unless `--skip-malformed` is passed. The output defaults to the input path with
 its extension replaced by `.rcsb`. The same input and `--group-rows` produce
 the same bytes.
 
+The reader is RFC 4180-style and streams: one logical record is held in memory
+at a time, and the file is read twice (typing, then building) rather than loaded
+as one string. A quoted field may contain the delimiter, a tab, a newline, or an
+escaped `""`:
+
+```text
+x,y,label
+1,2,"a,b"
+3,4,"c	d"
+5,6,"two
+lines"
+7,8,"he said ""hi"""
+```
+
+Both LF and CRLF record separators are accepted; a newline inside quotes is
+kept as `\n`. Blank lines and lines starting with `#` outside quotes are
+ignored. The delimiter (tab, comma or semicolon, else whitespace) is detected on
+the first record *after* quote-aware parsing and confirmed against the second,
+so a delimiter inside quotes cannot choose the wrong split. A genuinely ragged
+row still fails with its 1-based physical line; an unterminated quote names the
+line where the quoted field starts.
+
 When the store fits the budget it is loaded into the ordinary resident
 `Table`; every later path (split, preparation, search, diagnostics) is
 identical to the CSV path. On the fixed `tests/fixtures/clean.csv` trajectory

@@ -158,3 +158,81 @@ fn column_major_layout_matches_the_parser() {
     assert!(hi.dict(0).is_none(), "high-cardinality numeric text is dropped");
     assert_eq!(hi.col(0).len(), hi.len());
 }
+
+// ---------------------------------------------------------------------------
+// #126: quoted fields, quote-aware delimiter sniffing and streaming errors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn quoted_commas_tabs_newlines_escaped_quotes_crlf_and_empty_field() {
+    // One fixture with every hazard in the issue. The last row exercises a
+    // quoted empty field; the file uses CRLF record separators.
+    let csv = concat!(
+        "x,y,label\r\n",
+        "1,2,\"a,b\"\r\n",
+        "3,4,\"c\td\"\r\n",
+        "5,6,\"line1\nline2\"\r\n",
+        "7,8,\"he said \"\"hi\"\"\"\r\n",
+        "9,10,\"\"\r\n",
+    );
+    let t = data::parse_table(csv).unwrap();
+    assert_eq!(t.len(), 5);
+    assert_eq!(t.names, vec!["x", "y", "label"]);
+    assert!(t.numeric[0] && t.numeric[1], "x and y stay numeric");
+    assert!(!t.numeric[2], "the label column is text");
+    assert_eq!(t.text(0, 2), Some("a,b"));
+    assert_eq!(t.text(1, 2), Some("c\td"));
+    assert_eq!(t.text(2, 2), Some("line1\nline2"));
+    assert_eq!(t.text(3, 2), Some("he said \"hi\""));
+    assert_eq!(t.text(4, 2), Some(""));
+    assert_eq!((0..5).map(|r| t.value(r, 0)).collect::<Vec<_>>(), vec![1.0, 3.0, 5.0, 7.0, 9.0]);
+}
+
+#[test]
+fn delimiter_sniffing_ignores_delimiters_inside_quotes() {
+    // Tab file whose header quotes a comma: the comma count (3 in header)
+    // must not compete with the tab count.
+    let tabbed = "time\tvalue\tnote\n1\t2\t\"a,b\"\n3\t4\t\"c,d\"\n";
+    let t = data::parse_table(tabbed).unwrap();
+    assert_eq!(t.n_cols(), 3);
+    assert_eq!(t.text(0, 2), Some("a,b"));
+
+    // Comma file whose header quotes a tab.
+    let comma = "time,value,note\n1,2,\"a\tb\"\n3,4,\"c\td\"\n";
+    let t = data::parse_table(comma).unwrap();
+    assert_eq!(t.n_cols(), 3);
+    assert_eq!(t.text(0, 2), Some("a\tb"));
+
+    // Semicolon file with quoted commas and an unquoted tab in a value.
+    let semi = "time;value;note\n1;2;\"a,b\"\n3;4;\"c,d\"\n";
+    let t = data::parse_table(semi).unwrap();
+    assert_eq!(t.n_cols(), 3);
+    assert_eq!(t.text(1, 2), Some("c,d"));
+}
+
+#[test]
+fn a_quoted_comma_is_not_a_ragged_row_and_real_ragged_rows_still_name_the_line() {
+    // Quoted commas must not look like extra fields.
+    let t = data::parse_table("x,y,label\n1,2,\"a,b\"\n3,4,\"c,d\"\n").unwrap();
+    assert_eq!(t.len(), 2);
+
+    // A genuinely short row still fails at its 1-based physical line, even
+    // after a record that spans two lines inside quotes.
+    let err = data::parse_table("x,y,label\n1,2,\"a\nb\"\n3,4\n5\n").unwrap_err();
+    assert!(err.contains("line 4"), "{err}");
+    assert!(err.contains("expected 3") && err.contains("found 2"), "{err}");
+}
+
+#[test]
+fn quoted_field_at_end_of_file_without_a_trailing_newline() {
+    let csv = "x,label\n1,\"a,b\"\n2,\"the end\"";
+    let t = data::parse_table(csv).unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.text(1, 1), Some("the end"));
+}
+
+#[test]
+fn unterminated_quote_names_the_opening_line() {
+    let err = data::parse_table("x,y\n1,\"open\n2,3\n").unwrap_err();
+    assert!(err.contains("line 2") && err.contains("unterminated"), "{err}");
+}
