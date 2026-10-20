@@ -123,6 +123,9 @@ pub struct EvalSpec {
     /// carries the ending position of one test block into the next, so pooled
     /// total variation includes `|p_end - q_start|`.
     pub pool_reset_flat: bool,
+    /// Permit a test window that overlaps the 2026H2 lockbox.
+    /// `false` is the safe default: every runner refuses it.
+    pub allow_lockbox: bool,
 }
 
 impl EvalSpec {
@@ -499,6 +502,12 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
                 "window '{}': test_start must be before test_end",
                 w.label
             ));
+        }
+        if !spec.allow_lockbox {
+            crate::lockbox::Lockbox::crypto_2026h2().check(
+                w.test_start.floor() as i64,
+                w.test_end.ceil() as i64,
+            )?;
         }
         let gap = w.test_start - w.train_end;
         if gap + 1e-9 < embargo {
@@ -1019,6 +1028,7 @@ struct Stats {
     total_abs_delta: f64,
     trades: usize,
     entries: usize,
+    exits: usize,
 }
 
 impl Stats {
@@ -1034,6 +1044,7 @@ impl Stats {
         self.total_abs_delta += other.total_abs_delta;
         self.trades += other.trades;
         self.entries += other.entries;
+        self.exits += other.exits;
     }
 }
 
@@ -1216,9 +1227,31 @@ fn evaluate_window(
     }
     let end_positions = previous.clone();
 
-    // Equal-weight the groups present at each timestamp. The `CrossSection`
-    // keeps (sum, count) per timestamp, so shards over symbols can be merged
-    // without recomputing a denominator.
+    // #145: charge the final exit. A flat strategy is free; a held position
+    // pays the same per-side cost as its entry.
+    let mut last_of_group: HashMap<u64, usize> = HashMap::new();
+    for (&g, _) in previous.iter() {
+        if let Some((i, _)) = order
+            .iter()
+            .filter(|&&i| rows[i].group == g)
+            .map(|&i| (i, rows[i].time))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        {
+            last_of_group.insert(g, i);
+        }
+    }
+    for (g, i) in last_of_group {
+        let p = previous.get(&g).copied().unwrap_or(0.0);
+        if p != 0.0 {
+            let c = cost_side * p.abs();
+            net[i] -= c;
+            stats.total_cost += c;
+            stats.exits += 1;
+        }
+    }
+
+    // Equal-weight the groups present at each timestamp. Times are sorted so the
+    // return series has the same order as the Python reference.
     let mut time_order = order;
     time_order.sort_by(|&a, &b| {
         let ra = &rows[valid[a]];

@@ -341,11 +341,12 @@ atomically instead of streaming it. See
   `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
-* **`rcsr prep`** streams Binance/Bitstamp monthly ZIPs or aliased OHLCV CSVs
-  straight into a `.rcsb` store with timestamp normalisation, duplicate
-  aggregation, calendar-aware resampling, verified symbol splices, causal
-  feature/label specs, per-symbol parallelism and a checksummed manifest. No
-  intermediate CSV is written. See [`docs/data-format.md`](docs/data-format.md).
+* **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
+  trailing liquidity **as of** each rebalance, keeps delisted names while they
+  trade, never forward-fills across a listing/delisting/migration, verifies
+  splice ratios, charges both sides and the final exit, supplies a
+  matched-exposure random-long benchmark, refuses 2026H2 in every runner and
+  emits a checksummed provenance manifest. See [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 

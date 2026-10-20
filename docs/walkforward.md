@@ -53,23 +53,17 @@ selection on test. A single `--expr` keeps the original behaviour.
   There is no short leg and no leverage; `rcsr::walkforward::position_for`
   exposes the rule.
 * `--cost-bps` is charged **per side** on `|position - previous position|`,
-  separately inside each `--group-by` series. Per-window metrics start every
-  series flat, so an entry costs one side and its exit costs the other: a round
-  trip is `2 * cost_bps`.
-* **Pooled P&L carries the seam.** The pooled path is the concatenation of the
-  window paths, so a group that ends window `k` long and starts window `k+1`
-  long is not charged again; a change is charged once at the first row of that
-  group in the next window. Total variation is therefore
-  `TV(p·q) = TV(p) + TV(q) + |p_end - q_start|`, and the JSON
-  `pooled_seam.seam_cost`/`seam_trades` report the extra boundary term.
-  `--pool-reset-flat` restores the old behaviour (every boundary starts flat),
-  which is useful for reproducing pre-seam reports but is not the real path.
+  separately inside each `--group-by` series. Every series starts flat, so an
+  entry costs one side and its exit (including the **final** exit of every
+  group) costs the other: a round trip is `2 * cost_bps`. #145 changed the
+  final exit from free to charged; a missing exit would flatter the strategy
+  by one side.
 * Rows sharing a timestamp are equal-weighted, exactly as in the pilot: the
   period return is the mean net return over the groups present at that
-  timestamp. With no `--group-by` the whole table is one series. The internal
-  `CrossSection` carries `(sum, count)` per timestamp and can be merged across
-  symbol shards, so a symbol-parallel evaluation gives exactly the sequential
-  series even when a symbol is missing at some timestamps.
+  timestamp. With no `--group-by` the whole table is one series.
+* Every test window is checked against the 2026H2 lockbox
+  `[2026-07-01, 2027-01-01)`. A window that overlaps it is refused unless
+  `--allow-lockbox` is passed (declared final test only).
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
