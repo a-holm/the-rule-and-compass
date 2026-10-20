@@ -116,9 +116,12 @@ Any candidate producing a non-finite prediction is treated as a hard failure.
 
 ## 7. Simplification and presentation
 
-Before output, expressions are algebraically **simplified** (constant folding,
-`x*1 -> x`, `x+0 -> x`, `x/1 -> x`, `x^1 -> x`, …) and **denormalised** back to
-the original variable units, so the reported equations read naturally.
+Scoring and de-duplication use the sound normal form (`expr::simplify`): constant
+folding and only those identities that preserve every IEEE value, including
+`NaN`, `±inf` and signed zero. Before output, the display relation
+(`expr::simplify_display`) additionally applies affine normalisation and
+`x+0 -> x` for a readable equation, and the tree is **denormalised** back to the
+original variable units.
 
 ## 8. Concurrency
 

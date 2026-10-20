@@ -2911,8 +2911,8 @@ fn main() {
         .seeds
         .iter()
         .map(|s| {
-            let tree = expr::simplify(&expr::denormalize(
-                &expr::simplify(&s.tree),
+            let tree = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&s.tree),
                 &prepared.means,
                 &prepared.stds,
             ));
@@ -2957,8 +2957,8 @@ fn main() {
         .iter()
         .enumerate()
         .map(|(k, s)| {
-            let den = expr::simplify(&expr::denormalize(
-                &expr::simplify(&s.tree),
+            let den = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&s.tree),
                 &prepared.means,
                 &prepared.stds,
             ));
@@ -3193,8 +3193,8 @@ fn main() {
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, cfg.metric);
-                let den = expr::simplify(&expr::denormalize(
-                    &expr::simplify(&s.tree),
+                let den = expr::simplify_display(&expr::denormalize(
+                    &expr::simplify_display(&s.tree),
                     &f.means,
                     &f.stds,
                 ));
@@ -4319,8 +4319,8 @@ fn run_multi_output(
                 .iter()
                 .enumerate()
                 .map(|(j, name)| {
-                    let den = expr::simplify(&expr::denormalize(
-                        &expr::simplify(&trees[j]),
+                    let den = expr::simplify_display(&expr::denormalize(
+                        &expr::simplify_display(&trees[j]),
                         &prepared.means,
                         &prepared.stds,
                     ));
@@ -5628,8 +5628,8 @@ fn benchmark_run(
             .map(|(e, _, _)| train_error < *e)
             .unwrap_or(true)
         {
-            let den = expr::simplify(&expr::denormalize(
-                &expr::simplify(&sol.tree),
+            let den = expr::simplify_display(&expr::denormalize(
+                &expr::simplify_display(&sol.tree),
                 &prepared.means,
                 &prepared.stds,
             ));

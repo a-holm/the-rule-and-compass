@@ -99,13 +99,38 @@ Two consequences:
 * because fitness is measured in *semantics*, the operators are "blind": this is
   the gap that semantic operators (below) try to close.
 
-**Simplification is a rewriting system.** `simplify` applies oriented equations
-`l → r` of a `Σ`-algebra theory; if it terminates and is confluent it computes
-normal forms, i.e. a section of the quotient map. It is deliberately *not* fully
-confluent here, so it is a heuristic — but every rule it applies permanently
-shrinks the term, which reduces both evaluation cost and the printed complexity.
-Equality saturation with an e-graph would compute the *true* normal form up to a
-budget by searching the quotient directly **[planned]**.
+**Simplification is a rewriting system and a proof obligation.** The engine has
+two relations with different jobs:
+
+* **`expr::simplify` — the sound normal form (N_core).** It is used for scoring,
+  de-duplication and CSE. Every rule is value-preserving on IEEE-754 values,
+  including `NaN`, `±inf` and signed zero; a rule that needs a side condition is
+  applied only when the non-relational definedness/range analysis
+  (`expr::analyze_total`, O(nodes)) proves it. The rules are: constant folding
+  when the result is finite; `-(-x) → x`; `x + -0 → x` (and `x + +0 → x` only
+  when `x` is provably non-zero); `x - +0 → x`; `x - x → 0` only when `x` is
+  finite; `x * 1 → x`, `x / 1 → x`, `pow(x,1) → x`, `pow(x,0) → 1`;
+  `x / x → 1` only when `x` is finite and non-zero; `0 * x → ±0` only when `x`
+  is finite with a known sign (the sign follows `x`); and branch pruning for a
+  constant `If` condition. `Add` and `Mul` children are ordered by a total
+  structural key (`op index`, value bits, arity, children, block definition),
+  so `a+b` and `b+a` share one normal form. There is **no** associativity,
+  distributivity or affine re-association: f64 `+` and `*` are not associative,
+  and those rules belong to display only.
+* **`expr::simplify_display` — the display relation (R_approx).** It adds affine
+  normalisation (`x/1.1839 → 0.8447*x`), branch pruning and tolerance-based
+  identity absorption for a readable printed equation. It may change a value at
+  an IEEE edge case and is **never** used for scoring, dedup, CSE or a
+  checkpoint hash.
+
+The sound core terminates (every rule either shrinks the tree or folds it) and
+is confluent on its guarded fragment: it is applied bottom-up in one pass, the
+commutative orientation is a total order, and the result is idempotent
+(`simplify(simplify(t)) = simplify(t)`). The tests exercise idempotence,
+critical pairs, a 10k-tree differential corpus over edge values, and a 10k-tree
+soundness/precision check of the analysis. Equality saturation with an e-graph
+would compute a larger quotient by searching the theory directly **[planned]**.
+
 
 ---
 
@@ -204,7 +229,7 @@ library methods only to *seed* or *pre-process*.
 | Change | Why |
 |---|---|
 | Adjoint-based **Levenberg–Marquardt** constant fitting | One backward sweep gives the whole Jacobian: O(nodes) per row, independent of the number of constants. An undamped Gauss–Newton polish reaches machine precision on well-conditioned fits. |
-| **Affine normalisation** in the simplifier | `(x/c₁)/c₂ → k·x`, constant chains folded, branch pruning for constant conditions. Smaller printed forms *and* fewer nodes to evaluate. |
+| **Sound normal form** in scoring/dedup/CSE, **affine normalisation** in display | `simplify` preserves every IEEE value (including NaN/±inf/±0) and applies guarded cancellations only with a definedness proof; `simplify_display` keeps the readable affine forms. Smaller printed forms *and* deterministic dedup keys. |
 | **ε-dominance** archiving | Removes numerically-equivalent, larger expressions from the front. |
 | **Structural hashing + de-duplication** | Never evaluate two identical candidates in a generation. |
 | **Lexicographic parsimony pressure** | No size-penalty coefficient to tune; bloat is controlled at selection time. |

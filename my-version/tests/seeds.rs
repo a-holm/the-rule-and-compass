@@ -165,7 +165,7 @@ fn seed_is_simplified_fitted_and_present_in_the_final_archive() {
 fn structurally_duplicate_seeds_are_inserted_once() {
     let (vars, train, test) = spring();
     let a = expr::parse("sqrt(m / k)", &vars).expect("parse");
-    let b = expr::parse("sqrt(m / k) + 0", &vars).expect("parse");
+    let b = expr::parse("sqrt(m / k) * 1", &vars).expect("parse");
     let out = search::run_seeded(&config(2, 3), &train, &test, &[a, b]);
     assert_eq!(out.seeds.len(), 1, "the duplicate must be dropped");
 }
