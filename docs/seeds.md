@@ -95,6 +95,31 @@ An unreadable file is an **input error** (exit code `3`); a malformed
 expression is a **usage error** (exit code `2`) that names the flag (or the
 file and line), quotes the offending text and carries the parser's column.
 
+## Deterministic seed contract
+
+A reproduction is only a reproduction if the search seed is derived the same
+way every time. The contract is:
+
+* a run is identified by `(label, seed)`, where `label` is a stable string
+  chosen by the launcher (for example `btc-usd-2019h1`) and `seed` is an
+  integer;
+* the search seed is a fixed function of those two values, computed with the
+  engine's deterministic hash. The engine's own `--seed` is used directly and
+  echoed in every output format;
+* **do not use Python's `hash(label)`**: it is salted per process
+  (`PYTHONHASHSEED`), so the same label gives a different seed in each
+  interpreter. The old scratch launcher did exactly that and a "reproduction"
+  was therefore a different run;
+* a launcher must write the resolved numeric seed and the exact command line
+  into its log or run manifest, so the mapping is evidence rather than
+  folklore.
+
+The engine's MT19937 stream is seeded by `Mt::new(seed)`; islands use
+`seed ^ 0x9E3779B9 * (i + 1)`. No wall clock, PID or environment value enters
+the stream. `--time-budget` is the one exception to reproducibility: stopping
+on wall-clock time cannot be replayed bit for bit (see
+[`checkpoint.md`](checkpoint.md)).
+
 ## Reporting
 
 * **text** prints one `# seeded: complexity=… train_error=…  y = …` line per
