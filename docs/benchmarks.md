@@ -307,6 +307,11 @@ outside the numbers. `elapsed_seconds` is **kept for compatibility and means
 `search_seconds`**; use `total_seconds` for the cost of the whole run. The same
 fields appear in the NDJSON `done` event.
 
+Multi-output runs (`--target y1,y2`) use the same ledger in text, `--json` and
+the NDJSON `done` event. They do not run the single-target baseline or
+diagnostics phases, so `baselines_seconds` and `diagnostics_seconds` are
+reported as `0`, not omitted.
+
 The k-NN baseline reports its own sampling fields (`reference_rows`,
 `query_rows`, `capped`, `sem`, `seconds`); on an uncapped run
 `baselines_seconds` is the magnitude of that exact O(N²·d) work, not zero.
