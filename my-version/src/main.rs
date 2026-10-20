@@ -2136,6 +2136,7 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
             // The parser streams from the spool, so the text is not resident.
             let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
@@ -2186,6 +2187,7 @@ fn main() {
                 std::process::exit(EXIT_INPUT);
             }
         };
+        csv_shape = Some(shape);
         if let Some(limit) = guard_budget {
             let estimate = data::estimate_csv_stream_bytes(shape, projected_cols);
             if estimate > limit && !force {
