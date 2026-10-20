@@ -500,10 +500,10 @@ fn mask_elapsed(src: &str) -> String {
     let mut rest = &src[..];
     while let Some(i) = rest.find(key) {
         out.push_str(&rest[..i + key.len()]);
-        out.push_str(placeholder);
+        out.push_str("ELAPSED");
         let after = &rest[i + key.len()..];
-        if after.starts_with(placeholder) {
-            rest = &after[placeholder.len()..];
+        if after.starts_with("ELAPSED") {
+            rest = &after["ELAPSED".len()..];
             continue;
         }
         let end = after.find(|c| c == ',' || c == '}').unwrap_or(after.len());
