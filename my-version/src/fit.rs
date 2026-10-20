@@ -825,6 +825,41 @@ fn gn_step(
 ///
 /// This is the unweighted entry point; it delegates to [`fit_weighted`] with an
 /// empty weight vector, so existing results are bit-for-bit unchanged.
+/// Piecewise-constant operators whose adjoint is zero almost everywhere.
+///
+/// A constant fitted through `sign` or `step` has no useful gradient: the
+/// switch position stays wherever the search put it, so the printed threshold
+/// is arbitrary. This function lists the operators found in a tree so the CLI
+/// can warn when a fitted model contains one. `floor`, `ceil`, `round` and the
+/// comparisons have the same zero derivative but are usually deliberate
+/// rounding/structure, so they are not reported here.
+pub fn zero_adjoint_ops(tree: &Node) -> Vec<&'static str> {
+    fn walk(n: &Node, out: &mut Vec<&'static str>) {
+        match n.op {
+            Op::Sign => {
+                if !out.contains(&"sign") {
+                    out.push("sign");
+                }
+            }
+            Op::Step => {
+                if !out.contains(&"step") {
+                    out.push("step");
+                }
+            }
+            _ => {}
+        }
+        for k in &n.kids {
+            walk(k, out);
+        }
+        if let Some(block) = &n.block {
+            walk(&block.body, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree, &mut out);
+    out
+}
+
 pub fn fit(tree: &mut Node, x: &[Vec<f64>], y: &[f64], iters: usize) -> f64 {
     fit_weighted(tree, x, y, &[], iters)
 }
@@ -1395,6 +1430,19 @@ mod tests {
             let tree = node(op, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
             assert_eq!(analytic_grad(&tree, &[1.7]), vec![0.0]);
         }
+    }
+
+    #[test]
+    fn zero_adjoint_warning_lists_only_sign_and_step() {
+        let step = node(Op::Step, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert_eq!(zero_adjoint_ops(&step), vec!["step"]);
+        let sign = node(Op::Sign, vec![step.clone()]);
+        assert_eq!(zero_adjoint_ops(&sign), vec!["sign", "step"]);
+        // A smooth tree raises no warning, and rounding is not reported.
+        let smooth = node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert!(zero_adjoint_ops(&smooth).is_empty());
+        let rounded = node(Op::Round, vec![node(Op::Mul, vec![constant(1.3), input(0)])]);
+        assert!(zero_adjoint_ops(&rounded).is_empty());
     }
 
     #[test]

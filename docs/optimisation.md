@@ -418,6 +418,23 @@ trend that matters is the AVX speed-up over the existing walk, which grows with
 the arithmetic share of the tree. Trees dominated by `sin`/`cos`/`exp` gain
 less because AVX alone cannot vectorise those functions.
 
+#### Constants behind `sign` and `step`
+
+`sign` and `step` are piecewise constant: their derivative is zero almost
+everywhere, and so is the adjoint that [`fit.rs`](../my-version/src/fit.rs)
+uses to move constants. A constant that reaches the output only through one of
+them therefore never changes during fitting; whatever threshold the search
+happened to create is printed, but it is not an optimum. When the fitted Pareto
+front contains such a constant the CLI prints a warning naming `sign`/`step`.
+
+The workable pattern is **fit a smooth surrogate, threshold at inference**:
+search and fit `logistic(k·(x - t))` or `tanh(k·(x - t))`, which have usable
+gradients in `k` and `t`, then replace the surrogate with the hard switch only
+when the final rule is written down. Alternatively pin the threshold as a
+literal constant and do not ask the fitter to move it. A model using `sign` or
+`step` is still valid as a *given* rule; it is only the joint fitting that is
+ill-posed.
+
 #### Measured: search-level effect
 
 The kernel table measures one evaluation. In a real search the same candidate is
