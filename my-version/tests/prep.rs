@@ -151,10 +151,10 @@ fn outlier_bounds_are_training_only_and_hand_computed() {
     assert_eq!(p.prep.rows_dropped_outlier, 0);
 }
 
-/// A 3-wide centred moving average with shrinking edges, in original units
-/// (`center none`, `scale none`).
+/// #110: `--smooth` is a 3-wide **trailing** average with shrinking edges, in
+/// original units (`center none`, `scale none`). No row reads a later row.
 #[test]
-fn smoothing_uses_a_centred_window_and_shrinks_at_the_edges() {
+fn smoothing_is_trailing_by_default_and_shrinks_at_the_edges() {
     // n=6 at 30%: train rows 0..3, test rows 4..5.
     let mut csv = String::from("t,x,y\n");
     for i in 0..6 {
@@ -169,13 +169,38 @@ fn smoothing_uses_a_centred_window_and_shrinks_at_the_edges() {
     };
     let p = prepare(&t, &temporal(0.3), &pr);
 
-    // Train: [1,2,3,4] -> [1.5, 2, 3, 3.5]; test: [5,6] -> [5.5, 5.5].
+    // Train: [1,2,3,4] -> [1, 1.5, 2, 3]; test: [5,6] -> [5, 5.5].
     let train: Vec<f64> = p.train.x.iter().map(|r| r[0]).collect();
-    assert_eq!(train, vec![1.5, 2.0, 3.0, 3.5]);
+    assert_eq!(train, vec![1.0, 1.5, 2.0, 3.0]);
     let test: Vec<f64> = p.test.x.iter().map(|r| r[0]).collect();
-    assert_eq!(test, vec![5.5, 5.5]);
+    assert_eq!(test, vec![5.0, 5.5]);
+    assert_eq!(p.prep.smooth_mode, "trailing");
     // Two used columns (x and the target) x six rows.
     assert_eq!(p.prep.smoothed, 12);
+}
+
+/// The old centred window remains available, explicitly, and is reported as
+/// look-ahead rather than silently used.
+#[test]
+fn centred_smoothing_requires_the_explicit_flag_and_is_reported() {
+    let mut csv = String::from("t,x,y\n");
+    for i in 0..6 {
+        csv.push_str(&format!("{},{},{}\n", i, i + 1, i));
+    }
+    let t = data::parse_table(&csv).unwrap();
+    let pr = PrepSpec {
+        smooth: 3,
+        smooth_centred: true,
+        center: Center::None,
+        scale: Scale::None,
+        ..Default::default()
+    };
+    let p = prepare(&t, &temporal(0.3), &pr);
+    let train: Vec<f64> = p.train.x.iter().map(|r| r[0]).collect();
+    assert_eq!(train, vec![1.5, 2.0, 3.0, 3.5]);
+    assert_eq!(p.prep.smooth_mode, "centred");
+    let lines = p.prep.text_lines(None, 3).join("\n");
+    assert!(lines.contains("look-ahead"), "{lines}");
 }
 
 /// Each centre/scale combination has the expected training statistic, and the

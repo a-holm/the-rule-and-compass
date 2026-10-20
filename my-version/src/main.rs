@@ -155,8 +155,12 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              interpolate linear between the neighbours
   --outlier-iqr <k>          drop rows more than k interquartile ranges from the
                              column median (bounds from training rows only)
-  --smooth <k>               k-wide centred moving average per column (edges
-                             shrink; windows never cross the train/test split)
+  --smooth <k>               k-wide TRAILING moving average per column (a row
+                             reads only its own and earlier rows; edges shrink)
+  --smooth-centred <k>       the old centred window. Reads future bars and is
+                             a look-ahead on time series; reported as centred
+  --allow-interpolate        permit --fill interpolate on time-ordered data
+                             (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
   --filter <expr>            keep only rows where the expression is > 0; may
@@ -751,6 +755,8 @@ fn main() {
     let mut force = false;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
+    let mut smooth_centred = false;
+    let mut allow_interpolate = false;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -946,6 +952,18 @@ fn main() {
                     std::process::exit(EXIT_USAGE);
                 }
             },
+            // #110: centred smoothing reads future bars; opt in explicitly.
+            "--smooth-centred" => match val!().parse::<usize>() {
+                Ok(k) => {
+                    smooth = k;
+                    smooth_centred = true;
+                }
+                Err(_) => {
+                    eprintln!("error: --smooth-centred needs a non-negative integer window");
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            "--allow-interpolate" => allow_interpolate = true,
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -2105,6 +2123,8 @@ fn main() {
         fill,
         outlier_iqr,
         smooth,
+        smooth_centred,
+        allow_interpolate,
         center,
         scale,
         filter,
@@ -2474,7 +2494,7 @@ fn main() {
             prepared.report.gap,
             folds_json.join(",")
         );
-        if prepared.prep.active() {
+        if prepared.prep.active() || !prepared.prep.time_unit.is_empty() {
             let obj = prepared.prep.json();
             let inner = obj.trim_matches(|c| c == '{' || c == '}');
             println!("{{\"event\":\"preparation\",{}}}", inner);

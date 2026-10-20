@@ -24,7 +24,7 @@
 use crate::column::RowSelector;
 use crate::expr::{self, Node};
 use crate::rng::Mt;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Tokens that stand for a missing cell. They are accepted in numeric columns;
 /// anything else that does not parse as a number still makes the column
@@ -1617,8 +1617,13 @@ pub struct PrepSpec {
     /// Drop rows more than this many interquartile ranges from the column
     /// median (training rows define the bounds).
     pub outlier_iqr: Option<f64>,
-    /// Moving-average window in rows (`0` disables it).
+    /// Moving-average window in rows (`0` disables it). Trailing by default.
     pub smooth: usize,
+    /// #110: use the centred window (reads future bars). Explicit opt-in only.
+    pub smooth_centred: bool,
+    /// #110: allow `--fill interpolate` on time-ordered data (it reads the
+    /// next bar). Off by default.
+    pub allow_interpolate: bool,
     pub center: Center,
     pub scale: Scale,
     pub filter: Option<Filter>,
@@ -1634,6 +1639,8 @@ impl Default for PrepSpec {
             fill: FillMethod::None,
             outlier_iqr: None,
             smooth: 0,
+            smooth_centred: false,
+            allow_interpolate: false,
             center: Center::Mean,
             scale: Scale::Std,
             filter: None,
@@ -1660,6 +1667,17 @@ pub struct PrepReport {
     /// Data rows dropped by `--skip-malformed` because their field count did
     /// not match the header.
     pub rows_skipped_malformed: usize,
+    /// #110: smoothing window orientation (`trailing` or `centred`).
+    pub smooth_mode: &'static str,
+    /// #110: time-column hazards. Empty unit means no `--time` column.
+    pub time_unit: String,
+    pub time_rows: usize,
+    /// Rows whose numeric instant repeats an earlier row (after unit scaling).
+    pub time_duplicates: usize,
+    /// Rows where the time value decreases relative to the previous row.
+    pub time_non_monotonic: usize,
+    /// Numeric rows rescaled from ms/us/ns to seconds.
+    pub time_converted: usize,
 }
 
 impl Default for PrepReport {
@@ -1674,6 +1692,12 @@ impl Default for PrepReport {
             scale: "std",
             filtered: 0,
             rows_skipped_malformed: 0,
+            smooth_mode: "trailing",
+            time_unit: String::new(),
+            time_rows: 0,
+            time_duplicates: 0,
+            time_non_monotonic: 0,
+            time_converted: 0,
         }
     }
 }
@@ -1689,6 +1713,7 @@ impl PrepReport {
             || self.scale != "std"
             || self.filtered > 0
             || self.rows_skipped_malformed > 0
+            || self.smoothed > 0
     }
 
     /// One short, commented line per active transformation. `params` carries
@@ -1711,9 +1736,15 @@ impl PrepReport {
         }
         if smooth > 0 {
             out.push(format!(
-                "# preparation: smooth={} cells_smoothed={}",
-                smooth, self.smoothed
+                "# preparation: smooth={} mode={} cells_smoothed={}",
+                smooth, self.smooth_mode, self.smoothed
             ));
+            if self.smooth_mode == "centred" {
+                out.push(
+                    "# preparation: warning: centred smoothing reads future bars (look-ahead)"
+                        .to_string(),
+                );
+            }
         }
         if self.center != "mean" || self.scale != "std" {
             out.push(format!(
@@ -1733,24 +1764,148 @@ impl PrepReport {
                 self.rows_skipped_malformed
             ));
         }
+        if !self.time_unit.is_empty() {
+            out.push(format!(
+                "# preparation: time unit={} rows={} duplicates={} non_monotonic={} converted={}",
+                self.time_unit,
+                self.time_rows,
+                self.time_duplicates,
+                self.time_non_monotonic,
+                self.time_converted
+            ));
+            if self.time_duplicates > 0 {
+                out.push(format!(
+                    "# preparation: warning: {} duplicate time instant(s); de-duplicate by \
+                     instant before a temporal split",
+                    self.time_duplicates
+                ));
+            }
+            if self.time_non_monotonic > 0 {
+                out.push(format!(
+                    "# preparation: warning: time is not monotonic in row order ({} step(s)); \
+                     rows were ordered for the split, check the source",
+                    self.time_non_monotonic
+                ));
+            }
+        }
         out
     }
 
     /// The `preparation` object shared by `--json` and `--ndjson`.
     pub fn json(&self) -> String {
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
             self.rows_dropped_outlier,
             self.smoothed,
+            self.smooth_mode,
             self.center,
             self.scale,
             self.filtered,
-            self.rows_skipped_malformed
+            self.rows_skipped_malformed,
+            self.time_unit,
+            self.time_rows,
+            self.time_duplicates,
+            self.time_non_monotonic,
+            self.time_converted
         )
     }
+}
+
+/// #110: describe the time column without changing it: detected unit,
+/// duplicate instants (by numeric instant, so `1673343780` and
+/// `1673343780.0` collide) and non-monotonic steps in row order.
+struct TimeHazards {
+    unit: String,
+    rows: usize,
+    duplicates: usize,
+    non_monotonic: usize,
+    converted: usize,
+}
+
+fn time_hazards(t: &Table, spec: &SplitSpec) -> TimeHazards {
+    let mut out = TimeHazards {
+        unit: String::new(),
+        rows: 0,
+        duplicates: 0,
+        non_monotonic: 0,
+        converted: 0,
+    };
+    let Some(col) = spec.time_col else {
+        return out;
+    };
+    if col >= t.n_cols() {
+        return out;
+    }
+    let n = t.len();
+    let numeric = t.numeric[col];
+    let mut vals: Vec<f64> = if numeric {
+        t.col(col).to_vec()
+    } else if let Some(d) = t.dict(col) {
+        (0..n).map(|r| parse_time(d.text(r)).unwrap_or(f64::NAN)).collect()
+    } else {
+        t.col(col).to_vec()
+    };
+    out.rows = n;
+    let mut unit = "s";
+    let mut factor = 1.0;
+    if numeric {
+        let (lo, hi) = vals
+            .iter()
+            .filter(|v| v.is_finite())
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                (lo.min(v), hi.max(v))
+            });
+        // Same disjoint epoch windows as the strict parser in #130. Small
+        // columns are a plain index/seconds axis and keep their meaning.
+        let units = [
+            ("s", 1.0, 1.0e8, 4.2e9),
+            ("ms", 1e-3, 1.0e11, 4.2e12),
+            ("us", 1e-6, 1.0e14, 4.2e15),
+            ("ns", 1e-9, 1.0e17, 4.2e18),
+        ];
+        if lo >= 0.0 && hi < 1.0e8 {
+            // index-like
+        } else {
+            for (name, f, a, b) in units {
+                if lo >= a && hi <= b {
+                    unit = name;
+                    factor = f;
+                    break;
+                }
+            }
+        }
+        if unit != "s" {
+            out.converted = vals.iter().filter(|v| v.is_finite()).count();
+        }
+    }
+    if factor != 1.0 {
+        for v in vals.iter_mut() {
+            if v.is_finite() {
+                *v *= factor;
+            }
+        }
+    }
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut prev: Option<f64> = None;
+    for &v in &vals {
+        if !v.is_finite() {
+            continue;
+        }
+        if !seen.insert(v.to_bits()) {
+            out.duplicates += 1;
+        }
+        if let Some(p) = prev {
+            if v < p {
+                out.non_monotonic += 1;
+            }
+        }
+        prev = Some(v);
+    }
+    out.unit = unit.to_string();
+    out
 }
 
 /// Build normalised train/test samples. Returns (train, test, means, stds).
@@ -2152,6 +2307,21 @@ pub fn prepare_full_targets_weighted_with(
     let mut row_filled = vec![false; n];
     let mut rows_dropped_missing = 0usize;
 
+    // #110: interpolation reads the next bar in each side. On a time-ordered
+    // table that is look-ahead, so it needs an explicit opt-in.
+    if prep.fill == FillMethod::Interpolate
+        && !prep.allow_interpolate
+        && (spec.time_col.is_some()
+            || matches!(spec.mode, SplitMode::Temporal | SplitMode::TemporalGroup))
+    {
+        return Err(
+            "--fill interpolate reads the next bar, which is look-ahead on time-ordered \
+             data; use --fill previous or --fill drop, or pass --allow-interpolate if the \
+             rows are not a time series"
+                .to_string(),
+        );
+    }
+
     // 2. Missing values.
     match prep.fill {
         FillMethod::None => {
@@ -2391,11 +2561,13 @@ pub fn prepare_full_targets_weighted_with(
                 if col < nv && dtype_at(col) == DType::Boolean {
                     continue;
                 }
+                let cells_mut = cells.as_mut().expect("smoothing requires a mutable copy");
                 smoothed += smooth_cells(
-                    cells.as_mut().expect("smoothing requires a mutable copy"),
+                    cells_mut,
                     &side,
                     col,
                     prep.smooth,
+                    prep.smooth_centred,
                 );
             }
         }
@@ -2520,6 +2692,7 @@ pub fn prepare_full_targets_weighted_with(
         }
     }
 
+    let hazards = time_hazards(t, spec);
     Ok(Prepared {
         train,
         validation,
@@ -2538,6 +2711,12 @@ pub fn prepare_full_targets_weighted_with(
             scale: prep.scale.name(),
             filtered: filtered_count,
             rows_skipped_malformed: t.skipped_malformed,
+            smooth_mode: if prep.smooth_centred { "centred" } else { "trailing" },
+            time_unit: hazards.unit,
+            time_rows: hazards.rows,
+            time_duplicates: hazards.duplicates,
+            time_non_monotonic: hazards.non_monotonic,
+            time_converted: hazards.converted,
         },
     })
 }
@@ -2623,15 +2802,25 @@ fn split_sides(
     sides
 }
 
-/// Moving average over a `k`-wide window, centred on each value and shrinking at
-/// the edges of `side`. Missing cells are skipped; a cell with no observed
-/// neighbours is left missing. Returns the number of cells replaced.
-fn smooth_cells(cells: &mut [Vec<f64>], side: &[usize], col: usize, k: usize) -> usize {
+/// Moving average over a `k`-wide window, shrinking at the edges of `side`.
+///
+/// #110: the default window is **trailing** (`p-k+1 ..= p`), so a row only
+/// reads its own and earlier bars. `centred` keeps the old `p-k/2 ..= p+k/2`
+/// behaviour and therefore reads future bars; it is an explicit opt-in.
+/// Missing cells are skipped; a cell with no observed neighbours is left
+/// missing. Returns the number of cells replaced.
+fn smooth_cells(
+    cells: &mut [Vec<f64>],
+    side: &[usize],
+    col: usize,
+    k: usize,
+    centred: bool,
+) -> usize {
     if side.is_empty() || k < 2 {
         return 0;
     }
-    let before = k / 2;
-    let after = k - before - 1;
+    let before = if centred { k / 2 } else { k - 1 };
+    let after = if centred { k - 1 - k / 2 } else { 0 };
     let orig: Vec<f64> = side.iter().map(|&r| cells[r][col]).collect();
     let mut count = 0usize;
     for p in 0..side.len() {
@@ -4360,6 +4549,7 @@ mod tests {
             &mut Mt::new(1),
             &PrepSpec {
                 fill: FillMethod::Interpolate,
+                allow_interpolate: true,
                 center: Center::None,
                 scale: Scale::None,
                 ..Default::default()
