@@ -601,6 +601,7 @@ fn gpu_json(
     g: &Option<rcsr::search::GpuRunStats>,
     best_error: f64,
     baseline_error: f64,
+    fit_strategy: &str,
 ) -> String {
     let Some(g) = g else {
         return "null".to_string();
@@ -621,7 +622,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -631,6 +632,9 @@ fn gpu_json(
                 s.unsupported_programs,
                 jnum(s.fallback_seconds),
                 s.fallback_workers,
+                s.fit_attempts,
+                s.fit_gpu,
+                s.fit_fallback,
                 ops_json(&s.opcodes)
             )
         })
@@ -663,8 +667,19 @@ fn gpu_json(
         t_workers,
         ops_json(&total_ops)
     );
+    // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
+    // strategy and its attempt/fallback/refit counts are always auditable.
+    let fit = format!(
+        "\"fit\":{{\"strategy\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"seconds\":{}}}",
+        jstr(fit_strategy),
+        g.fit_attempts,
+        g.fit_gpu,
+        g.fit_fallback,
+        g.fit_refits,
+        jnum(g.fit_ms / 1000.0)
+    );
     format!(
-        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}}}",
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.sync_s),
@@ -691,7 +706,8 @@ fn gpu_json(
         jnum(a.duty_cycle()),
         quality,
         gens.join(","),
-        totals
+        totals,
+        fit
     )
 }
 
@@ -3250,7 +3266,12 @@ fn main() {
     let diagnostics_start = std::time::Instant::now();
 
     // #140: atomically finish the manifest with an end timestamp and timings.
-    if let (Some(path), Some(m)) = (&run_manifest_path, &manifest_state) {
+    if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
+        // #169: record the fit arm's ledger when the GPU fit ran.
+        if outcome.gpu.is_some() {
+            let (gpu, fallback, refits) = fit::gpu_fit_counts();
+            m.fit = Some((gpu, fallback, refits));
+        }
         let total_secs = run_start.elapsed().as_secs_f64();
         let phases = [
             ("data_prepare", data_prepare_secs),
@@ -4406,6 +4427,7 @@ fn main() {
                     &outcome.gpu,
                     gpu_best_error(&outcome),
                     gpu_baseline_error(&prepared.train),
+                    cfg.fit_strategy.name(),
                 ),
                 checkpoint_json,
                 null_json,
@@ -4634,6 +4656,7 @@ fn main() {
                     &outcome.gpu,
                     gpu_best_error(&outcome),
                     gpu_baseline_error(&prepared.train),
+                    cfg.fit_strategy.name(),
                 ),
                 outcome.archive.items.len(),
                 search_meta_ndjson
