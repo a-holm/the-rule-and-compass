@@ -35,8 +35,9 @@ syntax error names the 1-based column.
 Each seed is processed once, in this order, **before generation 1**:
 
 1. **parse** against the `--vars` names (a bad expression is exit code `2`);
-2. **simplify** (`expr::simplify`) — folds constants and removes algebraic
-   identities such as `+ 0`;
+2. **simplify** (`expr::simplify`) — folds constants and applies only
+   value-preserving identities. (`x + +0` is *not* removed: it changes `-0` to
+   `+0`; use `-0`, `*1` or `/1` for an exact identity.)
 3. **fit** its numeric constants on the full training sample with
    `--fit-iters` Levenberg–Marquardt iterations (the same fitter offspring
    use; `--no-fit` and `--fit-iters 0` leave constants untouched and take no

@@ -132,11 +132,16 @@ fn simplify_folds() {
             constant(0.0),
         ],
     );
-    let s = expr::simplify(&e);
+    // Display-only affine folding: the sound core keeps `x + +0` because it is
+    // not an identity at x = -0, and keeps `0*x` because it is not 0 at inf/NaN.
+    let s = expr::simplify_display(&e);
     assert_eq!(expr::to_string(&s, &["x".to_string()]), "x");
 
     let e2 = node(Op::Mul, vec![constant(0.0), input(0)]);
-    assert_eq!(expr::to_string(&expr::simplify(&e2), &["x".to_string()]), "0");
+    assert_eq!(
+        expr::to_string(&expr::simplify_display(&e2), &["x".to_string()]),
+        "0"
+    );
 
     let e3 = node(
         Op::Add,

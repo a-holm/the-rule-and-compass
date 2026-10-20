@@ -852,8 +852,10 @@ the historical LM path bit for bit.
   analytic per-input sensitivity ranking (`mean(|∂f/∂x_i| · σ_x_i / σ_f)`, no
   finite differences), and a repeated-search benchmark with per-complexity
   median/IQR error and wall-clock time;
-- bottom-up simplification with affine normalisation, and denormalisation back
-  to original units.
+- a sound, value-preserving bottom-up normal form for scoring/dedup/CSE
+  (`expr::simplify`) plus an aggressive display relation with affine
+  normalisation (`expr::simplify_display`), and denormalisation back to original
+  units.
 
 See [`docs/optimisation.md`](docs/optimisation.md) for the measured before/after
 numbers and the hardware plan.

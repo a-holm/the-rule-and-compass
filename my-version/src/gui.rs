@@ -1324,8 +1324,8 @@ impl RunPlan {
             .iter()
             .enumerate()
             .map(|(k, s)| {
-                let den = expr::simplify(&expr::denormalize(
-                    &expr::simplify(&s.tree),
+                let den = expr::simplify_display(&expr::denormalize(
+                    &expr::simplify_display(&s.tree),
                     &prepared.means,
                     &prepared.stds,
                 ));
@@ -1651,8 +1651,8 @@ impl RunPlan {
             if let Some(s) = best {
                 let test_error = search::eval_error(&s.tree, &f.test, self.cfg.metric);
                 let train_error = search::eval_error(&s.tree, &f.train, self.cfg.metric);
-                let den = expr::simplify(&expr::denormalize(
-                    &expr::simplify(&s.tree),
+                let den = expr::simplify_display(&expr::denormalize(
+                    &expr::simplify_display(&s.tree),
                     &f.means,
                     &f.stds,
                 ));
