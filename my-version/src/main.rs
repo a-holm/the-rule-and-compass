@@ -4720,6 +4720,7 @@ fn run_multi_output(
         diagnostics: 0.0,
         report: report_start.elapsed().as_secs_f64(),
         total: run_start.elapsed().as_secs_f64(),
+        gpu: 0.0,
     };
 
     match format {
