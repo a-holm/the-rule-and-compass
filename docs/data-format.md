@@ -16,12 +16,30 @@ group buffer and the sample, not by the file.
 rcsr --data large.csv --target y --max-memory 2GB
 ```
 
-The estimate is derived from the CSV size: **33× the file** (the measured
-1.75 KiB/row for six columns in #70). When the estimate is above the budget,
-`rcsr` prints the file size, the estimate and the budget, suggests `--force`
-and `rcsr import`, and exits **3** (input error). It does not allocate the
-table first, so it cannot become `memory allocation of N bytes failed`
-(SIGABRT) or a silent SIGKILL.
+The estimate is derived from the table's **shape**, not its file size (issue
+#112): once the header and row count are known, the guard models
+
+```text
+text     = bytes read into one String
+table    = rows x columns x 12 B          (f64 value + u32 dictionary code)
+prep     = rows x used_columns x 24 B      (cells, train and test copies)
+         + rows x 72 B                     (Vec headers and selectors)
+estimate = (text + table + prep) x 1.25    (allocator slack)
+```
+
+`used_columns` is the search's projection (`--vars`, `--target`, `--weight`);
+with no `--vars` the whole header is assumed. `rcsr import` has no search
+preparation, so its guard uses the `text + table` terms only. The old `33 x file size` factor
+was calibrated on ~6-column data and predicted 560 GB for a 17 GB, 93-column
+panel that is at most ~27 GB resident. The text term is not optional: the
+loader reads the whole CSV into one `String`, so a 17 GB CSV cannot be less
+than 17 GB resident.
+
+When the estimate is above the budget, `rcsr` prints the file size, the
+rows x columns basis, the estimate and the budget, suggests `--force` and
+`rcsr import`, and exits **3** (input error). It does not allocate the table
+first, so it cannot become `memory allocation of N bytes failed` (SIGABRT) or a
+silent SIGKILL.
 
 `--force` overrides the guard. The kernel can still kill the process; that is
 the deliberate meaning of "force".
@@ -33,7 +51,7 @@ The guard is opt-in for a CSV, but it also fires when a **hard** wall is
 detected: a cgroup v2/v1 memory limit or `ulimit -v` (`Max address space`).
 That is what makes a container or `ulimit` run fail cleanly instead of being
 OOM-killed. The soft `MemAvailable` figure is deliberately not used to refuse a
-CSV (the 33× estimate is conservative); it is used, together with the hard
+CSV (the shape estimate is conservative); it is used, together with the hard
 limits, to decide whether a `.rcsb` store is loaded resident or streamed.
 
 ## Import

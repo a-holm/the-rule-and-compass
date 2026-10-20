@@ -375,6 +375,134 @@ fn an_explicit_time_column_is_honoured_by_import() {
 }
 
 #[test]
+fn csv_shape_counts_header_width_and_data_rows() {
+    let text = "# note\n\nx,y,z\n1,2,3\n\n4,5,6\n";
+    assert_eq!(
+        data::csv_shape(text),
+        data::CsvShape {
+            rows: 2,
+            cols: 3,
+            bytes: text.len() as u64,
+        }
+    );
+    // The delimiter follows the loader: tab, comma, else whitespace.
+    assert_eq!((data::csv_shape("a\tb\n1\t2\n").rows, data::csv_shape("a\tb\n1\t2\n").cols), (1, 2));
+    assert_eq!(
+        (data::csv_shape("a b c\n1 2 3\n4 5 6\n").rows, data::csv_shape("a b c\n1 2 3\n4 5 6\n").cols),
+        (2, 3)
+    );
+}
+
+#[test]
+fn memory_estimate_follows_shape_not_file_size() {
+    // A wide table with a *small* file: every cell is one byte.
+    let mut wide = (0..90).map(|j| format!("c{}", j)).collect::<Vec<_>>().join(",");
+    let wide_row = std::iter::repeat("1").take(90).collect::<Vec<_>>().join(",");
+    for _ in 0..200 {
+        wide.push('\n');
+        wide.push_str(&wide_row);
+    }
+    // A narrow table with a *larger* file: two very long numeric cells.
+    let long = "1".repeat(200);
+    let mut narrow = String::from("x,y");
+    for _ in 0..200 {
+        narrow.push('\n');
+        narrow.push_str(&long);
+        narrow.push(',');
+        narrow.push_str(&long);
+    }
+    assert!(
+        wide.len() < narrow.len(),
+        "the fixture must be wider but smaller: {} vs {}",
+        wide.len(),
+        narrow.len()
+    );
+    let wide_shape = data::csv_shape(&wide);
+    let narrow_shape = data::csv_shape(&narrow);
+    let wide_est = data::estimate_csv_bytes(wide_shape, 0);
+    let narrow_est = data::estimate_csv_bytes(narrow_shape, 0);
+    assert!(
+        wide_est > narrow_est,
+        "the estimate must be driven by rows x columns, not bytes: {wide_est} vs {narrow_est}"
+    );
+    // The old guard was exactly 33 x file size; neither estimate is that.
+    assert_ne!(wide_est, wide_shape.bytes * 33);
+    assert_ne!(narrow_est, narrow_shape.bytes * 33);
+    // A projected search costs less preparation than the whole header.
+    assert!(data::estimate_csv_bytes(wide_shape, 7) < wide_est);
+}
+
+#[test]
+fn a_wide_small_csv_is_refused_before_a_narrow_large_one() {
+    let dir = temp_dir("shape-guard");
+    let mut wide = (0..90).map(|j| format!("c{}", j)).collect::<Vec<_>>().join(",");
+    let wide_row = std::iter::repeat("1").take(90).collect::<Vec<_>>().join(",");
+    for _ in 0..200 {
+        wide.push('\n');
+        wide.push_str(&wide_row);
+    }
+    let mut narrow = String::from("x,y");
+    let long = "1".repeat(200);
+    for _ in 0..200 {
+        narrow.push('\n');
+        narrow.push_str(&long);
+        narrow.push(',');
+        narrow.push_str(&long);
+    }
+    let wide_path = dir.join("wide.csv");
+    let narrow_path = dir.join("narrow.csv");
+    std::fs::write(&wide_path, &wide).unwrap();
+    std::fs::write(&narrow_path, &narrow).unwrap();
+    assert!(wide.len() < narrow.len());
+
+    // 300 kB is above the narrow table's estimate and below the wide one's.
+    let budget = "300KB";
+    let wide_run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            wide_path.to_str().unwrap(),
+            "--target",
+            "c0",
+            "--max-memory",
+            budget,
+            "--generations",
+            "1",
+            "--pop",
+            "8",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(wide_run.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&wide_run.stderr);
+    assert!(err.contains("200 rows x 90 columns"), "{err}");
+    assert!(err.contains("estimate basis"), "{err}");
+
+    let narrow_run = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            narrow_path.to_str().unwrap(),
+            "--target",
+            "y",
+            "--max-memory",
+            budget,
+            "--generations",
+            "1",
+            "--pop",
+            "8",
+        ])
+        .output()
+        .unwrap();
+    assert_ne!(
+        narrow_run.status.code(),
+        Some(3),
+        "a narrow file with more bytes must pass the shape guard: {}",
+        String::from_utf8_lossy(&narrow_run.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+#[test]
 fn the_memory_guard_refuses_a_csv_cleanly_with_exit_3() {
     let csv = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/clean.csv");
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
