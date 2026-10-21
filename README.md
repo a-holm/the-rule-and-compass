@@ -440,7 +440,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
-     [--dev-log file.ndjson] [--dev-log-every N] [--dev-log-max-bytes size]
+     [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
+     [--dev-log-every N] [--dev-log-max-bytes size]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
@@ -973,18 +974,20 @@ alone, cost O(front size) and never touch a training row. See
 
 ## Why did the run behave like that?
 
-`--dev-log <file>` writes one NDJSON **development event per generation** —
-phase timings, the population error quantiles, Pareto size/hypervolume/archive
-hash, the structural de-duplication rate, archive admissions, fit
-attempts/GPU/fallback-by-cause/refits, GPU kernel time and duty, CPU fallback
-seconds and workers, QD coverage/entropy, convergence, the per-island best error
-and an RNG state key — plus `run_start`, `checkpoint` and `run_end` events.
-It is off by default, it never changes the archive, the results or the
-configuration hash, each event is one atomic line, and the file is bounded by
-`--dev-log-max-bytes`. `rcsr dev-report <log>` (pure Rust, no Python) turns the
-file into a phase table, a fit-versus-evaluation share, fallback causes,
-convergence and archive growth, and a ranked list of bottlenecks. See
-[`docs/dev-log.md`](docs/dev-log.md).
+Every run writes a bounded NDJSON **development log** — on by default at
+`summary` level, the in-engine replacement for an external run monitor.
+`run_start`, one generation event every few generations (generation, elapsed,
+best/median error, Pareto size, phase times, fit/GPU/fallback counts, GPU duty,
+convergence), `checkpoint` events and `run_end`. `--dev-log-level full` writes
+every generation with the complete record (all error quantiles, archive
+hypervolume/hash, de-duplication rate, admissions, fallback-by-cause, QD
+coverage/entropy, per-island best, RNG key). The file is `rcsr.dev.ndjson` next
+to `--json-out`/`--save`, else in the working directory; `--no-dev-log` turns it
+off. It never changes the archive, the results or the configuration hash, each
+event is one atomic line, and the file is bounded by `--dev-log-max-bytes`.
+`rcsr dev-report <log>` (pure Rust, no Python) turns the file into a phase table,
+a fit-versus-evaluation share, fallback causes, convergence and archive growth,
+and a ranked list of bottlenecks. See [`docs/dev-log.md`](docs/dev-log.md).
 
 ## Layout
 
