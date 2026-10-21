@@ -52,7 +52,8 @@ gh issue list --label roadmap --limit 100
 * Rust, pure `std` for the core crate; the CUDA backend is opt-in behind
   `--features cuda`.
 * Commit messages follow `feat(area): ...`, `fix(area): ...`, `perf(area): ...`,
-  `docs: ...`; reference the issue with `Closes #<n>`.
+  `docs: ...`; reference the issue with `Refs #<n>`. **Never use `Closes #<n>`
+  in a commit or PR unless you are closing the issue at that exact moment.**
 * Prefer a measurement or a test over an assertion.
 
 ## Useful commands
