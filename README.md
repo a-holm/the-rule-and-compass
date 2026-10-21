@@ -340,8 +340,9 @@ atomically instead of streaming it. See
   25 % slack. The full rows load whenever that fits — on the 3.9M × 56 panel the
   estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
-  refused; sampling is explicit via `--sample-rows N` and is recorded as
-  `full_rows=false` in the preparation block, manifest and dev log. `rcsr
+  refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
+  `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
+  the preparation block, manifest and dev log. `rcsr
   import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
   v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).

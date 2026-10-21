@@ -6,9 +6,11 @@ Issue **#71**. Two related pieces:
 2. `--max-memory` refuses an input that would not fit, before the resident
    `Table` and its search copies are built.
 
-A store that does not fit is still searchable: the loader scans it group by
-group and materialises a bounded, hash-selected sample. RSS is bounded by the
-group buffer and the sample, not by the file.
+A store that does not fit is **refused** with its header-derived estimate
+(issue #112). It is still searchable: an explicit `--sample-rows N` asks the
+loader to scan it group by group and materialise a bounded, hash-selected
+sample, with RSS bounded by the group buffer and the sample, not by the file.
+Sampling never happens automatically, and the run records `full_rows=false`.
 
 ## Memory guard
 
@@ -141,7 +143,9 @@ the actionable options (`--force` for the full resident load, or an explicit
 experiment, and the preparation block, run manifest and dev log record
 `full_rows=false` plus the requested row count. Explicit sampling still uses the
 pinned one-multiply hash and scans groups, so RSS stays bounded by one group
-plus the sample.
+plus the sample. `--sample-rows` is mutually exclusive with `--force`, a
+request for at least the row count is a full load and must fit the budget like
+any other, and a sample whose own estimate exceeds the budget is refused.
 
 The estimator itself is header-derived, not a per-cell constant. For a store it
 sums the exact resident representation (`f64`/`i64` value blocks only for
@@ -393,12 +397,29 @@ code blocks, 151 dictionary levels; the resident `Table` is
 always 4 B, and `symbol` has no value block).
 
 `--max-memory 12GB --fill drop --generations 1 --pop 4 --fit-iters 0 --allow-lockbox`
-selected the **full 3,943,856 rows** (`full_rows=true`, `sampled_rows=null`),
-with `VmHWM` = **7,094,696 KiB (7.26 GB)**. The guard's CPU estimate was
-**7,826,847,852 B (7.83 GB)**: storage 1.81 GB + directory/group 0.03 GB +
-search 3.47 GB + fixed 0.95 GB + slack 1.57 GB, with 54 search + 2 scan columns.
-The old `rows × columns × 300 B` model reported **61.71 GiB (66.26 GB)** and
-sampled 577,141 rows; the new estimate is 1.08x the measured peak.
+selected the **full 3,943,856 rows** (`full_rows=true`, `sampled_rows=null`,
+train 2,894,422 + test 968,314), with `VmHWM` = **7,094,500 KiB (7.26 GB, from
+`/usr/bin/time -v`)**. The guard's CPU estimate was **7,826,847,852 B (7.83 GB)**:
+storage 1.81 GB + directory/group 0.03 GB + search 3.47 GB + fixed 0.95 GB +
+slack 1.57 GB, with 54 search + 2 scan columns. The old
+`rows × columns × 300 B` model reported **61.71 GiB (66.26 GB)** and sampled
+577,141 rows; the new estimate is **1.08x** the measured peak.
+
+Two further fixtures pin the shape axis, because the defect was a constant
+calibrated on one width. Both are generated stores, `--fill drop --fit-iters 0
+--generations 1 --pop 4 --max-memory 8GB`, full rows:
+
+| fixture | rows × cols | resident table | used cols | estimate | `VmHWM` | estimate / peak |
+|---|---|---:|---:|---:|---:|---:|
+| narrow | 2,000,000 × 6 | 112 MB | 5 search + 1 scan | 965,245,540 B | 806,308 KiB (826 MB) | **1.17** |
+| wide | 300,000 × 90 | 218 MB | 89 search + 1 scan | 960,305,140 B | 874,620 KiB (896 MB) | **1.07** |
+| panel | 3,943,856 × 56 | 1.81 GB | 54 search + 2 scan | 7,826,847,852 B | 7,094,500 KiB (7.26 GB) | **1.08** |
+
+The narrow and wide fixtures have almost the same estimate and peak while the
+cell counts differ by 7.3x and the store sizes by 2x: the estimate follows the
+per-row fixed term and the used-column projection, not a per-cell constant. All
+three are inside the issue's `[1.0, 2.0]` band; all three are also inside the
+calibrator's green band (`1.00 ≤ r ≤ 1.50`).
 
 The GPU/fit variant adds the `f32` image and the optional exact `f64` fit copy.
 For the pilot projection (53 search columns, `--fit-strategy gpu --fit-iters 8`)
