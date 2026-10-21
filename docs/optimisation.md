@@ -678,7 +678,10 @@ point and the exactness gate in `src/fit/gpu.rs`:
 
 `--fit-strategy gpu` without a batch backend (a direct call, a checkpoint
 resume, a non-CUDA build) uses the exact CPU arms and records the fallback; it
-is never a silent no-op. `--fit-report` prints GPU accepted/fallback/refit
+is never a silent no-op. A metric outside the least-squares family is a
+different matter: an explicit `--fit-strategy gpu` with it is refused as a
+usage error before the run (#223), because the CPU arms would fit a different
+objective. `--fit-report` prints GPU accepted/fallback/refit
 counts and whether a CUDA build is present.
 
 #### Exactness and fallbacks
@@ -795,11 +798,13 @@ were fitted, while the batched kernel is still 17–25× faster per candidate, s
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
 `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
-applies to the squared/AIC family (the kernel minimises squared error); other
-metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
-training rows in CPU f64 before it is scored and reported, so reported constants
-and metrics never come from f32. The arm is opt-in and saved in checkpoints;
-`exact` remains the default, bit for bit.
+applies to the squared/AIC family (the kernel minimises squared error); an
+explicit `gpu` with any other metric is a usage error (exit 2) naming
+`--metric squared` or a CPU strategy (exact, auto, linear, varpro, stream),
+never a silent CPU fit of a different objective (#223). Every finalist is refit
+exactly on all training rows in CPU f64 before it is scored and reported, so
+reported constants and metrics never come from f32. The arm is opt-in and saved
+in checkpoints; `exact` remains the default, bit for bit.
 
 #### Subsampled scoring: `--predictor-samples`
 

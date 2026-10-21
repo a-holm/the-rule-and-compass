@@ -31,9 +31,11 @@ device and labels every larger or unsupported candidate for the exact CPU arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+forced individually. An explicit `gpu` with a metric outside the least-squares
+family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
+squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+the default LM path when it cannot prove a safe result, and the default remains
+the historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -879,9 +881,11 @@ device and labels every larger or unsupported candidate for the exact CPU arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+forced individually. An explicit `gpu` with a metric outside the least-squares
+family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
+squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+the default LM path when it cannot prove a safe result, and the default remains
+the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant

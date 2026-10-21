@@ -524,3 +524,102 @@ fn bench_end_to_end() {
         eprintln!("control: arm={} hypervolume={:.6} ttt={}", name, hv, ttt);
     }
 }
+
+// ---------------------------------------------------------------- #223 ------
+//
+// The GPU LM kernel minimises weighted squared error only. An explicit
+// `--fit-strategy gpu` with any other metric must be a usage error naming the
+// cause and the two ways out, never a silent CPU fallback that optimises a
+// different objective. These tests run the real binary so the exit code and the
+// message are what a user sees.
+
+fn rcsr(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run rcsr")
+}
+
+/// Every metric outside the least-squares family is refused with exit 2 and
+/// a message that names the GPU LM's objective and both fixes. Iterating over
+/// `Metric::all()` means a future metric cannot inherit the old silent path.
+#[test]
+fn explicit_gpu_outside_the_least_squares_family_is_a_usage_error() {
+    let refused: Vec<&str> = Metric::all()
+        .iter()
+        .filter(|m| !m.is_least_squares())
+        .map(|m| m.name())
+        .collect();
+    assert!(
+        refused.contains(&"absolute") && refused.contains(&"rank_correlation"),
+        "the least-squares family changed unexpectedly: {refused:?}"
+    );
+    for metric in refused {
+        // `--implicit` metrics are refused earlier (by #14) when it is missing;
+        // with it, the GPU refusal is the one that must fire.
+        let implicit = Metric::parse(metric).is_implicit();
+        let mut args = vec![
+            "--data", "-", "--target", "y", "--vars", "x", "--fit-strategy", "gpu",
+            "--metric", metric,
+        ];
+        if implicit {
+            args.push("--implicit");
+        }
+        let out = rcsr(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "--metric {metric}: {stderr}");
+        assert!(
+            stderr.contains("--fit-strategy gpu minimises squared error only"),
+            "--metric {metric} must say what the GPU LM minimises: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("--metric {metric}")),
+            "--metric {metric} must name the metric it refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("--metric squared"),
+            "--metric {metric} must offer --metric squared: {stderr}"
+        );
+        assert!(
+            stderr.contains("--fit-strategy exact, auto, linear, varpro or stream"),
+            "--metric {metric} must offer the CPU strategies: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "--metric {metric}: a refused run prints no solutions"
+        );
+    }
+}
+
+/// The gate must not over-fire. The four least-squares metrics pass the usage
+/// check with `gpu`, and every other metric keeps every other strategy: each
+/// reaches the data loader, so the run fails on the missing file (exit 3)
+/// rather than on the fit strategy.
+#[test]
+fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
+    for metric in ["squared", "aic", "aicc", "bic"] {
+        let out = rcsr(&[
+            "--data", "missing-223.csv", "--target", "y", "--vars", "x",
+            "--fit-strategy", "gpu", "--metric", metric,
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "--metric {metric}: {stderr}");
+        assert!(
+            !stderr.contains("minimises squared error only"),
+            "--metric {metric} is fitted by least squares and must be accepted: {stderr}"
+        );
+    }
+    for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
+        let out = rcsr(&[
+            "--data", "missing-223.csv", "--target", "y", "--vars", "x",
+            "--fit-strategy", strategy, "--metric", "absolute",
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "--fit-strategy {strategy}: {stderr}");
+        assert!(
+            !stderr.contains("minimises squared error only"),
+            "--fit-strategy {strategy} keeps metric-aware CPU fitting: {stderr}"
+        );
+    }
+}
