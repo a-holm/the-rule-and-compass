@@ -632,6 +632,14 @@ extern "C" {
         outsse: *mut f64,
         outstatus: *mut i32,
     ) -> f32;
+    /* #169: block width, dynamic shared bytes and constant cap of the fit-kernel
+       instantiation a batch with `kmax` constants would use. Diagnostics. */
+    fn rc_fit_kernel_info(
+        kmax: i32,
+        threads: *mut i32,
+        smem_bytes: *mut i32,
+        max_constants: *mut i32,
+    ) -> i32;
 }
 
 /// #169: one candidate's batched-GPU fit result.
@@ -643,6 +651,29 @@ pub struct GpuFitOutput {
     pub sse: f64,
     /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
     pub status: i32,
+}
+
+/// #169: the fit-kernel instantiation that owns a batch whose largest constant
+/// count is `p`: `(block threads, dynamic shared bytes, constant cap)`.
+///
+/// `None` means `p` is past every instantiation, so the batch cannot run on the
+/// device at all. Diagnostics only: the dispatcher in `eval.cu` makes the same
+/// choice, this only reports it so a measurement can state the shared footprint
+/// it ran with.
+#[cfg(feature = "cuda")]
+pub fn fit_kernel_shape(p: usize) -> Option<(usize, usize, usize)> {
+    let (mut threads, mut smem, mut maxc) = (0i32, 0i32, 0i32);
+    let rc = unsafe { rc_fit_kernel_info(p as i32, &mut threads, &mut smem, &mut maxc) };
+    if rc != 0 || threads <= 0 || smem <= 0 {
+        return None;
+    }
+    Some((threads as usize, smem as usize, maxc as usize))
+}
+
+/// #169: CPU builds have no fit kernel, so there is no shape to report.
+#[cfg(not(feature = "cuda"))]
+pub fn fit_kernel_shape(_p: usize) -> Option<(usize, usize, usize)> {
+    None
 }
 
 /// Probe for a usable CUDA device once (issue #141).
@@ -2495,11 +2526,11 @@ mod fit_tests {
     }
 
     #[test]
-    fn gpu_fit_matches_the_cpu_lm_for_p_1_to_16() {
+    fn gpu_fit_matches_the_cpu_lm_for_p_1_to_20() {
         let n = 800;
         let mut errors: Vec<f64> = Vec::new();
         let mut worst_sse_rel = 0.0f64;
-        for p in 1..=16usize {
+        for p in 1..=20usize {
             let (x, y, cols, y32, _target, start) = linear_fixture(p, n);
             let mut ev = match GpuEvaluator::new(&cols, n, p, &y32) {
                 Some(ev) => ev,
@@ -2550,6 +2581,12 @@ mod fit_tests {
                 gpu_sse,
                 cpu_sse
             );
+            let worst_c = gpu_c
+                .iter()
+                .zip(&cpu_c)
+                .map(|(a, b)| (a - b).abs() / (1.0 + b.abs()))
+                .fold(0.0f64, f64::max);
+            eprintln!("p={:2} sse_rel={:.2e} max_const_err={:.2e}", p, rel, worst_c);
         }
         errors.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = errors[errors.len() / 2];
@@ -2609,16 +2646,159 @@ mod fit_tests {
         assert!(rel <= 1e-8, "SSE relative {:.3e}", rel);
     }
 
+    /// #169: the cap is 20 constants. Every `p` the kernel can take is offered
+    /// to it (never silently dropped), and only `p > 20` is labelled
+    /// `too_many_constants` for the CPU fallback.
     #[test]
-    fn p_above_the_kernel_cap_is_rejected_for_cpu_fallback() {
-        for p in 17..=20usize {
-            let start: Vec<f64> = vec![0.1; p];
-            assert!(
-                crate::fit::gpu_fit_plan(&model(&start)).is_none(),
-                "p={} must stay on the CPU",
+    fn the_constant_cap_is_twenty_and_p_above_it_is_labelled() {
+        use crate::fit::GpuFitReject;
+        assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
+        for p in 1..=20usize {
+            let m = linear_model(&vec![0.1; p]);
+            let plan = crate::fit::gpu_fit_plan_reason(&m)
+                .unwrap_or_else(|e| panic!("p={} must be offered to the kernel: {:?}", p, e));
+            assert_eq!(plan.nconst, p);
+        }
+        for p in 21..=24usize {
+            let m = linear_model(&vec![0.1; p]);
+            assert_eq!(
+                crate::fit::gpu_fit_plan_reason(&m).err(),
+                Some(GpuFitReject::TooManyConstants),
+                "p={} must be labelled too_many_constants",
                 p
             );
         }
+    }
+
+    /// #169: the two kernel instantiations are selected by the batch's largest
+    /// constant count, and the p=20 instantiation stays under 48 KB of shared
+    /// memory so two blocks still fit per SM.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fit_kernel_instantiations_report_their_shared_footprint() {
+        let small = fit_kernel_shape(4).expect("p=4 has an instantiation");
+        let large = fit_kernel_shape(20).expect("p=20 has an instantiation");
+        assert_eq!(small.2, 16, "p<=16 keeps the 16-constant instantiation");
+        assert_eq!(large.2, 20, "17..20 use the 20-constant instantiation");
+        assert_eq!(small.0, 256);
+        assert_eq!(large.0, 128);
+        assert!(small.1 > 0 && small.1 <= 48 * 1024, "small smem {}", small.1);
+        assert!(large.1 > 0 && large.1 <= 48 * 1024, "large smem {}", large.1);
+        assert!(
+            fit_kernel_shape(21).is_none(),
+            "p=21 is past every instantiation, so it must stay on the CPU"
+        );
+    }
+
+    /// #169: a mixed batch — `p = 4` beside `p = 17..=20`, i.e. a padded
+    /// `kmax = 20` — gives every candidate the same constants as fitting it
+    /// alone, bit for bit, even though the small candidate then runs in the
+    /// 20-constant, 128-row-chunk instantiation instead of its own. All of
+    /// them still match the CPU LM to the issue's tolerances.
+    #[test]
+    fn a_mixed_p_batch_matches_single_fits_and_the_cpu_lm() {
+        let n = 600;
+        let pmax = 20usize;
+        let (x, y, cols, y32) = orthogonal_fixture(pmax, n);
+        let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n * pmax];
+        for i in 0..n {
+            for k in 0..pmax {
+                cols64[k * n + i] = x[i][k];
+            }
+        }
+        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+
+        let ps = [4usize, 17, 18, 19, 20];
+        let mut starts = Vec::new();
+        let mut cpu_sse = Vec::new();
+        let mut singles = Vec::new();
+        for &p in &ps {
+            let start: Vec<f64> = (0..p).map(|k| 0.25 + 0.07 * k as f64).collect();
+            let mut tree = linear_model(&start);
+            let sse = crate::fit::fit_weighted(&mut tree, &x, &y, &[], 8);
+            cpu_sse.push(sse);
+            starts.push(start);
+            let plan = crate::fit::gpu_fit_plan(&linear_model(
+                &(0..p).map(|k| 0.25 + 0.07 * k as f64).collect::<Vec<_>>(),
+            ))
+            .expect("plan");
+            let (out, _) = ev.fit_batch(&[&plan], 8);
+            assert_eq!(out[0].status, 0, "p={} must be well conditioned", p);
+            singles.push(out[0].clone());
+        }
+
+        // One batch: kmax is 20, so every block uses the 20-constant
+        // instantiation and the padded start constants of the small candidate.
+        let plans: Vec<_> = starts
+            .iter()
+            .map(|s| crate::fit::gpu_fit_plan(&linear_model(s)).expect("plan"))
+            .collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (mixed, _) = ev.fit_batch(&refs, 8);
+        assert_eq!(mixed.len(), ps.len());
+
+        let mut errors = Vec::new();
+        for (k, &p) in ps.iter().enumerate() {
+            assert_eq!(mixed[k].status, 0, "mixed p={}", p);
+            assert_eq!(
+                mixed[k].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                singles[k].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "p={} changed in a padded batch",
+                p
+            );
+            assert_eq!(mixed[k].sse.to_bits(), singles[k].sse.to_bits());
+            let mut tree = linear_model(&starts[k]);
+            plans[k].apply(&mut tree, &mixed[k].c);
+            let gpu_c = constants(&tree);
+            let mut cpu_tree = tree.clone();
+            let gpu_sse = sse_at(&mut cpu_tree, &x, &y);
+            let rel = (gpu_sse - cpu_sse[k]).abs() / cpu_sse[k].abs().max(1e-8);
+            assert!(
+                rel <= 1e-8,
+                "p={}: SSE relative {:.3e} in a mixed batch",
+                p,
+                rel
+            );
+            // Compare with the CPU constants of the same candidate.
+            let mut cpu_only = linear_model(&starts[k]);
+            crate::fit::fit_weighted(&mut cpu_only, &x, &y, &[], 8);
+            for (a, b) in gpu_c.iter().zip(constants(&cpu_only)) {
+                errors.push((a - b).abs() / (1.0 + b.abs()));
+            }
+        }
+        errors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median = errors[errors.len() / 2];
+        assert!(median <= 1e-5, "median constant error {:.3e}", median);
+    }
+
+    /// A 20-column design: column `k` is `sin((k+1)t)`, so the columns are
+    /// orthogonal over the period and every constant is separately identified.
+    fn orthogonal_fixture(pmax: usize, n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>) {
+        let target: Vec<f64> = (0..pmax).map(|k| 1.0 + 0.31 * k as f64).collect();
+        let mut x = vec![vec![0.0; pmax]; n];
+        let mut cols = vec![0.0f32; n * pmax];
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = std::f64::consts::TAU * i as f64 / (n - 1) as f64;
+            let mut v = 0.0;
+            for k in 0..pmax {
+                let a = ((k + 1) as f64 * t).sin();
+                x[i][k] = a;
+                cols[k * n + i] = a as f32;
+                v += target[k] * a;
+            }
+            let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+            y.push(v + noise);
+        }
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        (x, y, cols, y32)
     }
 
     #[test]
@@ -2648,6 +2828,22 @@ mod fit_tests {
         let (out, ms) = ev.fit_batch(&[&plan], 8);
         assert!(ms >= 0.0);
         assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
+
+        // The same gate at the largest constant count: twenty collinear
+        // columns leave a rank-1 J^T J, so the ownership path at p=20 must
+        // still refuse to report constants.
+        let mut wide = node(Op::Mul, vec![constant(0.1), input(0)]);
+        for _ in 1..20 {
+            wide = node(
+                Op::Add,
+                vec![wide, node(Op::Mul, vec![constant(0.2), input(0)])],
+            );
+        }
+        let plan = crate::fit::gpu_fit_plan(&wide).expect("p=20 collinear plan");
+        assert_eq!(plan.nconst, 20);
+        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 1, "p=20 rank deficiency must be labelled");
 
         // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
         let bad = node(
@@ -2809,6 +3005,128 @@ mod fit_tests {
                 cpu / gpu.max(1e-9)
             );
         }
+    }
+
+    /// #169 measurement (ignored): fit-stage throughput by constant count, for
+    /// the p=17..20 box. `p=4` and `p=16` use the 256-thread instantiation,
+    /// `p=20` the 128-thread one; the shared footprint each cell ran with is
+    /// printed from `fit_kernel_shape`. `RCSR_BENCH_ARMS=gpu` repeats only the
+    /// device side (for an instantiation A/B). Run with
+    /// `cargo test --release --features cuda --lib bench_batched_fit_by_p -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_batched_fit_by_p() {
+        let arms = std::env::var("RCSR_BENCH_ARMS").unwrap_or_default();
+        let do_cpu = arms.is_empty() || arms.contains("cpu");
+        let cpu_threads = 8usize;
+        let pmax = 20usize;
+        let cells = [
+            (4usize, 100_000usize, 32usize),
+            (16, 100_000, 32),
+            (20, 100_000, 32),
+            (20, 100_000, 256),
+            (4, 1_000_000, 32),
+            (16, 1_000_000, 32),
+            (20, 1_000_000, 32),
+            (20, 1_000_000, 256),
+        ];
+        let mut data: Option<(usize, usize, Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>)> = None;
+        for &(p, n, candidates) in &cells {
+            // The CPU arm is the slow side; skip it for the big GPU-only cells
+            // and when only the device is being compared.
+            let cpu_arm = do_cpu && candidates <= 32;
+            if data.as_ref().map(|d| (d.0, d.1)) != Some((n, p)) {
+                let (x, y, cols, y32) = bench_fixture(pmax, p, n);
+                data = Some((n, p, x, y, cols, y32));
+            }
+            let (_, _, x, y, cols, y32) = data.as_ref().expect("fixture");
+            let start: Vec<f64> = (0..p).map(|k| 0.25 + 0.07 * k as f64).collect();
+
+            let cpu = if cpu_arm {
+                let t0 = std::time::Instant::now();
+                let per = candidates.div_ceil(cpu_threads);
+                std::thread::scope(|scope| {
+                    for _ in 0..cpu_threads {
+                        let (x, y, start) = (x, y, &start);
+                        scope.spawn(move || {
+                            for _ in 0..per {
+                                let mut t = linear_model(start);
+                                crate::fit::fit_weighted(&mut t, x, y, &[], 8);
+                            }
+                        });
+                    }
+                });
+                t0.elapsed().as_secs_f64()
+            } else {
+                f64::NAN
+            };
+
+            let mut ev = match GpuEvaluator::new(cols, n, pmax, y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU benchmark: no usable device");
+                    return;
+                }
+            };
+            let mut cols64 = vec![0.0f64; n * pmax];
+            for i in 0..n {
+                for k in 0..pmax {
+                    cols64[k * n + i] = x[i][k];
+                }
+            }
+            assert!(ev.set_fit_data(&cols64, y), "f64 rows uploaded");
+            let plan = crate::fit::gpu_fit_plan(&linear_model(&start)).expect("plan");
+            let plans: Vec<&crate::fit::GpuFitPlan> = (0..candidates).map(|_| &plan).collect();
+            let t1 = std::time::Instant::now();
+            let (out, ms) = ev.fit_batch(&plans, 8);
+            let gpu = t1.elapsed().as_secs_f64();
+            let mut by_status = [0usize; 3];
+            for r in &out {
+                if (0..3).contains(&r.status) {
+                    by_status[r.status as usize] += 1;
+                }
+            }
+            let (threads0, smem, maxc) = fit_kernel_shape(p).expect("instantiation");
+            eprintln!(
+                "p={} N={} P={} threads={} smem={}B maxc={} cpu={:.3}s gpu={:.3}s (kernel {:.1}ms) \
+                 cpu/cand={:.4}s gpu/cand={:.4}s speedup={:.1}x ok={}/{} status0={} status1={} status2={}",
+                p, n, candidates, threads0, smem, maxc, cpu, gpu, ms,
+                cpu / candidates as f64, gpu / candidates as f64,
+                cpu / gpu.max(1e-9), by_status[0], out.len(),
+                by_status[0], by_status[1], by_status[2]
+            );
+        }
+    }
+
+    /// `pmax` orthogonal columns over one period; the first `p` of them carry
+    /// the target, so a `p`-constant model converges instead of chasing every
+    /// column.
+    fn bench_fixture(
+        pmax: usize,
+        p: usize,
+        n: usize,
+    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>) {
+        let target: Vec<f64> = (0..p).map(|k| 1.0 + 0.31 * k as f64).collect();
+        let mut x = vec![vec![0.0; pmax]; n];
+        let mut cols = vec![0.0f32; n * pmax];
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = std::f64::consts::TAU * i as f64 / (n - 1) as f64;
+            let mut v = 0.0;
+            for k in 0..pmax {
+                let a = ((k + 1) as f64 * t).sin();
+                x[i][k] = a;
+                cols[k * n + i] = a as f32;
+                if k < p {
+                    v += target[k] * a;
+                }
+            }
+            let noise = (((i * 37) % 11) as f64 - 5.0) * 2e-4;
+            y.push(v + noise);
+        }
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        (x, y, cols, y32)
     }
 
     /// #169 diagnostic (ignored): does the batched kernel still match the CPU

@@ -26,7 +26,9 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+an exact CPU verifier, which fits candidates with at most 20 constants on the
+device and labels every larger or unsupported candidate for the exact CPU arm;
+below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. Every arm falls back to the
@@ -354,7 +356,9 @@ atomically instead of streaming it. See
   Windows are causal and gap-aware, warm-up is reported per column, and the
   `py15m` group reproduces the 35 Python enrichment columns on a committed
   parity fixture. The CPU path is always available; a per-family cost model
-  decides CPU vs GPU and records the reason. See
+  decides CPU vs GPU and records the reason, GPU builds upload the source
+  columns once and report the GPU column share, and the 3.9M-row measurement
+  keeps only the families that actually beat the CPU on the GPU. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
@@ -870,7 +874,9 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+an exact CPU verifier, which fits candidates with at most 20 constants on the
+device and labels every larger or unsupported candidate for the exact CPU arm;
+below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. Every arm falls back to the

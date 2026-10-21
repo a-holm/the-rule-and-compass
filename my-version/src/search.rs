@@ -1856,7 +1856,7 @@ fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
 ///
 /// The labels are stable: they appear in `gpu.fit.fallback_by_cause`, in each
 /// generation's ledger and in `--fit-report`/docs. Structural rejections are
-/// grouped into `unsupported_plan` except the explicit `p > 16` cap, which has
+/// grouped into `unsupported_plan` except the explicit `p > 20` cap, which has
 /// its own label because it is the only limit the kernel could lift.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum FitFallbackCause {
@@ -1865,7 +1865,7 @@ pub enum FitFallbackCause {
     UnsupportedPlan,
     /// Fewer than `32p` rows, so the normal-equation system is underdetermined.
     TooFewRows,
-    /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 16`).
+    /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 20`).
     TooManyConstants,
     /// The kernel's conditioning gate rejected the normal equations (status 1).
     IllConditioned,
@@ -4985,6 +4985,41 @@ mod tests {
             status_fallback_cause(0),
             FitFallbackCause::UnsupportedPlan
         );
+    }
+
+    /// #169: the kernel's constant cap is 20, so the `too_many_constants`
+    /// boundary is `p = 21`. Nothing else is labelled with that cause: `p <= 20`
+    /// must be offered to the kernel instead of silently falling back.
+    #[test]
+    fn the_gpu_fit_constant_cap_is_twenty_at_the_search_boundary() {
+        fn many_constants(p: usize) -> crate::expr::Node {
+            let mut t = node(Op::Mul, vec![constant(0.1), input(0)]);
+            for k in 1..p {
+                t = node(
+                    Op::Add,
+                    vec![
+                        t,
+                        node(Op::Mul, vec![constant(0.1 + 0.01 * k as f64), input(k)]),
+                    ],
+                );
+            }
+            t
+        }
+        assert_eq!(crate::fit::GPU_FIT_MAX_CONSTANTS, 20);
+        for p in 17..=20usize {
+            assert!(
+                crate::fit::gpu_fit_plan_reason(&many_constants(p)).is_ok(),
+                "p={} must be fitted on the device, not silently fallen back",
+                p
+            );
+        }
+        for p in 21..=22usize {
+            let reason = match crate::fit::gpu_fit_plan_reason(&many_constants(p)) {
+                Err(reason) => reason,
+                Ok(_) => panic!("p={} has no kernel instantiation", p),
+            };
+            assert_eq!(plan_fallback_cause(reason), FitFallbackCause::TooManyConstants);
+        }
     }
 
     /// #141: the library default follows the build: a CUDA binary prefers the
