@@ -186,9 +186,7 @@ impl StoreShape {
             .saturating_mul(scan as u128)
             .saturating_mul(SEARCH_BYTES_PER_CELL as u128);
         let fixed = rows.saturating_mul(FIXED_BYTES_PER_ROW as u128);
-        let search = search_cells
-            .saturating_add(scan_cells)
-            .saturating_add(fixed);
+        let search = search_cells.saturating_add(scan_cells);
 
         // Optional exact f64 fit image. The default split is 75 % train; the
         // 25 % slack covers an explicit full-train selection.
@@ -205,7 +203,8 @@ impl StoreShape {
             .saturating_add(directory)
             .saturating_add(group_buffer)
             .saturating_add(search)
-            .saturating_add(fit_copy);
+            .saturating_add(fit_copy)
+            .saturating_add(fixed);
         let total = base
             .saturating_mul(SLACK_NUM as u128)
             .saturating_add(SLACK_DEN as u128 - 1)
@@ -366,10 +365,10 @@ impl MemoryEstimate {
         }
         let table = (rows as u128)
             .saturating_mul(shape.table_bytes_per_row() as u128);
+        let fixed = (rows as u128).saturating_mul(FIXED_BYTES_PER_ROW as u128);
         let search = (rows as u128)
             .saturating_mul(used as u128)
-            .saturating_mul(stride as u128)
-            .saturating_add((rows as u128).saturating_mul(FIXED_BYTES_PER_ROW as u128));
+            .saturating_mul(stride as u128);
         let fit = if opts.gpu_fit {
             let fit_rows = (rows as u128).saturating_mul(3) / 4;
             fit_rows
@@ -384,7 +383,8 @@ impl MemoryEstimate {
             .saturating_add(directory)
             .saturating_add(buffer)
             .saturating_add(search)
-            .saturating_add(fit);
+            .saturating_add(fit)
+            .saturating_add(fixed);
         let total = base
             .saturating_mul(SLACK_NUM as u128)
             .saturating_add(SLACK_DEN as u128 - 1)
@@ -393,7 +393,7 @@ impl MemoryEstimate {
         self.storage_bytes = clamp(table).0;
         self.search_bytes = clamp(search).0;
         self.fit_copy_bytes = clamp(fit).0;
-        self.fixed_bytes = clamp((rows as u128).saturating_mul(FIXED_BYTES_PER_ROW as u128)).0;
+        self.fixed_bytes = clamp(fixed).0;
         self.base_bytes = clamp(base).0;
         self.total_bytes = clamp(total).0;
         self.slack_bytes = self.total_bytes.saturating_sub(self.base_bytes);

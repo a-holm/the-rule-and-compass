@@ -396,7 +396,7 @@ always 4 B, and `symbol` has no value block).
 selected the **full 3,943,856 rows** (`full_rows=true`, `sampled_rows=null`),
 with `VmHWM` = **7,094,696 KiB (7.26 GB)**. The guard's CPU estimate was
 **7,826,847,852 B (7.83 GB)**: storage 1.81 GB + directory/group 0.03 GB +
-search 4.42 GB + fixed 0.95 GB + slack 1.57 GB, with 54 search + 2 scan columns.
+search 3.47 GB + fixed 0.95 GB + slack 1.57 GB, with 54 search + 2 scan columns.
 The old `rows × columns × 300 B` model reported **61.71 GiB (66.26 GB)** and
 sampled 577,141 rows; the new estimate is 1.08x the measured peak.
 

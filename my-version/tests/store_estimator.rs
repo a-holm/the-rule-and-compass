@@ -291,6 +291,16 @@ fn the_3_9m_panel_estimates_near_the_measured_footprint() {
     // The 12 GB budget on the pilot host must choose the full load.
     assert!(estimate.total_bytes <= 12u64 * 1_000_000_000);
     assert!(!estimate.saturated);
+    // The reported terms must add up exactly, with `fixed` not folded into
+    // `search` a second time.
+    let terms = estimate.storage_bytes
+        + estimate.directory_bytes
+        + estimate.group_buffer_bytes
+        + estimate.search_bytes
+        + estimate.fit_copy_bytes
+        + estimate.fixed_bytes;
+    assert_eq!(terms, estimate.base_bytes);
+    assert_eq!(estimate.base_bytes + estimate.slack_bytes, estimate.total_bytes);
 }
 
 #[test]
