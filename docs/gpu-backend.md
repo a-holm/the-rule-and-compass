@@ -152,17 +152,60 @@ the final archive is always re-scored by the CPU f64 evaluator. The accumulation
 itself is f32 (see the 200 000-row caveat below), so the f32 fitness is a
 search signal, not a reported number.
 
-Static kernel cost measured on `sm_86` (CUDA 12.0, `-O3`), before and after this
-change:
+### Register and occupancy contract (#131)
 
-| kernel | SASS before | SASS after | registers | stack |
-|---|---:|---:|---:|---:|
-| `eval_kernel` (packed / pipeline) | 1 312 | 1 336 (+1.8%) | 27 → 27 | 288 B → 288 B |
-| `eval_pool_kernel` (fixed slots / synchronous) | 1 008 | 1 336 (+32.6%) | 28 → 30 | 288 B → 288 B |
-| `predict_kernel` (test fixtures only) | — | 1 296 | 26 | 288 B |
+The old acceptance wording used a single number ("27 registers") measured on one
+kernel before the pool kernel implemented the #131 opcodes. On `sm_86` that
+number was never the constraint: 27 and 30 registers round to the **same**
+allocation, and the actual occupancy cliff is at 41 registers. The contract is
+therefore per kernel and expressed as occupancy, not as a bare register count:
 
-The pool kernel grew because it previously **did not implement** the #131
-opcodes at all (it fell through to `r = 0.0f`); the growth is the cost of the
+* `eval_kernel`, `eval_pool_kernel` and `predict_kernel` carry
+  `__launch_bounds__(RC_MAX_THREADS, 6)` (`RC_MAX_THREADS` is 256), i.e. PTX
+  `.maxntid 256, 1, 1` and `.minnctapersm 6`;
+* at 256 threads each kernel must stay at or below **40 registers**, keep its
+  288-byte stack frame, and produce **no spill stores/loads**;
+* that gives six resident blocks per SM, 6 × 256 = 1 536 threads = 48 warps =
+  **100 % theoretical occupancy** on `sm_86`.
+
+Measured with the build script's flags (`sm_86`, CUDA 12.0, `-O3`) on
+`main` at `ce3201c` (before) and on this branch (after):
+
+```sh
+nvcc -O3 -std=c++14 -arch=sm_86 -cubin src/cuda/eval.cu \
+     -o /tmp/eval.cubin -Xptxas -v,-warn-spills
+cuobjdump -res-usage /tmp/eval.cubin
+```
+
+| kernel | REG before | REG after | allocated regs/thread | STACK | SHARED | LOCAL | spills | occupancy at 256 threads |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `eval_kernel` (packed / pipeline) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
+| `eval_pool_kernel` (fixed slots / synchronous) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
+| `predict_kernel` (test fixtures only) | 28 | 26 | 32 | 288 B | 0 | 0 | 0 | 100 % (6 blocks) |
+| `fit_kernel` (batched LM, untouched) | 93 | 93 | 96 | 1 744 B | 40 672 B | 0 | 0 | not subject to this contract |
+| `hash_kernel` / `cast_f32_to_f64_kernel` (untouched) | 16 / 12 | 16 / 12 | 16 / 16 | 0 | 0 | 0 | 0 | — |
+
+The before column is today's `main`, after the #121 device stack guards; the
+PR #180 snapshot (27 / 30 registers, same 288-byte stack) predates those guards
+and remains correct for that commit. Both snapshots round to 32 allocated
+registers per thread, so the launch-bounds build changes no occupancy.
+
+Why 32 allocated registers is the floor: for a 256-thread block (8 warps) the
+allocator charges `ceil(regs × 32 / 256) × 256` registers per warp. At 26–32
+registers that is 4 units = 1 024 registers per warp = 32 effective registers
+per thread. A block therefore uses 8 × 1 024 = 8 192 registers, and the SM's
+65 536 registers admit 8 blocks — but the 1 536-thread limit admits only 6, so
+threads bind and registers do not. The cliff is at 41: six blocks need at most
+`65 536 / 6 / 8 = 1 365` registers per warp, which rounds to 5 units = 1 280 =
+**40 registers per thread**. At 41–48 registers the allocator charges 6 units
+and the SM falls to five blocks = 40 warps = 83 % occupancy. `predict_kernel`
+and the 32-thread launch used for tiny `N` are capped by the 16-block limit
+instead (16 warps = 33 %). The harness
+`evaluator_kernels_carry_the_sm86_occupancy_contract` pins the launch bounds,
+the 256-thread constant and the 6 × 256 = 1 536 arithmetic.
+
+The pool kernel's SASS growth came from implementing the #131 opcodes at all
+(it previously fell through to `r = 0.0f`); the growth is the cost of the
 operators it now shares with the packed kernel, not a regression in a working
 path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
 and fallback counts for each generation under `gpu.generations` in `--json`,
@@ -257,8 +300,11 @@ Three honest caveats:
   the GPU numbers are CUDA-event kernel times and are stable.
 
 The kernel time grows from 0.178 ms (60 rows) to 7.29 ms (200 000 rows), so on
-short datasets it is still **latency-bound, not throughput-bound**: with only
-32–256 threads per block and a per-thread local-memory stack, occupancy is low.
+short datasets it is still **latency-bound, not throughput-bound**: at 256
+threads the register/occupancy contract above is designed for full residency,
+but a small `N` launches only 32 threads, where the 16-block cap limits the SM
+to 16 warps (33 %) regardless of registers. The per-thread local-memory stack
+then adds memory latency that a full block would hide.
 At 500 programs × 200 000 rows it reaches ~13 × 10⁹ evaluations/s, still a small
 fraction of the card's FP32 peak, so there is headroom left.
 

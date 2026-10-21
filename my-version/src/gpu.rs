@@ -1517,6 +1517,39 @@ mod tests {
         assert!(HOST_MAX_STACK < RC_MAX_STACK);
     }
 
+    /// #131: every evaluator kernel carries the same occupancy contract. On
+    /// `sm_86` an SM holds 1536 threads (48 warps) and at most 16 blocks, so
+    /// six blocks of `RC_MAX_THREADS` is full theoretical occupancy. The
+    /// launch bounds make ptxas derive the matching ~40-register ceiling; the
+    /// measured resource table lives in `docs/gpu-backend.md`.
+    #[test]
+    fn evaluator_kernels_carry_the_sm86_occupancy_contract() {
+        let src = include_str!("cuda/eval.cu");
+        let line = src
+            .lines()
+            .find(|l| l.trim_start().starts_with("#define RC_MAX_THREADS"))
+            .expect("the kernel defines RC_MAX_THREADS");
+        let max_threads: usize = line
+            .split_whitespace()
+            .nth(2)
+            .expect("a value")
+            .parse()
+            .expect("a number");
+        assert_eq!(max_threads, 256, "the contract was measured at 256 threads");
+        assert_eq!(
+            6 * max_threads,
+            1536,
+            "six blocks must fill all 48 warps of an sm_86 SM"
+        );
+        for kernel in ["eval_kernel", "eval_pool_kernel", "predict_kernel"] {
+            let marker = format!("__launch_bounds__(RC_MAX_THREADS, 6) {kernel}");
+            assert!(
+                src.contains(&marker),
+                "{kernel} lost its __launch_bounds__(RC_MAX_THREADS, 6) contract"
+            );
+        }
+    }
+
     /// #131: the Rust opcode constants must match the CUDA enum exactly.
     #[test]
     fn cuda_opcodes_match_rust_constants() {
