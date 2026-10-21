@@ -343,6 +343,16 @@ atomically instead of streaming it. See
   `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
+* **Incremental feature enrichment**: `rcsr enrich --data old.rcsb --out
+  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc`
+  appends pre-computed columns without rebuilding rows: existing value/code
+  blocks are copied byte for byte, dtypes and dictionaries survive, a duplicate
+  name needs an explicit `--replace`, and every change is chunk-size stable.
+  Windows are causal and gap-aware, warm-up is reported per column, and the
+  `py15m` group reproduces the 35 Python enrichment columns on a committed
+  parity fixture. The CPU path is always available; a per-family cost model
+  decides CPU vs GPU and records the reason. See
+  [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
   trade, never forward-fills across a listing/delisting/migration, verifies
@@ -440,14 +450,20 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
+     [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
+     [--dev-log-every N] [--dev-log-max-bytes size]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
 ```
 
-Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
-their own option lists in `rcsr schema` under `import`, `walkforward` and
-`verify-manifest`; the block above is the root search command.
+Subcommands (`rcsr import`, `rcsr prep`, `rcsr enrich`, `rcsr panel`, `rcsr
+walkforward`, `rcsr verify-manifest`, `rcsr dev-report`) carry their own option
+lists in `rcsr schema`; the block above is the root search command. The former
+Python pipeline is classified and retired in
+[`docs/python-pipeline-retirement.md`](docs/python-pipeline-retirement.md):
+the documented path is these Rust commands plus a thin `curl` acquisition
+recipe. `rcsr dev-report` summarises the optional `--dev-log` NDJSON record.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
@@ -969,6 +985,23 @@ alone, cost O(front size) and never touch a training row. See
 [`docs/convergence.md`](docs/convergence.md) for the exact formulas, the
 20-generation window, how to read them and the easy/hard evidence.
 
+## Why did the run behave like that?
+
+Every run writes a bounded NDJSON **development log** — on by default at
+`summary` level, the in-engine replacement for an external run monitor.
+`run_start`, one generation event every few generations (generation, elapsed,
+best/median error, Pareto size, phase times, fit/GPU/fallback counts, GPU duty,
+convergence), `checkpoint` events and `run_end`. `--dev-log-level full` writes
+every generation with the complete record (all error quantiles, archive
+hypervolume/hash, de-duplication rate, admissions, fallback-by-cause, QD
+coverage/entropy, per-island best, RNG key). The file is `rcsr.dev.ndjson` next
+to `--json-out`/`--save`, else in the working directory; `--no-dev-log` turns it
+off. It never changes the archive, the results or the configuration hash, each
+event is one atomic line, and the file is bounded by `--dev-log-max-bytes`.
+`rcsr dev-report <log>` (pure Rust, no Python) turns the file into a phase table,
+a fit-versus-evaluation share, fallback causes, convergence and archive growth,
+and a ranked list of bottlenecks. See [`docs/dev-log.md`](docs/dev-log.md).
+
 ## Layout
 
 ```
@@ -994,6 +1027,7 @@ docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
+docs/dev-log.md               optional per-generation development log and `dev-report`
 docs/qd.md                    opt-in CVT-MAP-Elites quality-diversity layer (--qd/--qd-policy)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan

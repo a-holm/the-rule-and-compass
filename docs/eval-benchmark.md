@@ -87,6 +87,10 @@ bit-identical. The threshold, which is the equality gate, is identical.
 
 ## Why the row-wise reference is the fair one
 
+The Python files in this section are a **frozen benchmark oracle**, not a
+pipeline step. Production evaluation is `rcsr walkforward`; the reference loop
+is kept only so the Rust speed-up has a same-semantic baseline.
+
 The issue says the walk-forward **used Python to read a 25 GB CSV, evaluate
 expressions row by row and compute P&L**, and that the Rust tool should replace
 that path. The fair comparison is therefore the same program at the same

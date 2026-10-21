@@ -25,7 +25,9 @@ fn every_tracked_launcher_publishes_a_verifiable_run() {
         seen += 1;
         let text = fs::read_to_string(&path).expect("read launcher");
         let name = path.file_name().unwrap().to_string_lossy();
-        for flag in ["--run-manifest", "--json-out", "--progress"] {
+        // #211: the development log is on by default; a launcher names one log
+        // per run so windows never share `rcsr.dev.ndjson`.
+        for flag in ["--run-manifest", "--json-out", "--progress", "--dev-log"] {
             assert!(text.contains(flag), "{name} does not pass {flag}");
         }
         assert!(

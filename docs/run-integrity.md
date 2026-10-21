@@ -89,6 +89,9 @@ A launcher should:
   default, and pass the same one on resume;
 * record the exact command line and the resolved seed;
 * pass `--run-manifest`, `--json-out` and `--progress`;
+* name one development log per run — `--dev-log <label>.dev.ndjson` (the engine
+  writes `rcsr.dev.ndjson` by default, which several windows in one directory
+  would share) — see [`dev-log.md`](dev-log.md);
 * keep stderr in a file rather than `/dev/null`;
 * resume with `--resume checkpoint.rcsr` and, only if intentional, with
   `--allow-backend-change`.
@@ -97,23 +100,53 @@ Two tracked examples implement the contract:
 
 * [`scripts/run-long.sh`](../scripts/run-long.sh) — one uninterrupted or
   resumed run; requires `--gpu`/`--cpu` and writes a manifest, atomic result,
-  command record and progress log.
+  command record, progress log and a per-label development log.
 * [`scripts/launch-windows.py`](../scripts/launch-windows.py) — several
   walk-forward windows; derives `SHA-256(label:seed)`, reuses the same backend
   on resume, and writes one manifest/log/result set per window. `--dry-run`
   prints the resolved commands without searching.
 
 The scratch launchers in the git-ignored `arbeidsmappe/crypto-rcsr/pilot/`
-directory are legacy. They are **not tracked and not supported**: several were
-written before this contract (`hash(label)` seeds, `/dev/null` stderr, plain
-`--json` redirected to a file without a manifest). Do not resume a long run
-with them. Use the tracked launchers above, or port the window list into
-`scripts/launch-windows.py`.
+directory are **retired**. Their classification and the Rust command that
+replaces each one are in
+[`python-pipeline-retirement.md`](python-pipeline-retirement.md); one-off probes
+are archived under `pilot/archive/` and must not be used. In particular, do not
+resume a long run with them (`hash(label)` seeds, `/dev/null` stderr, plain
+`--json` redirected to a file without a manifest). Use the tracked launchers
+above, or the `rcsr walkforward` command directly. The tracked
+`scripts/launch-windows.py` is the one remaining Python helper; it already
+follows the contract (SHA-256 seeds, explicit backend, manifest, atomic JSON,
+progress log) and is scheduled for a shell/Rust replacement as a separate
+follow-up, not as part of the data pipeline.
 
 `my-version/tests/launchers.rs` enforces the contract on every tracked
 `scripts/*.sh`/`*.py`: no `DEVNULL`, no Python `hash(`, an explicit backend, and
 `--run-manifest`/`--json-out`/`--progress`. It also runs `run-long.sh`
 end-to-end and checks the manifest with `rcsr verify-manifest`.
+
+## A long run, start to finish
+
+The flow the tracked launchers implement, and the one to use for a multi-hour
+run (the "10-hour run"):
+
+1. **Launch** with an explicit backend, a manifest, an atomic result, a
+   checkpoint and a per-run development log:
+   `scripts/run-long.sh ... --gpu` (or the per-window
+   `scripts/launch-windows.py`).
+2. **Watch** the development log instead of an external monitor:
+   `tail -f runs/<label>.dev.ndjson` shows a summary event every 10–25
+   generations (error, front size, phase times, fit/GPU/fallback counts, GPU
+   duty). The old scratch `monitor_10h.py` is not part of this flow; it is
+   tracked for deletion in #200. 1 Hz *process* sampling (CPU, RSS,
+   `nvidia-smi`) is still an outside-the-engine job, and `run_end` records the
+   process peak RSS and measured device-hours.
+3. **Resume** on the same backend with `--resume` when the wall-clock budget
+   ends; the log is truncated per run, so a resumed run gets its own file.
+4. **Explain** the finished run with `rcsr dev-report runs/<label>.dev.ndjson`:
+   phase table, fit vs evaluation share, fallback causes, convergence, archive
+   growth and a ranked bottleneck list. Use `--dev-log-level full` when the
+   per-generation detail is needed (`full` keeps every generation).
+5. **Verify** with `rcsr verify-manifest runs/<label>.manifest.json`.
 
 ## Acceptance checks
 

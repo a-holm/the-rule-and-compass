@@ -113,6 +113,11 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--allow-backend-change", "flag", "false", "permit --resume across cpu<->gpu (recorded on stderr and in --run-manifest)"),
         // #140: run integrity.
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
+        ("--dev-log", "string", "rcsr.dev.ndjson next to --json-out/--save, else the working directory", "write the bounded NDJSON development log to this path instead of the default. The log is ON BY DEFAULT (see --dev-log-level and --no-dev-log): run_start, generation events, checkpoint and run_end, schema `rcsr-devlog/1`, documented in docs/dev-log.md. Never changes the archive, results or config hash; no raw rows"),
+        ("--dev-log-level", "enum", "summary", "summary | full. summary writes one event every 10-25 generations with generation, elapsed, best/median error, Pareto size, phase times, fit/GPU/fallback counts, GPU duty and convergence; full writes every generation with the complete record (quantiles, archive hypervolume/hash, dedup rate, admissions, fallback-by-cause, QD coverage/entropy, per-island best, RNG key)"),
+        ("--no-dev-log", "flag", "false", "disable the development log entirely (the log is on by default at summary level)"),
+        ("--dev-log-every", "int", "level-dependent", "write a generation event every Nth generation; default 1 for full, clamp(generations/10, 10, 25) for summary (every generation when the budget is <= 10)"),
+        ("--dev-log-max-bytes", "size", "64MiB", "cap on generation and checkpoint events; run_start and run_end are always written (bytes or KiB/MiB/GiB/GB)"),
         ("--json-out", "string", "none", "write the final JSON result to this file atomically instead of stdout (implies --json); progress stays on stderr/NDJSON"),
         ("--format", "enum", "text", "text | json | ndjson"),
         ("--json", "flag", "false", "shorthand for --format json: one JSON result object"),
@@ -215,6 +220,24 @@ pub fn json() -> String {
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (unlabelled provenance is always allowed)\"}}]}},\n  \
+         \"enrich\":{{\"command\":\"rcsr enrich\",\"summary\":\"append causal, gap-aware OHLCV features to an existing .rcsb store without rebuilding it\",\"doc\":\"docs/ohlcv.md\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"existing .rcsb store or a CSV (loaded once into a temporary store)\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"<data>.enriched.rcsb\",\"description\":\"output store; existing columns are copied byte for byte\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, py15m, all, or explicit names; #125 names/groups also accepted\"}},\
+{{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n> (repeatable; labels are targets)\"}},\
+{{\"name\":\"--replace\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"overwrite an existing numeric column in place; default refuses a duplicate and preserves every column\"}},\
+{{\"name\":\"--chunk-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"read/compute batch; arithmetic and output hashes are identical for every size\"}},\
+{{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"group size for a CSV input store\"}},\
+{{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"inferred\",\"description\":\"expected bar spacing; windows spanning a missing bucket are NaN\"}},\
+{{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"time column\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"panel symbol column\"}},\
+{{\"name\":\"--cross-symbol\",\"type\":\"string\",\"default\":\"BTCUSDT\",\"description\":\"benchmark symbol for btc/cross features\"}},\
+{{\"name\":\"--cross-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"benchmark store when --data does not contain it\"}},\
+{{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; CPU is always available\"}},\
+{{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
+{{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
+{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout\"}}]}},\n  \
          \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
 {{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
@@ -231,6 +254,7 @@ pub fn json() -> String {
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic .part per symbol, progress on stderr\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}}]}},\n  \
+         \"dev_log\":{{\"schema\":\"rcsr-devlog/1\",\"version\":1,\"flag\":\"--dev-log\",\"default\":\"on (summary level)\",\"levels\":[\"summary\",\"full\"],\"default_path\":\"rcsr.dev.ndjson next to --json-out/--save, else the working directory\",\"disable\":\"--no-dev-log\",\"cadence\":\"summary clamp(generations/10,10,25), full 1; --dev-log-every overrides\",\"analyzer\":\"rcsr dev-report <log>\",\"events\":[\"run_start\",\"generation\",\"checkpoint\",\"run_end\"],\"atomic\":\"one complete line per write to an O_APPEND file; a killed run leaves a valid prefix\",\"bounded\":\"--dev-log-max-bytes caps generation and checkpoint events; run_start and run_end are always written\",\"trajectory\":\"the log is a reading: the archive, results and config hash are byte-identical with it on and off\",\"privacy\":\"counts, timings, hashes and error statistics only; no raw rows or personal data\",\"doc\":\"docs/dev-log.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
