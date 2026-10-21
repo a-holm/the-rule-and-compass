@@ -27,6 +27,7 @@
 use crate::expr::{node, Node, Op};
 use crate::genome::{postfix_hash, Philox, OP_HALT};
 use crate::gpu;
+use crate::pareto::Sol;
 use std::collections::HashSet;
 
 /// One parsed node inside a postfix program: its word span and arity.
@@ -329,6 +330,68 @@ pub fn decode(program: &[u32]) -> Option<Node> {
     }
 }
 
+/// Archive-guided parent pool for the flat path (#76 parity, #122).
+///
+/// The owned-tree loop draws 15 % of parents from the previous generation's
+/// Pareto front. The flat path cannot hold `Sol` trees in a slot, so the front
+/// is compiled once per generation into fixed-width postfix programs. Only
+/// programs that fit the slot and the complexity bound are kept; an empty pool
+/// behaves exactly like a disabled feature and consumes no random draw.
+#[derive(Clone, Debug, Default)]
+pub struct FrontParents {
+    programs: Vec<Vec<u32>>,
+}
+
+impl FrontParents {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Compile the archive front for the next generation. Trees the kernel
+    /// cannot emit (or that do not fit `width`) are skipped, exactly as the
+    /// flat path itself declines such a configuration as a whole.
+    pub fn from_front(front: &[Sol], width: usize, max_complexity: usize) -> Self {
+        let mut programs = Vec::with_capacity(front.len());
+        for sol in front {
+            let mut words = Vec::new();
+            if !gpu::compile(&sol.tree, &mut words) || words.len() > width {
+                continue;
+            }
+            let Some(spans) = spans(&words) else { continue };
+            if spans.len() > max_complexity {
+                continue;
+            }
+            programs.push(words);
+        }
+        Self { programs }
+    }
+
+    pub fn len(&self) -> usize {
+        self.programs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.programs.is_empty()
+    }
+
+    pub fn program(&self, index: usize) -> &[u32] {
+        &self.programs[index]
+    }
+}
+
+/// #76 parity: with probability `p`, pick a front program; otherwise `None`.
+///
+/// The order of the conditions matters. A disabled feature (`p == 0`) or an
+/// empty front returns without touching the RNG, which is what makes
+/// `--no-front-parents` bit-identical to the pre-#76 search.
+fn front_pick(front: &FrontParents, rng: &mut Philox, p: f64) -> Option<usize> {
+    if p > 0.0 && !front.is_empty() && rng.unit() < p {
+        Some(rng.below(front.len()))
+    } else {
+        None
+    }
+}
+
 /// The canonical `(hash, slot)` order used by dedup and compaction.
 pub fn canonical_order(arena: &Arena) -> Vec<usize> {
     let mut order: Vec<usize> = (0..arena.islands * arena.pop).collect();
@@ -430,6 +493,21 @@ impl Variation {
     /// the next attempt at that slot is used, and parent order is fixed, so
     /// the result never depends on thread or island scheduling.
     pub fn next_generation(&self, parents: &Arena, gen: u32, restart: &[bool]) -> Arena {
+        self.next_generation_with_front(parents, gen, restart, &FrontParents::empty(), 0.0)
+    }
+
+    /// Generate the next generation with the archive-guided parent draw
+    /// (#76 parity). `front_p` is the fraction of parent draws taken uniformly
+    /// from `front`; the search passes 0.15 when `--front-parents` is on and
+    /// 0.0 (with an empty pool and no RNG advance) when it is off.
+    pub fn next_generation_with_front(
+        &self,
+        parents: &Arena,
+        gen: u32,
+        restart: &[bool],
+        front: &FrontParents,
+        front_p: f64,
+    ) -> Arena {
         let mut attempts = 0usize;
         let mut scratch = Scratch::new(self.width);
         let mut next = Arena::new(parents.islands, parents.pop, self.width);
@@ -452,7 +530,18 @@ impl Variation {
             let elite = parents.best(i);
             next.copy_from(parents, next.slot_index(i, 0), elite);
             for j in 1..parents.pop {
-                self.fill_child(&mut next, parents, &mut seen, i, j, gen, &mut attempts, &mut scratch);
+                self.fill_child(
+                    &mut next,
+                    parents,
+                    &mut seen,
+                    i,
+                    j,
+                    gen,
+                    &mut attempts,
+                    &mut scratch,
+                    front,
+                    front_p,
+                );
             }
         }
         next
@@ -499,6 +588,8 @@ impl Variation {
         gen: u32,
         attempts: &mut usize,
         scratch: &mut Scratch,
+        front: &FrontParents,
+        front_p: f64,
     ) {
         let max_attempts = 64;
         for attempt in 0..max_attempts {
@@ -507,23 +598,47 @@ impl Variation {
             if attempt > 0 {
                 rng.set_draw(attempt as u32);
             }
-            let src = parents.slot(parents.tournament(island, &mut rng, 4));
-            let end = logical_len(src);
+            // #76: the first parent may come from the archive front. With the
+            // feature off, `front_pick` returns without drawing, so the stream
+            // is exactly the pre-#76 one.
             scratch.program.clear();
-            scratch.program.extend_from_slice(&src[..end]);
+            if let Some(fi) = front_pick(front, &mut rng, front_p) {
+                let program = front.program(fi);
+                scratch
+                    .program
+                    .extend_from_slice(&program[..logical_len(program)]);
+            } else {
+                let src = parents.slot(parents.tournament(island, &mut rng, 4));
+                let end = logical_len(src);
+                scratch.program.extend_from_slice(&src[..end]);
+            }
             if rng.unit() < 0.5 {
-                let other = parents.tournament(island, &mut rng, 4);
-                let other = parents.slot(other);
-                let other = &other[..logical_len(other)];
-                self.crossover_into(
-                    &mut scratch.program,
-                    other,
-                    &mut rng,
-                    &mut scratch.spans,
-                    &mut scratch.stack,
-                    &mut scratch.other_spans,
-                    &mut scratch.other_stack,
-                );
+                if let Some(fi) = front_pick(front, &mut rng, front_p) {
+                    let other = front.program(fi);
+                    let other = &other[..logical_len(other)];
+                    self.crossover_into(
+                        &mut scratch.program,
+                        other,
+                        &mut rng,
+                        &mut scratch.spans,
+                        &mut scratch.stack,
+                        &mut scratch.other_spans,
+                        &mut scratch.other_stack,
+                    );
+                } else {
+                    let other = parents.tournament(island, &mut rng, 4);
+                    let other = parents.slot(other);
+                    let other = &other[..logical_len(other)];
+                    self.crossover_into(
+                        &mut scratch.program,
+                        other,
+                        &mut rng,
+                        &mut scratch.spans,
+                        &mut scratch.stack,
+                        &mut scratch.other_spans,
+                        &mut scratch.other_stack,
+                    );
+                }
             }
             self.mutate_into(&mut scratch.program, &mut scratch.spans, &mut scratch.stack, &mut scratch.tmp, &mut rng);
             if rng.unit() < 0.5 {
@@ -846,6 +961,15 @@ mod tests {
     use super::*;
     use crate::expr::{constant, input};
 
+    fn solution(tree: Node, error: f64, cost: f64) -> Sol {
+        Sol {
+            complexity: crate::expr::complexity(&tree),
+            cost,
+            tree,
+            error,
+        }
+    }
+
     fn arena_of(programs: &[Vec<u32>], islands: usize, pop: usize, width: usize) -> Arena {
         let mut a = Arena::new(islands, pop, width);
         for (i, p) in programs.iter().enumerate() {
@@ -950,6 +1074,79 @@ mod tests {
     }
 
     const NM: usize = 3;
+
+    #[test]
+    fn front_draw_matches_the_owned_tree_contract() {
+        let tree = node(Op::Add, vec![input(0), constant(2.0)]);
+        let front = FrontParents::from_front(&[solution(tree, 0.5, 3.0)], 64, 30);
+        assert_eq!(front.len(), 1);
+
+        // Off (`p == 0`): no draw, exactly like `front_parent(..., 0.0)`.
+        let mut rng = Philox::at(1, 0, 0, 0);
+        let before = rng.counter();
+        assert_eq!(front_pick(&front, &mut rng, 0.0), None);
+        assert_eq!(rng.counter(), before);
+
+        // Empty front: no draw either, even when the feature is enabled.
+        let empty = FrontParents::empty();
+        let mut rng = Philox::at(1, 0, 0, 0);
+        let before = rng.counter();
+        assert_eq!(front_pick(&empty, &mut rng, 0.15), None);
+        assert_eq!(rng.counter(), before);
+
+        // On (`p == 1`): one Bernoulli draw plus one index draw.
+        let mut rng = Philox::at(1, 0, 0, 0);
+        assert_eq!(front_pick(&front, &mut rng, 1.0), Some(0));
+
+        // The 15 % rate is a property of the draw, not of the caller.
+        let mut hits = 0;
+        for i in 0..10_000u32 {
+            let mut rng = Philox::at(7, 0, i / 100, i % 100);
+            if front_pick(&front, &mut rng, 0.15).is_some() {
+                hits += 1;
+            }
+        }
+        assert!(
+            (1_300..=1_700).contains(&hits),
+            "15% draw produced {hits}/10000"
+        );
+    }
+
+    #[test]
+    fn front_parents_are_deterministic_and_leave_the_off_path_unchanged() {
+        let v = Variation::new(64, 2, 30, 9, &Op::default_set(), 3, true).unwrap();
+        let mut parents = Arena::new(2, 64, 64);
+        let mut rng = Philox::at(9, 0, 0, 0);
+        for i in 0..parents.islands * parents.pop {
+            let mut p = v.random_program(&mut rng, 3);
+            while spans(&p).is_none() {
+                p = v.random_program(&mut rng, 3);
+            }
+            parents.set_slot(i, &p);
+            parents.err[i] = ((i * 37) % 101) as f64 / 101.0;
+        }
+        let front = FrontParents::from_front(
+            &[solution(
+                node(Op::Add, vec![input(0), constant(7.0)]),
+                0.25,
+                3.0,
+            )],
+            64,
+            30,
+        );
+        let a = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
+        let b = v.next_generation_with_front(&parents, 5, &[false; 2], &front, 0.15);
+        assert_eq!(a.words, b.words);
+        assert_eq!(a.hash, b.hash);
+
+        // `--no-front-parents` must be bit-identical to the pre-#76 path.
+        let off = v.next_generation(&parents, 5, &[false; 2]);
+        let off_explicit =
+            v.next_generation_with_front(&parents, 5, &[false; 2], &FrontParents::empty(), 0.0);
+        assert_eq!(off.words, off_explicit.words);
+        assert_eq!(off.hash, off_explicit.hash);
+        assert_ne!(a.words, off.words, "the feedback must change some children");
+    }
 
     #[test]
     fn ten_thousand_slots_have_a_fixed_memory_bound() {

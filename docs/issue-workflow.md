@@ -26,9 +26,12 @@ traceable, reviewable and parallel-safe.
    `worktrees/issue-<number>-<short-slug>/`.
 5. Issues are **detailed**: context, what is missing, a proposal, and an explicit
    **acceptance criteria** checklist.
-6. A pull request is only opened when every acceptance box is true and the tests
-   pass.
-7. The PR body says `Closes #<number>`.
+6. A pull request may be opened for review before every acceptance box is true,
+   but any unmet box must be listed in the PR; the issue stays open.
+7. The PR body says `Refs #<number>`, **never** `Closes #<number>`.
+   GitHub treats `Closes` in any pushed commit or PR body as an instruction to
+   close the issue automatically. That is forbidden: the issue is closed
+   manually only after the full evidence matrix below is complete.
 8. Merge with **squash**, then remove the worktree and delete the branch.
 9. Never commit build output, datasets or local scratch. Keep `worktrees/`,
    `target/` and local-only directories out of git (they already are).
@@ -164,7 +167,7 @@ While working:
 git add -A
 git commit -m "feat(metrics): add median, max, rank-correlation and AIC metrics
 
-Closes #12"
+Refs #12"
 ```
 
 ---
@@ -177,7 +180,7 @@ git push -u origin "issue/$N-$SLUG"
 gh pr create --fill --base main \
   --title "$(git log -1 --pretty=%s)" \
   --body "$(cat <<EOF
-Closes #$N
+Refs #$N
 
 ## What changed
 - ...
@@ -217,6 +220,26 @@ git switch main && git pull --ff-only
 git worktree remove "worktrees/issue-$N-$SLUG"
 git branch -d "issue/$N-$SLUG" 2>/dev/null || true
 ```
+
+### Closing the issue is a separate act
+
+Merging a PR does **not** close the issue. `Closes #<n>` is forbidden in commits
+and PR bodies because GitHub closes the issue automatically when the commit
+reaches `main`. Close the issue manually only after all of the following are
+true and recorded on the issue:
+
+1. every acceptance criterion has named evidence (test, command, measurement or
+   artifact);
+2. the production path is real, not a stub, no-op flag or staged subset;
+3. edge cases, exactness/fallback behaviour and quantitative targets are
+   evidenced;
+4. docs/help/schema/checkpoint/migration/provenance are updated;
+5. the combined CPU/CUDA/bench integration gate passes;
+6. an independent verifier has mapped every requirement to evidence and found no
+   hidden follow-up inside the original scope.
+
+If a follow-up is genuinely outside the original scope, file a new issue; it
+does not justify closing the original.
 
 Mark the issue's remaining follow-up work as new issues rather than leaving the
 original open.
@@ -288,9 +311,11 @@ Rules:
 > `docs/issue-workflow.md` and follow it exactly. Create the worktree
 > `worktrees/issue-<n>-<slug>` on branch `issue/<n>-<slug>`, implement the
 > acceptance criteria in the issue (`gh issue view <n>`), add tests, commit,
-> push, and open a PR that says `Closes #<n>` with the acceptance checklist
-> ticked. Do not touch files outside the issue's scope. Report back with the PR
-> number and a one-line summary.
+> push, and open a PR that says `Refs #<n>` with the acceptance checklist.
+> **Never use `Closes #<n>`** in a commit or PR; the issue stays open until a
+> separate verifier closes it after every acceptance item has evidence. Do not
+> touch files outside the issue's scope. Report back with the PR number and a
+> one-line summary.
 >
 > **Do not start an independent full-suite run, and do not start one while any
 > other `cargo`/`rustc` process is running.** Use narrow checks while you work

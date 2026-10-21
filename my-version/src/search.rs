@@ -25,7 +25,7 @@ use crate::metrics::{score_weighted, Metric};
 use crate::multi;
 use crate::pareto::{Archive, Sol};
 #[cfg(feature = "cuda")]
-use crate::postfix::{Arena, Variation};
+use crate::postfix::{Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
@@ -2536,7 +2536,27 @@ fn run_postfix_search(
             break;
         }
         gens_done = gen + 1;
-        let mut next = variation.next_generation(&pool, gen as u32, &restart_flags);
+        // #76/#122: compile the previous generation's front once, then let the
+        // flat engine draw 15 % of parents from it. With the feature off the
+        // pool is empty and `front_p` is 0.0, so the draw consumes no RNG and
+        // the trajectory is exactly the pre-#76 one.
+        let front = if cfg.front_parents {
+            FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)
+        } else {
+            FrontParents::empty()
+        };
+        let front_p = if cfg.front_parents {
+            FRONT_PARENT_P
+        } else {
+            0.0
+        };
+        let mut next = variation.next_generation_with_front(
+            &pool,
+            gen as u32,
+            &restart_flags,
+            &front,
+            front_p,
+        );
         next.evaluate(&mut gpu.ev, train.len())?;
         restart_flags = vec![false; n_islands];
 
