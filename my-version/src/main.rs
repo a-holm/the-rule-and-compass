@@ -622,7 +622,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -632,9 +632,11 @@ fn gpu_json(
                 s.unsupported_programs,
                 jnum(s.fallback_seconds),
                 s.fallback_workers,
+                s.fit_screened,
                 s.fit_attempts,
                 s.fit_gpu,
                 s.fit_fallback,
+                ops_json(&s.fit_fallback_by_cause),
                 ops_json(&s.opcodes)
             )
         })
@@ -670,13 +672,16 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"seconds\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{}}}",
         jstr(fit_strategy),
+        g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
         g.fit_fallback,
+        ops_json(&g.fit_fallback_by_cause),
         g.fit_refits,
-        jnum(g.fit_ms / 1000.0)
+        jnum(g.fit_ms / 1000.0),
+        jnum(g.fit_host_ms / 1000.0)
     );
     format!(
         "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
@@ -3308,6 +3313,22 @@ fn main() {
             counts.gpu_refits
         );
         eprintln!("# fit: {}", fit::backend_description());
+        if let Some(g) = &outcome.gpu {
+            let causes = search::FitFallbackCause::ALL
+                .iter()
+                .map(|c| format!("{}={}", c.label(), g.fit_fallback_by_cause.get(c.label()).copied().unwrap_or(0)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] refits={}",
+                g.fit_screened,
+                g.fit_attempts,
+                g.fit_gpu,
+                g.fit_fallback,
+                causes,
+                g.fit_refits
+            );
+        }
     }
 
     // Seeded solutions, reported once each. The search holds them in
@@ -7614,6 +7635,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// #169: the GPU fit ledger in `--json` must expose admission and a label
+    /// for every fallback cause, not just a single opaque counter.
+    #[test]
+    fn gpu_fit_json_labels_every_fallback_cause() {
+        let mut g = search::GpuRunStats::default();
+        g.fit_screened = 100;
+        g.fit_attempts = 40;
+        g.fit_gpu = 37;
+        g.fit_fallback = 3;
+        g.fit_fallback_by_cause
+            .insert("ill_conditioned".to_string(), 2);
+        g.fit_fallback_by_cause.insert("non_finite".to_string(), 1);
+        g.fit_refits = 5;
+        g.fit_ms = 250.0;
+        g.fit_host_ms = 500.0;
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu");
+        assert!(
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5}"),
+            "{}",
+            json
+        );
+    }
 
     /// #71: the guard and the import command must be discoverable.
     #[test]

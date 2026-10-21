@@ -744,7 +744,13 @@ The search phase uses f32 row arithmetic with f64 accumulators and the solve;
 the final undamped polish runs in f64 on an exact f64 copy of the training rows.
 Candidates with no analytic GPU derivative, more than 16 constants, more than
 96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
-are refit by the exact CPU arm and counted as fallbacks. `--fit-strategy gpu`
+are refit by the exact CPU arm and counted as fallbacks. Before fitting, every
+unfitted offspring is screened on the GPU with its seed constants and only the
+best `max(32, pop/4)` of each island enter the fitted LM batch; the rest keep
+their screening score, so the evaluation count is unchanged while the fit
+volume falls. Every CPU fallback is labelled by cause (`unsupported_plan`,
+`too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
+`launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to the squared/AIC family (the kernel minimises squared error); other
 metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
 training rows in CPU f64 before it is scored and reported, so reported constants

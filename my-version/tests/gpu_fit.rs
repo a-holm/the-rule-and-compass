@@ -64,6 +64,42 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
+/// #169: the admission ledger must be internally exact and use only the
+/// documented fallback labels.
+#[cfg(feature = "cuda")]
+fn assert_fit_ledger(g: &rcsr::search::GpuRunStats) {
+    assert!(
+        g.fit_screened >= g.fit_attempts,
+        "admission cannot fit more candidates than it screened: {:?}",
+        g
+    );
+    assert_eq!(
+        g.fit_attempts,
+        g.fit_gpu + g.fit_fallback,
+        "every admitted fit is exactly one GPU success or one labelled fallback: {:?}",
+        g
+    );
+    let known: Vec<&str> = rcsr::search::FitFallbackCause::ALL
+        .iter()
+        .map(|c| c.label())
+        .collect();
+    let mut labelled = 0usize;
+    for (cause, n) in &g.fit_fallback_by_cause {
+        assert!(
+            known.contains(&cause.as_str()),
+            "unknown fallback cause {:?} in {:?}",
+            cause,
+            g
+        );
+        labelled += n;
+    }
+    assert_eq!(
+        labelled, g.fit_fallback,
+        "fallback causes must add up to the total: {:?}",
+        g
+    );
+}
+
 #[test]
 fn exact_is_still_the_default_and_unchanged() {
     assert_eq!(Config::default().fit_strategy, FitStrategy::Exact);
@@ -143,6 +179,7 @@ fn gpu_fit_is_deterministic_for_repeated_seeds_and_island_counts() {
         assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
         let g = a.gpu.as_ref().expect("a GPU report");
         assert!(g.fit_gpu > 0, "the fit kernel must have run: {:?}", g);
+        assert_fit_ledger(g);
     }
 }
 
@@ -160,6 +197,7 @@ fn reported_finalists_are_refit_exactly_on_the_cpu() {
     let g = out.gpu.as_ref().expect("a GPU report");
     assert!(g.fit_gpu > 0, "batched GPU fit ran: {:?}", g);
     assert!(g.fit_refits > 0, "finalists were refit: {:?}", g);
+    assert_fit_ledger(g);
     // Every reported training error is the exact CPU f64 score of the stored
     // tree, bit for bit (the archive was rebuilt after the exact refit).
     for s in &out.archive.items {
@@ -197,10 +235,84 @@ fn unsupported_trees_fall_back_and_the_kernel_is_not_a_noop() {
         "the GPU-fit arm must do work: {:?}",
         g
     );
+    assert_fit_ledger(g);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn admission_fits_only_the_promoted_fraction() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(240, 31);
+    let test = sample(60, 32);
+    let cfg = Config {
+        generations: 2,
+        islands: 1,
+        pop: 64,
+        max_complexity: 12,
+        fit_iters: 4,
+        patience: 0,
+        seed: 33,
+        fit_strategy: FitStrategy::Gpu,
+        metric: Metric::Squared,
+        gpu: true,
+        ..Default::default()
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert!(
+        g.fit_screened > g.fit_attempts,
+        "admission must screen more offspring than it fits: {:?}",
+        g
+    );
+    assert_fit_ledger(g);
 }
 
 /// #169 measurement (ignored): end-to-end wall time of a fit-heavy
 /// configuration on the CPU exact arm versus the GPU-fit arm.
+/// Run with `cargo test --release --features cuda --test gpu_fit bench_end_to_end -- --ignored --nocapture`.
+#[cfg(feature = "cuda")]
+/// #169: normalized 2-D hypervolume of `(cost, error)` points. The extrema are
+/// passed in so both arms are measured on the same grid.
+fn hypervolume(points: &[(f64, f64)], cmin: f64, cmax: f64, emin: f64, emax: f64) -> f64 {
+    if points.len() < 2 {
+        return 0.0;
+    }
+    let cspan = (cmax - cmin).max(1e-12);
+    let espan = (emax - emin).max(1e-12);
+    const G: usize = 64;
+    let normalized: Vec<(f64, f64)> = points
+        .iter()
+        .map(|&(c, e)| ((c - cmin) / cspan, (e - emin) / espan))
+        .collect();
+    let mut dominated = 0usize;
+    for gy in 0..G {
+        let y = (gy as f64 + 0.5) / G as f64;
+        for gx in 0..G {
+            let x = (gx as f64 + 0.5) / G as f64;
+            if normalized.iter().any(|&(px, py)| px <= x && py <= y) {
+                dominated += 1;
+            }
+        }
+    }
+    dominated as f64 / (G * G) as f64
+}
+
+fn front_points(out: &Outcome) -> Vec<(f64, f64)> {
+    out.archive
+        .items
+        .iter()
+        .filter(|s| s.error.is_finite())
+        .map(|s| (s.cost, s.error))
+        .collect()
+}
+
+/// #169 measurement (ignored): the pinned fit-heavy 154k cell, equal
+/// evaluations, exact CPU versus GPU admission. Reports end-to-end wall, the
+/// fit stage's share, GPU duty, every fallback cause, final best error,
+/// hypervolume and generation-to-target.
 /// Run with `cargo test --release --features cuda --test gpu_fit bench_end_to_end -- --ignored --nocapture`.
 #[cfg(feature = "cuda")]
 #[test]
@@ -210,29 +322,53 @@ fn bench_end_to_end() {
         eprintln!("skipping GPU benchmark: no usable CUDA device");
         return;
     }
-    let n = 154_000;
+    let n = std::env::var("RCSR_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(154_000);
+    let pop = std::env::var("RCSR_BENCH_POP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    let islands = std::env::var("RCSR_BENCH_ISLANDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4);
+    let generations = std::env::var("RCSR_BENCH_GENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let fit_iters = std::env::var("RCSR_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let train = sample(n, 21);
     let test = sample(1_000, 22);
-    // A fit-heavy cell: a smooth, always-finite operator set so most random
-    // candidates are eligible for the kernel (the default set mixes in
-    // non-finite and piecewise-constant operators, which correctly fall back).
+    // The feasibility note's pinned cell: fit-heavy, no screening, a smooth
+    // always-finite operator set so most random candidates are eligible for
+    // the kernel. Both arms run the same generations, population and islands,
+    // so the comparison is at equal evaluations.
     use rcsr::expr::Op;
     let base = Config {
-        generations: 2,
-        islands: 4,
-        pop: 64,
+        generations,
+        islands,
+        pop,
         max_complexity: 14,
-        fit_iters: 8,
+        fit_iters,
         metric: Metric::Squared,
+        fit_samples: 0,
+        predictor_samples: None,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Sin, Op::Cos, Op::Tanh, Op::Gauss, Op::Square, Op::Cube, Op::Neg],
         seed: 9,
         patience: 0,
         gpu_notes: false,
         ..Default::default()
     };
+    // (name, strategy, gpu, wall, per-generation best, outcome)
+    let mut runs = Vec::new();
     for (name, strategy, gpu) in [
         ("exact/cpu", FitStrategy::Exact, false),
-        ("gpu", FitStrategy::Gpu, true),
+        ("gpu/admission", FitStrategy::Gpu, true),
     ] {
         let cfg = Config {
             fit_strategy: strategy,
@@ -240,22 +376,100 @@ fn bench_end_to_end() {
             ..base.clone()
         };
         let t0 = std::time::Instant::now();
-        let out = search::run(&cfg, &train, &test);
+        let mut history: Vec<(usize, f64, f64)> = Vec::new();
+        let out = search::run_resumable(&cfg, &train, &test, None, 1, |cp| {
+            let best = cp
+                .archive
+                .items
+                .iter()
+                .map(|s| s.error)
+                .fold(f64::INFINITY, f64::min);
+            if history.last().map(|h| h.0) != Some(cp.generations) {
+                history.push((cp.generations, best, t0.elapsed().as_secs_f64()));
+            }
+        })
+        .expect("benchmark search");
         let wall = t0.elapsed().as_secs_f64();
-        let fit = out
-            .gpu
-            .as_ref()
-            .map(|g| (g.fit_gpu, g.fit_fallback, g.fit_ms, g.fit_refits))
-            .unwrap_or((0, 0, 0.0, 0));
+        let best = out
+            .archive
+            .items
+            .iter()
+            .map(|s| s.error)
+            .fold(f64::INFINITY, f64::min);
         eprintln!(
-            "arm={} N={} wall={:.2}s gpu_fit={} fallback={} kernel={:.2}s refits={}",
+            "arm={} N={} evals={} wall={:.2}s best={:.6e}",
             name,
             n,
+            base.generations * base.islands * base.pop,
             wall,
-            fit.0,
-            fit.1,
-            fit.2 / 1000.0,
-            fit.3
+            best
         );
+        if let Some(g) = &out.gpu {
+            let causes = rcsr::search::FitFallbackCause::ALL
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}={}",
+                        c.label(),
+                        g.fit_fallback_by_cause.get(c.label()).copied().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let fallback_rate = if g.fit_attempts == 0 {
+                0.0
+            } else {
+                g.fit_fallback as f64 / g.fit_attempts as f64
+            };
+            eprintln!(
+                "  fit: screened={} admitted={} gpu={} fallback={} rate={:.1}% causes=[{}] refits={}",
+                g.fit_screened,
+                g.fit_attempts,
+                g.fit_gpu,
+                g.fit_fallback,
+                100.0 * fallback_rate,
+                causes,
+                g.fit_refits
+            );
+            eprintln!(
+                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s duty={:.1}%",
+                g.fit_host_ms / 1000.0,
+                100.0 * (g.fit_host_ms / 1000.0) / wall,
+                g.fit_ms / 1000.0,
+                100.0 * g.accounting.duty_cycle()
+            );
+        }
+        runs.push((name, wall, history, out));
+    }
+
+    // Equal-evaluation quality control: both arms are normalized on the same
+    // (cost, error) extrema. The time-to-target control uses the exact arm's
+    // final best × 1.02, so the baseline reaches the target at its last
+    // generation by construction and the GPU arm must reach it no later.
+    let all: Vec<(f64, f64)> = runs.iter().flat_map(|r| front_points(&r.3)).collect();
+    let cmin = all.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let cmax = all.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let emin = all.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let emax = all.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let exact_best = runs[0]
+        .3
+        .archive
+        .items
+        .iter()
+        .map(|s| s.error)
+        .fold(f64::INFINITY, f64::min);
+    let target = exact_best * 1.02;
+    eprintln!(
+        "control: target={:.6e} (exact final best × 1.02)",
+        target
+    );
+    for (name, _, history, out) in &runs {
+        let hv = hypervolume(&front_points(out), cmin, cmax, emin, emax);
+        let ttt = history
+            .iter()
+            .find(|h| h.1 <= target)
+            .map(|h| format!("gen {} / {:.1}s", h.0, h.2))
+            .unwrap_or_else(|| "not reached".to_string());
+        eprintln!("control: arm={} hypervolume={:.6} ttt={}", name, hv, ttt);
     }
 }
