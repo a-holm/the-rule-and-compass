@@ -321,7 +321,11 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
     }
 }
 
-__global__ void eval_kernel(const float *__restrict__ cols,
+/* #131 register contract: 6 blocks of RC_MAX_THREADS per SM. On sm_86 the
+   thread limit (1536) allows 6 blocks of 256, so 6 is the occupancy target;
+   ptxas derives a hard ~40-register ceiling from it. Crossing that ceiling is
+   a compile-time error/spill, not a silent occupancy loss. */
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_kernel(const float *__restrict__ cols,
                             const float *__restrict__ y,
                             int n,
                             int v,
@@ -358,7 +362,7 @@ __global__ void eval_kernel(const float *__restrict__ cols,
 
 /* #122: the same evaluator over a fixed-stride genome pool. One block per
    program; slot `p` starts at `p * width` and ends at its HALT word. */
-__global__ void eval_pool_kernel(const float *__restrict__ cols,
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const float *__restrict__ cols,
                                  const float *__restrict__ y,
                                  int n,
                                  int v,
@@ -393,7 +397,7 @@ __global__ void eval_pool_kernel(const float *__restrict__ cols,
 /* #131 fixtures: raw per-row predictions of a packed batch, P x N row-major.
    Unlike the fitness kernels this does not apply the hard-failure magnitude
    limit, so a fixture can see NaN, infinities and signed zeros. */
-__global__ void predict_kernel(const float *__restrict__ cols,
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) predict_kernel(const float *__restrict__ cols,
                                int n,
                                const unsigned int *__restrict__ prog,
                                const unsigned int *__restrict__ off,
