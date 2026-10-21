@@ -1,10 +1,11 @@
 //! #145: point-in-time membership, delisted coins, splices, costs and the
 //! 2026H2 lockbox.
 
+use rcsr::data::{self, SplitMode, SplitSpec};
 use rcsr::lockbox::Lockbox;
 use rcsr::ohlcv::{self, Bar, Migration};
 use rcsr::panel::{
-    self, build_membership, build_panel, buy_and_hold, level_jumps, long_gaps,
+    self, build_membership, build_panel, build_panel_resumable, buy_and_hold, level_jumps, long_gaps,
     matched_exposure_random_long, net_returns, series_from_table, splice_canaries, CostModel,
     Membership, MembershipConfig,
 };
@@ -41,6 +42,8 @@ fn cfg(top: usize) -> MembershipConfig {
         min_bars: 20,
         top,
         min_adv_usd: 0.0,
+        start: None,
+        end: None,
     }
 }
 
@@ -216,22 +219,14 @@ fn matched_exposure_random_long_keeps_the_same_exposure() {
     assert_eq!(r, matched_exposure_random_long(&positions, &groups, 42));
 }
 
-#[test]
-fn every_runner_refuses_2026h2_unless_overridden() {
-    let l = Lockbox::crypto_2026h2();
-    let mut spec = EvalSpec {
+fn eval_spec(windows: Vec<Window>) -> EvalSpec {
+    EvalSpec {
         expression: "x".to_string(),
         vars: vec!["x".to_string()],
         target: "y".to_string(),
         time: "ts".to_string(),
         group: None,
-        windows: vec![Window {
-            label: "2026H2".to_string(),
-            train_start: l.start as f64 - 100.0,
-            train_end: l.start as f64 - 10.0,
-            test_start: l.start as f64,
-            test_end: l.start as f64 + 86_400.0,
-        }],
+        windows,
         horizon: 0.0,
         embargo: None,
         cost_bps: 10.0,
@@ -241,17 +236,89 @@ fn every_runner_refuses_2026h2_unless_overridden() {
         candidates: Vec::new(),
         pool_reset_flat: false,
         allow_lockbox: false,
+    }
+}
+
+/// One test for every runner: the search (`run`), walk-forward train and test,
+/// the panel build window and a labelled prep. All four must use the same
+/// central guard, not a per-runner copy.
+#[test]
+fn every_runner_refuses_2026h2_unless_overridden() {
+    let l = Lockbox::crypto_2026h2();
+    let day = 86_400i64;
+
+    // 1. `rcsr run`: a temporal split whose test rows fall in 2026H2.
+    let mut csv = String::from("ts,x,y\n");
+    let start = l.start - 500 * day;
+    for i in 0..800 {
+        let ts = start + i * day;
+        csv.push_str(&format!("{},{},{}\n", ts, i as f64, (i as f64).sin()));
+    }
+    let t = data::parse_table(&csv).unwrap();
+    let spec = SplitSpec {
+        mode: SplitMode::Temporal,
+        time_col: Some(0),
+        test_frac: 0.25,
+        ..Default::default()
     };
-    // A synthetic table is enough: validation refuses before reading rows.
-    let t = rcsr::data::parse_table("ts,x,y\n0,0,0\n1,1,1\n2,2,2\n3,3,3\n").unwrap();
-    let err = walkforward::run_table(&t, &spec, "test").unwrap_err();
+    let err = data::prepare_full(&t, &["x".into()], "y", &spec, &mut rcsr::rng::Mt::new(1))
+        .err()
+        .expect("run must refuse 2026H2");
+    assert!(err.contains("training split") || err.contains("test split"), "{}", err);
     assert!(err.contains("lockbox"), "{}", err);
-    spec.allow_lockbox = true;
-    let _ = walkforward::run_table(&t, &spec, "test");
+    let mut allowed = spec.clone();
+    allowed.allow_lockbox = true;
+    data::prepare_full(&t, &["x".into()], "y", &allowed, &mut rcsr::rng::Mt::new(1)).unwrap();
+
+    // 2. Walk-forward test window in 2026H2.
+    let mut wf = eval_spec(
+        vec![Window {
+            label: "2026H2".to_string(),
+            train_start: l.start as f64 - 100.0,
+            train_end: l.start as f64 - 10.0,
+            test_start: l.start as f64,
+            test_end: l.start as f64 + day as f64,
+        }],
+    );
+    let tiny = data::parse_table("ts,x,y\n0,0,0\n1,1,1\n2,2,2\n3,3,3\n").unwrap();
+    let err = walkforward::run_table(&tiny, &wf, "test").unwrap_err();
+    assert!(err.contains("test range"), "{}", err);
+    assert!(err.contains("lockbox"), "{}", err);
+
+    // 3. Walk-forward **training** window in 2026H2 with a 2027 test.
+    wf.windows = vec![Window {
+        label: "train-on-holdout".to_string(),
+        train_start: (l.start + day) as f64,
+        train_end: (l.start + 30 * day) as f64,
+        test_start: l.end as f64,
+        test_end: (l.end + day) as f64,
+    }];
+    let err = walkforward::run_table(&tiny, &wf, "test").unwrap_err();
+    assert!(err.contains("training range"), "{}", err);
+    assert!(err.contains("lockbox"), "{}", err);
+    wf.allow_lockbox = true;
+    let _ = walkforward::run_table(&tiny, &wf, "test");
+
+    // 4. An explicit panel build window in 2026H2.
+    let err = panel::check_build_window(l.start, l.start + 30 * day, day, false).unwrap_err();
+    assert!(err.contains("panel build range"), "{}", err);
+    panel::check_build_window(l.start, l.start + 30 * day, day, true).unwrap();
+    // A build that ends where the lockbox starts is allowed.
+    panel::check_build_window(l.start - 30 * day, l.start - day, day, false).unwrap();
+
+    // 5. A labelled prep inside 2026H2.
+    let err = rcsr::prep::check_labelled_rows(&[l.start + 1, l.start + 2], false).unwrap_err();
+    assert!(err.contains("prep labelled rows"), "{}", err);
+    rcsr::prep::check_labelled_rows(&[l.start + 1, l.start + 2], true).unwrap();
+    // Unlabelled bars are provenance; the manifest still counts the overlap.
+    let cov = l.overlap([l.start + 1, l.start + 2]);
+    assert_eq!(cov.rows, 2);
+    assert!(!cov.windows.is_empty());
 }
 
 #[test]
 fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
+    let l = Lockbox::crypto_2026h2();
     let s = series();
     let m = build_membership(&s, &cfg(2)).unwrap();
     let p = build_panel(&s, &m).unwrap();
@@ -270,8 +337,10 @@ fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
     std::fs::write(&input, csv).unwrap();
     let out_str = out.to_string_lossy().to_string();
     let in_str = input.to_string_lossy().to_string();
+    let snapshot = "{\"source\":\"binance-vision-monthly\",\"coverage_last\":\"2026-09-30\",\"verified\":true}";
     let manifest_path =
-        panel::write_panel_panel(&out_str, &p, &m, &[in_str.as_str()], 65_536).unwrap();
+        panel::write_panel_panel(&out_str, &p, &m, &[in_str.as_str()], 65_536, false, Some(snapshot))
+            .unwrap();
     assert!(out.exists());
     let text = std::fs::read_to_string(&manifest_path).unwrap();
     assert!(text.contains("\"sha256\""));
@@ -279,9 +348,47 @@ fn the_panel_store_and_manifest_record_counts_delisted_and_checksums() {
     assert!(text.contains("\"C\""));
     assert!(text.contains("\"symbols_per_year\""));
     assert!(text.contains("\"rebalances\""));
+    // #145: the manifest records the lockbox start/end, permission and
+    // coverage even when (as here, in 2020) no row overlaps it.
+    assert!(text.contains("\"lockbox\""), "{}", text);
+    assert!(text.contains("\"permitted\":false"), "{}", text);
+    assert!(text.contains("\"complete\":false"), "{}", text);
+    assert!(text.contains(&format!("\"start\":{}", l.start)), "{}", text);
+    assert!(text.contains(&format!("\"end\":{}", l.end)), "{}", text);
+    assert!(text.contains("\"snapshot\""), "{}", text);
+    assert!(text.contains("\"coverage_last\":\"2026-09-30\""), "{}", text);
     let _ = std::fs::remove_file(out);
     let _ = std::fs::remove_file(manifest_path);
     let _ = std::fs::remove_file(input);
+}
+
+#[test]
+fn a_resumed_build_reuses_parts_and_matches_the_one_shot_panel() {
+    let s = series();
+    let m = build_membership(&s, &cfg(2)).unwrap();
+    let one = build_panel(&s, &m).unwrap();
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let resumed = build_panel_resumable(&s, &m, DAY, &dir_s).unwrap();
+    assert_eq!(resumed.rows.len(), one.rows.len());
+    assert_eq!(resumed.delisted, one.delisted);
+    assert_eq!(resumed.gaps, one.gaps);
+    let parts: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+        .collect();
+    assert_eq!(parts.len(), s.len(), "one part per symbol");
+    // Remove one part: the resume path recreates exactly it and leaves the
+    // others untouched.
+    std::fs::remove_file(parts[0].path()).unwrap();
+    let again = build_panel_resumable(&s, &m, DAY, &dir_s).unwrap();
+    assert_eq!(again.rows.len(), one.rows.len());
+    assert_eq!(again.gaps, one.gaps);
+    // A different step must not reuse the directory.
+    assert!(build_panel_resumable(&s, &m, DAY * 2, &dir_s).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

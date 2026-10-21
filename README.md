@@ -347,8 +347,10 @@ atomically instead of streaming it. See
   trailing liquidity **as of** each rebalance, keeps delisted names while they
   trade, never forward-fills across a listing/delisting/migration, verifies
   splice ratios, charges both sides and the final exit, supplies a
-  matched-exposure random-long benchmark, refuses 2026H2 in every runner and
-  emits a checksummed provenance manifest. See [`docs/panel.md`](docs/panel.md).
+  matched-exposure random-long benchmark, refuses 2026H2 in every runner, and
+  emits a checksummed provenance manifest with a lockbox-coverage block.
+  `panel build --resume` caches one atomic part per symbol; `--snapshot` embeds
+  a verified archive snapshot. See [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -419,6 +421,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
+     [--allow-lockbox]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -512,6 +515,11 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
+* A split whose training **or** test rows fall inside the crypto 2026H2 lockbox
+  (`2026-07-01 .. 2027-01-01`) is refused unless `--allow-lockbox` is passed.
+  The same central guard covers `rcsr run`, `rcsr walkforward`, an explicit
+  `rcsr panel build` window and a labelled `rcsr prep`; see
+  [`docs/panel.md`](docs/panel.md#the-2026h2-lockbox).
 * `--train-select` / `--test-select` assign rows by expression (`> 0` is true)
   and override `--split`; `--exclude` drops rows and composes with any mode.
   A row matching both selections goes to training, one matching neither is
@@ -535,6 +543,7 @@ run:
 | `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
+| `--allow-lockbox` | permit train or test rows in the 2026H2 crypto lockbox (declared final test only) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |

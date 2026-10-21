@@ -239,6 +239,8 @@ pub struct Report {
     /// `store-stream` or `csv-table`.
     pub source: String,
     pub memory_bound: String,
+    /// #145: was the lockbox override explicitly set for this run?
+    pub allow_lockbox: bool,
     dropped_rows: usize,
 }
 
@@ -503,12 +505,19 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
                 w.label
             ));
         }
-        if !spec.allow_lockbox {
-            crate::lockbox::Lockbox::crypto_2026h2().check(
-                w.test_start.floor() as i64,
-                w.test_end.ceil() as i64,
-            )?;
-        }
+        // #145: a training range inside 2026H2 with a 2027 test would train on
+        // the holdout. Check both sides through the one central guard.
+        let guard = crate::lockbox::Guard::new(spec.allow_lockbox, None);
+        guard.check(
+            &format!("window '{}' training range", w.label),
+            w.train_start.floor() as i64,
+            w.train_end.ceil() as i64,
+        )?;
+        guard.check(
+            &format!("window '{}' test range", w.label),
+            w.test_start.floor() as i64,
+            w.test_end.ceil() as i64,
+        )?;
         let gap = w.test_start - w.train_end;
         if gap + 1e-9 < embargo {
             return Err(format!(
@@ -839,6 +848,7 @@ impl Accum {
             sign_test,
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
+            allow_lockbox: spec.allow_lockbox,
             dropped_rows: dropped,
         })
     }
@@ -1558,6 +1568,31 @@ impl Report {
     /// metrics, as required by issue #124.
     pub fn json(&self) -> String {
         let windows: Vec<String> = self.windows.iter().map(WindowResult::json).collect();
+        let lb = crate::lockbox::Lockbox::crypto_2026h2();
+        let overlap: Vec<String> = self
+            .windows
+            .iter()
+            .map(|w| {
+                let train_overlap = w.window.train_start < lb.end as f64
+                    && w.window.train_end > lb.start as f64;
+                let test_overlap = w.window.test_start < lb.end as f64
+                    && w.window.test_end > lb.start as f64;
+                format!(
+                    "{{\"label\":{},\"train_overlap\":{},\"test_overlap\":{}}}",
+                    jstr(&w.window.label),
+                    train_overlap,
+                    test_overlap
+                )
+            })
+            .collect();
+        let lockbox_json = format!(
+            "{{\"start\":{},\"end\":{},\"permitted\":{},\"evaluated\":{},\"windows\":[{}]}}",
+            lb.start,
+            lb.end,
+            self.allow_lockbox,
+            self.allow_lockbox,
+            overlap.join(",")
+        );
         format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"walkforward\",\
              \"expression\":{},\"target\":{},\"variables\":[{}],\"time\":{},\
@@ -1575,6 +1610,7 @@ impl Report {
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
+             \"lockbox\":{},\
              \"source\":{},\"memory_bound\":{},\"dropped_rows\":{},\
              \"windows\":[{}],\"pooled\":{}}}",
             jstr(env!("CARGO_PKG_VERSION")),
@@ -1611,6 +1647,7 @@ impl Report {
             self.sign_test.applicable,
             self.sign_test.p_value.map_or("null".to_string(), jnum),
             jstr(&self.sign_test.method),
+            lockbox_json,
             jstr(&self.source),
             jstr(&self.memory_bound),
             self.dropped_rows,
