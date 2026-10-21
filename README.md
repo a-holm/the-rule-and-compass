@@ -122,7 +122,9 @@ candidates by their validation error; the test block is never a selection
 input. The fold sign test is reported as not applicable for expanding folds
 because `test_k` lies inside `train_{k+1}`. See
 [`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
-definitions and the reference-agreement check against the Python evaluator.
+definitions and the reference-agreement check against the Python evaluator, and
+[`docs/eval-benchmark.md`](docs/eval-benchmark.md) for the pinned 4M-row
+Python-vs-Rust benchmark protocol and the measured 10x evidence.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
