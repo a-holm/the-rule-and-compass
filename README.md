@@ -861,8 +861,10 @@ historical LM path bit for bit.
   prediction skewness, with deterministic Halton initialisation, Lloyd
   centroid updates, a bounded local `(error, cost)` front per cell, UCB1
   parent selection, stratified migration and least-occupied restarts. The
-  passive layer reports coverage and hypervolume in text and `--json` without
-  changing the Pareto front; `--qd-policy` is the opt-in search change. See
+  passive layer reports reachable-support coverage, occupancy entropy and a
+  QD-score in text and `--json` without changing the Pareto front; every run
+  also reports a fixed-reference validation hypervolume that is comparable
+  across arms. `--qd-policy` is the opt-in search change. See
   [`docs/qd.md`](docs/qd.md);
 - **configurable complexity** (`--op-complexity`, `--complexity-weights`,
   `--depth-weight`): per-operator costs, variable/constant weights and a

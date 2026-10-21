@@ -431,7 +431,10 @@ SEARCH:
                              CPU trajectory
   --qd                       record an opt-in quality-diversity archive over
                              (variable usage x prediction skewness), passive;
-                             it never changes parents or the Pareto front
+                             it never changes parents or the Pareto front.
+                             Reports reachable-support coverage, occupancy
+                             entropy and QD-score; every run also reports a
+                             fixed-reference validation hypervolume
   --qd-cells <N>             descriptor cells (grid bins per axis or CVT K;
                              2..=512; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
@@ -711,17 +714,88 @@ fn gpu_json(
     )
 }
 
+/// #120: fixed-reference validation hypervolume of one run.
+///
+/// The reference error is the variance of the held-out target, which is a
+/// property of the data rather than of the arm, so two arms of the same split
+/// are comparable. The reported quantity is computed from the archive the run
+/// actually produced, on the same rows the report already uses.
+#[derive(Clone, Copy, Debug)]
+struct ValidationHv {
+    sample: &'static str,
+    reference_error: f64,
+    hypervolume: f64,
+    points: usize,
+}
+
+fn validation_hypervolume(rows: &[Row], prepared: &data::Prepared) -> ValidationHv {
+    let (sample, target) = if let Some(v) = &prepared.validation {
+        ("validation", &v.y)
+    } else if !prepared.test.y.is_empty() {
+        ("test", &prepared.test.y)
+    } else {
+        ("train", &prepared.train.y)
+    };
+    let pick: fn(&Row) -> f64 = match sample {
+        "validation" => |r: &Row| r.validation_error,
+        "test" => |r: &Row| r.test_error,
+        _ => |r: &Row| r.train_error,
+    };
+    let n = target.len();
+    let mean = if n == 0 {
+        0.0
+    } else {
+        target.iter().sum::<f64>() / n as f64
+    };
+    let var = if n == 0 {
+        0.0
+    } else {
+        target.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n as f64
+    };
+    let reference_error = if var.is_finite() && var > 0.0 {
+        var
+    } else {
+        1.0
+    };
+    let points: Vec<(f64, f64)> = rows
+        .iter()
+        .map(|r| (r.complexity, pick(r)))
+        .filter(|(c, e)| c.is_finite() && e.is_finite())
+        .collect();
+    ValidationHv {
+        sample,
+        reference_error,
+        hypervolume: qd::fixed_reference_hypervolume(&points, reference_error),
+        points: points.len(),
+    }
+}
+
+fn validation_hv_json(v: &ValidationHv) -> String {
+    format!(
+        "{{\"sample\":\"{}\",\"reference_error\":{},\"hypervolume\":{},\"points\":{}}}",
+        v.sample,
+        jnum(v.reference_error),
+        jnum(v.hypervolume),
+        v.points
+    )
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd ({}): {}/{} cells occupied ({:.1}%), {} entries, best error {}, hypervolume {:.4}",
+            "# qd ({}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
+             entropy {:.3}/{:.3} bits, qd-score {:.4}, descriptor fallbacks {}, hypervolume {:.4} (self-normalised diagnostic)",
             q.mode,
-            q.occupied,
-            q.cells,
-            100.0 * q.coverage,
+            q.occupied_reachable,
+            q.reachable,
+            100.0 * q.reachable_coverage,
             q.entries,
             jnum(q.best_error),
+            q.occupancy_entropy,
+            q.occupancy_entropy_normalized,
+            q.qd_score,
+            q.descriptor_fallbacks,
             q.hypervolume
         );
     }
@@ -732,15 +806,22 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
             q.mode,
             q.bins,
             q.cells,
+            q.reachable,
             q.occupied,
+            q.occupied_reachable,
             jnum(q.coverage),
+            jnum(q.reachable_coverage),
             q.entries,
             jnum(q.best_error),
             q.cell_cap,
+            jnum(q.occupancy_entropy),
+            jnum(q.occupancy_entropy_normalized),
+            jnum(q.qd_score),
+            q.descriptor_fallbacks,
             jnum(q.hypervolume),
             q.evaluations
         ),
@@ -3833,6 +3914,11 @@ fn main() {
         md.push_str(&time_markdown(&timing));
     }
 
+    // #120: fixed-reference validation HV is computed before any display
+    // truncation or selection reordering, from the full archive this run
+    // produced.
+    let validation_hv = validation_hypervolume(&rows, &prepared);
+
     if top > 0 && rows.len() > top {
         rows.truncate(top);
     }
@@ -3894,6 +3980,13 @@ fn main() {
                     );
                 }
                 qd_text(outcome.qd.as_ref());
+                eprintln!(
+                    "# validation hv ({}): {:.6} (ref error {}, {} front points; fixed reference, comparable across arms)",
+                    validation_hv.sample,
+                    validation_hv.hypervolume,
+                    jnum(validation_hv.reference_error),
+                    validation_hv.points
+                );
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -4465,7 +4558,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -4501,6 +4594,7 @@ fn main() {
                 resid_json,
                 cv_json,
                 stability_json,
+                validation_hv_json(&validation_hv),
                 qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")

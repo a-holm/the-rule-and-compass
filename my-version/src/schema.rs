@@ -97,7 +97,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--gpu", "flag", "false", "assert that the GPU must guide the search (exit 2 when built without --features cuda or no device is present); without --gpu/--cpu a CUDA build with a usable device selects the GPU automatically. Reported errors stay CPU f64, but f32 fitness can change the trajectory, so cross-backend runs are not bit-identical. JSON reports the measured kernel/sync/alloc/copy wall and kernel-time duty; SM occupancy is null unless measured separately with ncu"),
         ("--no-gpu", "flag", "false", "force CPU evaluation (alias --cpu); the reproducibility escape hatch. A non-CUDA build is CPU by default"),
         ("--cpu", "flag", "false", "alias for --no-gpu: force CPU evaluation"),
-        ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front"),
+        ("--qd", "flag", "false", "record an opt-in quality-diversity archive over (variable usage x prediction skewness); passive, never changes the Pareto front. Reports reachable-support coverage, occupancy entropy and QD-score; every run also reports a fixed-reference validation hypervolume"),
         ("--qd-cells", "int", "16", "descriptor cells: grid bins per axis or CVT K (2..=512; enables --qd)"),
         ("--qd-cell-cap", "int", "4", "maximum local Pareto front per descriptor cell"),
         ("--qd-cvt", "flag", "false", "use CVT-MAP-Elites (K centroids, deterministic Halton initialisation and Lloyd updates) instead of the grid"),
