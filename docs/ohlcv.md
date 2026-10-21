@@ -257,6 +257,12 @@ full-catalogue run is 56.5 s of feature arithmetic, 15.8 s of append/copy,
 2.5 s in the cross-sectional pass; its working set is one source column, the
 time column, a row permutation and the rank column (about 32 B/row).
 
+The host was shared during later repeats; wall time is sensitive to that, user
+CPU time is not. A repeat under load average 10.6 (another `rcsr` run at 5.3
+cores) measured `py15m` at 37.5 s wall / 30.8 s user and the full catalogue at
+153.7 s wall / 85.9 s user, with the same 35- and 168-column schemas. The
+feature arithmetic stayed ~57 s; the difference was disk write contention.
+
 GPU policy on the same 3.875M-row store (`--features returns`, CUDA build):
 the probe found `NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 11907 MB)`; the cost
 model estimated 5,812 ms CPU vs 1,950 ms GPU (transfer + kernel), but **no exact
