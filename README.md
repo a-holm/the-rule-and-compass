@@ -26,7 +26,9 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+an exact CPU verifier, which fits candidates with at most 20 constants on the
+device and labels every larger or unsupported candidate for the exact CPU arm;
+below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. Every arm falls back to the
@@ -870,7 +872,9 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+an exact CPU verifier, which fits candidates with at most 20 constants on the
+device and labels every larger or unsupported candidate for the exact CPU arm;
+below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. Every arm falls back to the

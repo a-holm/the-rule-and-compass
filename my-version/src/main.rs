@@ -388,7 +388,10 @@ SEARCH:
                              to exact LM when it cannot prove a safe result;
                              `stream` merges f64 sufficient statistics over row
                              blocks. `gpu` is the #169 batched kernel with a CPU
-                             fallback; it screens unfitted offspring, admits the
+                             fallback; it fits trees with at most 20 constants
+                             on the device (p<=16 uses a 256-thread block,
+                             p=17..20 a 128-thread one), screens unfitted
+                             offspring, admits the
                              best max(32,pop/4) per island below 1 048 576
                              training rows and every candidate with constants
                              at or above that size, then refits finalists

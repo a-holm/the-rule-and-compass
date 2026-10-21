@@ -424,12 +424,45 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) predict_kernel(const float 
  * loop moves; the block writes the final constants, SSE and status back.
  */
 
-#define FT_MAX_CONST 16
+/* Two instantiations, selected by the batch's largest constant count. The
+ * shared footprint grows with both the constant cap and the row chunk:
+ * p=20 with a 256-row chunk needs about 50.8 KB, above the 48 KB static limit
+ * and only one block per SM, while the 128-row chunk keeps it near 38.1 KB so
+ * two blocks still fit per SM on sm_86. p<=16 keeps the 256-row chunk it was
+ * measured with. Both instantiate the same code, and every statistic is
+ * accumulated over rows in ascending index order by one thread, so the chunk
+ * size changes which thread owns which row, never the sum: a candidate's
+ * constants are bit-identical whichever instantiation fits it. */
 #define FT_MAX_NODES 96
-/* Lower triangle + right-hand side + SSE. */
-#define FT_MAX_STATS (FT_MAX_CONST * (FT_MAX_CONST + 1) / 2 + FT_MAX_CONST + 1)
-#define FT_CHUNK 256
+#define FT_MAX_CONST_SMALL 16
+#define FT_CHUNK_SMALL 256
+#define FT_MAX_CONST_LARGE 20
+#define FT_CHUNK_LARGE 128
 #define FT_PCHUNK 128
+/* Lower triangle + right-hand side + SSE. */
+#define FT_STATS(MAXC) (((MAXC) * ((MAXC) + 1) / 2) + (MAXC) + 1)
+
+/* Dynamic shared block of one instantiation. The kernel takes it from
+ * `extern __shared__` so the same code serves both sizes and the p=20 block is
+ * not limited by the 48 KB static ceiling. */
+template <int MAXC, int CHUNK, int PCHUNK>
+struct FtSmem {
+    double sc[MAXC];
+    double sjtj[FT_STATS(MAXC)];
+    double sjtr[MAXC];
+    double sL[MAXC * MAXC];
+    double strial[MAXC];
+    double sdelta[MAXC];
+    double sred[CHUNK];
+    float sg[CHUNK * MAXC];
+    float sr[CHUNK];
+    double sdg[PCHUNK * MAXC];
+    double sdr[PCHUNK];
+    int sbad;
+    int ssolved;
+    double slambda;
+    double sbest;
+};
 
 __device__ __forceinline__ void ft_forward(const unsigned int *nd,
                                            int m,
@@ -494,6 +527,7 @@ __device__ __forceinline__ void ft_forward(const unsigned int *nd,
 }
 
 /* Reverse-mode adjoint sweep of the same program. `g[j] = d root / d c_j`. */
+template <int MAXC>
 __device__ __forceinline__ void ft_backward(const unsigned int *nd,
                                             int m,
                                             const float *v,
@@ -643,6 +677,7 @@ __device__ __forceinline__ void ft_forward_d(const unsigned int *nd,
     }
 }
 
+template <int MAXC>
 __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
                                               int m,
                                               const double *v,
@@ -721,6 +756,33 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
     }
 }
 
+/* Entries owned by one thread when the block is narrower than the statistic
+ * count: p=20 needs 231 entries but the 128-row-chunk instantiation has 128
+ * threads, so each thread owns at most two. */
+#define FT_OWNED(MAXC, CHUNK) (((FT_STATS(MAXC)) + (CHUNK) - 1) / (CHUNK))
+
+/* Decode statistic `s` of a p-constant system: 0 = J^T J entry (ei, ej),
+ * 1 = J^T r entry, 2 = the SSE. */
+__device__ __forceinline__ int ft_stat_kind(int s, int tri, int p, int *ei, int *ej)
+{
+    if (s < tri) {
+        int k = 0;
+        for (int i = 0; i < p; ++i) {
+            for (int j = 0; j <= i; ++j, ++k) {
+                if (k == s) {
+                    *ei = i;
+                    *ej = j;
+                    return 0;
+                }
+            }
+        }
+        return 0;
+    }
+    if (s < tri + p) return 1;
+    return 2;
+}
+
+template <int MAXC, int PCHUNK>
 __device__ void ft_assemble_d(const unsigned int *nd,
                               int m,
                               const double *__restrict__ cols,
@@ -738,41 +800,35 @@ __device__ void ft_assemble_d(const unsigned int *nd,
     const int tid = threadIdx.x;
     const int tri = p * (p + 1) / 2;
     const int total = tri + p + 1;
-    int kind = -1;
-    int ei = 0, ej = 0, which = 0;
-    if (tid < total) {
-        if (tid < tri) {
-            kind = 0;
-            int k = 0;
-            for (int i = 0; i < p; ++i) {
-                for (int j = 0; j <= i; ++j, ++k) {
-                    if (k == tid) {
-                        ei = i;
-                        ej = j;
-                    }
-                }
-            }
-        } else if (tid < tri + p) {
-            kind = 1;
-            which = tid - tri;
-        } else {
-            kind = 2;
-        }
+    /* Thread `t` owns entries `t`, `t + PCHUNK`, ... A block narrower than the
+       statistic count therefore still covers every entry, and each entry is
+       accumulated by one thread over rows in ascending order: ownership moves
+       a statistic between threads, it never changes its sum. */
+    int own[FT_OWNED(MAXC, PCHUNK)];
+    int own_kind[FT_OWNED(MAXC, PCHUNK)];
+    int own_i[FT_OWNED(MAXC, PCHUNK)];
+    int own_j[FT_OWNED(MAXC, PCHUNK)];
+    double acc[FT_OWNED(MAXC, PCHUNK)];
+    int nown = 0;
+    for (int s = tid; s < total; s += PCHUNK) {
+        own[nown] = s;
+        own_kind[nown] = ft_stat_kind(s, tri, p, &own_i[nown], &own_j[nown]);
+        acc[nown] = 0.0;
+        ++nown;
     }
-    double acc = 0.0;
-    for (int base = 0; base < n; base += FT_PCHUNK) {
-        const int rows = min(FT_PCHUNK, n - base);
-        if (tid < FT_PCHUNK) {
+    for (int base = 0; base < n; base += PCHUNK) {
+        const int rows = min(PCHUNK, n - base);
+        if (tid < PCHUNK) {
             const int row = base + tid;
             if (row < n) {
                 double v[FT_MAX_NODES];
                 double adj[FT_MAX_NODES];
-                double g[FT_MAX_CONST];
+                double g[MAXC];
                 ft_forward_d(nd, m, cols, n, row, c, v);
                 const double pred = v[m - 1];
                 const double r = pred - y[row];
                 bool ok = isfinite(pred) && fabs(pred) <= 1e30 && isfinite(r);
-                ft_backward_d(nd, m, v, adj, g, p);
+                ft_backward_d<MAXC>(nd, m, v, adj, g, p);
                 for (int j = 0; j < p; ++j) {
                     if (!isfinite(g[j])) ok = false;
                     dg[tid * p + j] = ok ? g[j] : 0.0;
@@ -785,30 +841,33 @@ __device__ void ft_assemble_d(const unsigned int *nd,
             }
         }
         __syncthreads();
-        if (kind == 0) {
-            for (int k = 0; k < rows; ++k) acc += dg[k * p + ei] * dg[k * p + ej];
-        } else if (kind == 1) {
-            for (int k = 0; k < rows; ++k) acc += dg[k * p + which] * dr[k];
-        } else if (kind == 2) {
-            for (int k = 0; k < rows; ++k) acc += dr[k] * dr[k];
+        for (int o = 0; o < nown; ++o) {
+            if (own_kind[o] == 0) {
+                const int ei = own_i[o];
+                const int ej = own_j[o];
+                for (int k = 0; k < rows; ++k) acc[o] += dg[k * p + ei] * dg[k * p + ej];
+            } else if (own_kind[o] == 1) {
+                const int which = own[o] - tri;
+                for (int k = 0; k < rows; ++k) acc[o] += dg[k * p + which] * dr[k];
+            } else {
+                for (int k = 0; k < rows; ++k) acc[o] += dr[k] * dr[k];
+            }
         }
         __syncthreads();
     }
-    if (kind == 0) {
-        int k = 0;
-        for (int i = 0; i < p; ++i) {
-            for (int j = 0; j <= i; ++j, ++k) {
-                if (k == tid) jtj[k] = acc;
-            }
+    for (int o = 0; o < nown; ++o) {
+        if (own_kind[o] == 0) {
+            jtj[own[o]] = acc[o];
+        } else if (own_kind[o] == 1) {
+            jtr[own[o] - tri] = acc[o];
+        } else {
+            *psse = acc[o];
         }
-    } else if (kind == 1) {
-        jtr[which] = acc;
-    } else if (kind == 2) {
-        *psse = acc;
     }
     __syncthreads();
 }
 
+template <int PCHUNK>
 __device__ double ft_sse_d(const unsigned int *nd,
                            int m,
                            const double *__restrict__ cols,
@@ -819,8 +878,8 @@ __device__ double ft_sse_d(const unsigned int *nd,
 {
     const int tid = threadIdx.x;
     double local = 0.0;
-    if (tid < FT_PCHUNK) {
-        for (int row = tid; row < n; row += FT_PCHUNK) {
+    if (tid < PCHUNK) {
+        for (int row = tid; row < n; row += PCHUNK) {
             double v[FT_MAX_NODES];
             ft_forward_d(nd, m, cols, n, row, c, v);
             const double pred = v[m - 1];
@@ -834,7 +893,7 @@ __device__ double ft_sse_d(const unsigned int *nd,
     }
     red[tid] = local;
     __syncthreads();
-    for (int st = FT_PCHUNK / 2; st > 0; st >>= 1) {
+    for (int st = PCHUNK / 2; st > 0; st >>= 1) {
         if (tid < st) red[tid] += red[tid + st];
         __syncthreads();
     }
@@ -843,9 +902,11 @@ __device__ double ft_sse_d(const unsigned int *nd,
     return total;
 }
 
-/* Assemble J^T J, J^T r and the SSE at `c`. Each statistic is owned by one
- * thread (thread t < stats owns entry t) and accumulated in block-local fixed
- * row order, so the reduction is deterministic and needs no atomics. */
+/* Assemble J^T J, J^T r and the SSE at `c`. Every statistic is owned by one
+ * thread and accumulated in block-local fixed row order, so the reduction is
+ * deterministic and needs no atomics. When the block is narrower than the
+ * statistic count a thread owns several entries (see ft_assemble_d). */
+template <int MAXC, int CHUNK>
 __device__ void ft_assemble(const unsigned int *nd,
                             int m,
                             const float *__restrict__ cols,
@@ -863,40 +924,30 @@ __device__ void ft_assemble(const unsigned int *nd,
     const int tid = threadIdx.x;
     const int tri = p * (p + 1) / 2;
     const int total = tri + p + 1;
-    int kind = -1;   /* 0 = jtj, 1 = jtr, 2 = sse */
-    int ei = 0, ej = 0, which = 0;
-    if (tid < total) {
-        if (tid < tri) {
-            kind = 0;
-            int k = 0;
-            for (int i = 0; i < p; ++i) {
-                for (int j = 0; j <= i; ++j, ++k) {
-                    if (k == tid) {
-                        ei = i;
-                        ej = j;
-                    }
-                }
-            }
-        } else if (tid < tri + p) {
-            kind = 1;
-            which = tid - tri;
-        } else {
-            kind = 2;
-        }
+    int own[FT_OWNED(MAXC, CHUNK)];
+    int own_kind[FT_OWNED(MAXC, CHUNK)];
+    int own_i[FT_OWNED(MAXC, CHUNK)];
+    int own_j[FT_OWNED(MAXC, CHUNK)];
+    double acc[FT_OWNED(MAXC, CHUNK)];
+    int nown = 0;
+    for (int s = tid; s < total; s += CHUNK) {
+        own[nown] = s;
+        own_kind[nown] = ft_stat_kind(s, tri, p, &own_i[nown], &own_j[nown]);
+        acc[nown] = 0.0;
+        ++nown;
     }
-    double acc = 0.0;
-    for (int base = 0; base < n; base += FT_CHUNK) {
-        const int rows = min(FT_CHUNK, n - base);
+    for (int base = 0; base < n; base += CHUNK) {
+        const int rows = min(CHUNK, n - base);
         const int row = base + tid;
         if (row < n) {
             float vt[FT_MAX_NODES];
             float adj[FT_MAX_NODES];
-            float g[FT_MAX_CONST];
+            float g[MAXC];
             ft_forward(nd, m, cols, n, row, c, vt);
             const float pred = vt[m - 1];
             const float r = pred - y[row];
             bool ok = isfinite(pred) && fabsf(pred) <= 1e30f && isfinite(r);
-            ft_backward(nd, m, vt, adj, g, p);
+            ft_backward<MAXC>(nd, m, vt, adj, g, p);
             for (int j = 0; j < p; ++j) {
                 if (!isfinite(g[j])) ok = false;
                 sg[tid * p + j] = ok ? g[j] : 0.0f;
@@ -908,37 +959,40 @@ __device__ void ft_assemble(const unsigned int *nd,
             sr[tid] = 0.0f;
         }
         __syncthreads();
-        if (kind == 0) {
-            for (int k = 0; k < rows; ++k) {
-                acc += (double)(sg[k * p + ei] * sg[k * p + ej]);
-            }
-        } else if (kind == 1) {
-            for (int k = 0; k < rows; ++k) {
-                acc += (double)(sg[k * p + which] * sr[k]);
-            }
-        } else if (kind == 2) {
-            for (int k = 0; k < rows; ++k) {
-                acc += (double)(sr[k] * sr[k]);
+        for (int o = 0; o < nown; ++o) {
+            if (own_kind[o] == 0) {
+                const int ei = own_i[o];
+                const int ej = own_j[o];
+                for (int k = 0; k < rows; ++k) {
+                    acc[o] += (double)(sg[k * p + ei] * sg[k * p + ej]);
+                }
+            } else if (own_kind[o] == 1) {
+                const int which = own[o] - tri;
+                for (int k = 0; k < rows; ++k) {
+                    acc[o] += (double)(sg[k * p + which] * sr[k]);
+                }
+            } else {
+                for (int k = 0; k < rows; ++k) {
+                    acc[o] += (double)(sr[k] * sr[k]);
+                }
             }
         }
         __syncthreads();
     }
-    if (kind == 0) {
-        int k = 0;
-        for (int i = 0; i < p; ++i) {
-            for (int j = 0; j <= i; ++j, ++k) {
-                if (k == tid) jtj[k] = acc;
-            }
+    for (int o = 0; o < nown; ++o) {
+        if (own_kind[o] == 0) {
+            jtj[own[o]] = acc[o];
+        } else if (own_kind[o] == 1) {
+            jtr[own[o] - tri] = acc[o];
+        } else {
+            *psse = acc[o];
         }
-    } else if (kind == 1) {
-        jtr[which] = acc;
-    } else if (kind == 2) {
-        *psse = acc;
     }
     __syncthreads();
 }
 
 /* Value-only SSE sweep of `c` for the trial step. Fixed-order f64 reduction. */
+template <int CHUNK>
 __device__ double ft_sse(const unsigned int *nd,
                          int m,
                          const float *__restrict__ cols,
@@ -949,7 +1003,7 @@ __device__ double ft_sse(const unsigned int *nd,
 {
     const int tid = threadIdx.x;
     double local = 0.0;
-    for (int row = tid; row < n; row += FT_CHUNK) {
+    for (int row = tid; row < n; row += CHUNK) {
         float vt[FT_MAX_NODES];
         ft_forward(nd, m, cols, n, row, c, vt);
         const float pred = vt[m - 1];
@@ -962,7 +1016,7 @@ __device__ double ft_sse(const unsigned int *nd,
     }
     red[tid] = local;
     __syncthreads();
-    for (int st = FT_CHUNK / 2; st > 0; st >>= 1) {
+    for (int st = CHUNK / 2; st > 0; st >>= 1) {
         if (tid < st) red[tid] += red[tid + st];
         __syncthreads();
     }
@@ -973,6 +1027,7 @@ __device__ double ft_sse(const unsigned int *nd,
 
 /* Damped Cholesky solve in f64. Returns 0 on success, 1 on a non-positive
  * pivot or a condition-number gate (`rho = max L_ii / min L_ii > 1e4`). */
+template <int MAXC>
 __device__ int ft_solve(const double *jtj,
                         const double *jtr,
                         double lambda,
@@ -1017,7 +1072,7 @@ __device__ int ft_solve(const double *jtj,
             }
         }
     }
-    double rhs[FT_MAX_CONST];
+    double rhs[MAXC];
     for (int i = 0; i < p; ++i) rhs[i] = -jtr[i];
     for (int i = 0; i < p; ++i) {
         double s = rhs[i];
@@ -1040,6 +1095,7 @@ __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
     if (i < n) dst[i] = (double)src[i];
 }
 
+template <int MAXC, int CHUNK, int PCHUNK>
 __global__ void fit_kernel(const float *__restrict__ cols,
                            const float *__restrict__ y,
                            const double *__restrict__ cols64,
@@ -1062,29 +1118,16 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     const int words = (int)(off[cand + 1] - off[cand]);
     const int m = words / 4;
     const unsigned int *nd = prog + off[cand];
-    const int tri = p * (p + 1) / 2;
 
-    __shared__ double sc[FT_MAX_CONST];
-    __shared__ double sjtj[FT_MAX_STATS];
-    __shared__ double sjtr[FT_MAX_CONST];
-    __shared__ double sL[FT_MAX_CONST * FT_MAX_CONST];
-    __shared__ double strial[FT_MAX_CONST];
-    __shared__ double sdelta[FT_MAX_CONST];
-    __shared__ double sred[FT_CHUNK];
-    __shared__ float sg[FT_CHUNK * FT_MAX_CONST];
-    __shared__ float sr[FT_CHUNK];
-    __shared__ double sdg[FT_PCHUNK * FT_MAX_CONST];
-    __shared__ double sdr[FT_PCHUNK];
-    __shared__ int sbad;
-    __shared__ int ssolved;
-    __shared__ double slambda;
-    __shared__ double sbest;
+    extern __shared__ char ft_smem_raw[];
+    FtSmem<MAXC, CHUNK, PCHUNK> *S =
+        reinterpret_cast<FtSmem<MAXC, CHUNK, PCHUNK> *>(ft_smem_raw);
 
-    if (tid < p) sc[tid] = c0[(size_t)cand * (size_t)kmax + (size_t)tid];
+    if (tid < p) S->sc[tid] = c0[(size_t)cand * (size_t)kmax + (size_t)tid];
     if (tid == 0) {
-        sbad = 0;
-        slambda = 1e-3;
-        sbest = 0.0;
+        S->sbad = 0;
+        S->slambda = 1e-3;
+        S->sbest = 0.0;
     }
     __syncthreads();
 
@@ -1094,42 +1137,42 @@ __global__ void fit_kernel(const float *__restrict__ cols,
 
     if (iters > 0) {
         /* First assembly also supplies the baseline SSE. */
-        ft_assemble(nd, m, cols, y, n, p, sc, sg, sr, sjtj, sjtr, &sbest, &sbad);
+        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
         assembled = 1;
-        best = sbest;
-        if (sbad) status = 2;
+        best = S->sbest;
+        if (S->sbad) status = 2;
         for (int it = 0; it < iters && status == 0; ++it) {
             if (!assembled) {
-                ft_assemble(nd, m, cols, y, n, p, sc, sg, sr, sjtj, sjtr, &sbest, &sbad);
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
                 assembled = 1;
-                if (sbad) {
+                if (S->sbad) {
                     status = 2;
                     break;
                 }
             }
             if (tid == 0) {
-                ssolved = (ft_solve(sjtj, sjtr, slambda, p, sdelta, sL) == 0);
+                S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL) == 0);
             }
             __syncthreads();
-            if (!ssolved) {
+            if (!S->ssolved) {
                 status = 1;
                 break;
             }
             if (tid < p) {
-                double t = sc[tid] + sdelta[tid];
-                strial[tid] = fmin(1e6, fmax(-1e6, t));
+                double t = S->sc[tid] + S->sdelta[tid];
+                S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_sse(nd, m, cols, y, n, strial, sred);
+            double tsse = ft_sse<CHUNK>(nd, m, cols, y, n, S->strial, S->sred);
             if (tsse < best) {
-                if (tid < p) sc[tid] = strial[tid];
+                if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
-                if (tid == 0) slambda = fmax(slambda / 8.0, 1e-12);
+                if (tid == 0) S->slambda = fmax(S->slambda / 8.0, 1e-12);
                 assembled = 0;
                 if (best == 0.0) break;
             } else {
-                if (tid == 0) slambda *= 6.0;
-                if (slambda > 1e9) break;
+                if (tid == 0) S->slambda *= 6.0;
+                if (S->slambda > 1e9) break;
             }
             __syncthreads();
         }
@@ -1137,28 +1180,28 @@ __global__ void fit_kernel(const float *__restrict__ cols,
            f32 assembly, and comparing an f64 trial against it would reject
            every polish step on a systematic rounding difference alone. */
         if (status == 0) {
-            const double exact = ft_sse_d(nd, m, cols64, y64, n, sc, sred);
+            const double exact = ft_sse_d<PCHUNK>(nd, m, cols64, y64, n, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
         for (int it = 0; it < 4 && status == 0 && best != 0.0; ++it) {
-            ft_assemble_d(nd, m, cols64, y64, n, p, sc, sdg, sdr, sjtj, sjtr, &sbest, &sbad);
+            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, n, p, S->sc, S->sdg, S->sdr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
             assembled = 1;
-            if (sbad) {
+            if (S->sbad) {
                 status = 2;
                 break;
             }
-            if (tid == 0) ssolved = (ft_solve(sjtj, sjtr, 0.0, p, sdelta, sL) == 0);
+            if (tid == 0) S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL) == 0);
             __syncthreads();
-            if (!ssolved) break;
+            if (!S->ssolved) break;
             if (tid < p) {
-                double t = sc[tid] + sdelta[tid];
-                strial[tid] = fmin(1e6, fmax(-1e6, t));
+                double t = S->sc[tid] + S->sdelta[tid];
+                S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_sse_d(nd, m, cols64, y64, n, strial, sred);
+            double tsse = ft_sse_d<PCHUNK>(nd, m, cols64, y64, n, S->strial, S->sred);
             if (tsse < best) {
-                if (tid < p) sc[tid] = strial[tid];
+                if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
             } else {
                 break;
@@ -1170,10 +1213,63 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     (void)v;
     __syncthreads();
     if (tid == 0) {
-        for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = sc[i];
+        for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
         outstatus[cand] = status;
     }
+}
+
+/* Shape of the instantiation that owns a batch whose largest constant count is
+ * `kmax`. Returns 0 and fills the out-parameters, or -1 when `kmax` is past the
+ * largest instantiation (the caller then keeps the CPU arm). */
+int ft_kernel_shape(int kmax, int *threads, int *smem_bytes, int *max_constants)
+{
+    if (kmax <= FT_MAX_CONST_SMALL) {
+        *threads = FT_CHUNK_SMALL;
+        *smem_bytes = (int)sizeof(FtSmem<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>);
+        *max_constants = FT_MAX_CONST_SMALL;
+        return 0;
+    }
+    if (kmax <= FT_MAX_CONST_LARGE) {
+        *threads = FT_CHUNK_LARGE;
+        *smem_bytes = (int)sizeof(FtSmem<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>);
+        *max_constants = FT_MAX_CONST_LARGE;
+        return 0;
+    }
+    return -1;
+}
+
+/* Launch one instantiation of the fit kernel. The shared block is dynamic, so
+ * the p=20 instantiation is not limited by the 48 KB static ceiling; the
+ * opt-in limit is raised once per instantiation. Returns 0 on success. */
+template <int MAXC, int CHUNK, int PCHUNK>
+static int ft_launch(RcCtx *c,
+                     int nprog,
+                     int kmax,
+                     const unsigned int *d_prog,
+                     const unsigned int *d_off,
+                     const int *d_p,
+                     const double *d_c0,
+                     int iters,
+                     double *d_c,
+                     double *d_sse,
+                     int *d_status)
+{
+    const int bytes = (int)sizeof(FtSmem<MAXC, CHUNK, PCHUNK>);
+    static int opted_in = 0;
+    if (!opted_in) {
+        if (cudaFuncSetAttribute((const void *)fit_kernel<MAXC, CHUNK, PCHUNK>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) !=
+            cudaSuccess) {
+            cudaGetLastError();
+            return -1;
+        }
+        opted_in = 1;
+    }
+    fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes>>>(
+        c->d_cols, c->d_y, c->d_cols64, c->d_y64, c->n, c->v, d_prog, d_off, d_p,
+        kmax, d_c0, iters, d_c, d_sse, d_status);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 /* #122: canonical postfix hash, FNV-1a over the words up to and including
@@ -1584,7 +1680,7 @@ float rc_fit_batch(void *ctx,
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nprog <= 0 || kmax <= 0) return -1.0f;
-    if (kmax > FT_MAX_CONST) return -1.0f;
+    if (kmax > FT_MAX_CONST_LARGE) return -1.0f;
     unsigned int *d_prog = 0;
     unsigned int *d_off = 0;
     int *d_p = 0;
@@ -1629,12 +1725,17 @@ float rc_fit_batch(void *ctx,
         rc_upload(d_p, pcount, sizeof(int) * (size_t)nprog);
         rc_upload(d_c0, c0, cbytes);
         cudaEventRecord(c->t0, 0);
-        fit_kernel<<<nprog, FT_CHUNK>>>(c->d_cols, c->d_y, c->d_cols64, c->d_y64, c->n, c->v,
-                                        d_prog, d_off, d_p, kmax, d_c0,
-                                        iters, d_c, d_sse, d_status);
+        int launched;
+        if (kmax <= FT_MAX_CONST_SMALL) {
+            launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, iters, d_c, d_sse, d_status);
+        } else {
+            launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, iters, d_c, d_sse, d_status);
+        }
         cudaEventRecord(c->t1, 0);
         cudaEventSynchronize(c->t1);
-        if (cudaGetLastError() != cudaSuccess) {
+        if (launched != 0 || cudaGetLastError() != cudaSuccess) {
             ok = 0;
         } else {
             rc_download(outc, d_c, cbytes);
@@ -1653,6 +1754,16 @@ float rc_fit_batch(void *ctx,
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
+}
+
+/* Shape of the fit-kernel instantiation that would run a batch whose largest
+ * constant count is `kmax`: block width, dynamic shared bytes and the largest
+ * constant count of that instantiation. Returns 0, or -1 when `kmax` is past
+ * every instantiation (such a batch stays on the CPU). Diagnostics only. */
+int rc_fit_kernel_info(int kmax, int *threads, int *smem_bytes, int *max_constants)
+{
+    if (!threads || !smem_bytes || !max_constants) return -1;
+    return ft_kernel_shape(kmax, threads, smem_bytes, max_constants);
 }
 
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.
