@@ -351,7 +351,9 @@ atomically instead of streaming it. See
   Windows are causal and gap-aware, warm-up is reported per column, and the
   `py15m` group reproduces the 35 Python enrichment columns on a committed
   parity fixture. The CPU path is always available; a per-family cost model
-  decides CPU vs GPU and records the reason. See
+  decides CPU vs GPU and records the reason, GPU builds upload the source
+  columns once and report the GPU column share, and the 3.9M-row measurement
+  keeps only the families that actually beat the CPU on the GPU. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
