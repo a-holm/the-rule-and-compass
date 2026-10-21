@@ -59,12 +59,43 @@ rcsr panel build --data hourly_base.rcsb --membership membership.csv \
   --bar-seconds 3600 --resume work/panel-parts --out panel.rcsb
 ```
 
-Each symbol writes one atomic `<symbol>.part`; a re-run reads existing parts and
-skips those symbols, printing `panel build: resume N/M symbols (P%), K part(s)
-reused`. `state.txt` pins the bar step and membership row count, so a part built
-from a different membership is refused rather than silently mixed in. The part
-cache is deterministic: the one-shot and resumed builds have the same rows,
-gaps and delisted set (a test pins this).
+Each symbol writes one atomic `<symbol>.part` and a `parts.txt` index, and
+`state.txt` pins the cache. The part is a fixed 96-byte binary record per row
+(`ts, member_asof, gap, flags, nine f64`) behind a 44-byte header (magic,
+version, bar step, the symbol's series end, row count and an FNV-1a of the
+payload); the store's own SHA-256 is not needed inside each part because
+`state.txt` pins it. Reading a part is `fs::read` plus a copy: no text parsing,
+no float formatting, so a warm read is much cheaper than the store parse it
+replaces.
+
+`state.txt` records `version`, `step`, `store_sha256`, `membership_key` (a
+SHA-256 of the loaded decisions, so re-serialising the CSV does not invalidate
+anything) and `settings` (`--migrations`). `--jobs` is deliberately absent: it
+changes nothing about the rows.
+
+Three modes:
+
+| cache | behaviour |
+|---|---|
+| absent | build every part from the input, then write `parts.txt` |
+| warm (`state.txt` matches, `parts.txt` present) | **do not read the input at all**; read the parts and reassemble the panel |
+| other inputs or an older format | with `--data` in hand the directory is rebuilt in place (every part is dropped first, so no stale row can enter); without it the warm load refuses |
+
+A part is also validated against its recorded series end and checksum, so a
+deleted, truncated or edited part is refused (`... does not match the cache
+index`) or rebuilt from the input rather than silently shrinking the panel. The
+resumed build is deterministic: cold and warm writes produce the same rows and a
+**byte-identical store** (tests pin row equality and the SHA-256 of the written
+`.rcsb`).
+
+`rcsr panel membership --cache <dir>` does the same for the membership table,
+which costs ~10 s because it reshapes the whole store. Its key is the store
+SHA-256 plus every ranking setting (`--top`, `--lookback`, `--rebalance`,
+`--min-history`, `--min-bars`, `--min-adv`, `--start`, `--end`). A warm run
+copies the cached CSV out and prints `panel membership: cached (...)`. The store
+checksum is taken from the manifest `rcsr prep` writes beside the store when
+that manifest still agrees with the file's byte count; otherwise the store is
+hashed (see the measured note on why re-reading 1.5 GB matters).
 
 `rcsr prep` has the same shape of cache behind `--resume <dir>`: one atomic
 spool plus a checksum sidecar per symbol, keyed by the archive SHA-256 and the
@@ -194,7 +225,7 @@ already excluded), `top=100`, `lookback=90`, `min-history=90`.
 | new PIT daily | 232,006 | 432 | 129 | 2018-04..2026-06 | 23.2 MB | 16.9 s |
 | old hourly compact | — | 100 | 0 | — | 1.8 GB `.rcsb` | Python |
 | old hourly PIT (109-name input) | 3,515,245 | 108 | 19 | 2021-01..2026-09 | 336 MB | 11.2 s |
-| **new PIT hourly (full archive)** | **4,775,757** | **445** | **332** | **2021-01..2026-06** | **478 MB** | **32.6 s** build |
+| **new PIT hourly (full archive)** | **4,775,757** | **445** | **332** | **2021-01..2026-06** | **478 MB** | **15.8 s** build (32.6 s before the binary parts) |
 
 The new hourly panel is built from `raw_15m_all` (636 symbol directories,
 24,952 monthly ZIPs, 2017-08..2026-06), not the old 109-name survivor download:
@@ -204,7 +235,8 @@ rcsr prep --input raw_15m_all --format binance --resample 1h --jobs 8 \
   --resume work/prep-parts --out hourly_base.rcsb
 rcsr panel membership --data hourly_base.rcsb --start 2021-01-01 \
   --end 2026-07-01 --top 100 --lookback 90 --min-history 90 --min-bars 60 \
-  --rebalance 30 --out membership_hourly_pit.csv
+  --rebalance 30 --cache work/membership-cache \
+  --out membership_hourly_pit.csv
 rcsr panel build --data hourly_base.rcsb --membership membership_hourly_pit.csv \
   --bar-seconds 3600 --start 2021-01-01 --end 2026-07-01 \
   --resume work/panel-parts --snapshot snapshot.json \
@@ -218,37 +250,58 @@ inside continued series. Store SHA-256
 `6caa29791e05d07b8eb1ce5af820d030a9d8e97c7eb6ca35bb3f1c2587eb2682`.
 The panel stops at 2026-06-30, so its manifest lockbox block has `rows: 0`.
 
-### Rebuild cost after the prep cache (2026-10-21)
+### Rebuild cost with both caches (2026-10-21)
 
-Measured on the same host, one stage at a time. `prep` cold (new `--resume`
-directory, 24,952 ZIPs parsed) and warm (586/586 parts reused, 0 parsed):
+Same host, 8 cores, one stage at a time through the shared build lock, empty
+caches for the cold run. Prep cold parses all 24,952 ZIPs; warm reuses 586/586
+symbols and 0 parsed. The panel is built from 586 binary parts and the warm run
+reads the parts only (0 store parse).
 
-| stage | cold | warm (all parts reused) | peak RSS (warm) |
-|---|---:|---:|---:|
-| prep 15m -> 1h, `--jobs 8` | **172.1 s** (6.59 GB RSS) | **16.0 s / 31.6 s** (two runs) | 2.05 GB |
-| membership | 9.9 s | 9.9 s (not cached) | 3.16 GB |
-| panel build, 586 parts | **32.6 s** | **42.0 s** | 4.62 GB |
-| **full pipeline** | **214 s** | **73.1 s** (prep 21.4 + membership 9.7 + panel 42.0) | — |
+| stage | cold | warm, parts resident | warm, parts partly evicted | peak RSS |
+|---|---:|---:|---:|---:|
+| prep 15m -> 1h, `--jobs 8` | **178.97 s** | **15.20 s** | **26.10 s** | 6.62 GB cold / 2.05 GB warm |
+| membership (`--cache`) | 7.72 s | **0.01 s** | **0.03 s** | 3.23 GB cold / 8 MB warm |
+| panel build, 586 parts | **15.83 s** | **10.00 s** | **14.51 s** | 3.24 GB cold / 1.46 GB warm |
+| **full pipeline** | **202.6 s** | **29.8 s** | **36.1 s** | — |
 
-The warm prep store is byte-identical to the cold one and to the pre-cache
-baseline: 1,505,748,818 bytes, SHA-256
-`d328b6f1cb3011cb37a71da4c4df86d7999d4826b09cd230ff5eeb2af2325b53`
-(the manifest is identical too). The warm panel is SHA-256
-`6caa29791e05d07b8eb1ce5af820d030a9d8e97c7eb6ca35bb3f1c2587eb2682`,
-byte-identical to the cold panel. Warm prep wall time varies with page cache
-(16.0 s when the 1.4 GB of parts and 2.8 GB of ZIPs are resident, 31.6 s after
-other builds evicted them); the pipeline run above is the conservative 21.4 s.
+Page cache and disk, from `/usr/bin/time -v`:
 
-**The <=60 s box is not reached on the reuse path: 73.1 s, 13.1 s over.** `prep`
-is no longer the blocker; the panel `--resume` path is. Its text `.part` files
-take 42.0 s to re-read and parse, while a cold panel build parses the 1.5 GB
-store in 32.6 s. Rebuilding the panel parts (no `--resume`) would give
-21.4 + 9.7 + 32.6 = 63.7 s, still over, and 16.0 + 9.7 + 32.6 = 58.3 s only on
-a warm page cache, which is too marginal to claim. Closing the box needs a
-binary (or column-block) panel part so reuse is cheaper than the cold parse, or
-a panel builder that consumes the prep parts directly; membership (9.7 s) would
-also need a cache keyed by the prep store hash to leave headroom. Cold from
-scratch is 214 s, dominated by the 172 s ZIP parse.
+| run | stage | wall | FS blocks read | note |
+|---|---|---:|---:|---|
+| cold | prep | 178.97 s | 520,280 | 24,952 ZIPs parsed |
+| cold | panel | 15.83 s | 0 | store and parts resident |
+| warm 1 | prep | 26.10 s | 2,189,496 | spools and ZIPs evicted by the cold run |
+| warm 1 | panel | 10.00 s | 0 | parts written by the cold run, resident |
+| warm 2 | prep | 15.20 s | 0 | everything resident |
+| warm 2 | panel | 14.51 s | 898,312 | ~439 MB of parts partly evicted |
+
+A cache hit does almost no work: `panel membership: cached (store sha256
+d328b6f1cb30)`, `prep: resume 586/586 symbols (100.0%), 586 reused, 0 parsed`,
+`panel build: resume 586/586 symbols (100.0%), 586 part(s) reused, 0 parsed`.
+The spread between the two warm runs is page cache, not different work.
+
+All three artefacts are byte-identical across cold and warm:
+
+| artefact | bytes | SHA-256 |
+|---|---:|---|
+| prep store `base.rcsb` | 1,505,748,818 | `d328b6f1cb3011cb37a71da4c4df86d7999d4826b09cd230ff5eeb2af2325b53` |
+| membership CSV | 868,307 | `85501f878324372e477f32426bea83c68b8fd7c2db98555bf5de95abc8924cd6` |
+| panel `panel.rcsb` | 477,591,961 | `6caa29791e05d07b8eb1ce5af820d030a9d8e97c7eb6ca35bb3f1c2587eb2682` |
+
+The panel hash is also the pre-cache baseline, so the cache changes cost, not
+bytes. The cold and warm panel manifests differ only in the input/output file
+names (the recorded input and output hashes are identical).
+
+**The <=60 s box is met with headroom on the reuse path: 29.8-36.1 s.** It is
+not claimed for a cold rebuild (202.6 s, dominated by the 179 s ZIP parse), and
+not for a partially populated cache (a changed store, membership or settings
+rebuilds the directory in place, which costs the cold panel build again). The
+binary part is what closed the gap: the old text parts cost 42.0 s to re-read
+and parse, more than the 32.6 s cold parse they replaced; the 96-byte records
+cost ~10-15 s for the whole warm panel including the 477 MB store write. The
+membership cache removes the remaining 9.7 s, and the input store is keyed by
+the SHA-256 its prep manifest already records, so a warm run does not re-read
+1.5 GB to hash it (an absent or mismatching manifest falls back to hashing).
 
 Membership selects at most 100 names per period; the per-year union is larger
 because names rotate. The delisted list includes FTT, LUNA, TOMOUSDT, MATIC and

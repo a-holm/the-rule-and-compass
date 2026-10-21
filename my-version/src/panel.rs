@@ -143,7 +143,9 @@ impl Panel {
         self.rows.retain(|r| {
             start.map_or(true, |s| r.bar.time >= s) && end.map_or(true, |e| r.bar.time < e)
         });
-        let mut last: BTreeMap<String, i64> = BTreeMap::new();
+        // Rows are ordered by time, so the last write per symbol is its latest
+        // bar; borrowing the symbol avoids 4.7M string clones on a big panel.
+        let mut last: BTreeMap<&str, i64> = BTreeMap::new();
         let mut first_ts = i64::MAX;
         let mut last_ts = i64::MIN;
         let mut gaps = 0usize;
@@ -151,18 +153,17 @@ impl Panel {
             first_ts = first_ts.min(r.bar.time);
             last_ts = last_ts.max(r.bar.time);
             gaps += r.gap_buckets;
-            last.entry(r.symbol.clone())
-                .and_modify(|t| *t = (*t).max(r.bar.time))
-                .or_insert(r.bar.time);
+            last.insert(r.symbol.as_str(), r.bar.time);
         }
-        self.symbols = self.rows.iter().map(|r| r.symbol.clone()).collect();
+        self.symbols = last.keys().map(|s| s.to_string()).collect();
         self.first_ts = if self.rows.is_empty() { 0 } else { first_ts };
         self.last_ts = if self.rows.is_empty() { 0 } else { last_ts };
         self.gaps = gaps;
+        let end = self.last_ts;
         self.delisted = last
             .into_iter()
-            .filter(|(_, t)| *t < self.last_ts - 30 * 86_400)
-            .map(|(s, _)| s)
+            .filter(|(_, t)| *t < end - 30 * 86_400)
+            .map(|(s, _)| s.to_string())
             .collect();
     }
 
@@ -381,13 +382,27 @@ fn symbol_panel_rows(
 }
 
 fn assemble_panel(
-    mut rows: Vec<PanelRow>,
+    rows: Vec<PanelRow>,
     series: &BTreeMap<String, Vec<Bar>>,
+) -> Result<Panel, String> {
+    let last: BTreeMap<String, i64> = series
+        .iter()
+        .filter_map(|(s, v)| v.last().map(|b| (s.clone(), b.time)))
+        .collect();
+    assemble_panel_with_last(rows, &last)
+}
+
+/// Assemble rows when the end of each symbol's input series is already known.
+/// A warm resumed build never reads the series, so it takes them from the part
+/// headers; the delisted set is therefore identical to the cold build's.
+fn assemble_panel_with_last(
+    mut rows: Vec<PanelRow>,
+    last: &BTreeMap<String, i64>,
 ) -> Result<Panel, String> {
     if rows.is_empty() {
         return Err("panel: membership selects no rows".to_string());
     }
-    rows.sort_by(|a, b| a.bar.time.cmp(&b.bar.time).then(a.symbol.cmp(&b.symbol)));
+    rows.sort_unstable_by(|a, b| a.bar.time.cmp(&b.bar.time).then_with(|| a.symbol.cmp(&b.symbol)));
     let symbols: BTreeSet<String> = rows.iter().map(|r| r.symbol.clone()).collect();
     let first_ts = rows.iter().map(|r| r.bar.time).min().unwrap_or(0);
     let last_ts = rows.iter().map(|r| r.bar.time).max().unwrap_or(0);
@@ -396,13 +411,7 @@ fn assemble_panel(
     // not forward-filled.
     let delisted: BTreeSet<String> = symbols
         .iter()
-        .filter(|s| {
-            series
-                .get(*s)
-                .and_then(|v| v.last())
-                .map(|b| b.time < last_ts - 30 * 86_400)
-                .unwrap_or(true)
-        })
+        .filter(|s| last.get(*s).map(|t| *t < last_ts - 30 * 86_400).unwrap_or(true))
         .cloned()
         .collect();
     Ok(Panel {
@@ -423,17 +432,56 @@ fn part_name(symbol: &str) -> String {
     format!("{}.part", safe)
 }
 
-fn write_symbol_part(path: &std::path::Path, rows: &[PanelRow]) -> Result<(), String> {
-    use std::fmt::Write as _;
-    let mut text = String::new();
+// ---------------------------------------------------------------------------
+// Binary panel parts (issue #145, warm-rebuild budget)
+// ---------------------------------------------------------------------------
+//
+// A text part costs more to re-read than the whole 1.5 GB prep store costs to
+// parse, because every row is re-parsed from a 14-field line. A part is a
+// fixed-size binary record instead: reading one is `fs::read` plus a copy, with
+// no parsing and no float-formatting dependence.
+
+const PANEL_CACHE_VERSION: &str = "rcsr-panel-cache-2";
+const MEMBERSHIP_CACHE_VERSION: &str = "rcsr-membership-cache-1";
+const PART_MAGIC: &[u8; 8] = b"RCSRPART";
+const PART_VERSION: u32 = 2;
+/// magic 8 + version 4 + step 8 + series_last 8 + rows 8 + checksum 8.
+const PART_HEADER: usize = 44;
+/// ts 8 + as_of 8 + gap 4 + flags 4 + nine f64.
+const PART_RECORD: usize = 96;
+
+/// FNV-1a over the payload: cheap, and enough to catch a truncated, edited or
+/// half-written part. The store SHA-256 in `state.txt` pins the inputs.
+fn part_checksum(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+fn write_symbol_part(
+    path: &std::path::Path,
+    rows: &[PanelRow],
+    series_last: i64,
+    step: i64,
+) -> Result<u64, String> {
+    let mut buf = Vec::with_capacity(PART_HEADER + rows.len() * PART_RECORD);
+    buf.extend_from_slice(PART_MAGIC);
+    buf.extend_from_slice(&PART_VERSION.to_le_bytes());
+    buf.extend_from_slice(&step.to_le_bytes());
+    buf.extend_from_slice(&series_last.to_le_bytes());
+    buf.extend_from_slice(&(rows.len() as u64).to_le_bytes());
+    buf.extend_from_slice(&0u64.to_le_bytes());
     for r in rows {
         let b = r.bar;
-        let _ = writeln!(
-            text,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            b.time,
-            r.as_of,
-            r.gap_buckets,
+        buf.extend_from_slice(&b.time.to_le_bytes());
+        buf.extend_from_slice(&r.as_of.to_le_bytes());
+        buf.extend_from_slice(&(r.gap_buckets.min(u32::MAX as usize) as u32).to_le_bytes());
+        let flags = (b.complete as u32) | ((b.traded as u32) << 1);
+        buf.extend_from_slice(&flags.to_le_bytes());
+        for v in [
             b.open,
             b.high,
             b.low,
@@ -443,48 +491,283 @@ fn write_symbol_part(path: &std::path::Path, rows: &[PanelRow]) -> Result<(), St
             b.trades,
             b.taker_buy_base,
             b.taker_buy_quote,
-            b.complete as u8,
-            b.traded as u8
-        );
+        ] {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
     }
-    let tmp = path.with_extension("part.tmp");
+    debug_assert_eq!(buf.len(), PART_HEADER + rows.len() * PART_RECORD);
+    let sum = part_checksum(&buf[PART_HEADER..]);
+    buf[36..44].copy_from_slice(&sum.to_le_bytes());
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    std::fs::write(&tmp, &buf).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    Ok(sum)
+}
+
+struct PartHeader {
+    step: i64,
+    series_last: i64,
+    rows: usize,
+    checksum: u64,
+}
+
+fn parse_part_header(path: &std::path::Path, bytes: &[u8]) -> Result<PartHeader, String> {
+    if bytes.len() < PART_HEADER {
+        return Err(format!("{}: truncated panel part", path.display()));
+    }
+    if &bytes[0..8] != PART_MAGIC {
+        return Err(format!(
+            "{}: not a binary panel part; use a new --resume directory",
+            path.display()
+        ));
+    }
+    let u32_at = |o: usize| u32::from_le_bytes(bytes[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    let i64_at = |o: usize| i64::from_le_bytes(bytes[o..o + 8].try_into().unwrap());
+    if u32_at(8) != PART_VERSION {
+        return Err(format!(
+            "{}: panel part version {} (expected {})",
+            path.display(),
+            u32_at(8),
+            PART_VERSION
+        ));
+    }
+    let rows = u64_at(28) as usize;
+    let want = PART_HEADER + rows * PART_RECORD;
+    if bytes.len() != want {
+        return Err(format!(
+            "{}: {} bytes, expected {} for {} rows",
+            path.display(),
+            bytes.len(),
+            want,
+            rows
+        ));
+    }
+    let checksum = u64_at(36);
+    if part_checksum(&bytes[PART_HEADER..]) != checksum {
+        return Err(format!("{}: panel part checksum mismatch", path.display()));
+    }
+    Ok(PartHeader {
+        step: i64_at(12),
+        series_last: i64_at(20),
+        rows,
+        checksum,
+    })
+}
+
+/// Read one part: `(series end, checksum, rows)`.
+fn read_symbol_part(
+    path: &std::path::Path,
+    symbol: &str,
+    step: i64,
+) -> Result<(i64, u64, Vec<PanelRow>), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let h = parse_part_header(path, &bytes)?;
+    if h.step != step {
+        return Err(format!(
+            "{}: part was built with --bar-seconds {}, not {}",
+            path.display(),
+            h.step,
+            step
+        ));
+    }
+    let mut out = Vec::with_capacity(h.rows);
+    for rec in bytes[PART_HEADER..].chunks_exact(PART_RECORD) {
+        let i64_at = |o: usize| i64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
+        let u32_at = |o: usize| u32::from_le_bytes(rec[o..o + 4].try_into().unwrap());
+        let f64_at = |o: usize| f64::from_le_bytes(rec[o..o + 8].try_into().unwrap());
+        let flags = u32_at(20);
+        let mut bar =
+            Bar::new(i64_at(0), f64_at(24), f64_at(32), f64_at(40), f64_at(48), f64_at(56));
+        bar.quote_volume = f64_at(64);
+        bar.trades = f64_at(72);
+        bar.taker_buy_base = f64_at(80);
+        bar.taker_buy_quote = f64_at(88);
+        bar.complete = flags & 1 != 0;
+        bar.traded = flags & 2 != 0;
+        out.push(PanelRow {
+            symbol: symbol.to_string(),
+            bar,
+            as_of: i64_at(8),
+            gap_buckets: u32_at(16) as usize,
+        });
+    }
+    Ok((h.series_last, h.checksum, out))
+}
+
+/// One cache entry: the symbol's last bar in the input series plus the part's
+/// row count and checksum. A warm build uses it to detect a deleted, replaced
+/// or truncated part without reading the 1.5 GB input store.
+struct PartEntry {
+    series_last: i64,
+    rows: usize,
+    checksum: u64,
+}
+
+fn index_path(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("parts.txt")
+}
+
+/// Publish a small file atomically (`tmp` + rename).
+fn publish_text(path: &std::path::Path, text: &str) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
     std::fs::write(&tmp, text).map_err(|e| format!("{}: {}", tmp.display(), e))?;
     std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
-fn read_symbol_part(path: &std::path::Path, symbol: &str) -> Result<Vec<PanelRow>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+fn read_index(dir: &std::path::Path) -> Result<Vec<(String, PartEntry)>, String> {
+    let path = index_path(dir);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        let f: Vec<&str> = line.split('\t').collect();
-        if f.len() < 14 {
-            return Err(format!("{}:{}: expected 14 fields", path.display(), i + 1));
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
         }
-        let num = |k: usize| -> Result<f64, String> {
-            f[k].parse().map_err(|_| format!("{}:{}: bad number", path.display(), i + 1))
-        };
-        let mut bar = Bar::new(
-            f[0].parse().map_err(|_| format!("{}:{}: bad ts", path.display(), i + 1))?,
-            num(3)?,
-            num(4)?,
-            num(5)?,
-            num(6)?,
-            num(7)?,
-        );
-        bar.quote_volume = num(8)?;
-        bar.trades = num(9)?;
-        bar.taker_buy_base = num(10)?;
-        bar.taker_buy_quote = num(11)?;
-        bar.complete = f[12] != "0";
-        bar.traded = f[13] != "0";
-        out.push(PanelRow {
-            symbol: symbol.to_string(),
-            bar,
-            as_of: f[1].parse().map_err(|_| format!("{}:{}: bad as_of", path.display(), i + 1))?,
-            gap_buckets: f[2].parse().map_err(|_| format!("{}:{}: bad gap", path.display(), i + 1))?,
-        });
+        let f: Vec<&str> = line.split('\t').collect();
+        let line_no = i + 1;
+        if f.len() != 4 {
+            return Err(format!(
+                "{}:{}: expected symbol, series_last, rows, checksum",
+                path.display(),
+                line_no
+            ));
+        }
+        let bad = |what: &str| format!("{}:{}: bad {}", path.display(), line_no, what);
+        out.push((
+            f[0].to_string(),
+            PartEntry {
+                series_last: f[1].parse().map_err(|_| bad("series_last"))?,
+                rows: f[2].parse::<usize>().map_err(|_| bad("row count"))?,
+                checksum: f[3].parse().map_err(|_| bad("checksum"))?,
+            },
+        ));
     }
     Ok(out)
+}
+
+fn write_index(dir: &std::path::Path, index: &[(String, PartEntry)]) -> Result<(), String> {
+    let mut text = String::with_capacity(index.len() * 48 + 40);
+    text.push_str("# symbol\tseries_last\trows\tchecksum\n");
+    for (symbol, e) in index {
+        let _ = writeln!(text, "{}\t{}\t{}\t{}", symbol, e.series_last, e.rows, e.checksum);
+    }
+    publish_text(&index_path(dir), &text)
+}
+
+/// What a cache directory is pinned to. `--jobs` is deliberately absent: it
+/// changes nothing about the rows.
+fn cache_state_text(step: i64, store_sha256: &str, membership_key: &str, settings: &str) -> String {
+    format!(
+        "version={}\nstep={}\nstore_sha256={}\nmembership_key={}\nsettings={}\n",
+        PANEL_CACHE_VERSION, step, store_sha256, membership_key, settings
+    )
+}
+
+/// The SHA-256 of the input store, taken from the manifest that `rcsr prep`
+/// published beside it when that still describes the file.
+///
+/// Hashing a 1.5 GB store costs ~9 s on the reference host and a warm pipeline
+/// would pay it twice (membership and build), so the recorded checksum is
+/// preferred. A missing manifest, a non-hex value or a byte count that disagrees
+/// with the file falls back to hashing the store. An in-place edit that keeps
+/// both the byte length and the manifest is not detected; delete the manifest to
+/// force a hash.
+pub fn store_key(path: &str) -> String {
+    let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(u64::MAX);
+    let manifest_path = format!("{}.manifest.json", path);
+    if let Ok(text) = std::fs::read_to_string(&manifest_path) {
+        let sha = json_field(&text, "output_sha256");
+        let recorded = json_field(&text, "output_bytes").and_then(|v| v.parse::<u64>().ok());
+        if let Some(sha) = sha {
+            let hex = sha.len() == 64 && sha.bytes().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase());
+            if hex && recorded == Some(bytes) {
+                return sha;
+            }
+        }
+    }
+    manifest::sha256_file(path).unwrap_or_default()
+}
+
+/// Minimal `"key":value` extractor. The manifests are written by this crate and
+/// the crate is std-only, so a scan of the first occurrence is enough.
+fn json_field(text: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{}\":", key);
+    let start = text.find(&pat)? + pat.len();
+    let rest = text[start..].trim_start();
+    if let Some(r) = rest.strip_prefix('"') {
+        return Some(r[..r.find('"')?].to_string());
+    }
+    let end = rest
+        .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+        .unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// The membership cache key: the input store checksum plus every ranking
+/// setting that changes a decision.
+pub fn membership_cache_key(store_sha256: &str, cfg: &MembershipConfig) -> String {
+    format!(
+        "version={}\nstore_sha256={}\nrebalance={}\nlookback={}\nmin_history={}\n\
+         min_bars={}\ntop={}\nmin_adv={}\nstart={}\nend={}\n",
+        MEMBERSHIP_CACHE_VERSION,
+        store_sha256,
+        cfg.rebalance_days,
+        cfg.lookback_days,
+        cfg.min_history_days,
+        cfg.min_bars,
+        cfg.top,
+        cfg.min_adv_usd,
+        cfg.start.unwrap_or(0),
+        cfg.end.unwrap_or(0)
+    )
+}
+
+/// A stable digest of the loaded membership **decisions** (not the CSV bytes),
+/// so a cache stays valid when the same table is re-serialised.
+pub fn membership_key(membership: &Membership) -> String {
+    let mut text = String::with_capacity(membership.rows.len() * 48);
+    for r in &membership.rows {
+        let _ = writeln!(
+            text,
+            "{} {} {} {:.6} {}",
+            r.as_of, r.symbol, r.member as u8, r.adv_usd, r.n_bars
+        );
+    }
+    for as_of in &membership.as_of {
+        let _ = writeln!(text, "@{}", as_of);
+    }
+    manifest::sha256_hex(text.as_bytes())
+}
+
+/// Is `state_dir` a warm cache for exactly these inputs?
+///
+/// * `Ok(true)`: every part is present and indexed, so the input need not be
+///   read at all;
+/// * `Ok(false)`: no usable cache yet (none, or one built for other inputs);
+///   build one from the input.
+pub fn panel_cache_ready(
+    state_dir: &str,
+    step_seconds: i64,
+    store_sha256: &str,
+    membership: &Membership,
+    settings: &str,
+) -> Result<bool, String> {
+    let dir = std::path::Path::new(state_dir);
+    let wanted = cache_state_text(
+        step_seconds.max(1),
+        store_sha256,
+        &membership_key(membership),
+        settings,
+    );
+    match std::fs::read_to_string(dir.join("state.txt")) {
+        Ok(got) if got == wanted => Ok(index_path(dir).exists()),
+        Ok(_) => Ok(false),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Resumable panel build (issue #145). One part per symbol is written
@@ -492,65 +775,150 @@ fn read_symbol_part(path: &std::path::Path, symbol: &str) -> Result<Vec<PanelRow
 /// state file refuses a resumed directory built with a different step or
 /// membership so a stale part can never enter a new panel.
 pub fn build_panel_resumable(
-    series: &BTreeMap<String, Vec<Bar>>,
+    series: Option<&BTreeMap<String, Vec<Bar>>>,
     membership: &Membership,
     step_seconds: i64,
     state_dir: &str,
+    store_sha256: &str,
+    settings: &str,
 ) -> Result<Panel, String> {
     let step = step_seconds.max(1);
-    std::fs::create_dir_all(state_dir)
-        .map_err(|e| format!("{}: {}", state_dir, e))?;
-    let state_path = std::path::Path::new(state_dir).join("state.txt");
-    let wanted = format!(
-        "step={}\nmembership_rows={}\nfirst_as_of={}\nlast_as_of={}\n",
-        step,
-        membership.rows.len(),
-        membership.as_of.first().copied().unwrap_or(0),
-        membership.as_of.last().copied().unwrap_or(0)
-    );
-    if state_path.exists() {
-        let got = std::fs::read_to_string(&state_path)
-            .map_err(|e| format!("{}: {}", state_path.display(), e))?;
-        if got != wanted {
-            return Err(format!(
-                "{} was built with a different step or membership; remove it or use a new \
-                 --resume directory",
-                state_dir
-            ));
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("{}: {}", state_dir, e))?;
+    let dir = std::path::Path::new(state_dir);
+    let state_path = dir.join("state.txt");
+    let wanted = cache_state_text(step, store_sha256, &membership_key(membership), settings);
+    let reuse = match std::fs::read_to_string(&state_path) {
+        Ok(got) if got == wanted => true,
+        _ => {
+            // The directory holds a cache for other inputs (or an older
+            // format). With the input in hand the cache is rebuilt in place:
+            // every part is dropped first, so no stale row can enter the new
+            // panel. Without the input, a mismatch is refused rather than
+            // guessed at.
+            if series.is_none() {
+                return Err(format!(
+                    "{} was built with a different bar step, input checksum, membership or \
+                     settings; remove it or use a new --resume directory",
+                    state_dir
+                ));
+            }
+            if let Ok(it) = std::fs::read_dir(dir) {
+                for entry in it.filter_map(|e| e.ok()) {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".part")
+                        || name.ends_with(".tmp")
+                        || name == "parts.txt"
+                        || name == "state.txt"
+                    {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+            eprintln!("panel build: cache holds other inputs or an older format; rebuilding it");
+            publish_text(&state_path, &wanted)?;
+            false
         }
-    } else {
-        std::fs::write(&state_path, &wanted).map_err(|e| format!("{}: {}", state_path.display(), e))?;
-    }
-    let index = membership_index(membership);
-    let total = series.len();
-    let mut rows = Vec::new();
-    let mut reused = 0usize;
-    for (done, (symbol, bars)) in series.iter().enumerate() {
-        let path = std::path::Path::new(state_dir).join(part_name(symbol));
-        if path.exists() {
-            reused += 1;
-            rows.extend(read_symbol_part(&path, symbol)?);
-        } else {
-            let part = symbol_panel_rows(
-                symbol,
-                bars,
-                index.get(symbol.as_str()).map(|v| v.as_slice()),
-                step,
-            );
-            write_symbol_part(&path, &part)?;
-            rows.extend(part);
-        }
-        if (done + 1) % 25 == 0 || done + 1 == total {
+    };
+    let mut last: BTreeMap<String, i64> = BTreeMap::new();
+    let mut rows: Vec<PanelRow> = Vec::new();
+    match series {
+        None => {
+            // Warm path: the index pins the symbol set, so a deleted or edited
+            // part is an error rather than a quietly smaller panel.
+            if !reuse {
+                return Err(format!(
+                    "{} has no completed panel cache; run once with --data to build it",
+                    state_dir
+                ));
+            }
+            let index = read_index(dir)?;
+            if index.is_empty() {
+                return Err(format!("{}: panel part index is empty", state_dir));
+            }
+            for (symbol, entry) in &index {
+                let path = dir.join(part_name(symbol));
+                let (series_last, checksum, part) = read_symbol_part(&path, symbol, step)
+                    .map_err(|e| format!("{} (remove the directory and rebuild)", e))?;
+                if part.len() != entry.rows || checksum != entry.checksum {
+                    return Err(format!(
+                        "{} does not match the cache index; remove the directory and rebuild",
+                        path.display()
+                    ));
+                }
+                if series_last != entry.series_last {
+                    return Err(format!(
+                        "{} ends at {} but the index records {}; remove the directory and rebuild",
+                        path.display(),
+                        series_last,
+                        entry.series_last
+                    ));
+                }
+                last.insert(symbol.clone(), series_last);
+                rows.extend(part);
+            }
             eprintln!(
-                "panel build: resume {}/{} symbols ({:.1}%), {} part(s) reused",
-                done + 1,
-                total,
-                100.0 * (done + 1) as f64 / total.max(1) as f64,
-                reused
+                "panel build: resume {}/{} symbols (100.0%), {} part(s) reused, 0 parsed",
+                index.len(),
+                index.len(),
+                index.len()
             );
         }
+        Some(series) => {
+            let index = membership_index(membership);
+            let total = series.len();
+            let mut reused = 0usize;
+            let mut new_index: Vec<(String, PartEntry)> = Vec::with_capacity(total);
+            for (done, (symbol, bars)) in series.iter().enumerate() {
+                let path = dir.join(part_name(symbol));
+                let series_last = bars.last().map(|b| b.time).unwrap_or(0);
+                // A part is reused only when its recorded series end still
+                // matches the input, so a lengthened series is rebuilt.
+                let cached = if reuse && path.exists() {
+                    match read_symbol_part(&path, symbol, step) {
+                        Ok((part_last, checksum, part)) if part_last == series_last => {
+                            Some((checksum, part))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let (checksum, part) = match cached {
+                    Some((checksum, part)) => {
+                        reused += 1;
+                        (checksum, part)
+                    }
+                    None => {
+                        let part = symbol_panel_rows(
+                            symbol,
+                            bars,
+                            index.get(symbol.as_str()).map(|v| v.as_slice()),
+                            step,
+                        );
+                        let checksum = write_symbol_part(&path, &part, series_last, step)?;
+                        (checksum, part)
+                    }
+                };
+                last.insert(symbol.clone(), series_last);
+                new_index.push((
+                    symbol.clone(),
+                    PartEntry { series_last, rows: part.len(), checksum },
+                ));
+                rows.extend(part);
+                if (done + 1) % 25 == 0 || done + 1 == total {
+                    eprintln!(
+                        "panel build: resume {}/{} symbols ({:.1}%), {} part(s) reused",
+                        done + 1,
+                        total,
+                        100.0 * (done + 1) as f64 / total.max(1) as f64,
+                        reused
+                    );
+                }
+            }
+            write_index(dir, &new_index)?;
+        }
     }
-    assemble_panel(rows, series)
+    assemble_panel_with_last(rows, &last)
 }
 
 /// A canonical panel table: `ts, symbol, open..taker_buy_quote, gap, member_asof`.
@@ -575,14 +943,19 @@ pub fn panel_table(panel: &Panel) -> Table {
     let mut times = Vec::with_capacity(n);
     let mut sym_codes = Vec::with_capacity(n);
     let mut sym_levels: Vec<String> = Vec::new();
+    let mut level_of: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
     for r in &panel.rows {
         times.push(r.bar.time);
         cols[0].push(r.bar.time as f64);
-        let code = match sym_levels.iter().position(|s| s == &r.symbol) {
-            Some(c) => c as u32,
+        // Level codes are assigned in first-appearance order; a hash lookup
+        // keeps a 4.7M-row panel linear instead of scanning 445 levels per row.
+        let code = match level_of.get(r.symbol.as_str()) {
+            Some(c) => *c,
             None => {
                 sym_levels.push(r.symbol.clone());
-                (sym_levels.len() - 1) as u32
+                let c = (sym_levels.len() - 1) as u32;
+                level_of.insert(r.symbol.as_str(), c);
+                c
             }
         };
         sym_codes.push(code);
@@ -664,6 +1037,31 @@ pub fn write_panel_panel(
     Ok(manifest_path)
 }
 
+/// [`write_panel_panel`] with the SHA-256 of `inputs[0]` already known. A warm
+/// rebuild computes the store checksum for the cache key, and re-hashing 1.5 GB
+/// only to write the manifest would undo part of the saving.
+pub fn write_panel_panel_hashed(
+    out: &str,
+    panel: &Panel,
+    membership: &Membership,
+    inputs: &[&str],
+    first_sha256: &str,
+    group_rows: usize,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
+) -> Result<String, String> {
+    let table = panel_table(panel);
+    store::write_store_with_time(out, &table, group_rows, Some(0))?;
+    let mut known: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(first) = inputs.first() {
+        known.insert((*first).to_string(), first_sha256.to_string());
+    }
+    let text = provenance_json_with(inputs, &known, membership, panel, out, allow_lockbox, snapshot);
+    let manifest_path = format!("{}.manifest.json", out);
+    std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
+    Ok(manifest_path)
+}
+
 /// JSON provenance: inputs, as-of dates, counts, delisted names, gaps and
 /// checksums.
 pub fn provenance_json(
@@ -674,11 +1072,36 @@ pub fn provenance_json(
     allow_lockbox: bool,
     snapshot: Option<&str>,
 ) -> String {
+    provenance_json_with(
+        inputs,
+        &BTreeMap::new(),
+        membership,
+        panel,
+        output,
+        allow_lockbox,
+        snapshot,
+    )
+}
+
+/// [`provenance_json`] with some input checksums already computed.
+pub fn provenance_json_with(
+    inputs: &[&str],
+    known: &BTreeMap<String, String>,
+    membership: &Membership,
+    panel: &Panel,
+    output: &str,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
+) -> String {
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel\",");
     let _ = writeln!(s, "  \"inputs\":[");
     for (i, p) in inputs.iter().enumerate() {
-        let sha = manifest::sha256_file(p).unwrap_or_else(|_| "unknown".to_string());
+        let sha = known
+            .get(*p)
+            .cloned()
+            .or_else(|| manifest::sha256_file(p).ok())
+            .unwrap_or_else(|| "unknown".to_string());
         let bytes = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
         let comma = if i + 1 == inputs.len() { "" } else { "," };
         let _ = writeln!(
@@ -1132,6 +1555,7 @@ pub fn run(args: &[String]) -> ! {
     let mut end: Option<i64> = None;
     let mut allow_lockbox = false;
     let mut resume: Option<String> = None;
+    let mut membership_cache: Option<String> = None;
     let mut snapshot_path: Option<String> = None;
     let mut i = 1usize;
     while i < args.len() {
@@ -1203,6 +1627,10 @@ pub fn run(args: &[String]) -> ! {
                 resume = Some(val(i));
                 i += 1;
             }
+            "--cache" => {
+                membership_cache = Some(val(i));
+                i += 1;
+            }
             "--snapshot" => {
                 snapshot_path = Some(val(i));
                 i += 1;
@@ -1221,20 +1649,6 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(2);
         }
     };
-    let table = match read_table(&data) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(3);
-        }
-    };
-    let mut series = match series_from_table(&table) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {}", e);
-            std::process::exit(3);
-        }
-    };
     let migrations = match migrations_src.as_deref().map(parse_migrations).transpose() {
         Ok(m) => m.unwrap_or_default(),
         Err(e) => {
@@ -1242,25 +1656,68 @@ pub fn run(args: &[String]) -> ! {
             std::process::exit(2);
         }
     };
-    if !migrations.is_empty() {
-        match ohlcv::apply_migrations(&series, &migrations) {
-            Ok(s) => series = s,
-            Err(e) => {
-                eprintln!("error: {}", e);
-                std::process::exit(3);
-            }
+    // Reading and reshaping the 1.5 GB prep store into per-symbol bars costs
+    // ~15 s. A warm `build` must not pay it, so the table is loaded lazily.
+    let load_series = || -> BTreeMap<String, Vec<Bar>> {
+        let table = match read_table(&data) {
+            Ok(t) => t,
+            Err(e) => fail(&e),
+        };
+        let mut series = match series_from_table(&table) {
+            Ok(s) => s,
+            Err(e) => fail(&e),
+        };
+        if !migrations.is_empty() {
+            series = match ohlcv::apply_migrations(&series, &migrations) {
+                Ok(s) => s,
+                Err(e) => fail(&e),
+            };
         }
-    }
+        series
+    };
     // `--start/--end` scope the rebalance decisions as well as the output.
     cfg.start = start;
     cfg.end = end;
     match cmd {
         "membership" => {
+            // #145: the membership CSV is a pure function of the store and the
+            // ranking settings, and costs ~10 s because it reshapes the whole
+            // store. `--cache` keys it by the store SHA-256 so a warm pipeline
+            // does not recompute it.
+            let out = out.unwrap_or_else(|| "membership.csv".to_string());
+            let store_sha = store_key(&data);
+            let key = membership_cache_key(&store_sha, &cfg);
+            if let Some(dir) = &membership_cache {
+                let dir = std::path::Path::new(dir);
+                let state = dir.join("state.txt");
+                let csv = dir.join("membership.csv");
+                if std::fs::read_to_string(&state).map(|got| got == key).unwrap_or(false)
+                    && csv.exists()
+                {
+                    let text = std::fs::read_to_string(&csv)
+                        .unwrap_or_else(|e| fail(&format!("{}: {}", csv.display(), e)));
+                    publish_text(std::path::Path::new(&out), &text)
+                        .unwrap_or_else(|e| fail(&e));
+                    eprintln!(
+                        "panel membership: cached (store sha256 {}), {} as-of dates -> {}",
+                        &store_sha[..store_sha.len().min(12)],
+                        text.lines().count().saturating_sub(1),
+                        out
+                    );
+                    std::process::exit(0);
+                }
+                std::fs::create_dir_all(dir)
+                    .unwrap_or_else(|e| fail(&format!("{}: {}", dir.display(), e)));
+                // Publish the settings only with the table, so a crash leaves a
+                // stale state.txt pointing at no CSV (a miss), never a CSV that
+                // belongs to other settings.
+                let _ = std::fs::remove_file(&state);
+            }
+            let series = load_series();
             let m = match build_membership(&series, &cfg) {
                 Ok(m) => m,
                 Err(e) => fail(&e),
             };
-            let out = out.unwrap_or_else(|| "membership.csv".to_string());
             let mut text = String::from("as_of,symbol,member,adv_usd,n_bars\n");
             for r in &m.rows {
                 let _ = writeln!(
@@ -1269,8 +1726,13 @@ pub fn run(args: &[String]) -> ! {
                     r.as_of, r.symbol, r.member as u8, r.adv_usd, r.n_bars
                 );
             }
-            if let Err(e) = std::fs::write(&out, text) {
+            if let Err(e) = std::fs::write(&out, &text) {
                 fail(&format!("{}: {}", out, e));
+            }
+            if let Some(dir) = &membership_cache {
+                let dir = std::path::Path::new(dir);
+                publish_text(&dir.join("membership.csv"), &text).unwrap_or_else(|e| fail(&e));
+                publish_text(&dir.join("state.txt"), &key).unwrap_or_else(|e| fail(&e));
             }
             eprintln!(
                 "panel membership: {} decisions, {} as-of dates, {} selected -> {}",
@@ -1286,11 +1748,34 @@ pub fn run(args: &[String]) -> ! {
                 Ok(m) => m,
                 Err(e) => fail(&e),
             };
+            // The cache key is the input store checksum, the decisions and the
+            // settings that change a row. A mismatch is an error, not a mix.
+            let store_sha = store_key(&data);
+            let settings = migrations_src.clone().unwrap_or_default();
             let mut panel = match &resume {
-                Some(dir) => build_panel_resumable(&series, &m, bar_seconds, dir),
-                None => build_panel_with_step(&series, &m, bar_seconds),
-            }
-            .unwrap_or_else(|e| fail(&e));
+                Some(dir) => {
+                    let warm = panel_cache_ready(dir, bar_seconds, &store_sha, &m, &settings)
+                        .unwrap_or_else(|e| fail(&e));
+                    let panel = if warm {
+                        build_panel_resumable(None, &m, bar_seconds, dir, &store_sha, &settings)
+                    } else {
+                        let series = load_series();
+                        build_panel_resumable(
+                            Some(&series),
+                            &m,
+                            bar_seconds,
+                            dir,
+                            &store_sha,
+                            &settings,
+                        )
+                    };
+                    panel.unwrap_or_else(|e| fail(&e))
+                }
+                None => {
+                    let series = load_series();
+                    build_panel_with_step(&series, &m, bar_seconds).unwrap_or_else(|e| fail(&e))
+                }
+            };
             panel.retain_range(start, end);
             if panel.rows.is_empty() {
                 fail("panel build range selects no rows");
@@ -1314,11 +1799,12 @@ pub fn run(args: &[String]) -> ! {
                 None => None,
             };
             let out = out.unwrap_or_else(|| "panel.rcsb".to_string());
-            match write_panel_panel(
+            match write_panel_panel_hashed(
                 &out,
                 &panel,
                 &m,
                 &[&data, &mp],
+                &store_sha,
                 group_rows,
                 allow_lockbox,
                 snapshot_text.as_deref(),
@@ -1336,6 +1822,7 @@ pub fn run(args: &[String]) -> ! {
             }
         }
         "audit" => {
+            let series = load_series();
             let m = match build_membership(&series, &cfg) {
                 Ok(m) => m,
                 Err(e) => fail(&e),
@@ -1495,6 +1982,8 @@ MEMBERSHIP:
   --min-history <days>    minimum age before selection (default 90)
   --min-bars <n>          minimum trailing bars (default 60)
   --min-adv <usd>         minimum trailing ADV (default 0)
+  --cache <dir>           cache the membership table keyed by the store SHA-256
+                          and the ranking settings; a warm run copies it out
 
 BUILD / AUDIT:
   --data <csv|rcsb>       daily OHLCV with a symbol column
@@ -1507,8 +1996,10 @@ BUILD / AUDIT:
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
   --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
-  --resume <dir>          resumable build: cache one atomic .part per symbol; a
-                          re-run skips completed symbols and prints progress
+  --resume <dir>          resumable build: one atomic binary part per symbol,
+                          keyed by the store SHA-256, the membership decisions
+                          and the settings; a fully warm re-run reads the parts
+                          only (no 1.5 GB parse) and prints the resume line
   --snapshot <json>       embed a verified archive-snapshot manifest verbatim
                           under the panel manifest's `snapshot` block
 

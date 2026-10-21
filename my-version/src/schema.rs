@@ -248,12 +248,13 @@ pub fn json() -> String {
 {{\"name\":\"--min-history\",\"type\":\"int\",\"default\":\"90\",\"description\":\"minimum age before selection\"}},\
 {{\"name\":\"--rebalance\",\"type\":\"int\",\"default\":\"30\",\"description\":\"days between membership decisions\"}},\
 {{\"name\":\"--min-bars\",\"type\":\"int\",\"default\":\"60\",\"description\":\"minimum trailing bars\"}},\
+{{\"name\":\"--cache\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership cache keyed by the store SHA-256 and the ranking settings\"}},\
 {{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"86400\",\"description\":\"bar spacing for gap counts (3600 hourly)\"}},\
 {{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol] verified splice table\"}},\
 {{\"name\":\"--start\",\"type\":\"time\",\"default\":\"panelfirst\",\"description\":\"explicit evaluated range start; checked against the lockbox\"}},\
 {{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
-{{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic .part per symbol, progress on stderr\"}},\
+{{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic binary .part per symbol keyed by the store SHA-256 and the membership; a fully warm run reads the parts only\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}}]}},\n  \
          \"dev_log\":{{\"schema\":\"rcsr-devlog/1\",\"version\":1,\"flag\":\"--dev-log\",\"default\":\"on (summary level)\",\"levels\":[\"summary\",\"full\"],\"default_path\":\"rcsr.dev.ndjson next to --json-out/--save, else the working directory\",\"disable\":\"--no-dev-log\",\"cadence\":\"summary clamp(generations/10,10,25), full 1; --dev-log-every overrides\",\"analyzer\":\"rcsr dev-report <log>\",\"events\":[\"run_start\",\"generation\",\"checkpoint\",\"run_end\"],\"atomic\":\"one complete line per write to an O_APPEND file; a killed run leaves a valid prefix\",\"bounded\":\"--dev-log-max-bytes caps generation and checkpoint events; run_start and run_end are always written\",\"trajectory\":\"the log is a reading: the archive, results and config hash are byte-identical with it on and off\",\"privacy\":\"counts, timings, hashes and error statistics only; no raw rows or personal data\",\"doc\":\"docs/dev-log.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
