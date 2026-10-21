@@ -128,7 +128,9 @@ INPUT:
   --sample-rows <n>          explicit hash sample of a `.rcsb` store (opt-in;
                              without this flag a store is never sampled).
                              Recorded as full_rows=false in the preparation
-                             block, manifest and dev log
+                             block, manifest and dev log. Mutually exclusive
+                             with --force; n >= the row count is a full load
+                             and must still fit the budget
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -2528,6 +2530,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #112: `--force` means the full resident load and `--sample-rows` means a
+    // stratified sample; honouring one silently would hide the other.
+    if force && sample_rows.is_some() {
+        eprintln!(
+            "error: --force and --sample-rows contradict each other (--force loads the full \
+             input, --sample-rows asks for a sample); pass one of them"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     let target = match target {
         Some(t) => t,
         None => {
@@ -2699,9 +2710,20 @@ fn main() {
                     fs.to_table()
                 } else if let Some(requested) = sample_rows {
                     // Sampling is explicit. Never let `--sample-rows` be a
-                    // quieter way to exceed the budget.
+                    // quieter way to exceed the budget: a request that covers
+                    // every row is a full load, so it must pass the same guard
+                    // as the default path.
                     let n = requested.min(rows);
                     if n >= rows {
+                        if estimate.total_bytes > limit {
+                            refuse_store_full_with_sample_request(
+                                &data_path,
+                                &fs,
+                                &estimate,
+                                requested,
+                                limit,
+                            );
+                        }
                         store_resident = true;
                         store_memory_estimate = Some(estimate);
                         store_full_rows = Some(true);
@@ -7286,6 +7308,12 @@ fn refuse_store_for_memory(
 ) -> ! {
     eprintln!("error: input would exceed the memory budget");
     let disk = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let dictionary_cols = fs
+        .header()
+        .columns()
+        .iter()
+        .filter(|c| c.has_codes)
+        .count();
     eprintln!(
         "  {}: {} on disk, {} rows x {} columns ({}, {} dictionary column(s))",
         path,
@@ -7296,10 +7324,7 @@ fn refuse_store_for_memory(
             1 => "store v1",
             _ => "store v2",
         },
-        estimate
-            .cols
-            .saturating_sub(estimate.used_cols)
-            .max(0)
+        dictionary_cols
     );
     eprintln!("  estimate basis: store header dtypes + row groups + used columns");
     eprintln!(
@@ -7362,6 +7387,47 @@ fn refuse_store_sample_for_memory(
         "  memory budget is {} ({} bytes); pass --force to attempt it anyway",
         human_bytes(limit),
         limit
+    );
+    std::process::exit(EXIT_INPUT);
+}
+
+/// #112: `--sample-rows N` with `N >= rows` asks for every row, i.e. the full
+/// load. It must not bypass the budget the default path enforces.
+fn refuse_store_full_with_sample_request(
+    path: &str,
+    fs: &store::FileStore,
+    estimate: &memory::MemoryEstimate,
+    requested: usize,
+    limit: u64,
+) -> ! {
+    eprintln!(
+        "error: --sample-rows {} covers every row of '{}', so it is a full load, \
+         and the full store does not fit the memory budget",
+        requested, path
+    );
+    eprintln!(
+        "  full store: {} rows x {} columns; estimate {} = storage {} + directory/group {} + \
+         search {} + fit {} + fixed {} + slack {}{}",
+        estimate.rows,
+        estimate.cols,
+        human_bytes(estimate.total_bytes),
+        human_bytes(estimate.storage_bytes),
+        human_bytes(estimate.directory_bytes.saturating_add(estimate.group_buffer_bytes)),
+        human_bytes(estimate.search_bytes),
+        human_bytes(estimate.fit_copy_bytes),
+        human_bytes(estimate.fixed_bytes),
+        human_bytes(estimate.slack_bytes),
+        if estimate.saturated { " (at least)" } else { "" }
+    );
+    eprintln!(
+        "  memory budget is {} ({} bytes; set it with --max-memory)",
+        human_bytes(limit),
+        limit
+    );
+    eprintln!(
+        "  pass --sample-rows with fewer than {} rows to sample, or --force to load the full \
+         store anyway",
+        fs.n_rows()
     );
     std::process::exit(EXIT_INPUT);
 }

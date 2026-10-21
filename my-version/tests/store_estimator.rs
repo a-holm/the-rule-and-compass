@@ -458,6 +458,93 @@ fn the_real_panel_store_loads_full_under_a_12gb_budget() {
 }
 
 #[test]
+fn a_sample_request_covering_every_row_cannot_bypass_the_budget() {
+    // `--sample-rows N` with `N >= rows` is a full load. It must not become a
+    // quieter way to ignore `--max-memory`.
+    let dir = temp_dir("sample-full");
+    let path = small_store(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            path.to_str().unwrap(),
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "1",
+            "--pop",
+            "4",
+            "--max-memory",
+            "1",
+            "--sample-rows",
+            "999999999",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("covers every row"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert!(String::from_utf8_lossy(&output.stdout).is_empty());
+    // A real sample that is still over budget is refused too.
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            path.to_str().unwrap(),
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "1",
+            "--pop",
+            "4",
+            "--max-memory",
+            "1",
+            "--sample-rows",
+            "250",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("would still exceed"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn force_and_sample_rows_are_rejected_as_contradictory() {
+    let dir = temp_dir("force-sample");
+    let path = small_store(&dir);
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data",
+            path.to_str().unwrap(),
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--generations",
+            "1",
+            "--pop",
+            "4",
+            "--force",
+            "--sample-rows",
+            "250",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("contradict"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn explicit_sampling_is_recorded_as_full_rows_false() {
     let dir = temp_dir("sample");
     let path = small_store(&dir);
