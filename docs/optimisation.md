@@ -782,7 +782,7 @@ reverse-mode Jacobian for the p constants, `JᵀJ`/`Jᵀr`/SSE accumulation, a
 damped f64 Cholesky solve with a conditioning gate, and ordered trial steps.
 The search phase uses f32 row arithmetic with f64 accumulators and the solve;
 the final undamped polish runs in f64 on an exact f64 copy of the training rows.
-Candidates with no analytic GPU derivative, more than 16 constants, more than
+Candidates with no analytic GPU derivative, more than 20 constants, more than
 96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
 are refit by the exact CPU arm and counted as fallbacks. Before fitting, every
 unfitted offspring is screened on the GPU with its seed constants and only the

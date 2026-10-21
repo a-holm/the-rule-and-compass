@@ -791,8 +791,24 @@ one CUDA block per candidate:
    this arm is selected), so the returned constants are not limited by the f32
    evaluator copy or by f32 row arithmetic.
 
+**Two instantiations.** The kernel is compiled twice and dispatched on the
+batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
+chunk it was measured with (about 39.7 KB of shared memory); `17 <= p <= 20`
+uses a 128-thread block and a 128-row chunk (about 38.1 KB). Both fit two blocks
+per SM on `sm_86`. The larger alternative — 20 constants with a 256-row chunk —
+needs about 50.8 KB, past the 48 KB static ceiling and only one block per SM, so
+the shared block is dynamic (`extern __shared__`) and the opt-in limit is raised
+once with `cudaFuncSetAttribute`; it is measured below. A block narrower than
+the statistic count (231 entries at `p = 20`) gives each thread several
+statistics (`t`, `t + blockDim`, …), so every entry is still owned by exactly
+one thread and accumulated over rows in ascending order. That keeps the sum
+independent of the chunk size: a candidate fitted alone and the same candidate
+in a padded `kmax = 20` batch are **bit-identical**, which
+`a_mixed_p_batch_matches_single_fits_and_the_cpu_lm` asserts for `p = 4` beside
+`p = 17..20`.
+
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
-only for the squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no
+only for the squared/AIC family, with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
 `32p` rows. The arm also screens before it fits: every unfitted offspring is
 scored once on the GPU with its seed constants, and the screened ranking decides
@@ -815,7 +831,7 @@ The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
-constants), `too_few_rows`, `too_many_constants` (`p > 16`), `ill_conditioned`,
+constants), `too_few_rows`, `too_many_constants` (`p > 20`), `ill_conditioned`,
 `non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
@@ -826,12 +842,54 @@ finalist is refit by the exact CPU f64 LM on all training rows before the final
 archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
 constants and metrics therefore never come from f32. The unit tests upload the
 same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
-LM to machine precision (median `2e-15` in the p=1..16 test, median relative
+LM to machine precision (median `2e-15` in the p=1..20 test, median relative
 constant error `<= 1e-5` and SSE relative `<= 1e-8` asserted) and every
-ill-conditioned/non-finite candidate carries a fallback status. Without the f64
+ill-conditioned/non-finite candidate carries a fallback status. For
+`p = 17..20` the measured worst cases are SSE relative `6.0e-13` and constant
+error `1.2e-12`, and a `p = 20` collinear design is still labelled status 1.
+Without the f64
 copy (a device-allocation failure) the polish runs on f32-rounded inputs and the
 constants differ by roughly `1e-7` relative; the finalist refit still makes the
 reported numbers exact.
+
+**Constant cap and the p=17..20 instantiation (#169).** The cap is 20 constants.
+`p = 1..16` keeps the original 256-thread instantiation; `p = 17..20` runs the
+second one. Their resources, from `cuobjdump -res-usage` on the built
+`librcsrcuda.so` and from `gpu::fit_kernel_shape` at runtime, are:
+
+| constant cap | block | row chunk | dynamic shared | registers | stack (local frame) |
+|---:|---:|---:|---:|---:|---:|
+| 16 | 256 | 256 | 40 672 B | 89 | 1 792 B |
+| 20 | 128 | 128 | 38 992 B | 85 | 1 824 B |
+
+Both stay under the 48 KB static ceiling and fit two blocks per SM on `sm_86`.
+The rejected alternative — 20 constants with a 256-thread block and a 256-row
+chunk — is 50 768 B (one block per SM). At `N = 1e5`/`1e6`, `P = 256`, eight
+iterations, one batch per cell:
+
+| `p` instantiation | shared | kernel at `N=1e5` | kernel at `N=1e6` |
+|---|---:|---:|---:|
+| 20, 128 threads / 128 rows | 38 992 B | 4 038.7 ms | 40 232.7 ms |
+| 20, 256 threads / 256 rows | 50 768 B | 4 404.6 ms (+9.1 %) | 45 237.0 ms (+12.4 %) |
+
+The two-block-per-SM variant wins, so `FT_CHUNK_LARGE` is 128. Fit-stage
+throughput against the 8-thread CPU LM on the same cells (the host was busy with
+other suites, so the CPU side is indicative rather than a clean baseline):
+
+| p | N | P | CPU wall | GPU wall | fit speed-up | fallbacks |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 1e5 | 32 | 2.10 s | 0.16 s | 13.2× | 0 |
+| 16 | 1e5 | 32 | 8.72 s | 0.54 s | 16.1× | 0 |
+| 20 | 1e5 | 32 | 14.43 s | 0.70 s | 20.7× | 0 |
+| 20 | 1e5 | 256 | — | 4.04 s (15.8 ms/candidate) | — | 0 of 256 |
+| 4 | 1e6 | 32 | 25.51 s | 1.47 s | 17.3× | 0 |
+| 16 | 1e6 | 32 | 80.63 s | 4.98 s | 16.2× | 0 |
+| 20 | 1e6 | 32 | 76.11 s | 6.98 s | 10.9× | 0 |
+| 20 | 1e6 | 256 | — | 40.23 s (157 ms/candidate) | — | 0 of 256 |
+
+Every `p = 17..20` fixture ends with status 0, so none of them falls back. The
+only constant-count fallback left is `too_many_constants` at `p > 20`, which the
+plan rejects before the kernel sees the candidate.
 
 **Measurements (RTX 3060, i7-3770K, this host).** Fit stage at `N = 154 000`,
 8-thread CPU wall versus the whole GPU batch (upload + kernel + download):
