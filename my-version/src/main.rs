@@ -436,7 +436,10 @@ SEARCH:
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
-                             the GPU automatically. Reported errors stay CPU
+                             the GPU automatically for --metric squared only:
+                             the kernel scores squared error, so every other
+                             metric (including the default absolute) runs on the
+                             CPU and prints the reason. Reported errors stay CPU
                              f64, but f32 fitness can change the trajectory
                              (cross-backend runs are not bit-identical). JSON
                              reports the measured kernel/sync/alloc/copy wall
@@ -3632,14 +3635,16 @@ fn main() {
 
     // #141: one line stating the resources this run will use. `rows`/`cols`
     // are the training table (the search's hot loop); test rows are in the
-    // split object. The backend is the startup decision; a per-objective
-    // fallback is still reported once by the search itself.
+    // split object. The backend is the effective one (#140's own check), so a
+    // configuration the device cannot score is not reported as a GPU run
+    // (#236); the search still prints its own `# gpu: off (...)` note.
     if !quiet {
         let threads = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let cols = prepared.train.x.first().map(|r| r.len()).unwrap_or(0);
-        let (kind, device, reason) = if cfg.gpu && gpu_probe.available() {
+        let blocked = search::backend_blocker_reason(&cfg, &prepared.train);
+        let (kind, device, reason) = if effective_backend == Backend::Gpu && gpu_probe.available() {
             ("gpu", gpu_probe.device.as_deref().unwrap_or("unknown"), None)
         } else {
             (
@@ -3648,7 +3653,8 @@ fn main() {
                 gpu_explicit
                     .filter(|explicit| !*explicit)
                     .map(|_| "--cpu/--no-gpu")
-                    .or(gpu_probe.reason.as_deref()),
+                    .or(gpu_probe.reason.as_deref())
+                    .or(blocked),
             )
         };
         match reason {
@@ -3689,7 +3695,10 @@ fn main() {
             let opened = DevSink::open(&path, dev_log_max_bytes, dev_every, dev_log_level);
             match opened {
                 Ok(sink) => {
-                    let (backend_name, device) = if cfg.gpu && gpu_probe.available() {
+                    // #236: the log's backend must be the effective one, not
+                    // the startup probe's; a metric the kernel cannot score
+                    // runs on the CPU and the evidence has to say so.
+                    let (backend_name, device) = if effective_backend == Backend::Gpu {
                         ("gpu", gpu_probe.device.clone())
                     } else {
                         ("cpu", None)

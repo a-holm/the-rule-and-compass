@@ -1380,9 +1380,10 @@ fn score_pipeline_batch(
 
 /// #26: whether a run may use the GPU at all.
 ///
-/// Restricted to the single-output, unweighted, full-sample regression path:
-/// multi-output and implicit objectives need more than one prediction per row,
-/// and `--predictor-samples` changes the rows every generation, so each of
+/// Restricted to the single-output, unweighted, full-sample **squared-error**
+/// path: multi-output and implicit objectives need more than one prediction per
+/// row, `--predictor-samples` changes the rows every generation, and every
+/// non-squared metric needs an objective the device does not score yet. Each of
 /// those keeps the CPU evaluator.
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
@@ -1400,6 +1401,14 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     }
     if cfg.metric.is_parameter_aware() {
         return Some("parameter-aware metric");
+    }
+    // #236: the CUDA evaluator accumulates squared error. Every other metric
+    // must be scored on the CPU until its objective is native on the device;
+    // otherwise a slope/absolute/rank run can silently rank by MSE. This is a
+    // correctness gate, not a performance preference: remove it only together
+    // with a tested native scorer for the metric.
+    if cfg.metric != crate::metrics::Metric::Squared {
+        return Some("metric is not scored natively on the GPU");
     }
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
@@ -1434,6 +1443,29 @@ pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
     }
     let _ = (cfg, train);
     Backend::Cpu
+}
+
+/// #236: the labelled cause a requested GPU run will actually be scored on the
+/// CPU, or `None` when the device is usable (or `--gpu` was not requested).
+///
+/// This is the same decision [`effective_backend`] makes. The CLI prints it in
+/// the resource line and records it in the development log, so a run whose
+/// objective the kernel cannot score never claims the GPU in its own evidence
+/// record.
+pub fn backend_blocker_reason(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    #[cfg(feature = "cuda")]
+    {
+        if cfg.gpu
+            && !matches!(
+                std::env::var("RCSR_GPU").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            )
+        {
+            return gpu_blocker(cfg, train);
+        }
+    }
+    let _ = (cfg, train);
+    None
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {

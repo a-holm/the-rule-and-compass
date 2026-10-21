@@ -5,7 +5,7 @@
 //! keep: the opt-in strategy, determinism, exact reporting and checkpoint
 //! round-trips. Device-dependent tests skip cleanly on a machine without CUDA.
 
-use rcsr::checkpoint::Checkpoint;
+use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::data::Sample;
 use rcsr::expr;
 use rcsr::fit::FitStrategy;
@@ -42,6 +42,47 @@ fn gpu_config(seed: u32) -> Config {
         metric: Metric::Squared,
         gpu: true,
         ..Default::default()
+    }
+}
+
+/// #236: the CUDA evaluator accumulates squared error. A non-squared metric
+/// must never be handed to it, or a slope/absolute/rank run is silently ranked
+/// by MSE. This test pins the correctness gate, not a performance choice.
+#[test]
+fn non_squared_metrics_never_use_the_gpu_evaluator() {
+    let s = sample(64, 7);
+    let metrics = [
+        Metric::Absolute,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Median,
+        Metric::Maximum,
+        Metric::Signed,
+        Metric::LogSquashed,
+        Metric::RankCorrelation,
+        Metric::RankCorrelationSigned,
+        Metric::Interquartile,
+        Metric::Auc,
+        Metric::LogLoss,
+        Metric::Hinge,
+        Metric::Slope,
+        Metric::ImplicitDerivative,
+        Metric::ImplicitResidual,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ];
+    for metric in metrics {
+        let cfg = Config {
+            gpu: true,
+            metric,
+            ..Default::default()
+        };
+        assert_eq!(
+            search::effective_backend(&cfg, &s),
+            Backend::Cpu,
+            "{metric:?} must not be scored by the squared-error GPU evaluator"
+        );
     }
 }
 

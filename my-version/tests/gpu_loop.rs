@@ -320,6 +320,74 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
     );
 }
 
+/// #236: the CUDA evaluator accumulates squared error, so a non-squared metric
+/// stays on the CPU — visibly. `--metric slope --gpu` must print the labelled
+/// reason, must not claim the device in the resource line or JSON, and must
+/// return exactly the `--no-gpu` run: the CPU evaluator is the only one in both
+/// runs, so any difference would mean the gate is leaking somewhere else.
+#[cfg(feature = "cuda")]
+#[test]
+fn non_squared_metric_on_gpu_prints_the_reason_and_matches_the_cpu() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let common = [
+        "--data",
+        "-",
+        "--target",
+        "y",
+        "--vars",
+        "x",
+        "--generations",
+        "8",
+        "--pop",
+        "24",
+        "--seed",
+        "21",
+        "--metric",
+        "slope",
+        "--json",
+    ];
+    let mut gpu_args = common.to_vec();
+    gpu_args.extend_from_slice(&["--gpu"]);
+    let (code, stdout, stderr) = run_cli(&gpu_args, Some("1"));
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(
+        stdout.contains("\"metric\":\"slope\""),
+        "the configured objective is still slope, json: {stdout}"
+    );
+    assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
+    assert!(
+        stdout.contains("\"backend_reason\":\"metric is not scored natively on the GPU\""),
+        "the fallback must carry its labelled cause, json: {stdout}"
+    );
+    assert!(
+        stderr.contains("# gpu: off (metric is not scored natively on the GPU)"),
+        "the reason must be printed once, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("# resource: backend=cpu"),
+        "the resource line must report the evaluator that ran, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("# resource: backend=gpu"),
+        "a CPU-scored run must not claim the device, got: {stderr}"
+    );
+
+    let mut cpu_args = common.to_vec();
+    cpu_args.extend_from_slice(&["--no-gpu"]);
+    let (cpu_code, cpu_stdout, cpu_stderr) = run_cli(&cpu_args, Some("1"));
+    assert_eq!(cpu_code, Some(0), "stderr: {cpu_stderr}");
+    // The reported front is the last JSON field; everything before it carries
+    // wall-clock measurements that legitimately differ between runs.
+    let front = |s: &str| s[s.find("\"pareto\":").expect("a JSON front")..].to_string();
+    assert_eq!(
+        front(&stdout),
+        front(&cpu_stdout),
+        "the gated GPU run must reproduce the --no-gpu front exactly"
+    );
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn recovered_law_and_reported_errors_agree_with_the_cpu_backend() {

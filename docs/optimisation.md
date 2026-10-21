@@ -698,6 +698,7 @@ counts and whether a CUDA build is present.
 | non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
 | streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
 | GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
+| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` is ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking |
 
 `auto` is deterministic: it chooses by tree structure and size only, never by
 wall-clock timing, so a seed cannot change path between runs. For separable
