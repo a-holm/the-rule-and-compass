@@ -440,14 +440,16 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
      [--allow-backend-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
+     [--dev-log file.ndjson] [--dev-log-every N] [--dev-log-max-bytes size]
      [--top N] [--quiet] [--out file.tsv]
      [--report summary|sensitivity|benchmark] [--report-out file.md]
      [--report-repeats N]
 ```
 
-Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
-their own option lists in `rcsr schema` under `import`, `walkforward` and
-`verify-manifest`; the block above is the root search command.
+Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`,
+`rcsr dev-report`) carry their own option lists in `rcsr schema` under `import`,
+`walkforward`, `verify-manifest` and `dev_log`; the block above is the root
+search command.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
@@ -969,6 +971,21 @@ alone, cost O(front size) and never touch a training row. See
 [`docs/convergence.md`](docs/convergence.md) for the exact formulas, the
 20-generation window, how to read them and the easy/hard evidence.
 
+## Why did the run behave like that?
+
+`--dev-log <file>` writes one NDJSON **development event per generation** —
+phase timings, the population error quantiles, Pareto size/hypervolume/archive
+hash, the structural de-duplication rate, archive admissions, fit
+attempts/GPU/fallback-by-cause/refits, GPU kernel time and duty, CPU fallback
+seconds and workers, QD coverage/entropy, convergence, the per-island best error
+and an RNG state key — plus `run_start`, `checkpoint` and `run_end` events.
+It is off by default, it never changes the archive, the results or the
+configuration hash, each event is one atomic line, and the file is bounded by
+`--dev-log-max-bytes`. `rcsr dev-report <log>` (pure Rust, no Python) turns the
+file into a phase table, a fit-versus-evaluation share, fallback causes,
+convergence and archive growth, and a ranked list of bottlenecks. See
+[`docs/dev-log.md`](docs/dev-log.md).
+
 ## Layout
 
 ```
@@ -994,6 +1011,7 @@ docs/building-blocks.md       user-defined reusable sub-formulas (--function)
 docs/multi-output.md          one shared shape, per-output constants (--target y1,y2)
 docs/benchmarks.md            known-truth recovery benchmarks and recorded results
 docs/convergence.md           confidence, stability, maturity and percent converged
+docs/dev-log.md               optional per-generation development log and `dev-report`
 docs/qd.md                    opt-in CVT-MAP-Elites quality-diversity layer (--qd/--qd-policy)
 docs/gui.md                   design for a GUI over the JSON/NDJSON contract
 docs/gpu-backend.md           the optional CUDA evaluator and the DGX Spark plan
