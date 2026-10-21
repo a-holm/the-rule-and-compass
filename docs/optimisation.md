@@ -788,7 +788,11 @@ are refit by the exact CPU arm and counted as fallbacks. Before fitting, every
 unfitted offspring is screened on the GPU with its seed constants and only the
 best `max(32, pop/4)` of each island enter the fitted LM batch; the rest keep
 their screening score, so the evaluation count is unchanged while the fit
-volume falls. Every CPU fallback is labelled by cause (`unsupported_plan`,
+volume falls. At or above **1 048 576 training rows** the screen stops being a
+useful proxy for the fitted ranking, so every candidate with constants is
+admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
+were fitted, while the batched kernel is still 17–25× faster per candidate, so
+full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
 `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to the squared/AIC family (the kernel minimises squared error); other

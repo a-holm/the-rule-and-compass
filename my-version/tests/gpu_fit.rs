@@ -364,28 +364,59 @@ fn bench_end_to_end() {
         gpu_notes: false,
         ..Default::default()
     };
+    // `RCSR_BENCH_ARMS=exact,gpu` (the default) runs both arms; a diagnostic
+    // can select one (`exact` or `gpu`) to repeat an arm without paying for
+    // the other. The equal-evaluation comparison always uses both.
+    let arms = std::env::var("RCSR_BENCH_ARMS").unwrap_or_else(|_| "exact,gpu".to_string());
+    let wanted = |name: &str| {
+        arms.split(',').map(str::trim).any(|a| {
+            a.eq_ignore_ascii_case(name)
+                || (a.eq_ignore_ascii_case("exact") && name.starts_with("exact"))
+                || (a.eq_ignore_ascii_case("gpu") && name.starts_with("gpu"))
+        })
+    };
     // (name, strategy, gpu, wall, per-generation best, outcome)
     let mut runs = Vec::new();
     for (name, strategy, gpu) in [
         ("exact/cpu", FitStrategy::Exact, false),
         ("gpu/admission", FitStrategy::Gpu, true),
     ] {
+        if !wanted(name) {
+            continue;
+        }
         let cfg = Config {
             fit_strategy: strategy,
             gpu,
             ..base.clone()
         };
         let t0 = std::time::Instant::now();
-        let mut history: Vec<(usize, f64, f64)> = Vec::new();
+        let mut history: Vec<(usize, f64, f64, String)> = Vec::new();
         let out = search::run_resumable(&cfg, &train, &test, None, 1, |cp| {
             let best = cp
                 .archive
                 .items
                 .iter()
-                .map(|s| s.error)
-                .fold(f64::INFINITY, f64::min);
+                .min_by(|a, b| {
+                    a.error
+                        .partial_cmp(&b.error)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let best = best.map(|s| s.error).unwrap_or(f64::INFINITY);
             if history.last().map(|h| h.0) != Some(cp.generations) {
-                history.push((cp.generations, best, t0.elapsed().as_secs_f64()));
+                let text = cp
+                    .archive
+                    .items
+                    .iter()
+                    .min_by(|a, b| {
+                        a.error
+                            .partial_cmp(&b.error)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|s| {
+                        expr::to_string(&s.tree, &["x0".to_string(), "x1".to_string()])
+                    })
+                    .unwrap_or_default();
+                history.push((cp.generations, best, t0.elapsed().as_secs_f64(), text));
             }
         })
         .expect("benchmark search");
@@ -404,6 +435,13 @@ fn bench_end_to_end() {
             wall,
             best
         );
+        // Per-generation archive best, so a quality regression can be located
+        // in the trajectory rather than only at the end.
+        let trajectory: Vec<String> = history
+            .iter()
+            .map(|(g, b, t, text)| format!("g{}={:.6e}@{:.1}s[{}]", g, b, t, text))
+            .collect();
+        eprintln!("  history: {}", trajectory.join(" "));
         if let Some(g) = &out.gpu {
             let causes = rcsr::search::FitFallbackCause::ALL
                 .iter()
@@ -446,12 +484,20 @@ fn bench_end_to_end() {
     // (cost, error) extrema. The time-to-target control uses the exact arm's
     // final best × 1.02, so the baseline reaches the target at its last
     // generation by construction and the GPU arm must reach it no later.
+    if runs.is_empty() {
+        eprintln!("no arm selected by RCSR_BENCH_ARMS={}", arms);
+        return;
+    }
     let all: Vec<(f64, f64)> = runs.iter().flat_map(|r| front_points(&r.3)).collect();
     let cmin = all.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
     let cmax = all.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
     let emin = all.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
     let emax = all.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-    let exact_best = runs[0]
+    let baseline = runs
+        .iter()
+        .find(|r| r.0.starts_with("exact"))
+        .unwrap_or(&runs[0]);
+    let exact_best = baseline
         .3
         .archive
         .items
@@ -460,8 +506,13 @@ fn bench_end_to_end() {
         .fold(f64::INFINITY, f64::min);
     let target = exact_best * 1.02;
     eprintln!(
-        "control: target={:.6e} (exact final best × 1.02)",
-        target
+        "control: target={:.6e} ({} final best × 1.02)",
+        target,
+        if baseline.0.starts_with("exact") {
+            "exact"
+        } else {
+            "this arm's"
+        }
     );
     for (name, _, history, out) in &runs {
         let hv = hypervolume(&front_points(out), cmin, cmax, emin, emax);
