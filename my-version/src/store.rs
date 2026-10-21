@@ -85,11 +85,6 @@ impl DType {
 /// block). It is a streaming unit, not an L2 tile.
 pub const DEFAULT_GROUP_ROWS: usize = 65_536;
 
-/// Measured resident cost per cell when the engine prepares a search sample
-/// (1.75 KiB/row for six columns in #70), used to turn a byte budget into a row
-/// cap. It is deliberately pessimistic: the cost is copies, not the cells.
-pub const RESIDENT_BYTES_PER_CELL: u64 = 300;
-
 #[derive(Clone, Debug, PartialEq)]
 struct ColumnMeta {
     name: String,
@@ -202,6 +197,55 @@ impl Header {
     pub fn columns(&self) -> Vec<ColumnInfo> {
         (0..self.columns.len()).filter_map(|c| self.column(c)).collect()
     }
+
+    /// Header-derived resident shape (issue #112): exactly what `to_table` and
+    /// the search allocate, without opening or reading the data blocks.
+    ///
+    /// Sizes come from the *resident* representation, not the on-disk width:
+    /// values only for `numeric` columns, an extra `i64` copy, always-`u32`
+    /// codes, dictionary levels, row-group directories and the group buffer.
+    pub fn memory_shape(&self) -> crate::memory::StoreShape {
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| {
+                let dictionary_bytes = if c.has_codes {
+                    c.levels
+                        .iter()
+                        .fold(0u64, |a, level| a.saturating_add(level.len() as u64 + 24))
+                        .saturating_add(24)
+                } else {
+                    0
+                };
+                crate::memory::ColumnShape {
+                    name: c.name.clone(),
+                    value_width: if c.numeric { 8 } else { 0 },
+                    int_width: if c.dtype == DType::I64 { 8 } else { 0 },
+                    code_width: if c.has_codes { 4 } else { 0 },
+                    dictionary_bytes,
+                }
+            })
+            .collect();
+        crate::memory::StoreShape {
+            rows: self.n_rows,
+            group_rows: self.group_rows,
+            // The header JSON is parsed and dropped, but its offsets survive as
+            // `Vec<u64>` directories; the estimator charges those plus the
+            // per-column Vec/String headers.
+            header_len: 0,
+            columns,
+        }
+    }
+
+    /// Estimated peak resident bytes for loading this store and preparing a
+    /// search sample (issue #112). `opts` carries the used-column projection
+    /// and the backend copies.
+    pub fn estimate_resident(
+        &self,
+        opts: &crate::memory::EstimateOptions,
+    ) -> crate::memory::MemoryEstimate {
+        self.memory_shape().estimate(opts)
+    }
 }
 
 /// Public, read-only description of one stored column.
@@ -296,10 +340,28 @@ impl FileStore {
         self.header.n_groups()
     }
 
-    /// Bytes a resident `Table` plus its search preparation would need. The
-    /// estimate is intentionally conservative (see [`RESIDENT_BYTES_PER_CELL`]).
-    pub fn estimated_resident_bytes(&self) -> u64 {
-        resident_estimate(self.header.n_rows, self.header.n_cols)
+    /// Header-derived resident shape (issue #112). Sizes are the resident
+    /// representation, not the compact on-disk widths.
+    pub fn memory_shape(&self) -> crate::memory::StoreShape {
+        self.header.memory_shape()
+    }
+
+    /// Estimated peak resident bytes for this store plus search preparation.
+    pub fn estimate_resident(
+        &self,
+        opts: &crate::memory::EstimateOptions,
+    ) -> crate::memory::MemoryEstimate {
+        self.header.estimate_resident(opts)
+    }
+
+    /// Largest sample that fits the same model. Explicit `--sample-rows` uses
+    /// this only to warn/refuse; the automatic path never samples.
+    pub fn sample_row_cap(
+        &self,
+        budget: u64,
+        opts: &crate::memory::EstimateOptions,
+    ) -> usize {
+        self.memory_shape().sample_row_cap(budget, opts)
     }
 
     fn validate_blocks(&mut self, file_len: u64) -> Result<(), String> {
@@ -709,21 +771,6 @@ pub fn is_store_path(path: &str) -> bool {
         .and_then(|mut f| f.read_exact(&mut magic))
         .map(|_| &magic == MAGIC)
         .unwrap_or(false)
-}
-
-/// Estimated resident footprint of a table plus search preparation.
-pub fn resident_estimate(n_rows: usize, n_cols: usize) -> u64 {
-    (n_rows as u64)
-        .saturating_mul(n_cols.max(1) as u64)
-        .saturating_mul(RESIDENT_BYTES_PER_CELL)
-}
-
-/// How many rows fit in a memory budget for a sampled search. The search holds
-/// several copies while preparing, so only ~60 % of the budget is offered.
-pub fn sample_row_cap(budget: u64, n_cols: usize) -> usize {
-    let usable = budget.saturating_mul(6) / 10;
-    let per_row = (n_cols.max(1) as u64).saturating_mul(RESIDENT_BYTES_PER_CELL);
-    (usable / per_row).max(1_000) as usize
 }
 
 /// Detected memory budget from the kernel, in bytes:

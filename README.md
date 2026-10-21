@@ -332,15 +332,22 @@ atomically instead of streaming it. See
   echoed in the output.
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
-* **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
-  (rows × columns plus preparation, calibrated on 6- and 90-column runs, not a
-  multiple of the file size) would exceed the budget, with exit 3 and a fix,
-  instead of being SIGABRT/SIGKILL'ed. The estimate and its basis appear in the
-  preparation block. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
-  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
-  that can be scanned group by group and searched from a bounded hash sample
-  when it does not fit; v1 stores still load. See
-  [`docs/data-format.md`](docs/data-format.md).
+* **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
+  footprint would exceed the budget, with exit 3 and a fix, instead of being
+  SIGABRT/SIGKILL'ed. A CSV is estimated from its measured rows × columns plus
+  preparation (calibrated on 6- and 90-column runs, never a multiple of the file
+  size). A `.rcsb` store is estimated exactly from its header: resident dtypes
+  (values only for numeric columns, the extra `i64` copy, 4-byte codes),
+  dictionaries, row groups, the used-column projection and GPU/fit copies, plus
+  25 % slack. The full rows load whenever that fits — on the 3.9M × 56 panel the
+  estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
+  61.71 GiB that produced a 577k-row sample. A store that does not fit is
+  refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
+  `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
+  the preparation block, manifest and dev log. `rcsr
+  import` writes a versioned `.rcsb` store (format v2: per-column
+  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
+  v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).
 * **Market data as a typed layer**: `rcsr::ohlcv` resamples OHLCV exactly
   (open=first, high=max, low=min, close=last, flows summed), keeps gaps and
   flags zero-volume/partial bars, understands crypto 24/7 and NYSE/LSE
@@ -433,7 +440,7 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
-     [--max-memory size] [--force] [--skip-malformed]
+     [--max-memory size] [--force] [--sample-rows N] [--skip-malformed]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
      [--weight col]
      [--metric <name>] [--generations N] [--islands I]

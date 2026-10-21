@@ -14,6 +14,7 @@
 use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::complexity::ComplexityModel;
 use rcsr::manifest;
+use rcsr::memory;
 use rcsr::expr::{self, Op};
 use rcsr::fit;
 use rcsr::metrics::{self, Metric};
@@ -111,16 +112,25 @@ INPUT:
                              for CSV ('-' reads the table from standard input)
   --max-memory <size>        refuse when the estimated resident footprint is
                              larger than this (bytes, or KiB/MiB/GiB/GB; e.g.
-                             512MB, 2GiB). Exit 3 with the rows x columns
-                             estimate and an actionable message instead of
-                             SIGABRT/SIGKILL. The CSV reader streams, so the
-                             file text is not resident. The calibrated estimate
-                             and its rows x columns basis are reported in the
-                             preparation block. A `.rcsb` store that does not
-                             fit is searched from a hash sample with bounded
-                             RSS; a CSV is refused before parsing.
-  --force                    override --max-memory and try the resident path
-                             anyway (the kernel may still kill the process)
+                             512MB, 2GiB). Exit 3 with the estimate and an
+                             actionable message instead of SIGABRT/SIGKILL.
+                             The CSV reader streams, so the file text is not
+                             resident. A `.rcsb` store is estimated exactly
+                             from its header: resident dtypes (values only for
+                             numeric columns, the i64 copy, 4-byte codes),
+                             dictionaries, row groups, the used-column
+                             projection and GPU/fit copies, plus 25% slack.
+                             The full rows load whenever this fits; otherwise
+                             the store is refused. The estimate and its basis
+                             are reported in the preparation block.
+  --force                    override --max-memory and load the full input
+                             resident anyway (the kernel may still kill it)
+  --sample-rows <n>          explicit hash sample of a `.rcsb` store (opt-in;
+                             without this flag a store is never sampled).
+                             Recorded as full_rows=false in the preparation
+                             block, manifest and dev log. Mutually exclusive
+                             with --force; n >= the row count is a full load
+                             and must still fit the budget
   --target <col>[,<col>..]   target column; a comma-separated list enables
                              multi-output regression (one shared shape, one
                              fitted constant vector per output). See
@@ -1080,6 +1090,9 @@ fn dev_run_start(
         train_fingerprint: format!("{:016x}", train.hash),
         test_rows: test.rows,
         test_fingerprint: format!("{:016x}", test.hash),
+        full_rows: prepared.prep.full_rows,
+        sampled_rows: prepared.prep.sampled_rows,
+        estimate_bytes: prepared.prep.store_estimate.map(|m| m.total_bytes),
         config,
         config_hash: rcsr::checkpoint::config_hash(cfg),
         seed: cfg.seed,
@@ -1436,6 +1449,9 @@ fn main() {
     // is the deliberate override.
     let mut max_memory: Option<u64> = None;
     let mut force = false;
+    // #112: sampling is opt-in. The automatic path never samples a store; it
+    // loads the full rows or refuses with the header-derived estimate.
+    let mut sample_rows: Option<usize> = None;
     let mut outlier_iqr: Option<f64> = None;
     let mut smooth = 0usize;
     let mut smooth_centred = false;
@@ -1531,6 +1547,21 @@ fn main() {
                 }
             }
             "--force" => force = true,
+            // #112: explicit hash sample. Without this flag a store that does
+            // not fit is refused, never sampled silently.
+            "--sample-rows" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => sample_rows = Some(n),
+                    _ => {
+                        eprintln!(
+                            "error: --sample-rows needs an integer >= 1, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--skip-malformed" => skip_malformed = true,
             "--target" => target = Some(val!()),
             "--vars" => {
@@ -2504,6 +2535,26 @@ fn main() {
             std::process::exit(EXIT_USAGE);
         }
     };
+    // #112: sampling is a store-only, explicit experiment. Refusing the flag
+    // on a CSV is honest; silently ignoring it would hide the difference.
+    if sample_rows.is_some()
+        && (data_path == "-" || !store::is_store_path(&data_path))
+    {
+        eprintln!(
+            "error: --sample-rows applies only to a .rcsb store; a CSV is loaded in full \
+             or refused"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    // #112: `--force` means the full resident load and `--sample-rows` means a
+    // stratified sample; honouring one silently would hide the other.
+    if force && sample_rows.is_some() {
+        eprintln!(
+            "error: --force and --sample-rows contradict each other (--force loads the full \
+             input, --sample-rows asks for a sample); pass one of them"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     let target = match target {
         Some(t) => t,
         None => {
@@ -2580,6 +2631,12 @@ fn main() {
     let mut out_of_core_note: Option<String> = None;
     let mut csv_shape: Option<data::CsvShape> = None;
     let mut store_resident = false;
+    // #112: the store estimator's terms and whether the full rows were used.
+    // They are reported in the preparation block and carried into the run
+    // manifest/dev log, so a sampled run is never silent.
+    let mut store_memory_estimate: Option<memory::MemoryEstimate> = None;
+    let mut store_full_rows: Option<bool> = None;
+    let mut store_sample_rows: Option<usize> = None;
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -2610,32 +2667,117 @@ fn main() {
     } else if store::is_store_path(&data_path) {
         match store::FileStore::open(&data_path) {
             Ok(fs) => {
-                let estimate = fs.estimated_resident_bytes();
-                let resident = force || budget.map_or(true, |limit| estimate <= limit);
-                if resident {
-                    store_resident = true;
-                    fs.to_table()
+                // #112: project from the header before reading a group. The
+                // search copies only variables, targets and the weight; time
+                // and group are scanned during preparation.
+                let target_set: Vec<&str> = target_names.iter().map(|s| s.as_str()).collect();
+                let time_name = time_name.as_deref();
+                let group_name = group_name.as_deref();
+                let weight = weight_name.as_deref();
+                let mut used_cols = if vars.is_empty() {
+                    fs.header()
+                        .columns()
+                        .iter()
+                        .filter(|c| {
+                            c.numeric
+                                && !target_set.iter().any(|t| c.name.as_str() == *t)
+                                && Some(c.name.as_str()) != time_name
+                                && Some(c.name.as_str()) != group_name
+                                && Some(c.name.as_str()) != weight
+                        })
+                        .count()
                 } else {
-                    let limit = budget.unwrap_or(estimate);
-                    let cap = store::sample_row_cap(limit, fs.n_cols());
-                    let rows = fs.n_rows();
-                    match fs.sample_table(cap, cfg.seed as u64) {
-                        Ok(t) => {
-                            out_of_core_note = Some(format!(
-                                "out of core: '{}' has {} rows x {} cols (estimated resident \
-                                 footprint {}); searched a {}-row hash sample (seed {}), \
-                                 scanned group by group with RSS bounded by one group",
-                                data_path,
-                                rows,
-                                fs.n_cols(),
-                                human_bytes(estimate),
-                                t.len(),
-                                cfg.seed
-                            ));
-                            Ok(t)
+                    vars.len()
+                };
+                used_cols = used_cols
+                    .saturating_add(target_names.len())
+                    .saturating_add(usize::from(weight_name.is_some()));
+                let scan_cols = usize::from(time_name.is_some())
+                    .saturating_add(usize::from(group_name.is_some()));
+                let mutable_prep = matches!(
+                    fill,
+                    data::FillMethod::Mean
+                        | data::FillMethod::Median
+                        | data::FillMethod::Zero
+                        | data::FillMethod::Previous
+                        | data::FillMethod::Interpolate
+                ) || outlier_iqr.is_some()
+                    || smooth > 0
+                    || smooth_centred;
+                let mem_opts = memory::EstimateOptions {
+                    used_cols,
+                    scan_cols,
+                    gpu: cfg.gpu,
+                    gpu_fit: cfg.gpu && cfg.fit_iters > 0 && cfg.fit_strategy.defers_to_gpu(),
+                    mutable_prep,
+                    simd: cfg.simd,
+                };
+                let estimate = fs.estimate_resident(&mem_opts);
+                let rows = fs.n_rows();
+                let limit = budget.unwrap_or(estimate.total_bytes);
+                // The default is the full load whenever it fits. `--force`
+                // promotes an over-budget store to resident; `--sample-rows`
+                // is the only way to sample, even when the full store fits.
+                let full = force || (sample_rows.is_none() && budget.map_or(true, |b| estimate.total_bytes <= b));
+                if full {
+                    store_resident = true;
+                    store_memory_estimate = Some(estimate);
+                    store_full_rows = Some(true);
+                    fs.to_table()
+                } else if let Some(requested) = sample_rows {
+                    // Sampling is explicit. Never let `--sample-rows` be a
+                    // quieter way to exceed the budget: a request that covers
+                    // every row is a full load, so it must pass the same guard
+                    // as the default path.
+                    let n = requested.min(rows);
+                    if n >= rows {
+                        if estimate.total_bytes > limit {
+                            refuse_store_full_with_sample_request(
+                                &data_path,
+                                &fs,
+                                &estimate,
+                                requested,
+                                limit,
+                            );
                         }
-                        Err(e) => Err(e),
+                        store_resident = true;
+                        store_memory_estimate = Some(estimate);
+                        store_full_rows = Some(true);
+                        fs.to_table()
+                    } else {
+                        let sampled = estimate.with_sampled_rows(n, &fs.memory_shape(), &mem_opts);
+                        if sampled.total_bytes > limit && !force {
+                            refuse_store_sample_for_memory(
+                                &data_path, &fs, &sampled, requested, limit,
+                            );
+                        }
+                        store_memory_estimate = Some(sampled);
+                        store_full_rows = Some(false);
+                        store_sample_rows = Some(n);
+                        match fs.sample_table(n, cfg.seed as u64) {
+                            Ok(t) => {
+                                out_of_core_note = Some(format!(
+                                    "sampling (explicit): '{}' has {} rows x {} cols; \
+                                     --sample-rows {} selected {} rows (seed {}), full_rows=false; \
+                                     estimated sampled footprint {}",
+                                    data_path,
+                                    rows,
+                                    fs.n_cols(),
+                                    requested,
+                                    t.len(),
+                                    cfg.seed,
+                                    human_bytes(sampled.total_bytes)
+                                ));
+                                Ok(t)
+                            }
+                            Err(e) => Err(e),
+                        }
                     }
+                } else {
+                    // No automatic sample: a store that does not fit is
+                    // refused with its exact terms, and the user chooses
+                    // --force or --sample-rows explicitly.
+                    refuse_store_for_memory(&data_path, &fs, &estimate, limit);
                 }
             }
             Err(e) => Err(e),
@@ -3191,6 +3333,13 @@ fn main() {
             + usize::from(weight_col.is_some());
         prepared.prep.memory_estimate = Some(data::csv_estimate(shape, used));
     }
+    if let Some(estimate) = store_memory_estimate {
+        // #112: the store estimate used at the guard time is reported even on
+        // a successful full load, so the decision has an observable basis.
+        prepared.prep.store_estimate = Some(estimate);
+        prepared.prep.full_rows = store_full_rows;
+        prepared.prep.sampled_rows = store_sample_rows;
+    }
 
     // #113: a binary metric needs a binary target. Reject a multi-valued target
     // here, before any search, instead of silently merging its classes at the
@@ -3460,6 +3609,9 @@ fn main() {
             effective_backend.as_str(),
             resume_path.clone(),
             backend_change.clone(),
+            store_full_rows,
+            store_sample_rows,
+            store_memory_estimate.map(|m| m.total_bytes),
         );
         if let Err(e) = m.write(path, None, &[("data_prepare", data_prepare_secs)]) {
             eprintln!("error: {}", e);
@@ -7167,6 +7319,141 @@ fn spool_stdin() -> Result<TempCsv, String> {
     Err("error reading stdin: could not create a temporary file".to_string())
 }
 
+/// #112: a store that does not fit is refused with its exact header-derived
+/// terms. Sampling is never automatic; the user chooses `--force` (resident) or
+/// `--sample-rows N` (explicit, recorded as `full_rows=false`).
+fn refuse_store_for_memory(
+    path: &str,
+    fs: &store::FileStore,
+    estimate: &memory::MemoryEstimate,
+    limit: u64,
+) -> ! {
+    eprintln!("error: input would exceed the memory budget");
+    let disk = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let dictionary_cols = fs
+        .header()
+        .columns()
+        .iter()
+        .filter(|c| c.has_codes)
+        .count();
+    eprintln!(
+        "  {}: {} on disk, {} rows x {} columns ({}, {} dictionary column(s))",
+        path,
+        human_bytes(disk),
+        estimate.rows,
+        estimate.cols,
+        match fs.header().version {
+            1 => "store v1",
+            _ => "store v2",
+        },
+        dictionary_cols
+    );
+    eprintln!("  estimate basis: store header dtypes + row groups + used columns");
+    eprintln!(
+        "    storage {} + directory/group {} + search {} + fit {} + fixed {} + slack {} \
+         = {}{}",
+        human_bytes(estimate.storage_bytes),
+        human_bytes(estimate.directory_bytes.saturating_add(estimate.group_buffer_bytes)),
+        human_bytes(estimate.search_bytes),
+        human_bytes(estimate.fit_copy_bytes),
+        human_bytes(estimate.fixed_bytes),
+        human_bytes(estimate.slack_bytes),
+        human_bytes(estimate.total_bytes),
+        if estimate.saturated { " (at least)" } else { "" }
+    );
+    eprintln!(
+        "    projection: {} search + {} scan used column(s) of {}",
+        estimate.used_cols, estimate.scan_cols, estimate.cols
+    );
+    eprintln!(
+        "  memory budget is {} ({} bytes; set it with --max-memory)",
+        human_bytes(limit),
+        limit
+    );
+    eprintln!("  pass --force to load the full store resident anyway, or");
+    eprintln!(
+        "  pass --sample-rows <n> to hash-sample explicitly (the manifest/dev log then \
+         records full_rows=false)"
+    );
+    std::process::exit(EXIT_INPUT);
+}
+
+/// #112: an explicit `--sample-rows` request that is still over budget is
+/// refused instead of becoming a quieter out-of-budget run.
+fn refuse_store_sample_for_memory(
+    path: &str,
+    fs: &store::FileStore,
+    estimate: &memory::MemoryEstimate,
+    requested: usize,
+    limit: u64,
+) -> ! {
+    eprintln!("error: --sample-rows {} would still exceed the memory budget", requested);
+    eprintln!(
+        "  {}: {} requested rows of {} (full store is {} rows x {} columns)",
+        path,
+        requested,
+        fs.n_rows(),
+        fs.n_rows(),
+        fs.n_cols()
+    );
+    eprintln!(
+        "  sampled estimate: storage {} + search {} + fit {} + fixed {} + slack {} = {}",
+        human_bytes(estimate.storage_bytes),
+        human_bytes(estimate.search_bytes),
+        human_bytes(estimate.fit_copy_bytes),
+        human_bytes(estimate.fixed_bytes),
+        human_bytes(estimate.slack_bytes),
+        human_bytes(estimate.total_bytes)
+    );
+    eprintln!(
+        "  memory budget is {} ({} bytes); pass --force to attempt it anyway",
+        human_bytes(limit),
+        limit
+    );
+    std::process::exit(EXIT_INPUT);
+}
+
+/// #112: `--sample-rows N` with `N >= rows` asks for every row, i.e. the full
+/// load. It must not bypass the budget the default path enforces.
+fn refuse_store_full_with_sample_request(
+    path: &str,
+    fs: &store::FileStore,
+    estimate: &memory::MemoryEstimate,
+    requested: usize,
+    limit: u64,
+) -> ! {
+    eprintln!(
+        "error: --sample-rows {} covers every row of '{}', so it is a full load, \
+         and the full store does not fit the memory budget",
+        requested, path
+    );
+    eprintln!(
+        "  full store: {} rows x {} columns; estimate {} = storage {} + directory/group {} + \
+         search {} + fit {} + fixed {} + slack {}{}",
+        estimate.rows,
+        estimate.cols,
+        human_bytes(estimate.total_bytes),
+        human_bytes(estimate.storage_bytes),
+        human_bytes(estimate.directory_bytes.saturating_add(estimate.group_buffer_bytes)),
+        human_bytes(estimate.search_bytes),
+        human_bytes(estimate.fit_copy_bytes),
+        human_bytes(estimate.fixed_bytes),
+        human_bytes(estimate.slack_bytes),
+        if estimate.saturated { " (at least)" } else { "" }
+    );
+    eprintln!(
+        "  memory budget is {} ({} bytes; set it with --max-memory)",
+        human_bytes(limit),
+        limit
+    );
+    eprintln!(
+        "  pass --sample-rows with fewer than {} rows to sample, or --force to load the full \
+         store anyway",
+        fs.n_rows()
+    );
+    std::process::exit(EXIT_INPUT);
+}
+
 fn refuse_for_memory(
     path: &str,
     shape: data::CsvShape,
@@ -7206,10 +7493,13 @@ fn refuse_for_memory(
         human_bytes(limit),
         limit
     );
-    eprintln!("  re-run with a larger budget, pass --force to attempt it anyway, or");
-    eprintln!("  convert it once and search out of core:");
+    eprintln!("  re-run with a larger budget or pass --force to attempt it anyway;");
+    eprintln!("  a `.rcsb` store can also be sampled explicitly:");
     eprintln!("    rcsr import <input.csv> <store.rcsb>");
-    eprintln!("    rcsr --data <store.rcsb> --target <col> --max-memory {}", human_bytes(limit));
+    eprintln!(
+        "    rcsr --data <store.rcsb> --target <col> --max-memory {} [--sample-rows N]",
+        human_bytes(limit)
+    );
     std::process::exit(EXIT_INPUT);
 }
 
@@ -7547,9 +7837,10 @@ USAGE:
 
   The output defaults to the input path with its extension replaced by `.rcsb`.
   The store is deterministic: the same input and --group-rows produce the same
-  bytes. It is searched with `rcsr --data <store.rcsb> ...`; when it does not
-  fit the memory budget the run scans it group by group and searches a hash
-  sample with bounded RSS.
+  bytes. It is searched with `rcsr --data <store.rcsb> ...`; the guard reads
+  the header and loads the full rows when the exact estimate fits. If it does
+  not, the run refuses unless `--force` or an explicit `--sample-rows N` is
+  given; it never samples silently.
 
 OPTIONS:
   --data <input.csv>       input table (alternative to the positional path)
@@ -7561,7 +7852,7 @@ OPTIONS:
   --max-memory <size>      refuse before parsing when the streamed and
                            calibrated rows x
                            columns estimate exceeds this (not 33x file size)
-  --force                  override --max-memory
+  --force                  override --max-memory and load the full input
   --quiet                  do not print the summary
   -h, --help               show this help
 ",

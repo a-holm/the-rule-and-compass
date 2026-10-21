@@ -21,8 +21,9 @@ pub fn has_option(name: &str) -> bool {
 /// known CLI flag explicitly rather than calling it unknown.
 pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--data", "string", "none", "table path, a .rcsb column store made by `rcsr import`, or '-' for stdin"),
-        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A streaming CSV is estimated from calibrated rows x columns (table + preparation, no resident text) once the header and row count are known; the estimate and basis appear in the preparation block and it exits 3 before parsing. A .rcsb store that does not fit is searched from a bounded hash sample"),
-        ("--force", "flag", "false", "override --max-memory and attempt the resident path anyway"),
+        ("--max-memory", "size", "auto", "refuse when the estimated resident footprint exceeds this (bytes, or KiB/MiB/GiB/GB). A streaming CSV is estimated from calibrated rows x columns (table + preparation, no resident text) once the header and row count are known. A .rcsb store is estimated exactly from its header: resident dtypes (values only for numeric columns, the i64 copy, 4-byte codes), dictionaries, row groups, the used-column projection and GPU/fit copies, plus 25% slack. The full rows load whenever this fits; otherwise it exits 3 before reading a group. The estimate and basis appear in the preparation block"),
+        ("--force", "flag", "false", "override --max-memory and load the full input resident anyway"),
+        ("--sample-rows", "int", "none", "explicit hash sample of a .rcsb store (opt-in; a store is never sampled without it). Mutually exclusive with --force; n >= the row count is a full load and must still fit --max-memory. Recorded as full_rows=false in the preparation block, manifest and dev log"),
         ("--target", "csv", "none", "target column name; a comma-separated list (y1,y2) enables multi-output regression with one shared shape and per-output constants"),
         ("--vars", "csv", "all-except-targets", "input column names"),
         ("--dtype", "csv", "all-continuous", "per-variable datatype, col=continuous|boolean|categorical (categorical expands to one-hot boolean columns named col=value)"),
@@ -198,8 +199,8 @@ pub fn json() -> String {
  {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"rows per I/O group\"}},\
  {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto-detected\",\"description\":\"store this column as exact i64 timestamps\"}},\
  {{\"name\":\"--skip-malformed\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"drop ragged rows instead of refusing the input\"}},\
- {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse before parsing when the estimate exceeds this\"}},\
- {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory\"}},\
+ {{\"name\":\"--max-memory\",\"type\":\"size\",\"default\":\"auto\",\"description\":\"refuse when the header-derived store or rows x columns CSV estimate exceeds this\"}},\
+ {{\"name\":\"--force\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"override --max-memory and load the full input\"}},\
  {{\"name\":\"--quiet\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"do not print the import summary\"}}]}},\n  \
          \"verify-manifest\":{{\"command\":\"rcsr verify-manifest\",\"summary\":\"check a --run-manifest against the current binary, commit, data and canonical config\",\"doc\":\"docs/run-integrity.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"path stored in the manifest\",\"description\":\"data file to hash instead of the manifest's path\"}}],\"exit_codes\":{{\"0\":\"all checks pass\",\"1\":\"mismatch\",\"2\":\"usage error\"}}}},\n  \
