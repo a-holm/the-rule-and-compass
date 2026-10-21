@@ -178,8 +178,8 @@ fn the_two_controls_are_available_and_deterministic() {
 /// reference is the held-out target variance, not an arm's observed extremes.
 #[test]
 fn fixed_reference_validation_hypervolume_is_reported_for_every_arm() {
-    let baseline = json(&[]);
-    let qd = json(&["--qd", "--qd-cells", "8"]);
+    let baseline = json(&["--cpu"]);
+    let qd = json(&["--cpu", "--qd", "--qd-cells", "8"]);
     for (label, out) in [("baseline", &baseline), ("qd", &qd)] {
         assert!(
             out.contains("\"validation_hv\":{"),
@@ -216,7 +216,7 @@ fn fixed_reference_validation_hypervolume_is_reported_for_every_arm() {
         .expect("descriptor_fallbacks");
     assert_eq!(fallbacks, 0, "QD re-evaluated candidates for descriptors");
     // Deterministic for a seed (timing fields are not).
-    let repeat = json(&["--qd", "--qd-cells", "8"]);
+    let repeat = json(&["--cpu", "--qd", "--qd-cells", "8"]);
     assert_eq!(qd_object(&repeat), qd_object(&qd));
 }
 
