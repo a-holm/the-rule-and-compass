@@ -827,12 +827,13 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 only for a metric with a native device objective (squared/AIC family, and
 `log_squashed` since #229), with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The family is also a **CLI contract** (#223): an explicit
-`--fit-strategy gpu` with any metric outside `squared`, `aic`, `aicc` and `bic`
-is a usage error (exit code `2`) raised before any data is read, because the
-only alternative would be a silent CPU fit of a different objective. The
-message names the kernel's objective and both fixes (--metric squared, or a
-CPU fit strategy). The device-missing fallback below is unchanged: it never
+`32p` rows. The device objective is also a **CLI contract** (#223, extended by
+#229): an explicit `--fit-strategy gpu` with any metric *without* a native
+device objective — that is, outside `squared`, `aic`, `aicc`, `bic` and
+`log_squashed` — is a usage error (exit code `2`) raised before any data is
+read, because the only alternative would be a silent CPU fit of a different
+objective. The message names the two objectives the kernel minimises and every
+way out (`--metric squared`, `--metric log_squashed`, or a CPU fit strategy). The device-missing fallback below is unchanged: it never
 claims the GPU arm and is recorded with its cause.
 
 The arm also screens before it fits: every unfitted offspring is

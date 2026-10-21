@@ -175,7 +175,6 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
         metric.name()
     ))
 }
-}
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
 /// materialise. Above it the exact LM path runs, so a large dataset never pays
@@ -3567,21 +3566,22 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223: an explicit GPU request is refused outside the least-squares
-    /// family, and the refusal says why and what to use instead. The
-    /// least-squares family is accepted, including `squared` and the three
-    /// information criteria.
+    /// #223 + #229: an explicit GPU request is refused for every metric without
+    /// a native device objective, and the refusal says why and what to use
+    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares and
+    /// `log_squashed` fits by weighted IRLS on the device (#229), so both are
+    /// accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if m.is_least_squares() {
+            if fit_loss(*m).is_some() {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
             let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
             assert!(
-                why.contains("minimises squared error only"),
+                why.contains("minimises squared error or log-squashed loss only"),
                 "the refusal must name the GPU LM's objective: {why}"
             );
             assert!(
@@ -3592,6 +3592,10 @@ mod tests {
                 why.contains("--metric squared"),
                 "the refusal must point at --metric squared: {why}"
             );
+            assert!(
+                why.contains("--metric log_squashed"),
+                "the refusal must point at the robust arm: {why}"
+            );
             for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
                 assert!(
                     why.contains(strategy),
@@ -3599,6 +3603,10 @@ mod tests {
                 );
             }
         }
+        // The robust arm is native since #229: it must never be refused.
+        assert!(gpu_fit_metric_error(Metric::LogSquashed).is_none());
+        assert!(gpu_fit_metric_error(Metric::Squared).is_none());
+        assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
     }
 
     #[test]

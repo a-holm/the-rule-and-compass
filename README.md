@@ -33,9 +33,9 @@ arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. An explicit `gpu` with a metric outside the least-squares
-family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
-squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+forced individually. An explicit `gpu` with a metric that has no native device
+objective is a usage error, because the kernel would otherwise fit a different
+loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
 the default LM path when it cannot prove a safe result, and the default remains
 the historical LM path bit for bit.
 
@@ -892,9 +892,9 @@ arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. An explicit `gpu` with a metric outside the least-squares
-family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
-squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+forced individually. An explicit `gpu` with a metric that has no native device
+objective is a usage error, because the kernel would otherwise fit a different
+loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
 the default LM path when it cannot prove a safe result, and the default remains
 the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,

@@ -736,19 +736,25 @@ fn rcsr(args: &[&str]) -> std::process::Output {
         .expect("run rcsr")
 }
 
-/// Every metric outside the least-squares family is refused with exit 2 and
-/// a message that names the GPU LM's objective and both fixes. Iterating over
-/// `Metric::all()` means a future metric cannot inherit the old silent path.
+/// Every metric without a native device objective is refused with exit 2 and a
+/// message that names what the GPU LM minimises and every way out. #229 admits
+/// `log_squashed` because the kernel now fits it, so the refused set is exactly
+/// the complement of `fit::fit_loss`. Iterating over `Metric::all()` means a
+/// future metric cannot inherit the old silent path.
 #[test]
-fn explicit_gpu_outside_the_least_squares_family_is_a_usage_error() {
+fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     let refused: Vec<&str> = Metric::all()
         .iter()
-        .filter(|m| !m.is_least_squares())
+        .filter(|m| rcsr::fit::fit_loss(**m).is_none())
         .map(|m| m.name())
         .collect();
     assert!(
         refused.contains(&"absolute") && refused.contains(&"rank_correlation"),
-        "the least-squares family changed unexpectedly: {refused:?}"
+        "the native-objective family changed unexpectedly: {refused:?}"
+    );
+    assert!(
+        !refused.contains(&"log_squashed"),
+        "log_squashed is fitted by the kernel since #229 and must not be refused"
     );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
@@ -765,7 +771,7 @@ fn explicit_gpu_outside_the_least_squares_family_is_a_usage_error() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "--metric {metric}: {stderr}");
         assert!(
-            stderr.contains("--fit-strategy gpu minimises squared error only"),
+            stderr.contains("--fit-strategy gpu minimises squared error or log-squashed loss only"),
             "--metric {metric} must say what the GPU LM minimises: {stderr}"
         );
         assert!(
@@ -787,13 +793,13 @@ fn explicit_gpu_outside_the_least_squares_family_is_a_usage_error() {
     }
 }
 
-/// The gate must not over-fire. The four least-squares metrics pass the usage
-/// check with `gpu`, and every other metric keeps every other strategy: each
-/// reaches the data loader, so the run fails on the missing file (exit 3)
-/// rather than on the fit strategy.
+/// The gate must not over-fire. The four least-squares metrics and
+/// `log_squashed` pass the usage check with `gpu`, and every metric keeps every
+/// other strategy: each reaches the data loader, so the run fails on the missing
+/// file (exit 3) rather than on the fit strategy.
 #[test]
 fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
-    for metric in ["squared", "aic", "aicc", "bic"] {
+    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
         let out = rcsr(&[
             "--data", "missing-223.csv", "--target", "y", "--vars", "x",
             "--fit-strategy", "gpu", "--metric", metric,
@@ -801,7 +807,7 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(3), "--metric {metric}: {stderr}");
         assert!(
-            !stderr.contains("minimises squared error only"),
+            !stderr.contains("minimises squared error or log-squashed loss only"),
             "--metric {metric} is fitted by least squares and must be accepted: {stderr}"
         );
     }
@@ -813,7 +819,7 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(3), "--fit-strategy {strategy}: {stderr}");
         assert!(
-            !stderr.contains("minimises squared error only"),
+            !stderr.contains("minimises squared error or log-squashed loss only"),
             "--fit-strategy {strategy} keeps metric-aware CPU fitting: {stderr}"
         );
     }

@@ -454,9 +454,9 @@ SEARCH:
                              the kernel scores. Every other metric (including
                              the default absolute) runs on the CPU and prints
                              the reason, never with a proxy loss. Reported
-                             errors stay CPU f64; cross-backend runs are not
-                             bit-identical because f32 fitness can change the
-                             trajectory. JSON
+                             errors stay CPU f64. Cross-backend runs are
+                             not bit-identical because f32 fitness can change
+                             the trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
                              measured separately with ncu
@@ -2217,9 +2217,10 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
-    // #223: an explicit `--fit-strategy gpu` asks for the batched GPU LM, which
-    // minimises squared error only. Refuse a metric from another family instead
-    // of silently fitting its constants on the CPU with a different objective.
+    // #223 + #229: an explicit `--fit-strategy gpu` asks for the batched GPU LM,
+    // which minimises squared error or log-squashed loss. Refuse a metric with
+    // no native device objective instead of silently fitting its constants on
+    // the CPU with a different objective.
     // The check runs before any data is read, so it is a usage error.
     if fit_strategy_set && cfg.fit_strategy == fit::FitStrategy::Gpu {
         if let Some(why) = fit::gpu_fit_metric_error(cfg.metric) {
