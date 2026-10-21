@@ -25,7 +25,7 @@ use crate::metrics::{score_weighted, Metric};
 use crate::multi;
 use crate::pareto::{Archive, Sol};
 #[cfg(feature = "cuda")]
-use crate::postfix::{Arena, FrontParents, Variation};
+use crate::postfix::{unique_slots, Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
@@ -157,6 +157,12 @@ pub struct Config {
     pub qd_control: u8,
     /// Optional progress callback, invoked once per generation.
     pub progress: Option<ProgressFn>,
+    /// #211: optional development-log callback, invoked once per generation
+    /// with the measured record. Like [`progress`](Self::progress) it is a
+    /// reporting hook: it is not search state, is ignored by
+    /// [`search_setting_differences`](Self::search_setting_differences), and
+    /// `None` (the default) skips every measurement the log would need.
+    pub dev_log: Option<DevFn>,
     // #27: use the SoA/AVX evaluator for candidate predictions. This is a
     // path choice, not a search setting: both paths must produce the same
     // errors, so it is ignored by `search_setting_differences`.
@@ -194,6 +200,93 @@ pub struct Progress {
 /// Progress callback type. `Send + Sync` so islands can report concurrently.
 pub type ProgressFn = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
 
+/// #211: development-log callback type. Called once per completed generation on
+/// the search's main thread with a fully measured
+/// [`GenRecord`](crate::devlog::GenRecord); the CLI formats it as one NDJSON
+/// line. Not called at all when no log is attached.
+pub type DevFn = std::sync::Arc<dyn Fn(&crate::devlog::GenRecord) + Send + Sync>;
+
+/// #211: per-generation counters shared by the island threads.
+///
+/// Every increment is a relaxed atomic add on a counter that only exists when a
+/// development log is attached, so the search pays one predictable branch per
+/// counted event and nothing else. Nothing here feeds back into variation,
+/// fitting or selection: the counters are write-only for the whole generation.
+#[derive(Debug, Default)]
+pub struct GenCounters {
+    pub attempts: std::sync::atomic::AtomicU64,
+    pub duplicates: std::sync::atomic::AtomicU64,
+    pub too_complex: std::sync::atomic::AtomicU64,
+    pub offspring: std::sync::atomic::AtomicU64,
+    pub fitted: std::sync::atomic::AtomicU64,
+    /// Constant-fitting CPU time, nanoseconds, summed over threads.
+    pub fit_ns: std::sync::atomic::AtomicU64,
+    /// Candidate-evaluation CPU time, nanoseconds, summed over threads.
+    pub eval_ns: std::sync::atomic::AtomicU64,
+}
+
+impl GenCounters {
+    fn add(slot: &std::sync::atomic::AtomicU64, by: u64) {
+        slot.fetch_add(by, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn get(slot: &std::sync::atomic::AtomicU64) -> u64 {
+        slot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Increment `field` on `self` when a log is attached.
+    fn count(c: Option<&GenCounters>, field: fn(&GenCounters) -> &std::sync::atomic::AtomicU64) {
+        if let Some(c) = c {
+            Self::add(field(c), 1);
+        }
+    }
+
+    /// Total of `field` across the generation's threads.
+    fn total(
+        c: Option<&GenCounters>,
+        field: fn(&GenCounters) -> &std::sync::atomic::AtomicU64,
+    ) -> u64 {
+        c.map(|c| Self::get(field(c))).unwrap_or(0)
+    }
+
+    /// Total of `field` in seconds.
+    fn seconds(
+        c: Option<&GenCounters>,
+        field: fn(&GenCounters) -> &std::sync::atomic::AtomicU64,
+    ) -> f64 {
+        Self::total(c, field) as f64 / 1e9
+    }
+}
+
+/// #211: `fit_constants`, timed and counted only when a log is attached.
+#[inline]
+fn fit_counted(
+    counters: Option<&GenCounters>,
+    tree: &mut Node,
+    cfg: &Config,
+    fit: &Sample,
+    score: &Sample,
+) -> Option<FitResult> {
+    let t = counters.map(|_| std::time::Instant::now());
+    let out = fit_constants(tree, cfg, fit, score);
+    if let (Some(c), Some(t)) = (counters, t) {
+        GenCounters::add(&c.fitted, 1);
+        GenCounters::add(&c.fit_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    }
+    out
+}
+
+/// #211: an evaluated individual, timed only when a log is attached.
+#[inline]
+fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> Ind {
+    let t = counters.map(|_| std::time::Instant::now());
+    let ind = make();
+    if let (Some(c), Some(t)) = (counters, t) {
+        GenCounters::add(&c.eval_ns, t.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+    }
+    ind
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -227,6 +320,7 @@ impl Default for Config {
             qd_policy: false,
             qd_control: 0,
             progress: None,
+            dev_log: None, // #211: off unless --dev-log is given
             simd: true, // #27
             // #141: the GPU is the default backend when the binary is built
             // with CUDA and a device is available. The probe happens once at
@@ -247,7 +341,8 @@ impl Config {
     /// `generations` is deliberately excluded: it is a **budget**, not a
     /// property of the trajectory. Resuming may extend it (never shorten it),
     /// and every other setting must match the checkpoint exactly. `progress`
-    /// is a reporting callback, not search state, and is ignored.
+    /// and `dev_log` (#211) are reporting callbacks, not search state, and are
+    /// ignored.
     pub fn search_setting_differences(&self, other: &Config) -> Vec<&'static str> {
         let mut diff = Vec::new();
         macro_rules! compare {
@@ -874,6 +969,27 @@ impl GpuSearch {
             fit_refits: 0,
             fit_ms: self.fit_ms,
             fit_host_ms: self.fit_host_ms,
+        }
+    }
+
+    /// #211: a cheap snapshot of this evaluator's ledger for the development
+    /// log. The run-level counters are monotone; the caller subtracts the
+    /// previous generation's snapshot. The per-batch fields come from the stats
+    /// this generation recorded, so they are already that generation's alone.
+    fn dev_snapshot(&self, generation: usize) -> GpuSnapshot {
+        let batch = self.stats.get(&generation);
+        GpuSnapshot {
+            accounting: self.ev.stats(),
+            fit_attempts: self.fit_attempts,
+            fit_gpu: self.fit_gpu,
+            fit_fallback: self.fit_fallback,
+            fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
+            fallback_s: batch.map(|b| b.fallback_seconds).unwrap_or(0.0),
+            fallback_workers: batch.map(|b| b.fallback_workers).unwrap_or(0),
+            programs: batch.map(|b| b.programs).unwrap_or(0),
+            native: batch.map(|b| b.native).unwrap_or(0),
+            lowered: batch.map(|b| b.lowered).unwrap_or(0),
+            fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
         }
     }
 
@@ -2208,6 +2324,9 @@ fn evolve_island(
     // bounded GPU queue as soon as it is fitted, so scoring overlaps the rest
     // of this generation. `None` is the synchronous path exactly.
     sink: Option<(&std::sync::mpsc::SyncSender<PipelineJob>, usize)>,
+    // #211: per-generation development-log counters. `None` (the default) makes
+    // every count and timer below a single branch with no effect.
+    counters: Option<&GenCounters>,
 ) {
     if !screened {
         for ind in isl.iter_mut() {
@@ -2241,6 +2360,7 @@ fn evolve_island(
 
     while next.len() < pop && attempts < max_attempts {
         attempts += 1;
+        GenCounters::count(counters, |c| &c.attempts);
         // #120: with the policy on, a UCB/stratified cell elite supplies most
         // parents; 5% still come from the global Pareto front. With the policy
         // off this is exactly the #76 draw.
@@ -2257,9 +2377,11 @@ fn evolve_island(
 
         let mut tree = expr::simplify(&child);
         if cfg.complexity_model.complexity(&tree) > cfg.max_complexity as f64 {
+            GenCounters::count(counters, |c| &c.too_complex); // #211
             continue;
         }
         if cfg.dedup && !seen.insert(expr::structural_hash(&tree)) {
+            GenCounters::count(counters, |c| &c.duplicates); // #211
             continue;
         }
 
@@ -2271,7 +2393,7 @@ fn evolve_island(
         // batched kernel before scoring; fitting them here would hide the
         // offload behind a CPU LM pass.
         if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
-            fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
+            fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
             tree = expr::simplify(&tree);
         }
         // #26: with the GPU batch active the fitness is filled in after every
@@ -2280,11 +2402,12 @@ fn evolve_island(
         let ind = if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
+            eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
         };
         if ind.complexity > cfg.max_complexity as f64 {
             continue;
         }
+        GenCounters::count(counters, |c| &c.offspring); // #211
         let slot = next.len();
         next.push(ind);
         offer(&sink, slot, &next[slot]); // #119
@@ -2303,15 +2426,16 @@ fn evolve_island(
         // #14: otherwise fit on the objective the metric actually scores.
         let mut fitted = None;
         if cfg.fit_iters > 0 && !train.sample.is_multi() && !defers_fit_to_gpu(cfg, defer_gpu) {
-            fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample); // #85 #87
+            fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #85 #87 #211
             tree = expr::simplify(&tree);
         }
         // #26: same deferral for the random fill.
         let slot = next.len();
+        GenCounters::count(counters, |c| &c.offspring); // #211
         next.push(if defer_gpu {
             Ind::pending(tree, cfg)
         } else {
-            Ind::evaluated_fitted(tree, fitted, train, cfg) // #25 #87
+            eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #25 #87 #211
         });
         offer(&sink, slot, &next[slot]); // #119
     }
@@ -2341,14 +2465,15 @@ fn evolve_island(
                 let mut tree = expr::simplify(&t);
                 let mut fitted = None;
                 if cfg.fit_iters > 0 && !train.sample.is_multi() {
-                    fitted = fit_constants(&mut tree, cfg, fit_sample, train.sample);
+                    fitted = fit_counted(counters, &mut tree, cfg, fit_sample, train.sample); // #211
                     tree = expr::simplify(&tree);
                 }
                 let slot = pop - immigrants + k;
+                GenCounters::count(counters, |c| &c.offspring); // #211
                 next[slot] = if defer_gpu {
                     Ind::pending(tree, cfg)
                 } else {
-                    Ind::evaluated_fitted(tree, fitted, train, cfg)
+                    eval_counted(counters, || Ind::evaluated_fitted(tree, fitted, train, cfg)) // #211
                 };
                 offer(&sink, slot, &next[slot]);
             }
@@ -2469,6 +2594,12 @@ pub struct Outcome {
     pub gpu: Option<GpuRunStats>,
     /// #120: quality-diversity coverage report, or `None` when the layer is off.
     pub qd: Option<QdReport>,
+    /// #211: why the generation loop stopped: `solved` (an error at or below
+    /// the solved floor), `patience` (no improvement for `--patience`
+    /// generations), `time_budget`, or `generations` (the budget ran out). Read
+    /// by the development log's `run_end` event; it is not printed, so the
+    /// default output is unchanged.
+    pub stop_reason: &'static str,
 }
 
 /// Run a search once, from a fresh start.
@@ -2789,8 +2920,200 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     )
 }
 
-/// #122: the generation loop over the flat postfix arena.
+/// #211: a cheap copy of the GPU ledger, used to take a per-generation delta.
 ///
+/// The run-level counters are monotone, so subtracting a snapshot from the one
+/// taken at the next generation boundary gives that generation's share without
+/// adding a second accounting path. `programs`/`native`/`lowered`/`fallbacks`
+/// come from the batch stats keyed by generation and are therefore not
+/// subtracted.
+#[derive(Clone, Debug, Default)]
+pub struct GpuSnapshot {
+    pub accounting: crate::gpu_stats::GpuStats,
+    pub fit_attempts: usize,
+    pub fit_gpu: usize,
+    pub fit_fallback: usize,
+    pub fit_fallback_by_cause: BTreeMap<String, usize>,
+    pub fallback_s: f64,
+    pub fallback_workers: usize,
+    pub programs: usize,
+    pub native: usize,
+    pub lowered: usize,
+    pub fallbacks: usize,
+}
+
+impl GpuSnapshot {
+    /// Everything that happened after `earlier`.
+    pub fn since(&self, earlier: &GpuSnapshot) -> GpuSnapshot {
+        let mut causes = self.fit_fallback_by_cause.clone();
+        for (name, count) in &earlier.fit_fallback_by_cause {
+            let entry = causes.entry(name.clone()).or_insert(0);
+            *entry = entry.saturating_sub(*count);
+        }
+        causes.retain(|_, v| *v > 0);
+        GpuSnapshot {
+            accounting: self.accounting.since(&earlier.accounting),
+            fit_attempts: self.fit_attempts.saturating_sub(earlier.fit_attempts),
+            fit_gpu: self.fit_gpu.saturating_sub(earlier.fit_gpu),
+            fit_fallback: self.fit_fallback.saturating_sub(earlier.fit_fallback),
+            fit_fallback_by_cause: causes,
+            fallback_s: (self.fallback_s - earlier.fallback_s).max(0.0),
+            fallback_workers: self.fallback_workers.max(earlier.fallback_workers),
+            programs: self.programs,
+            native: self.native,
+            lowered: self.lowered,
+            fallbacks: self.fallbacks,
+        }
+    }
+}
+
+/// #211: read the clock and reset the mark. A no-op (0.0) with no log attached.
+fn dev_lap(mark: &mut Option<std::time::Instant>) -> f64 {
+    match mark.as_mut() {
+        Some(t) => {
+            let now = std::time::Instant::now();
+            let d = now.duration_since(*t).as_secs_f64();
+            *t = now;
+            d
+        }
+        None => 0.0,
+    }
+}
+
+/// #211: hash of the island RNG states at a generation boundary.
+///
+/// Two runs that agree on this key at the same generation saw the same random
+/// stream; a comparison between logs can therefore tell "different data" from
+/// "different randomness".
+fn dev_rng_key(rngs: &[Mt], main: &Mt) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |w: u32| {
+        h ^= w as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    for r in rngs {
+        let (words, idx) = r.state();
+        mix(idx as u32);
+        for &w in words.iter() {
+            mix(w);
+        }
+    }
+    let (words, idx) = main.state();
+    mix(idx as u32);
+    for &w in words.iter() {
+        mix(w);
+    }
+    h
+}
+
+/// #211: assemble one generation's development record.
+///
+/// Called only when a development log is attached, so the quantile sorts below
+/// never run on a normal search. `errors` are this generation's finite
+/// population errors and `island_best` its per-island minima, both measured by
+/// the caller (the owned-tree and flat-arena loops read different state).
+#[allow(clippy::too_many_arguments)]
+fn dev_generation(
+    generation: usize,
+    cfg: &Config,
+    errors: Vec<f64>,
+    island_best: Vec<f64>,
+    archive: &Archive,
+    convergence: Convergence,
+    rng_key: u64,
+    t: f64,
+    phases: [f64; 5],
+    counters: Option<&GenCounters>,
+    offers: usize,
+    admissions: usize,
+    refits: usize,
+    gpu: Option<GpuSnapshot>,
+    qd: Option<crate::devlog::QdGen>,
+) -> crate::devlog::GenRecord {
+    let q = |p: f64| crate::diagnostics::quantile(&errors, p);
+    let best_error = errors.iter().copied().fold(f64::INFINITY, f64::min);
+    let points: Vec<(f64, f64)> = archive.items.iter().map(|s| (s.cost, s.error)).collect();
+    let (fit, fallback_s, fallback_workers) = match &gpu {
+        Some(g) => (
+            crate::devlog::FitGen {
+                attempts: g.fit_attempts,
+                gpu: g.fit_gpu,
+                fallback: g.fit_fallback,
+                refits,
+                fallback_by_cause: g
+                    .fit_fallback_by_cause
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect(),
+            },
+            g.fallback_s,
+            g.fallback_workers,
+        ),
+        None => (
+            crate::devlog::FitGen {
+                refits,
+                ..Default::default()
+            },
+            0.0,
+            0,
+        ),
+    };
+    let gpu_rec = gpu.as_ref().map(|g| crate::devlog::GpuGen {
+        batches: g.accounting.batches,
+        programs: g.programs.max(g.accounting.programs as usize) as u64,
+        kernel_s: g.accounting.kernel_s,
+        wall_s: g.accounting.wall_s,
+        duty: g.accounting.duty_cycle(),
+        native: g.native,
+        lowered: g.lowered,
+        fallbacks: g.fallbacks,
+        fallback_s: g.fallback_s,
+        fallback_workers: g.fallback_workers,
+    });
+    crate::devlog::GenRecord {
+        generation,
+        total_generations: cfg.generations,
+        t,
+        wall_s: phases.iter().sum(),
+        prep_s: phases[0],
+        search_s: phases[1],
+        eval_s: phases[2],
+        select_s: phases[3],
+        archive_s: phases[4],
+        fit_cpu_s: GenCounters::seconds(counters, |c| &c.fit_ns),
+        eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns),
+        best_error,
+        p05: q(0.05),
+        p25: q(0.25),
+        median: q(0.5),
+        p75: q(0.75),
+        p95: q(0.95),
+        pareto_size: archive.items.len(),
+        hypervolume: crate::qd::fixed_reference_hypervolume(&points, 1.0),
+        archive_hash: archive.hash(),
+        offers,
+        admissions,
+        attempts: GenCounters::total(counters, |c| &c.attempts) as usize,
+        duplicates: GenCounters::total(counters, |c| &c.duplicates) as usize,
+        too_complex: GenCounters::total(counters, |c| &c.too_complex) as usize,
+        offspring: GenCounters::total(counters, |c| &c.offspring) as usize,
+        fitted: GenCounters::total(counters, |c| &c.fitted) as usize,
+        refits,
+        gpu: gpu_rec,
+        fit,
+        fallback_s,
+        fallback_workers,
+        qd,
+        confidence: convergence.confidence,
+        stability: convergence.stability,
+        maturity: convergence.maturity,
+        percent_converged: convergence.percent_converged,
+        island_best,
+        rng_key,
+    }
+}
+
+/// #122: the generation loop over the flat postfix arena.
 /// The device evaluates the whole arena in one upload and one launch; the host
 /// only varies compact arrays, tests the archive with `(error, cost)` and
 /// rebuilds an owned tree for a candidate that actually enters the front.
@@ -2834,6 +3157,12 @@ fn run_postfix_search(
     let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
     let mut restart_flags = vec![false; n_islands];
     let t0 = std::time::Instant::now();
+    // #211: why the loop ends, for the development log's run_end event.
+    let mut stop_reason: &'static str = if converged_early {
+        "already_stopped"
+    } else {
+        "generations"
+    };
 
     for gen in gens_done..cfg.generations {
         // A checkpoint saved after an early stop stays stopped even when the
@@ -2842,6 +3171,16 @@ fn run_postfix_search(
             break;
         }
         gens_done = gen + 1;
+        // #211: development-log clock and counters. `None` without --dev-log, so
+        // this loop is the one it always was.
+        let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
+        let mut dev_offers = 0usize;
+        let mut dev_admissions = 0usize;
+        let dev_gpu_before = if dev_mark.is_some() {
+            Some(gpu.dev_snapshot(gen))
+        } else {
+            None
+        };
         // #76/#122: compile the previous generation's front once, then let the
         // flat engine draw 15 % of parents from it. With the feature off the
         // pool is empty and `front_p` is 0.0, so the draw consumes no RNG and
@@ -2863,7 +3202,9 @@ fn run_postfix_search(
             &front,
             front_p,
         );
+        let dev_generate = dev_lap(&mut dev_mark); // #211
         next.evaluate(&mut gpu.ev, train.len())?;
+        let dev_eval = dev_lap(&mut dev_mark); // #211
         restart_flags = vec![false; n_islands];
 
         // Archive: test `(error, cost)` first and rebuild a tree only for a
@@ -2877,13 +3218,20 @@ fn run_postfix_search(
                     gen_best = error;
                 }
                 let cost = next.cost[idx] as f64;
+                if dev_mark.is_some() {
+                    dev_offers += 1; // #211
+                }
                 if !archive.admits(error, cost) {
                     continue;
+                }
+                if dev_mark.is_some() {
+                    dev_admissions += 1; // #211
                 }
                 let Some(tree) = next.decode(idx) else { continue };
                 archive.try_insert_view(&tree, error, expr::complexity(&tree), cost);
             }
         }
+        let dev_archive = dev_lap(&mut dev_mark); // #211
         gpu_stats.push(GpuGenStats {
             generation: gen,
             opcodes: Default::default(),
@@ -2904,6 +3252,7 @@ fn run_postfix_search(
         if let Some(budget) = cfg.time_budget {
             if t0.elapsed().as_secs_f64() >= budget {
                 converged_early = true;
+                stop_reason = "time_budget"; // #211
             }
         }
 
@@ -2917,10 +3266,71 @@ fn run_postfix_search(
                 convergence,
             });
         }
+        // #211: same boundary as `--progress`. The flat arena has its own
+        // de-duplication pass, so the duplicate count is read from the arena
+        // (programs that share a canonical postfix hash) instead of a rejected
+        // attempt counter; `fit_*` stays zero because this path is fit-free by
+        // construction.
+        if let Some(report) = &cfg.dev_log {
+            let mut dev_errors: Vec<f64> = Vec::with_capacity(n_islands * pop);
+            let mut dev_island_best: Vec<f64> = Vec::with_capacity(n_islands);
+            for i in 0..n_islands {
+                let mut best = f64::INFINITY;
+                for j in 0..pop {
+                    let e = next.err[next.slot_index(i, j)];
+                    if e.is_finite() {
+                        dev_errors.push(e);
+                        best = best.min(e);
+                    }
+                }
+                dev_island_best.push(best);
+            }
+            let unique = unique_slots(&next).len();
+            let programs = n_islands * pop;
+            let gpu_now = gpu.dev_snapshot(gen);
+            let counters = GenCounters::default();
+            GenCounters::add(&counters.attempts, programs as u64);
+            GenCounters::add(&counters.offspring, programs as u64);
+            GenCounters::add(&counters.duplicates, programs.saturating_sub(unique) as u64);
+            let mut rec = dev_generation(
+                gens_done,
+                cfg,
+                dev_errors,
+                dev_island_best,
+                &archive,
+                convergence,
+                {
+                    let mut h = 0xcbf2_9ce4_8422_2325u64;
+                    for w in [cfg.seed, gen as u32] {
+                        h ^= w as u64;
+                        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                    h
+                },
+                t0.elapsed().as_secs_f64(),
+                [0.0, dev_generate, dev_eval, 0.0, dev_archive],
+                Some(&counters),
+                dev_offers,
+                dev_admissions,
+                0,
+                dev_gpu_before.map(|b| gpu_now.since(&b)),
+                None,
+            );
+            // The flat arena compiles the whole batch for the kernel and
+            // records its own synthesis of the per-generation counters; that
+            // entry, not the (empty) node-path one, describes this batch.
+            if let (Some(g), Some(gs)) = (rec.gpu.as_mut(), gpu_stats.last()) {
+                g.native = gs.native;
+                g.lowered = gs.lowered;
+                g.fallbacks = gs.fallbacks;
+            }
+            report(&rec);
+        }
 
         if gen_best.is_finite() {
             if gen_best <= 1e-24 {
                 converged_early = true;
+                stop_reason = "solved"; // #211
             }
             let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
             if rel <= 1e-9 {
@@ -2931,6 +3341,7 @@ fn run_postfix_search(
             best_prev = best_prev.min(gen_best);
             if cfg.patience > 0 && no_improve >= cfg.patience {
                 converged_early = true;
+                stop_reason = "patience"; // #211
             }
         }
 
@@ -3114,6 +3525,7 @@ fn run_postfix_search(
             fit_host_ms: gpu.fit_host_ms,
         }),
         qd: None,
+        stop_reason,
     })
 }
 
@@ -3531,9 +3943,37 @@ fn run_search(
         None
     };
 
+    // #211: why the generation loop ends, for the development log's run_end.
+    let mut stop_reason: &'static str = if converged_early {
+        "already_stopped"
+    } else {
+        "generations"
+    };
+
     if !converged_early {
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
+
+            // #211: development-log scaffolding. With no log attached `dev_mark`
+            // is `None`, the counter block is `None`, and every `dev_lap` below
+            // returns 0.0 without reading a clock, so the generation is the one
+            // it always was.
+            let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
+            let dev_counters = cfg.dev_log.is_some().then(GenCounters::default);
+            // The island threads take `Option<&GenCounters>`, which is `Copy`;
+            // the owning `Option` stays here for the readout below.
+            let dev_counters_ref = dev_counters.as_ref();
+            let mut dev_refits = 0usize;
+            let mut dev_offers = 0usize;
+            let mut dev_admissions = 0usize;
+            #[cfg(feature = "cuda")]
+            let dev_gpu_before = if dev_mark.is_some() {
+                gpu.as_ref().map(|g| g.dev_snapshot(gen))
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let dev_gpu_before: Option<GpuSnapshot> = None;
 
             // One fixed subset for the whole generation; a fresh draw next time.
             // `None` means the full training sample, exactly as before.
@@ -3581,6 +4021,9 @@ fn run_search(
                 for pop in islands.iter_mut() {
                     for ind in pop.iter_mut() {
                         ind.refit_and_reeval(gen_data, fit_train, cfg); // #25
+                        if dev_mark.is_some() {
+                            dev_refits += 1; // #211
+                        }
                     }
                 }
             }
@@ -3591,6 +4034,7 @@ fn run_search(
             } else {
                 None
             };
+            let dev_prep = dev_lap(&mut dev_mark); // #211
 
             // ---- parallel generation across islands ---------------------
             let aggs_ref = &aggs;
@@ -3680,6 +4124,7 @@ fn run_search(
                                 cfg.qd_policy, // #120
                                 cfg.qd_control, // #120 control
                                 sender.as_ref().map(|t| (t, i)), // #119
+                                dev_counters_ref, // #211
                             ) // #85
                         })
                     })
@@ -3703,6 +4148,7 @@ fn run_search(
                     let _ = h.join();
                 }
             });
+            let dev_search = dev_lap(&mut dev_mark); // #211: island scope
 
             #[cfg(feature = "cuda")]
             {
@@ -3753,6 +4199,7 @@ fn run_search(
                         score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
                 }
             }
+            let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
 
             // #85: successive halving phase two. Promote the top fraction of
             // the screening offspring, refit and re-score them on every
@@ -3774,6 +4221,9 @@ fn run_search(
                         ind.error = sol.error;
                         ind.complexity = sol.cost;
                         promoted.push(ind);
+                        if dev_mark.is_some() {
+                            dev_refits += 1; // #211
+                        }
                     }
                     let mut combined = parents;
                     combined.extend(promoted);
@@ -3781,6 +4231,7 @@ fn run_search(
                     *pop = combined;
                 }
             }
+            let dev_select = dev_lap(&mut dev_mark); // #211
 
             // ---- archive + convergence bookkeeping ----------------------
             let mut gen_best = f64::INFINITY;
@@ -3788,6 +4239,15 @@ fn run_search(
                 for ind in pop {
                     if ind.error < gen_best {
                         gen_best = ind.error;
+                    }
+                    if dev_mark.is_some() {
+                        // #211: "admission" is the archive's own dominance test,
+                        // asked before the insert so the count is a property of
+                        // the offer, not of the insertion order.
+                        dev_offers += 1;
+                        if archive.admits(ind.error, ind.complexity) {
+                            dev_admissions += 1;
+                        }
                     }
                     archive.try_insert_view(
                         &ind.tree,
@@ -3797,10 +4257,12 @@ fn run_search(
                     );
                 }
             }
+            let dev_archive = dev_lap(&mut dev_mark); // #211
 
             if let Some(budget) = cfg.time_budget {
                 if t0.elapsed().as_secs_f64() >= budget {
                     converged_early = true;
+                    stop_reason = "time_budget"; // #211
                     break;
                 }
             }
@@ -3820,9 +4282,62 @@ fn run_search(
                 });
             }
 
+            // #211: one development-log record per completed generation, written
+            // at the same boundary `--progress` reports. Everything here is a
+            // reading of state the search already holds; nothing is drawn from
+            // the RNG and nothing is written back.
+            if let Some(report) = &cfg.dev_log {
+                #[cfg(feature = "cuda")]
+                let gpu_now = gpu.as_ref().map(|g| g.dev_snapshot(gen));
+                #[cfg(not(feature = "cuda"))]
+                let gpu_now: Option<GpuSnapshot> = None;
+                // The population error vector and per-island best are read here,
+                // once, rather than inside the helper: the log pays for them
+                // only when it exists.
+                let mut dev_errors: Vec<f64> = Vec::with_capacity(cfg.pop * islands.len());
+                let mut dev_island_best: Vec<f64> = Vec::with_capacity(islands.len());
+                for pop in &islands {
+                    let mut best = f64::INFINITY;
+                    for ind in pop {
+                        if ind.error.is_finite() {
+                            dev_errors.push(ind.error);
+                            best = best.min(ind.error);
+                        }
+                    }
+                    dev_island_best.push(best);
+                }
+                let rec = dev_generation(
+                    gens_done,
+                    cfg,
+                    dev_errors,
+                    dev_island_best,
+                    &archive,
+                    convergence,
+                    dev_rng_key(&rngs, &rng),
+                    t0.elapsed().as_secs_f64(),
+                    [dev_prep, dev_search, dev_eval, dev_select, dev_archive],
+                    dev_counters_ref,
+                    dev_offers,
+                    dev_admissions,
+                    dev_refits,
+                    dev_gpu_before.zip(gpu_now).map(|(b, n)| n.since(&b)),
+                    qd_archive.as_ref().map(|q| {
+                        let r = q.report();
+                        crate::devlog::QdGen {
+                            occupied: r.occupied_reachable,
+                            reachable: r.reachable,
+                            coverage: r.reachable_coverage,
+                            entropy: r.occupancy_entropy,
+                        }
+                    }),
+                );
+                report(&rec);
+            }
+
             if gen_best.is_finite() {
                 if gen_best <= 1e-24 {
                     converged_early = true;
+                    stop_reason = "solved"; // #211
                     break;
                 }
                 let rel = (best_prev - gen_best) / (1.0 + best_prev.abs());
@@ -3834,6 +4349,7 @@ fn run_search(
                 best_prev = best_prev.min(gen_best);
                 if cfg.patience > 0 && no_improve >= cfg.patience {
                     converged_early = true;
+                    stop_reason = "patience"; // #211
                     break;
                 }
             }
@@ -4219,6 +4735,7 @@ fn run_search(
         gpu: gpu_stats,
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
+        stop_reason, // #211
     })
 }
 
@@ -4555,6 +5072,7 @@ mod tests {
                 false, // #120
                 0,     // #120 control
                 None,  // #119: synchronous test path
+                None,  // #211: no development log in this test
             );
             let trees: Vec<Node> = isl.iter().map(|i| i.tree.clone()).collect();
             let errors: Vec<u64> = isl.iter().map(|i| i.error.to_bits()).collect();
