@@ -158,7 +158,8 @@ rcsr enrich --data panel.csv --out panel.rcsb --features ta:core,returns
 The report (`<out>.enrich.json`, plus `--json` on stdout) records the input and
 output SHA-256, every per-column hash, each column's nominal warm-up, observed
 `NaN` count and first finite row, the inferred bar spacing, phase timings and
-peak RSS.
+peak RSS. The append writer hashes the output as it streams the blocks to disk,
+so a multi-gigabyte store is not read a second time just to checksum it.
 
 ### Catalogue
 
@@ -288,10 +289,94 @@ pre-registered tolerance is `1e-12` absolute-or-relative, and the parity test
 bit-identical. The earlier 35 CPU-only columns in the full-catalogue run keep
 identical hashes; the 127 GPU columns are tolerance-equal.
 
-The 15.9M-row store was not available on this machine in this increment, so its
-CPU/GPU pair is not measured here; the same harness applies
-(`rcsr enrich --data <store> --features ... --gpu off|auto --dry-run --json`).
-That remains an open #200 acceptance item.
+### 15.9M-row CPU/GPU pair (2026-10-22)
+
+The exact 15.9M-row artifact on this machine is the pilot's
+`panel_hourly_all.rcsb`: **15,893,809 rows x 56 columns**, version 1. It holds
+`ts`, `symbol` and pre-computed features only (no `open/high/low/close/volume`),
+so `rcsr enrich` cannot read it, and the append-only writer refuses version 1.
+The missing artifact is an **OHLCV version-2 store at 15.9M rows**.
+
+The largest enrichable cell is `panel15m.rcsb`: version 2, **16,113,108 rows x
+11 columns** (109 symbols, 15-minute bars), 1.4 % more rows than the 15.9M
+target. Both arms appended the complete advertised catalogue
+(`--features all,py15m` = **201 columns**; output 212 columns), so the pair
+covers every advertised name rather than a dry-run catalogue. The host shared
+the RTX 3060 with the 10-hour `wf_hourly_gpu_10h_1` search (60-100 % SM
+utilisation) and the ext4 disk with other builds, so wall time is noisy; the
+per-phase seconds below are the report's own measurements.
+
+| arm | wall | feature | xs | append | peak RSS | GPU columns / share | kernel | transfer |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| CPU run 1 | 900.7 s | 486.3 s | 26.2 s | 366.7 s | 922 MiB | 0 / 0 % | – | – |
+| CPU run 2 | 1179.8 s | 475.3 s | 17.5 s | 669.7 s | 920 MiB | 0 / 0 % | – | – |
+| GPU run 1 (`auto`) | 907.9 s | 322.3 s | 16.2 s | 551.6 s | 1195 MiB | 145 / **72.1 %** | 5.80 s | 20.56 GB |
+| GPU run 2 (`auto`) | 866.3 s | 324.8 s | 20.4 s | 504.7 s | 1195 MiB | 145 / **72.1 %** | 6.99 s | 20.56 GB |
+
+The feature phase is the measured GPU win: **323.5 s mean vs 480.8 s**, 1.49x
+(49.8k vs 33.5k feature rows/s). The append is the same code over the same
+bytes on both arms; it ranged from 366.7 s to 669.7 s on this shared disk and is
+what decides end-to-end wall. The two-run means are **887.1 s (GPU) vs 1040.3 s
+(CPU)**, 1.17x, but a single pair can tie (run 1: 907.9 s vs 900.7 s).
+End-to-end throughput was 13.7k-18.6k rows/s (27.26 GB output, 40.7-74.3 MB/s
+append).
+
+The auto plan dispatched 145 of 201 columns: `returns` 120/121 (`r192` stays on
+the CPU), `ma` 14/14, `calendar` 8/8 and `xs` 3/3, with zero fallbacks. The
+other 56 columns stay on the CPU with their recorded reasons: no exact kernel
+(`btc` 9, `py15m` 4); one-thread-per-segment kernels that do not repay the
+resident upload (`atr` 8, `rsi` 3, `donchian` 2, `lags` 10); or estimated GPU
+time not below the CPU after the 10.5 s context term (`bollinger` 4, `candle`
+6, `vol` 9). The run uploads 20.56 GB of device traffic once; no source column
+is re-uploaded per family.
+
+Exactness on the full pair (`cpu_16m.rcsb` vs `gpu_16m.rcsb`, every one of the
+201 advertised columns) is checked by the harness below: zero NaN-mask
+mismatches, every finite value within the pre-registered `1e-12`, and
+bit-identical columns reported per name. The two CPU runs produced the same
+store SHA-256 (`a4c99c95279c...`) and the two GPU runs the same
+(`5a501b777cd0...`); the GPU store differs from the CPU store only within that
+tolerance (CUDA `log`/`sin`/`cos` last bits), never in schema or order.
+
+```sh
+# CPU and GPU arms (both write the full 212-column store)
+rcsr enrich --data panel15m.rcsb --out cpu.rcsb --features all,py15m --gpu off --json > cpu.json
+rcsr enrich --data panel15m.rcsb --out gpu.rcsb --features all,py15m --gpu auto --json > gpu.json
+
+# Every advertised column, NaN mask and value; ignores nothing
+RCSR_ENRICH_PARITY_CPU=cpu.rcsb RCSR_ENRICH_PARITY_GPU=gpu.rcsb \
+RCSR_ENRICH_PARITY_SPEC=all,py15m \
+  cargo test --release --features cuda --test enrich_gpu \
+  advertised_catalogue_matches_between_cpu_and_gpu_on_a_large_store -- --ignored --nocapture
+```
+
+On this pair the harness compared 210 numeric columns (201 advertised plus the
+9 input value columns): **83 bit-identical**, **127 within last-bit
+differences**, **max absolute difference 8.882e-16**, **zero NaN-mask
+mismatches**, and every value inside the pre-registered `1e-12`. The differing
+columns are the `log`/`sin`/`cos` families (`returns` and `calendar`); all
+input columns and every CPU-computed feature are byte-identical.
+
+### Append throughput fixes (2026-10-22)
+
+Two costs dominated the old append path: a `write_all` plus a SHA-256 update per
+**value** while staging each feature column, and a second full read of the
+output store to checksum it after the rename. The writer now stages 64 KiB
+blocks and hashes as it writes, so the checksum costs one pass instead of two.
+`tests/enrich.rs::append_preserves_every_existing_column_and_metadata` checks
+the streamed digest against a plain re-read.
+
+Same 3,874,994-row store, `--features all --gpu off --dry-run` (the 171-column
+feature phase, same machine and load class):
+
+| build | feature phase | total | peak RSS |
+|---|---:|---:|---:|
+| before | 110.4 s | 123.4 s | 335 MiB |
+| after | **64.9 s** | **75.2 s** | 346 MiB |
+
+On the 16.1M-row cell the CPU arm went from 1408.5 s to 900.7 s (23:30 -> 15:01)
+with the **same output SHA-256** (`a4c99c95...`): the 27.26 GB second read
+disappeared and the bytes did not change.
 
 ### Measured enrichment (2026-10-21)
 

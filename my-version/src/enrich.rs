@@ -2115,6 +2115,9 @@ struct TempColumn {
     name: String,
     path: PathBuf,
     writer: Option<BufWriter<std::fs::File>>,
+    /// Reused byte staging so a column segment reaches the writer and the hash
+    /// as one block instead of one 8-byte call per value.
+    buf: Vec<u8>,
     hash: Sha256Hasher,
     warmup: usize,
     nan_rows: usize,
@@ -2122,6 +2125,10 @@ struct TempColumn {
     label: bool,
     row_offset: usize,
 }
+
+/// Staging size for [`TempColumn::write_values`]; a multiple of 8 and of the
+/// 64-byte SHA-256 block.
+const WRITE_CHUNK_BYTES: usize = 1 << 16;
 
 impl TempColumn {
     fn create(dir: &Path, name: &str, warmup: usize, label: bool) -> Result<Self, String> {
@@ -2135,6 +2142,7 @@ impl TempColumn {
             name: name.to_string(),
             path,
             writer: Some(BufWriter::with_capacity(1 << 20, file)),
+            buf: Vec::with_capacity(WRITE_CHUNK_BYTES),
             hash: Sha256Hasher::new(),
             warmup,
             nan_rows: 0,
@@ -2143,24 +2151,40 @@ impl TempColumn {
             row_offset: 0,
         })
     }
+    /// Flush the staging block into the writer and the hash (same bytes, same
+    /// order, so the digest is unchanged).
+    fn drain_buf(&mut self) -> Result<(), String> {
+        if self.buf.is_empty() {
+            return Ok(());
+        }
+        if let Some(w) = self.writer.as_mut() {
+            w.write_all(&self.buf)
+                .map_err(|e| format!("{}: {}", self.path.display(), e))?;
+            self.hash.update(&self.buf);
+        }
+        self.buf.clear();
+        Ok(())
+    }
     fn write_values(&mut self, values: &[f64]) -> Result<(), String> {
-        let w = self.writer.as_mut().ok_or("temp column already closed")?;
-        let mut buf = [0u8; 8];
+        if self.writer.is_none() {
+            return Err("temp column already closed".to_string());
+        }
         for &v in values {
             if !v.is_finite() {
                 self.nan_rows += 1;
             } else if self.first_finite.is_none() {
                 self.first_finite = Some(self.row_offset);
             }
-            buf.copy_from_slice(&v.to_le_bytes());
-            w.write_all(&buf)
-                .map_err(|e| format!("{}: {}", self.path.display(), e))?;
-            self.hash.update(&buf);
+            self.buf.extend_from_slice(&v.to_le_bytes());
+            if self.buf.len() >= WRITE_CHUNK_BYTES {
+                self.drain_buf()?;
+            }
             self.row_offset += 1;
         }
         Ok(())
     }
     fn flush(&mut self) -> Result<(), String> {
+        self.drain_buf()?;
         if let Some(w) = self.writer.as_mut() {
             w.flush()
                 .map_err(|e| format!("{}: {}", self.path.display(), e))?;
@@ -2168,6 +2192,7 @@ impl TempColumn {
         Ok(())
     }
     fn finish(&mut self) -> Result<FeatureReport, String> {
+        self.flush()?;
         if let Some(mut w) = self.writer.take() {
             w.flush().map_err(|e| format!("{}: {}", self.path.display(), e))?;
         }
@@ -3211,14 +3236,15 @@ fn enrich_inner(
         return Ok(report);
     }
 
-    // Append pass: copy existing blocks and write the new columns.
+    // Append pass: copy existing blocks and write the new columns. The writer
+    // hashes the bytes as they stream out, so the report gets the output
+    // checksum without a second multi-gigabyte read.
     let t_write = Instant::now();
     let tmp_out = work_dir.join("out.rcsb").to_string_lossy().into_owned();
-    store::write_store_appending(&tmp_out, &store, &extras)?;
+    let output_sha = store::write_store_appending_hashed(&tmp_out, &store, &extras)?;
     std::fs::rename(&tmp_out, out).map_err(|e| format!("{}: {}", out, e))?;
     let write_seconds = t_write.elapsed().as_secs_f64();
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-    let output_sha = manifest::sha256_file(out).unwrap_or_else(|_| "unknown".to_string());
 
     let columns_out = FileStore::open(out)?.n_cols();
     let backend = if gpu_columns > 0 { "gpu" } else { "cpu" };

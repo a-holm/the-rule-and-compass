@@ -9,7 +9,7 @@
 
 use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options};
-use rcsr::store::{self, FileStore};
+use rcsr::store::{self, DType, FileStore};
 
 fn bars(symbol: &str, n: usize, start: i64, step: i64, gap_at: Option<usize>) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
     (0..n)
@@ -182,4 +182,104 @@ fn small_store_stays_on_the_cpu_with_a_reason() {
     let plan = r.plans.iter().find(|p| p.group == "returns").unwrap();
     assert_eq!(plan.backend, "cpu");
     assert!(plan.reason.contains("below"), "reason: {}", plan.reason);
+}
+
+/// Full-catalogue CPU/GPU parity on a large store.
+///
+/// Run the CLI twice on the same input store, once with `--gpu off` and once
+/// with `--gpu auto` (or `on`), then point these variables at the two outputs:
+///
+/// ```sh
+/// RCSR_ENRICH_PARITY_CPU=/data/cpu.rcsb \
+/// RCSR_ENRICH_PARITY_GPU=/data/gpu.rcsb \
+/// RCSR_ENRICH_PARITY_SPEC=all \
+///   cargo test --release --features cuda --test enrich_gpu \
+///   advertised_catalogue_matches_between_cpu_and_gpu_on_a_large_store -- --ignored --nocapture
+/// ```
+///
+/// Every advertised column must exist, every NaN mask must agree and every
+/// finite value must be within the pre-registered `1e-12` relative tolerance.
+/// The test also prints how many columns are bit-identical; transcendentals
+/// differ in the last bit because CUDA `log`/`sin`/`cos` are not the host libm.
+#[test]
+#[ignore = "needs a CPU/GPU output pair from the large-store harness (see docs/ohlcv.md)"]
+fn advertised_catalogue_matches_between_cpu_and_gpu_on_a_large_store() {
+    let cpu_path = match std::env::var("RCSR_ENRICH_PARITY_CPU") {
+        Ok(v) => v,
+        Err(_) => {
+            eprintln!("skipping: RCSR_ENRICH_PARITY_CPU is not set");
+            return;
+        }
+    };
+    let gpu_path = std::env::var("RCSR_ENRICH_PARITY_GPU").expect("RCSR_ENRICH_PARITY_GPU");
+    let spec = std::env::var("RCSR_ENRICH_PARITY_SPEC").unwrap_or_else(|_| "all".to_string());
+    let cpu = FileStore::open(&cpu_path).unwrap();
+    let gpu = FileStore::open(&gpu_path).unwrap();
+    assert_eq!(cpu.n_rows(), gpu.n_rows(), "row count differs");
+    let names = cpu.header().names();
+    assert_eq!(names, gpu.header().names(), "schema differs between the two arms");
+
+    let advertised = rcsr::enrich::expand(&spec).unwrap();
+    for name in &advertised {
+        assert!(names.iter().any(|n| n == name), "advertised column '{name}' is missing");
+    }
+
+    let mut compared = 0usize;
+    let mut identical = 0usize;
+    let mut worst: f64 = 0.0;
+    for (ci, name) in names.iter().enumerate() {
+        if name == "ts" || name == "symbol" {
+            continue;
+        }
+        if cpu.header().dtypes()[ci] != DType::F64 || gpu.header().dtypes()[ci] != DType::F64 {
+            continue;
+        }
+        let mut bit_same = true;
+        let mut max_abs: f64 = 0.0;
+        let mut check = 0usize;
+        for g in 0..cpu.n_groups() {
+            let a = cpu.read_f64_group(g, ci).unwrap();
+            let b = gpu.read_f64_group(g, ci).unwrap();
+            assert_eq!(a.len(), b.len());
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    x.is_finite() == y.is_finite(),
+                    "column '{name}' group {g} row {i}: NaN mask differs (CPU {x:?}, GPU {y:?})"
+                );
+                if x.to_bits() != y.to_bits() {
+                    bit_same = false;
+                }
+                if x.is_finite() && y.is_finite() {
+                    check += 1;
+                    if !close_enough(*x, *y) {
+                        panic!(
+                            "column '{name}' group {g} row {i}: CPU {x:?} vs GPU {y:?} beyond 1e-12"
+                        );
+                    }
+                    max_abs = max_abs.max((x - y).abs());
+                }
+            }
+        }
+        assert!(check > 0, "column '{name}' has no finite values in the pair");
+        compared += 1;
+        if bit_same {
+            identical += 1;
+        }
+        worst = worst.max(max_abs);
+        if advertised.contains(name) {
+            eprintln!(
+                "column {name}: bit-identical={bit_same} max_abs_diff={max_abs:.3e}"
+            );
+        }
+    }
+    eprintln!(
+        "compared {compared} numeric columns ({} advertised), bit-identical {identical}, \
+         max abs diff {worst:.3e}",
+        advertised.len()
+    );
+    assert!(
+        compared >= advertised.len(),
+        "compared only {compared} numeric columns for {} advertised names",
+        advertised.len()
+    );
 }

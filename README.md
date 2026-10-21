@@ -378,7 +378,11 @@ atomically instead of streaming it. See
   parity fixture. The CPU path is always available; a per-family cost model
   decides CPU vs GPU and records the reason, GPU builds upload the source
   columns once and report the GPU column share, and the 3.9M-row measurement
-  keeps only the families that actually beat the CPU on the GPU. See
+  keeps only the families that actually beat the CPU on the GPU. On the
+  16.1M-row OHLCV panel the GPU feature phase is **1.49x** the CPU (72.1 % of
+  columns dispatched, zero fallbacks) while end-to-end wall is decided by the
+  append write; the output checksum is computed while the blocks stream, so a
+  multi-gigabyte store is never read twice. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
