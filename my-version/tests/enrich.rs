@@ -264,17 +264,39 @@ fn cross_sectional_ranks_are_stable_and_break_ties_by_symbol() {
 fn cost_model_keeps_small_stores_on_the_cpu_and_names_the_reason() {
     let mut counts = std::collections::BTreeMap::new();
     counts.insert("returns", (120usize, OpClass::Elementwise));
-    let small = enrich::plan_groups(&counts, 10_000, GpuMode::Auto, true);
+    let mut supported = std::collections::BTreeMap::new();
+    supported.insert("returns", 120usize);
+    let small = enrich::plan_groups(&counts, &supported, 10_000, GpuMode::Auto, true);
     assert_eq!(small[0].backend, "cpu");
     assert!(small[0].reason.contains("below"));
-    let large = enrich::plan_groups(&counts, 3_900_000, GpuMode::Auto, true);
-    assert_eq!(large[0].backend, "cpu");
-    assert!(large[0].reason.contains("no exact GPU kernel"));
+    assert_eq!(small[0].gpu_cols, 0);
+    let large = enrich::plan_groups(&counts, &supported, 3_900_000, GpuMode::Auto, true);
     assert!(large[0].gpu_ms < large[0].cpu_ms, "the cost model should still see a GPU win");
-    let off = enrich::plan_groups(&counts, 3_900_000, GpuMode::Off, true);
+    if enrich::gpu_kernels_compiled() {
+        assert_eq!(large[0].backend, "gpu");
+        assert_eq!(large[0].gpu_cols, 120);
+        assert_eq!(large[0].cpu_cols, 0);
+    } else {
+        assert_eq!(large[0].backend, "cpu");
+        assert!(large[0].reason.contains("without --features cuda"));
+    }
+    let off = enrich::plan_groups(&counts, &supported, 3_900_000, GpuMode::Off, true);
     assert_eq!(off[0].backend, "cpu");
-    let none = enrich::plan_groups(&counts, 3_900_000, GpuMode::Auto, false);
-    assert!(none[0].reason.contains("no usable CUDA"));
+    let none = enrich::plan_groups(&counts, &supported, 3_900_000, GpuMode::Auto, false);
+    assert!(
+        none[0].reason.to_ascii_lowercase().contains("cuda"),
+        "reason: {}",
+        none[0].reason
+    );
+    let unregistered = enrich::plan_groups(
+        &counts,
+        &std::collections::BTreeMap::new(),
+        3_900_000,
+        GpuMode::Auto,
+        true,
+    );
+    assert_eq!(unregistered[0].backend, "cpu");
+    assert!(unregistered[0].reason.contains("no exact GPU kernel"));
 }
 
 #[test]

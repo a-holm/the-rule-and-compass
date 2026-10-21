@@ -50,6 +50,7 @@ fn fail(lines: &[String]) -> ! {
 
 fn main() {
     println!("cargo:rerun-if-changed=src/cuda/eval.cu");
+    println!("cargo:rerun-if-changed=src/cuda/enrich.cu");
     println!("cargo:rerun-if-changed=src/cuda/arch.rs");
     println!("cargo:rerun-if-env-changed=RCSR_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=RCSR_NVCC");
@@ -128,12 +129,20 @@ fn main() {
 
     let arch_flag = format!("-arch={}", arch.name());
     let mut cmd = Command::new(&nvcc);
-    cmd.args(["-O3", "-std=c++14", arch_flag.as_str(), "-shared"]);
+    // `-fmad=false` keeps multiply-add association identical to the Rust f64
+    // reference; the enrichment kernels must not silently contract `a*b+c`.
+    cmd.args(["-O3", "-fmad=false", "-std=c++14", arch_flag.as_str(), "-shared"]);
     cmd.args(["-Xcompiler", "-fPIC"]);
     if unified {
         cmd.arg("-DRCSR_UNIFIED=1");
     }
-    cmd.args(["-o", so.as_str(), "src/cuda/eval.cu", "-lcudart"]);
+    cmd.args([
+        "-o",
+        so.as_str(),
+        "src/cuda/eval.cu",
+        "src/cuda/enrich.cu",
+        "-lcudart",
+    ]);
 
     let result = cmd.output().unwrap_or_else(|e| {
         fail(&[

@@ -234,7 +234,7 @@ pub fn json() -> String {
 {{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"panel symbol column\"}},\
 {{\"name\":\"--cross-symbol\",\"type\":\"string\",\"default\":\"BTCUSDT\",\"description\":\"benchmark symbol for btc/cross features\"}},\
 {{\"name\":\"--cross-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"benchmark store when --data does not contain it\"}},\
-{{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; CPU is always available\"}},\
+{{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; auto uses a registered exact kernel only when it beats the CPU, on forces it above the 1M-row floor, off runs the CPU reference\"}},\
 {{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\

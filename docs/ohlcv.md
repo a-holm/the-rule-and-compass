@@ -230,15 +230,68 @@ every chunk size (tested). Cross-sectional ties are resolved by symbol and row
 order.
 
 The CPU path is always present. `plan_groups` estimates CPU time and GPU time
-(kernel + two transfers + fixed launch overhead) per family from rows, output
-columns and operation class (elementwise, rolling sum/std, Wilder scan,
-segmented rank, join). A family is dispatched to the GPU only when a device is
-usable, the store has at least one million rows, an exact kernel is registered
-for that class, and the estimated GPU time is *strictly* lower than the CPU
-time. This increment registers no enrichment kernels, so every family records
-`backend=cpu` and the reason in the report; a CUDA build and a CPU-only build
-produce the same bytes. Measured CPU/GPU share on the 3.9M-row store is in the
-PR for #200.
+(kernel + two transfers + the one-time resident upload) per family from rows,
+output columns and operation class (elementwise, calendar trig, rolling
+sum/std/extrema, Wilder scan, segmented rank, join). A family is dispatched to
+the GPU only when a device is usable, the store has at least one million rows,
+an exact kernel is registered for those columns, and the estimated GPU time is
+*strictly* lower than the CPU time. The context and source columns are uploaded
+once per run; a second family does not re-upload `time/open/high/low/close/
+volume/quote_volume`.
+
+`--gpu auto` (the default) applies the cost model. `--gpu on` *forces* every
+registered kernel above the row floor, which is how the parity fixture exercises
+all kernels; it does not make the cost model claim a win. `--no-gpu`/`--cpu`
+forces the reference path. A CPU-only build ignores the GPU arms entirely, and a
+CUDA build with no device falls back with the reason in every plan row.
+
+The CUDA kernels live in `src/cuda/enrich.cu`. Elementwise families use one
+thread per row; rolling sums/standard deviations, Donchian, Wilder/EMA scans and
+labels run one thread per symbol segment in the same operation order as the CPU,
+with `-fmad=false` so multiply-add association is identical. Cross-sectional
+ranks use a stable segmented radix sort with the CPU's `(time, symbol, row)` tie
+order. All accumulation is f64. The report records `gpu_columns`,
+`cpu_columns`, `gpu_share`, `fallback`, kernel seconds and transfer bytes in both
+the text log and the JSON sidecar.
+
+### GPU enrichment measurement (2026-10-21)
+
+Same 3,874,994 x 11 store, RTX 3060, release CUDA build. `--dry-run` isolates the
+feature phase (the append/copy is identical on both arms):
+
+| run | features | GPU columns / share | feature phase | kernel | transfer |
+|---|---:|---:|---:|---:|---:|
+| `--gpu off` | returns (120) | 0 / 0 % | 40.56 s | – | – |
+| `--gpu auto` | returns (120) | 120 / **100 %** | **33.89 s** | 0.224 s | 3.98 GB |
+| `--gpu off` | own catalogue, no xs/btc (162) | 0 / 0 % | 52.51 s | – | – |
+| `--gpu auto` | own catalogue, no xs/btc (162) | 128 / **79.0 %** | **39.59 s** | 0.245 s | 4.23 GB |
+
+The auto plan sends `returns` and `calendar` to the GPU. Rolling sum/std,
+Donchian, lags, candle and the Wilder/RSI families stay on the CPU with
+`estimated GPU time is not below CPU`: their one-thread-per-segment kernels are
+slower on this part, and the ten-column `lags` family does not repay the
+resident-upload cost. `atr14`/`natr14`/`rsi14` are still #125 names with no GPU
+kernel and record that reason.
+
+A real `--features returns` run including the 4.0 GB append measured 84.3 s
+(CPU) and 99.4 s (GPU) wall in one pair; the append write varied between 13.0 s
+and 16.4 s and dominated the difference. The feature phase is the measured GPU
+win above; end-to-end wall on a shared disk is not claimed as a speed-up.
+
+Exactness on that 3.9M-row store (`parity_off.rcsb` vs `parity_auto.rcsb`,
+120 return columns): **zero NaN-mask mismatches**, max absolute difference
+**4.44e-16**, max relative difference **2.22e-16** (`r100` at row 2,703,037).
+The per-column SHA-256 hashes differ for transcendentals because CUDA `log`/
+`sin`/`cos` round differently from the host libm at the last bit; the
+pre-registered tolerance is `1e-12` absolute-or-relative, and the parity test
+(`tests/enrich_gpu.rs`) enforces it. Columns with no transcendental step are
+bit-identical. The earlier 35 CPU-only columns in the full-catalogue run keep
+identical hashes; the 127 GPU columns are tolerance-equal.
+
+The 15.9M-row store was not available on this machine in this increment, so its
+CPU/GPU pair is not measured here; the same harness applies
+(`rcsr enrich --data <store> --features ... --gpu off|auto --dry-run --json`).
+That remains an open #200 acceptance item.
 
 ### Measured enrichment (2026-10-21)
 
@@ -269,13 +322,6 @@ cores) measured `py15m` at 37.5 s wall / 30.8 s user and the full catalogue at
 153.7 s wall / 85.9 s user, with the same 35- and 168-column schemas. The
 feature arithmetic stayed ~57 s; the difference was disk write contention.
 
-GPU policy on the same 3.875M-row store (`--features returns`, CUDA build):
-the probe found `NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 11907 MB)`; the cost
-model estimated 5,812 ms CPU vs 1,950 ms GPU (transfer + kernel), but **no exact
-enrichment kernel is registered**, so the run used the CPU: GPU share **0 %**,
-CPU share **100 %**. The report names that reason per family. This is the
-explicit unmet item in the #200 PR; the CPU-only build is byte-identical.
-
 Reproduce (the stores are local, git-ignored data):
 
 ```sh
@@ -288,6 +334,10 @@ rcsr prep --input raw15_82 --resample 1h --out hourly_3p875m.rcsb --jobs 8
 /usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out rich.rcsb \
   --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,btc --json > rich.json
 /usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out xs.rcsb --features xs --json > xs.json
+/usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out cpu.rcsb \
+  --features returns --gpu off --dry-run --json > returns_cpu.json
+/usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out gpu.rcsb \
+  --features returns --gpu auto --dry-run --json > returns_gpu.json
 
 # Python baseline (2,006,580 rows x 35 added columns)
 PANEL_OUT=panel_15m_rich_py.csv /usr/bin/time -v python3 enrich_panel_15m.py
