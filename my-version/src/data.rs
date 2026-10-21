@@ -1551,6 +1551,9 @@ pub struct SplitSpec {
     pub exclude: Option<Filter>,
     /// #130: how the time column is parsed.
     pub time: TimeSpec,
+    /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
+    /// the safe default for every caller of [`prepare_full`].
+    pub allow_lockbox: bool,
 }
 
 impl Default for SplitSpec {
@@ -1567,6 +1570,7 @@ impl Default for SplitSpec {
             test_select: None,
             exclude: None,
             time: TimeSpec::default(),
+            allow_lockbox: false,
         }
     }
 }
@@ -1588,8 +1592,19 @@ pub struct SplitReport {
     pub groups_total: usize,
     pub groups_train: usize,
     pub groups_test: usize,
+    pub train_time_min: Option<f64>,
     pub train_time_max: Option<f64>,
     pub test_time_min: Option<f64>,
+    pub test_time_max: Option<f64>,
+    /// #145: whether the split's time ranges were checked against the lockbox
+    /// (only possible when a time column exists and the values are Unix
+    /// seconds).
+    pub lockbox_checked: bool,
+    /// Rows in the training side inside the lockbox (must be 0 unless the
+    /// override is set).
+    pub lockbox_train: crate::lockbox::Overlap,
+    /// Rows in the test side inside the lockbox (must be 0 unless overridden).
+    pub lockbox_test: crate::lockbox::Overlap,
     /// Rows dropped by `--exclude` before splitting (issue #3).
     pub excluded_rows: usize,
     /// Rows matching both selections; they are assigned to training (#3).
@@ -2469,6 +2484,10 @@ pub fn prepare_full_targets_weighted_with(
             return Err("--validation-frac left no rows to fit on".to_string());
         }
     }
+
+    // #145: the search trains and scores on these rows, so both sides must be
+    // clear of the lockbox unless the caller declared a final test.
+    check_split_lockbox(filtered, spec, &train_idx, &fold_idx, &mut report)?;
 
     let n = filtered.len();
     // Used columns: every input, then every target (one target in the
@@ -3593,6 +3612,65 @@ fn build_split(
     let all_folds: Vec<usize> = fold_idx.iter().flatten().copied().collect();
     report.selector = describe_selector(n, &train, &all_folds);
     Ok((train, fold_idx, report))
+}
+
+/// #145: refuse a split whose training or test rows fall inside the 2026H2
+/// lockbox. This is the guard behind `rcsr run` (the default search command),
+/// not only `walkforward`. A dataset without a time column cannot be checked;
+/// neither can a numeric time column that is not Unix seconds (a row index or a
+/// year fraction), so the check is skipped rather than rejecting valid
+/// non-crypto data.
+fn check_split_lockbox(
+    t: &Table,
+    spec: &SplitSpec,
+    train: &[usize],
+    folds: &[Vec<usize>],
+    report: &mut SplitReport,
+) -> Result<(), String> {
+    let Some(tc) = spec.time_col else {
+        return Ok(());
+    };
+    let keys = match time_keys_with(t, tc, &spec.time) {
+        Ok((keys, _)) => keys,
+        Err(_) => return Ok(()),
+    };
+    let times = |idx: &[usize]| -> Vec<i64> {
+        idx.iter()
+            .map(|&i| keys.get(i).copied().unwrap_or(f64::NAN))
+            .filter(|v| v.is_finite())
+            .map(|v| v.floor() as i64)
+            .collect()
+    };
+    let train_times = times(train);
+    let test_idx: Vec<usize> = folds.iter().flatten().copied().collect();
+    let test_times = times(&test_idx);
+    let extent = |v: &[i64]| -> Option<(f64, f64)> {
+        v.iter()
+            .copied()
+            .min()
+            .zip(v.iter().copied().max())
+            .map(|(a, b)| (a as f64, b as f64))
+    };
+    let span = extent(&train_times).into_iter().chain(extent(&test_times)).fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(lo, hi), (a, b)| (lo.min(a), hi.max(b)),
+    );
+    if !crate::lockbox::plausible_epoch_seconds(span.0, span.1) {
+        return Ok(());
+    }
+    report.lockbox_checked = true;
+    if let Some((a, b)) = extent(&train_times) {
+        report.train_time_min = Some(a);
+        report.train_time_max = Some(b);
+    }
+    if let Some((a, b)) = extent(&test_times) {
+        report.test_time_min = Some(a);
+        report.test_time_max = Some(b);
+    }
+    let guard = crate::lockbox::Guard::new(spec.allow_lockbox, None);
+    report.lockbox_train = guard.check_times("training split", &train_times)?;
+    report.lockbox_test = guard.check_times("test split", &test_times)?;
+    Ok(())
 }
 
 /// Split one time-ordered sequence into a training prefix and `folds`

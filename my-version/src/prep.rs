@@ -294,6 +294,9 @@ pub struct Options {
     pub dry_run: bool,
     pub jobs: usize,
     pub group_rows: usize,
+    /// #145: permit a labelled build (an evaluation target) inside 2026H2.
+    /// Unlabelled bars are provenance and are always allowed.
+    pub allow_lockbox: bool,
 }
 
 impl Default for Options {
@@ -314,6 +317,7 @@ impl Default for Options {
             dry_run: false,
             jobs: 1,
             group_rows: store::DEFAULT_GROUP_ROWS,
+            allow_lockbox: false,
         }
     }
 }
@@ -921,6 +925,14 @@ impl Audit {
     }
 }
 
+/// Guard a labelled build with the central lockbox module. Exposed so a test
+/// can exercise the same path the CLI uses.
+pub fn check_labelled_rows(times: &[i64], allow_lockbox: bool) -> Result<(), String> {
+    crate::lockbox::Guard::new(allow_lockbox, None)
+        .check_times("prep labelled rows", times)
+        .map(|_| ())
+}
+
 /// Build the table, audit and manifest without writing anything.
 pub fn build(opts: &Options) -> Result<Build, String> {
     let sources = discover(&opts.inputs, opts.symbol.as_deref())?;
@@ -1223,6 +1235,15 @@ pub fn build(opts: &Options) -> Result<Build, String> {
     }
     let table = Table::from_parts(names.clone(), numeric, out_columns, total, 0);
 
+    // #145: a labelled build creates an evaluation target. If any row is in the
+    // lockbox, the same central guard decides. Unlabelled bars are provenance
+    // and may retain the holdout.
+    let lb = crate::lockbox::Lockbox::crypto_2026h2();
+    let coverage = lb.overlap(times.iter().copied());
+    if opts.label.is_some() {
+        check_labelled_rows(&times, opts.allow_lockbox)?;
+    }
+
     let input_hashes: Vec<(String, String, u64)> = sources
         .iter()
         .map(|s| {
@@ -1310,6 +1331,11 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         );
     }
     let _ = writeln!(manifest_text, "  ],");
+    let _ = writeln!(
+        manifest_text,
+        "  \"lockbox\":{},",
+        lb.json(&coverage, opts.allow_lockbox, false, false)
+    );
     let _ = writeln!(manifest_text, "  \"audit\":{},", audit.json());
     let _ = writeln!(
         manifest_text,
@@ -1317,8 +1343,8 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         total,
         names.len(),
         audit.symbols,
-        times.first().copied().unwrap_or(0),
-        times.last().copied().unwrap_or(0)
+        times.iter().copied().min().unwrap_or(0),
+        times.iter().copied().max().unwrap_or(0)
     );
     manifest_text.push_str("}\n");
 
@@ -1494,6 +1520,7 @@ pub fn run(args: &[String]) -> ! {
             },
             "--out" | "-o" => opts.out = Some(val!()),
             "--dry-run" => opts.dry_run = true,
+            "--allow-lockbox" => opts.allow_lockbox = true,
             "--jobs" | "-j" => {
                 let v = val!();
                 opts.jobs = v.parse().unwrap_or(0);
@@ -1597,6 +1624,7 @@ TRANSFORMS:
   --group-rows <n>        column-store group size (default 65536)
   --out, -o <store.rcsb>  output store (required unless --dry-run)
   --dry-run               print the audit and manifest, write nothing
+  --allow-lockbox         permit labelled rows in 2026H2 (final test only)
 
 FEATURES (explicit names):
   ret1 ret5 ma20_ratio ma60_ratio bb20_z atr14 natr14 rsi14 adx14 di_plus

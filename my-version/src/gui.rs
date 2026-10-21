@@ -695,6 +695,7 @@ struct RawOptions {
     smooth: usize,
     smooth_centred: bool,
     allow_interpolate: bool,
+    allow_lockbox: bool,
     validation_frac: f64,
     date_only: DateOnlyPolicy,
     time_unit: Option<TimeUnit>,
@@ -738,6 +739,7 @@ impl Default for RawOptions {
             smooth: 0,
             smooth_centred: false,
             allow_interpolate: false,
+            allow_lockbox: false,
             validation_frac: 0.0,
             date_only: DateOnlyPolicy::Error,
             time_unit: None,
@@ -862,6 +864,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
                 raw.smooth_centred = raw.smooth > 0;
             }
             "--allow-interpolate" => raw.allow_interpolate = true,
+            "--allow-lockbox" => raw.allow_lockbox = true,
             "--center" => raw.center = Center::parse(&take(&mut i)?)?,
             "--scale" => raw.scale = Scale::parse(&take(&mut i)?)?,
             "--filter" => raw.filter = Some(take(&mut i)?),
@@ -1304,6 +1307,7 @@ impl RunPlan {
             test_select,
             exclude,
             time: time_spec,
+            allow_lockbox: raw.allow_lockbox,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

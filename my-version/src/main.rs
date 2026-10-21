@@ -168,6 +168,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --smooth-centred <k>       the old centred window. Reads future bars and is
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
+  --allow-lockbox            permit train/test rows in 2026H2 (declared final test only)
                              (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
@@ -1107,6 +1108,8 @@ fn main() {
     let mut smooth = 0usize;
     let mut smooth_centred = false;
     let mut allow_interpolate = false;
+    // #145: a search may not train or score inside 2026H2 by default.
+    let mut allow_lockbox = false;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -1319,6 +1322,7 @@ fn main() {
                 }
             },
             "--allow-interpolate" => allow_interpolate = true,
+            "--allow-lockbox" => allow_lockbox = true,
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -2648,6 +2652,7 @@ fn main() {
             unit: time_unit,
             tz,
         },
+        allow_lockbox,
     };
     let prep = data::PrepSpec {
         fill,
@@ -3565,6 +3570,30 @@ fn main() {
     } else {
         None
     };
+
+    // #145: cross-validation draws its own folds, so the split guard above
+    // cannot see them. If any row of the table is in 2026H2, some fold would
+    // train or score on the holdout; refuse before the first fold.
+    if cv_mode.is_some() && !allow_lockbox {
+        if let Some(name) = &time_name {
+            if let Ok(j) = table.index_of(name) {
+                let keys = data::time_keys_with(&table, j, &spec.time)
+                    .map(|(k, _)| k)
+                    .unwrap_or_default();
+                let times: Vec<i64> = keys
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.floor() as i64)
+                    .collect();
+                if let Err(e) = rcsr::lockbox::Guard::default()
+                    .check_times("cross-validation rows", &times)
+                {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+    }
 
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
@@ -7136,7 +7165,12 @@ fn run_audit(args: &[String]) -> ! {
         }
     };
 
+    // #145: the leakage audit is read-only; it reports lockbox coverage rather
+    // than refusing, but uses the same central guard's overlap counter.
     let mut report = time_report;
+    let lockbox_coverage = rcsr::lockbox::Guard::default().overlap(
+        panel.time.iter().filter(|v| v.is_finite()).map(|v| *v as i64),
+    );
     report.merge(leakage::audit_panel(&panel, &target, horizon));
     // D5 differential learner is already part of audit_panel; run it explicitly
     // as well so its count is visible even when no name canary exists.
@@ -7381,6 +7415,7 @@ fn run_audit(args: &[String]) -> ! {
          \"time_unit\":{},\"horizon\":{},\"overlap_rows\":{},\"effective_n\":{},\
          \"time_audit\":{{\"rows\":{},\"median_dt\":{},\"min_dt\":{},\"max_dt\":{},\
          \"duplicate_instants\":{},\"non_monotonic_rows\":{}}},\
+         \"lockbox\":{},\
          \"leaks\":[{}]}}",
         jstr(VERSION),
         clean,
@@ -7401,6 +7436,12 @@ fn run_audit(args: &[String]) -> ! {
         ta.max_dt,
         ta.duplicate_instants,
         ta.non_monotonic_rows,
+        rcsr::lockbox::Lockbox::crypto_2026h2().json(
+            &lockbox_coverage,
+            false,
+            false,
+            false
+        ),
         leaks_json.join(",")
     );
     if let Some(path) = report_path {
@@ -7412,6 +7453,11 @@ fn run_audit(args: &[String]) -> ! {
     if json_out {
         println!("{}", out);
     } else if clean {
+        println!(
+            "# audit: lockbox rows={} windows={} (read-only, not evaluated)",
+            lockbox_coverage.rows,
+            lockbox_coverage.windows.len()
+        );
         println!(
             "audit clean: {} checks, {} rows, N_eff {:.1}, spec {:016x}",
             report.checks,

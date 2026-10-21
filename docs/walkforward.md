@@ -61,9 +61,13 @@ selection on test. A single `--expr` keeps the original behaviour.
 * Rows sharing a timestamp are equal-weighted, exactly as in the pilot: the
   period return is the mean net return over the groups present at that
   timestamp. With no `--group-by` the whole table is one series.
-* Every test window is checked against the 2026H2 lockbox
-  `[2026-07-01, 2027-01-01)`. A window that overlaps it is refused unless
-  `--allow-lockbox` is passed (declared final test only).
+* Every window is checked against the 2026H2 lockbox
+  `[2026-07-01, 2027-01-01)`, on **both** sides: a training range inside the
+  holdout is refused even when the test block is in 2027. `--allow-lockbox` is
+  the only override (declared final test only) and is echoed as
+  `"lockbox": {"permitted": true, ...}` in the JSON report. The same
+  `rcsr::lockbox::Guard` is used by `rcsr run` (the default search),
+  `rcsr panel build --start/--end` and a labelled `rcsr prep`.
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
