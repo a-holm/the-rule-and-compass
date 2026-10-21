@@ -908,6 +908,55 @@ sweep per survivor. Its measured effect is inside the run-to-run noise; it is
 kept because it removes work without changing a single bit of the reported
 score.
 
+#### Opt-in promotion-refit budget: `--refit-iters`
+
+`--fit-samples` promotes the top 1/16 of each generation and refits those
+survivors on all training rows. `--refit-iters N` sets the LM budget for that
+refit only:
+
+* `0` (the default) uses `--fit-iters`, exactly the historical path;
+* `N >= 1` uses N damped LM iterations, warm-started from the constants the
+  screen just fitted. The fitter's four undamped Gauss–Newton polish steps are
+  never cut, so `N = 1` at `--fit-iters 8` is 11 row sweeps instead of 25.
+
+The flag does not change the screen sample, the 1/16 promotion fraction,
+full-data selection, the archive rebuild, or the GPU exact CPU `f64` finalist
+refit. It is opt-in because the shorter damped phase can change the basin a
+promoted tree lands in even when the objective and polish are unchanged.
+
+**Pre-registered quality gate.** On seeds 1/7/42, for both the current default
+and the recorded (`--no-front-parents`) workload: the promoted-front best
+full-data error must be at most `1.05x` the full-budget control on every seed
+(and no seed above `1.2x`); no control-front point may be dominated by the
+cheap arm's front; and the equal-evaluation fixed-reference validation
+hypervolume must be at least `0.98x` the control's. Time-to-target uses the
+control's final best error times `1.02` as the target; the cheap arm must reach
+it no later than the control. Failing any cell rejects the flag as a shipped
+default and leaves it documented as an opt-in experiment only.
+
+**Measured verdict: rejected (2026-10-21).** On the `w2.csv` workload above
+(CPU, G=30, pop 100, squared, `--fit-samples 200`, three interleaved `%U`
+repetitions) the one-iteration arm is **1.10–1.62× faster**, but it fails the
+gate on every seed/workload cell. Paired medians:
+
+| workload | seed | speed-up | best-error delta | validation-HV delta |
+|---|---:|---:|---:|---:|
+| current default | 1 | 1.50× | +263.7 % | −31.4 % |
+| current default | 7 | 1.62× | +159.4 % | −45.8 % |
+| current default | 42 | 1.10× | −47.7 % | +71.4 % |
+| recorded | 1 | 1.41× | −38.1 % | −68.4 % |
+| recorded | 7 | 1.27× | +90.2 % | −11.3 % |
+| recorded | 42 | 1.43× | −85.9 % | −83.1 % |
+
+The failure is not a final-constant artefact: refitting the surviving archive
+with the full budget after the cheap promotion changed the best errors by less
+than `1e-5` relative and did not rescue the front or hypervolume. The shortened
+damped phase changes which basin a promoted tree lands in, so the *selected
+shapes* diverge from the full-budget trajectory. `--refit-iters` therefore
+stays opt-in with this measured warning; it is not a recommended default and
+does not replace `--fit-iters` for quality-sensitive runs. The `--fit-samples`
+default and every reported metric remain on the historical full-budget path.
+
 #### Opt-in codegen: `target-cpu=native` and PGO
 
 Neither flag is forced in the repository; the default build is portable. Both

@@ -447,7 +447,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--no-fit]
+     [--fit-iters N] [--refit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--variation auto|node|postfix]
      [--no-front-parents]
@@ -925,7 +925,15 @@ historical LM path bit for bit.
   optimistically biased (the winner's curse), promotion reduces but does not
   remove it, and on deterministic, noiseless data the screen is a pure loss.
   `0` (the default) keeps the historical path; the flag is independent of
-  `--predictor-samples`;
+  `--predictor-samples`. `--refit-iters N` is a separate opt-in budget for the
+  promoted survivors' full-data refit: `0` (the default) keeps `--fit-iters`
+  and its bits, while `N >= 1` keeps the warm start and the four-step
+  Gauss–Newton polish but shortens the damped phase. It cuts only
+  per-generation promotion work (the final archive and the GPU exact finalist
+  refit keep their budgets). The paired gate on seeds 1/7/42 **failed**: it is
+  1.10–1.62× faster but changes the selected basin, regressing best error by up
+  to 2.6× and validation hypervolume by up to 83 %, so it stays an opt-in
+  experiment and is not a recommended default;
 - **seeded starts** (`--seed-expr`, `--seed-file`): prior solutions are parsed,
   simplified, fitted and inserted into the archive and every island before
   generation 1; a seed is an elite, kept even above `--max-complexity`;
