@@ -26,6 +26,54 @@ fn tmp(name: &str) -> PathBuf {
     p
 }
 
+fn tmp_dir(name: &str) -> PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("rcsr-prep-cache-test-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&p);
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+/// A three-symbol Binance-style directory with a distinct price level per
+/// symbol, so a mis-merged or stale cached part is visible in the table.
+fn write_three_symbols(dir: &Path) {
+    let csv = std::fs::read_to_string(fixture("binance_1m.csv")).unwrap();
+    for (sym, bump) in [("AAA", 0.0), ("BBB", 10.0), ("CCC", 20.0)] {
+        let shifted: String = csv
+            .lines()
+            .map(|l| {
+                let f: Vec<&str> = l.split(',').collect();
+                let n = f.len();
+                let mut out = String::new();
+                for (i, x) in f.iter().enumerate() {
+                    if i == 1 || i == 2 || i == 3 || i == 4 || i == 6 {
+                        out.push_str(&format!("{:.4}", x.parse::<f64>().unwrap() + bump));
+                    } else {
+                        out.push_str(x);
+                    }
+                    if i != n - 1 {
+                        out.push(',');
+                    }
+                }
+                out
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join(format!("{}.csv", sym)), shifted + "\n").unwrap();
+    }
+}
+
+fn cache_parts(cache: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = std::fs::read_dir(cache)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some(ext))
+        .collect();
+    out.sort();
+    out
+}
+
 fn base(input: String) -> Options {
     Options {
         inputs: vec![input],
@@ -225,6 +273,128 @@ fn the_same_spec_and_inputs_reproduce_the_same_bytes() {
 }
 
 #[test]
+fn a_resumed_prep_reuses_parts_and_reproduces_the_store_bytes() {
+    let dir = tmp_dir("resume");
+    let input = dir.join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    write_three_symbols(&input);
+    let cache = dir.join("cache");
+    let mut opts = base(input.to_string_lossy().to_string());
+    opts.resample = Some(Timeframe::M15);
+    opts.features = rcsr::features::expand("ta:core,candle:geometry").unwrap();
+    opts.label = Some(LabelSpec { horizon: 2, cost_bps: 10.0, vol_window: 0, stride: 1 });
+    opts.jobs = 3;
+    opts.resume = Some(cache.to_string_lossy().to_string());
+
+    let cold = prep::build(&opts).unwrap();
+    let pa = tmp("resume-cold.rcsb");
+    store::write_store_with_time(&pa.to_string_lossy(), &cold.table, 65_536, Some(0)).unwrap();
+    assert_eq!(cache_parts(&cache, "spool").len(), 3, "one spool per symbol");
+    assert_eq!(cache_parts(&cache, "key").len(), 3, "one key per symbol");
+
+    // Warm run: same settings, different --jobs (it must not invalidate the
+    // cache and must not change byte order).
+    let before: Vec<_> = cache_parts(&cache, "spool")
+        .iter()
+        .map(|p| std::fs::metadata(p).unwrap().modified().unwrap())
+        .collect();
+    opts.jobs = 1;
+    let warm = prep::build(&opts).unwrap();
+    let pb = tmp("resume-warm.rcsb");
+    store::write_store_with_time(&pb.to_string_lossy(), &warm.table, 65_536, Some(0)).unwrap();
+
+    assert_eq!(prep::table_csv(&cold.table), prep::table_csv(&warm.table));
+    assert_eq!(cold.manifest, warm.manifest, "a resumed build must reproduce the manifest");
+    let a = std::fs::read(&pa).unwrap();
+    let b = std::fs::read(&pb).unwrap();
+    assert_eq!(a, b, "a resumed build must reproduce the store bytes");
+    assert_eq!(
+        rcsr::manifest::sha256_file(&pa).unwrap(),
+        rcsr::manifest::sha256_file(&pb).unwrap()
+    );
+
+    // Reuse means "read, do not rewrite": every spool keeps its timestamp.
+    let after: Vec<_> = cache_parts(&cache, "spool")
+        .iter()
+        .map(|p| std::fs::metadata(p).unwrap().modified().unwrap())
+        .collect();
+    assert_eq!(before, after, "reused spools must not be rewritten");
+
+    // A third run with more workers is still the same table.
+    opts.jobs = 4;
+    let again = prep::build(&opts).unwrap();
+    assert_eq!(prep::table_csv(&warm.table), prep::table_csv(&again.table));
+    assert_eq!(warm.manifest, again.manifest);
+
+    let _ = std::fs::remove_file(pa);
+    let _ = std::fs::remove_file(pb);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_changed_archive_invalidates_only_its_symbol_part() {
+    let dir = tmp_dir("invalidate");
+    let input = dir.join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    write_three_symbols(&input);
+    let cache = dir.join("cache");
+    let mut opts = base(input.to_string_lossy().to_string());
+    opts.resample = Some(Timeframe::M15);
+    opts.features = rcsr::features::expand("ta:core").unwrap();
+    opts.jobs = 2;
+    opts.resume = Some(cache.to_string_lossy().to_string());
+    let cold = prep::build(&opts).unwrap();
+
+    // Replace one symbol's archive with another symbol's bars while keeping
+    // its byte length and modification time. The archive checksum, not the
+    // name, size or mtime, must decide.
+    let path = input.join("BBB.csv");
+    let before = std::fs::read(&path).unwrap();
+    let donor = std::fs::read(input.join("CCC.csv")).unwrap();
+    assert_eq!(before.len(), donor.len(), "the fixture rewrite keeps the size");
+    assert_ne!(before, donor);
+    let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+    std::fs::write(&path, &donor).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+
+    let mut fresh_opts = opts.clone();
+    fresh_opts.resume = None;
+    let reference = prep::build(&fresh_opts).unwrap();
+    let resumed = prep::build(&opts).unwrap();
+    assert_ne!(prep::table_csv(&cold.table), prep::table_csv(&resumed.table));
+    assert_eq!(prep::table_csv(&reference.table), prep::table_csv(&resumed.table));
+    assert_eq!(reference.manifest, resumed.manifest);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_resume_directory_with_other_settings_is_refused() {
+    let dir = tmp_dir("settings");
+    let input = dir.join("input");
+    std::fs::create_dir_all(&input).unwrap();
+    std::fs::write(input.join("AAA.csv"), std::fs::read(fixture("aliased_1m.csv")).unwrap()).unwrap();
+    let cache = dir.join("cache");
+    let mut opts = base(input.to_string_lossy().to_string());
+    opts.jobs = 2;
+    opts.resume = Some(cache.to_string_lossy().to_string());
+    prep::build(&opts).unwrap();
+
+    opts.features = rcsr::features::expand("ta:core").unwrap();
+    let err = prep::build(&opts).unwrap_err();
+    assert!(err.contains("different settings"), "{}", err);
+    assert!(err.contains("--resume"), "{}", err);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_verified_splice_merges_the_two_legs_and_a_wrong_k_fails() {
     let dir = tmp("splice");
     let _ = std::fs::create_dir_all(&dir);
@@ -296,7 +466,7 @@ fn prep_help_and_schema_document_the_command() {
     let help = prep::usage();
     for flag in [
         "--input", "--format", "--resample", "--features", "--label", "--migrations",
-        "--dry-run", "--jobs",
+        "--dry-run", "--jobs", "--resume",
     ] {
         assert!(help.contains(flag), "help is missing {}", flag);
     }
