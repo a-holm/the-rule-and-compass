@@ -1851,6 +1851,13 @@ pub struct PrepReport {
     /// #112: the memory guard's estimate for this CSV and its basis. `None`
     /// for a `.rcsb` store or when the source did not go through the CSV guard.
     pub memory_estimate: Option<CsvEstimate>,
+    /// #112: the header-derived store estimate. `None` for a CSV source.
+    pub store_estimate: Option<crate::memory::MemoryEstimate>,
+    /// #112: `Some(true)` when the full store/CSV rows were used, `Some(false)`
+    /// for an explicit `--sample-rows` sample, `None` when not a store.
+    pub full_rows: Option<bool>,
+    /// #112: rows selected by an explicit `--sample-rows`.
+    pub sampled_rows: Option<usize>,
 }
 
 impl Default for PrepReport {
@@ -1872,6 +1879,9 @@ impl Default for PrepReport {
             time_non_monotonic: 0,
             time_converted: 0,
             memory_estimate: None,
+            store_estimate: None,
+            full_rows: None,
+            sampled_rows: None,
         }
     }
 }
@@ -1907,6 +1917,39 @@ impl PrepReport {
                 m.prep_bytes,
                 m.slack_bytes
             ));
+        }
+        if let Some(m) = self.store_estimate {
+            out.push(format!(
+                "# preparation: memory estimate {} B from store header: {} rows x {} columns \
+                 ({} search + {} scan used); basis: storage {} B + directory/group {} B + \
+                 search {} B + fit {} B + fixed {} B + slack {} B{}",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.scan_cols,
+                m.storage_bytes,
+                m.directory_bytes.saturating_add(m.group_buffer_bytes),
+                m.search_bytes,
+                m.fit_copy_bytes,
+                m.fixed_bytes,
+                m.slack_bytes,
+                if m.saturated { " (saturated: at least)" } else { "" }
+            ));
+            if m.saturated {
+                out.push(
+                    "# preparation: warning: the store estimate saturated u64; the real \
+                     footprint is at least this large"
+                        .to_string(),
+                );
+            }
+            if self.full_rows == Some(false) {
+                out.push(format!(
+                    "# preparation: warning: full_rows=false; used an explicit {}-row sample, \
+                     not the full store",
+                    self.sampled_rows.unwrap_or(m.rows)
+                ));
+            }
         }
         if self.fill != "none" || self.rows_dropped_missing > 0 {
             out.push(format!(
@@ -1997,8 +2040,39 @@ impl PrepReport {
             ),
             None => "null".to_string(),
         };
+        let store = match self.store_estimate {
+            Some(m) => format!(
+                "{{\"estimate_bytes\":{},\"rows\":{},\"columns\":{},\"used_columns\":{},\
+                 \"scan_columns\":{},\"storage_bytes\":{},\"directory_bytes\":{},\
+                 \"group_buffer_bytes\":{},\"search_bytes\":{},\"fit_copy_bytes\":{},\
+                 \"fixed_bytes\":{},\"slack_bytes\":{},\"saturated\":{},\
+                 \"basis\":\"store header: dtypes + row groups + projection\"}}",
+                m.total_bytes,
+                m.rows,
+                m.cols,
+                m.used_cols,
+                m.scan_cols,
+                m.storage_bytes,
+                m.directory_bytes,
+                m.group_buffer_bytes,
+                m.search_bytes,
+                m.fit_copy_bytes,
+                m.fixed_bytes,
+                m.slack_bytes,
+                m.saturated
+            ),
+            None => "null".to_string(),
+        };
+        let full_rows = match self.full_rows {
+            Some(v) => v.to_string(),
+            None => "null".to_string(),
+        };
+        let sampled_rows = match self.sampled_rows {
+            Some(v) => v.to_string(),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{},\"memory\":{}}}",
+            "{{\"fill\":\"{}\",\"rows_filled\":{},\"rows_dropped_missing\":{},\"rows_dropped_outlier\":{},\"smoothed\":{},\"smooth_mode\":\"{}\",\"center\":\"{}\",\"scale\":\"{}\",\"filtered\":{},\"rows_skipped_malformed\":{},\"time_unit\":\"{}\",\"time_rows\":{},\"time_duplicates\":{},\"time_non_monotonic\":{},\"time_converted\":{},\"memory\":{},\"store_memory\":{},\"full_rows\":{},\"sampled_rows\":{}}}",
             self.fill,
             self.rows_filled,
             self.rows_dropped_missing,
@@ -2014,7 +2088,10 @@ impl PrepReport {
             self.time_duplicates,
             self.time_non_monotonic,
             self.time_converted,
-            memory
+            memory,
+            store,
+            full_rows,
+            sampled_rows
         )
     }
 }
@@ -3021,6 +3098,9 @@ fn prepare_full_targets_weighted_inner(
             time_non_monotonic: hazards.non_monotonic,
             time_converted: hazards.converted,
             memory_estimate: None,
+            store_estimate: None,
+            full_rows: None,
+            sampled_rows: None,
         },
     })
 }

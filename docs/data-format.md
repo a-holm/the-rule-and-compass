@@ -88,7 +88,8 @@ detected: a cgroup v2/v1 memory limit or `ulimit -v` (`Max address space`).
 That is what makes a container or `ulimit` run fail cleanly instead of being
 OOM-killed. The soft `MemAvailable` figure is deliberately not used to refuse a
 CSV (the shape estimate is conservative); it is used, together with the hard
-limits, to decide whether a `.rcsb` store is loaded resident or streamed.
+limits, to decide whether a `.rcsb` store is loaded resident, explicitly
+sampled, or refused.
 
 ## Import
 
@@ -134,10 +135,23 @@ CSV   sha256  e4140058d01882540e877259014b07559bf1b9d1805b4d4e7c776220d18c2992
 store sha256  e4140058d01882540e877259014b07559bf1b9d1805b4d4e7c776220d18c2992
 ```
 
-When it does not fit, the run prints an `out of core:` note and searches a
-sample selected by the pinned one-multiply hash while scanning groups. The
-sample is a sample: report it as such. (The full-data re-score of the Pareto
-front on a streamed store is follow-up work, not silently claimed here.)
+When it does not fit, the run **refuses** with the header-derived estimate and
+the actionable options (`--force` for the full resident load, or an explicit
+`--sample-rows N`). It no longer samples automatically: a sample is an opt-in
+experiment, and the preparation block, run manifest and dev log record
+`full_rows=false` plus the requested row count. Explicit sampling still uses the
+pinned one-multiply hash and scans groups, so RSS stays bounded by one group
+plus the sample.
+
+The estimator itself is header-derived, not a per-cell constant. For a store it
+sums the exact resident representation (`f64`/`i64` value blocks only for
+numeric columns, the extra `i64` copy, 4-byte codes, dictionary strings), the
+row-group directory and one `GroupBuf`, and then the search copies for the
+**used-column projection** (`--vars` + targets + weight, plus time/group during
+preparation), the GPU `f32` image, the optional exact `f64` fit image and the
+240 B/row fixed preparation term. A single 25 % slack covers allocator
+rounding. The full rows load whenever that total fits; otherwise the run exits
+3 before reading a group.
 
 ## `rcsr prep`: raw archives to a store, no intermediate CSV
 
@@ -368,24 +382,35 @@ file text and the prepared samples. The streaming path still builds the
 resident `Table` and search samples, so the guard estimates those terms from the
 measured shape.
 
-### Column store
+### Column store (issue #112)
 
-Machine: 31 GiB RAM, 8 threads, `/mnt/lager` on a spinning disk. Fixture: a
-directly generated version-1 store, **100,000,000 rows × 5 columns = 4.0 GB**,
-searched under `ulimit -v 900000` (900 MiB address space) with
-`--max-memory 256MB --generations 2 --pop 16 --baseline-samples 512`:
+Machine: 31 GiB RAM, 8 threads, `/mnt/lager`. Fixture: the committed-outside-git
+`arbeidsmappe/crypto-rcsr/pilot/panel_hourly_compact.rcsb`, a **version-1**
+store of **3,943,856 rows × 56 columns**, 1,924,648,087 bytes on disk,
+`group_rows = 65,536`. Header arithmetic: 55 numeric value blocks, five `u32`
+code blocks, 151 dictionary levels; the resident `Table` is
+**1,814,179,393 B** (the v1 on-disk code blocks are 8 B but resident codes are
+always 4 B, and `symbol` has no value block).
 
-```text
-out of core: 100000000 rows x 5 cols (estimated 139.70 GiB);
-             searched a 102401-row hash sample (seed 0)
-wall      5.29 s
-max RSS   43,356 KiB (42.3 MiB)
-exit      0
-```
+`--max-memory 12GB --fill drop --generations 1 --pop 4 --fit-iters 0 --allow-lockbox`
+selected the **full 3,943,856 rows** (`full_rows=true`, `sampled_rows=null`),
+with `VmHWM` = **7,094,696 KiB (7.26 GB)**. The guard's CPU estimate was
+**7,826,847,852 B (7.83 GB)**: storage 1.81 GB + directory/group 0.03 GB +
+search 4.42 GB + fixed 0.95 GB + slack 1.57 GB, with 54 search + 2 scan columns.
+The old `rows × columns × 300 B` model reported **61.71 GiB (66.26 GB)** and
+sampled 577,141 rows; the new estimate is 1.08x the measured peak.
 
-The 139.70 GiB estimate is deliberately conservative (300 B/cell); the real
-resident preparation of this shape would also not fit. The run read the whole
-4 GB store for the sample scan while RSS stayed at one group plus the sample.
+The GPU/fit variant adds the `f32` image and the optional exact `f64` fit copy.
+For the pilot projection (53 search columns, `--fit-strategy gpu --fit-iters 8`)
+the same model gives **10.54 GB**, against the earlier forced full load's
+**6.49 GB** peak (ratio 1.62, under the issue's 2x ceiling). The synthetic
+**15.9M × 56** case scales linearly with cells to **42.2 GB**, not by a global
+per-cell constant; that is the case a 64 GB host can choose resident.
+
+The estimator fixtures in `my-version/tests/store_estimator.rs` pin the v1/v2
+resident widths, dictionary and row-group terms, the projection identity, the
+3.9M/15.9M cases, the full-load decision and the explicit-sample/refusal
+behaviour. The old 300 B/cell constant is gone.
 
 Guard, same machine, a 40.4 MiB / 1,000,000-row CSV under `ulimit -v 300000`
 and `--max-memory 512MB`:
@@ -394,8 +419,9 @@ and `--max-memory 512MB`:
 error: input would exceed the memory budget
   guard.csv: 40.40 MiB on disk; estimated resident footprint 1.30 GiB
   memory budget is 488.28 MiB (512000000 bytes; set it with --max-memory)
-  ... pass --force ... or convert it once and search out of core:
+  ... pass --force ...; a `.rcsb` store can also be sampled explicitly:
     rcsr import <input.csv> <store.rcsb>
+    rcsr --data <store.rcsb> --target <col> --max-memory ... [--sample-rows N]
 exit 3
 ```
 
