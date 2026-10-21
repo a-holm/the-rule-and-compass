@@ -355,19 +355,16 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
-/// SHA-256 of a file, as lowercase hex.
-pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, String> {
-    let bytes = std::fs::read(path.as_ref())
-        .map_err(|e| format!("cannot read '{}': {}", path.as_ref().display(), e))?;
-    Ok(sha256_hex(&bytes))
+/// Streaming SHA-256 state. The file and in-memory entry points share it, so a
+/// multi-gigabyte store is hashed without reading or copying it into RAM.
+struct Sha256 {
+    h: [u32; 8],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_len: u64,
 }
 
-/// SHA-256, as lowercase hex.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    const H0: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+impl Sha256 {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
@@ -380,19 +377,46 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
         0xc67178f2,
     ];
-    let mut h = H0;
-    let mut msg = bytes.to_vec();
-    let bit_len = (bytes.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
+    fn new() -> Self {
+        Sha256 {
+            h: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+            ],
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let take = (64 - self.buf_len).min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == 64 {
+                let chunk = self.buf;
+                self.compress(&chunk);
+                self.buf_len = 0;
+            }
+        }
+        while data.len() >= 64 {
+            self.compress(&data[..64]);
+            data = &data[64..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    fn compress(&mut self, chunk: &[u8]) {
         let mut w = [0u32; 64];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            *word = u32::from_be_bytes([
                 chunk[i * 4],
                 chunk[i * 4 + 1],
                 chunk[i * 4 + 2],
@@ -407,21 +431,21 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
                 .wrapping_add(w[i - 7])
                 .wrapping_add(s1);
         }
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut hh = h[7];
+        let mut a = self.h[0];
+        let mut b = self.h[1];
+        let mut c = self.h[2];
+        let mut d = self.h[3];
+        let mut e = self.h[4];
+        let mut f = self.h[5];
+        let mut g = self.h[6];
+        let mut hh = self.h[7];
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
             let temp1 = hh
                 .wrapping_add(s1)
                 .wrapping_add(ch)
-                .wrapping_add(K[i])
+                .wrapping_add(Sha256::K[i])
                 .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
@@ -435,20 +459,57 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
             b = a;
             a = temp1.wrapping_add(temp2);
         }
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(hh);
+        self.h[0] = self.h[0].wrapping_add(a);
+        self.h[1] = self.h[1].wrapping_add(b);
+        self.h[2] = self.h[2].wrapping_add(c);
+        self.h[3] = self.h[3].wrapping_add(d);
+        self.h[4] = self.h[4].wrapping_add(e);
+        self.h[5] = self.h[5].wrapping_add(f);
+        self.h[6] = self.h[6].wrapping_add(g);
+        self.h[7] = self.h[7].wrapping_add(hh);
     }
-    let mut out = String::with_capacity(64);
-    for word in h {
-        out.push_str(&format!("{:08x}", word));
+
+    fn finalize(mut self) -> String {
+        let bits = self.total_len.wrapping_mul(8);
+        let rem = self.buf_len;
+        let pad_len = if rem < 56 { 56 - rem } else { 120 - rem };
+        let mut pad = [0u8; 64];
+        pad[0] = 0x80;
+        self.update(&pad[..pad_len]);
+        self.update(&bits.to_be_bytes());
+        let mut out = String::with_capacity(64);
+        for word in self.h {
+            out.push_str(&format!("{:08x}", word));
+        }
+        out
     }
-    out
+}
+
+/// SHA-256 of a file, as lowercase hex. The file is read in 1 MiB chunks, so
+/// hashing the output store does not add its size to the process RSS.
+pub fn sha256_file(path: impl AsRef<Path>) -> Result<String, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path.as_ref())
+        .map_err(|e| format!("cannot read '{}': {}", path.as_ref().display(), e))?;
+    let mut state = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read '{}': {}", path.as_ref().display(), e))?;
+        if n == 0 {
+            break;
+        }
+        state.update(&buf[..n]);
+    }
+    Ok(state.finalize())
+}
+
+/// SHA-256, as lowercase hex.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut state = Sha256::new();
+    state.update(bytes);
+    state.finalize()
 }
 
 fn jstr(s: &str) -> String {
@@ -578,6 +639,26 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn streaming_file_hash_matches_in_memory_for_chunk_boundaries() {
+        let path = std::env::temp_dir().join(format!(
+            "rcsr-sha256-stream-{}",
+            std::process::id()
+        ));
+        // Around the 64-byte block and 56-byte padding boundaries, and more
+        // than one 1 MiB read chunk.
+        for len in [0usize, 1, 55, 56, 57, 63, 64, 65, 1_048_575, 1_048_576, 1_048_577] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(
+                sha256_file(&path).unwrap(),
+                sha256_hex(&bytes),
+                "length {len}"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
