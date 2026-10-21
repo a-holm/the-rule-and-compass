@@ -388,7 +388,11 @@ SEARCH:
                              to exact LM when it cannot prove a safe result;
                              `stream` merges f64 sufficient statistics over row
                              blocks. `gpu` is the #169 batched kernel with a CPU
-                             fallback; without a batch backend it uses the exact
+                             fallback; it screens unfitted offspring, admits the
+                             best max(32,pop/4) per island below 1 048 576
+                             training rows and every candidate with constants
+                             at or above that size, then refits finalists
+                             exactly. Without a batch backend it uses the exact
                              CPU arms (never a no-op)
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit) at the

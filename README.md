@@ -26,7 +26,10 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier) can be forced individually. Every arm falls back to the
+an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+`max(32, pop/4)` of each island, and at or above that size every candidate with
+constants, so the seed-constant screen cannot cost quality at large `N`) can be
+forced individually. Every arm falls back to the
 default LM path when it cannot prove a safe result, and the default remains the
 historical LM path bit for bit.
 
@@ -359,8 +362,13 @@ atomically instead of streaming it. See
   splice ratios, charges both sides and the final exit, supplies a
   matched-exposure random-long benchmark, refuses 2026H2 in every runner, and
   emits a checksummed provenance manifest with a lockbox-coverage block.
-  `panel build --resume` caches one atomic part per symbol; `--snapshot` embeds
-  a verified archive snapshot. See [`docs/panel.md`](docs/panel.md).
+  `panel build --resume` caches one atomic **binary** part per symbol, keyed by
+  the input store SHA-256, the membership decisions and the settings; a fully
+  warm run reads the parts only (it does not parse the store) and reproduces a
+  byte-identical panel. `panel membership --cache` keys the membership table the
+  same way. `prep --resume` caches one checksum-keyed spool per symbol;
+  `--snapshot` embeds a verified archive snapshot. See
+  [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -862,7 +870,10 @@ front. The search may instead use the exact solver portfolio
 affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
-an exact CPU verifier) can be forced individually. Every arm falls back to the
+an exact CPU verifier; below 1 048 576 training rows it fits the screened top
+`max(32, pop/4)` of each island, and at or above that size every candidate with
+constants, so the seed-constant screen cannot cost quality at large `N`) can be
+forced individually. Every arm falls back to the
 default LM path when it cannot prove a safe result, and the default remains the
 historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,

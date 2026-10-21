@@ -370,25 +370,256 @@ fn a_resumed_build_reuses_parts_and_matches_the_one_shot_panel() {
     let dir = std::env::temp_dir().join(format!("rcsr-panel-resume-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let dir_s = dir.to_string_lossy().to_string();
-    let resumed = build_panel_resumable(&s, &m, DAY, &dir_s).unwrap();
-    assert_eq!(resumed.rows.len(), one.rows.len());
-    assert_eq!(resumed.delisted, one.delisted);
-    assert_eq!(resumed.gaps, one.gaps);
+    let store = "store-0000";
+    let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, store, "").unwrap();
+    assert_eq!(cold.rows, one.rows);
+    assert_eq!(cold.delisted, one.delisted);
+    assert_eq!(cold.gaps, one.gaps);
     let parts: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
         .collect();
     assert_eq!(parts.len(), s.len(), "one part per symbol");
-    // Remove one part: the resume path recreates exactly it and leaves the
-    // others untouched.
+    assert!(dir.join("parts.txt").exists(), "the cache index is written");
+    // A fully warm build takes no input at all and reproduces the cold panel.
+    assert!(panel::panel_cache_ready(&dir_s, DAY, store, &m, "").unwrap());
+    let warm = build_panel_resumable(None, &m, DAY, &dir_s, store, "").unwrap();
+    assert_eq!(warm.rows, cold.rows);
+    assert_eq!(warm.delisted, cold.delisted);
+    assert_eq!(warm.gaps, cold.gaps);
+    // Remove one part: the source-fed resume path recreates exactly it.
     std::fs::remove_file(parts[0].path()).unwrap();
-    let again = build_panel_resumable(&s, &m, DAY, &dir_s).unwrap();
-    assert_eq!(again.rows.len(), one.rows.len());
+    let again = build_panel_resumable(Some(&s), &m, DAY, &dir_s, store, "").unwrap();
+    assert_eq!(again.rows, one.rows);
     assert_eq!(again.gaps, one.gaps);
-    // A different step must not reuse the directory.
-    assert!(build_panel_resumable(&s, &m, DAY * 2, &dir_s).is_err());
+    // A warm build with a missing part must fail loudly, not shrink the panel.
+    let dir2 = std::env::temp_dir().join(format!("rcsr-panel-resume-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir2);
+    let dir2_s = dir2.to_string_lossy().to_string();
+    build_panel_resumable(Some(&s), &m, DAY, &dir2_s, store, "").unwrap();
+    let victim = std::fs::read_dir(&dir2)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".part"))
+        .unwrap();
+    std::fs::remove_file(victim.path()).unwrap();
+    assert!(build_panel_resumable(None, &m, DAY, &dir2_s, store, "").is_err());
+    // A different bar step is not reused: it rebuilds the directory for the
+    // new step and matches that step's one-shot build.
+    let other = build_panel_resumable(Some(&s), &m, DAY * 2, &dir_s, store, "").unwrap();
+    assert_eq!(
+        other.rows,
+        panel::build_panel_with_step(&s, &m, DAY * 2).unwrap().rows
+    );
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn a_changed_store_or_membership_invalidates_the_panel_cache() {
+    let s = series();
+    let m = build_membership(&s, &cfg(2)).unwrap();
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-key-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    // Same inputs: warm.
+    assert!(panel::panel_cache_ready(&dir_s, DAY, "store-a", &m, "").unwrap());
+    // A different input store checksum is not warm, and a warm build refuses
+    // to guess: it must not mix rows from the previous store.
+    assert!(!panel::panel_cache_ready(&dir_s, DAY, "store-b", &m, "").unwrap());
+    assert!(build_panel_resumable(None, &m, DAY, &dir_s, "store-b", "").is_err());
+    // A different membership is not warm either: the cache pins decisions.
+    let mut m2 = m.clone();
+    m2.rows[0].member = !m2.rows[0].member;
+    assert!(!panel::panel_cache_ready(&dir_s, DAY, "store-a", &m2, "").unwrap());
+    // Nor is a different settings string (e.g. migrations).
+    assert!(!panel::panel_cache_ready(&dir_s, DAY, "store-a", &m, "OLD->NEW:1").unwrap());
+    // Fed with the input, the cache is rebuilt in place for the new key and
+    // agrees with a one-shot build of those inputs.
+    let mut s2 = s.clone();
+    s2.get_mut("B").unwrap()[10].close *= 1.5;
+    let m3 = build_membership(&s2, &cfg(2)).unwrap();
+    let rebuilt = build_panel_resumable(Some(&s2), &m3, DAY, &dir_s, "store-b", "").unwrap();
+    assert_eq!(rebuilt.rows, build_panel(&s2, &m3).unwrap().rows);
+    assert!(panel::panel_cache_ready(&dir_s, DAY, "store-b", &m3, "").unwrap());
+    assert!(!panel::panel_cache_ready(&dir_s, DAY, "store-a", &m, "").unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_corrupted_panel_part_and_a_stale_format_are_refused() {
+    let s = series();
+    let m = build_membership(&s, &cfg(2)).unwrap();
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-corrupt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    let part = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().ends_with(".part"))
+        .unwrap()
+        .path();
+    let mut bytes = std::fs::read(&part).unwrap();
+    // Flip one payload byte: the recorded checksum no longer matches.
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&part, &bytes).unwrap();
+    let err = build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").unwrap_err();
+    assert!(err.contains("checksum"), "{}", err);
+    // The source-fed path simply rebuilds the part.
+    let rebuilt = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    assert_eq!(rebuilt.rows, cold.rows);
+    // A text-format cache from the previous version is never read as binary:
+    // with the input it is rebuilt, without it the warm build refuses.
+    std::fs::write(
+        dir.join("stale.part"),
+        "1609459200\t1609459200\t0\t1\t1\t1\t1\t1\t1\t1\t1\t1\t1\t1\n",
+    )
+    .unwrap();
+    std::fs::remove_file(dir.join("state.txt")).unwrap();
+    assert!(build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").is_err());
+    let again = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    assert_eq!(again.rows, cold.rows);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_part_with_a_stale_series_end_is_rebuilt() {
+    let s = series();
+    let m = build_membership(&s, &cfg(2)).unwrap();
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-grow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    let untouched = std::fs::metadata(dir.join("C.part")).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // A part that records an older series end (as if the input had grown) must
+    // not be trusted: the source-fed path rebuilds it. The checksum covers the
+    // payload, so patching the header alone still parses.
+    let a_part = dir.join("A.part");
+    let mut bytes = std::fs::read(&a_part).unwrap();
+    bytes[20..28].copy_from_slice(&0i64.to_le_bytes());
+    std::fs::write(&a_part, &bytes).unwrap();
+    // The warm (index-only) path refuses the mismatch instead of shrinking.
+    let err = build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").unwrap_err();
+    assert!(err.contains("ends at"), "{}", err);
+    let rebuilt = build_panel_resumable(Some(&s), &m, DAY, &dir_s, "store-a", "").unwrap();
+    assert_eq!(rebuilt.rows, cold.rows);
+    assert_eq!(rebuilt.delisted, cold.delisted);
+    assert!(
+        std::fs::metadata(&a_part).unwrap().modified().unwrap() > untouched,
+        "the stale part is rewritten"
+    );
+    assert_eq!(
+        std::fs::metadata(dir.join("C.part")).unwrap().modified().unwrap(),
+        untouched,
+        "an unchanged part is not rewritten"
+    );
+    // The repaired cache is warm again.
+    let warm = build_panel_resumable(None, &m, DAY, &dir_s, "store-a", "").unwrap();
+    assert_eq!(warm.rows, cold.rows);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cold_and_warm_panel_stores_are_byte_identical() {
+    let s = series();
+    let m = build_membership(&s, &cfg(2)).unwrap();
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-hash-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir_s = dir.to_string_lossy().to_string();
+    let store = "store-a";
+    let cold = build_panel_resumable(Some(&s), &m, DAY, &dir_s, store, "").unwrap();
+    let warm = build_panel_resumable(None, &m, DAY, &dir_s, store, "").unwrap();
+    // The resumed rows are identical value-for-value, not just in count.
+    assert_eq!(cold.rows, warm.rows);
+    assert_eq!(cold.symbols, warm.symbols);
+    assert_eq!(cold.delisted, warm.delisted);
+    assert_eq!((cold.gaps, cold.first_ts, cold.last_ts), (warm.gaps, warm.first_ts, warm.last_ts));
+    // And the written stores hash the same, so a manifest checksum cannot tell
+    // a warm rebuild from a cold one.
+    let csv = std::env::temp_dir().join(format!("rcsr-panel-hash-{}.csv", std::process::id()));
+    let mut text = String::from("ts,symbol,open,high,low,close,volume,quote_volume\n");
+    for (sym, bs) in &s {
+        for b in bs {
+            text.push_str(&format!(
+                "{},{},{},{},{},{},{},{}\n",
+                b.time, sym, b.open, b.high, b.low, b.close, b.volume, b.quote_volume
+            ));
+        }
+    }
+    std::fs::write(&csv, text).unwrap();
+    let csv_s = csv.to_string_lossy().to_string();
+    let a = std::env::temp_dir().join(format!("rcsr-panel-hash-a-{}.rcsb", std::process::id()));
+    let b = std::env::temp_dir().join(format!("rcsr-panel-hash-b-{}.rcsb", std::process::id()));
+    let a_s = a.to_string_lossy().to_string();
+    let b_s = b.to_string_lossy().to_string();
+    panel::write_panel_panel(&a_s, &cold, &m, &[csv_s.as_str()], 65_536, false, None).unwrap();
+    panel::write_panel_panel(&b_s, &warm, &m, &[csv_s.as_str()], 65_536, false, None).unwrap();
+    let ha = rcsr::manifest::sha256_file(&a).unwrap();
+    let hb = rcsr::manifest::sha256_file(&b).unwrap();
+    assert_eq!(ha, hb, "cold and warm panel stores differ");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+    let _ = std::fs::remove_file(format!("{}.manifest.json", a_s));
+    let _ = std::fs::remove_file(format!("{}.manifest.json", b_s));
+    let _ = std::fs::remove_file(&csv);
+}
+
+#[test]
+fn a_store_key_reads_the_published_manifest_and_falls_back_to_hashing() {
+    let dir = std::env::temp_dir().join(format!("rcsr-panel-storekey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = dir.join("s.rcsb");
+    std::fs::write(&store, b"abc").unwrap();
+    let store_s = store.to_string_lossy().to_string();
+    let hashed = rcsr::manifest::sha256_hex(b"abc");
+    // No manifest: hash the file.
+    assert_eq!(panel::store_key(&store_s), hashed);
+    // A manifest written for this file (same byte count) supplies the key
+    // without re-reading 1.5 GB.
+    let recorded = "f".repeat(64);
+    let manifest = format!(
+        "{{\n  \"tool\":\"rcsr prep\",\n  \"output_sha256\":\"{}\",\n  \"output_bytes\":3,\n  \
+         \"output\":{{\"path\":\"s.rcsb\"}}\n}}\n",
+        recorded
+    );
+    std::fs::write(format!("{}.manifest.json", store_s), &manifest).unwrap();
+    assert_eq!(panel::store_key(&store_s), recorded);
+    // A manifest that describes a different file length is not trusted.
+    let stale = manifest.replace("\"output_bytes\":3", "\"output_bytes\":4");
+    std::fs::write(format!("{}.manifest.json", store_s), &stale).unwrap();
+    assert_eq!(panel::store_key(&store_s), hashed);
+    // A non-hex value is not trusted either.
+    let junk = manifest.replace(&recorded, "unknown");
+    std::fs::write(format!("{}.manifest.json", store_s), &junk).unwrap();
+    assert_eq!(panel::store_key(&store_s), hashed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_membership_cache_key_covers_the_store_and_every_ranking_setting() {
+    let base = cfg(2);
+    let key = panel::membership_cache_key("store-a", &base);
+    assert_eq!(key, panel::membership_cache_key("store-a", &base));
+    assert_ne!(key, panel::membership_cache_key("store-b", &base));
+    let mut c = base.clone();
+    c.top = 3;
+    assert_ne!(key, panel::membership_cache_key("store-a", &c));
+    let mut c = base.clone();
+    c.lookback_days = 31;
+    assert_ne!(key, panel::membership_cache_key("store-a", &c));
+    let mut c = base.clone();
+    c.start = Some(T0);
+    assert_ne!(key, panel::membership_cache_key("store-a", &c));
+    let mut c = base.clone();
+    c.end = Some(T0 + 30 * DAY);
+    assert_ne!(key, panel::membership_cache_key("store-a", &c));
 }
 
 #[test]
