@@ -684,15 +684,28 @@ one CUDA block per candidate:
    this arm is selected), so the returned constants are not limited by the f32
    evaluator copy or by f32 row arithmetic.
 
-**Eligibility and fallback.** A candidate is offered to the kernel only for the
-squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no shared block
-constants, an analytic derivative for every operator, and at least `32p` rows.
+**Eligibility, admission and fallback.** A candidate is offered to the kernel
+only for the squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no
+shared block constants, an analytic derivative for every operator, and at least
+`32p` rows. The arm also screens before it fits: every unfitted offspring is
+scored once on the GPU with its seed constants, and only the best
+`max(32, pop/4)` candidates of each island are admitted to the fitted LM batch
+(ties break on complexity and then the fixed population index). The remaining
+offspring keep their screening score. This cuts the fit volume without changing
+the evaluation count or the finalist refit, and the admission set is a pure
+function of the screened errors, so it is reproducible.
+
 The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
 (the undamped Cholesky diagonal ratio exceeds `1e4` or a pivot hits the
 `1e-12` floor), `2` a non-finite value or residual. Status `1`/`2`, unsupported
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
-constants. `--fit-report` and the `gpu.fit` JSON object count
-`attempts`/`gpu`/`fallback`/`refits`; the run manifest records the same ledger.
+constants. Every CPU fallback is labelled by cause: `unsupported_plan`
+(no analytic derivative, too many nodes, shared block constants or no
+constants), `too_few_rows`, `too_many_constants` (`p > 16`), `ill_conditioned`,
+`non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
+`screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
+`seconds` and the whole fit stage's `host_seconds`; the run manifest records the
+same accepted/fallback/refit totals.
 
 **Exactness.** Search fitness is still f32 and only guides selection. Every
 finalist is refit by the exact CPU f64 LM on all training rows before the final
@@ -726,6 +739,32 @@ duty gates are therefore **not met by this first arm**; the measured lever is
 the fit-stage ratio on eligible candidates, and the fallback/refit share is what
 limits Amdahl. A dispatcher that avoids offering degenerate candidates and a
 lower-cost finalist refit are the follow-ups, not a default change.
+
+**Admission/promotion A/B (WP-169-D).** The pinned fit-heavy 154k cell
+(4 islands, `--pop 256`, five generations, no screening, `--fit-iters 8`,
+smooth finite operators) at equal 5 120 evaluations:
+
+| arm | wall | best error | hypervolume | TTT (exact final × 1.02) |
+|---|---:|---:|---:|---|
+| `exact` CPU | 218.68 s | 1.8589e-2 | 0.5056 | gen 5 / 218.7 s |
+| `gpu` + admission | 93.38 s | 1.0861e-2 | 0.5386 | gen 4 / 19.1 s |
+
+The GPU arm is **2.34×** end-to-end. It screened 6 124 offspring, admitted
+1 536, fitted 1 437 on the device and sent 99 to the CPU (**6.4 %** of admitted;
+all `ill_conditioned`, every other cause zero), then refit 997 finalists
+exactly. The whole fit stage was 32.00 s (34.3 % of wall; kernel 4.39 s) and GPU
+duty was **96.8 %**. Hypervolume and time-to-target are both better than the
+CPU arm at equal evaluations.
+
+The measured fit share is **34.3 %, below the 50 % construction** the issue's
+`>= 1.3×` clause names, so this cell does not evidence that conditional box even
+though its measured e2e and duty exceed the numeric thresholds. A second probe
+at `N = 3.9M`, `pop 128`, one island and two generations (256 evaluations) had a
+low fallback rate (2.1 %) and 99.5 % duty but **failed the quality control**
+(exact best 0.1612 versus GPU 0.4753; hypervolume 0.0032 versus 0.0000; target
+not reached). Two generations at that size are too few for admission by
+seed-constant screening, so the 3.9M hourly cell remains an open follow-up, not
+a passing measurement.
 
 **Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
 arm yet: it scores a tree as soon as it is offered, before the barrier fit
