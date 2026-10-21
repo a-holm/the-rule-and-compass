@@ -351,6 +351,9 @@ fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
         ..EstimateOptions::default()
     };
     let estimate = fs.estimate_resident(&opts);
+    // `--cpu` pins the guard's model to the same options the estimate above
+    // uses: a CUDA build defaults to the GPU backend, which legitimately adds
+    // the f32 staging copy and would need a larger budget.
     let output = Command::new(env!("CARGO_BIN_EXE_rcsr"))
         .args([
             "--data",
@@ -363,6 +366,7 @@ fn a_store_that_fits_loads_the_full_rows_not_a_sample() {
             "1",
             "--pop",
             "4",
+            "--cpu",
             "--max-memory",
             &estimate.total_bytes.to_string(),
             "--json",
