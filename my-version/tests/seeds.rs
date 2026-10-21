@@ -171,6 +171,10 @@ fn seed_is_simplified_fitted_and_present_in_the_final_archive() {
 /// fix, a domain-safe simplifier left `0 + sqrt(m / k)` in the seed; the GPU
 /// trajectory then found the smaller `sqrt(m / k)` with the same zero error,
 /// which legitimately dominated and removed the seed from the Pareto front.
+///
+/// #236: the device scores squared error only, so the A/B uses `squared` for
+/// both arms; with the default `absolute` the "GPU" arm would silently be a
+/// second CPU run. The absolute-metric seed path is covered by the tests above.
 #[test]
 fn seed_is_canonical_and_present_on_cpu_and_gpu_paths() {
     let (vars, train, test) = spring();
@@ -182,6 +186,7 @@ fn seed_is_canonical_and_present_on_cpu_and_gpu_paths() {
     for gpu in [false, true] {
         let mut cfg = config(1, 8);
         cfg.gpu = gpu;
+        cfg.metric = Metric::Squared;
         let out = search::run_seeded(&cfg, &train, &test, &[seed.clone()]);
 
         assert_eq!(out.seeds.len(), 1, "gpu={}: one accepted seed", gpu);
