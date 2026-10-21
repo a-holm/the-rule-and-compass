@@ -2395,7 +2395,19 @@ fn enrich_inner(
     let mut own = Vec::new();
     let mut py15m_requested = Vec::new();
     for n in &requested {
-        if py15m_names().contains(n) {
+        if matches!(
+            n.as_str(),
+            "bb20_bw" | "month_sin" | "month_cos" | "dom_sin" | "dom_cos"
+        ) {
+            // These names are shared by a standalone group (bollinger/calendar)
+            // and the py15m family. Compute the cheap standalone form unless
+            // the user asked for the whole py15m family.
+            if !requested.iter().any(|x| x == "py15m") {
+                own.push(n.clone());
+            } else if py15m_names().contains(n) {
+                py15m_requested.push(n.clone());
+            }
+        } else if py15m_names().contains(n) {
             py15m_requested.push(n.clone());
         } else if n.starts_with("xs_rank_") {
             // Computed in the cross-sectional pass, which needs every symbol.
