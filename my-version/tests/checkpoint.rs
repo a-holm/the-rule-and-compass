@@ -387,6 +387,10 @@ fn a_gpu_run_and_a_gpu_resume_match_exactly() {
     let test = sample(80);
     let mut full = Config {
         generations: 20,
+        // #236: the device scores squared error only, so a GPU run must use a
+        // metric the kernel can rank. The default `absolute` would keep this
+        // test on the CPU and quietly stop testing the GPU resume path.
+        metric: rcsr::metrics::Metric::Squared,
         ..config(17)
     };
     full.gpu = true;

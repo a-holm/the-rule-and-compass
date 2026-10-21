@@ -102,6 +102,29 @@ impl FitStrategy {
     }
 }
 
+/// #223: why an explicit `--fit-strategy gpu` cannot honour `metric`, or `None`
+/// when it can.
+///
+/// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) accumulates and
+/// minimises weighted squared error only. Every metric outside
+/// [`Metric::is_least_squares`] fits on the CPU through IRLS, logistic IRLS or
+/// the coordinate polish, so accepting the combination would silently
+/// substitute a different objective for the one the user asked to optimise.
+/// The CLI and the web front end turn this into a usage error before any data
+/// is read; the search's own dispatch requires the same predicate.
+pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
+    if metric.is_least_squares() {
+        return None;
+    }
+    Some(format!(
+        "--fit-strategy gpu minimises squared error only, but --metric {} is not a \
+         least-squares objective, so the GPU LM cannot fit it. Use --metric squared \
+         (aic, aicc and bic also fit by least squares), or a CPU fit strategy: \
+         --fit-strategy exact, auto, linear, varpro or stream.",
+        metric.name()
+    ))
+}
+
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
 /// materialise. Above it the exact LM path runs, so a large dataset never pays
 /// an unbounded allocation. 8M cells is 64 MiB of `f64` at the cap.
@@ -1788,16 +1811,23 @@ pub fn fit_weighted_metric(
     // before reaching any of them. For the squared family this keeps the
     // historical weighted-SSE return value rather than the mean-squared score.
     if iters == 0 {
-        return match metric {
-            Squared | Aic | Aicc | Bic => fit_weighted(tree, x, y, w, 0),
-            _ => metric_score(tree, x, y, w, metric),
-        };
+        if metric.is_least_squares() {
+            return fit_weighted(tree, x, y, w, 0);
+        }
+        return metric_score(tree, x, y, w, metric);
+    }
+    // The exact historical path. Information criteria fit by least squares and
+    // add their parameter penalty when scoring; they do not change the
+    // constants' objective. #223 keeps the family in one predicate so the GPU
+    // dispatch and the CLI refusal can never disagree with this fit.
+    if metric.is_least_squares() {
+        return fit_weighted(tree, x, y, w, iters);
     }
     match metric {
-        // The exact historical path. Information criteria fit by least squares
-        // and add their parameter penalty when scoring; they do not change the
-        // constants' objective.
-        Squared | Aic | Aicc | Bic => fit_weighted(tree, x, y, w, iters),
+        // `Metric::is_least_squares` returned above for these.
+        Squared | Aic | Aicc | Bic => {
+            unreachable!("least-squares metrics are fitted by fit_weighted")
+        }
         Absolute => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
@@ -3483,6 +3513,40 @@ mod tests {
         assert!(FitStrategy::parse("convex").is_none());
         assert!(FitStrategy::Gpu.defers_to_gpu());
         assert!(!FitStrategy::Auto.defers_to_gpu());
+    }
+
+    /// #223: an explicit GPU request is refused outside the least-squares
+    /// family, and the refusal says why and what to use instead. The
+    /// least-squares family is accepted, including `squared` and the three
+    /// information criteria.
+    #[test]
+    fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
+        for m in Metric::all() {
+            let why = gpu_fit_metric_error(*m);
+            if m.is_least_squares() {
+                assert!(why.is_none(), "{} must stay accepted", m.name());
+                continue;
+            }
+            let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
+            assert!(
+                why.contains("minimises squared error only"),
+                "the refusal must name the GPU LM's objective: {why}"
+            );
+            assert!(
+                why.contains(&format!("--metric {}", m.name())),
+                "the refusal must name the metric: {why}"
+            );
+            assert!(
+                why.contains("--metric squared"),
+                "the refusal must point at --metric squared: {why}"
+            );
+            for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
+                assert!(
+                    why.contains(strategy),
+                    "the refusal must offer the CPU strategy {strategy}: {why}"
+                );
+            }
+        }
     }
 
     #[test]

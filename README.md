@@ -31,9 +31,11 @@ device and labels every larger or unsupported candidate for the exact CPU arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+forced individually. An explicit `gpu` with a metric outside the least-squares
+family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
+squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+the default LM path when it cannot prove a safe result, and the default remains
+the historical LM path bit for bit.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -886,9 +888,11 @@ device and labels every larger or unsupported candidate for the exact CPU arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+forced individually. An explicit `gpu` with a metric outside the least-squares
+family (squared, aic, aicc, bic) is a usage error, because the kernel minimises
+squared error; use `--metric squared` or a CPU strategy. Every arm falls back to
+the default LM path when it cannot prove a safe result, and the default remains
+the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant
@@ -981,13 +985,20 @@ numbers and the hardware plan.
 ## Backends: GPU by default when available
 
 A binary built with `--features cuda` probes the device once at startup and uses
-the GPU to guide the search whenever one is available; a build without the
-feature, or a machine with no usable device, falls back to the CPU and records
-the reason. `--gpu` asserts that a device must exist (exit 2 otherwise),
-`--no-gpu`/`--cpu` forces the CPU, and `RCSR_GPU=0` simulates a missing device.
-Non-quiet runs print one resource line with the backend, device, available
-threads and training rows/columns, and `--json` records `backend`,
-`backend_reason` and `device`.
+the GPU to guide the search whenever one is available **and the run's metric is
+scored on the device**; a build without the feature, or a machine with no usable
+device, falls back to the CPU and records the reason. `--gpu` asserts that a
+device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
+`RCSR_GPU=0` simulates a missing device. Non-quiet runs print one resource line
+with the backend, device, available threads and training rows/columns, and
+`--json` records `backend`, `backend_reason` and `device`.
+
+The kernel ranks candidates by **squared error**, so only `--metric squared` is
+scored on the device. Every other metric — including the default `absolute` —
+keeps the CPU evaluator, prints `# gpu: off (metric is not scored natively on
+the GPU)` and records that cause in `backend_reason`; a device run is never
+ranked by a substitute loss. Native device scoring for the other objectives is
+tracked in #236–#238.
 
 Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
 change the search trajectory. Reported metrics, constants and diagnostics are

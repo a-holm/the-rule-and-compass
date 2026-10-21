@@ -401,24 +401,33 @@ Each generation then runs as:
 3. selection, migration and restart decisions consume the returned fitness.
 
 The GPU never produces a number a user reads. The kernel sums squared errors;
-the search divides that by the row count and uses it as a mean-squared fitness
-(exact for `--metric squared`, a ranking proxy for the other plain regression
-metrics). At the end `full_data_archive` re-scores the surviving trees on the
-full training sample with the CPU evaluator in `f64`, and the reported
-train/test errors, Pareto front and convergence statistics come from that
-rebuild. Constants stay on the CPU and in `f64` throughout.
+the search divides that by the row count and uses it as a mean-squared fitness.
+That is exact only for `--metric squared`. Every other metric is scored by the
+CPU evaluator: the kernel has no MAE, rank, minimax, correlation, slope or
+classification objective, and using MSE as a ranking proxy silently changes the
+search (`--metric slope` was observed to select a different Pareto point). At
+the end `full_data_archive` re-scores the surviving trees on the full training
+sample with the CPU evaluator in `f64`, and the reported train/test errors,
+Pareto front and convergence statistics come from that rebuild. Constants stay
+on the CPU and in `f64` throughout.
 
-The GPU path is used for single-output, unweighted, full-sample runs with a
-plain regression metric. Multi-output (`--target y1,y2`), `--weight`, the
-implicit metrics, classification metrics, AIC/AICc/BIC and
-`--predictor-samples` keep the CPU evaluator, because they need more than one
-prediction per row or a different set of rows every generation; the reason is
-printed in the one-line note.
+The GPU path is used for single-output, unweighted, full-sample
+`--metric squared` runs. Multi-output (`--target y1,y2`), `--weight`, every
+non-squared metric (including implicit, classification, correlation, rank,
+slope and AIC/AICc/BIC) and `--predictor-samples` keep the CPU evaluator,
+because they need more than one prediction per row, a different objective, or a
+different set of rows every generation; the reason is printed in the one-line
+note.
 
 Fallback and the flags:
 
-* With neither flag, a CUDA build with a usable device selects the GPU. A build
-  without the feature prints
+* With neither flag, a CUDA build with a usable device selects the GPU **for
+  `--metric squared`**. Every other metric, including the default `absolute`,
+  is scored on the CPU and prints
+  `# gpu: off (metric is not scored natively on the GPU)` once; the resource
+  line and the `--json` `backend` both say `cpu` and `backend_reason` carries
+  the same cause.
+* A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
   build with no usable device prints the same line with the probe's reason.
 * `--gpu` is an **assertion**: it exits 2 with a clear error when the build or
@@ -810,7 +819,15 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
 only for the squared/AIC family, with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The arm also screens before it fits: every unfitted offspring is
+`32p` rows. The family is also a **CLI contract** (#223): an explicit
+`--fit-strategy gpu` with any metric outside `squared`, `aic`, `aicc` and `bic`
+is a usage error (exit code `2`) raised before any data is read, because the
+only alternative would be a silent CPU fit of a different objective. The
+message names the kernel's objective and both fixes (--metric squared, or a
+CPU fit strategy). The device-missing fallback below is unchanged: it never
+claims the GPU arm and is recorded with its cause.
+
+The arm also screens before it fits: every unfitted offspring is
 scored once on the GPU with its seed constants, and the screened ranking decides
 admission. Below **1 048 576 training rows** only the best
 `max(32, pop/4)` candidates of each island are admitted to the fitted LM batch
