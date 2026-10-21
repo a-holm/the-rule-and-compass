@@ -88,6 +88,13 @@ pub struct Config {
     pub init_depth: usize,
     /// Levenberg–Marquardt iterations for constant fitting (0 disables).
     pub fit_iters: usize,
+    /// #201: iteration budget for the full-data promotion refit of screened
+    /// survivors. `0` keeps [`fit_iters`](Self::fit_iters) (the historical
+    /// path, bit for bit); `N >= 1` uses N warm-started LM iterations while
+    /// keeping the fitter's four-step Gauss–Newton polish. It only affects
+    /// candidates promoted by `--fit-samples`; the final archive and the GPU
+    /// exact finalist refit keep their existing budgets.
+    pub refit_iters: usize,
     /// #116: exact constant-fitting arm. `Exact` is the historical CPU LM;
     /// `Auto`/`Linear` use the closed-form linear least-squares arm for trees
     /// affine in every constant and fall back to LM otherwise. Changing it
@@ -302,6 +309,7 @@ impl Default for Config {
             restart_interval: 60,
             init_depth: 3,
             fit_iters: 8,
+            refit_iters: 0, // #201: off; promotion refits use fit_iters
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
             fit_report: false,
             dedup: true,
@@ -363,6 +371,7 @@ impl Config {
         compare!(restart_interval, "restart_interval");
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
+        compare!(refit_iters, "refit_iters"); // #201
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(dedup, "dedup");
         if self.time_budget.map(f64::to_bits) != other.time_budget.map(f64::to_bits) {
@@ -389,6 +398,19 @@ impl Config {
     /// The generation budget is excluded (see [`Config::search_setting_differences`]).
     pub fn same_search_settings(&self, other: &Config) -> bool {
         self.search_setting_differences(other).is_empty()
+    }
+
+    /// #201: LM iterations for a full-data promotion refit.
+    ///
+    /// `--refit-iters 0` (the default) returns [`fit_iters`](Self::fit_iters),
+    /// so the historical full budget and its bits are preserved. A positive
+    /// value is the opt-in shorter, warm-started promotion budget.
+    pub fn promotion_refit_iters(&self) -> usize {
+        if self.refit_iters == 0 {
+            self.fit_iters
+        } else {
+            self.refit_iters
+        }
     }
 
     /// #25: the only dimensional question the search asks.
@@ -1702,6 +1724,8 @@ thread_local! {
     /// #85: how many times [`refit_survivor`] reused the fitter's final SSE
     /// instead of scoring the promoted tree again.
     static REFIT_SSE_REUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// #201: the budget the last promotion refit actually asked the fitter for.
+    static REFIT_ITERS_USED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// #15: score a candidate on `s`, dispatching to the shared-shape multi-output
@@ -2042,7 +2066,26 @@ fn fit_for_generation(cfg: &Config, sample: &Sample, generation: usize) -> Optio
 
 /// #85: refit one screening survivor on the full training sample and score it
 /// there, ready to enter the archive.
+///
+/// #201: the promotion budget is [`Config::promotion_refit_iters`], so
+/// `--refit-iters 1` keeps the warm start and the undamped Gauss–Newton polish
+/// while cutting the damped phase. With the flag unset this is exactly the
+/// historical full `--fit-iters` refit.
 fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
+    let iters = cfg.promotion_refit_iters();
+    #[cfg(test)]
+    REFIT_ITERS_USED.with(|n| n.set(iters));
+    refit_survivor_with_iters(tree, train, cfg, iters)
+}
+
+/// #201: [`refit_survivor`] with an explicit budget. Final QD cell elites and
+/// tests can ask for the historical full budget even when promotion is cheap.
+fn refit_survivor_with_iters(
+    tree: &Node,
+    train: &EvalSample,
+    cfg: &Config,
+    iters: usize,
+) -> Sol {
     let mut tree = expr::simplify(tree);
     // #85/#87: the promoted tree is fitted on exactly the rows that will score
     // it, so for the squared metric the fitter's final SSE is the score.
@@ -2050,7 +2093,7 @@ fn refit_survivor(tree: &Node, train: &EvalSample, cfg: &Config) -> Sol {
     // same bit pattern (see `Ind::evaluated_fitted`).
     let mut fitted = None;
     if cfg.fit_iters > 0 && !train.sample.is_multi() {
-        fitted = fit_constants(&mut tree, cfg, train.sample, train.sample);
+        fitted = fit_constants_with_iters(&mut tree, cfg, train.sample, train.sample, iters);
         tree = expr::simplify(&tree);
     }
     let hash = expr::structural_hash(&tree);
@@ -4620,7 +4663,9 @@ fn run_search(
     if cfg.qd_policy {
         if let Some(qd) = qd_archive.as_mut() {
             qd.refit_all(|tree| {
-                let sol = refit_survivor(tree, &train_data, cfg);
+                // #201: the reported QD front keeps the full finalist budget;
+                // only the per-generation promotion refit is opt-in cheaper.
+                let sol = refit_survivor_with_iters(tree, &train_data, cfg, cfg.fit_iters);
                 (sol.error, sol.cost)
             });
         }
@@ -5380,6 +5425,52 @@ mod tests {
         let full = eval_error_with(&sol.tree, &s, Metric::Squared, true);
         assert_eq!(sol.error.to_bits(), full.to_bits());
         assert!(sol.error < 1e-12, "full-data error = {}", sol.error);
+    }
+
+    /// #201: `--refit-iters` is opt-in. Zero means the historical
+    /// `--fit-iters` budget; a positive value is the shorter warm-started
+    /// promotion budget, and `refit_survivor` actually passes it through.
+    #[test]
+    fn refit_iters_is_opt_in_and_reaches_the_promotion_refit() {
+        let s = sample();
+        let view = EvalSample::new(
+            &s,
+            &Config {
+                metric: Metric::Squared,
+                fit_iters: 8,
+                ..Default::default()
+            },
+        );
+        let tree = node(Op::Mul, vec![constant(3.0), input(0)]);
+
+        let mut cfg = Config {
+            metric: Metric::Squared,
+            fit_iters: 8,
+            ..Default::default()
+        };
+        assert_eq!(cfg.promotion_refit_iters(), 8);
+        refit_survivor(&tree, &view, &cfg);
+        assert_eq!(REFIT_ITERS_USED.with(|n| n.get()), 8);
+
+        cfg.refit_iters = 1;
+        assert_eq!(cfg.promotion_refit_iters(), 1);
+        refit_survivor(&tree, &view, &cfg);
+        assert_eq!(
+            REFIT_ITERS_USED.with(|n| n.get()),
+            1,
+            "the opt-in budget must reach fit_constants_with_iters"
+        );
+
+        // A no-fit run must never fit, even when a refit budget is set.
+        cfg.fit_iters = 0;
+        cfg.refit_iters = 3;
+        let sol = refit_survivor(&tree, &view, &cfg);
+        assert_eq!(REFIT_ITERS_USED.with(|n| n.get()), 3);
+        assert_eq!(
+            expr::structural_hash(&sol.tree),
+            expr::structural_hash(&expr::simplify(&tree)),
+            "fit_iters = 0 must leave the constants untouched"
+        );
     }
 
     /// #85: the promoted tree is fitted on exactly the rows that score it, so

@@ -1040,6 +1040,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "units.target",
         "require_dimensions",
         "fit_samples",
+        "refit_iters", // #201: missing means 0 (use fit_iters)
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
         "fit_rows",      // #116: missing means 0 (off)
@@ -1179,6 +1180,15 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             }
             n
         }
+    };
+
+    // #201: promotion-refit budget; missing means 0 (use fit_iters). Any
+    // positive value is accepted, matching the CLI.
+    let refit_iters = match fields.get("refit_iters").map(|s| s.as_str()) {
+        None => 0,
+        Some(raw) => raw
+            .parse()
+            .map_err(|_| format!("bad config value for 'refit_iters': '{}'", raw))?,
     };
 
     // #116: fit-only row screening; missing means off.
@@ -1323,6 +1333,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         restart_interval: num_usize("restart_interval")?,
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
+        refit_iters, // #201
         fit_strategy, // #116
         fit_report: false,
         dedup: bool_val("dedup")?,
@@ -1389,6 +1400,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config restart_interval {}", cfg.restart_interval).unwrap();
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
+    // #201: only write the opt-in field, so an off run's checkpoint stays
+    // byte-identical to one written before the flag existed.
+    if cfg.refit_iters > 0 {
+        writeln!(out, "config refit_iters {}", cfg.refit_iters).unwrap();
+    }
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     // #122: absent means auto (the historical path for every old checkpoint).

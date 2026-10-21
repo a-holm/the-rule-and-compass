@@ -323,6 +323,34 @@ fn fit_portfolio_settings_round_trip() {
     assert_eq!(cp.to_text(), text, "round trip must preserve the new fields");
 }
 
+/// #201: the opt-in promotion-refit budget is saved search state, while the
+/// default (0) must leave the historical checkpoint bytes untouched.
+#[test]
+fn refit_iters_round_trips_only_when_opted_in() {
+    let train = sample(120);
+    let test = sample(40);
+
+    let off = config(5);
+    let off_text = checkpoint_text(&off, &train, &test);
+    assert!(
+        !off_text.contains("config refit_iters "),
+        "default checkpoints must not grow a new field"
+    );
+
+    let mut on = config(5);
+    on.refit_iters = 1;
+    let text = checkpoint_text(&on, &train, &test);
+    assert!(text.contains("config refit_iters 1\n"));
+    let cp = Checkpoint::from_text(&text).expect("parse");
+    assert_eq!(cp.config.refit_iters, 1);
+    assert_eq!(cp.config.promotion_refit_iters(), 1);
+    assert!(
+        on.same_search_settings(&cp.config),
+        "differences: {:?}",
+        on.search_setting_differences(&cp.config)
+    );
+}
+
 #[test]
 fn an_uninterrupted_run_and_a_saved_then_resumed_run_match_exactly() {
     let train = sample(240);

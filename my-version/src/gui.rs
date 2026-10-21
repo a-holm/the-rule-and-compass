@@ -908,6 +908,7 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
             "--ops" => cfg.ops = Op::parse_list(&take(&mut i)?),
             "--eval-expr" => raw.eval_expr = Some(take(&mut i)?),
             "--fit-iters" => cfg.fit_iters = int(&take(&mut i)?, "--fit-iters", 0)?,
+            "--refit-iters" => cfg.refit_iters = int(&take(&mut i)?, "--refit-iters", 0)?,
             "--fit-report" => cfg.fit_report = true,
             "--fit-samples" => cfg.fit_samples = int(&take(&mut i)?, "--fit-samples", 0)?,
             "--fit-strategy" => {

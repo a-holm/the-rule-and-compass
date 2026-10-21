@@ -378,6 +378,13 @@ SEARCH:
                              log_squashed use IRLS; auc/log_loss/hinge use
                              logistic IRLS; rank/order/correlation losses use a
                              deterministic coordinate polish
+  --refit-iters <N>          LM iterations for the full-data promotion refit of
+                             screened survivors (default 0 = use --fit-iters, the
+                             historical budget). N >= 1 warm-starts each promoted
+                             tree from its screen constants; the four-step
+                             Gauss–Newton polish is always kept. Only affects
+                             --fit-samples promotions; the final archive and the
+                             GPU exact finalist refit keep their budgets
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
@@ -1470,6 +1477,9 @@ fn main() {
     let mut seed_set = false;
     let mut ops_set = false;
     let mut fit_iters_set = false;
+    // #201: remember an explicit promotion-refit budget so a resume can refuse
+    // a contradiction just like --fit-iters.
+    let mut refit_iters_set = false;
     // #116: remember an explicit --fit-strategy so a resume can refuse a
     // contradiction with the saved configuration.
     let mut fit_strategy_set = false;
@@ -1757,6 +1767,24 @@ fn main() {
             "--fit-iters" => {
                 cfg.fit_iters = val!().parse().unwrap_or(cfg.fit_iters);
                 fit_iters_set = true;
+            }
+            // #201: opt-in budget for the full-data promotion refit.
+            "--refit-iters" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) => {
+                        // 0 restores the historical full `--fit-iters` budget.
+                        cfg.refit_iters = n;
+                        refit_iters_set = true;
+                    }
+                    _ => {
+                        eprintln!(
+                            "error: --refit-iters needs a non-negative integer, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
             }
             "--no-fit" => {
                 cfg.fit_iters = 0;
@@ -2290,6 +2318,13 @@ fn main() {
             conflicts.push(format!(
                 "--fit-iters {} (saved {})",
                 cfg.fit_iters, saved.fit_iters
+            ));
+        }
+        // #201: the promotion-refit budget is saved search state.
+        if refit_iters_set && cfg.refit_iters != saved.refit_iters {
+            conflicts.push(format!(
+                "--refit-iters {} (saved {})",
+                cfg.refit_iters, saved.refit_iters
             ));
         }
         // #116: the fitting arm is saved search state.
@@ -3560,13 +3595,24 @@ fn main() {
         // archive was refit on every training row.
         if cfg.fit_iters > 0 && cfg.fit_samples >= 2 && cfg.fit_samples < prepared.train.len() {
             let n = cfg.fit_samples;
-            eprintln!(
-                "# fit: constants screened on {} of {} training rows per generation; \
-                 survivors refit on all {} rows",
-                n,
-                prepared.train.len(),
-                prepared.train.len()
-            );
+            if cfg.refit_iters > 0 {
+                eprintln!(
+                    "# fit: constants screened on {} of {} training rows per generation; \
+                     survivors refit on all {} rows with {} LM iteration(s) plus polish",
+                    n,
+                    prepared.train.len(),
+                    prepared.train.len(),
+                    cfg.refit_iters
+                );
+            } else {
+                eprintln!(
+                    "# fit: constants screened on {} of {} training rows per generation; \
+                     survivors refit on all {} rows",
+                    n,
+                    prepared.train.len(),
+                    prepared.train.len()
+                );
+            }
         }
         // #86: state the effective screening size, and say so when a near-full
         // request was widened to the full sample instead of paying the
@@ -4969,11 +5015,17 @@ fn main() {
             // #85: only emitted when screening is on, so an off run's JSON is
             // byte-identical to the historical output.
             let fit_json = if outcome.fit_samples > 0 {
+                let refit_iters = if cfg.refit_iters > 0 {
+                    format!(",\"refit_iters\":{}", cfg.refit_iters)
+                } else {
+                    String::new()
+                };
                 format!(
-                    "\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}},",
+                    "\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}{}}},",
                     outcome.fit_samples,
                     prepared.train.len(),
-                    outcome.archive_refit
+                    outcome.archive_refit,
+                    refit_iters
                 )
             } else {
                 String::new()
@@ -5255,11 +5307,17 @@ fn main() {
             // #85: the closing event carries the screening note only when the
             // flag is on, so the off path keeps its exact bytes.
             let fit_ndjson = if outcome.fit_samples > 0 {
+                let refit_iters = if cfg.refit_iters > 0 {
+                    format!(",\"refit_iters\":{}", cfg.refit_iters)
+                } else {
+                    String::new()
+                };
                 format!(
-                    ",\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}}}",
+                    ",\"fit\":{{\"samples\":{},\"train_rows\":{},\"refit\":{}{}}}",
                     outcome.fit_samples,
                     prepared.train.len(),
-                    outcome.archive_refit
+                    outcome.archive_refit,
+                    refit_iters
                 )
             } else {
                 String::new()
