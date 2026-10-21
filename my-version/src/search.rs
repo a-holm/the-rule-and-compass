@@ -4246,6 +4246,7 @@ mod tests {
             tree: node(Op::Add, vec![input(0), constant(1.0)]),
             error,
             complexity,
+            descriptor: None,
         }
     }
 
