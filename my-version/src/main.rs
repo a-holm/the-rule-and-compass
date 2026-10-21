@@ -99,8 +99,9 @@ USAGE:
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr dev-report <log.ndjson>
-                              summarise a --dev-log file (phases, fit/eval
-                              share, fallback causes, bottlenecks)
+                              summarise the development log rcsr writes by
+                              default (phases, fit/eval share, fallback
+                              causes, bottlenecks)
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -496,25 +497,34 @@ RUN INTEGRITY (#140):
   [--data <file>]            commit, data file and canonical config; exit 1 on
                              any mismatch (exit 0 when everything matches)
 
-DEVELOPMENT LOG (#211):
-  --dev-log <path>           write one NDJSON event per generation plus start,
-                             checkpoint and end events to this path (default:
-                             off). Independent of --json/--ndjson/--progress.
-                             Each event carries `schema: rcsr-devlog/1`; it
-                             records phase timings, error quantiles, Pareto
-                             size/hypervolume/hash, dedup rate, admissions,
-                             fit attempts/GPU/fallback-by-cause/refits, GPU
-                             kernel/wall/duty, CPU fallback seconds/workers, QD
-                             coverage/entropy, convergence, per-island best and
-                             the RNG key. No raw rows or personal data. One
-                             atomic line per write, bounded by --dev-log-max-bytes;
-                             logging never changes the archive, the results or
-                             the configuration hash. See docs/dev-log.md
-  --dev-log-every <N>        write a generation event only every Nth
-                             generation (default 1). run_end always carries the
-                             final archive and stop reason
+DEVELOPMENT LOG (#211) — on by default:
+  The engine writes rcsr.dev.ndjson next to --json-out (or --save), else in
+  the working directory. It is the in-engine replacement for the old external
+  run monitor; --no-dev-log turns it off. Independent of --json/--ndjson/
+  --progress. Every line carries `schema: rcsr-devlog/1` and no raw rows.
+  --dev-log-level <level>    summary (default) or full.
+                             summary: run_start, one event every 10-25
+                             generations (gen, elapsed, best/median error,
+                             Pareto size, phase times, fit/GPU/fallback counts,
+                             GPU duty, convergence), checkpoint events and
+                             run_end
+                             full: every generation with the complete record
+                             (all error quantiles, archive hypervolume/hash,
+                             dedup rate, admissions, fit fallback-by-cause,
+                             kernel/wall/duty, QD coverage/entropy, per-island
+                             best, RNG key)
+  --dev-log <path>           write to this path instead of the default one
+  --no-dev-log               disable the log entirely
+  --dev-log-every <N>        write a generation event every Nth generation
+                             (default: level-dependent — 1 for full; for
+                             summary clamp(generations/10, 10, 25), and every
+                             generation when the budget is <= 10)
   --dev-log-max-bytes <size> cap on generation and checkpoint events (default
                              64MiB); run_start and run_end are always written
+  Writes are one atomic line each, so a killed run leaves a valid prefix, and
+  logging never changes the archive, the results or the configuration hash.
+  Budget: ~50 ms once per run plus 7-16 us per written event. See
+  docs/dev-log.md and docs/run-integrity.md
   dev-report <log>           Rust analyzer for a dev log: phase table, fit vs
                              evaluation share, fallback causes, convergence,
                              archive growth and a ranked bottleneck list
@@ -916,17 +926,25 @@ impl PhaseTimings {
 #[derive(Clone)]
 struct DevSink {
     log: std::sync::Arc<std::sync::Mutex<rcsr::devlog::Log>>,
-    /// `--dev-log-every`: write a generation event only when
+    /// `--dev-log-level`: the shape of a `generation` event.
+    level: rcsr::devlog::Level,
+    /// The resolved cadence: write a generation event only when
     /// `generation % every == 0`.
     every: usize,
 }
 
 impl DevSink {
-    fn open(path: &str, max_bytes: u64, every: usize) -> Result<DevSink, String> {
+    fn open(
+        path: &str,
+        max_bytes: u64,
+        every: usize,
+        level: rcsr::devlog::Level,
+    ) -> Result<DevSink, String> {
         Ok(DevSink {
             log: std::sync::Arc::new(std::sync::Mutex::new(rcsr::devlog::Log::create(
                 path, max_bytes,
             )?)),
+            level,
             every: every.max(1),
         })
     }
@@ -945,7 +963,7 @@ impl DevSink {
         let sink = self.clone();
         std::sync::Arc::new(move |rec: &rcsr::devlog::GenRecord| {
             if sink.every == 1 || rec.generation % sink.every == 0 {
-                sink.write(&rec.json(), false);
+                sink.write(&rec.json_at(sink.level), false);
             }
         })
     }
@@ -1017,6 +1035,7 @@ fn dev_run_start(
     cfg: &search::Config,
     backend: &str,
     device: Option<String>,
+    level: rcsr::devlog::Level,
     every: usize,
     max_bytes: u64,
     resumed_from: Option<String>,
@@ -1059,10 +1078,30 @@ fn dev_run_start(
         host: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
         start_utc: manifest::utc_now(),
+        level,
         every,
         max_bytes,
         resumed_from,
     }
+}
+
+/// #211: where the default log goes — next to the result artifacts when the run
+/// names them, otherwise the working directory.
+///
+/// `--json-out` wins over `--save` because it is the artifact the person reads;
+/// a `--run-manifest` is not used because it is provenance, not a result.
+fn default_dev_log_path(json_out: Option<&str>, save: Option<&str>) -> String {
+    let dir = json_out
+        .or(save)
+        .map(std::path::Path::new)
+        .and_then(|p| p.parent())
+        .filter(|d| !d.as_os_str().is_empty());
+    match dir {
+        Some(d) => d.join(rcsr::devlog::DEFAULT_FILE_NAME),
+        None => std::path::PathBuf::from(rcsr::devlog::DEFAULT_FILE_NAME),
+    }
+    .to_string_lossy()
+    .into_owned()
 }
 
 /// The `variables_detail` array shared by `--json`, `--ndjson` and
@@ -1406,12 +1445,16 @@ fn main() {
     let mut allow_backend_change = false;
     let mut run_manifest_path: Option<String> = None;
     let mut json_out: Option<String> = None;
-    // #211: optional engine-level development log (off unless --dev-log).
+    // #211: the engine-level development log. It is **on by default** at
+    // `summary` level, which is what replaces the old external run monitor.
     let mut dev_log_path: Option<String> = None;
-    let mut dev_log_every = 1usize;
+    let mut dev_log_level = rcsr::devlog::Level::Summary;
+    let mut dev_log_level_set = false;
+    let mut dev_log_disabled = false;
+    let mut dev_log_every: Option<usize> = None;
     let mut dev_log_max_bytes = rcsr::devlog::DEFAULT_MAX_BYTES;
-    let mut dev_log_every_set = false;
     let mut dev_log_max_bytes_set = false;
+    let mut dev_log_requested = false;
 
     // Which search flags were written on the command line. Used to refuse a
     // resume whose explicit override contradicts the saved configuration.
@@ -1923,16 +1966,39 @@ fn main() {
             "--resume" => resume_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
-            // #211: the development log. `--dev-log-every` throttles the
-            // generation events; `--dev-log-max-bytes` bounds the file.
-            "--dev-log" => dev_log_path = Some(val!()),
+            // #211: the development log. It is on by default; `--no-dev-log`
+            // turns it off, `--dev-log` picks the path, `--dev-log-level`
+            // picks the detail, `--dev-log-every` the cadence and
+            // `--dev-log-max-bytes` the bound.
+            "--dev-log" => {
+                dev_log_path = Some(val!());
+                dev_log_requested = true;
+            }
+            "--no-dev-log" => {
+                dev_log_disabled = true;
+                dev_log_requested = true;
+            }
+            "--dev-log-level" => {
+                let v = val!();
+                match rcsr::devlog::Level::parse(&v) {
+                    Some(level) => {
+                        dev_log_level = level;
+                        dev_log_level_set = true;
+                        dev_log_requested = true;
+                    }
+                    None => {
+                        eprintln!(
+                            "error: --dev-log-level must be summary or full, got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--dev-log-every" => {
                 let v = val!();
                 match v.parse::<usize>() {
-                    Ok(n) if n >= 1 => {
-                        dev_log_every = n;
-                        dev_log_every_set = true;
-                    }
+                    Ok(n) if n >= 1 => dev_log_every = Some(n),
                     _ => {
                         eprintln!("error: --dev-log-every needs an integer >= 1, got '{}'", v);
                         std::process::exit(EXIT_USAGE);
@@ -2030,18 +2096,29 @@ fn main() {
         eprintln!("error: --report cannot be combined with --eval-expr");
         std::process::exit(EXIT_USAGE);
     }
-    // #211: the development log describes one search.
-    if (dev_log_every_set || dev_log_max_bytes_set) && dev_log_path.is_none() {
-        eprintln!("error: --dev-log-every and --dev-log-max-bytes require --dev-log <path>");
+    // #211: the development log describes one search. It is on by default, so
+    // only an *explicit* request is refused where it cannot be honoured;
+    // `--report benchmark` simply runs its repeats without a log.
+    if dev_log_disabled
+        && (dev_log_path.is_some()
+            || dev_log_level_set
+            || dev_log_every.is_some()
+            || dev_log_max_bytes_set)
+    {
+        eprintln!(
+            "error: --no-dev-log conflicts with --dev-log, --dev-log-level, --dev-log-every \
+             and --dev-log-max-bytes"
+        );
         std::process::exit(EXIT_USAGE);
     }
     if dev_log_path.is_some() && eval_expr.is_some() {
         eprintln!("error: --dev-log cannot be combined with --eval-expr (it logs a search)");
         std::process::exit(EXIT_USAGE);
     }
-    if dev_log_path.is_some() && report == Some(ReportKind::Benchmark) {
+    if dev_log_requested && report == Some(ReportKind::Benchmark) {
         eprintln!(
-            "error: --dev-log cannot be combined with --report benchmark (one log describes one search; \n  run the repeats separately or drop --report benchmark)"
+            "error: --dev-log/--dev-log-level cannot be combined with --report benchmark \
+             (one log describes one search;\n  run the repeats separately or drop --report benchmark)"
         );
         std::process::exit(EXIT_USAGE);
     }
@@ -3567,37 +3644,79 @@ fn main() {
     }
 
     // #211: open the development log and write its first event before the
-    // search, so a killed process still records what it was doing. With no
-    // `--dev-log`, `dev_sink` is `None` and `cfg.dev_log` stays `None`: the
-    // search then skips every measurement the log would need.
-    let dev_sink: Option<DevSink> = match &dev_log_path {
-        Some(path) => {
-            let sink = match DevSink::open(path, dev_log_max_bytes, dev_log_every) {
-                Ok(sink) => sink,
-                Err(e) => {
+    // search, so a killed process still records what it was doing.
+    //
+    // The log is **on by default** at `summary` level: that is the in-engine
+    // replacement for the external run monitor. `--no-dev-log` turns it off, and
+    // with it off `cfg.dev_log` stays `None` so the search skips every
+    // measurement the log would need. `--report benchmark` repeats one search
+    // several times, so it runs without a log rather than interleaving runs.
+    let explicit_benchmark = report == Some(ReportKind::Benchmark);
+    let dev_target: Option<(String, bool)> = if dev_log_disabled || explicit_benchmark {
+        None
+    } else {
+        match &dev_log_path {
+            Some(p) => Some((p.clone(), true)),
+            None => Some((
+                default_dev_log_path(json_out.as_deref(), save_path.as_deref()),
+                false,
+            )),
+        }
+    };
+    let dev_every = dev_log_every.unwrap_or_else(|| dev_log_level.default_every(cfg.generations));
+    let dev_sink: Option<DevSink> = match dev_target {
+        Some((path, explicit)) => {
+            let opened = DevSink::open(&path, dev_log_max_bytes, dev_every, dev_log_level);
+            match opened {
+                Ok(sink) => {
+                    let (backend_name, device) = if cfg.gpu && gpu_probe.available() {
+                        ("gpu", gpu_probe.device.clone())
+                    } else {
+                        ("cpu", None)
+                    };
+                    let info = dev_run_start(
+                        &command,
+                        &data_path,
+                        &prepared,
+                        &cfg,
+                        backend_name,
+                        device,
+                        dev_log_level,
+                        dev_every,
+                        dev_log_max_bytes,
+                        resume_path.clone(),
+                    );
+                    sink.write(&rcsr::devlog::run_start_json(&info), true);
+                    if !quiet {
+                        eprintln!(
+                            "# dev-log: {} ({} level, every {} generation(s), cap {})",
+                            path,
+                            dev_log_level.as_str(),
+                            dev_every,
+                            human_bytes(dev_log_max_bytes)
+                        );
+                    }
+                    cfg.dev_log = Some(sink.callback());
+                    Some(sink)
+                }
+                // An explicit path is a promise: refuse to run without it. The
+                // default path is a convenience, so a read-only or missing
+                // directory must not stop the search.
+                Err(e) if explicit => {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }
-            };
-            let (backend_name, device) = if cfg.gpu && gpu_probe.available() {
-                ("gpu", gpu_probe.device.clone())
-            } else {
-                ("cpu", None)
-            };
-            let info = dev_run_start(
-                &command,
-                &data_path,
-                &prepared,
-                &cfg,
-                backend_name,
-                device,
-                dev_log_every,
-                dev_log_max_bytes,
-                resume_path.clone(),
-            );
-            sink.write(&rcsr::devlog::run_start_json(&info), true);
-            cfg.dev_log = Some(sink.callback());
-            Some(sink)
+                Err(e) => {
+                    if !quiet {
+                        eprintln!(
+                            "warning: {}; continuing without a development log (use --dev-log \
+                             <path> or --no-dev-log to choose)",
+                            e
+                        );
+                    }
+                    None
+                }
+            }
         }
         None => None,
     };
@@ -8231,19 +8350,38 @@ mod tests {
     fn help_and_schema_document_the_development_log() {
         let help = usage();
         let schema = schema::json();
-        for flag in ["--dev-log", "--dev-log-every", "--dev-log-max-bytes"] {
+        for flag in [
+            "--dev-log",
+            "--dev-log-level",
+            "--dev-log-every",
+            "--dev-log-max-bytes",
+            "--no-dev-log",
+        ] {
             assert!(help.contains(flag), "usage() is missing {flag}");
             assert!(schema.contains(flag), "schema::json() is missing {flag}");
         }
         for line in [
             "rcsr dev-report <log.ndjson>",
             "DEVELOPMENT LOG (#211)",
+            "on by default",
+            "rcsr.dev.ndjson",
+            "summary",
+            "full",
             "rcsr-devlog/1",
             "docs/dev-log.md",
         ] {
             assert!(help.contains(line), "usage() is missing '{line}'");
         }
-        for field in ["rcsr-devlog/1", "run_start", "generation", "checkpoint", "run_end", "dev-report"] {
+        for field in [
+            "rcsr-devlog/1",
+            "run_start",
+            "generation",
+            "checkpoint",
+            "run_end",
+            "dev-report",
+            "on (summary level)",
+            "--no-dev-log",
+        ] {
             assert!(schema.contains(field), "schema::json() is missing '{field}'");
         }
         // The analyzer's own usage names both jobs it does.

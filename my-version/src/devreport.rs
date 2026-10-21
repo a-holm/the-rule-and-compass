@@ -176,6 +176,8 @@ pub struct Finding {
 pub struct Analysis {
     pub path: String,
     pub schema: String,
+    /// `summary` or `full`, from `run_start` (or the first generation event).
+    pub level: String,
     pub events: usize,
     pub skipped: usize,
     pub truncated: bool,
@@ -278,9 +280,20 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         }
     }
     a.points.sort_by_key(|p| p.generation);
+    if a.level.is_empty() {
+        for ev in events {
+            if ev.get("event").and_then(|v| v.as_str()) == Some("generation") {
+                if let Some(l) = ev.get("level").and_then(|v| v.as_str()) {
+                    a.level = l.to_string();
+                    break;
+                }
+            }
+        }
+    }
 
     if let Some(s) = start {
         a.command = string_field(s, "command");
+        a.level = string_field(s, "level");
         a.seed = s.get("seed").and_then(|v| v.as_usize()).unwrap_or(0) as u32;
         a.backend = string_field(s, "backend");
         a.device = string_field(s, "device");
@@ -470,7 +483,7 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
             ),
         });
     }
-    if a.offers > 0 {
+    if a.offers > 0 && a.attempts > 0 {
         let adm = a.admissions as f64 / a.offers as f64;
         findings.push(Finding {
             severity: 1.0 - adm,
@@ -577,13 +590,23 @@ pub fn render(a: &Analysis) -> String {
     let mut out = String::new();
     out.push_str("# rcsr development log\n\n");
     out.push_str(&format!(
-        "`{}` — schema `{}`, {} event(s), {} generation(s), {} checkpoint(s)\n\n",
+        "`{}` — schema `{}`, `{}` level, {} event(s), {} of {} generation(s) logged, \
+         {} checkpoint(s)\n\n",
         a.path,
         if a.schema.is_empty() { "(none)" } else { &a.schema },
+        if a.level.is_empty() { "unknown" } else { &a.level },
         a.events,
         a.points.len(),
+        a.generations_requested.max(a.points.len()),
         a.checkpoints
     ));
+    if a.level == "summary" {
+        out.push_str(
+            "> This is a **summary** log: one event every few generations with the \
+             monitoring fields. Per-generation quantiles, variation counters, archive \
+             hypervolume/hash and RNG keys are only in `--dev-log-level full`.\n\n",
+        );
+    }
     if a.skipped > 0 {
         out.push_str(&format!(
             "> {} line(s) were skipped: not complete `{}` events. A killed run's \
@@ -676,11 +699,13 @@ pub fn render(a: &Analysis) -> String {
             median_of(&mut per)
         }
     ));
-    out.push_str(
-        "`search` is the island-thread scope, so the CPU work inside it (`fit_cpu`, \
-         `eval_cpu`) overlaps other islands and is not a phase of its own. The five \
-         windows above are disjoint on the main thread.\n\n",
-    );
+    out.push_str(&format!(
+        "Totals cover the {} logged generation(s). `search` is the island-thread scope, \
+         so the CPU work inside it (`fit_cpu`, `eval_cpu`) overlaps other islands and \
+         is not a phase of its own; the five windows above are disjoint on the main \
+         thread.\n\n",
+        a.points.len()
+    ));
 
     // Fit vs eval.
     let candidate_cpu = a.fit_cpu + a.eval_cpu;
@@ -706,26 +731,39 @@ pub fn render(a: &Analysis) -> String {
             a.gpu_wall_s, a.gpu_batches
         ));
     }
-    out.push_str(&format!(
-        "| constants fitted on the CPU | {} candidate(s) |\n\n",
-        a.fitted
-    ));
-
-    // Variation.
-    out.push_str("## Variation effort\n\n| counter | total |\n|---|---:|\n");
-    out.push_str(&format!("| offspring produced | {} |\n", a.offspring));
-    out.push_str(&format!("| attempts | {} |\n", a.attempts));
-    out.push_str(&format!("| rejected: duplicate | {} |\n", a.duplicates));
-    out.push_str(&format!("| rejected: too complex | {} |\n", a.too_complex));
-    if a.attempts > 0 {
+    if a.level == "full" || a.fitted > 0 {
         out.push_str(&format!(
-            "| dedup rate | {:.1}% |\n",
-            100.0 * a.duplicates as f64 / a.attempts as f64
+            "| constants fitted on the CPU | {} candidate(s) |\n",
+            a.fitted
         ));
     }
-    out.push_str(&format!("| archive offers | {} |\n", a.offers));
-    out.push_str(&format!("| archive admissions | {} |\n", a.admissions));
-    out.push_str(&format!("| exact CPU refits | {} |\n\n", a.refits));
+    out.push('\n');
+
+    // Variation effort exists only in a full log; a summary log does not carry
+    // per-generation variation counters.
+    out.push_str("## Variation effort\n\n");
+    if a.attempts == 0 && a.offers == 0 {
+        out.push_str(
+            "Not recorded at `summary` level: re-run with `--dev-log-level full` for \
+             attempts, duplicates, too-complex rejects, archive offers/admissions and \
+             refits.\n\n",
+        );
+    } else {
+        out.push_str("| counter | total |\n|---|---:|\n");
+        out.push_str(&format!("| offspring produced | {} |\n", a.offspring));
+        out.push_str(&format!("| attempts | {} |\n", a.attempts));
+        out.push_str(&format!("| rejected: duplicate | {} |\n", a.duplicates));
+        out.push_str(&format!("| rejected: too complex | {} |\n", a.too_complex));
+        if a.attempts > 0 {
+            out.push_str(&format!(
+                "| dedup rate | {:.1}% |\n",
+                100.0 * a.duplicates as f64 / a.attempts as f64
+            ));
+        }
+        out.push_str(&format!("| archive offers | {} |\n", a.offers));
+        out.push_str(&format!("| archive admissions | {} |\n", a.admissions));
+        out.push_str(&format!("| exact CPU refits | {} |\n\n", a.refits));
+    }
 
     // Fallbacks.
     out.push_str("## Fallback causes\n\n");
@@ -744,6 +782,11 @@ pub fn render(a: &Analysis) -> String {
                 out.push_str(&format!("| `{}` | {} |\n", cause, count));
             }
             out.push('\n');
+        } else if a.level != "full" {
+            out.push_str(
+                "The per-cause breakdown is only in `--dev-log-level full`; the counts \
+                 above are the summary ledger.\n\n",
+            );
         }
     }
 
@@ -770,10 +813,14 @@ pub fn render(a: &Analysis) -> String {
         "| Pareto size, first / last / max | {} / {} / {} |\n",
         a.pareto_first, a.pareto_last, a.pareto_max
     ));
-    out.push_str(&format!(
-        "| hypervolume (reference 1.0), first / last | {:.6} / {:.6} |\n",
-        a.hv_first, a.hv_last
-    ));
+    if a.hv_first.is_finite() && a.hv_last.is_finite() {
+        out.push_str(&format!(
+            "| hypervolume (reference 1.0), first / last | {:.6} / {:.6} |\n",
+            a.hv_first, a.hv_last
+        ));
+    } else {
+        out.push_str("| hypervolume | only in `--dev-log-level full` |\n");
+    }
     out.push_str(&format!("| final archive hash | `{}` |\n\n", a.final_hash));
     if !a.islands_last.is_empty() {
         out.push_str("| island | best error (last generation) |\n|---:|---:|\n");
@@ -1007,6 +1054,51 @@ mod tests {
         assert!(text.contains("first generation at or above 0.75 converged | 2"));
         assert!(text.contains("## Archive growth"));
         assert!(text.contains("0x0000000000000003"));
+    }
+
+    /// A `summary` log renders the monitoring sections, says what the level
+    /// omits and never prints `NaN` for the fields a summary does not carry.
+    #[test]
+    fn a_summary_log_is_reported_as_such() {
+        let start = run_start_json(&RunStart {
+            version: "0.1.0".into(),
+            level: crate::devlog::Level::Summary,
+            every: 10,
+            seed: 5,
+            ..RunStart::default()
+        });
+        let mut body = format!("{}\n", start);
+        for gen in 1..=3 {
+            let mut rec = GenRecord {
+                generation: gen * 10,
+                total_generations: 30,
+                t: gen as f64,
+                wall_s: 0.5,
+                search_s: 0.4,
+                best_error: 1.0 / gen as f64,
+                median: 2.0,
+                pareto_size: gen + 1,
+                percent_converged: 0.5,
+                ..Default::default()
+            };
+            rec.offers = 0;
+            body.push_str(&rec.json_at(crate::devlog::Level::Summary));
+            body.push('\n');
+        }
+        let (events, skipped) = parse_log(&body);
+        assert_eq!(skipped, 0);
+        let a = analyse("summary.ndjson", &events, skipped);
+        assert_eq!(a.level, "summary");
+        assert_eq!(a.points.len(), 3);
+        let text = render(&a);
+        assert!(text.contains("`summary` level"), "{}", text);
+        assert!(text.contains("Not recorded at `summary` level"), "{}", text);
+        assert!(text.contains("| hypervolume | only in `--dev-log-level full` |"));
+        assert!(text.contains("## Bottleneck ranking"));
+        assert!(!text.contains("NaN"), "{}", text);
+        // A summary log carries no dedup/admission counters, so no finding may
+        // claim them.
+        assert!(!text.contains("structural de-duplication rejected"), "{}", text);
     }
 
     /// A torn trailing line is skipped and the report still renders.
