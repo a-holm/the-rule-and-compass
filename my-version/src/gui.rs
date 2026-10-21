@@ -980,6 +980,13 @@ fn parse_args(args: &[String]) -> Result<(RawOptions, search::Config), String> {
         }
         i += 1;
     }
+    // #223: the batched GPU LM minimises squared error only. The web front end
+    // must refuse another metric's objective, not silently fit it on the CPU.
+    if cfg.fit_strategy == fit::FitStrategy::Gpu {
+        if let Some(why) = fit::gpu_fit_metric_error(cfg.metric) {
+            return Err(why);
+        }
+    }
     Ok((raw, cfg))
 }
 

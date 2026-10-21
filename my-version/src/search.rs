@@ -2035,16 +2035,14 @@ fn select_promoted(
 }
 
 /// #169: true when this generation's offspring are left unfitted for the
-/// batched GPU LM arm. The kernel minimises squared error, so only that metric
-/// qualifies; every other configuration keeps the CPU fit path it had before.
+/// batched GPU LM arm. The kernel minimises squared error, so only the
+/// least-squares family qualifies ([`Metric::is_least_squares`], #223); every
+/// other configuration keeps the CPU fit path it had before.
 fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
     defer_gpu
         && cfg.fit_strategy.defers_to_gpu()
         && cfg.fit_iters > 0
-        && matches!(
-            cfg.metric,
-            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
-        )
+        && cfg.metric.is_least_squares()
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's

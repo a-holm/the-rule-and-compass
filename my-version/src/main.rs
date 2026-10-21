@@ -396,7 +396,10 @@ SEARCH:
                              training rows and every candidate with constants
                              at or above that size, then refits finalists
                              exactly. Without a batch backend it uses the exact
-                             CPU arms (never a no-op)
+                             CPU arms (never a no-op). The kernel minimises
+                             squared error, so `gpu` with a metric outside
+                             squared/aic/aicc/bic is a usage error; use
+                             `--metric squared` or a CPU strategy
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit) at the
                              end of the run (diagnostics only)
@@ -2177,6 +2180,16 @@ fn main() {
             "  --implicit appends the target as an input and searches f(inputs, target) = 0"
         );
         std::process::exit(EXIT_USAGE);
+    }
+    // #223: an explicit `--fit-strategy gpu` asks for the batched GPU LM, which
+    // minimises squared error only. Refuse a metric from another family instead
+    // of silently fitting its constants on the CPU with a different objective.
+    // The check runs before any data is read, so it is a usage error.
+    if fit_strategy_set && cfg.fit_strategy == fit::FitStrategy::Gpu {
+        if let Some(why) = fit::gpu_fit_metric_error(cfg.metric) {
+            eprintln!("error: {}", why);
+            std::process::exit(EXIT_USAGE);
+        }
     }
     // #69: query sampling is an unbiased estimate only for mean-loss metrics.
     // Refuse the flag elsewhere rather than silently reporting a subsample of a

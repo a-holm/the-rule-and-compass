@@ -819,7 +819,15 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
 only for the squared/AIC family, with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The arm also screens before it fits: every unfitted offspring is
+`32p` rows. The family is also a **CLI contract** (#223): an explicit
+`--fit-strategy gpu` with any metric outside `squared`, `aic`, `aicc` and `bic`
+is a usage error (exit code `2`) raised before any data is read, because the
+only alternative would be a silent CPU fit of a different objective. The
+message names the kernel's objective and both fixes (--metric squared, or a
+CPU fit strategy). The device-missing fallback below is unchanged: it never
+claims the GPU arm and is recorded with its cause.
+
+The arm also screens before it fits: every unfitted offspring is
 scored once on the GPU with its seed constants, and the screened ranking decides
 admission. Below **1 048 576 training rows** only the best
 `max(32, pop/4)` candidates of each island are admitted to the fitted LM batch
