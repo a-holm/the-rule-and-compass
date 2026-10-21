@@ -27,7 +27,9 @@ affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
-device and labels every larger or unsupported candidate for the exact CPU arm;
+device — least squares for the squared/AIC family, IRLS for `log_squashed`
+(#229) — and labels every larger or unsupported candidate for the exact CPU
+arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
@@ -884,7 +886,9 @@ affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
-device and labels every larger or unsupported candidate for the exact CPU arm;
+device — least squares for the squared/AIC family, IRLS for `log_squashed`
+(#229) — and labels every larger or unsupported candidate for the exact CPU
+arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
@@ -1003,7 +1007,10 @@ tracked in #236–#238.
 Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
 change the search trajectory. Reported metrics, constants and diagnostics are
 always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. A GPU run also reports a measured `gpu` block (allocation, H2D,
+reproduction. A metric may use the GPU only when the kernel computes its
+objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
+every other metric is scored on the CPU, so no run is ever ranked by a proxy
+loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
 launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See

@@ -797,15 +797,19 @@ useful proxy for the fitted ranking, so every candidate with constants is
 admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
-`too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
-`launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
-applies to the squared/AIC family (the kernel minimises squared error); an
-explicit `gpu` with any other metric is a usage error (exit 2) naming
-`--metric squared` or a CPU strategy (exact, auto, linear, varpro, stream),
-never a silent CPU fit of a different objective (#223). Every finalist is refit
-exactly on all training rows in CPU f64 before it is scored and reported, so
-reported constants and metrics never come from f32. The arm is opt-in and saved
-in checkpoints; `exact` remains the default, bit for bit.
+`too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
+`non_finite`, `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+applies to metrics with a native device objective: the squared/AIC family, and
+`log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
+accumulator, accepted only when the configured loss improves and gated by a
+scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
+An explicit `gpu` with any other metric is a usage error (exit 2) naming
+`--metric squared`, `--metric log_squashed` or a CPU strategy (exact, auto,
+linear, varpro, stream), never a silent CPU fit of a different objective
+(#223). Every finalist is refit exactly on all training rows in CPU f64 *for
+the configured metric* before it is scored and reported, so reported constants
+and metrics never come from f32. The arm is opt-in and saved in checkpoints;
+`exact` remains the default, bit for bit.
 
 #### Subsampled scoring: `--predictor-samples`
 
