@@ -18,9 +18,10 @@ Checkpoints record `backend cpu|gpu` (#140). `--resume` refuses a CPU/GPU
 change with exit code `3` and an error naming both backends; pass
 `--allow-backend-change` to override it deliberately. The override is printed on
 stderr and recorded in `--run-manifest` under `resume.backend_change`. This is
-the fix for the observed incident where `resume_10h.py` omitted `--gpu` and
-silently continued a GPU-selected population on the CPU. Always state `--gpu`
-or `--cpu` explicitly in a launcher, even though CPU is the default.
+the fix for the observed incident where the archived `resume_10h.py` omitted
+`--gpu` and silently continued a GPU-selected population on the CPU. Always
+state `--gpu` or `--cpu` explicitly in a launcher, even though CPU is the
+default.
 
 ## Build and run
 

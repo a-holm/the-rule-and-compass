@@ -104,11 +104,17 @@ Two tracked examples implement the contract:
   prints the resolved commands without searching.
 
 The scratch launchers in the git-ignored `arbeidsmappe/crypto-rcsr/pilot/`
-directory are legacy. They are **not tracked and not supported**: several were
-written before this contract (`hash(label)` seeds, `/dev/null` stderr, plain
-`--json` redirected to a file without a manifest). Do not resume a long run
-with them. Use the tracked launchers above, or port the window list into
-`scripts/launch-windows.py`.
+directory are **retired**. Their classification and the Rust command that
+replaces each one are in
+[`python-pipeline-retirement.md`](python-pipeline-retirement.md); one-off probes
+are archived under `pilot/archive/` and must not be used. In particular, do not
+resume a long run with them (`hash(label)` seeds, `/dev/null` stderr, plain
+`--json` redirected to a file without a manifest). Use the tracked launchers
+above, or the `rcsr walkforward` command directly. The tracked
+`scripts/launch-windows.py` is the one remaining Python helper; it already
+follows the contract (SHA-256 seeds, explicit backend, manifest, atomic JSON,
+progress log) and is scheduled for a shell/Rust replacement as a separate
+follow-up, not as part of the data pipeline.
 
 `my-version/tests/launchers.rs` enforces the contract on every tracked
 `scripts/*.sh`/`*.py`: no `DEVNULL`, no Python `hash(`, an explicit backend, and

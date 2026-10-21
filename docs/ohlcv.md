@@ -129,3 +129,154 @@ same bar algebra without an intermediate CSV.
 The `rcsr prep` CLI (#123) owns raw-archive decoding, the spec file and the
 manifest. The point-in-time panel builder (#145) owns membership, costs and the
 lockbox. Both call these types.
+
+## Incremental enrichment (`rcsr enrich`, issue #200)
+
+`rcsr prep` builds a store from raw archives. `rcsr enrich` is the other half:
+it opens an existing OHLCV store (or a CSV), computes pre-computed feature
+columns and writes a new store whose existing columns are copied **byte for
+byte**. Rows are never rebuilt, re-sorted or re-encoded, and the input file is
+never modified when `--out` names a different path.
+
+```sh
+# Appending is the default: every existing column keeps its position, dtype,
+# dictionary and values. A name that already exists is an error.
+rcsr enrich --data panel_hourly.rcsb --out panel_hourly_rich.rcsb \
+  --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc
+
+# Explicit replacement of one numeric column, keeping its schema position.
+rcsr enrich --data panel_hourly_rich.rcsb --out panel_hourly_rich2.rcsb \
+  --features rsi14 --replace
+
+# Targets use the #125 label semantics (enter at the next open, symmetric cost).
+rcsr enrich --data bars.rcsb --out bars_labelled.rcsb --label fwd:1h,cost=10bp,volnorm=96
+
+# CSV input is loaded once into a temporary store and then follows the same path.
+rcsr enrich --data panel.csv --out panel.rcsb --features ta:core,returns
+```
+
+The report (`<out>.enrich.json`, plus `--json` on stdout) records the input and
+output SHA-256, every per-column hash, each column's nominal warm-up, observed
+`NaN` count and first finite row, the inferred bar spacing, phase timings and
+peak RSS.
+
+### Catalogue
+
+| group | columns | definition |
+|---|---|---|
+| `returns` | `r1` .. `r120` | `ln(close[i]/close[i-k])` when the two bars are exactly `k` steps apart |
+| `ma` | `ma5 ma10 ma20 ma50 ma100 ma200` | `close / trailing mean - 1` |
+| `vol` | `vol5 vol20 vol60 vol120` | population std of the 1-bar log returns |
+| `atr` | `atr14 natr14` | #125 Wilder ATR in price units and percent |
+| `rsi` | `rsi14` | #125 Wilder RSI, 0..100 |
+| `bollinger` | `bb20_z bb20_bw` | z-score and `4*std/mean` |
+| `vz` | `vz96` | z-score of `log1p(volume)` |
+| `range` | `range1` | `(high - low) / close` |
+| `candle` | `clv1 body1 upper_wick1 lower_wick1 open_gap1` | close-location value and #125 geometry |
+| `donchian` | `don20 don96` | close position in the trailing high/low channel, `[0,1]` |
+| `calendar` | `dow_* hour_* month_* dom_*` (sin/cos) | UTC calendar cycles |
+| `lags` | `lag_r1_1` .. `lag_r1_10` | causal copies of `r1`, refused across a gap |
+| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp cross-section, `(rank-1)/(n-1)` |
+| `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by timestamp |
+| `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
+| `all` | every group above except `py15m` | |
+
+`ta:core`, `ta:full`, `exotic:cheap` and `candle:geometry` keep their #125
+meaning and are computed by `rcsr::features`, not copied into this module.
+`cross_ret1`/`cross_beta20` are accepted and use the `--cross-symbol` series.
+
+### Causality, gaps and warm-up
+
+A feature at row `i` reads only bars at or before `i`. A window is valid only
+when every bucket between its first and last bar is present at the inferred
+(or `--bar-seconds`) spacing. A window that spans a listing, delisting,
+migration or outage hole is `NaN`; nothing is forward-filled or bridged.
+Wilder and EMA state restarts after a gap. Warm-up rows are `NaN`; the report
+prints the nominal warm-up, the observed `NaN` count and the first finite row.
+`cargo test --test enrich every_catalogue_column_is_causal_on_a_prefix` checks
+that truncating the store never changes an earlier value.
+
+`xs_rank_*` ranks each timestamp across symbols, ignores non-finite source
+values, breaks ties by symbol name then row order, and returns `NaN` when fewer
+than two values are present. The pass holds one source column, the time column,
+a row permutation and the rank column (about 32 B/row), never the whole panel.
+`rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
+
+### `py15m` parity
+
+`py15m` reproduces the 35 columns added by the Python
+`arbeidsmappe/crypto-rcsr/pilot/enrich_panel_15m.py` step (EMA/MACD, extra RSI
+and Bollinger windows, ATR50, stochastic, ADX/DI, OBV z-score, VWAP deviation,
+Parkinson/Garman-Klass, 96-bar skew/kurt, `r192`, month/day-of-month cycles and
+BTC market joins). The committed fixture
+`my-version/tests/fixtures/enrich/btc_15m_py15m_expected.csv` is 400 rows of the
+pilot's `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
+`btc_15m_ohlcv.csv`; the test compares values within a pre-registered
+`1e-6` absolute-or-relative tolerance. Two deliberate fixes are documented:
+a gap is not bridged, and the first true range is `high - low` instead of
+NumPy's `np.roll` wrap-around that reads the last close.
+
+### Determinism and the cost model
+
+`--chunk-rows` changes only read/compute batching; the arithmetic and output
+order are fixed, so per-column hashes and the store checksum are identical for
+every chunk size (tested). Cross-sectional ties are resolved by symbol and row
+order.
+
+The CPU path is always present. `plan_groups` estimates CPU time and GPU time
+(kernel + two transfers + fixed launch overhead) per family from rows, output
+columns and operation class (elementwise, rolling sum/std, Wilder scan,
+segmented rank, join). A family is dispatched to the GPU only when a device is
+usable, the store has at least one million rows, an exact kernel is registered
+for that class, and the estimated GPU time is *strictly* lower than the CPU
+time. This increment registers no enrichment kernels, so every family records
+`backend=cpu` and the reason in the report; a CUDA build and a CPU-only build
+produce the same bytes. Measured CPU/GPU share on the 3.9M-row store is in the
+PR for #200.
+
+### Measured enrichment (2026-10-21)
+
+Machine: AMD/Intel 8-thread host, 31 GiB RAM, RTX 3060 (12 GiB), ext4 on
+`/mnt/lager`, release build. Source store: `rcsr prep --resample 1h` over the
+82 longest-lived pilot symbols, **3,874,994 rows x 11 columns** (310 MiB); the
+3.9M-row target is met to within 0.6 %. The Python baseline is the real
+`arbeidsmappe/crypto-rcsr/pilot/enrich_panel_15m.py` on the full
+`panel_15m.csv` (2,006,580 rows, 67 columns).
+
+| run | rows | columns added | wall | peak RSS | output |
+|---|---:|---:|---:|---:|---:|
+| Python `enrich_panel_15m.py` | 2,006,580 | 35 | 342 s | 875 MiB | 1.9 GiB CSV |
+| `rcsr enrich --features py15m` | 3,874,994 | 35 | **22.1 s** | **115 MiB** | 1.4 GiB store |
+| `rcsr enrich` full catalogue (no `xs`) | 3,874,994 | 168 | 105.4 s | 256 MiB | 5.2 GiB store |
+| `rcsr enrich --features xs` | 3,874,994 | 3 | 8.3 s | 164 MiB | 399 MiB store |
+
+The `py15m` comparison is per row: Rust processes 176k rows/s against Python's
+5.9k rows/s (**~30x**), with 7.6x lower peak RSS, on a store 1.9x larger. The
+full-catalogue run is 56.5 s of feature arithmetic, 15.8 s of append/copy,
+0.2 s of reads and the rest hashing the 5.2 GiB output. `--features xs` spends
+2.5 s in the cross-sectional pass; its working set is one source column, the
+time column, a row permutation and the rank column (about 32 B/row).
+
+GPU policy on the same 3.875M-row store (`--features returns`, CUDA build):
+the probe found `NVIDIA GeForce RTX 3060 (sm_86, 28 SMs, 11907 MB)`; the cost
+model estimated 5,812 ms CPU vs 1,950 ms GPU (transfer + kernel), but **no exact
+enrichment kernel is registered**, so the run used the CPU: GPU share **0 %**,
+CPU share **100 %**. The report names that reason per family. This is the
+explicit unmet item in the #200 PR; the CPU-only build is byte-identical.
+
+Reproduce (the stores are local, git-ignored data):
+
+```sh
+# 82 symbols, resampled to 1h: 3,874,994 rows x 11 columns
+rcsr prep --input raw15_82 --resample 1h --out hourly_3p875m.rcsb --jobs 8
+
+# the new append-only enrichment
+/usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out py15m.rcsb \
+  --features py15m --json > py15m.json
+/usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out rich.rcsb \
+  --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,btc --json > rich.json
+/usr/bin/time -v rcsr enrich --data hourly_3p875m.rcsb --out xs.rcsb --features xs --json > xs.json
+
+# Python baseline (2,006,580 rows x 35 added columns)
+PANEL_OUT=panel_15m_rich_py.csv /usr/bin/time -v python3 enrich_panel_15m.py
+```
