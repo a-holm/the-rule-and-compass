@@ -167,6 +167,42 @@ fn below_the_gate_auto_keeps_the_owned_tree_path() {
 }
 
 #[test]
+fn front_parents_draw_is_deterministic_on_the_flat_path() {
+    let data = sample(200);
+    let mut on = cfg(VariationMode::Postfix, 1, 4096, 3);
+    on.front_parents = true;
+    let a = run(&on, &data, &data);
+    let b = run(&on, &data, &data);
+    assert_eq!(describe(&a), describe(&b));
+    assert_eq!(a.archive.hash(), b.archive.hash());
+
+    // The flag is live on this path: the archive-guided draw changes the
+    // trajectory rather than being accepted and ignored.
+    let mut off = on.clone();
+    off.front_parents = false;
+    let c = run(&off, &data, &data);
+    assert_ne!(
+        describe(&a),
+        describe(&c),
+        "front feedback must affect the flat trajectory"
+    );
+    assert!(!c.archive.items.is_empty(), "the off run still produces a front");
+}
+
+#[test]
+fn five_thousand_rows_are_a_supported_flat_benchmark_cell() {
+    // The #122 performance target is stated at N >= 5000, but the recorded
+    // 6.7x was measured at 3750 training rows. This pins the larger cell so a
+    // future change cannot silently make it unsupported or unbounded.
+    let data = sample(5000);
+    let c = cfg(VariationMode::Postfix, 1, 4096, 2);
+    let out = run(&c, &data, &data);
+    assert_eq!(out.generations, 2);
+    assert!(!out.archive.items.is_empty(), "the front must be non-empty");
+    assert!(out.archive.items.iter().all(|s| s.complexity <= 12));
+}
+
+#[test]
 fn fitting_runs_stay_on_the_owned_tree_path() {
     let data = sample(120);
     let mut c = cfg(VariationMode::Auto, 1, 4096, 1);

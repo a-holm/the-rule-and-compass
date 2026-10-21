@@ -534,12 +534,39 @@ rcsr ... --variation postfix                   # require the flat path
 
 `auto` requires a GPU, `--fit-iters 0`, `islands × pop >= 4096`, the default
 complexity model, no aggregates/custom blocks/dimension constraints, no
-screening or predictor subsampling and no QD layer. The flat engine draws parents
-from the island tournament only: the archive-guided `--front-parents` draw is
-not ported, so `auto` can produce a different (but deterministic) trajectory. Everything else stays on the
-owned-tree path, including all constant fitting (#116), simplification of
-reported expressions, checkpoints and exact `f64` reporting. A fitting run can
-therefore never be silently approximated by the flat engine.
+screening or predictor subsampling and no QD layer. The flat engine now has
+`--front-parents` parity with the owned-tree loop: at the start of a generation
+it compiles the previous front once into fixed-width postfix programs
+(`postfix::FrontParents`) and takes 15 % of parent draws uniformly from it,
+using the same draw order as `pick_parent` (#76). `--no-front-parents` passes an
+empty pool and `front_p = 0`, consumes no random draw and is bit-identical to
+the pre-#76 flat trajectory. Everything else stays on the owned-tree path,
+including all constant fitting (#116), simplification of reported expressions,
+checkpoints and exact `f64` reporting. A fitting run can therefore never be
+silently approximated by the flat engine.
+
+#### Archive-hash contract (#122)
+
+The hash box has two well-posed readings, and only those are claimed:
+
+1. **Same-path determinism.** For a fixed seed, build and configuration the
+   archive hash repeats exactly: repeated runs, one-island and four-island
+   configurations, and a checkpoint/resume trip all reproduce it
+   (`tests/postfix_loop.rs`).
+2. **Content equivalence on a fixed candidate stream.** The front is reduced by
+   `Archive::canonicalize` to a monotone `(cost, error)` staircase: sort by
+   `(cost, error, structural hash)`, keep the best per cost, keep only strictly
+   improving errors as cost rises, then trim the cap deterministically. The
+   hash is FNV-1a over `(cost bits, error bits, structural hash)` in that order,
+   so a fixed member set hashes the same however it arrived
+   (`pareto::tests::hash_is_content_equivalent_for_a_fixed_candidate_stream`).
+3. **Not equality to the pre-#122 trajectory.** That comparison is ill-posed,
+   not merely unimplemented. The old archive was updated by ε-dominance, which
+   is not transitive, and when over capacity `prune` removed
+   `items[len / 2]`; both depend on insertion order, so there is no canonical
+   old hash. The flat engine also deliberately uses a different counter-based
+   RNG contract. We therefore do not claim that the flat archive equals the
+   historical owned-tree archive for the same seed.
 
 ### The `if` cell and the worker pool (#121)
 
@@ -591,6 +618,36 @@ operators, 10 generations, three interleaved runs each on a busy shared host
 | `--variation node` (historical default pipeline) | 5.71 / 6.82 / 7.20 | 3.54–7.24 | 1.47 |
 | `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
 | `--variation node --pipeline-depth 0` (best tree setting) | 5.01 / 5.15 / 5.28 | 3.19 | 1.94 |
+
+**Re-measured at the stated `N >= 5 000` (2026-10-21).** The 6.7× above used
+3 750 training rows (a 5 000-row file at the default 25 % test fraction), which
+is below the issue's `N >= 5 000` wording. The same host, file and budget with
+`--test-frac 0` (so **N = 5 000**), three interleaved runs each:
+
+```sh
+./target/release/rcsr --data gpu5k.csv --target y --vars x0,x1 \
+  --no-fit --gpu --pop 10000 --islands 1 --generations 10 --seed 1 \
+  --patience 0 --test-frac 0 --variation node|postfix
+```
+
+| Run | wall, s (three runs) | median wall | generations/s |
+|---|---:|---:|---:|
+| `--variation node` (overlap pipeline, the default) | 6.68 / 7.22 / 6.74 | 6.74 | 1.48 |
+| `--variation postfix` | 0.90 / 0.85 / 0.91 | 0.90 | **11.1 (7.5×)** |
+
+Peak RSS was 128.4 MB for the owned-tree run and **113.5 MB** for the flat run;
+the flat value did not grow from one to ten generations (113.68 MB at one
+generation). The 3 750-row and 5 000-row cells agree, so the target is met at
+the stated row count. This is a no-fit screening cell, not production search
+throughput; fitting remains on the owned-tree path (#116).
+
+**Fallback and memory boxes.** At `P = 4 000`, `--variation auto` keeps the
+owned-tree path and reports `node variation (population 4000 is below the
+4096-genome gate)`; forcing `--variation postfix` refuses the run. The arena is
+fixed capacity: 2.56 MB of program words plus 20 B of metadata per slot at
+`P = 10 000`, and `postfix::tests::ten_thousand_slots_have_a_fixed_memory_bound`
+pins that the next generation has exactly the same byte count
+(`tests/postfix_loop.rs` runs the `N = 5 000` cell).
 
 At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
 of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10

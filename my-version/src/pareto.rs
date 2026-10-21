@@ -176,6 +176,23 @@ impl Archive {
     /// FNV-1a over the canonical staircase: cost bits, error bits and the
     /// structural hash of each tree. Two archives with the same members in
     /// canonical order hash identically, independent of insertion order.
+    ///
+    /// # Contract (#122)
+    ///
+    /// * **Same-path determinism.** Two runs with the same seed, build and
+    ///   configuration produce the same hash. This also holds when the same
+    ///   islands are evolved alone or beside others, and across a
+    ///   checkpoint/resume trip (`tests/postfix_loop.rs`).
+    /// * **Content equivalence.** Feed a fixed candidate stream to two
+    ///   archives, canonicalize both, and the hash is a function of the
+    ///   surviving `(cost, error, structural hash)` staircase only. The sort
+    ///   plus one-entry-per-cost rule makes it independent of insertion order.
+    /// * **Not the pre-#122 tree trajectory.** The old owned-tree archive was
+    ///   updated by order-dependent ε-dominance and, once over capacity,
+    ///   `prune` removed `items[len/2]`. Both decisions depend on arrival
+    ///   order, so there is no canonical old hash to compare against. The flat
+    ///   engine also uses a counter-based RNG, so equality with the old
+    ///   trajectory is ill-posed by construction and is not claimed.
     pub fn hash(&self) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
         let mut order: Vec<&Sol> = self.items.iter().collect();
@@ -255,6 +272,46 @@ mod tests {
             assert!(pair[1].cost > pair[0].cost);
             assert!(pair[1].error < pair[0].error);
         }
+    }
+
+    #[test]
+    fn hash_is_content_equivalent_for_a_fixed_candidate_stream() {
+        // A fixed stream: strictly improving error as cost rises, so every
+        // candidate survives on content regardless of arrival order.
+        let stream: Vec<Sol> = (0..12)
+            .map(|k| {
+                let cost = 1.0 + k as f64;
+                sol(cost, 1.0 / cost, cost + 0.5)
+            })
+            .collect();
+        let mut forward = Archive::new(100);
+        for s in stream.iter().cloned() {
+            forward.try_insert(s);
+        }
+        let mut reverse = Archive::new(100);
+        for s in stream.iter().rev().cloned() {
+            reverse.try_insert(s);
+        }
+        forward.canonicalize();
+        reverse.canonicalize();
+        assert_eq!(forward.hash(), reverse.hash(), "hash depends on content");
+        assert_eq!(forward.items.len(), reverse.items.len());
+        for (a, b) in forward.items.iter().zip(&reverse.items) {
+            assert_eq!(a.cost.to_bits(), b.cost.to_bits());
+            assert_eq!(a.error.to_bits(), b.error.to_bits());
+            assert_eq!(
+                crate::expr::structural_hash(&a.tree),
+                crate::expr::structural_hash(&b.tree)
+            );
+        }
+
+        // Membership matters: dropping one candidate changes the hash.
+        let mut fewer = Archive::new(100);
+        for s in stream.iter().take(11).cloned() {
+            fewer.try_insert(s);
+        }
+        fewer.canonicalize();
+        assert_ne!(forward.hash(), fewer.hash());
     }
 
     #[test]
