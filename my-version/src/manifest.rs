@@ -512,6 +512,34 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     state.finalize()
 }
 
+/// Incremental SHA-256 for callers that hash one column group at a time.
+///
+/// `rcsr enrich` uses this to produce per-column digests without materialising
+/// a whole column (or the whole store) in memory.
+pub struct Sha256Hasher {
+    state: Sha256,
+}
+
+impl Default for Sha256Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Sha256Hasher {
+    pub fn new() -> Self {
+        Sha256Hasher {
+            state: Sha256::new(),
+        }
+    }
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.state.update(bytes);
+    }
+    pub fn finalize(self) -> String {
+        self.state.finalize()
+    }
+}
+
 fn jstr(s: &str) -> String {
     let mut o = String::with_capacity(s.len() + 2);
     o.push('"');

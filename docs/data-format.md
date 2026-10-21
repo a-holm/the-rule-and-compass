@@ -404,3 +404,14 @@ row alignment, the CSV-vs-store search front, the guard (exit 3) for both
 search and import, magic detection without the `.rcsb` extension, v2 per-column
 dtypes, 4-byte code blocks, a 100-symbol daily-panel v1-to-v2 migration, and
 the exact ms/us/ns time path.
+
+## Appending columns (`rcsr enrich`, issue #200)
+
+`store::write_store_appending` writes a new store by copying every existing
+value and dictionary-code block verbatim and laying the new `f64` blocks after
+the existing columns in each group. The header is rewritten because offsets
+move, but existing names, order, dtypes, dictionaries and values do not change;
+the input file is untouched. A duplicate name is refused unless `--replace` is
+explicit, in which case the numeric column keeps its schema position and its
+stale dictionary (if any) is dropped. The output is written to a temporary file
+next to `--out` and renamed into place.

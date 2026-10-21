@@ -41,6 +41,7 @@ use crate::column::GroupBuf;
 use crate::data::{Column, DictColumn, Table};
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 /// Eight-byte magic; the trailing NUL makes a truncated file easy to reject.
 pub const MAGIC: &[u8; 8] = b"RCSRBIN\0";
@@ -185,6 +186,32 @@ impl Header {
             .filter(|c| c.has_codes)
             .map(|c| c.levels.as_slice())
     }
+
+    /// Metadata of one column, in header order.
+    pub fn column(&self, col: usize) -> Option<ColumnInfo> {
+        self.columns.get(col).map(|c| ColumnInfo {
+            name: c.name.clone(),
+            numeric: c.numeric,
+            dtype: c.dtype,
+            has_codes: c.has_codes,
+            levels: c.levels.clone(),
+        })
+    }
+
+    /// All column metadata, in header order.
+    pub fn columns(&self) -> Vec<ColumnInfo> {
+        (0..self.columns.len()).filter_map(|c| self.column(c)).collect()
+    }
+}
+
+/// Public, read-only description of one stored column.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub name: String,
+    pub numeric: bool,
+    pub dtype: DType,
+    pub has_codes: bool,
+    pub levels: Vec<String>,
 }
 
 /// A healthy store on disk: header plus an open file handle.
@@ -429,6 +456,55 @@ impl FileStore {
                 }
             })
             .collect())
+    }
+
+    /// Read one group of one numeric column into a fresh `f64` vector.
+    ///
+    /// This is the columnar I/O seam used by `rcsr enrich`: it decodes only the
+    /// column a caller asks for, instead of every column in the group. An
+    /// `i64` time column is converted exactly (its sentinel becomes `NaN`);
+    /// a dictionary-only column has no value block and returns `NaN`s.
+    pub fn read_f64_group(&self, group: usize, col: usize) -> Result<Vec<f64>, String> {
+        let meta = self
+            .header
+            .columns
+            .get(col)
+            .ok_or_else(|| format!("{}: column {} is out of range", self.path, col))?;
+        if group >= self.header.n_groups() {
+            return Err(format!(
+                "{}: group {} is out of range ({} groups)",
+                self.path,
+                group,
+                self.header.n_groups()
+            ));
+        }
+        let len = self.header.group_len(group);
+        let mut out = vec![f64::NAN; len];
+        let mut scratch = Vec::new();
+        match meta.dtype {
+            DType::F64 => read_f64_block(
+                &self.file,
+                &self.path,
+                self.data_start + meta.offsets[group],
+                &mut out,
+                &mut scratch,
+            )?,
+            DType::I64 => {
+                let mut ints = vec![0i64; len];
+                read_i64_block(
+                    &self.file,
+                    &self.path,
+                    self.data_start + meta.offsets[group],
+                    &mut ints,
+                    &mut scratch,
+                )?;
+                for (dst, v) in out.iter_mut().zip(ints) {
+                    *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
+                }
+            }
+            DType::U32 => {}
+        }
+        Ok(out)
     }
 
     /// Load the whole store into the resident column-major image. This is the
@@ -865,6 +941,207 @@ pub fn write_store_with_time(
 fn group_len(n_rows: usize, group_rows: usize, group: usize) -> usize {
     let lo = group.saturating_mul(group_rows);
     (n_rows.saturating_sub(lo)).min(group_rows)
+}
+
+/// One pre-computed column to append to an existing store.
+///
+/// `file` is a raw little-endian `f64` column in row order (one value per row,
+/// no header), normally produced group-by-group by `rcsr enrich`. Keeping the
+/// values in a temporary column file is what lets the writer hold one group in
+/// memory instead of all new columns.
+#[derive(Clone, Debug)]
+pub struct AppendColumn {
+    pub name: String,
+    pub file: PathBuf,
+    /// Replace an existing `f64` column of the same name in place. Without
+    /// this, a duplicate name is an error and existing columns are preserved.
+    pub replace: bool,
+}
+
+/// Write `source` to `path` with `extras` appended, copying the existing
+/// value/code blocks verbatim.
+///
+/// This is the append-only enrichment writer. It does **not** decode and
+/// re-encode existing rows: every untouched column keeps its exact bytes,
+/// dtype, dictionary, levels and position. Only the header offsets change
+/// because new columns are laid out after the existing ones in each group.
+///
+/// A `replace` extra keeps the existing column's position (and therefore its
+/// place in the schema) but writes new `f64` values. Replacing a time,
+/// dictionary, text or non-numeric column is refused: those carry meaning that
+/// a feature column cannot reproduce.
+pub fn write_store_appending(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+) -> Result<(), String> {
+    if extras.is_empty() {
+        return Err("append needs at least one column".to_string());
+    }
+    if source.path == path {
+        return Err(format!(
+            "{}: refusing to append in place; write to a different path and rename",
+            path
+        ));
+    }
+    if source.header.version != VERSION {
+        return Err(format!(
+            "{}: appending needs a version-{} store (this one is version {}); \
+             re-run `rcsr import` to rewrite it",
+            source.path, VERSION, source.header.version
+        ));
+    }
+    let n_rows = source.header.n_rows;
+    let group_rows = source.header.group_rows;
+    let n_groups = source.header.n_groups();
+
+    let mut seen = std::collections::BTreeSet::new();
+    for e in extras {
+        if e.name.is_empty() {
+            return Err("append column has an empty name".to_string());
+        }
+        if !seen.insert(e.name.clone()) {
+            return Err(format!("feature '{}' appears twice", e.name));
+        }
+        let len = std::fs::metadata(&e.file)
+            .map_err(|err| format!("{}: {}", e.file.display(), err))?
+            .len();
+        let want = (n_rows as u64).saturating_mul(8);
+        if len != want {
+            return Err(format!(
+                "{}: temporary column for '{}' has {} bytes, expected {} ({} rows x 8)",
+                e.file.display(),
+                e.name,
+                len,
+                want,
+                n_rows
+            ));
+        }
+    }
+
+    let mut columns = source.header.columns.clone();
+    // `extra_of[output column] = Some(index into extras)`.
+    let mut extra_of: Vec<Option<usize>> = vec![None; columns.len()];
+    for (ei, e) in extras.iter().enumerate() {
+        if let Some(ci) = source.header.column_index(&e.name) {
+            if !e.replace {
+                return Err(format!(
+                    "column '{}' already exists (use --replace to overwrite it)",
+                    e.name
+                ));
+            }
+            let c = &mut columns[ci];
+            if c.dtype != DType::F64 || !c.numeric {
+                return Err(format!(
+                    "column '{}' is {} and cannot be replaced by a numeric feature",
+                    e.name,
+                    if c.has_codes { "a dictionary column" } else { c.dtype.name() }
+                ));
+            }
+            // A numeric column may carry a low-cardinality dictionary; the
+            // replacement feature has no levels, so drop the stale codes.
+            c.has_codes = false;
+            c.levels.clear();
+            extra_of[ci] = Some(ei);
+        } else {
+            columns.push(ColumnMeta {
+                name: e.name.clone(),
+                numeric: true,
+                dtype: DType::F64,
+                levels: Vec::new(),
+                has_codes: false,
+                offsets: Vec::with_capacity(n_groups),
+                code_offsets: Vec::with_capacity(n_groups),
+            });
+            extra_of.push(Some(ei));
+        }
+    }
+
+    // Recompute offsets for the new schema. Existing widths are unchanged, so
+    // the copy loop below can hand the source block to the file untouched.
+    // The cloned source metadata already carries the old offsets; clear them
+    // before the group-major layout pass appends the new ones.
+    for col in &mut columns {
+        col.offsets.clear();
+        col.code_offsets.clear();
+    }
+    let mut cursor = 0u64;
+    for g in 0..n_groups {
+        let len = group_len(n_rows, group_rows, g) as u64;
+        for col in &mut columns {
+            col.offsets.push(cursor);
+            cursor = cursor.saturating_add(len * col_value_width(col.dtype));
+            if col.has_codes {
+                col.code_offsets.push(cursor);
+                cursor = cursor.saturating_add(len * 4);
+            }
+        }
+    }
+    let header = Header {
+        version: VERSION,
+        n_rows,
+        n_cols: columns.len(),
+        group_rows,
+        columns,
+    };
+    let json = header_json(&header);
+    if json.len() > u32::MAX as usize {
+        return Err("column store header is too large".to_string());
+    }
+
+    let extras_files: Vec<File> = extras
+        .iter()
+        .map(|e| File::open(&e.file).map_err(|err| format!("{}: {}", e.file.display(), err)))
+        .collect::<Result<_, _>>()?;
+
+    let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    file.write_all(MAGIC)
+        .and_then(|_| file.write_all(&VERSION.to_le_bytes()))
+        .and_then(|_| file.write_all(&(json.len() as u32).to_le_bytes()))
+        .and_then(|_| file.write_all(json.as_bytes()))
+        .map_err(|e| format!("{}: {}", path, e))?;
+
+    let mut buf: Vec<u8> = Vec::new();
+    for g in 0..n_groups {
+        let lo = g * group_rows;
+        let len = group_len(n_rows, group_rows, g);
+        for (ci, col) in header.columns.iter().enumerate() {
+            if let Some(ei) = extra_of[ci] {
+                let bytes = len * 8;
+                buf.resize(bytes, 0);
+                read_exact_at(&extras_files[ei], &mut buf, (lo as u64) * 8).map_err(|e| {
+                    format!("{}: reading appended column '{}': {}", path, col.name, e)
+                })?;
+                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+                continue;
+            }
+            let src = &source.header.columns[ci];
+            let bytes = len as u64 * source.header.value_width(ci);
+            if bytes > 0 {
+                buf.resize(bytes as usize, 0);
+                read_exact_at(
+                    &source.file,
+                    &mut buf,
+                    source.data_start + src.offsets[g],
+                )
+                .map_err(|e| format!("{}: copying column '{}': {}", path, src.name, e))?;
+                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+            }
+            if src.has_codes {
+                let bytes = len * 4;
+                buf.resize(bytes, 0);
+                read_exact_at(
+                    &source.file,
+                    &mut buf,
+                    source.data_start + src.code_offsets[g],
+                )
+                .map_err(|e| format!("{}: copying codes for '{}': {}", path, src.name, e))?;
+                file.write_all(&buf).map_err(|e| format!("{}: {}", path, e))?;
+            }
+        }
+    }
+    file.flush().map_err(|e| format!("{}: {}", path, e))?;
+    Ok(())
 }
 
 /// v2 value-block width. A pure dictionary column stores no values.

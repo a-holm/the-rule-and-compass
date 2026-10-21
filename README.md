@@ -343,6 +343,16 @@ atomically instead of streaming it. See
   `ta:core`/`ta:full`/`exotic:cheap`/`candle:geometry`/`cross:btc` features and
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
+* **Incremental feature enrichment**: `rcsr enrich --data old.rcsb --out
+  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc`
+  appends pre-computed columns without rebuilding rows: existing value/code
+  blocks are copied byte for byte, dtypes and dictionaries survive, a duplicate
+  name needs an explicit `--replace`, and every change is chunk-size stable.
+  Windows are causal and gap-aware, warm-up is reported per column, and the
+  `py15m` group reproduces the 35 Python enrichment columns on a committed
+  parity fixture. The CPU path is always available; a per-family cost model
+  decides CPU vs GPU and records the reason. See
+  [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
   trade, never forward-fills across a listing/delisting/migration, verifies
@@ -445,9 +455,13 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--report-repeats N]
 ```
 
-Subcommands (`rcsr import`, `rcsr walkforward`, `rcsr verify-manifest`) carry
-their own option lists in `rcsr schema` under `import`, `walkforward` and
-`verify-manifest`; the block above is the root search command.
+Subcommands (`rcsr import`, `rcsr prep`, `rcsr enrich`, `rcsr panel`, `rcsr
+walkforward`, `rcsr verify-manifest`) carry their own option lists in `rcsr
+schema`; the block above is the root search command. The former Python pipeline
+is classified and retired in
+[`docs/python-pipeline-retirement.md`](docs/python-pipeline-retirement.md):
+the documented path is these Rust commands plus a thin `curl` acquisition
+recipe.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)

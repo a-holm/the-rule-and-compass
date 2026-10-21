@@ -94,6 +94,7 @@ USAGE:
   rcsr --data <file|-> --target <col>[,<col>...] [options]
   rcsr import <input.csv> [<store.rcsb>] [--group-rows N] [--time <col>]
   rcsr prep --input <file|dir> --out <store.rcsb> [options]
+  rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
@@ -1098,6 +1099,10 @@ fn main() {
     // #123: stream raw klines/CSV archives straight to a column store.
     if args.first().map(|s| s.as_str()) == Some("prep") {
         rcsr::prep::run(&args[1..]);
+    }
+    // #200: append pre-computed features to an existing OHLCV store.
+    if args.first().map(|s| s.as_str()) == Some("enrich") {
+        rcsr::enrich::run(&args[1..]);
     }
     // #145: point-in-time membership and the rebuilt panel.
     if args.first().map(|s| s.as_str()) == Some("panel") {
