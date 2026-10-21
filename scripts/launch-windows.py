@@ -58,6 +58,7 @@ def build_command(args, label: str, start: int, end: int, out_dir: str):
     manifest = os.path.join(out_dir, f"{label}.manifest.json")
     result = os.path.join(out_dir, f"{label}.result.json")
     log = os.path.join(out_dir, f"{label}.stderr.log")
+    dev_log = os.path.join(out_dir, f"{label}.dev.ndjson")
     command_file = os.path.join(out_dir, f"{label}.command.txt")
     resolved_seed = stable_seed(label, args.seed)
 
@@ -77,6 +78,10 @@ def build_command(args, label: str, start: int, end: int, out_dir: str):
         "--run-manifest", manifest,
         "--json-out", result,
         "--progress",
+        # #211: the engine's development log, one file per window (the default
+        # rcsr.dev.ndjson next to --json-out would be shared by every window).
+        "--dev-log", dev_log,
+        "--dev-log-level", "summary",
         "--gpu" if args.backend == "gpu" else "--cpu",
     ]
     if args.time_budget:
@@ -85,7 +90,7 @@ def build_command(args, label: str, start: int, end: int, out_dir: str):
         cmd += ["--resume", checkpoint]
     if args.allow_backend_change:
         cmd += ["--allow-backend-change"]
-    return cmd, checkpoint, manifest, result, log, command_file, resolved_seed
+    return cmd, checkpoint, manifest, result, log, dev_log, command_file, resolved_seed
 
 
 def main(argv=None):
@@ -132,7 +137,7 @@ def main(argv=None):
     os.makedirs(args.out_dir, exist_ok=True)
     failed = []
     for label, start, end in args.window:
-        cmd, ck, manifest, result, log, command_file, seed = build_command(
+        cmd, ck, manifest, result, log, dev_log, command_file, seed = build_command(
             args, label, start, end, args.out_dir
         )
         line = "# resolved_seed={} label={} backend={}\n{}".format(

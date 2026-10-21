@@ -11,6 +11,11 @@ my-version/target/
 *.swp
 *~
 
+# The engine's development log is on by default (#211); a run in the working
+# directory (including `cargo test`) writes this file.
+rcsr.dev.ndjson
+**.dev.ndjson
+
 # Python benchmark bytecode
 __pycache__/
 *.pyc

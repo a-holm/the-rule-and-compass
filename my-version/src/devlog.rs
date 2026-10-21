@@ -61,6 +61,61 @@ pub const VERSION: u32 = 1;
 /// `--generations 1000000` run cannot fill a disk.
 pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The file name used when the log path is not given: written next to
+/// `--json-out`/`--save`, else in the working directory.
+pub const DEFAULT_FILE_NAME: &str = "rcsr.dev.ndjson";
+
+/// #211: how much detail a `generation` event carries.
+///
+/// The log is on by default at [`Level::Summary`]: a concise record about every
+/// 10–25 generations that is enough to watch a long run (error, front size,
+/// phase times, fit/GPU/fallback counts, GPU duty) and cheap enough to leave on.
+/// [`Level::Full`] writes every generation with the complete record — quantiles,
+/// archive hash/hypervolume, variation counters, RNG key, per-island best — for
+/// after-the-fact analysis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Level {
+    #[default]
+    Summary,
+    Full,
+}
+
+impl Level {
+    pub fn parse(s: &str) -> Option<Level> {
+        match s {
+            "summary" => Some(Level::Summary),
+            "full" => Some(Level::Full),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Level::Summary => "summary",
+            Level::Full => "full",
+        }
+    }
+
+    /// The generation cadence for a run of `generations`.
+    ///
+    /// `full` writes every generation. `summary` writes one event every
+    /// `clamp(generations / 10, 10, 25)` generations — so a run produces roughly
+    /// 10–40 events however long it is — and every generation when the budget is
+    /// 10 or fewer, so a short run still has a trajectory.
+    pub fn default_every(self, generations: usize) -> usize {
+        match self {
+            Level::Full => 1,
+            Level::Summary => {
+                if generations <= 10 {
+                    1
+                } else {
+                    (generations / 10).clamp(10, 25)
+                }
+            }
+        }
+    }
+}
+
 /// Events larger than this are reported by the writer's `oversize` counter.
 /// One event is normally 400–900 bytes.
 pub const MAX_EVENT_BYTES: usize = 8 * 1024;
@@ -416,11 +471,62 @@ impl GenRecord {
         }
     }
 
+    /// The complete NDJSON line (without the trailing newline), at `level`.
+    pub fn json_at(&self, level: Level) -> String {
+        match level {
+            Level::Full => self.json(),
+            Level::Summary => self.json_summary(),
+        }
+    }
+
+    /// The concise `summary` event: what a monitor needs to follow a long run.
+    ///
+    /// It deliberately omits the population quantiles beyond the median, the
+    /// archive hash/hypervolume, the variation counters, the per-island best
+    /// list and the RNG key — those exist only in a `full` log.
+    pub fn json_summary(&self) -> String {
+        format!(
+            "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"summary\",\
+             \"generation\":{},\"total\":{},\"t\":{},\"wall\":{},\
+             \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\
+             \"fit_cpu\":{},\"eval_cpu\":{}}},\
+             \"error\":{{\"best\":{},\"median\":{}}},\
+             \"archive\":{{\"size\":{}}},\
+             \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
+             \"gpu\":{},\"fallback\":{{\"seconds\":{},\"workers\":{}}},\
+             \"convergence\":{{\"percent_converged\":{}}}}}",
+            SCHEMA,
+            VERSION,
+            self.generation,
+            self.total_generations,
+            num(self.t),
+            num(self.wall_s),
+            num(self.prep_s),
+            num(self.search_s),
+            num(self.eval_s),
+            num(self.select_s),
+            num(self.archive_s),
+            num(self.fit_cpu_s),
+            num(self.eval_cpu_s),
+            num(self.best_error),
+            num(self.median),
+            self.pareto_size,
+            self.fit.attempts,
+            self.fit.gpu,
+            self.fit.fallback,
+            self.gpu.as_ref().map(|g| g.json()).unwrap_or_else(|| "null".to_string()),
+            num(self.fallback_s),
+            self.fallback_workers,
+            num(self.percent_converged)
+        )
+    }
+
     /// The complete NDJSON line (without the trailing newline).
     pub fn json(&self) -> String {
         let islands: Vec<String> = self.island_best.iter().map(|v| num(*v)).collect();
         format!(
-            "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"generation\":{},\"total\":{},\
+            "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"full\",\
+             \"generation\":{},\"total\":{},\
              \"t\":{},\"wall\":{},\
              \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\
              \"fit_cpu\":{},\"eval_cpu\":{}}},\
@@ -506,7 +612,9 @@ pub struct RunStart {
     pub host: String,
     pub arch: String,
     pub start_utc: String,
-    /// `--dev-log-every`.
+    /// `--dev-log-level`.
+    pub level: Level,
+    /// The resolved generation cadence.
     pub every: usize,
     /// `--dev-log-max-bytes`, `0` for no cap.
     pub max_bytes: u64,
@@ -538,7 +646,7 @@ pub fn run_start_json(r: &RunStart) -> String {
          \"config_hash\":{},\"config\":{},\
          \"seed\":{},\"backend\":{},\"device\":{},\"threads\":{},\
          \"host\":{{\"os\":{},\"arch\":{}}},\
-         \"start\":{},\"every\":{},\"max_bytes\":{},\"resumed_from\":{}}}",
+         \"start\":{},\"level\":{},\"every\":{},\"max_bytes\":{},\"resumed_from\":{}}}",
         SCHEMA,
         VERSION,
         text(&r.command),
@@ -564,6 +672,7 @@ pub fn run_start_json(r: &RunStart) -> String {
         text(&r.host),
         text(&r.arch),
         text(&r.start_utc),
+        text(r.level.as_str()),
         r.every,
         r.max_bytes,
         r.resumed_from.as_ref().map(|p| text(p)).unwrap_or_else(|| "null".into())
@@ -1005,6 +1114,52 @@ mod tests {
         );
     }
 
+    /// The summary level is a strict subset: it keeps what a monitor needs and
+    /// drops the per-generation detail a full log adds.
+    #[test]
+    fn the_summary_event_keeps_the_monitoring_fields_only() {
+        let r = rec();
+        let line = r.json_at(Level::Summary);
+        let j = Json::parse(&line).expect("the summary line parses");
+        assert_eq!(j.get("level").and_then(|v| v.as_str()), Some("summary"));
+        for key in ["generation", "t", "wall", "phases", "error", "archive", "fit", "gpu", "fallback", "convergence"] {
+            assert!(j.get(key).is_some(), "summary has no '{}'", key);
+        }
+        assert_eq!(j.get("error").and_then(|e| e.get("best")).and_then(|v| v.as_f64()), Some(0.5));
+        assert_eq!(j.get("error").and_then(|e| e.get("median")).and_then(|v| v.as_f64()), Some(0.8));
+        assert_eq!(j.get("archive").and_then(|a| a.get("size")).and_then(|v| v.as_usize()), Some(4));
+        assert_eq!(j.get("fit").and_then(|f| f.get("fallback")).and_then(|v| v.as_usize()), Some(2));
+        assert_eq!(j.get("gpu").and_then(|g| g.get("duty")).and_then(|v| v.as_f64()), Some(0.2));
+        for key in ["variation", "islands", "rng"] {
+            assert!(j.get(key).is_none(), "summary must not carry '{}'", key);
+        }
+        let archive = j.get("archive").unwrap();
+        assert!(archive.get("hash").is_none() && archive.get("hypervolume").is_none());
+        // The full line of the same record keeps them.
+        let full = Json::parse(&r.json()).unwrap();
+        assert_eq!(full.get("level").and_then(|v| v.as_str()), Some("full"));
+        assert!(full.get("variation").is_some() && full.get("islands").is_some());
+        assert!(line.len() < r.json().len(), "summary must be smaller than full");
+    }
+
+    /// The default cadence keeps a long run to a bounded number of events.
+    #[test]
+    fn the_level_cadence_is_bounded() {
+        assert_eq!(Level::Full.default_every(5000), 1);
+        assert_eq!(Level::Summary.default_every(1), 1);
+        assert_eq!(Level::Summary.default_every(10), 1);
+        assert_eq!(Level::Summary.default_every(40), 10);
+        assert_eq!(Level::Summary.default_every(200), 20);
+        assert_eq!(Level::Summary.default_every(10_000), 25);
+        // A 10-hour run at 100 000 generations still writes a few thousand
+        // events, not one hundred thousand.
+        assert!(100_000 / Level::Summary.default_every(100_000) <= 4_000);
+        assert_eq!(Level::parse("summary"), Some(Level::Summary));
+        assert_eq!(Level::parse("full"), Some(Level::Full));
+        assert_eq!(Level::parse("Full"), None);
+        assert_eq!(Level::default(), Level::Summary);
+    }
+
     /// A trailing partial line (what a killed process can leave) is rejected by
     /// the parser, so the reader's valid-prefix rule is testable.
     #[test]
@@ -1118,17 +1273,26 @@ mod tests {
             log.append(&line, false);
         }
         let n = 2000;
-        let t = std::time::Instant::now();
-        for _ in 0..n {
-            line = record.json();
-            log.append(&line, false);
-        }
-        let per_event_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+        let mut cost = |level: Level| -> (f64, usize) {
+            let t = std::time::Instant::now();
+            let mut out = String::new();
+            for _ in 0..n {
+                out = record.json_at(level);
+                log.append(&out, false);
+            }
+            (t.elapsed().as_secs_f64() * 1e6 / n as f64, out.len())
+        };
+        let (summary_us, summary_bytes) = cost(Level::Summary);
+        let (per_event_us, full_bytes) = cost(Level::Full);
         println!(
-            "# dev-log cost: {:.2} us/event, {} bytes/event",
-            per_event_us,
-            line.len()
+            "# dev-log cost: summary {:.2} us/event ({} bytes), full {:.2} us/event ({} bytes)",
+            summary_us, summary_bytes, per_event_us, full_bytes
         );
+        assert!(
+            summary_us <= per_event_us,
+            "the summary record must not cost more than the full one"
+        );
+        line = record.json();
         assert!(
             per_event_us < 5000.0,
             "one event took {:.0} us; the log would not be free",
@@ -1155,6 +1319,7 @@ mod tests {
         });
         assert!(start.starts_with(&format!("{{\"schema\":\"{}\"", SCHEMA)));
         let parsed = Json::parse(&start).unwrap();
+        assert_eq!(parsed.get("level").and_then(|v| v.as_str()), Some("summary"));
         assert_eq!(
             parsed.get("config").and_then(|c| c.get("seed")).and_then(|v| v.as_f64()),
             Some(3.0)

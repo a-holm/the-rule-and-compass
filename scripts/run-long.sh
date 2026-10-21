@@ -69,6 +69,7 @@ CHECKPOINT="$OUT_DIR/$LABEL.rcsr"
 MANIFEST="$OUT_DIR/$LABEL.manifest.json"
 RESULT="$OUT_DIR/$LABEL.result.json"
 LOG="$OUT_DIR/$LABEL.stderr.log"
+DEV_LOG="$OUT_DIR/$LABEL.dev.ndjson"
 CMD="$OUT_DIR/$LABEL.command.txt"
 
 ARGS=(
@@ -76,6 +77,9 @@ ARGS=(
     --seed "$RESOLVED_SEED" --generations "$GENERATIONS"
     --save "$CHECKPOINT" --run-manifest "$MANIFEST"
     --json-out "$RESULT" --progress
+    # #211: the engine's development log, one file per label (the default,
+    # rcsr.dev.ndjson next to --json-out, would be shared by every window).
+    --dev-log "$DEV_LOG" --dev-log-level summary
     "$BACKEND"
 )
 if [ "$RESUME" = "1" ]; then
@@ -96,3 +100,4 @@ if ! rcsr "${ARGS[@]}" 2> >(tee "$LOG" >&2); then
 fi
 echo "# result: $RESULT"
 echo "# manifest: $MANIFEST (verify with: rcsr verify-manifest $MANIFEST)"
+echo "# dev-log: $DEV_LOG (summarise with: rcsr dev-report $DEV_LOG)"

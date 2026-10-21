@@ -1,16 +1,18 @@
-//! #211: the optional engine-level development log.
+//! #211: the engine-level development log.
 //!
-//! These tests drive the real binary. They pin the three properties the issue
-//! demands before anything else:
+//! The log is **on by default** at `summary` level — it is the in-engine
+//! replacement for the old external run monitor — and `--no-dev-log` turns it
+//! off. These tests drive the real binary and pin the properties the issue
+//! demands:
 //!
-//! * the log is **off** unless `--dev-log` is given;
-//! * logging on and off produces **identical** archive, results and
+//! * the default is a summary log at `rcsr.dev.ndjson` in the expected place,
+//!   and `--no-dev-log` writes nothing;
+//! * logging at either level produces **identical** archive, results and
 //!   configuration hash (the log is a reading, not a search input);
 //! * the file is **bounded** and a killed run leaves a **valid prefix** that
-//!   `rcsr dev-report` still reads.
-//!
-//! Everything else — the event fields, `--dev-log-every`, the checkpoint event
-//! and the analyzer's summary — is exercised on a run of the same fixtures.
+//!   `rcsr dev-report` still reads;
+//! * `summary` stays concise and `full` carries the complete record, both
+//!   readable by the analyzer.
 
 use rcsr::devlog::Json;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,9 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The baseline command: small, deterministic, `--cpu` so the pin does not
 /// depend on whether the build has CUDA or a device.
+///
+/// It carries `--no-dev-log` because the log is now on by default and most
+/// tests below are not about it; the tests that are pass their own flags.
 fn base_args(data: &str) -> Vec<String> {
     [
         "--data",
@@ -48,6 +53,7 @@ fn base_args(data: &str) -> Vec<String> {
         "8",
         "--cpu",
         "--quiet",
+        "--no-dev-log",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -56,6 +62,15 @@ fn base_args(data: &str) -> Vec<String> {
 
 fn run(args: &[String]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(args)
+        .output()
+        .expect("run rcsr")
+}
+
+/// Run with `dir` as the working directory, so a default log lands there.
+fn run_in(dir: &Path, args: &[String]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .current_dir(dir)
         .args(args)
         .output()
         .expect("run rcsr")
@@ -80,16 +95,84 @@ fn f(j: &Json, key: &str) -> Option<f64> {
     j.get(key).and_then(|v| v.as_f64())
 }
 
-/// The log is off by default: the flag is what creates the file, and no other
-/// flag implies it.
+fn field(j: &Json, key: &str) -> String {
+    j.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn generation_numbers(events: &[Json]) -> Vec<usize> {
+    events_of(events, "generation")
+        .iter()
+        .map(|g| g.get("generation").and_then(|v| v.as_usize()).unwrap())
+        .collect()
+}
+
+/// The log is on by default: a plain run writes `rcsr.dev.ndjson` in the
+/// working directory at `summary` level, with a bounded number of events.
 #[test]
-fn the_log_is_off_unless_dev_log_is_given() {
+fn the_log_is_on_by_default_at_summary_level() {
+    let dir = scratch("default");
+    let data = fixture();
+    let args: Vec<String> = base_args(&data)
+        .into_iter()
+        .filter(|a| a != "--no-dev-log")
+        .collect();
+    let out = run_in(&dir, &args);
+    assert!(
+        out.status.success(),
+        "rcsr failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = dir.join("rcsr.dev.ndjson");
+    assert!(path.exists(), "the default log was not written in the cwd");
+
+    let events = parse_events(&path);
+    assert_eq!(
+        events.first().unwrap().get("event").and_then(|v| v.as_str()),
+        Some("run_start")
+    );
+    assert_eq!(
+        events.last().unwrap().get("event").and_then(|v| v.as_str()),
+        Some("run_end")
+    );
+    let start = events_of(&events, "run_start")[0];
+    assert_eq!(field(start, "level"), "summary", "summary is the default level");
+    // 8 generations <= 10, so the summary cadence is one event per generation.
+    assert_eq!(f(start, "every"), Some(1.0));
+    assert_eq!(generation_numbers(&events), (1..=8).collect::<Vec<_>>());
+
+    // Every generation event is a *summary* record: the monitoring fields are
+    // present and the full-only fields are not.
+    for g in events_of(&events, "generation") {
+        assert_eq!(field(g, "level"), "summary");
+        for key in ["generation", "t", "wall", "phases", "error", "archive", "fit", "gpu", "fallback", "convergence"] {
+            assert!(g.get(key).is_some(), "summary event has no '{}'", key);
+        }
+        assert!(f(g.get("error").unwrap(), "best").is_some());
+        assert!(f(g.get("error").unwrap(), "median").is_some());
+        assert!(g.get("archive").unwrap().get("size").is_some());
+        for key in ["variation", "islands", "rng"] {
+            assert!(
+                g.get(key).is_none(),
+                "summary must not carry the full-only field '{}'",
+                key
+            );
+        }
+        assert!(
+            g.get("archive").unwrap().get("hash").is_none(),
+            "summary must not carry the archive hash"
+        );
+    }
+}
+
+/// `--no-dev-log` writes nothing at all.
+#[test]
+fn no_dev_log_writes_nothing() {
     let dir = scratch("off");
     let data = fixture();
     let mut args = base_args(&data);
     args.push("--out".into());
     args.push(dir.join("front.tsv").to_string_lossy().into_owned());
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(
         out.status.success(),
         "rcsr failed: {}",
@@ -102,17 +185,104 @@ fn the_log_is_off_unless_dev_log_is_given() {
     assert_eq!(created, vec!["front.tsv".to_string()], "nothing else was written");
 }
 
-/// The core guarantee: with the log on, the front, the JSON result and the
-/// canonical configuration hash are byte-identical to the same run with it off.
-///
-/// Only wall-clock timings may differ, so they are removed before comparing.
+/// The default path follows the result artifacts: next to `--json-out`, else
+/// next to `--save`, else the working directory.
+#[test]
+fn the_default_path_follows_json_out_then_save() {
+    let dir = scratch("path");
+    let data = fixture();
+    let results = dir.join("results");
+    std::fs::create_dir_all(&results).unwrap();
+
+    // `--json-out` wins.
+    let args: Vec<String> = base_args(&data)
+        .into_iter()
+        .filter(|a| a != "--no-dev-log")
+        .chain([
+            "--json-out".to_string(),
+            results.join("out.json").to_string_lossy().into_owned(),
+            "--save".to_string(),
+            results.join("state.ckpt").to_string_lossy().into_owned(),
+            "--save-every".to_string(),
+            "4".to_string(),
+        ])
+        .collect();
+    let out = run_in(&dir, &args);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        results.join("rcsr.dev.ndjson").exists(),
+        "the log must sit next to --json-out"
+    );
+    assert!(!dir.join("rcsr.dev.ndjson").exists());
+    let events = parse_events(&results.join("rcsr.dev.ndjson"));
+    assert!(
+        !events_of(&events, "checkpoint").is_empty(),
+        "checkpoint events are written at both levels"
+    );
+
+    // `--save` alone is enough.
+    std::fs::remove_file(results.join("rcsr.dev.ndjson")).unwrap();
+    let other = dir.join("state");
+    std::fs::create_dir_all(&other).unwrap();
+    let args: Vec<String> = base_args(&data)
+        .into_iter()
+        .filter(|a| a != "--no-dev-log")
+        .chain([
+            "--save".to_string(),
+            other.join("s.ckpt").to_string_lossy().into_owned(),
+        ])
+        .collect();
+    let out = run_in(&dir, &args);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        other.join("rcsr.dev.ndjson").exists(),
+        "the log must sit next to --save"
+    );
+}
+
+/// A summary log keeps the cadence small: `clamp(generations/10, 10, 25)`.
+#[test]
+fn the_summary_cadence_is_bounded() {
+    let dir = scratch("cadence");
+    let data = fixture();
+    let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--generations".into());
+    args.push("200".into());
+    // The cadence is a property of the budget, so the run must not stop early.
+    args.push("--patience".into());
+    args.push("0".into());
+    args.push("--pop".into());
+    args.push("8".into());
+    args.push("--dev-log".into());
+    args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
+    let out = run_in(&dir, &args);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let events = parse_events(&dir.join("run.ndjson"));
+    let start = events_of(&events, "run_start")[0];
+    assert_eq!(f(start, "every"), Some(20.0), "200/10 = 20");
+    let numbers = generation_numbers(&events);
+    assert_eq!(numbers, (1..=10).map(|i| i * 20).collect::<Vec<_>>());
+}
+
+/// The core guarantee: with the log on — at either level — the front, the JSON
+/// result and the canonical configuration hash are byte-identical to the same
+/// run with it off. Only wall-clock timings may differ, so they are removed
+/// before comparing.
 #[test]
 fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
     let dir = scratch("identical");
     let data = fixture();
     let mut outputs = Vec::new();
-    for (name, log) in [("off", false), ("on", true)] {
+    let arms: [(&str, Vec<String>); 3] = [
+        ("off", vec!["--no-dev-log".to_string()]),
+        ("summary", vec![]),
+        ("full", vec!["--dev-log-level".to_string(), "full".to_string()]),
+    ];
+    for (name, extra) in arms {
         let mut args = base_args(&data);
+        args.retain(|a| a != "--no-dev-log");
+        args.extend(extra);
         args.push("--out".into());
         args.push(dir.join(format!("{}.tsv", name)).to_string_lossy().into_owned());
         args.push("--json-out".into());
@@ -123,11 +293,12 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
                 .to_string_lossy()
                 .into_owned(),
         );
-        if log {
+        // An explicit path keeps the logged arms inside this test's directory.
+        if name != "off" {
             args.push("--dev-log".into());
-            args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
+            args.push(dir.join(format!("{}.ndjson", name)).to_string_lossy().into_owned());
         }
-        let out = run(&args);
+        let out = run_in(&dir, &args);
         assert!(
             out.status.success(),
             "rcsr failed: {}",
@@ -136,12 +307,8 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
         let tsv = std::fs::read(dir.join(format!("{}.tsv", name))).unwrap();
         let json = std::fs::read_to_string(dir.join(format!("{}.json", name))).unwrap();
         let manifest = std::fs::read_to_string(dir.join(format!("{}.manifest", name))).unwrap();
-        outputs.push((tsv, json, manifest));
+        outputs.push((name.to_string(), tsv, json, manifest));
     }
-    let (off_tsv, off_json, off_manifest) = &outputs[0];
-    let (on_tsv, on_json, on_manifest) = &outputs[1];
-    assert_eq!(off_tsv, on_tsv, "the logged run changed the reported front");
-
     // `elapsed_seconds` and every `*_seconds` in `timing` are wall clock; the
     // rest of the JSON document must be identical.
     let strip = |text: &str| -> Vec<String> {
@@ -156,14 +323,6 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
             .map(|(k, v)| format!("{:?}", (k, v)))
             .collect()
     };
-    assert_eq!(
-        strip(off_json),
-        strip(on_json),
-        "the logged run changed the JSON result"
-    );
-
-    // The canonical configuration hash is the trajectory identity (#140); the
-    // manifest records it (with the canonical text) on the `"config"` line.
     let config_of = |manifest: &str| -> String {
         manifest
             .lines()
@@ -171,30 +330,45 @@ fn logging_on_or_off_leaves_the_archive_results_and_config_hash_identical() {
             .expect("a config line in the manifest")
             .to_string()
     };
-    assert_eq!(config_of(off_manifest), config_of(on_manifest));
-    assert!(
-        config_of(off_manifest).contains("\"hash\":"),
-        "the manifest records the canonical config hash"
-    );
-
-    // And the log really exists and describes the same run.
-    let events = parse_events(&dir.join("run.ndjson"));
-    assert_eq!(events_of(&events, "generation").len(), 8);
+    let (off_name, off_tsv, off_json, off_manifest) = &outputs[0];
+    assert_eq!(off_name, "off");
+    for (name, tsv, json, manifest) in &outputs[1..] {
+        assert_eq!(off_tsv, tsv, "the {} run changed the reported front", name);
+        assert_eq!(strip(off_json), strip(json), "the {} run changed the JSON result", name);
+        assert_eq!(
+            config_of(off_manifest),
+            config_of(manifest),
+            "the {} run changed the configuration hash",
+            name
+        );
+    }
+    assert!(config_of(off_manifest).contains("\"hash\":"));
+    // The two logged arms really are a summary and a full log.
+    let summary = parse_events(&dir.join("summary.ndjson"));
+    let full = parse_events(&dir.join("full.ndjson"));
+    assert_eq!(field(events_of(&summary, "run_start")[0], "level"), "summary");
+    assert_eq!(field(events_of(&full, "run_start")[0], "level"), "full");
+    assert!(events_of(&summary, "generation")[0].get("variation").is_none());
+    assert!(events_of(&full, "generation")[0].get("variation").is_some());
 }
 
-/// Every documented event and field is present, with the documented types.
+/// Every documented event and field of a `full` log is present, with the
+/// documented types.
 #[test]
-fn the_log_emits_the_documented_events_and_fields() {
+fn the_full_log_emits_the_documented_events_and_fields() {
     let dir = scratch("fields");
     let data = fixture();
     let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--dev-log-level".into());
+    args.push("full".into());
     args.push("--dev-log".into());
     args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
     args.push("--save".into());
     args.push(dir.join("state.ckpt").to_string_lossy().into_owned());
     args.push("--save-every".into());
     args.push("4".into());
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(
         out.status.success(),
         "rcsr failed: {}",
@@ -235,17 +409,19 @@ fn the_log_emits_the_documented_events_and_fields() {
         "threads",
         "host",
         "start",
+        "level",
         "every",
         "max_bytes",
     ] {
         assert!(start.get(key).is_some(), "run_start has no '{}'", key);
     }
+    assert_eq!(field(start, "level"), "full");
     let config = start.get("config").expect("config object");
     assert_eq!(f(config, "pop"), Some(40.0), "the resolved config is recorded");
     assert_eq!(f(config, "seed"), Some(3.0));
 
     let gens = events_of(&events, "generation");
-    assert_eq!(gens.len(), 8);
+    assert_eq!(gens.len(), 8, "full writes every generation");
     let g = gens[3];
     for key in [
         "generation",
@@ -266,6 +442,7 @@ fn the_log_emits_the_documented_events_and_fields() {
     ] {
         assert!(g.get(key).is_some(), "generation has no '{}'", key);
     }
+    assert_eq!(field(g, "level"), "full");
     let phases = g.get("phases").unwrap();
     for key in ["prep", "search", "eval", "select", "archive", "fit_cpu", "eval_cpu"] {
         assert!(f(phases, key).is_some(), "phases has no '{}'", key);
@@ -314,12 +491,7 @@ fn the_log_emits_the_documented_events_and_fields() {
         2,
         "one entry per island"
     );
-    // The generation counter is 1-based and monotonic.
-    let numbers: Vec<usize> = gens
-        .iter()
-        .map(|g| g.get("generation").and_then(|v| v.as_usize()).unwrap())
-        .collect();
-    assert_eq!(numbers, (1..=8).collect::<Vec<_>>());
+    assert_eq!(generation_numbers(&events), (1..=8).collect::<Vec<_>>());
 
     let cps = events_of(&events, "checkpoint");
     assert!(
@@ -344,24 +516,26 @@ fn the_log_emits_the_documented_events_and_fields() {
     );
 }
 
-/// `--dev-log-every N` keeps every Nth generation and nothing else.
+/// `--dev-log-every N` overrides the level's cadence and keeps every Nth
+/// generation and nothing else.
 #[test]
-fn dev_log_every_throttles_generation_events() {
+fn dev_log_every_overrides_the_cadence_at_both_levels() {
     let dir = scratch("every");
     let data = fixture();
-    let mut args = base_args(&data);
-    args.push("--dev-log".into());
-    args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
-    args.push("--dev-log-every".into());
-    args.push("3".into());
-    let out = run(&args);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let events = parse_events(&dir.join("run.ndjson"));
-    let numbers: Vec<usize> = events_of(&events, "generation")
-        .iter()
-        .map(|g| g.get("generation").and_then(|v| v.as_usize()).unwrap())
-        .collect();
-    assert_eq!(numbers, vec![3, 6]);
+    for level in ["summary", "full"] {
+        let mut args = base_args(&data);
+        args.retain(|a| a != "--no-dev-log");
+        args.push("--dev-log".into());
+        args.push(dir.join(format!("{}.ndjson", level)).to_string_lossy().into_owned());
+        args.push("--dev-log-level".into());
+        args.push(level.into());
+        args.push("--dev-log-every".into());
+        args.push("3".into());
+        let out = run_in(&dir, &args);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let events = parse_events(&dir.join(format!("{}.ndjson", level)));
+        assert_eq!(generation_numbers(&events), vec![3, 6], "level {}", level);
+    }
 }
 
 /// The byte cap bounds the generation stream, and `run_end` is always written.
@@ -370,11 +544,14 @@ fn the_byte_cap_bounds_the_file_and_the_end_event_always_lands() {
     let dir = scratch("cap");
     let data = fixture();
     let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--dev-log-level".into());
+    args.push("full".into());
     args.push("--dev-log".into());
     args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
     args.push("--dev-log-max-bytes".into());
     args.push("4KiB".into());
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     let path = dir.join("run.ndjson");
@@ -410,9 +587,12 @@ fn a_killed_run_leaves_a_valid_prefix_that_dev_report_reads() {
     let dir = scratch("killed");
     let data = fixture();
     let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--dev-log-level".into());
+    args.push("full".into());
     args.push("--dev-log".into());
     args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     let path = dir.join("run.ndjson");
@@ -446,9 +626,12 @@ fn dev_report_summarises_the_run_and_ranks_bottlenecks() {
     let dir = scratch("report");
     let data = fixture();
     let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--dev-log-level".into());
+    args.push("full".into());
     args.push("--dev-log".into());
     args.push(dir.join("run.ndjson").to_string_lossy().into_owned());
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 
     let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
@@ -493,10 +676,42 @@ fn dev_report_summarises_the_run_and_ranks_bottlenecks() {
     assert!(text.contains("| seed | 3 |"), "{}", text);
     assert!(text.contains("| backend | cpu |"), "{}", text);
     assert!(
-        text.contains("| generations | 8 of 8 requested |"),
-        "{}",
+        text.contains("| dedup rate |"),
+        "a full log carries the variation counters"
+    );
+}
+
+/// The analyzer reads the default (summary) log too, says what the level left
+/// out, and still ranks the bottlenecks.
+#[test]
+fn dev_report_reads_a_summary_log_and_names_what_it_omits() {
+    let dir = scratch("report-summary");
+    let data = fixture();
+    let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--generations".into());
+    args.push("40".into());
+    let out = run_in(&dir, &args);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let log = dir.join("rcsr.dev.ndjson");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(["dev-report", log.to_str().unwrap()])
+        .output()
+        .expect("run dev-report");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(text.contains("`summary` level"), "{}", text);
+    assert!(text.contains("This is a **summary** log"), "{}", text);
+    assert!(
+        text.contains("Not recorded at `summary` level"),
+        "the report must name what the level omits: {}",
         text
     );
+    assert!(text.contains("only in `--dev-log-level full`"));
+    assert!(text.contains("## Bottleneck ranking"));
+    assert!(text.contains("| seed | 3 |"));
+    assert!(!text.contains("NaN"), "no NaN in a report: {}", text);
 }
 
 /// No raw rows: the log records counts, hashes and error statistics, never an
@@ -528,10 +743,12 @@ fn the_log_contains_no_raw_data_rows() {
         "30".into(),
         "--cpu".into(),
         "--quiet".into(),
+        "--dev-log-level".into(),
+        "full".into(),
         "--dev-log".into(),
         dir.join("run.ndjson").to_string_lossy().into_owned(),
     ];
-    let out = run(&args);
+    let out = run_in(&dir, &args);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let body = std::fs::read_to_string(dir.join("run.ndjson")).unwrap();
     for needle in ["1234.5678", "98765.4321", "a,b,y"] {
@@ -551,51 +768,27 @@ fn the_log_contains_no_raw_data_rows() {
 }
 
 /// The log never touches stdout: a `--json` result stays one JSON object and an
-/// `--ndjson` stream never carries a `rcsr-devlog` line, with or without the
-/// flag. (The log's own events go only to the `--dev-log` path.)
+/// `--ndjson` stream never carries a `rcsr-devlog` line.
 #[test]
 fn the_log_is_independent_of_the_result_streams() {
     let dir = scratch("streams");
     let data = fixture();
     for format in ["--json", "--ndjson"] {
-        let mut plain = base_args(&data);
-        plain.push(format.into());
-        let with = {
-            let mut a = plain.clone();
-            a.push("--dev-log".into());
-            a.push(dir.join("s.ndjson").to_string_lossy().into_owned());
-            a
-        };
-        let a = run(&plain);
-        let b = run(&with);
-        assert!(a.status.success() && b.status.success());
-        let sa = String::from_utf8_lossy(&a.stdout).into_owned();
+        let mut args = base_args(&data);
+        args.retain(|a| a != "--no-dev-log");
+        args.push(format.into());
+        let b = run_in(&dir, &args);
+        assert!(b.status.success());
         let sb = String::from_utf8_lossy(&b.stdout).into_owned();
         assert!(
-            !sa.contains("rcsr-devlog") && !sb.contains("rcsr-devlog"),
+            !sb.contains("rcsr-devlog"),
             "the development log leaked onto stdout"
         );
         if format == "--json" {
-            // A single JSON object, and the same object either way up to the
-            // wall-clock fields.
-            let ja = Json::parse(&sa).expect("--json prints one object");
-            let jb = Json::parse(&sb).expect("--json still prints one object");
-            assert_eq!(
-                match (ja, jb) {
-                    (Json::Obj(mut x), Json::Obj(mut y)) => {
-                        x.retain(|(k, _)| k != "elapsed_seconds" && k != "timing" && k != "baselines");
-                        y.retain(|(k, _)| k != "elapsed_seconds" && k != "timing" && k != "baselines");
-                        x == y
-                    }
-                    _ => false,
-                },
-                true,
-                "the log changed the JSON stdout stream"
-            );
+            Json::parse(&sb).expect("--json still prints one object");
         }
-        // The log file itself has the events.
-        let events = parse_events(&dir.join("s.ndjson"));
-        assert!(!events_of(&events, "generation").is_empty());
+        // The default log file is written in the working directory.
+        assert!(dir.join("rcsr.dev.ndjson").exists());
     }
 }
 
@@ -603,7 +796,10 @@ fn the_log_is_independent_of_the_result_streams() {
 #[test]
 fn dev_log_flag_misuse_is_a_usage_error() {
     let data = fixture();
+    // `--no-dev-log` contradicts every flag that configures the log.
     for extra in [
+        vec!["--dev-log", "/tmp/x.ndjson"],
+        vec!["--dev-log-level", "full"],
         vec!["--dev-log-every", "2"],
         vec!["--dev-log-max-bytes", "1MiB"],
     ] {
@@ -612,8 +808,17 @@ fn dev_log_flag_misuse_is_a_usage_error() {
         let out = run(&args);
         assert_eq!(out.status.code(), Some(2), "expected a usage error for {:?}", extra);
     }
+    // An unknown level is refused.
+    let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
+    args.push("--dev-log-level".into());
+    args.push("verbose".into());
+    let out = run(&args);
+    assert_eq!(out.status.code(), Some(2));
+
     // Logging an --eval-expr run is refused: there is no search to log.
     let mut args = base_args(&data);
+    args.retain(|a| a != "--no-dev-log");
     args.push("--eval-expr".into());
     args.push("x".into());
     args.push("--dev-log".into());
