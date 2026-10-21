@@ -902,10 +902,8 @@ fn find_time_col(names: &[String], explicit: Option<&str>) -> Option<usize> {
 /// occupy one contiguous run of rows; a symbol that reappears after another is
 /// refused, because the per-symbol feature state cannot be carried back.
 fn segments(store: &FileStore, time_col: usize, symbol_col: Option<usize>) -> Result<(Vec<Segment>, i64), String> {
-    let group_rows = store.group_rows();
     let mut segs: Vec<Segment> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut sym_keys: BTreeMap<String, u32> = BTreeMap::new();
     let mut step_hist: BTreeMap<i64, usize> = BTreeMap::new();
     let mut prev_time: Option<i64> = None;
     let mut prev_sym: Option<usize> = None;
@@ -958,16 +956,14 @@ fn segments(store: &FileStore, time_col: usize, symbol_col: Option<usize>) -> Re
                     ));
                 }
                 seen.insert(sym.clone());
-                let next_key = sym_keys.len() as u32;
-                let key = *sym_keys.entry(sym.clone()).or_insert(next_key);
                 let start = segs.iter().map(|s| s.len).sum::<usize>();
                 segs.push(Segment {
                     symbol: sym.clone(),
-                    key,
+                    key: 0,
                     start,
                     len: 0,
                 });
-                current = Some((sym, key));
+                current = Some((sym, 0));
             }
             if let Some(seg) = segs.last_mut() {
                 seg.len += 1;
@@ -990,7 +986,16 @@ fn segments(store: &FileStore, time_col: usize, symbol_col: Option<usize>) -> Re
         .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
         .map(|(d, _)| d)
         .unwrap_or(0);
-    let _ = group_rows;
+    // Ties in a cross-section break by symbol name, then row order, so assign
+    // each symbol its lexical rank rather than its first-appearance order.
+    let mut names: Vec<String> = segs.iter().map(|s| s.symbol.clone()).collect();
+    names.sort();
+    for seg in &mut segs {
+        seg.key = names
+            .binary_search(&seg.symbol)
+            .map(|k| k as u32)
+            .unwrap_or(0);
+    }
     Ok((segs, step))
 }
 
@@ -2045,6 +2050,9 @@ fn compute_series(
         )?;
         for c in computed {
             if let Some(t) = cols.get_mut(&c.name) {
+                // #125 reports the exact warm-up for its own names; use it
+                // rather than this module's nominal table.
+                t.warmup = c.warmup;
                 t.write_values(&c.values)?;
             }
         }
@@ -2160,7 +2168,15 @@ fn compute_own(
             "beta_btc_60" | "cross_beta20" => {
                 let w = if name == "cross_beta20" { 20 } else { 60 };
                 if s.symbol == ctx.cross.symbol {
-                    vec![1.0; n]
+                    (0..n)
+                        .map(|i| {
+                            if i + 1 >= w && contig(&s.times, i, w, s.step) {
+                                1.0
+                            } else {
+                                f64::NAN
+                            }
+                        })
+                        .collect()
                 } else {
                     beta_window(s, &b.ret1, &ctx.cross.r1, w)
                 }
@@ -2688,7 +2704,7 @@ fn enrich_inner(
             let _ = std::fs::remove_file(&e.file);
         }
         let mut report = Report {
-            input: input_path,
+            input: opts.data.clone(),
             output: out.to_string(),
             input_sha256: input_sha,
             output_sha256: String::new(),
@@ -2730,7 +2746,7 @@ fn enrich_inner(
     let columns_out = FileStore::open(out)?.n_cols();
     let backend = if plans.iter().any(|p| p.backend == "gpu") { "gpu" } else { "cpu" };
     Ok(Report {
-        input: input_path,
+        input: opts.data.clone(),
         output: out.to_string(),
         input_sha256: input_sha,
         output_sha256: output_sha,
