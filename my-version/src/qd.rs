@@ -24,6 +24,7 @@
 use crate::data::Sample;
 use crate::expr::{self, Node, Op};
 use crate::rng::Mt;
+use std::collections::HashMap;
 
 /// A point in the two-dimensional descriptor space, each coordinate in `[0, 1]`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -132,7 +133,23 @@ pub struct QdArchive {
     /// Bounded deterministic sample used by the CVT Lloyd updates.
     observed: Vec<Descriptor>,
     records: usize,
+    /// Number of input columns, used to derive the *reachable* usage lattice.
+    /// Usage is `distinct inputs / nvars`, so only `nvars + 1` values occur.
+    nvars: usize,
+    /// Descriptors already known for a structural hash, tagged with the sample
+    /// they were computed on. Population descriptors arrive through
+    /// [`QdArchive::record_with_descriptors`]; this cache keeps the archive from
+    /// re-evaluating a tree it has already classified (for example a Pareto
+    /// member that was a population member last generation). It is cleared when
+    /// the sample changes and bounded so a long run stays O(1).
+    known: HashMap<u64, Descriptor>,
+    /// Fingerprint of the sample `known` entries were computed on.
+    known_tag: u64,
 }
+
+/// Keep the descriptor cache bounded; a long run must not retain one entry per
+/// candidate it has ever seen.
+const KNOWN_CACHE_CAP: usize = 65_536;
 
 /// The per-run coverage summary reported by the CLI and `--json`.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,16 +158,42 @@ pub struct QdReport {
     pub bins: usize,
     pub cells: usize,
     pub occupied: usize,
+    /// `occupied / cells`. *Diagnostic only*: `cells` is a designer choice
+    /// (and CVT centroids move), so this fraction is not comparable across
+    /// arms. Use [`QdReport::reachable_coverage`] for a denominator the
+    /// descriptor can actually reach.
     pub coverage: f64,
+    /// Cells whose Voronoi region intersects an attainable usage value.
+    ///
+    /// Usage is `distinct inputs / nvars`, so only `nvars + 1` values occur.
+    /// A cell that cannot be nearest to any reachable descriptor can never be
+    /// occupied, and counting it in the denominator charges the search for a
+    /// region the descriptor simply cannot express.
+    pub reachable: usize,
+    /// Occupied cells that are also reachable.
+    pub occupied_reachable: usize,
+    /// `occupied_reachable / reachable`; the honest coverage fraction.
+    pub reachable_coverage: f64,
     pub entries: usize,
     pub best_error: f64,
     pub cell_cap: usize,
     /// Dominated area of the archive's `(cost, error)` points, normalized by
-    /// the observed cost and error range. Reported, not optimized directly.
+    /// the observed cost and error range. Self-normalised, therefore **not
+    /// comparable between runs**; kept as a diagnostic only.
     pub hypervolume: f64,
+    /// Shannon entropy (bits) of the candidate-visit distribution over the
+    /// reachable cells. Zero means every offer landed in one cell.
+    pub occupancy_entropy: f64,
+    /// `occupancy_entropy / log2(reachable)` in `[0, 1]`.
+    pub occupancy_entropy_normalized: f64,
+    /// Quality pairing: `Σ 1 / (1 + best_error)` over occupied reachable
+    /// cells. Coverage without quality is trivially maximised by a random map,
+    /// so coverage is always reported next to this sum.
+    pub qd_score: f64,
     /// Total candidates offered to the archive.
     pub evaluations: usize,
 }
+
 
 /// Below this many observed descriptors a CVT update has nothing to learn from.
 const CVT_UPDATE_MIN: usize = 32;
@@ -168,6 +211,36 @@ fn halton(mut i: usize, base: usize) -> f64 {
         i /= base;
     }
     r
+}
+
+/// Cheap identity of the rows a descriptor was computed on.
+///
+/// The archive caches descriptors by structural hash; using one computed on a
+/// different row subset would silently mislabel a candidate. The tag folds the
+/// row count and the target values (plus the first and last row), so a new
+/// `--predictor-samples` draw or screening subset invalidates the cache without
+/// an expensive per-candidate comparison.
+fn sample_tag(s: &Sample) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut mix = |x: u64| {
+        h ^= x;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    };
+    mix(s.x.len() as u64);
+    for y in &s.y {
+        mix(y.to_bits());
+    }
+    if let Some(first) = s.x.first() {
+        for v in first {
+            mix(v.to_bits());
+        }
+    }
+    if let Some(last) = s.x.last() {
+        for v in last {
+            mix(v.to_bits());
+        }
+    }
+    h
 }
 
 fn nearest_in(centroids: &[Descriptor], d: Descriptor) -> usize {
@@ -197,6 +270,9 @@ impl QdArchive {
             visits: vec![0; bins * bins],
             observed: Vec::new(),
             records: 0,
+            nvars: 2,
+            known: HashMap::new(),
+            known_tag: 0,
         }
     }
 
@@ -220,6 +296,9 @@ impl QdArchive {
             visits: vec![0; cells],
             observed: Vec::new(),
             records: 0,
+            nvars: 2,
+            known: HashMap::new(),
+            known_tag: 0,
         }
     }
 
@@ -236,7 +315,17 @@ impl QdArchive {
             visits: vec![0; cells],
             observed: Vec::new(),
             records: 0,
+            nvars: 2,
+            known: HashMap::new(),
+            known_tag: 0,
         }
+    }
+
+    /// Declare the number of input columns so [`QdReport::reachable`] can use
+    /// the actual usage lattice instead of the naive `K`.
+    pub fn with_nvars(mut self, nvars: usize) -> Self {
+        self.nvars = nvars;
+        self
     }
 
     pub fn bins(&self) -> usize {
@@ -284,13 +373,26 @@ impl QdArchive {
     }
 
     /// Insert one evaluated candidate. Returns whether the archive changed.
+    ///
+    /// A descriptor already known for this structural hash *on the same sample*
+    /// is reused, so a tree the search has classified is never evaluated a
+    /// second time here.
     pub fn insert(&mut self, tree: &Node, error: f64, cost: f64, sample: &Sample) -> bool {
-        let d = descriptor(tree, sample);
+        let tag = sample_tag(sample);
+        if tag != self.known_tag {
+            self.known.clear();
+            self.known_tag = tag;
+        }
+        let d = match self.known.get(&expr::structural_hash(tree)) {
+            Some(d) => *d,
+            None => descriptor(tree, sample),
+        };
+        self.remember(tree, d);
         self.insert_descriptor(tree, error, cost, d)
     }
 
     /// Insert a candidate whose descriptor is already known. The search uses
-    /// this after promotion so it does not evaluate the tree twice.
+    /// this after scoring so it does not evaluate the tree twice.
     pub fn insert_descriptor(
         &mut self,
         tree: &Node,
@@ -323,11 +425,42 @@ impl QdArchive {
         )
     }
 
+    /// Bound and store a descriptor under its structural hash.
+    fn remember(&mut self, tree: &Node, d: Descriptor) {
+        if self.known.len() >= KNOWN_CACHE_CAP {
+            // Deterministic bounded cache: dropping it only costs a future
+            // re-evaluation, never a different archive.
+            self.known.clear();
+        }
+        self.known.insert(expr::structural_hash(tree), d);
+    }
+
     /// Record every individual on the current populations plus the global
     /// archive. Kept deterministic: the caller passes them in a fixed order.
     pub fn record(&mut self, trees: impl IntoIterator<Item = (Node, f64, f64)>, sample: &Sample) {
-        for (tree, error, cost) in trees {
-            self.insert(&tree, error, cost, sample);
+        self.record_with_descriptors(trees.into_iter().map(|(t, e, c)| (t, e, c, None)), sample);
+    }
+
+    /// #120: record candidates while carrying the descriptor that the scoring
+    /// pass already accumulated. `None` falls back to a known descriptor for
+    /// the same sample or, last resort, one evaluation — the path used for
+    /// candidates scored on a GPU or on a row subset.
+    pub fn record_with_descriptors(
+        &mut self,
+        trees: impl IntoIterator<Item = (Node, f64, f64, Option<Descriptor>)>,
+        sample: &Sample,
+    ) {
+        let tag = sample_tag(sample);
+        if tag != self.known_tag {
+            self.known.clear();
+            self.known_tag = tag;
+        }
+        for (tree, error, cost, d) in trees {
+            let d = d
+                .or_else(|| self.known.get(&expr::structural_hash(&tree)).copied())
+                .unwrap_or_else(|| descriptor(&tree, sample));
+            self.remember(&tree, d);
+            self.insert_descriptor(&tree, error, cost, d);
         }
         self.maybe_recenter();
     }
@@ -397,14 +530,124 @@ impl QdArchive {
         }
     }
 
+    /// The attainable usage values. Usage is `used / nvars`, so only
+    /// `nvars + 1` points occur regardless of how many candidates are scored.
+    fn usage_levels(&self) -> Vec<f64> {
+        if self.nvars == 0 {
+            return vec![0.0];
+        }
+        (0..=self.nvars)
+            .map(|k| k as f64 / self.nvars as f64)
+            .collect()
+    }
+
+    /// Mark every cell that can be nearest to at least one *attainable*
+    /// descriptor: usage on the lattice above and skew anywhere in `[0, 1]`.
+    ///
+    /// For a CVT this is exact geometry, not a heuristic. On the vertical line
+    /// `usage = u`, "centroid i is at least as near as centroid j" is linear in
+    /// `skew`, so intersecting those half-lines over every `j` gives the
+    /// interval of skew where `i` wins. A cell is reachable when that interval
+    /// is non-empty for at least one usage level. Ties are treated as
+    /// reachable (a point on a Voronoi boundary is counted for both cells);
+    /// that can only over-count by a measure-zero boundary and never invents a
+    /// region the descriptor cannot approach.
+    fn reachable_mask(&self) -> Vec<bool> {
+        let mut reach = vec![false; self.cells.len()];
+        match self.mode {
+            QdMode::Random => {
+                // The control hashes arbitrary descriptors, so every cell is
+                // reachable *by construction*. Its coverage is reported but is
+                // not a behavioural measurement.
+                reach.fill(true);
+            }
+            QdMode::Grid => {
+                let b = self.bins;
+                let mut usage_bins = vec![false; b];
+                for u in self.usage_levels() {
+                    let ix = (u.clamp(0.0, 1.0) * b as f64).floor() as usize;
+                    usage_bins[ix.min(b - 1)] = true;
+                }
+                // Skew is continuous on [0, 1], so every skew bin is reachable
+                // once its usage row is.
+                for (u, row) in usage_bins.iter().enumerate() {
+                    if *row {
+                        for s in 0..b {
+                            reach[u * b + s] = true;
+                        }
+                    }
+                }
+            }
+            QdMode::Cvt => {
+                let k = self.centroids.len();
+                let mut done = vec![false; k];
+                for u in self.usage_levels() {
+                    for i in 0..k {
+                        if done[i] {
+                            continue;
+                        }
+                        let ci = self.centroids[i];
+                        let mut lo = 0.0f64;
+                        let mut hi = 1.0f64;
+                        let mut feasible = true;
+                        for (j, cj) in self.centroids.iter().enumerate() {
+                            if j == i {
+                                continue;
+                            }
+                            // d_i(s)^2 - d_j(s)^2 <= 0
+                            // = (u-ci.u)^2 - (u-cj.u)^2 + ci.s^2 - cj.s^2
+                            //   + 2(cj.s - ci.s) s
+                            let a = (u - ci.usage).powi(2) - (u - cj.usage).powi(2)
+                                + ci.skew * ci.skew
+                                - cj.skew * cj.skew;
+                            let p = 2.0 * (cj.skew - ci.skew);
+                            let eps = 1e-12;
+                            if p.abs() <= eps {
+                                if a > eps {
+                                    feasible = false;
+                                    break;
+                                }
+                            } else if p > 0.0 {
+                                hi = hi.min(-a / p);
+                            } else {
+                                lo = lo.max(-a / p);
+                            }
+                            if lo > hi + 1e-9 {
+                                feasible = false;
+                                break;
+                            }
+                        }
+                        if feasible && lo <= hi + 1e-9 && hi >= 0.0 && lo <= 1.0 {
+                            done[i] = true;
+                            reach[i] = true;
+                        }
+                    }
+                }
+            }
+        }
+        reach
+    }
+
     pub fn report(&self) -> QdReport {
+        let reach = self.reachable_mask();
+        let reachable = reach.iter().filter(|&&r| r).count();
         let mut occupied = 0;
+        let mut occupied_reachable = 0;
         let mut entries = 0;
         let mut best = f64::INFINITY;
         let mut points: Vec<(f64, f64)> = Vec::new();
-        for cell in &self.cells {
+        let mut qd_score = 0.0;
+        for (ix, cell) in self.cells.iter().enumerate() {
             if !cell.entries.is_empty() {
                 occupied += 1;
+                if reach[ix] {
+                    occupied_reachable += 1;
+                    if let Some(e) = cell.best() {
+                        if e.error.is_finite() {
+                            qd_score += 1.0 / (1.0 + e.error.max(0.0));
+                        }
+                    }
+                }
                 entries += cell.entries.len();
                 for e in &cell.entries {
                     best = best.min(e.error);
@@ -415,16 +658,50 @@ impl QdArchive {
             }
         }
         let total = self.cells.len();
+        // Occupancy entropy over the *reachable* cells: how spread out the
+        // candidates offered to the archive were. Coverage alone cannot see
+        // the difference between "one offer in each of two cells" and "ten
+        // thousand offers in one and one in the other".
+        let mut visit_total = 0u64;
+        for (ix, r) in reach.iter().enumerate() {
+            if *r {
+                visit_total = visit_total.saturating_add(self.visits[ix]);
+            }
+        }
+        let mut entropy = 0.0;
+        if visit_total > 0 {
+            for (ix, r) in reach.iter().enumerate() {
+                if *r && self.visits[ix] > 0 {
+                    let p = self.visits[ix] as f64 / visit_total as f64;
+                    entropy -= p * p.log2();
+                }
+            }
+        }
+        let entropy_norm = if reachable > 1 {
+            entropy / (reachable as f64).log2()
+        } else {
+            0.0
+        };
         QdReport {
             mode: self.mode.name(),
             bins: self.bins,
             cells: total,
             occupied,
             coverage: occupied as f64 / total as f64,
+            reachable,
+            occupied_reachable,
+            reachable_coverage: if reachable == 0 {
+                0.0
+            } else {
+                occupied_reachable as f64 / reachable as f64
+            },
             entries,
             best_error: best,
             cell_cap: self.cell_cap,
             hypervolume: hypervolume(&points),
+            occupancy_entropy: entropy,
+            occupancy_entropy_normalized: entropy_norm,
+            qd_score,
             evaluations: self.records,
         }
     }
@@ -592,6 +869,45 @@ fn hypervolume(points: &[(f64, f64)]) -> f64 {
     dominated as f64 / (G * G) as f64
 }
 
+/// Fixed-reference validation hypervolume of a `(cost, error)` front.
+///
+/// `Σ (c_{i+1} − c_i) · log10(1 + e_ref / e_i)` over the cost-sorted front,
+/// where `e_i` is the best error seen at or below `c_i`. Both the reference
+/// error and the log transform are fixed by the **data**, not by the observed
+/// extremes, so two arms can be compared even when one reaches a smaller cost
+/// or error span. (The archive's [`QdReport::hypervolume`] intentionally does
+/// normalise by the observed range and is therefore not comparable.)
+///
+/// `e_ref` should be a scale of the target on the held-out sample (its
+/// variance is what the CLI uses). A single point contributes zero area,
+/// exactly like a one-point Pareto front.
+pub fn fixed_reference_hypervolume(points: &[(f64, f64)], e_ref: f64) -> f64 {
+    let mut front: Vec<(f64, f64)> = points
+        .iter()
+        .copied()
+        .filter(|(c, e)| c.is_finite() && e.is_finite())
+        .collect();
+    if front.len() < 2 {
+        return 0.0;
+    }
+    front.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
+    let e_ref = if e_ref.is_finite() && e_ref > 0.0 {
+        e_ref
+    } else {
+        1.0
+    };
+    let mut best = f64::INFINITY;
+    let mut hv = 0.0;
+    for w in front.windows(2) {
+        best = best.min(w[0].1.max(0.0));
+        let dc = w[1].0 - w[0].0;
+        if dc > 0.0 && best.is_finite() {
+            hv += dc * (1.0 + e_ref / best.max(1e-12)).log10();
+        }
+    }
+    hv
+}
+
 /// Moment and sign statistics accumulated from one prediction vector. This is
 /// the local/GPU-friendly form: one pass over `pred` yields everything the
 /// descriptor needs.
@@ -723,11 +1039,28 @@ pub fn skew_descriptor(pred: &[f64]) -> f64 {
 }
 
 /// Convenience wrapper for callers that do not already hold the predictions.
-/// This is the only path that evaluates the tree here; the search can call
-/// [`descriptor_from_prediction`] instead.
+/// This is the only path that evaluates the tree here; the search calls
+/// [`descriptor_from_prediction`] with the prediction the scoring pass already
+/// computed, so a QD run never pays a second full tree evaluation per
+/// candidate.
 pub fn descriptor(tree: &Node, sample: &Sample) -> Descriptor {
+    #[cfg(test)]
+    FALLBACK_DESCRIPTORS.with(|n| n.set(n.get() + 1));
     let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
     descriptor_from_prediction(tree, &pred, sample.x.first().map(Vec::len).unwrap_or(0))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times the evaluating fallback [`descriptor`] was used. A
+    /// one-pass test asserts this does not move when QD scores candidates.
+    static FALLBACK_DESCRIPTORS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook for the one-pass descriptor contract.
+#[cfg(test)]
+pub fn fallback_descriptor_count() -> usize {
+    FALLBACK_DESCRIPTORS.with(|n| n.get())
 }
 
 #[cfg(test)]
@@ -890,5 +1223,109 @@ mod tests {
                 elapsed.as_secs_f64() * 1e6 / iterations as f64
             );
         }
+    }
+
+    /// #120 one-pass contract: the prediction-based descriptor is bit-identical
+    /// to the convenience wrapper that evaluates the tree itself.
+    #[test]
+    fn descriptor_from_prediction_equals_the_evaluating_path() {
+        let s = sample();
+        let trees = [
+            node(Op::Add, vec![input(0), constant(0.25)]),
+            node(Op::Mul, vec![input(0), input(1)]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.7), input(0)])]),
+            node(Op::Div, vec![input(1), node(Op::Add, vec![input(0), constant(2.0)])]),
+        ];
+        for t in &trees {
+            let pred: Vec<f64> = s.x.iter().map(|row| expr::eval(t, row)).collect();
+            let one_pass = descriptor_from_prediction(t, &pred, 2);
+            let own_path = descriptor(t, &s);
+            assert_eq!(
+                one_pass,
+                own_path,
+                "{}",
+                expr::to_string(t, &["x".into(), "y".into()])
+            );
+            assert_eq!(one_pass.usage.to_bits(), own_path.usage.to_bits());
+            assert_eq!(one_pass.skew.to_bits(), own_path.skew.to_bits());
+        }
+    }
+
+    /// The denominator is the usage lattice, not `K`. With two inputs usage can
+    /// only be `0`, `0.5` or `1`, so an `8 x 8` grid has 24 reachable cells.
+    #[test]
+    fn grid_reachable_coverage_uses_the_usage_lattice() {
+        let mut q = QdArchive::new(8, 4).with_nvars(2);
+        assert_eq!(q.report().reachable, 3 * 8);
+        assert_eq!(q.report().reachable_coverage, 0.0);
+        // usage 0.5 only reaches the middle usage row.
+        q.insert_descriptor(
+            &node(Op::Mul, vec![input(0), input(1)]),
+            0.5,
+            3.0,
+            Descriptor { usage: 0.5, skew: 0.5 },
+        );
+        let r = q.report();
+        assert_eq!(r.reachable, 24);
+        assert_eq!(r.occupied_reachable, 1);
+        assert!((r.reachable_coverage - 1.0 / 24.0).abs() < 1e-12, "{r:?}");
+        // The legacy geometric fraction divides by 64 and is retained only as
+        // a diagnostic.
+        assert!((r.coverage - 1.0 / 64.0).abs() < 1e-12, "{r:?}");
+    }
+
+    /// A cell that no attainable descriptor can be nearest to must not count
+    /// against coverage. The CVT denominator is therefore <= K.
+    #[test]
+    fn cvt_reachable_denominator_is_at_most_the_cell_count() {
+        let q = QdArchive::new_cvt(16, 4).with_nvars(2);
+        let r = q.report();
+        assert!(r.reachable > 0, "{r:?}");
+        assert!(r.reachable <= r.cells, "{r:?}");
+        assert_eq!(r.occupied, 0);
+        assert_eq!(r.reachable_coverage, 0.0);
+    }
+
+    /// Entropy sees attention spread that coverage cannot.
+    #[test]
+    fn occupancy_entropy_measures_visit_spread() {
+        let mut q = QdArchive::new(8, 4).with_nvars(2);
+        let t = node(Op::Mul, vec![input(0), input(1)]);
+        let a = Descriptor { usage: 0.5, skew: 0.1 };
+        let b = Descriptor { usage: 0.5, skew: 0.9 };
+        for _ in 0..4 {
+            q.insert_descriptor(&t, 1.0, 3.0, a);
+        }
+        let one_cell = q.report();
+        assert_eq!(one_cell.occupancy_entropy, 0.0);
+        assert_eq!(one_cell.occupancy_entropy_normalized, 0.0);
+        // A second visited cell produces entropy in (0, 1] bits.
+        q.insert_descriptor(&t, 2.0, 3.0, b);
+        let two = q.report();
+        assert!(two.occupancy_entropy > 0.0, "{two:?}");
+        assert!(two.occupancy_entropy <= 1.0 + 1e-12, "{two:?}");
+        assert!(two.occupancy_entropy_normalized > 0.0, "{two:?}");
+        assert!(two.occupancy_entropy_normalized < 1.0, "{two:?}");
+        // Quality pairing is reported alongside coverage.
+        assert!((one_cell.qd_score - 0.5).abs() < 1e-12, "{one_cell:?}");
+    }
+
+    #[test]
+    fn fixed_reference_hypervolume_is_pinned_to_the_reference() {
+        let front = [(1.0, 0.1), (2.0, 0.05), (3.0, 0.01)];
+        let hv = fixed_reference_hypervolume(&front, 1.0);
+        let manual =
+            1.0 * (1.0 + 1.0 / 0.1f64).log10() + 1.0 * (1.0 + 1.0 / 0.05f64).log10();
+        assert!((hv - manual).abs() < 1e-12, "{hv} vs {manual}");
+        // Doubling every cost doubles the area: the reference never rescales.
+        let doubled: Vec<(f64, f64)> = front.iter().map(|&(c, e)| (2.0 * c, e)).collect();
+        assert!((fixed_reference_hypervolume(&doubled, 1.0) - 2.0 * hv).abs() < 1e-12);
+        // A dominated extra point cannot lower it.
+        let mut with_extra = front.to_vec();
+        with_extra.push((2.5, 0.5));
+        assert!((fixed_reference_hypervolume(&with_extra, 1.0) - hv).abs() < 1e-12);
+        // One point has no area; a larger reference error scores a larger area.
+        assert_eq!(fixed_reference_hypervolume(&front[..1], 1.0), 0.0);
+        assert!(fixed_reference_hypervolume(&front, 10.0) > hv);
     }
 }

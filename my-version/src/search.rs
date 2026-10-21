@@ -308,6 +308,13 @@ struct Ind {
     error: f64,
     /// Configured complexity from [`Config::complexity_model`].
     complexity: f64,
+    /// #120: behaviour descriptor accumulated from the same prediction vector
+    /// that produced `error`. `None` when the QD layer is off, when the tree
+    /// was scored on the GPU, on a row subset, with a metric that has no
+    /// prediction vector, or before it has been evaluated. The QD archive also
+    /// cross-checks a descriptor against the sample it was computed on before
+    /// trusting it.
+    descriptor: Option<qd::Descriptor>,
 }
 
 impl Ind {
@@ -335,20 +342,30 @@ impl Ind {
         let tree = expr::simplify(&tree);
         let hash = expr::structural_hash(&tree);
         let complexity = cfg.complexity_model.complexity(&tree);
-        let error = if cfg.accepts_dimensions(&tree) {
+        // #120: when the QD layer is on, obtain the descriptor from the same
+        // prediction sweep that scores the candidate. If the fitter's SSE is
+        // reused, that sweep does not happen; the error is still reused
+        // bit-for-bit (the passive layer must not change the trajectory) and
+        // the descriptor costs one separate prediction pass, exactly the old
+        // fallback. The folded path applies whenever scoring already produces
+        // predictions, which is every metric except the squared reuse case.
+        let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
+        let (error, descriptor) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
-                    fit.sse / train.sample.len() as f64
+                    let d = want_descriptor.then(|| qd::descriptor(&tree, train.sample));
+                    (fit.sse / train.sample.len() as f64, d)
                 }
-                _ => score_tree(&tree, train, cfg), // #27
+                _ => eval_error_and_descriptor(&tree, train, cfg.metric, want_descriptor), // #27
             }
         } else {
-            f64::INFINITY
+            (f64::INFINITY, None)
         };
         Ind {
             tree,
             error,
             complexity,
+            descriptor,
         }
     }
 
@@ -371,6 +388,9 @@ impl Ind {
             tree,
             error,
             complexity,
+            // A GPU batch returns the error, not the prediction vector, so the
+            // descriptor is filled by the archive's fallback path.
+            descriptor: None,
         }
     }
 
@@ -378,11 +398,14 @@ impl Ind {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
         // #25: re-evaluation must not resurrect a rejected candidate.
-        self.error = if cfg.accepts_dimensions(&self.tree) {
-            score_tree(&self.tree, train, cfg) // #27
+        let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
+        let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
+            eval_error_and_descriptor(&self.tree, train, cfg.metric, want_descriptor) // #27
         } else {
-            f64::INFINITY
+            (f64::INFINITY, None)
         };
+        self.error = error;
+        self.descriptor = descriptor;
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -419,6 +442,9 @@ impl Ind {
             tree: ind.tree,
             error: ind.error,
             complexity: ind.complexity,
+            // A checkpoint stores the tree and score, not the descriptor; the
+            // archive recomputes it on the resumed run like any other candidate.
+            descriptor: None,
         }
     }
 }
@@ -1283,22 +1309,56 @@ fn reset_transpose_count() {
 }
 
 fn eval_error_on(tree: &Node, data: &EvalSample, metric: Metric) -> f64 {
+    eval_error_and_descriptor(tree, data, metric, false).0
+}
+
+/// #120: score a candidate and, when asked, accumulate its behaviour
+/// descriptor from the *same* prediction vector.
+///
+/// This is the one-pass contract: the scoring reduction already visits every
+/// row of `pred`, so the usage count (a tree walk) and the prediction moments
+/// (`PredictionStats`) are computed without a second tree evaluation. The QD
+/// layer therefore costs the search nothing beyond the statistics themselves
+/// on the CPU scoring path.
+///
+/// Two shapes deliberately have no descriptor: the implicit metric evaluates
+/// per row through the gradient (the fallback evaluates once more), and a
+/// multi-output objective has one prediction vector per output and keeps its
+/// own path. Both are reported by the QD archive's fallback.
+fn eval_error_and_descriptor(
+    tree: &Node,
+    data: &EvalSample,
+    metric: Metric,
+    want_descriptor: bool,
+) -> (f64, Option<qd::Descriptor>) {
     let s = data.sample;
     if s.is_empty() {
-        return f64::INFINITY;
+        return (f64::INFINITY, None);
     }
+    let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     // #14: an implicit metric measures the distance to the level set
     // |f| / ||grad f||. That needs f and its gradient at each row, so it is
     // scored from the tree and the row instead of a prediction vector. Every
     // other metric takes the original path, bit for bit.
     if metric.is_implicit() {
-        return crate::implicit::score(tree, s, metric);
+        let error = crate::implicit::score(tree, s, metric);
+        let descriptor = want_descriptor.then(|| qd::descriptor(tree, s));
+        return (error, descriptor);
     }
     let pred = predictions(tree, data);
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
-    score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
+    let error = score_weighted(
+        &pred,
+        &s.y,
+        &s.w,
+        metric,
+        expr::count_constants(tree),
+    );
+    let descriptor =
+        want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
+    (error, descriptor)
 }
 
 /// #27: one candidate's prediction vector.
@@ -2656,6 +2716,7 @@ fn run_postfix_search(
                             error: next.err[next.slot_index(i, j)],
                             complexity: next.cost[next.slot_index(i, j)] as f64,
                             tree,
+                            descriptor: None,
                         })
                         .collect()
                 })
@@ -2699,6 +2760,7 @@ fn run_postfix_search(
                         error: pool.err[pool.slot_index(i, j)],
                         complexity: pool.cost[pool.slot_index(i, j)] as f64,
                         tree,
+                        descriptor: None,
                     })
                     .collect()
             })
@@ -3186,13 +3248,14 @@ fn run_search(
     // never feeds back into selection, so turning it on cannot change the
     // trajectory or the Pareto front.
     let mut qd_archive = if cfg.qd_bins > 0 {
-        Some(if cfg.qd_control == 2 {
+        let archive = if cfg.qd_control == 2 {
             QdArchive::new_random(cfg.qd_bins, cfg.qd_cell_cap)
         } else if cfg.qd_cvt {
             QdArchive::new_cvt(cfg.qd_bins, cfg.qd_cell_cap)
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
-        })
+        };
+        Some(archive.with_nvars(nvars))
     } else {
         None
     };
@@ -3232,6 +3295,10 @@ fn run_search(
                 None
             };
             let eval_data = screen_data.as_ref().unwrap_or(gen_data);
+            // #120: an `Ind` descriptor is accumulated from the prediction that
+            // scored `eval_data`. It describes `gen_train` only when those are
+            // the same rows: no per-generation subset and no screening subset.
+            let cached_descriptors_valid = gen_sample.is_none() && !screened;
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -3529,21 +3596,36 @@ fn run_search(
                                 .as_ref()
                                 .and_then(|q| q.least_occupied_descriptor())
                             {
-                                Some(target) => islands[ii]
-                                    .iter()
-                                    .enumerate()
-                                    .min_by(|(_, a), (_, b)| {
-                                        let da = qd::descriptor(&a.tree, gen_train);
-                                        let db = qd::descriptor(&b.tree, gen_train);
-                                        let score = |d: qd::Descriptor| {
-                                            (d.usage - target.usage).powi(2)
-                                                + (d.skew - target.skew).powi(2)
-                                        };
-                                        score(da)
-                                            .partial_cmp(&score(db))
-                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                    })
-                                    .map(|(i, _)| i),
+                                Some(target) => {
+                                    // #120: reuse the descriptors the scoring
+                                    // pass already accumulated when they
+                                    // describe `gen_train`; only the GPU or
+                                    // subset paths pay for one here.
+                                    let descriptors: Vec<qd::Descriptor> = islands[ii]
+                                        .iter()
+                                        .map(|ind| {
+                                            if cached_descriptors_valid {
+                                                if let Some(d) = ind.descriptor {
+                                                    return d;
+                                                }
+                                            }
+                                            qd::descriptor(&ind.tree, gen_train)
+                                        })
+                                        .collect();
+                                    descriptors
+                                        .iter()
+                                        .enumerate()
+                                        .min_by(|(_, a), (_, b)| {
+                                            let score = |d: &qd::Descriptor| {
+                                                (d.usage - target.usage).powi(2)
+                                                    + (d.skew - target.skew).powi(2)
+                                            };
+                                            score(a)
+                                                .partial_cmp(&score(b))
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        })
+                                        .map(|(i, _)| i)
+                                }
                                 None => None,
                             }
                         } else {
@@ -3671,14 +3753,23 @@ fn run_search(
                 for pop in &islands {
                     for ind in pop {
                         if ind.error.is_finite() {
-                            items.push((ind.tree.clone(), ind.error, ind.complexity));
+                            // #120: the descriptor the scoring pass already
+                            // accumulated. `None` means the archive falls back
+                            // to its known-descriptor cache or one evaluation
+                            // (GPU-scored, subsampled or checkpointed trees).
+                            let d = if cached_descriptors_valid {
+                                ind.descriptor
+                            } else {
+                                None
+                            };
+                            items.push((ind.tree.clone(), ind.error, ind.complexity, d));
                         }
                     }
                 }
                 for s in &archive.items {
-                    items.push((s.tree.clone(), s.error, s.cost));
+                    items.push((s.tree.clone(), s.error, s.cost, None));
                 }
-                qd.record(items, gen_train);
+                qd.record_with_descriptors(items, gen_train);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -3951,6 +4042,7 @@ mod tests {
             tree: node(Op::Sin, vec![input(0)]),
             error: 1.0,
             complexity: 1.0,
+            descriptor: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -4120,6 +4212,7 @@ mod tests {
             tree: node(Op::Mul, vec![constant(2.0), input(0)]),
             error: f64::INFINITY,
             complexity: 0.0,
+            descriptor: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -4510,6 +4603,51 @@ mod tests {
         assert!(
             pool.busy.load(std::sync::atomic::Ordering::Relaxed) <= 2,
             "the pool ran more threads than it owns"
+        );
+    }
+
+    /// #120: scoring a candidate with the QD layer on must not require the
+    /// evaluating descriptor fallback, and must not change the error. This is
+    /// the one-pass contract for the CPU scoring path.
+    #[test]
+    fn qd_descriptor_is_folded_into_the_scoring_pass() {
+        let data = sample();
+        let trees = [
+            node(Op::Add, vec![input(0), constant(0.25)]),
+            node(Op::Mul, vec![input(0), node(Op::Add, vec![input(1), constant(0.5)])]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]),
+        ];
+        let mut off = Config::default();
+        off.fit_iters = 0;
+        let mut on = off.clone();
+        on.qd_bins = 16;
+        let mut view_cfg = Config::default();
+        view_cfg.fit_iters = 0;
+        let off_data = EvalSample::new(&data, &view_cfg);
+        let on_data = EvalSample::new(&data, &on);
+
+        let before = crate::qd::fallback_descriptor_count();
+        for t in &trees {
+            let plain = Ind::evaluated(t.clone(), &off_data, &off);
+            let qd = Ind::evaluated(t.clone(), &on_data, &on);
+            assert_eq!(
+                plain.error.to_bits(),
+                qd.error.to_bits(),
+                "the QD fold changed the reported error"
+            );
+            let want = crate::qd::descriptor_from_prediction(
+                t,
+                &data.x.iter().map(|row| expr::eval(t, row)).collect::<Vec<_>>(),
+                2,
+            );
+            let got = qd.descriptor.expect("QD scoring must attach a descriptor");
+            assert_eq!(got, want, "folded descriptor differs from the evaluating path");
+            assert_eq!(plain.descriptor, None, "QD off must not accumulate moments");
+        }
+        assert_eq!(
+            crate::qd::fallback_descriptor_count(),
+            before,
+            "QD scoring evaluated a tree a second time for its descriptor"
         );
     }
 }
