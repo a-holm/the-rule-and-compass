@@ -195,8 +195,21 @@ table, input paths/sizes/checksums, audit counters (duplicates, gaps,
 zero-volume rows, units converted, zero-variance features, NaNs) and the output
 checksum.
 
-`--jobs N` parallelises by symbol; symbols are merged in sorted order, so the
-output does not depend on scheduling.
+`--jobs N` bounds **every** parallel pass by symbol (parse, resample and
+features/MTF/label), not only parsing, so the number of in-flight per-symbol
+matrices is at most `N`. Symbols are merged in sorted order, so the output does
+not depend on scheduling. Feature columns are moved into the per-symbol spool
+instead of copied, and the cross-asset benchmark is shared with `Arc`, which
+keeps the feature phase well below the final table; the peak is the assembly
+table itself. The output checksum is computed in 1 MiB chunks, so hashing a
+multi-gigabyte store does not add it to RSS.
+
+For measurement, set `RCSR_PREP_RSS_LOG=1` to print `VmRSS` at assembly
+checkpoints, or run the harness
+`scripts/measure/prep_rss.py --csv rss.csv -- <rcsr prep ...>`; it samples
+`/proc/<pid>/status` (`VmRSS`, `VmHWM`, `Threads`) and reports the peak in
+bytes alongside the child's wall time. The thread count shows the bounded
+worker phases versus the single-threaded assembly.
 
 ## File format, versions 1 and 2
 
