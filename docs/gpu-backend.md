@@ -421,8 +421,13 @@ note.
 
 Fallback and the flags:
 
-* With neither flag, a CUDA build with a usable device selects the GPU. A build
-  without the feature prints
+* With neither flag, a CUDA build with a usable device selects the GPU **for
+  `--metric squared`**. Every other metric, including the default `absolute`,
+  is scored on the CPU and prints
+  `# gpu: off (metric is not scored natively on the GPU)` once; the resource
+  line and the `--json` `backend` both say `cpu` and `backend_reason` carries
+  the same cause.
+* A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
   build with no usable device prints the same line with the probe's reason.
 * `--gpu` is an **assertion**: it exits 2 with a clear error when the build or

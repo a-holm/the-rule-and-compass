@@ -1445,6 +1445,29 @@ pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
     Backend::Cpu
 }
 
+/// #236: the labelled cause a requested GPU run will actually be scored on the
+/// CPU, or `None` when the device is usable (or `--gpu` was not requested).
+///
+/// This is the same decision [`effective_backend`] makes. The CLI prints it in
+/// the resource line and records it in the development log, so a run whose
+/// objective the kernel cannot score never claims the GPU in its own evidence
+/// record.
+pub fn backend_blocker_reason(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    #[cfg(feature = "cuda")]
+    {
+        if cfg.gpu
+            && !matches!(
+                std::env::var("RCSR_GPU").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            )
+        {
+            return gpu_blocker(cfg, train);
+        }
+    }
+    let _ = (cfg, train);
+    None
+}
+
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
     // #27: keep the public entry point on the fast path; `--no-simd` goes
     // through a scalar `EvalSample` inside the search.
