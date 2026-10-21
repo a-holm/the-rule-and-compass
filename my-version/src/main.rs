@@ -454,9 +454,9 @@ SEARCH:
                              the kernel scores. Every other metric (including
                              the default absolute) runs on the CPU and prints
                              the reason, never with a proxy loss. Reported
-                             errors stay CPU f64, but f32 fitness can change
-                             the trajectory (cross-backend runs are not
-                             bit-identical). JSON
+                             errors stay CPU f64; cross-backend runs are not
+                             bit-identical because f32 fitness can change the
+                             trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
                              measured separately with ncu

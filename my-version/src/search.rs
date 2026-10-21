@@ -5013,6 +5013,7 @@ mod tests {
                 "unsupported_plan",
                 "too_few_rows",
                 "too_many_constants",
+                "metric_not_native",
                 "ill_conditioned",
                 "non_finite",
                 "launch",

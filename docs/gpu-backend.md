@@ -856,8 +856,8 @@ The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
-constants), `too_few_rows`, `too_many_constants` (`p > 20`), `ill_conditioned`,
-`non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
+constants), `too_few_rows`, `too_many_constants` (`p > 20`), `metric_not_native`,
+`ill_conditioned`, `non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
