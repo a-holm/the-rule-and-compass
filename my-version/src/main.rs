@@ -98,6 +98,9 @@ USAGE:
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
   rcsr verify-manifest <manifest.json> [--data <file>]
+  rcsr dev-report <log.ndjson>
+                              summarise a --dev-log file (phases, fit/eval
+                              share, fallback causes, bottlenecks)
   rcsr schema                 print a machine-readable description of this tool
   rcsr --help | --version
 
@@ -493,6 +496,29 @@ RUN INTEGRITY (#140):
   [--data <file>]            commit, data file and canonical config; exit 1 on
                              any mismatch (exit 0 when everything matches)
 
+DEVELOPMENT LOG (#211):
+  --dev-log <path>           write one NDJSON event per generation plus start,
+                             checkpoint and end events to this path (default:
+                             off). Independent of --json/--ndjson/--progress.
+                             Each event carries `schema: rcsr-devlog/1`; it
+                             records phase timings, error quantiles, Pareto
+                             size/hypervolume/hash, dedup rate, admissions,
+                             fit attempts/GPU/fallback-by-cause/refits, GPU
+                             kernel/wall/duty, CPU fallback seconds/workers, QD
+                             coverage/entropy, convergence, per-island best and
+                             the RNG key. No raw rows or personal data. One
+                             atomic line per write, bounded by --dev-log-max-bytes;
+                             logging never changes the archive, the results or
+                             the configuration hash. See docs/dev-log.md
+  --dev-log-every <N>        write a generation event only every Nth
+                             generation (default 1). run_end always carries the
+                             final archive and stop reason
+  --dev-log-max-bytes <size> cap on generation and checkpoint events (default
+                             64MiB); run_start and run_end are always written
+  dev-report <log>           Rust analyzer for a dev log: phase table, fit vs
+                             evaluation share, fallback causes, convergence,
+                             archive growth and a ranked bottleneck list
+
 OUTPUT:
   --format text|json|ndjson  (default text)
   --json                     shorthand for --format json
@@ -880,6 +906,165 @@ impl PhaseTimings {
     }
 }
 
+/// #211: the shared `--dev-log` sink.
+///
+/// One per process. `main` writes `run_start`, `run_end` and checkpoint events
+/// through it, and the search's generation callback holds a clone, so the file
+/// is a single ordered stream no matter which part of the engine produced the
+/// event. The `Mutex` is never contended: the search calls the callback on its
+/// main thread.
+#[derive(Clone)]
+struct DevSink {
+    log: std::sync::Arc<std::sync::Mutex<rcsr::devlog::Log>>,
+    /// `--dev-log-every`: write a generation event only when
+    /// `generation % every == 0`.
+    every: usize,
+}
+
+impl DevSink {
+    fn open(path: &str, max_bytes: u64, every: usize) -> Result<DevSink, String> {
+        Ok(DevSink {
+            log: std::sync::Arc::new(std::sync::Mutex::new(rcsr::devlog::Log::create(
+                path, max_bytes,
+            )?)),
+            every: every.max(1),
+        })
+    }
+
+    fn write(&self, line: &str, terminal: bool) {
+        match self.log.lock() {
+            Ok(mut log) => {
+                log.append(line, terminal);
+            }
+            Err(_) => eprintln!("warning: --dev-log: the log lock is poisoned"),
+        }
+    }
+
+    /// The search-side callback.
+    fn callback(&self) -> rcsr::search::DevFn {
+        let sink = self.clone();
+        std::sync::Arc::new(move |rec: &rcsr::devlog::GenRecord| {
+            if sink.every == 1 || rec.generation % sink.every == 0 {
+                sink.write(&rec.json(), false);
+            }
+        })
+    }
+
+    fn checkpoint(&self, generation: usize, path: &str) {
+        // The hash and size let a reader prove the file it has is the one the
+        // log names. A failed read is not a search error: the event records 0.
+        let (bytes, hash) = match std::fs::read(path) {
+            Ok(body) => (body.len() as u64, rcsr::devlog::fnv1a(&body)),
+            Err(_) => (0, 0),
+        };
+        self.write(
+            &rcsr::devlog::checkpoint_json(generation, path, bytes, hash),
+            false,
+        );
+    }
+
+    /// Bookkeeping for `run_end`: (events, bytes, dropped) before this event.
+    fn stats(&self) -> (u64, u64, u64) {
+        match self.log.lock() {
+            Ok(log) => (log.events(), log.bytes(), log.dropped()),
+            Err(_) => (0, 0, 0),
+        }
+    }
+
+    fn end(
+        &self,
+        outcome: &rcsr::search::Outcome,
+        wall_s: f64,
+        search_s: f64,
+        json_path: Option<String>,
+    ) {
+        let best = outcome
+            .archive
+            .items
+            .iter()
+            .map(|s| s.error)
+            .fold(f64::INFINITY, f64::min);
+        let gpu_wall = outcome.gpu.as_ref().map(|g| g.accounting.wall_s);
+        let (events, bytes, dropped) = self.stats();
+        let end = rcsr::devlog::RunEnd {
+            generations: outcome.generations,
+            stop: outcome.stop_reason.to_string(),
+            wall_s,
+            search_s,
+            pareto_size: outcome.archive.items.len(),
+            best_error: best,
+            archive_hash: outcome.archive.hash(),
+            json_path,
+            peak_rss_bytes: rcsr::devlog::peak_rss_bytes(),
+            gpu_wall_s: gpu_wall,
+            device_hours: gpu_wall.map(|w| w / 3600.0),
+            events,
+            bytes,
+            dropped,
+            end_utc: manifest::utc_now(),
+        };
+        self.write(&rcsr::devlog::run_end_json(&end), true);
+    }
+}
+
+/// #211: the `run_start` event, built from the same facts the run manifest
+/// records (#140).
+#[allow(clippy::too_many_arguments)]
+fn dev_run_start(
+    command: &str,
+    data_path: &str,
+    prepared: &data::Prepared,
+    cfg: &search::Config,
+    backend: &str,
+    device: Option<String>,
+    every: usize,
+    max_bytes: u64,
+    resumed_from: Option<String>,
+) -> rcsr::devlog::RunStart {
+    let (commit, dirty) = manifest::git_info();
+    let exe = std::env::current_exe().unwrap_or_default();
+    let train = rcsr::checkpoint::fingerprint(&prepared.train);
+    let test = rcsr::checkpoint::fingerprint(&prepared.test);
+    let canonical = rcsr::checkpoint::config_canonical(cfg);
+    let config: Vec<(String, String)> = canonical
+        .lines()
+        .filter_map(|l| l.strip_prefix("config "))
+        .filter_map(|l| l.split_once(' '))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    rcsr::devlog::RunStart {
+        command: command.to_string(),
+        version: VERSION.to_string(),
+        commit,
+        dirty,
+        binary_sha256: manifest::sha256_file(&exe).unwrap_or_else(|_| "unknown".to_string()),
+        data_path: data_path.to_string(),
+        data_sha256: if data_path == "-" || data_path.is_empty() {
+            None
+        } else {
+            manifest::sha256_file(std::path::Path::new(data_path)).ok()
+        },
+        train_rows: train.rows,
+        train_fingerprint: format!("{:016x}", train.hash),
+        test_rows: test.rows,
+        test_fingerprint: format!("{:016x}", test.hash),
+        config,
+        config_hash: rcsr::checkpoint::config_hash(cfg),
+        seed: cfg.seed,
+        backend: backend.to_string(),
+        device,
+        threads: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        host: std::env::consts::OS.to_string(),
+        arch: std::env::consts::ARCH.to_string(),
+        start_utc: manifest::utc_now(),
+        every,
+        max_bytes,
+        resumed_from,
+    }
+}
+
 /// The `variables_detail` array shared by `--json`, `--ndjson` and
 /// `--eval-expr`: one object per search input with its datatype. A one-hot
 /// indicator also reports its source column.
@@ -1115,6 +1300,10 @@ fn main() {
     ) {
         run_walkforward(&args[1..]);
     }
+    // #211: summarise a --dev-log file (phases, fallbacks, bottlenecks).
+    if args.first().map(|s| s.as_str()) == Some("dev-report") {
+        rcsr::devreport::run(&args[1..]);
+    }
     // #140: verify a run manifest without starting a search.
     if args.first().map(|s| s.as_str()) == Some("verify-manifest") {
         run_verify_manifest(&args[1..]);
@@ -1217,6 +1406,12 @@ fn main() {
     let mut allow_backend_change = false;
     let mut run_manifest_path: Option<String> = None;
     let mut json_out: Option<String> = None;
+    // #211: optional engine-level development log (off unless --dev-log).
+    let mut dev_log_path: Option<String> = None;
+    let mut dev_log_every = 1usize;
+    let mut dev_log_max_bytes = rcsr::devlog::DEFAULT_MAX_BYTES;
+    let mut dev_log_every_set = false;
+    let mut dev_log_max_bytes_set = false;
 
     // Which search flags were written on the command line. Used to refuse a
     // resume whose explicit override contradicts the saved configuration.
@@ -1728,6 +1923,38 @@ fn main() {
             "--resume" => resume_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
+            // #211: the development log. `--dev-log-every` throttles the
+            // generation events; `--dev-log-max-bytes` bounds the file.
+            "--dev-log" => dev_log_path = Some(val!()),
+            "--dev-log-every" => {
+                let v = val!();
+                match v.parse::<usize>() {
+                    Ok(n) if n >= 1 => {
+                        dev_log_every = n;
+                        dev_log_every_set = true;
+                    }
+                    _ => {
+                        eprintln!("error: --dev-log-every needs an integer >= 1, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--dev-log-max-bytes" => {
+                let v = val!();
+                match parse_memory_bytes(&v) {
+                    Ok(n) if n > 0 => {
+                        dev_log_max_bytes = n;
+                        dev_log_max_bytes_set = true;
+                    }
+                    _ => {
+                        eprintln!(
+                            "error: --dev-log-max-bytes needs a positive size (bytes, KiB/MiB/GiB/GB), got '{}'",
+                            v
+                        );
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--json-out" => json_out = Some(val!()),
             "--format" => {
                 format = match val!().as_str() {
@@ -1801,6 +2028,21 @@ fn main() {
     }
     if report.is_some() && eval_expr.is_some() {
         eprintln!("error: --report cannot be combined with --eval-expr");
+        std::process::exit(EXIT_USAGE);
+    }
+    // #211: the development log describes one search.
+    if (dev_log_every_set || dev_log_max_bytes_set) && dev_log_path.is_none() {
+        eprintln!("error: --dev-log-every and --dev-log-max-bytes require --dev-log <path>");
+        std::process::exit(EXIT_USAGE);
+    }
+    if dev_log_path.is_some() && eval_expr.is_some() {
+        eprintln!("error: --dev-log cannot be combined with --eval-expr (it logs a search)");
+        std::process::exit(EXIT_USAGE);
+    }
+    if dev_log_path.is_some() && report == Some(ReportKind::Benchmark) {
+        eprintln!(
+            "error: --dev-log cannot be combined with --report benchmark (one log describes one search; \n  run the repeats separately or drop --report benchmark)"
+        );
         std::process::exit(EXIT_USAGE);
     }
     // #25: the filter needs a declaration, unless a checkpoint saved one.
@@ -3324,6 +3566,42 @@ fn main() {
         }
     }
 
+    // #211: open the development log and write its first event before the
+    // search, so a killed process still records what it was doing. With no
+    // `--dev-log`, `dev_sink` is `None` and `cfg.dev_log` stays `None`: the
+    // search then skips every measurement the log would need.
+    let dev_sink: Option<DevSink> = match &dev_log_path {
+        Some(path) => {
+            let sink = match DevSink::open(path, dev_log_max_bytes, dev_log_every) {
+                Ok(sink) => sink,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            };
+            let (backend_name, device) = if cfg.gpu && gpu_probe.available() {
+                ("gpu", gpu_probe.device.clone())
+            } else {
+                ("cpu", None)
+            };
+            let info = dev_run_start(
+                &command,
+                &data_path,
+                &prepared,
+                &cfg,
+                backend_name,
+                device,
+                dev_log_every,
+                dev_log_max_bytes,
+                resume_path.clone(),
+            );
+            sink.write(&rcsr::devlog::run_start_json(&info), true);
+            cfg.dev_log = Some(sink.callback());
+            Some(sink)
+        }
+        None => None,
+    };
+
     // #15: multi-output reporting has its own shape (one entry per target);
     // the single-output path below is untouched.
     if multi_output {
@@ -3339,6 +3617,7 @@ fn main() {
             json_out.clone(),
             run_start,
             start,
+            dev_sink.as_ref(),
         );
         std::process::exit(EXIT_OK);
     }
@@ -3380,6 +3659,10 @@ fn main() {
                 }
                 let generation = cp.generations;
                 last_saved = Some((generation, path.clone()));
+                // #211: the checkpoint file is saved; record its size and hash.
+                if let Some(sink) = &dev_sink {
+                    sink.checkpoint(generation, &path);
+                }
                 if format == Format::Ndjson {
                     println!(
                         "{{\"event\":\"checkpoint\",\"action\":\"saved\",\"path\":{},\"generation\":{}}}",
@@ -3423,6 +3706,19 @@ fn main() {
         }
     };
     let search_seconds = search_start.elapsed().as_secs_f64();
+    // #211: close the development log now that the search has returned: the
+    // final archive, the stop reason, the wall and the process peak RSS. It is
+    // written before diagnostics so a later failure still leaves a complete
+    // log; the report phase is therefore not part of `wall` here (it is in the
+    // run manifest's phase timings).
+    if let Some(sink) = &dev_sink {
+        sink.end(
+            &outcome,
+            run_start.elapsed().as_secs_f64(),
+            search_seconds,
+            json_out.clone(),
+        );
+    }
     // Compatibility: `elapsed_seconds` has always meant the search phase.
     let elapsed = search_seconds;
     let diagnostics_start = std::time::Instant::now();
@@ -3834,6 +4130,9 @@ fn main() {
             .map(|s| s.error)
             .fold(f64::INFINITY, f64::min);
         let saved_progress = cfg.progress.take();
+        // #211: a null control is a separate search; it must not write into the
+        // real run's log.
+        let saved_dev_log = cfg.dev_log.take();
         let mut best_null = Vec::with_capacity(null_runs);
         for r in 0..null_runs {
             let mut rng = Mt::new(cfg.seed ^ (0x51ED_2701u32.wrapping_mul(r as u32 + 1)));
@@ -3878,6 +4177,7 @@ fn main() {
             best_null.push(b);
         }
         cfg.progress = saved_progress;
+        cfg.dev_log = saved_dev_log; // #211
         null_control = Some(if null_block > 1 {
             diagnostics::NullControl::summarise_block(
                 observed,
@@ -4948,6 +5248,7 @@ struct MultiParetoRow {
 /// output; `train_error`/`test_error` on the row are the combined (mean) error
 /// the archive was ranked on. Shape complexity is counted once.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_multi_output(
     cfg: &search::Config,
     prepared: &data::Prepared,
@@ -4960,6 +5261,8 @@ fn run_multi_output(
     json_out: Option<String>,
     run_start: std::time::Instant,
     start: std::time::Instant,
+    // #211: the development log, if one is open.
+    dev: Option<&DevSink>,
 ) {
     let outcome = search::run(cfg, &prepared.train, &prepared.test);
     let search_seconds = start.elapsed().as_secs_f64();
@@ -5265,6 +5568,16 @@ fn run_multi_output(
             eprintln!("error writing {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
+    }
+
+    // #211: close the development log for a multi-output run too.
+    if let Some(sink) = dev {
+        sink.end(
+            &outcome,
+            run_start.elapsed().as_secs_f64(),
+            search_seconds,
+            json_out.clone(),
+        );
     }
 
     std::process::exit(if finite { EXIT_OK } else { EXIT_NO_SOLUTION });
@@ -6391,6 +6704,7 @@ fn benchmark_markdown(
 
     let mut extra = cfg.clone();
     extra.progress = None;
+    extra.dev_log = None; // #211: a repeat is not the logged run
     for r in 1..repeats {
         extra.seed = cfg
             .seed
@@ -7910,6 +8224,34 @@ mod tests {
 
     /// Every report flag and type must stay documented in `--help` and `schema`.
     #[test]
+    /// #211: the development log is a documented surface: every flag, the
+    /// schema id, the four event names and the analyzer are in `--help` and in
+    /// `rcsr schema`.
+    #[test]
+    fn help_and_schema_document_the_development_log() {
+        let help = usage();
+        let schema = schema::json();
+        for flag in ["--dev-log", "--dev-log-every", "--dev-log-max-bytes"] {
+            assert!(help.contains(flag), "usage() is missing {flag}");
+            assert!(schema.contains(flag), "schema::json() is missing {flag}");
+        }
+        for line in [
+            "rcsr dev-report <log.ndjson>",
+            "DEVELOPMENT LOG (#211)",
+            "rcsr-devlog/1",
+            "docs/dev-log.md",
+        ] {
+            assert!(help.contains(line), "usage() is missing '{line}'");
+        }
+        for field in ["rcsr-devlog/1", "run_start", "generation", "checkpoint", "run_end", "dev-report"] {
+            assert!(schema.contains(field), "schema::json() is missing '{field}'");
+        }
+        // The analyzer's own usage names both jobs it does.
+        let report_usage = rcsr::devreport::usage();
+        assert!(report_usage.contains("bottleneck"));
+        assert!(report_usage.contains("<log>"));
+    }
+
     fn help_and_schema_document_reports() {
         for flag in ["--report", "--report-out", "--report-repeats"] {
             assert!(usage().contains(flag), "usage() is missing {flag}");

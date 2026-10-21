@@ -113,6 +113,9 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--allow-backend-change", "flag", "false", "permit --resume across cpu<->gpu (recorded on stderr and in --run-manifest)"),
         // #140: run integrity.
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
+        ("--dev-log", "string", "none", "write a bounded NDJSON development log to this path: run_start, one generation event per generation (phase timings, error quantiles, Pareto size/hypervolume/archive hash, dedup rate, admissions, fit attempts/GPU/fallback-by-cause/refits, GPU kernel/wall/duty, CPU fallback seconds/workers, QD coverage/entropy, convergence, per-island best, RNG key), checkpoint and run_end. schema `rcsr-devlog/1`, documented in docs/dev-log.md. Off by default; never changes the archive, results or config hash; no raw rows"),
+        ("--dev-log-every", "int", "1", "write a generation event only every Nth generation; run_end still carries the final archive and stop reason (requires --dev-log)"),
+        ("--dev-log-max-bytes", "size", "64MiB", "cap on generation and checkpoint events; run_start and run_end are always written (bytes or KiB/MiB/GiB/GB; requires --dev-log)"),
         ("--json-out", "string", "none", "write the final JSON result to this file atomically instead of stdout (implies --json); progress stays on stderr/NDJSON"),
         ("--format", "enum", "text", "text | json | ndjson"),
         ("--json", "flag", "false", "shorthand for --format json: one JSON result object"),
@@ -249,6 +252,7 @@ pub fn json() -> String {
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic .part per symbol, progress on stderr\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}}]}},\n  \
+         \"dev_log\":{{\"schema\":\"rcsr-devlog/1\",\"version\":1,\"flag\":\"--dev-log\",\"default\":\"off\",\"analyzer\":\"rcsr dev-report <log>\",\"events\":[\"run_start\",\"generation\",\"checkpoint\",\"run_end\"],\"atomic\":\"one complete line per write to an O_APPEND file; a killed run leaves a valid prefix\",\"bounded\":\"--dev-log-max-bytes caps generation and checkpoint events; run_start and run_end are always written\",\"trajectory\":\"the log is a reading: the archive, results and config hash are byte-identical with it on and off\",\"privacy\":\"counts, timings, hashes and error statistics only; no raw rows or personal data\",\"doc\":\"docs/dev-log.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),

@@ -11,6 +11,8 @@ pub mod complexity;
 pub mod data;
 pub mod diagnostics;
 pub mod enrich; // #200: append-only OHLCV feature enrichment
+pub mod devlog; // #211: optional development log
+pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
 pub mod features;
