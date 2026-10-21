@@ -121,6 +121,12 @@ pub struct Config {
     /// `0` keeps the historical path and `N` at least the sample size is an
     /// exact no-op. When both are set, `fit_rows` wins and is reported as such.
     pub fit_rows: usize,
+    /// #116: disk-backed rows for the streaming fit arm. `Some` only when the
+    /// CLI resolved a resident `.rcsb` store whose prepared training rows can be
+    /// re-read exactly; it is read by `--fit-strategy stream` and never changes
+    /// selection or scoring. Like [`simd`](Self::simd), it is a path choice and
+    /// is not saved in a checkpoint.
+    pub fit_stream_source: Option<std::sync::Arc<crate::fit::StoreSpec>>,
     /// #76: let the global Pareto front supply a fraction of parents. `false`
     /// is the pre-#76 algorithm, bit for bit; `true` (the default when it is
     /// measured to help) draws a parent from the front with probability
@@ -211,6 +217,7 @@ impl Default for Config {
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
+            fit_stream_source: None,
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
@@ -1361,6 +1368,34 @@ fn fit_constants_with_iters(
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
+        // #116: when the CLI resolved a disk-backed source for exactly these
+        // training rows, the stream arm reads them group by group instead of
+        // the resident `Sample`. This is the same exact f64 sufficient-
+        // statistic merge; a read/conditioning failure falls through to the
+        // resident strategy below.
+        let squared_family = matches!(
+            cfg.metric,
+            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
+        );
+        let full_training_rows = std::ptr::eq(fit, score)
+            && cfg.fit_samples == 0
+            && cfg.fit_rows == 0
+            && cfg.predictor_samples.is_none();
+        if cfg.fit_strategy == crate::fit::FitStrategy::Stream
+            && squared_family
+            && full_training_rows
+        {
+            if let Some(spec) = &cfg.fit_stream_source {
+                let source = crate::fit::StoreRows::new(spec.clone());
+                if let Some(sse) = crate::fit::fit_stream_source(tree, &source, iters) {
+                    return Some(FitResult {
+                        sse,
+                        hash: expr::structural_hash(tree),
+                        same_rows: true,
+                    });
+                }
+            }
+        }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::fit_weighted_strategy_metric(
             tree,

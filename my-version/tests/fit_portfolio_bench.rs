@@ -111,11 +111,21 @@ fn bench_varpro_vs_lm() {
             fit_weighted_strategy(&mut t, &x, &y, &[], 8, FitStrategy::VarPro);
             s.elapsed().as_secs_f64()
         }).collect());
+        let c = median((0..3).map(|_| {
+            let mut t = base.clone();
+            let s = Instant::now();
+            fit_weighted_strategy(&mut t, &x, &y, &[], 8, FitStrategy::Auto);
+            s.elapsed().as_secs_f64()
+        }).collect());
         let mut t8 = base.clone();
         let sse8 = fit_weighted_strategy(&mut t8, &x, &y, &[], 8, FitStrategy::VarPro);
         let mut t40 = base.clone();
         let sse40 = fit_weighted_strategy(&mut t40, &x, &y, &[], 40, FitStrategy::VarPro);
-        println!("varpro N={n:>7} lm={a:.6}s varpro={b:.6}s speedup={:.1}x sse8={sse8:.3e} sse40={sse40:.3e}", a / b);
+        println!(
+            "varpro N={n:>7} lm={a:.6}s varpro={b:.6}s auto={c:.6}s speedup={:.1}x auto_lm_ratio={:.2} sse8={sse8:.3e} sse40={sse40:.3e}",
+            a / b,
+            a / c
+        );
     }
 }
 

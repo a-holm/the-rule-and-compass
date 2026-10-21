@@ -48,6 +48,22 @@ pub struct VarProPartition {
 /// bilinear and is never admitted together, so `a*(b + x)` keeps one of them
 /// nonlinear. At least one constant must remain nonlinear; otherwise the
 /// closed-form linear arm owns the tree.
+/// #116: the deterministic `auto` cost gate for variable projection.
+///
+/// VarPro's inner beta solve is `O(N q²)` and each outer iteration pays a full
+/// Jacobian at the beta *and* theta columns. On the measured separable `p = 3`
+/// cells (`q = 2`, `s = 1`: `a·sin(b·x) + c`) that costs 2.5–3× exact LM, and
+/// the `auto` arm also pays LM for its quality check, so selecting VarPro there
+/// is a regression rather than an optimisation. `s >= 2` or `q >= 4` is the
+/// structural break-even: more than one nonlinear parameter amortises the outer
+/// Jacobian, and a wide linear block makes the inner solve the dominant,
+/// closed-form part. The rule is structural only, so it is reproducible from a
+/// seed and cannot thrash with wall-clock noise. The explicit `varpro` arm
+/// bypasses this gate; `auto` never does.
+pub fn cost_eligible(part: &VarProPartition) -> bool {
+    part.theta.len() >= 2 || part.beta.len() >= 4
+}
+
 pub(super) fn partition(f: &Flat) -> Option<VarProPartition> {
     let k = f.nconst;
     if k < 2 || k > VARPRO_MAX_CONSTANTS {

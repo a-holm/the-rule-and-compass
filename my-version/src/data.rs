@@ -1624,6 +1624,10 @@ pub struct Prepared {
     /// What data preparation did (missing values, outliers, smoothing,
     /// normalisation, row filter).
     pub prep: PrepReport,
+    /// #116: raw table row ids of [`Prepared::train`], in sample order. Empty
+    /// unless the caller used [`prepare_full_targets_weighted_with_indices`];
+    /// the ordinary preparation does not pay this `O(N)` allocation.
+    pub train_indices: Vec<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2302,6 +2306,39 @@ pub fn prepare_full_targets_weighted_with(
     rng: &mut Mt,
     prep: &PrepSpec,
 ) -> Result<Prepared, String> {
+    prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, false)
+}
+
+/// Like [`prepare_full_targets_weighted_with`], also returning the raw table row
+/// ids of the prepared training sample (`Prepared::train_indices`).
+///
+/// Collecting the ids costs one `usize` per training row, so it is opt-in: the
+/// CLI requests it only for a resident `.rcsb` store under
+/// `--fit-strategy stream`, where the ids let [`crate::fit::StoreRows`] re-read
+/// the same training rows from disk without keeping the sample resident.
+pub fn prepare_full_targets_weighted_with_indices(
+    t: &Table,
+    vars: &[String],
+    targets: &[&str],
+    weight: Option<&str>,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+    prep: &PrepSpec,
+) -> Result<Prepared, String> {
+    prepare_full_targets_weighted_inner(t, vars, targets, weight, spec, rng, prep, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_full_targets_weighted_inner(
+    t: &Table,
+    vars: &[String],
+    targets: &[&str],
+    weight: Option<&str>,
+    spec: &SplitSpec,
+    rng: &mut Mt,
+    prep: &PrepSpec,
+    collect_train_indices: bool,
+) -> Result<Prepared, String> {
     // With an explicit --fill method, a junk token in an otherwise numeric
     // column is treated as a missing value (and then filled or dropped).
     // Without it the column stays non-numeric, exactly as before. #133: only
@@ -2943,6 +2980,11 @@ pub fn prepare_full_targets_weighted_with(
         means,
         stds,
         report,
+        train_indices: if collect_train_indices {
+            train_idx.clone()
+        } else {
+            Vec::new()
+        },
         prep: PrepReport {
             fill: prep.fill.name(),
             rows_filled,
