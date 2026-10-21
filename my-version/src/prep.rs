@@ -932,7 +932,7 @@ pub fn check_labelled_rows(times: &[i64], allow_lockbox: bool) -> Result<(), Str
     crate::lockbox::Guard::new(allow_lockbox, None)
         .check_times("prep labelled rows", times)
         .map(|_| ())
-
+}
 
 /// Split `items` into at most `jobs` deterministic round-robin chunks.
 ///
