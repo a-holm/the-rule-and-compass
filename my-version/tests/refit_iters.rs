@@ -112,12 +112,16 @@ fn refit_iters_one_is_deterministic() {
     );
 }
 
-/// Pre-registered quality gate on a small deterministic fixture: the opt-in
-/// one-iteration promotion refit must not lose best error (5% per seed, 20%
-/// worst case) and must keep fixed-reference hypervolume within 2% of the
-/// full-budget promotion refit at equal evaluations.
+/// The same gate on a small deterministic fixture: the opt-in one-iteration
+/// promotion refit must not lose best error (5% per seed, 20% worst case) and
+/// must keep fixed-reference hypervolume within 2% of the full-budget promotion
+/// refit at equal evaluations.
+///
+/// This is the regression guard for the mechanics, not evidence for the
+/// recorded workload: the paired w2.csv gate over seeds 1/7/42 fails and is
+/// recorded in `docs/optimisation.md`.
 #[test]
-fn refit_iters_one_meets_the_quality_gate() {
+fn refit_iters_one_meets_the_quality_gate_on_the_easy_fixture() {
     let train = sample(120);
     let test = sample(40);
     for seed in [1, 7, 42] {
