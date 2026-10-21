@@ -362,9 +362,13 @@ atomically instead of streaming it. See
   splice ratios, charges both sides and the final exit, supplies a
   matched-exposure random-long benchmark, refuses 2026H2 in every runner, and
   emits a checksummed provenance manifest with a lockbox-coverage block.
-  `panel build --resume` caches one atomic part per symbol; `prep --resume`
-  caches one checksum-keyed spool per symbol; `--snapshot` embeds
-  a verified archive snapshot. See [`docs/panel.md`](docs/panel.md).
+  `panel build --resume` caches one atomic **binary** part per symbol, keyed by
+  the input store SHA-256, the membership decisions and the settings; a fully
+  warm run reads the parts only (it does not parse the store) and reproduces a
+  byte-identical panel. `panel membership --cache` keys the membership table the
+  same way. `prep --resume` caches one checksum-keyed spool per symbol;
+  `--snapshot` embeds a verified archive snapshot. See
+  [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
