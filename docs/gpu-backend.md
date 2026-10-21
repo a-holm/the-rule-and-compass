@@ -56,13 +56,18 @@ actionable error naming the target, the detected toolkit, and the minimum
 supported CUDA version. For example, on a CUDA 12.0 machine:
 
 ```text
-error: RCSR_CUDA_ARCH=sm_121 needs CUDA 12.8 or newer, but `nvcc` is CUDA 12.0.
+error: RCSR_CUDA_ARCH=sm_121 needs CUDA 12.9 or newer, but `nvcc` is CUDA 12.0.
 error: sm_121 is the GB10 in the DGX Spark; its DGX OS images ship CUDA 13.0.
 error: Install a newer toolkit and point RCSR_NVCC at it, for example:
-error:   RCSR_NVCC=/usr/local/cuda-12.8/bin/nvcc RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
+error:   RCSR_NVCC=/usr/local/cuda-12.9/bin/nvcc RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
 error: or build for the GPU in this machine, for example:
 error:   RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 ```
+
+CUDA 12.8 was the wrong floor: it added Blackwell (`sm_100`, `sm_120`) but its
+`nvcc --list-gpu-arch` stops at `compute_120`. `sm_121` first appears in CUDA
+12.9 (`compute_121`), so a 12.8 toolkit fails with "not defined for option
+'gpu-architecture'" even though the build script used to let it through.
 
 Environment overrides for the build:
 
@@ -79,7 +84,62 @@ Minimum toolkit per target, as used by the build-script check:
 | `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0 |
 | `sm_90` / `sm_90a` | 11.8 / 12.0 | Hopper |
 | `sm_100` | 12.8 | datacentre Blackwell |
-| `sm_121` | 12.8 | GB10 / DGX Spark; DGX OS ships CUDA 13.x |
+| `sm_120` | 12.8 | consumer Blackwell |
+| `sm_121` | 12.9 | GB10 / DGX Spark; DGX OS ships CUDA 13.x |
+
+The build-script check is deliberately about the **compiler**, not the device:
+`RCSR_CUDA_ARCH=sm_121` succeeds on any machine with CUDA ≥ 12.9 and needs no
+GB10 attached.
+
+### `sm_121` compile-only validation (#28)
+
+[`tests/sm121_compile.rs`](../my-version/tests/sm121_compile.rs) compiles the
+real `src/cuda/eval.cu` for `sm_121` and inspects the cubin. It needs CUDA ≥
+12.9 and `cuobjdump`, but no GPU; when no such toolkit is found it prints a skip
+note and the rest of the suite is unaffected. Run it explicitly:
+
+```sh
+RCSR_SM121_NVCC=/path/to/cuda-13/bin/nvcc \
+  cargo test --release --test sm121_compile -- --nocapture
+```
+
+The test asserts that `nvcc`/`ptxas` accept `-arch=sm_121`, that
+`cuobjdump --list-elf` names an `.sm_121.cubin`, that `--dump-sass` is tagged
+`code for sm_121` / `EF_CUDA_SM121`, and that `ptxas -v` reports a resource line
+for `eval_pool_kernel` and `fit_kernel`.
+
+Recorded on 2026-10-21 with CUDA 13.0.88 (V13.0.88) on an x86_64 host, no GPU
+involved:
+
+| Kernel | Registers | Stack | Static smem |
+|---|---|---|---|
+| `eval_pool_kernel` | 30 | 288 B | 1 024 B |
+| `eval_kernel` | 33 | 288 B | 1 024 B |
+| `fit_kernel` | 110 | 1 744 B | 40 672 B |
+| `predict_kernel` | 29 | 288 B | — |
+| `hash_kernel` | 14 | — | — |
+
+`cuobjdump --dump-sass` reports `code for sm_121` and
+`EF_CUDA_SM121 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM121)`; the disassembly contains
+Blackwell instructions (`UMOV.64`, `DFMA`, `LDS.64`). This is **compile
+evidence**: the source and toolchain produce real `sm_121` device code, and the
+resource budget is recorded. It is **not** evidence that a GB10 loaded or ran
+the kernels, and it says nothing about occupancy or speed.
+
+**The runtime half stays open.** `sm_121` execution needs a GB10 (or another
+`sm_121` device) and its driver. Acceptance is therefore split explicitly:
+*compiles for `sm_121`* is local and permanent (the test above); *runs on GB10*
+is one dated remote session recording `nvidia-smi` (device, driver, compute
+capability), the GPU test suite and a benchmark. The second must never be
+marked from cross-compilation alone.
+
+**PTX portability is not `sm_121` performance evidence.** The current `sm_86`
+build embeds `compute_86` PTX (`cuobjdump -lptx` shows `*.sm_86.ptx`), and PTX
+is forward-compatible, so that fatbin can JIT for `sm_121` and run (set
+`CUDA_FORCE_PTX_JIT=1` to force the path). That proves the source is portable
+and is the cheapest first check on a rented Spark; it does not measure native
+`sm_121` codegen, so it cannot replace either the compile test above or the
+native run.
 
 
 ## How it works
@@ -691,7 +751,7 @@ Exact build commands:
 # RTX 3060 / Ampere: plain device memory, CUDA 11.1+ (verified with 12.0)
 RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 
-# DGX Spark / GB10: CUDA 12.8+ (13.0+ on DGX OS), unified memory on by default
+# DGX Spark / GB10: CUDA 12.9+ (13.0+ on DGX OS), unified memory on by default
 RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
 
 # unified memory on any other target, e.g. to test the path on a discrete GPU
@@ -703,12 +763,14 @@ RCSR_CUDA_ARCH=sm_121 RCSR_GPU_UNIFIED=0 cargo build --release --features cuda
 
 Plan and status:
 
-1. **Native build.** `RCSR_CUDA_ARCH=sm_121`, CUDA 12.8+ `nvcc` (CUDA 13 on DGX
-   OS). Implemented: the architecture is accepted by the validator and the
-   build script reports the required toolkit instead of dumping nvcc output.
-   `sm_121` is a *consumer Blackwell* target; datacentre flags such as `sm_100`
-   will not run on it. **The binary itself has not been built or run here**
-   because this machine's `nvcc` is CUDA 12.0.
+1. **Native build.** `RCSR_CUDA_ARCH=sm_121`, CUDA 12.9+ `nvcc` (CUDA 13 on DGX
+   OS). Implemented: the architecture is accepted by the validator, the build
+   script reports the required toolkit instead of dumping nvcc output, and
+   `tests/sm121_compile.rs` compile-verifies a real `sm_121` cubin with CUDA
+   13.0.88 (see “`sm_121` compile-only validation” above). `sm_121` is a
+   *consumer Blackwell* target; datacentre flags such as `sm_100` will not run
+   on it. **The kernels have not been run on a GB10 here**: compilation is
+   local and permanent, execution is hardware-gated.
 2. **Unified memory.** Implemented. Building for `sm_121` compiles the context
    with `-DRCSR_UNIFIED=1`, which allocates every buffer with
    `cudaMallocManaged` (host-accessible, explicit copies removed). The same
@@ -861,20 +923,28 @@ substitute for either.
 | SM occupancy / achieved SM throughput | needs `ncu` with counter permission | **unverified here** — reported as `null`, never invented |
 | `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
-| `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |
+| `sm_121` compilation (cubin + SASS + register/smem audit) | x86_64 host, CUDA 13.0.88, **no GPU** (`tests/sm121_compile.rs`) | **verified — compiled, not run** |
+| `sm_121` execution on a GB10 (device, driver, GPU tests, benchmark) | needs a dated session on `sm_121` hardware | **hardware-gated — not run here** |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 
-What would close the gaps: on a DGX Spark (or any `sm_121` + CUDA 13 machine),
-run
+The compile gap is closed by the test and table above; it can be re-run on any
+machine with CUDA ≥ 12.9. The runtime gap needs a DGX Spark (or any `sm_121` +
+CUDA 13 machine), where the dated session should record:
 
 ```sh
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 RCSR_CUDA_ARCH=sm_121 cargo test --release --features cuda
 RCSR_CUDA_ARCH=sm_121 ./target/release/rcsr-gpu-bench --data <set> --batch 8000
+
+# first, the cheap portability check on the existing sm_86 build:
+CUDA_FORCE_PTX_JIT=1 ./target/release/rcsr-gpu-bench --data <set> --batch 8000
 ```
 
 then repeat the benchmark with a dataset whose f32 columns exceed device VRAM,
 and compare the unified run with `RCSR_GPU_UNIFIED=0`. The benchmark prints the
 device, the architecture and `memory : device|unified`, so the result records
-which path produced it.
+which path produced it. The PTX-JIT run proves portability only; the native
+`sm_121` build is what the performance claim needs. Neither run is claimed
+here.
 

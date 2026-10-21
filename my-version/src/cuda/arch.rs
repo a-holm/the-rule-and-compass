@@ -94,8 +94,10 @@ pub fn parse_arch(s: &str) -> Result<Arch, String> {
 ///
 /// The values are the toolkit releases that introduced each compute capability;
 /// they are deliberately conservative (an older toolkit cannot compile the
-/// target at all). `sm_121` is the GB10 in the DGX Spark; CUDA 12.8 added the
-/// Blackwell family, and the DGX OS images ship CUDA 13.
+/// target at all). CUDA 12.8 added Blackwell (`sm_100`, `sm_120`);
+/// `sm_121` — the GB10 in the DGX Spark — first appears in CUDA 12.9, and
+/// 12.8's `nvcc --list-gpu-arch` stops at `compute_120`. The DGX OS images
+/// ship CUDA 13.
 pub fn minimum_cuda(a: Arch) -> Option<(u32, u32)> {
     match (a.major, a.minor) {
         (0, _) => None,
@@ -111,7 +113,8 @@ pub fn minimum_cuda(a: Arch) -> Option<(u32, u32)> {
                 Some((11, 8))
             }
         }
-        (10, _) | (12, _) => Some((12, 8)),
+        (10, _) | (12, 0) => Some((12, 8)),
+        (12, _) => Some((12, 9)),
         _ => None,
     }
 }
@@ -187,8 +190,10 @@ mod tests {
         assert_eq!(minimum_cuda(sm86), Some((11, 1)));
         assert_eq!(minimum_cuda(sm90), Some((11, 8)));
         assert_eq!(minimum_cuda(sm90a), Some((12, 0)));
-        assert_eq!(minimum_cuda(sm121), Some((12, 8)));
+        assert_eq!(minimum_cuda(sm121), Some((12, 9)));
+        assert_eq!(minimum_cuda(parse_arch("sm_121a").unwrap()), Some((12, 9)));
         assert_eq!(minimum_cuda(parse_arch("sm_100").unwrap()), Some((12, 8)));
+        assert_eq!(minimum_cuda(parse_arch("sm_120").unwrap()), Some((12, 8)));
     }
 
     #[test]
