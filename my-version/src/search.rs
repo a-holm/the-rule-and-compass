@@ -798,7 +798,7 @@ impl GpuSearch {
             self.fit_screened += pending.len();
             self.stats.entry(generation).or_default().fit_screened += pending.len();
             self.evaluate_pending(islands, &pending, train, cfg, generation)?;
-            let admitted = select_promoted(islands, &pending);
+            let admitted = select_promoted(islands, &pending, train.len());
             let fit_start = std::time::Instant::now();
             self.fit_pending(islands, &admitted, train, cfg, generation);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
@@ -1918,28 +1918,55 @@ fn status_fallback_cause(status: i32) -> FitFallbackCause {
     }
 }
 
+/// #169: training size at which the seed-constant screen stops paying for
+/// itself.
+///
+/// Below this many rows the screen is a useful proxy: it ranks offspring by
+/// their inherited/parent-fitted constants, which is close to what the LM will
+/// produce, and cutting the fitted fraction keeps the fit volume down. At
+/// `N >= 1 048 576` the same screen becomes almost uninformative while the
+/// exact CPU fit dominates the generation: the 3.9M hourly probe admitted only
+/// `pop/4` and reached best error 0.4753 against 0.1612 for the exact arm at
+/// equal evaluations. Widening admission to every candidate with constants
+/// restores the exact arm's fit coverage; the batched kernel is still 17-25x
+/// faster per candidate, so the arm remains a speed-up. The threshold is a row
+/// count, never a timing measurement, so the admission set stays reproducible.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) const WIDE_ADMISSION_ROWS: usize = 1 << 20;
+
 /// #169: how many offspring of one island are admitted to the fitted LM batch.
 ///
-/// The fixed fraction `pop/4` is floored at 32 so a small island still admits
-/// the candidates the kernel is best at, and capped at the island size so the
-/// default and the tiny test configurations are exact no-ops. The choice uses
-/// only the population size, never timing, so it is reproducible.
+/// Below [`WIDE_ADMISSION_ROWS`] the fixed fraction `pop/4` is floored at 32 so
+/// a small island still admits the candidates the kernel is best at, and capped
+/// at the island size so the default and the tiny test configurations are exact
+/// no-ops. At and above the threshold every candidate with constants is
+/// admitted, because the seed-constant screen no longer predicts the fitted
+/// ranking well enough to leave three quarters of the offspring unfitted (the
+/// 3.9M hourly cell failed its quality gate that way). The choice uses only the
+/// population size and the row count, never timing, so it is reproducible.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn admission_count(island_pop: usize) -> usize {
+fn admission_count(island_pop: usize, train_rows: usize) -> usize {
+    if train_rows >= WIDE_ADMISSION_ROWS {
+        return island_pop.max(1);
+    }
     ((island_pop / 4).max(32)).min(island_pop).max(1)
 }
 
 /// #169: deterministic admission of pending offspring to the fitted LM batch.
 ///
 /// Every pending (`error.is_nan()`) individual is screened with its seed
-/// constants first. Per island, the best `admission_count(island_pop)` are
-/// promoted; ties break on complexity and then on the population index, so the
-/// set depends only on the screened errors and the fixed island/population
-/// order. Non-promoted offspring keep their screening score.
+/// constants first. Per island, the best `admission_count(island_pop,
+/// train_rows)` are promoted; ties break on complexity and then on the
+/// population index, so the set depends only on the screened errors, the row
+/// count and the fixed island/population order. Non-promoted offspring keep
+/// their screening score. At `train_rows >= WIDE_ADMISSION_ROWS` every
+/// candidate with constants is promoted, so the screen can only exclude trees
+/// that have nothing to fit.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn select_promoted(
     islands: &[Vec<Ind>],
     pending: &[(usize, usize)],
+    train_rows: usize,
 ) -> Vec<(usize, usize)> {
     let mut promoted = Vec::with_capacity(pending.len());
     for (i, pop) in islands.iter().enumerate() {
@@ -1966,7 +1993,7 @@ fn select_promoted(
                 )
                 .then(a.0.cmp(&b.0))
         });
-        let take = admission_count(pop.len()).min(ranked.len());
+        let take = admission_count(pop.len(), train_rows).min(ranked.len());
         promoted.extend(ranked[..take].iter().map(|&(j, _, _)| (i, j)));
     }
     // Fitting order is deterministic; the candidates are independent, but a
@@ -4767,15 +4794,23 @@ mod tests {
         }
     }
 
-    /// #169: the admission fraction is a pure function of the population size.
+    /// #169: the admission fraction is a pure function of the population size
+    /// and the training row count, and widens to every candidate at large `N`.
     #[test]
     fn admission_count_is_the_documented_fraction() {
-        assert_eq!(admission_count(1), 1);
-        assert_eq!(admission_count(24), 24, "small islands admit everyone");
-        assert_eq!(admission_count(64), 32, "max(32, pop/4)");
-        assert_eq!(admission_count(100), 32);
-        assert_eq!(admission_count(128), 32);
-        assert_eq!(admission_count(256), 64);
+        let small = WIDE_ADMISSION_ROWS - 1;
+        assert_eq!(admission_count(1, small), 1);
+        assert_eq!(admission_count(24, small), 24, "small islands admit everyone");
+        assert_eq!(admission_count(64, small), 32, "max(32, pop/4)");
+        assert_eq!(admission_count(100, small), 32);
+        assert_eq!(admission_count(128, small), 32);
+        assert_eq!(admission_count(256, small), 64);
+        // 154k, the pinned fit-heavy cell: the documented fraction is unchanged.
+        assert_eq!(admission_count(256, 154_000), 64);
+        // The 3.9M hourly cell: every candidate with constants is admitted.
+        assert_eq!(admission_count(128, 3_900_000), 128);
+        assert_eq!(admission_count(256, WIDE_ADMISSION_ROWS), 256);
+        assert_eq!(admission_count(1, WIDE_ADMISSION_ROWS), 1);
     }
 
     /// #169: promotion is deterministic, per island, and ranks on the same
@@ -4801,8 +4836,8 @@ mod tests {
         let pending: Vec<(usize, usize)> = (0..2)
             .flat_map(|i| (0..n).filter(|j| j % 17 != 0).map(move |j| (i, j)))
             .collect();
-        let a = select_promoted(&islands, &pending);
-        let b = select_promoted(&islands, &pending);
+        let a = select_promoted(&islands, &pending, 240);
+        let b = select_promoted(&islands, &pending, 240);
         assert_eq!(a, b, "the same screen must yield the same admission set");
         assert_eq!(a.len(), 64, "32 per island");
 
@@ -4849,7 +4884,7 @@ mod tests {
             ind.error = 5.0;
         }
         let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
-        let got = select_promoted(&islands, &pending);
+        let got = select_promoted(&islands, &pending, 240);
         let mut wanted: Vec<(usize, usize)> = (0..8).map(|j| (0, j)).collect();
         wanted.extend((40..64).map(|j| (0, j)));
         assert_eq!(got, wanted, "lower complexity wins an error tie");
@@ -4868,12 +4903,42 @@ mod tests {
             islands[0].push(ind);
         }
         let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
-        let got = select_promoted(&islands, &pending);
+        let got = select_promoted(&islands, &pending, 240);
         assert_eq!(got.len(), 32);
         assert!(
             got.iter().all(|&(_, j)| j % 2 == 1),
             "only trees with constants may be admitted: {:?}",
             got
+        );
+    }
+
+    /// #169: at and above `WIDE_ADMISSION_ROWS` the seed-constant ranking must
+    /// not leave a fittable offspring unfitted. Every candidate with constants
+    /// is promoted, regardless of its screened error, while a tree with no
+    /// constants is still skipped (there is nothing for the LM to fit).
+    #[test]
+    fn large_cells_admit_every_candidate_with_constants() {
+        let mut islands = vec![Vec::new()];
+        for j in 0..128 {
+            let mut ind = pending_ind(1.0 + j as f64, 1.0);
+            if j % 16 == 0 {
+                ind.tree = input(0); // no constants
+            }
+            islands[0].push(ind);
+        }
+        let pending: Vec<(usize, usize)> = (0..128).map(|j| (0, j)).collect();
+        let got = select_promoted(&islands, &pending, WIDE_ADMISSION_ROWS);
+        let wanted: Vec<(usize, usize)> = (0..128).filter(|j| j % 16 != 0).map(|j| (0, j)).collect();
+        assert_eq!(
+            got, wanted,
+            "every fittable candidate must be admitted at large N"
+        );
+        // Just below the threshold the old fraction still applies.
+        let narrow = select_promoted(&islands, &pending, WIDE_ADMISSION_ROWS - 1);
+        assert_eq!(
+            narrow.len(),
+            32,
+            "below the threshold the pop/4 floor is unchanged"
         );
     }
 

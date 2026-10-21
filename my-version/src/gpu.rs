@@ -2811,6 +2811,88 @@ mod fit_tests {
         }
     }
 
+    /// #169 diagnostic (ignored): does the batched kernel still match the CPU
+    /// LM at the hourly cell's row count? Run with
+    /// `cargo test --release --features cuda --lib diagnostic_gpu_fit_matches_cpu_at_one_million_rows -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn diagnostic_gpu_fit_matches_cpu_at_one_million_rows() {
+        use crate::expr::random_tree_with;
+        use crate::metrics::Metric;
+        use crate::rng::Mt;
+        let n = 1_050_000usize;
+        let mut x: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut y: Vec<f64> = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64 * 6.0 - 3.0;
+            let s = ((i as u32).wrapping_mul(2_654_435_761) ^ 21) as f64 / u32::MAX as f64;
+            x.push(vec![t, s * 2.0 - 1.0]);
+            y.push(1.7 * t.sin() + 0.4 * t + 0.3 * s - 0.2);
+        }
+        let mut cols = vec![0.0f32; n * 2];
+        for (r, row) in x.iter().enumerate() {
+            cols[r] = row[0] as f32;
+            cols[n + r] = row[1] as f32;
+        }
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = match GpuEvaluator::new(&cols, n, 2, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n * 2];
+        for (r, row) in x.iter().enumerate() {
+            cols64[r] = row[0];
+            cols64[n + r] = row[1];
+        }
+        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        let ops = [
+            Op::Add, Op::Sub, Op::Mul, Op::Sin, Op::Cos, Op::Tanh, Op::Gauss, Op::Square,
+            Op::Cube, Op::Neg,
+        ];
+        let mut rng = Mt::new(9);
+        let mut trees = Vec::new();
+        while trees.len() < 24 {
+            let t = crate::expr::simplify(&random_tree_with(&mut rng, 2, &ops, 4, None));
+            if crate::fit::gpu_fit_plan_reason(&t).is_ok() {
+                trees.push(t);
+            }
+        }
+        let plans: Vec<_> = trees
+            .iter()
+            .map(|t| crate::fit::gpu_fit_plan(t).expect("plan"))
+            .collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (out, ms) = ev.fit_batch(&refs, 8);
+        eprintln!("kernel {:.1} ms for {} candidates", ms, out.len());
+        let sample = crate::data::Sample {
+            x,
+            y,
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let mut worst = 0.0f64;
+        for (k, ((tree, plan), res)) in trees.iter().zip(&plans).zip(&out).enumerate() {
+            let mut cpu = tree.clone();
+            let cpu_sse = crate::fit::fit_weighted_metric(
+                &mut cpu, &sample.x, &sample.y, &[], 8, Metric::Squared,
+            );
+            let mut gpu = tree.clone();
+            plan.apply(&mut gpu, &res.c);
+            let gpu_sse = crate::search::eval_error(&gpu, &sample, Metric::Squared) * n as f64;
+            let rel = (gpu_sse - cpu_sse).abs() / cpu_sse.max(1e-300);
+            worst = worst.max(rel);
+            eprintln!(
+                "cand {} p={} status={} cpu={:.6e} gpu={:.6e} rel={:.2e}",
+                k, plan.nconst, res.status, cpu_sse, gpu_sse, rel
+            );
+        }
+        eprintln!("worst relative SSE gap {:.3e}", worst);
+    }
+
     #[test]
     fn a_fitted_tree_is_independent_of_batch_composition() {
         let n = 400;
