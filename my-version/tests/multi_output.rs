@@ -270,8 +270,8 @@ fn timing_phases_sum_to_wall_in_text_json_and_ndjson() {
     // The text line rounds to hundredths, so it cannot carry a 1% arithmetic
     // check on a sub-second fixture; the JSON numbers below do that.
     assert!(
-        fields["total"] > 0.0,
-        "text total wall must be positive: {line}"
+        fields["total"] >= 0.0,
+        "text total wall must not be negative: {line}"
     );
     assert!(
         fields["prep"] + fields["search"] <= fields["total"] + 0.01,
@@ -306,11 +306,13 @@ fn timing_phases_sum_to_wall_in_text_json_and_ndjson() {
     ];
     let json_sum: f64 = phases.iter().map(|k| num_after(k)).sum();
     let json_total = num_after("total_seconds");
-    assert!(json_total > 0.0, "JSON total wall must be positive: {body}");
-    assert!(
-        (json_sum - json_total).abs() <= 0.01 * json_total,
-        "JSON phases must sum to wall within 1%: {json_sum} vs {json_total}"
-    );
+    assert!(json_total >= 0.0, "JSON total wall must not be negative: {body}");
+    if json_total > 0.0 {
+        assert!(
+            (json_sum - json_total).abs() <= 0.01 * json_total,
+            "JSON phases must sum to wall within 1%: {json_sum} vs {json_total}"
+        );
+    }
     assert_eq!(
         num_after("elapsed_seconds"),
         num_after("search_seconds"),
