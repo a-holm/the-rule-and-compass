@@ -1380,9 +1380,10 @@ fn score_pipeline_batch(
 
 /// #26: whether a run may use the GPU at all.
 ///
-/// Restricted to the single-output, unweighted, full-sample regression path:
-/// multi-output and implicit objectives need more than one prediction per row,
-/// and `--predictor-samples` changes the rows every generation, so each of
+/// Restricted to the single-output, unweighted, full-sample **squared-error**
+/// path: multi-output and implicit objectives need more than one prediction per
+/// row, `--predictor-samples` changes the rows every generation, and every
+/// non-squared metric needs an objective the device does not score yet. Each of
 /// those keeps the CPU evaluator.
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
@@ -1400,6 +1401,14 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     }
     if cfg.metric.is_parameter_aware() {
         return Some("parameter-aware metric");
+    }
+    // #236: the CUDA evaluator accumulates squared error. Every other metric
+    // must be scored on the CPU until its objective is native on the device;
+    // otherwise a slope/absolute/rank run can silently rank by MSE. This is a
+    // correctness gate, not a performance preference: remove it only together
+    // with a tested native scorer for the metric.
+    if cfg.metric != crate::metrics::Metric::Squared {
+        return Some("metric is not scored natively on the GPU");
     }
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
