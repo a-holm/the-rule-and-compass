@@ -113,7 +113,7 @@ Text output adds two lines:
       "reachable_coverage":0.6316,"entries":31,"best_error":1.145...,
       "cell_cap":4,"occupancy_entropy":2.31,
       "occupancy_entropy_normalized":0.784,"qd_score":3.812,
-      "hypervolume":0.7143,"evaluations":12000},
+      "descriptor_fallbacks":0,"hypervolume":0.7143,"evaluations":12000},
 "validation_hv":{"sample":"test","reference_error":0.912,
                  "hypervolume":4.201337,"points":9}
 ```
@@ -144,6 +144,10 @@ Text output adds two lines:
 * `qd_score = Σ 1 / (1 + best_error)` over occupied reachable cells pairs
   coverage with quality. A descriptor map that occupies every cell with useless
   predictions has near-zero QD-score.
+* `descriptor_fallbacks` counts archive insertions that needed the evaluating
+  fallback (GPU-scored, subset-scored or previously unseen trees). It is `0`
+  for a CPU run whose candidates all came through the one-pass scoring path,
+  and is the direct evidence that QD no longer re-evaluates every candidate.
 * `hypervolume` is the old dominated area **normalised by the arm's own observed
   `(cost, error)` extremes**. It is kept as a diagnostic and must not be
   compared between runs: a worse front can score higher by shrinking its span.

@@ -206,6 +206,15 @@ fn fixed_reference_validation_hypervolume_is_reported_for_every_arm() {
             .expect("reference error")
     };
     assert_eq!(reference(&baseline), reference(&qd));
+    // #120: the CPU passive path classifies every candidate from the scoring
+    // pass; the archive must not fall back to a second tree evaluation.
+    let fallbacks: usize = qd_object(&qd)
+        .split("\"descriptor_fallbacks\":")
+        .nth(1)
+        .and_then(|s| s.split(',').next())
+        .and_then(|s| s.parse().ok())
+        .expect("descriptor_fallbacks");
+    assert_eq!(fallbacks, 0, "QD re-evaluated candidates for descriptors");
     // Deterministic for a seed (timing fields are not).
     let repeat = json(&["--qd", "--qd-cells", "8"]);
     assert_eq!(qd_object(&repeat), qd_object(&qd));

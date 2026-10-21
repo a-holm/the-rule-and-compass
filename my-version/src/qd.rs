@@ -145,6 +145,10 @@ pub struct QdArchive {
     known: HashMap<u64, Descriptor>,
     /// Fingerprint of the sample `known` entries were computed on.
     known_tag: u64,
+    /// How many archive insertions needed the evaluating descriptor fallback
+    /// (GPU-scored, subset-scored or unknown trees). Reported so the one-pass
+    /// claim is measurable from `--json` instead of asserted.
+    fallbacks: usize,
 }
 
 /// Keep the descriptor cache bounded; a long run must not retain one entry per
@@ -192,6 +196,9 @@ pub struct QdReport {
     pub qd_score: f64,
     /// Total candidates offered to the archive.
     pub evaluations: usize,
+    /// Archive insertions that needed the evaluating descriptor fallback. Zero
+    /// on a CPU run whose candidates were all scored by the one-pass path.
+    pub descriptor_fallbacks: usize,
 }
 
 
@@ -273,6 +280,7 @@ impl QdArchive {
             nvars: 2,
             known: HashMap::new(),
             known_tag: 0,
+            fallbacks: 0,
         }
     }
 
@@ -299,6 +307,7 @@ impl QdArchive {
             nvars: 2,
             known: HashMap::new(),
             known_tag: 0,
+            fallbacks: 0,
         }
     }
 
@@ -318,6 +327,7 @@ impl QdArchive {
             nvars: 2,
             known: HashMap::new(),
             known_tag: 0,
+            fallbacks: 0,
         }
     }
 
@@ -385,7 +395,10 @@ impl QdArchive {
         }
         let d = match self.known.get(&expr::structural_hash(tree)) {
             Some(d) => *d,
-            None => descriptor(tree, sample),
+            None => {
+                self.fallbacks += 1;
+                descriptor(tree, sample)
+            }
         };
         self.remember(tree, d);
         self.insert_descriptor(tree, error, cost, d)
@@ -456,9 +469,17 @@ impl QdArchive {
             self.known_tag = tag;
         }
         for (tree, error, cost, d) in trees {
-            let d = d
-                .or_else(|| self.known.get(&expr::structural_hash(&tree)).copied())
-                .unwrap_or_else(|| descriptor(&tree, sample));
+            let hash = expr::structural_hash(&tree);
+            let d = match d {
+                Some(d) => d,
+                None => match self.known.get(&hash).copied() {
+                    Some(d) => d,
+                    None => {
+                        self.fallbacks += 1;
+                        descriptor(&tree, sample)
+                    }
+                },
+            };
             self.remember(&tree, d);
             self.insert_descriptor(&tree, error, cost, d);
         }
@@ -703,6 +724,7 @@ impl QdArchive {
             occupancy_entropy_normalized: entropy_norm,
             qd_score,
             evaluations: self.records,
+            descriptor_fallbacks: self.fallbacks,
         }
     }
 

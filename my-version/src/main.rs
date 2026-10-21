@@ -785,7 +785,7 @@ fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
             "# qd ({}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
-             entropy {:.3}/{:.3} bits, qd-score {:.4}, hypervolume {:.4} (self-normalised diagnostic)",
+             entropy {:.3}/{:.3} bits, qd-score {:.4}, descriptor fallbacks {}, hypervolume {:.4} (self-normalised diagnostic)",
             q.mode,
             q.occupied_reachable,
             q.reachable,
@@ -795,6 +795,7 @@ fn qd_text(q: Option<&qd::QdReport>) {
             q.occupancy_entropy,
             q.occupancy_entropy_normalized,
             q.qd_score,
+            q.descriptor_fallbacks,
             q.hypervolume
         );
     }
@@ -805,7 +806,7 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
             q.mode,
             q.bins,
             q.cells,
@@ -820,6 +821,7 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
             jnum(q.occupancy_entropy),
             jnum(q.occupancy_entropy_normalized),
             jnum(q.qd_score),
+            q.descriptor_fallbacks,
             jnum(q.hypervolume),
             q.evaluations
         ),
