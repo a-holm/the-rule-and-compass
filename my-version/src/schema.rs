@@ -215,6 +215,24 @@ pub fn json() -> String {
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (unlabelled provenance is always allowed)\"}}]}},\n  \
+         \"enrich\":{{\"command\":\"rcsr enrich\",\"summary\":\"append causal, gap-aware OHLCV features to an existing .rcsb store without rebuilding it\",\"doc\":\"docs/ohlcv.md\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"existing .rcsb store or a CSV (loaded once into a temporary store)\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"<data>.enriched.rcsb\",\"description\":\"output store; existing columns are copied byte for byte\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, py15m, all, or explicit names; #125 names/groups also accepted\"}},\
+{{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n> (repeatable; labels are targets)\"}},\
+{{\"name\":\"--replace\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"overwrite an existing numeric column in place; default refuses a duplicate and preserves every column\"}},\
+{{\"name\":\"--chunk-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"read/compute batch; arithmetic and output hashes are identical for every size\"}},\
+{{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"store default\",\"description\":\"group size for a CSV input store\"}},\
+{{\"name\":\"--bar-seconds\",\"type\":\"int\",\"default\":\"inferred\",\"description\":\"expected bar spacing; windows spanning a missing bucket are NaN\"}},\
+{{\"name\":\"--time\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"time column\"}},\
+{{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"panel symbol column\"}},\
+{{\"name\":\"--cross-symbol\",\"type\":\"string\",\"default\":\"BTCUSDT\",\"description\":\"benchmark symbol for btc/cross features\"}},\
+{{\"name\":\"--cross-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"benchmark store when --data does not contain it\"}},\
+{{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; CPU is always available\"}},\
+{{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
+{{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
+{{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
+{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout\"}}]}},\n  \
          \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
 {{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
