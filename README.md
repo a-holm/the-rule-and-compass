@@ -349,7 +349,8 @@ atomically instead of streaming it. See
   splice ratios, charges both sides and the final exit, supplies a
   matched-exposure random-long benchmark, refuses 2026H2 in every runner, and
   emits a checksummed provenance manifest with a lockbox-coverage block.
-  `panel build --resume` caches one atomic part per symbol; `--snapshot` embeds
+  `panel build --resume` caches one atomic part per symbol; `prep --resume`
+  caches one checksum-keyed spool per symbol; `--snapshot` embeds
   a verified archive snapshot. See [`docs/panel.md`](docs/panel.md).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.

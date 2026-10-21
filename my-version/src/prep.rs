@@ -295,6 +295,10 @@ pub struct Options {
     pub dry_run: bool,
     pub jobs: usize,
     pub group_rows: usize,
+    /// #145: resumable per-symbol cache. Each completed symbol is written to
+    /// the directory atomically (one spool plus one key sidecar) and reused on
+    /// a later build when its archive checksums and the build settings match.
+    pub resume: Option<String>,
     /// #145: permit a labelled build (an evaluation target) inside 2026H2.
     /// Unlabelled bars are provenance and are always allowed.
     pub allow_lockbox: bool,
@@ -318,6 +322,7 @@ impl Default for Options {
             dry_run: false,
             jobs: 1,
             group_rows: store::DEFAULT_GROUP_ROWS,
+            resume: None,
             allow_lockbox: false,
         }
     }
@@ -423,15 +428,21 @@ fn symbol_of(path: &Path, root: Option<&Path>, override_symbol: Option<&str>) ->
 
 /// Parse one source into raw bars. Header detection is by aliases, so a
 /// headerless Binance/Bitstamp export and a named OHLCV CSV both work.
-fn parse_source(
+/// Parse one source from bytes that the caller has already read (and hashed).
+/// `prep` reads each archive once, hashes those bytes for the resume key and
+/// the manifest, and then parses the same buffer, so a cold build does not pay
+/// for a second pass over 2.8 GB of ZIPs.
+fn parse_source_bytes(
     src: &Source,
     layout: Layout,
     tz: Tz,
     audit: &mut Audit,
+    bytes: Vec<u8>,
 ) -> Result<Vec<Bar>, String> {
     let mut texts: Vec<(String, String)> = Vec::new();
     if src.path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("zip")) == Some(true) {
-        let archive = zip::ZipArchive::open(&src.path.to_string_lossy())?;
+        let archive = zip::ZipArchive::from_bytes(bytes)
+            .map_err(|e| format!("{}: {}", src.path.display(), e))?;
         for (name, bytes) in archive.read_extension(".csv")? {
             texts.push((name.clone(), String::from_utf8_lossy(&bytes).to_string()));
         }
@@ -442,8 +453,8 @@ fn parse_source(
             return Err(format!("{}: ZIP has no .csv entry", src.path.display()));
         }
     } else {
-        let text = std::fs::read_to_string(&src.path)
-            .map_err(|e| format!("{}: {}", src.path.display(), e))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| format!("{}: input is not valid UTF-8", src.path.display()))?;
         texts.push((src.path.display().to_string(), text));
     }
     let mut bars = Vec::new();
@@ -807,6 +818,212 @@ struct SymbolPanel {
     gap_rows: usize,
     stride_rows: usize,
     notes: Vec<String>,
+    /// True when `spool` is a resume-cache part (reused or just written) and
+    /// must survive assembly. A fresh temporary spool is deleted.
+    keep_spool: bool,
+    /// Per-symbol archive checksum key, set when this symbol should be written
+    /// to the resume cache after pass 4 (the key sidecar is `<spool>.key`).
+    cache_key: Option<String>,
+}
+
+/// Bumped whenever the part layout or the meaning of its fields changes.
+const CACHE_VERSION: &str = "rcsr-prep-cache-1";
+
+fn cache_file(dir: &str, symbol: &str, ext: &str) -> PathBuf {
+    let safe: String = symbol
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Path::new(dir).join(format!("{}.{}", safe, ext))
+}
+
+/// Everything that changes a symbol's parsed/resampled/feature values. The
+/// source archives are added per symbol in `archive_key`. `jobs`,
+/// `group_rows`, `out` and `dry_run` are deliberately absent: they do not
+/// change the parts and must not invalidate them.
+fn cache_config_key(opts: &Options) -> String {
+    let label = opts
+        .label
+        .map(|l| format!("{}|{}|{}|{}", l.horizon, l.cost_bps, l.vol_window, l.stride))
+        .unwrap_or_else(|| "none".to_string());
+    let migrations = opts
+        .migrations
+        .iter()
+        .map(|m| format!("{}>{}:{}:{}", m.old, m.new, m.k, m.tolerance))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mtf = opts.mtf.iter().map(|t| t.name()).collect::<Vec<_>>().join(",");
+    manifest::sha256_hex(
+        format!(
+            "{CACHE_VERSION}|{}|{}|{}|{}|{}|{}|{}|{}",
+            opts.format.name(),
+            opts.tz.name(),
+            opts.calendar.name(),
+            opts.resample.map(|t| t.name()).unwrap_or("none"),
+            mtf,
+            opts.features.join(","),
+            label,
+            migrations
+        )
+        .as_bytes(),
+    )
+}
+
+fn archive_key(symbol: &str, archives: &[(String, u64)]) -> String {
+    let mut text = String::with_capacity(64 + archives.len() * 80);
+    text.push_str(symbol);
+    text.push('\n');
+    for (hash, bytes) in archives {
+        text.push_str(hash);
+        text.push(':');
+        text.push_str(&bytes.to_string());
+        text.push('\n');
+    }
+    manifest::sha256_hex(text.as_bytes())
+}
+
+fn escape_notes(notes: &[String]) -> String {
+    notes
+        .iter()
+        .map(|n| n.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n"))
+        .collect::<Vec<_>>()
+        .join("\t")
+}
+
+fn unescape_notes(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split('\t')
+        .map(|n| {
+            let mut out = String::with_capacity(n.len());
+            let mut chars = n.chars();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('t') => out.push('\t'),
+                    Some('n') => out.push('\n'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => out.push('\\'),
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+struct CacheMeta {
+    archives: String,
+    rows_in: usize,
+    duplicates: usize,
+    non_monotonic: usize,
+    invalid: usize,
+    unit: String,
+    unit_converted: usize,
+    zero_volume: usize,
+    rows: usize,
+    names: Vec<String>,
+    warmup: usize,
+    gap_rows: usize,
+    stride_rows: usize,
+    notes: Vec<String>,
+}
+
+fn read_cache_meta(path: &Path) -> Option<CacheMeta> {
+    let text = std::fs::read_to_string(path).ok()?;
+    fn field(text: &str, key: &str) -> Option<String> {
+        let prefix = format!("{}=", key);
+        text.lines()
+            .find_map(|l| l.strip_prefix(&prefix).map(|v| v.to_string()))
+    }
+    fn num(text: &str, key: &str) -> Option<usize> {
+        field(text, key)?.parse().ok()
+    }
+    if field(&text, "version")? != CACHE_VERSION {
+        return None;
+    }
+    Some(CacheMeta {
+        // The caller compares this in plain text so a moved or rewritten
+        // archive is visible without parsing.
+        archives: field(&text, "archives")?,
+        rows_in: num(&text, "rows_in")?,
+        duplicates: num(&text, "duplicates")?,
+        non_monotonic: num(&text, "non_monotonic")?,
+        invalid: num(&text, "invalid")?,
+        unit: field(&text, "unit")?,
+        unit_converted: num(&text, "unit_converted")?,
+        zero_volume: num(&text, "zero_volume")?,
+        rows: num(&text, "rows")?,
+        names: unescape_notes(&field(&text, "names")?),
+        warmup: num(&text, "warmup")?,
+        gap_rows: num(&text, "gap_rows")?,
+        stride_rows: num(&text, "stride_rows")?,
+        notes: unescape_notes(&field(&text, "notes")?),
+    })
+}
+
+fn write_cache_meta(path: &Path, config: &str, key: &str, audit: &Audit, panel: &SymbolPanel) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    let _ = writeln!(text, "version={}", CACHE_VERSION);
+    let _ = writeln!(text, "config={}", config);
+    let _ = writeln!(text, "archives={}", key);
+    let _ = writeln!(text, "rows_in={}", audit.rows_in);
+    let _ = writeln!(text, "duplicates={}", audit.duplicates);
+    let _ = writeln!(text, "non_monotonic={}", audit.non_monotonic);
+    let _ = writeln!(text, "invalid={}", audit.invalid);
+    let _ = writeln!(text, "unit={}", audit.unit);
+    let _ = writeln!(text, "unit_converted={}", audit.unit_converted);
+    let _ = writeln!(text, "zero_volume={}", audit.zero_volume);
+    let _ = writeln!(text, "rows={}", panel.rows);
+    let _ = writeln!(text, "names={}", escape_notes(&panel.names));
+    let _ = writeln!(text, "warmup={}", panel.warmup);
+    let _ = writeln!(text, "gap_rows={}", panel.gap_rows);
+    let _ = writeln!(text, "stride_rows={}", panel.stride_rows);
+    let _ = writeln!(text, "notes={}", escape_notes(&panel.notes));
+    publish(path, text.as_bytes())
+}
+
+/// Publish a file atomically inside the cache directory.
+fn publish(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+/// Read the `ts` column back from a cached spool so assembly and gap counting
+/// do not need the original archives.
+fn read_spool_times(path: &Path) -> Result<Vec<i64>, String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let mut r = std::io::BufReader::new(file);
+    let mut u32b = [0u8; 4];
+    r.read_exact(&mut u32b).map_err(|e| e.to_string())?;
+    let n = u32::from_le_bytes(u32b) as usize;
+    for _ in 0..n {
+        r.read_exact(&mut u32b).map_err(|e| e.to_string())?;
+        let len = u32::from_le_bytes(u32b) as usize;
+        let mut name = vec![0u8; len];
+        r.read_exact(&mut name).map_err(|e| e.to_string())?;
+    }
+    let mut u64b = [0u8; 8];
+    r.read_exact(&mut u64b).map_err(|e| e.to_string())?;
+    let rows = u64::from_le_bytes(u64b) as usize;
+    let mut bytes = vec![0u8; rows * 8];
+    r.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()) as i64)
+        .collect())
 }
 
 /// Write one symbol's canonical OHLCV and extra columns to a column-major
@@ -814,7 +1031,10 @@ struct SymbolPanel {
 /// bars and feature columns are dropped as soon as the file is written.
 fn write_spool(path: &Path, symbol: &str, bars: &[Bar], values: &[(String, Vec<f64>)]) -> Result<(), String> {
     use std::io::Write;
-    let file = std::fs::File::create(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    let file = std::fs::File::create(&tmp).map_err(|e| format!("{}: {}", tmp.display(), e))?;
     let mut w = std::io::BufWriter::new(file);
     let mut names: Vec<(&str, &[f64])> = vec![("ts", &[])];
     for n in &CANONICAL[1..] {
@@ -866,7 +1086,10 @@ fn write_spool(path: &Path, symbol: &str, bars: &[Bar], values: &[(String, Vec<f
     for (_, v) in values {
         write_col(&mut w, &|r| v[r])?;
     }
-    w.flush().map_err(|e| e.to_string())
+    w.flush().map_err(|e| e.to_string())?;
+    let file = w.into_inner().map_err(|e| e.error().to_string())?;
+    file.sync_all().map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path.display(), e))
 }
 
 fn read_spool(
@@ -1013,66 +1236,231 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         by_symbol.entry(s.symbol.clone()).or_default().push(s);
     }
     let groups: Vec<(String, Vec<Source>)> = by_symbol.into_iter().collect();
-    let chunks = bounded_chunks(groups, opts.jobs);
 
-    // Pass 1: parse + timestamp/duplicate normalisation, parallel by symbol.
-    let mut parsed: Vec<(String, Vec<Bar>)> = Vec::new();
+    // #145: the resume cache. `state.txt` pins the settings; every symbol then
+    // owns one spool and one key sidecar, both published atomically. A part is
+    // reused only when its archive checksum key and the settings still match.
+    let mut cache_dir: Option<String> = None;
+    let mut cache_write = false;
+    let config_key = cache_config_key(opts);
+    if let Some(dir) = &opts.resume {
+        if !opts.migrations.is_empty() {
+            audit.notes.push(
+                "resume cache disabled: --migrations splices symbols, so a per-symbol part \
+                 cannot be keyed to its inputs"
+                    .to_string(),
+            );
+        } else {
+            let state_path = Path::new(dir).join("state.txt");
+            let wanted = format!("version={}\nconfig={}\n", CACHE_VERSION, config_key);
+            let existing = std::fs::read_to_string(&state_path).ok();
+            match existing {
+                Some(got) if got == wanted => {
+                    cache_dir = Some(dir.clone());
+                    cache_write = !opts.dry_run;
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "{} was built with different settings (format, timezone, calendar, \
+                         resample, mtf, features, label or migrations); remove it or use a new \
+                         --resume directory",
+                        dir
+                    ));
+                }
+                None if opts.dry_run => {
+                    // --dry-run writes nothing, so it only reuses a cache that
+                    // already carries a matching state file.
+                }
+                None => {
+                    std::fs::create_dir_all(dir)
+                        .map_err(|e| format!("{}: {}", dir, e))?;
+                    publish(&state_path, wanted.as_bytes())?;
+                    cache_dir = Some(dir.clone());
+                    cache_write = true;
+                }
+            }
+        }
+    }
+
+    // Per-symbol output of pass 1: either freshly parsed bars or a cached
+    // final panel. Both carry the archive checksums for the manifest.
+    struct Work {
+        symbol: String,
+        bars: Option<Vec<Bar>>,
+        panel: Option<SymbolPanel>,
+        audit: Audit,
+        hashes: Vec<(String, String, u64)>,
+        key: Option<String>,
+    }
+    let chunks = bounded_chunks(groups, opts.jobs);
+    // A cross-asset feature joins BTC by timestamp. Reuse BTC from the cache
+    // only when no cross feature needs its bars; otherwise re-parse that one
+    // symbol so the benchmark is present in this run.
+    let need_cross = opts.features.iter().any(|f| f.starts_with("cross_"));
+    let mut works: Vec<Work> = Vec::new();
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
         for chunk in chunks {
             let format = opts.format;
             let tz = opts.tz;
-            handles.push(scope.spawn(move || -> Result<(Vec<(String, Vec<Bar>)>, Audit), String> {
-                let mut local = Audit::default();
-                local.unit = "s".to_string();
-                let mut out = Vec::new();
+            let cache = cache_dir.clone();
+            handles.push(scope.spawn(move || -> Result<Vec<Work>, String> {
+                let mut out = Vec::with_capacity(chunk.len());
                 for (symbol, srcs) in chunk {
-                    let mut raw = Vec::new();
-                    for src in srcs {
-                        raw.extend(parse_source(&src, format, tz, &mut local)?);
+                    // Read and hash every archive once. The same buffer is
+                    // parsed below when the part is not reusable.
+                    let mut blobs = Vec::with_capacity(srcs.len());
+                    let mut hashes = Vec::with_capacity(srcs.len());
+                    let mut keyed = Vec::with_capacity(srcs.len());
+                    for src in &srcs {
+                        let bytes = std::fs::read(&src.path)
+                            .map_err(|e| format!("{}: {}", src.path.display(), e))?;
+                        let hash = manifest::sha256_hex(&bytes);
+                        keyed.push((hash.clone(), bytes.len() as u64));
+                        hashes.push((
+                            src.path.to_string_lossy().to_string(),
+                            hash,
+                            bytes.len() as u64,
+                        ));
+                        blobs.push(bytes);
                     }
-                    out.push((symbol, normalise_bars(raw, &mut local)));
+                    let key = archive_key(&symbol, &keyed);
+                    let is_btc =
+                        symbol == "BTCUSDT" || symbol == "BTCUSD" || symbol == "BTC";
+                    if let Some(dir) = &cache {
+                        if !(need_cross && is_btc) {
+                        let spool = cache_file(dir, &symbol, "spool");
+                        let meta_path = cache_file(dir, &symbol, "key");
+                        if let Some(meta) = read_cache_meta(&meta_path) {
+                            if meta.archives == key && spool.exists() {
+                                let times = read_spool_times(&spool)?;
+                                if times.len() == meta.rows {
+                                    let mut a = Audit::default();
+                                    a.rows_in = meta.rows_in;
+                                    a.duplicates = meta.duplicates;
+                                    a.non_monotonic = meta.non_monotonic;
+                                    a.invalid = meta.invalid;
+                                    a.unit = meta.unit;
+                                    a.unit_converted = meta.unit_converted;
+                                    a.zero_volume = meta.zero_volume;
+                                    out.push(Work {
+                                        symbol: symbol.clone(),
+                                        bars: None,
+                                        panel: Some(SymbolPanel {
+                                            symbol: symbol.clone(),
+                                            times,
+                                            rows: meta.rows,
+                                            names: meta.names,
+                                            spool,
+                                            warmup: meta.warmup,
+                                            gap_rows: meta.gap_rows,
+                                            stride_rows: meta.stride_rows,
+                                            notes: meta.notes,
+                                            keep_spool: true,
+                                            cache_key: None,
+                                        }),
+                                        audit: a,
+                                        hashes,
+                                        key: Some(key),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        }
+                    }
+                    let mut local = Audit::default();
+                    local.unit = "s".to_string();
+                    let mut raw = Vec::new();
+                    for (src, bytes) in srcs.iter().zip(blobs) {
+                        raw.extend(parse_source_bytes(src, format, tz, &mut local, bytes)?);
+                    }
+                    let bars = normalise_bars(raw, &mut local);
+                    out.push(Work {
+                        symbol,
+                        bars: Some(bars),
+                        panel: None,
+                        audit: local,
+                        hashes,
+                        key: Some(key),
+                    });
                 }
-                Ok((out, local))
+                Ok(out)
             }));
         }
         for h in handles {
-            let (part, a) = h.join().map_err(|_| "prep worker panicked".to_string())??;
-            audit.merge(&a);
-            parsed.extend(part);
+            works.extend(h.join().map_err(|_| "prep worker panicked".to_string())??);
         }
         Ok(())
     })?;
-    parsed.sort_by(|a, b| a.0.cmp(&b.0));
-    audit.symbols = parsed.len();
-    let mut series: BTreeMap<String, Vec<Bar>> = parsed.into_iter().collect();
+    works.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    audit.symbols = works.len();
+    let mut reused = 0usize;
+    let mut input_hash_map: BTreeMap<String, (String, u64)> = BTreeMap::new();
+    let mut panels: Vec<SymbolPanel> = Vec::new();
+    let mut fresh: Vec<(String, Vec<Bar>, Option<String>, Audit)> = Vec::new();
+    for w in works {
+        audit.merge(&w.audit);
+        for (path, hash, size) in w.hashes {
+            input_hash_map.insert(path, (hash, size));
+        }
+        if let Some(p) = w.panel {
+            reused += 1;
+            panels.push(p);
+        } else if let Some(bars) = w.bars {
+            let key = if cache_write { w.key } else { None };
+            fresh.push((w.symbol, bars, key, w.audit));
+        }
+    }
+    if cache_dir.is_some() {
+        eprintln!(
+            "prep: resume {}/{} symbols ({:.1}%), {} reused, {} parsed",
+            reused,
+            audit.symbols,
+            if audit.symbols == 0 { 0.0 } else { 100.0 * reused as f64 / audit.symbols as f64 },
+            reused,
+            audit.symbols - reused
+        );
+    }
+    let mut series: BTreeMap<String, Vec<Bar>> = if opts.migrations.is_empty() {
+        BTreeMap::new()
+    } else {
+        fresh.drain(..).map(|(s, b, _, _)| (s, b)).collect()
+    };
 
-    // Pass 2: verified splices, before resampling.
+    // Pass 2: verified splices, before resampling. A cache is never used with
+    // migrations, so every symbol here has fresh bars.
     if !opts.migrations.is_empty() {
         series = apply_migrations(&series, &opts.migrations)?;
         audit.migrations = opts.migrations.len();
+        for (s, b) in series {
+            fresh.push((s, b, None, Audit::default()));
+        }
     }
 
-    // Pass 3: resample each symbol (calendar-aware), parallel.
-    let symbols: Vec<(String, Vec<Bar>)> = series.into_iter().collect();
-    let mut resampled: Vec<(String, Vec<Bar>)> = Vec::new();
+    // Pass 3: resample each fresh symbol (calendar-aware), parallel. Cached
+    // symbols are already final and skip this pass entirely.
+    let symbols = fresh;
+    let mut resampled: Vec<(String, Vec<Bar>, Option<String>, Audit)> = Vec::new();
     let resample_chunks = bounded_chunks(symbols, opts.jobs);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
         for chunk in resample_chunks {
             let resample = opts.resample;
             let calendar = opts.calendar;
-            handles.push(scope.spawn(move || -> Result<Vec<(String, Vec<Bar>)>, String> {
-                let mut out = Vec::with_capacity(chunk.len());
-                for (symbol, bars) in chunk {
-                    let bars = match resample {
-                        Some(tf) => resample_calendar(&bars, tf, calendar)?,
-                        None => bars,
-                    };
-                    out.push((symbol, bars));
-                }
-                Ok(out)
-            }));
+            handles.push(scope.spawn(
+                move || -> Result<Vec<(String, Vec<Bar>, Option<String>, Audit)>, String> {
+                    let mut out = Vec::with_capacity(chunk.len());
+                    for (symbol, bars, key, a) in chunk {
+                        let bars = match resample {
+                            Some(tf) => resample_calendar(&bars, tf, calendar)?,
+                            None => bars,
+                        };
+                        out.push((symbol, bars, key, a));
+                    }
+                    Ok(out)
+                },
+            ));
         }
         for h in handles {
             resampled.extend(h.join().map_err(|_| "prep worker panicked".to_string())??);
@@ -1088,11 +1476,10 @@ pub fn build(opts: &Options) -> Result<Build, String> {
     // the whole series per symbol.
     let cross: Option<Arc<[Bar]>> = resampled
         .iter()
-        .find(|(s, _)| s == "BTCUSDT" || s == "BTCUSD" || s == "BTC")
-        .map(|(_, b)| Arc::from(b.as_slice()));
+        .find(|(s, _, _, _)| s == "BTCUSDT" || s == "BTCUSD" || s == "BTC")
+        .map(|(_, b, _, _)| Arc::from(b.as_slice()));
 
     // Pass 4: features, MTF joins and the label, parallel by symbol.
-    let mut panels: Vec<SymbolPanel> = Vec::new();
     let feature_chunks = bounded_chunks(resampled, opts.jobs);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
@@ -1102,9 +1489,12 @@ pub fn build(opts: &Options) -> Result<Build, String> {
             let label = opts.label;
             let calendar = opts.calendar;
             let cross = cross.clone();
+            let cache = cache_dir.clone();
+            let config = config_key.clone();
+            let write_cache = cache_write;
             handles.push(scope.spawn(move || -> Result<Vec<SymbolPanel>, String> {
                 let mut out = Vec::with_capacity(chunk.len());
-                for (symbol, bars) in chunk {
+                for (symbol, bars, key, a) in chunk {
                     let _guard = enter_pass4_worker();
                     let mut values: Vec<(String, Vec<f64>)> = Vec::new();
                     let mut warmup = 0usize;
@@ -1156,15 +1546,21 @@ pub fn build(opts: &Options) -> Result<Build, String> {
                     }
                     let names: Vec<String> = values.iter().map(|(n, _)| n.clone()).collect();
                     let seq = SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let spool = std::env::temp_dir().join(format!(
-                        "rcsr-prep-{}-{}-{}.spool",
-                        std::process::id(),
-                        seq,
-                        symbol.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-                    ));
+                    let (spool, cache_key) = match (&cache, write_cache, key) {
+                        (Some(dir), true, Some(k)) => (cache_file(dir, &symbol, "spool"), Some(k)),
+                        _ => (
+                            std::env::temp_dir().join(format!(
+                                "rcsr-prep-{}-{}-{}.spool",
+                                std::process::id(),
+                                seq,
+                                symbol.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                            )),
+                            None,
+                        ),
+                    };
                     write_spool(&spool, &symbol, &bars, &values)?;
                     let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
-                    out.push(SymbolPanel {
+                    let panel = SymbolPanel {
                         symbol,
                         times,
                         rows: bars.len(),
@@ -1174,7 +1570,16 @@ pub fn build(opts: &Options) -> Result<Build, String> {
                         gap_rows,
                         stride_rows,
                         notes,
-                    });
+                        keep_spool: cache_key.is_some(),
+                        cache_key,
+                    };
+                    if let (Some(dir), Some(k)) = (&cache, &panel.cache_key) {
+                        let meta = cache_file(dir, &panel.symbol, "key");
+                        // The key sidecar is published after the spool, so a
+                        // crash leaves an orphan spool that is simply rebuilt.
+                        write_cache_meta(&meta, &config, k, &a, &panel)?;
+                    }
+                    out.push(panel);
                 }
                 Ok(out)
             }));
@@ -1253,7 +1658,9 @@ pub fn build(opts: &Options) -> Result<Build, String> {
             }
         }
         read_spool(&p.spool, p.rows, &mut columns, &index)?;
-        let _ = std::fs::remove_file(&p.spool);
+        if !p.keep_spool {
+            let _ = std::fs::remove_file(&p.spool);
+        }
         audit.rows_out += p.rows;
         audit.gaps += gap_count_times(&p.times, tf);
         audit.label_gap_rows += p.gap_rows;
@@ -1324,12 +1731,17 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         check_labelled_rows(&times, opts.allow_lockbox)?;
     }
 
+    // The hashes were computed once per archive in pass 1, from the same bytes
+    // that were parsed or keyed against, so a cold build does not read the
+    // input a second time.
     let input_hashes: Vec<(String, String, u64)> = sources
         .iter()
         .map(|s| {
             let p = s.path.to_string_lossy().to_string();
-            let size = std::fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0);
-            let hash = manifest::sha256_file(&s.path).unwrap_or_else(|_| "unknown".to_string());
+            let (hash, size) = input_hash_map
+                .get(&p)
+                .cloned()
+                .unwrap_or_else(|| ("unknown".to_string(), 0));
             (p, hash, size)
         })
         .collect();
@@ -1599,6 +2011,7 @@ pub fn run(args: &[String]) -> ! {
                 Err(e) => fail(&e),
             },
             "--out" | "-o" => opts.out = Some(val!()),
+            "--resume" => opts.resume = Some(val!()),
             "--dry-run" => opts.dry_run = true,
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--jobs" | "-j" => {
@@ -1702,6 +2115,9 @@ TRANSFORMS:
   --spec <file>           key=value spec (features/label/resample/mtf/...)
   --jobs, -j <n>          parallel symbol workers (default 1)
   --group-rows <n>        column-store group size (default 65536)
+  --resume <dir>          resumable per-symbol cache: one atomic spool plus a
+                          key sidecar per symbol, keyed by archive SHA-256 and
+                          the build settings; reuse prints on stderr
   --out, -o <store.rcsb>  output store (required unless --dry-run)
   --dry-run               print the audit and manifest, write nothing
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)

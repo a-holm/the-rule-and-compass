@@ -204,6 +204,31 @@ keeps the feature phase well below the final table; the peak is the assembly
 table itself. The output checksum is computed in 1 MiB chunks, so hashing a
 multi-gigabyte store does not add it to RSS.
 
+### Resumable, checksum-keyed parts
+
+```sh
+rcsr prep --input raw_15m_all --format binance --resample 1h --jobs 8 \
+  --resume work/prep-parts --out hourly_base.rcsb
+```
+
+`--resume <dir>` writes one completed symbol per part: `<SYMBOL>.spool` (the
+canonical OHLCV plus feature/label columns, in the same binary spool the
+assembler reads) and `<SYMBOL>.key` (its archive SHA-256 list and audit
+counters). Both are published atomically with a `.tmp` rename; the key is
+written **after** the spool, so a crash leaves either a complete part or an
+orphan spool that is rebuilt. A re-run hashes the archives, and reuses a part
+only when its checksum list and `state.txt` settings still match; a changed
+archive, a changed `--features`/`--label`/`--resample`/`--mtf`/`--tz`/migrations
+setting or a different directory is rebuilt or refused, never mixed in. `--jobs`
+is not part of the key: changing it reuses every part and only affects the
+scheduling of newly parsed symbols. Reuse prints
+`prep: resume N/M symbols (P%), K reused, L parsed` on stderr.
+
+Cached symbols skip decompression, resampling and feature work entirely; a warm
+run still reads the parts and assembles/writes the store, which is the
+remaining cost. `--dry-run` writes no parts, and `--migrations` disables the
+cache because a splice changes a symbol's identity across two archives.
+
 For measurement, set `RCSR_PREP_RSS_LOG=1` to print `VmRSS` at assembly
 checkpoints, or run the harness
 `scripts/measure/prep_rss.py --csv rss.csv -- <rcsr prep ...>`; it samples

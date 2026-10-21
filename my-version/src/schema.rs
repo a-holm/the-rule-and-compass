@@ -212,6 +212,7 @@ pub fn json() -> String {
 {{\"name\":\"--migrations\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OLD->NEW:k[:tol],... with a verified boundary ratio\"}},\
 {{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"parallel symbol workers; output order stays deterministic\"}},\
 {{\"name\":\"--group-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"column-store group size\"}},\
+{{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable per-symbol cache keyed by archive SHA-256: atomic spool + key per symbol, reused on a later build with the same settings\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"output .rcsb store\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print audit + manifest and write nothing\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (unlabelled provenance is always allowed)\"}}]}},\n  \
