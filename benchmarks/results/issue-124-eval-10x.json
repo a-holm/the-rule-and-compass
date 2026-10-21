@@ -1,0 +1,86 @@
+{
+  "artifacts": {
+    "csv": "/mnt/lager/eureqa/worktrees/issue-124-benchmark/arbeidsmappe/crypto-rcsr/pilot/panel_hourly_compact.csv",
+    "csv_bytes": 4234183400,
+    "csv_sha256": "7a3233822af84dbe68f73f005627713fdc74f4ad31e0e4db023f6dd047ed5bca",
+    "rcsr": "/mnt/lager/eureqa/worktrees/issue-124-benchmark/my-version/target/release/rcsr",
+    "rcsr_sha256": "0e9051480960451798c265b86219cf117a348afd95536d9835aba8a1450180f7",
+    "reference": "/mnt/lager/eureqa/worktrees/issue-124-benchmark/benchmarks/eval_python_reference.py",
+    "reference_sha256": "f7e01a0c42eafe8bd3c9869fac64f42f4a7d3810e184521b510575c51432afe1",
+    "store": "/mnt/lager/eureqa/worktrees/issue-124-benchmark/arbeidsmappe/crypto-rcsr/pilot/panel_hourly_v2.rcsb",
+    "store_bytes": 1814220771,
+    "store_sha256": "7b98a2836f97b4d6ac6385443486a81f73fec929de310f28d6a4efa3cb78a6f4"
+  },
+  "comparison": {
+    "passes_10x": true,
+    "python_rss_kib_median": 107442.0,
+    "python_sharpe": -20.833191482965866,
+    "python_test_rows": 845928,
+    "python_threshold": 0.007034873088967409,
+    "python_wall_median": 81.4,
+    "rss_ratio": 0.9742301693808713,
+    "rust_dropped_rows": 6,
+    "rust_rss_kib_median": 110284.0,
+    "rust_sharpe": -20.833125265449986,
+    "rust_test_rows": 845922,
+    "rust_threshold": 0.007034873088967409,
+    "rust_wall_median": 4.055,
+    "test_row_delta": -6,
+    "threshold_abs_delta": 0.0,
+    "threshold_equal": true,
+    "wall_ratio": 20.073982737361284
+  },
+  "gate": {
+    "min_ratio": 10.0,
+    "passed": true,
+    "threshold_tolerance": 1e-12
+  },
+  "generated_at_utc": "2026-10-21T06:20:25Z",
+  "host": {
+    "machine": "x86_64",
+    "platform": "Linux-7.0.0-34-generic-x86_64-with-glibc2.39",
+    "processor": "x86_64",
+    "python_implementation": "CPython",
+    "python_version": "3.12.3"
+  },
+  "issue": 124,
+  "protocol": {
+    "cost_bps": 10.0,
+    "group_by": "symbol",
+    "horizon": 172800,
+    "periods_per_year": 8760.0,
+    "reference_kind": "row-wise csv.reader, stdlib only, not vectorised",
+    "reference_sha256": "f7e01a0c42eafe8bd3c9869fac64f42f4a7d3810e184521b510575c51432afe1",
+    "rss_source": "/usr/bin/time -f '%e %M' (maximum resident set size, KiB)",
+    "score": "r16",
+    "target": "y60",
+    "test_end": 1735689600,
+    "test_start": 1704240000,
+    "threshold_quantile": 0.7,
+    "train_end": 1704067200,
+    "train_start": 1609459200,
+    "warm_cache": "two repeats after the first full scan; the first repeat is reported too"
+  },
+  "runs": {
+    "python": [
+      {
+        "peak_rss_kib": 107320,
+        "wall_seconds": 82.95
+      },
+      {
+        "peak_rss_kib": 107564,
+        "wall_seconds": 79.85
+      }
+    ],
+    "rust": [
+      {
+        "peak_rss_kib": 110324,
+        "wall_seconds": 4.06
+      },
+      {
+        "peak_rss_kib": 110244,
+        "wall_seconds": 4.05
+      }
+    ]
+  }
+}

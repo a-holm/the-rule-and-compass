@@ -10,3 +10,7 @@ my-version/target/
 .DS_Store
 *.swp
 *~
+
+# Python benchmark bytecode
+__pycache__/
+*.pyc

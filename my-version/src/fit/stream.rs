@@ -22,6 +22,9 @@
 //! same constants.
 
 use super::*;
+use crate::column::GroupBuf;
+use crate::store::FileStore;
+use std::sync::Arc;
 
 /// Rows per accumulation block. The same value is used for every pass, making
 /// the reduction order deterministic for a given row count.
@@ -61,6 +64,219 @@ impl RowSource for SliceRows<'_> {
             let w = self.w.get(i).copied().unwrap_or(1.0);
             if !f(&self.x[i], self.y[i], w) {
                 return false;
+            }
+        }
+        true
+    }
+}
+
+/// #116: a resolved `.rcsb` projection for the streaming fitter.
+///
+/// The spec is cheap to share between threads: it holds the opened
+/// [`FileStore`] plus column indices, the opt-in row subset and the same affine
+/// per-column transform the resident training sample received. Each fit creates
+/// its own [`StoreRows`] with its own [`GroupBuf`], so concurrent islands never
+/// share mutable reader state and never materialise the data.
+#[derive(Clone, Debug)]
+pub struct StoreSpec {
+    store: Arc<FileStore>,
+    columns: Vec<usize>,
+    target: usize,
+    weight: Option<usize>,
+    means: Vec<f64>,
+    stds: Vec<f64>,
+    /// Sorted ascending raw row ids, or `None` for every row.
+    rows: Option<Vec<usize>>,
+}
+
+impl StoreSpec {
+    /// Project `columns` and `target` from an opened store. Every used column
+    /// must be numeric; text/dictionary columns are rejected with a descriptive
+    /// error so the caller falls back to the resident path.
+    pub fn new(
+        store: Arc<FileStore>,
+        columns: Vec<usize>,
+        target: usize,
+    ) -> Result<Self, String> {
+        let n_cols = store.n_cols();
+        if columns.is_empty() {
+            return Err("stream store source needs at least one input column".to_string());
+        }
+        for &c in columns.iter().chain(std::iter::once(&target)) {
+            if c >= n_cols {
+                return Err(format!(
+                    "stream store column {} is out of range ({} columns)",
+                    c, n_cols
+                ));
+            }
+            if store.header().is_numeric(c) != Some(true) {
+                return Err(format!(
+                    "stream store column {} is not numeric; use the resident path",
+                    c
+                ));
+            }
+        }
+        let k = columns.len();
+        Ok(StoreSpec {
+            store,
+            columns,
+            target,
+            weight: None,
+            means: vec![0.0; k],
+            stds: vec![1.0; k],
+            rows: None,
+        })
+    }
+
+    /// Use a numeric weight column (one weight per row).
+    pub fn with_weight(mut self, column: usize) -> Result<Self, String> {
+        if column >= self.store.n_cols() {
+            return Err(format!(
+                "stream store weight column {} is out of range ({} columns)",
+                column,
+                self.store.n_cols()
+            ));
+        }
+        if self.store.header().is_numeric(column) != Some(true) {
+            return Err(format!(
+                "stream store weight column {} is not numeric",
+                column
+            ));
+        }
+        self.weight = Some(column);
+        Ok(self)
+    }
+
+    /// Apply the prepared training centring/scaling to the input columns.
+    /// `means`/`stds` are in the same order as [`StoreSpec::columns`].
+    pub fn with_standardisation(mut self, means: Vec<f64>, stds: Vec<f64>) -> Result<Self, String> {
+        if means.len() != self.columns.len() || stds.len() != self.columns.len() {
+            return Err(format!(
+                "stream store transform has {} means and {} stds for {} columns",
+                means.len(),
+                stds.len(),
+                self.columns.len()
+            ));
+        }
+        if !means.iter().chain(&stds).all(|v| v.is_finite()) {
+            return Err("stream store transform contains a non-finite value".to_string());
+        }
+        if stds.iter().any(|s| *s == 0.0) {
+            return Err("stream store transform has a zero scale".to_string());
+        }
+        self.means = means;
+        self.stds = stds;
+        Ok(self)
+    }
+
+    /// Restrict the source to the prepared training rows. Ids are raw store
+    /// row numbers; they are sorted and deduplicated so the read order (and
+    /// therefore the reduction order) is deterministic.
+    pub fn with_rows(mut self, mut rows: Vec<usize>) -> Result<Self, String> {
+        rows.sort_unstable();
+        rows.dedup();
+        if let Some(&last) = rows.last() {
+            if last >= self.store.n_rows() {
+                return Err(format!(
+                    "stream store row {} is out of range ({} rows)",
+                    last,
+                    self.store.n_rows()
+                ));
+            }
+        }
+        if rows.is_empty() {
+            return Err("stream store row subset is empty".to_string());
+        }
+        self.rows = Some(rows);
+        Ok(self)
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+            .as_ref()
+            .map(|r| r.len())
+            .unwrap_or_else(|| self.store.n_rows())
+    }
+}
+
+/// #116: disk-backed [`RowSource`] over [`FileStore::load_group_with`].
+///
+/// One group is resident at a time (`GroupBuf`, default 512 KiB per `f64`
+/// column) plus one scratch row and the decode buffer. The fitter keeps only
+/// `O(p²)` statistics, so a store larger than RAM is consumed group by group.
+pub struct StoreRows {
+    spec: Arc<StoreSpec>,
+    reader: std::cell::RefCell<StoreReader>,
+}
+
+struct StoreReader {
+    buf: GroupBuf,
+    scratch: Vec<u8>,
+    row: Vec<f64>,
+}
+
+impl StoreRows {
+    pub fn new(spec: Arc<StoreSpec>) -> Self {
+        let k = spec.columns.len();
+        StoreRows {
+            spec,
+            reader: std::cell::RefCell::new(StoreReader {
+                buf: GroupBuf::new(),
+                scratch: Vec::new(),
+                row: vec![0.0; k],
+            }),
+        }
+    }
+}
+
+impl RowSource for StoreRows {
+    fn rows(&self) -> usize {
+        self.spec.rows()
+    }
+
+    fn for_each_row(&self, f: &mut dyn FnMut(&[f64], f64, f64) -> bool) -> bool {
+        let store = &*self.spec.store;
+        let mut next = 0usize;
+        let mut reader = self.reader.borrow_mut();
+        let StoreReader {
+            buf,
+            scratch,
+            row,
+        } = &mut *reader;
+        for g in 0..store.n_groups() {
+            if let Some(selected) = &self.spec.rows {
+                if next >= selected.len() {
+                    break;
+                }
+            }
+            let view = match store.load_group_with(g, buf, scratch) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let base = g.saturating_mul(store.group_rows());
+            for r in 0..view.len() {
+                let raw = base + r;
+                if let Some(selected) = &self.spec.rows {
+                    while next < selected.len() && selected[next] < raw {
+                        next += 1;
+                    }
+                    if next >= selected.len() || selected[next] != raw {
+                        continue;
+                    }
+                    next += 1;
+                }
+                for (j, &c) in self.spec.columns.iter().enumerate() {
+                    row[j] = (view.col(c)[r] - self.spec.means[j]) / self.spec.stds[j];
+                }
+                let y = view.col(self.spec.target)[r];
+                let w = self
+                    .spec
+                    .weight
+                    .map(|c| view.col(c)[r])
+                    .unwrap_or(1.0);
+                if !f(row, y, w) {
+                    return false;
+                }
             }
         }
         true

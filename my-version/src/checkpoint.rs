@@ -1331,6 +1331,8 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         predictor_samples,
         fit_samples, // #85
         fit_rows,     // #116
+        // #116: a disk row source is a path choice, not saved search state.
+        fit_stream_source: None,
         front_parents, // #76
         units,
         require_dimensions,

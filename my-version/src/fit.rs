@@ -27,8 +27,10 @@ pub use gpu::{
     backend_description, fit_batch_verified, refit_finalists_exact, BatchStatus, BatchedFitter,
     VerifiedBatch,
 };
-pub use stream::{fit_stream, fit_stream_with, RowSource, SliceRows, STREAM_BLOCK_ROWS};
-pub use varpro::VarProPartition;
+pub use stream::{
+    fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
+};
+pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
@@ -302,20 +304,59 @@ impl GpuFitPlan {
     }
 }
 
-/// #169: build the GPU fit plan for `tree`, or `None` when the candidate must
-/// stay on the CPU (non-affine block bodies, too many constants or nodes, or an
-/// operator without an analytic GPU derivative).
-pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
+/// #169: why a candidate cannot be offered to the batched GPU fit kernel.
+///
+/// These are the structural rejection reasons the admission policy labels
+/// separately from the kernel's runtime statuses (ill-conditioned/non-finite)
+/// and from the search-level "too few rows" guard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuFitReject {
+    /// Too many constants for the static kernel layout (`p > 16`).
+    TooManyConstants,
+    /// The flattened program exceeds [`GPU_FIT_MAX_NODES`].
+    TooManyNodes,
+    /// The tree has no constants to fit.
+    NoConstants,
+    /// Block bodies share constants; the CPU path owns those.
+    SharedConstants,
+    /// An operator without an analytic value/adjoint pair.
+    UnsupportedOp,
+}
+
+impl GpuFitReject {
+    /// Stable label used by the JSON ledger and the docs.
+    pub fn label(self) -> &'static str {
+        match self {
+            GpuFitReject::TooManyConstants => "too_many_constants",
+            GpuFitReject::TooManyNodes => "too_many_nodes",
+            GpuFitReject::NoConstants => "no_constants",
+            GpuFitReject::SharedConstants => "shared_constants",
+            GpuFitReject::UnsupportedOp => "unsupported_op",
+        }
+    }
+}
+
+/// #169: build the GPU fit plan for `tree`, or say why it is ineligible.
+pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitReject> {
     let f = flatten(tree);
-    if f.nconst == 0 || f.nconst > GPU_FIT_MAX_CONSTANTS || f.op.len() > GPU_FIT_MAX_NODES {
-        return None;
+    if f.nconst == 0 {
+        return Err(GpuFitReject::NoConstants);
+    }
+    if f.nconst > GPU_FIT_MAX_CONSTANTS {
+        return Err(GpuFitReject::TooManyConstants);
+    }
+    if f.op.len() > GPU_FIT_MAX_NODES {
+        return Err(GpuFitReject::TooManyNodes);
     }
     if !f.shared.is_empty() {
-        return None; // block bodies share constants; the CPU path owns those
+        return Err(GpuFitReject::SharedConstants); // the CPU path owns block bodies
     }
     let mut words = Vec::with_capacity(f.op.len() * 4);
     for i in 0..f.op.len() {
-        let op = gpu_fit_opcode(f.op[i])?;
+        let op = match gpu_fit_opcode(f.op[i]) {
+            Some(op) => op,
+            None => return Err(GpuFitReject::UnsupportedOp),
+        };
         let kids = &f.kids[i];
         let k0 = kids.first().copied().unwrap_or(0) as u32;
         let k1 = kids.get(1).copied().unwrap_or(0) as u32;
@@ -334,12 +375,20 @@ pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
             c0[f.cslot[i] as usize] = f.val[i];
         }
     }
-    Some(GpuFitPlan {
+    Ok(GpuFitPlan {
         words,
         nconst: f.nconst,
         c0,
         flat: f,
     })
+}
+
+/// #169: build the GPU fit plan for `tree`, or `None` when the candidate must
+/// stay on the CPU (non-affine block bodies, too many constants or nodes, or an
+/// operator without an analytic GPU derivative).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn gpu_fit_plan(tree: &Node) -> Option<GpuFitPlan> {
+    gpu_fit_plan_reason(tree).ok()
 }
 
 /// Flattened expression: children always precede parents, so index order is a
@@ -1259,7 +1308,17 @@ pub fn fit_weighted_strategy(
                 return s;
             }
         }
-        if try_varpro {
+        // #116: structural cost eligibility. `auto` and the direct-GPU fallback
+        // only select VarPro when the partition is measured to amortise the
+        // outer Jacobian (`s >= 2` or `q >= 4`); otherwise the exact LM arm is
+        // both cheaper and the reference. The explicit `varpro` arm is a user
+        // override and keeps the old behaviour.
+        let auto_like = matches!(strategy, FitStrategy::Auto | FitStrategy::Gpu);
+        let varpro_eligible = !auto_like
+            || separable_partition(tree)
+                .map(|part| varpro::cost_eligible(&part))
+                .unwrap_or(false);
+        if try_varpro && varpro_eligible {
             // `auto` promises never to be worse than the reference LM arm.
             // VarPro is not a global solver for a general separable problem,
             // so run the exact LM path from the same starting tree and keep
@@ -1288,6 +1347,16 @@ pub fn fit_weighted_strategy(
     }
     EXACT_FITS.fetch_add(1, Ordering::Relaxed);
     fit_lm(tree, x, y, w, iters)
+}
+
+/// #116: run the streaming arm over an explicit row source and record the arm
+/// count. This is the entry point the search uses when a disk-backed
+/// [`StoreRows`] was resolved for the training rows. `None` means the caller
+/// must fall back to the exact resident arm.
+pub fn fit_stream_source<S: RowSource>(tree: &mut Node, source: &S, iters: usize) -> Option<f64> {
+    let sse = stream::fit_stream_with(tree, source, iters)?;
+    STREAM_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(sse)
 }
 
 /// #116: the structural partition VarPro would use, for tests and `--fit-report`.

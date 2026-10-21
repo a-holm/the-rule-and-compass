@@ -168,6 +168,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --smooth-centred <k>       the old centred window. Reads future bars and is
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
+  --allow-lockbox            permit train/test rows in 2026H2 (declared final test only)
                              (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
@@ -431,7 +432,10 @@ SEARCH:
                              CPU trajectory
   --qd                       record an opt-in quality-diversity archive over
                              (variable usage x prediction skewness), passive;
-                             it never changes parents or the Pareto front
+                             it never changes parents or the Pareto front.
+                             Reports reachable-support coverage, occupancy
+                             entropy and QD-score; every run also reports a
+                             fixed-reference validation hypervolume
   --qd-cells <N>             descriptor cells (grid bins per axis or CVT K;
                              2..=512; enables --qd)
   --qd-cell-cap <N>          maximum local Pareto front per descriptor cell (default 4)
@@ -622,7 +626,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -632,9 +636,11 @@ fn gpu_json(
                 s.unsupported_programs,
                 jnum(s.fallback_seconds),
                 s.fallback_workers,
+                s.fit_screened,
                 s.fit_attempts,
                 s.fit_gpu,
                 s.fit_fallback,
+                ops_json(&s.fit_fallback_by_cause),
                 ops_json(&s.opcodes)
             )
         })
@@ -670,13 +676,16 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"seconds\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{}}}",
         jstr(fit_strategy),
+        g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
         g.fit_fallback,
+        ops_json(&g.fit_fallback_by_cause),
         g.fit_refits,
-        jnum(g.fit_ms / 1000.0)
+        jnum(g.fit_ms / 1000.0),
+        jnum(g.fit_host_ms / 1000.0)
     );
     format!(
         "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
@@ -711,17 +720,88 @@ fn gpu_json(
     )
 }
 
+/// #120: fixed-reference validation hypervolume of one run.
+///
+/// The reference error is the variance of the held-out target, which is a
+/// property of the data rather than of the arm, so two arms of the same split
+/// are comparable. The reported quantity is computed from the archive the run
+/// actually produced, on the same rows the report already uses.
+#[derive(Clone, Copy, Debug)]
+struct ValidationHv {
+    sample: &'static str,
+    reference_error: f64,
+    hypervolume: f64,
+    points: usize,
+}
+
+fn validation_hypervolume(rows: &[Row], prepared: &data::Prepared) -> ValidationHv {
+    let (sample, target) = if let Some(v) = &prepared.validation {
+        ("validation", &v.y)
+    } else if !prepared.test.y.is_empty() {
+        ("test", &prepared.test.y)
+    } else {
+        ("train", &prepared.train.y)
+    };
+    let pick: fn(&Row) -> f64 = match sample {
+        "validation" => |r: &Row| r.validation_error,
+        "test" => |r: &Row| r.test_error,
+        _ => |r: &Row| r.train_error,
+    };
+    let n = target.len();
+    let mean = if n == 0 {
+        0.0
+    } else {
+        target.iter().sum::<f64>() / n as f64
+    };
+    let var = if n == 0 {
+        0.0
+    } else {
+        target.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n as f64
+    };
+    let reference_error = if var.is_finite() && var > 0.0 {
+        var
+    } else {
+        1.0
+    };
+    let points: Vec<(f64, f64)> = rows
+        .iter()
+        .map(|r| (r.complexity, pick(r)))
+        .filter(|(c, e)| c.is_finite() && e.is_finite())
+        .collect();
+    ValidationHv {
+        sample,
+        reference_error,
+        hypervolume: qd::fixed_reference_hypervolume(&points, reference_error),
+        points: points.len(),
+    }
+}
+
+fn validation_hv_json(v: &ValidationHv) -> String {
+    format!(
+        "{{\"sample\":\"{}\",\"reference_error\":{},\"hypervolume\":{},\"points\":{}}}",
+        v.sample,
+        jnum(v.reference_error),
+        jnum(v.hypervolume),
+        v.points
+    )
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
         eprintln!(
-            "# qd ({}): {}/{} cells occupied ({:.1}%), {} entries, best error {}, hypervolume {:.4}",
+            "# qd ({}): {}/{} reachable cells occupied ({:.1}%), {} entries, best error {}, \
+             entropy {:.3}/{:.3} bits, qd-score {:.4}, descriptor fallbacks {}, hypervolume {:.4} (self-normalised diagnostic)",
             q.mode,
-            q.occupied,
-            q.cells,
-            100.0 * q.coverage,
+            q.occupied_reachable,
+            q.reachable,
+            100.0 * q.reachable_coverage,
             q.entries,
             jnum(q.best_error),
+            q.occupancy_entropy,
+            q.occupancy_entropy_normalized,
+            q.qd_score,
+            q.descriptor_fallbacks,
             q.hypervolume
         );
     }
@@ -732,15 +812,22 @@ fn qd_json(q: Option<&qd::QdReport>) -> String {
     match q {
         None => "null".to_string(),
         Some(q) => format!(
-            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"occupied\":{},\"coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"hypervolume\":{},\"evaluations\":{}}}",
+            "{{\"mode\":\"{}\",\"bins\":{},\"cells\":{},\"reachable\":{},\"occupied\":{},\"occupied_reachable\":{},\"coverage\":{},\"reachable_coverage\":{},\"entries\":{},\"best_error\":{},\"cell_cap\":{},\"occupancy_entropy\":{},\"occupancy_entropy_normalized\":{},\"qd_score\":{},\"descriptor_fallbacks\":{},\"hypervolume\":{},\"evaluations\":{}}}",
             q.mode,
             q.bins,
             q.cells,
+            q.reachable,
             q.occupied,
+            q.occupied_reachable,
             jnum(q.coverage),
+            jnum(q.reachable_coverage),
             q.entries,
             jnum(q.best_error),
             q.cell_cap,
+            jnum(q.occupancy_entropy),
+            jnum(q.occupancy_entropy_normalized),
+            jnum(q.qd_score),
+            q.descriptor_fallbacks,
             jnum(q.hypervolume),
             q.evaluations
         ),
@@ -1107,6 +1194,8 @@ fn main() {
     let mut smooth = 0usize;
     let mut smooth_centred = false;
     let mut allow_interpolate = false;
+    // #145: a search may not train or score inside 2026H2 by default.
+    let mut allow_lockbox = false;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -1319,6 +1408,7 @@ fn main() {
                 }
             },
             "--allow-interpolate" => allow_interpolate = true,
+            "--allow-lockbox" => allow_lockbox = true,
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -2142,6 +2232,7 @@ fn main() {
     };
     let mut out_of_core_note: Option<String> = None;
     let mut csv_shape: Option<data::CsvShape> = None;
+    let mut store_resident = false;
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -2175,6 +2266,7 @@ fn main() {
                 let estimate = fs.estimated_resident_bytes();
                 let resident = force || budget.map_or(true, |limit| estimate <= limit);
                 if resident {
+                    store_resident = true;
                     fs.to_table()
                 } else {
                     let limit = budget.unwrap_or(estimate);
@@ -2648,6 +2740,7 @@ fn main() {
             unit: time_unit,
             tz,
         },
+        allow_lockbox,
     };
     let prep = data::PrepSpec {
         fill,
@@ -2660,16 +2753,48 @@ fn main() {
         filter,
         dtypes: dtypes.clone(),
     };
+    // #116: `--fit-strategy stream` can read the training rows back from a
+    // resident `.rcsb` store instead of keeping a second resident copy. This is
+    // exact only when the store's raw rows *are* the prepared population and
+    // the preparation is affine (centre/scale) or absent; smoothing, fill,
+    // filters, exclusions and lags rewrite values or row ids and fall back to
+    // the resident sample. The row ids cost one `usize` per training row and
+    // are requested only for this arm.
+    let stream_store_candidate = cfg.fit_strategy == fit::FitStrategy::Stream
+        && data_path != "-"
+        && store::is_store_path(&data_path)
+        && store_resident
+        && !multi_output
+        && !implicit_mode
+        && lags == 0
+        && history_frac == 0.0
+        && prep.fill == data::FillMethod::None
+        && prep.outlier_iqr.is_none()
+        && prep.smooth == 0
+        && prep.filter.is_none()
+        && spec.exclude.is_none();
     let mut rng = Mt::new(cfg.seed);
-    let mut prepared = match data::prepare_full_targets_weighted_with(
-        &table,
-        &vars,
-        &target_refs,
-        weight_name.as_deref(),
-        &spec,
-        &mut rng,
-        &prep,
-    ) {
+    let mut prepared = match if stream_store_candidate {
+        data::prepare_full_targets_weighted_with_indices(
+            &table,
+            &vars,
+            &target_refs,
+            weight_name.as_deref(),
+            &spec,
+            &mut rng,
+            &prep,
+        )
+    } else {
+        data::prepare_full_targets_weighted_with(
+            &table,
+            &vars,
+            &target_refs,
+            weight_name.as_deref(),
+            &spec,
+            &mut rng,
+            &prep,
+        )
+    } {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -2677,6 +2802,38 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    if stream_store_candidate {
+        let resolved = (|| -> Result<fit::StoreSpec, String> {
+            let fs = std::sync::Arc::new(store::FileStore::open(&data_path)?);
+            let columns = vars
+                .iter()
+                .map(|v| table.index_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut stream_spec = fit::StoreSpec::new(fs, columns, table.index_of(target_refs[0])?)?;
+            if let Some(name) = weight_name.as_deref() {
+                stream_spec = stream_spec.with_weight(table.index_of(name)?)?;
+            }
+            stream_spec = stream_spec
+                .with_standardisation(prepared.means.clone(), prepared.stds.clone())?
+                .with_rows(prepared.train_indices.clone())?;
+            Ok(stream_spec)
+        })();
+        match resolved {
+            Ok(stream_spec) => {
+                cfg.fit_stream_source = Some(std::sync::Arc::new(stream_spec));
+                notes.push(format!(
+                    "stream: fitting from '{}' group by group ({} training rows, O(p²) resident state)",
+                    data_path,
+                    prepared.train_indices.len()
+                ));
+            }
+            Err(e) => notes.push(format!(
+                "stream: disk row source unavailable ({}); using the resident training sample",
+                e
+            )),
+        }
+    }
 
     // #112: report the guard's estimate and its rows x columns basis in the
     // normal preparation block, not only when the guard refuses the file. Use
@@ -3308,6 +3465,22 @@ fn main() {
             counts.gpu_refits
         );
         eprintln!("# fit: {}", fit::backend_description());
+        if let Some(g) = &outcome.gpu {
+            let causes = search::FitFallbackCause::ALL
+                .iter()
+                .map(|c| format!("{}={}", c.label(), g.fit_fallback_by_cause.get(c.label()).copied().unwrap_or(0)))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] refits={}",
+                g.fit_screened,
+                g.fit_attempts,
+                g.fit_gpu,
+                g.fit_fallback,
+                causes,
+                g.fit_refits
+            );
+        }
     }
 
     // Seeded solutions, reported once each. The search holds them in
@@ -3566,6 +3739,30 @@ fn main() {
         None
     };
 
+    // #145: cross-validation draws its own folds, so the split guard above
+    // cannot see them. If any row of the table is in 2026H2, some fold would
+    // train or score on the holdout; refuse before the first fold.
+    if cv_mode.is_some() && !allow_lockbox {
+        if let Some(name) = &time_name {
+            if let Ok(j) = table.index_of(name) {
+                let keys = data::time_keys_with(&table, j, &spec.time)
+                    .map(|(k, _)| k)
+                    .unwrap_or_default();
+                let times: Vec<i64> = keys
+                    .iter()
+                    .filter(|v| v.is_finite())
+                    .map(|v| v.floor() as i64)
+                    .collect();
+                if let Err(e) = rcsr::lockbox::Guard::default()
+                    .check_times("cross-validation rows", &times)
+                {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+    }
+
     // Cross-validation (issue #19): rebuild the split as `k` folds, re-run the
     // search on each fold's own training rows, and score the model it returns on
     // the held-out block. Each fold is normalised on its training rows alone.
@@ -3767,6 +3964,11 @@ fn main() {
         md.push_str(&time_markdown(&timing));
     }
 
+    // #120: fixed-reference validation HV is computed before any display
+    // truncation or selection reordering, from the full archive this run
+    // produced.
+    let validation_hv = validation_hypervolume(&rows, &prepared);
+
     if top > 0 && rows.len() > top {
         rows.truncate(top);
     }
@@ -3828,6 +4030,13 @@ fn main() {
                     );
                 }
                 qd_text(outcome.qd.as_ref());
+                eprintln!(
+                    "# validation hv ({}): {:.6} (ref error {}, {} front points; fixed reference, comparable across arms)",
+                    validation_hv.sample,
+                    validation_hv.hypervolume,
+                    jnum(validation_hv.reference_error),
+                    validation_hv.points
+                );
             }
             for r in &rows {
                 // #14: an implicit model is printed as 0 = f(...).
@@ -4399,7 +4608,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -4435,6 +4644,7 @@ fn main() {
                 resid_json,
                 cv_json,
                 stability_json,
+                validation_hv_json(&validation_hv),
                 qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")
@@ -7136,7 +7346,12 @@ fn run_audit(args: &[String]) -> ! {
         }
     };
 
+    // #145: the leakage audit is read-only; it reports lockbox coverage rather
+    // than refusing, but uses the same central guard's overlap counter.
     let mut report = time_report;
+    let lockbox_coverage = rcsr::lockbox::Guard::default().overlap(
+        panel.time.iter().filter(|v| v.is_finite()).map(|v| *v as i64),
+    );
     report.merge(leakage::audit_panel(&panel, &target, horizon));
     // D5 differential learner is already part of audit_panel; run it explicitly
     // as well so its count is visible even when no name canary exists.
@@ -7381,6 +7596,7 @@ fn run_audit(args: &[String]) -> ! {
          \"time_unit\":{},\"horizon\":{},\"overlap_rows\":{},\"effective_n\":{},\
          \"time_audit\":{{\"rows\":{},\"median_dt\":{},\"min_dt\":{},\"max_dt\":{},\
          \"duplicate_instants\":{},\"non_monotonic_rows\":{}}},\
+         \"lockbox\":{},\
          \"leaks\":[{}]}}",
         jstr(VERSION),
         clean,
@@ -7401,6 +7617,12 @@ fn run_audit(args: &[String]) -> ! {
         ta.max_dt,
         ta.duplicate_instants,
         ta.non_monotonic_rows,
+        rcsr::lockbox::Lockbox::crypto_2026h2().json(
+            &lockbox_coverage,
+            false,
+            false,
+            false
+        ),
         leaks_json.join(",")
     );
     if let Some(path) = report_path {
@@ -7412,6 +7634,11 @@ fn run_audit(args: &[String]) -> ! {
     if json_out {
         println!("{}", out);
     } else if clean {
+        println!(
+            "# audit: lockbox rows={} windows={} (read-only, not evaluated)",
+            lockbox_coverage.rows,
+            lockbox_coverage.windows.len()
+        );
         println!(
             "audit clean: {} checks, {} rows, N_eff {:.1}, spec {:016x}",
             report.checks,
@@ -7614,6 +7841,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// #169: the GPU fit ledger in `--json` must expose admission and a label
+    /// for every fallback cause, not just a single opaque counter.
+    #[test]
+    fn gpu_fit_json_labels_every_fallback_cause() {
+        let mut g = search::GpuRunStats::default();
+        g.fit_screened = 100;
+        g.fit_attempts = 40;
+        g.fit_gpu = 37;
+        g.fit_fallback = 3;
+        g.fit_fallback_by_cause
+            .insert("ill_conditioned".to_string(), 2);
+        g.fit_fallback_by_cause.insert("non_finite".to_string(), 1);
+        g.fit_refits = 5;
+        g.fit_ms = 250.0;
+        g.fit_host_ms = 500.0;
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu");
+        assert!(
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5}"),
+            "{}",
+            json
+        );
+    }
 
     /// #71: the guard and the import command must be discoverable.
     #[test]

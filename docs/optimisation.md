@@ -618,6 +618,18 @@ constants is refused because it is bilinear. Rank deficiency, a non-finite row,
 a failed inner solve or a non-improving result returns `None` and the tree goes
 to exact LM untouched.
 
+**`auto` cost eligibility (structural, deterministic).** The measured
+`p = 3` separable cell (`q = 2`, `s = 1`) is 0.3–0.4× exact LM: VarPro's inner
+QR and line-search trials cost more row sweeps than LM's three parameters, and
+`auto` also paid the LM quality check. `auto` therefore selects VarPro only when
+the partition satisfies `s >= 2` or `q >= 4` (`varpro::cost_eligible`); the
+explicit `--fit-strategy varpro` override still runs it on every separable tree.
+The gate reads only the tree structure, never wall-clock time, so a seed cannot
+change path between runs. On the measured `p = 3` cells `auto` is now 0.97–1.04×
+exact LM instead of 2.5–3× slower, and two runs from the same start are
+bit-identical. Eligibility does not weaken the quality check: on an eligible
+cell `auto` still keeps the lower of the VarPro and exact-LM objectives.
+
 #### Out-of-core / row-sharded fitting (#116)
 
 `--fit-strategy stream` keeps only the sufficient statistics of the weighted
@@ -631,6 +643,25 @@ a memory map or a generated stream; `fit_stream_with` never asks for more than
 one row at a time. `--fit-strategy auto` does not select `stream` yet: the
 dispatcher stays deterministic and does not guess that data is out of core.
 Use `--fit-strategy stream` explicitly.
+
+`StoreRows` is the disk-backed `RowSource`: it calls
+`FileStore::load_group_with` into one reusable `GroupBuf` (one group, default
+512 KiB per `f64` column), applies the same training-row subset and
+centring/scaling the resident sample received, and visits weights and targets
+from the same group. Concurrent islands each construct their own reader, so no
+mutable buffer is shared and the `O(p²)` statistics are merged in a fixed
+group/row order. On a resident `.rcsb` with `--fit-strategy stream` (squared
+metric family, no `--fit-samples`/`--fit-rows` screen) the CLI resolves the
+exact training row ids during preparation and the search fits from the store
+instead of the resident `Sample`; smoothing, fill, filters, exclusions, lags,
+multi-output and implicit runs fall back to the resident path, because their
+rows or values no longer match the raw store. A read error, non-finite row, or
+singular normal equation returns `None` and the exact resident arm runs. The
+1e8-row probe in `tests/fit_stream_store.rs` (`#[ignore]`, pointed at a store
+with `RCSR_STREAM_PROBE_STORE`) fitted 1e8×2 rows in 273 s with
+`VmHWM ≈ 18.7 MB`; peak memory is independent of `N`, but **scoring and final
+refit still need a resident sample**, so this is exact out-of-core *fitting*,
+not a >RAM search.
 
 #### Batched GPU fitting (#169)
 
@@ -658,6 +689,7 @@ counts and whether a CUDA build is present.
 | linear objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
 | linear constants versus exact LM | relative difference `<= 1e-8` on affine tests |
 | VarPro objective versus exact LM | projected SSE `<=` LM SSE × `(1 + 1e-9)` on separable tests |
+| `auto` VarPro eligibility | structural only: `s >= 2` or `q >= 4`; otherwise exact LM (explicit `varpro` bypasses the gate) |
 | rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
 | size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
 | non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
@@ -703,16 +735,24 @@ new arm pays:
 | separable `N=1e3, p=3` | 7.8 ms | 4.2 ms (VarPro) | **1.9×** |
 | separable `N=1e4, p=3` | 14.1 ms | 41.2 ms (VarPro) | 0.3× |
 | separable `N=1e5, p=3` | 171 ms | 478 ms (VarPro) | 0.4× |
+| separable `N=1e3, p=3` | 0.90 ms | 0.90 ms (`auto`) | 0.99× |
+| separable `N=1e4, p=3` | 8.41 ms | 8.63 ms (`auto`) | 0.97× |
+| separable `N=1e5, p=3` | 90.5 ms | 87.4 ms (`auto`) | 1.04× |
 | streamed `N=1e6` generated rows | 3.99 s | 2.56 s (stream) | **1.56×** |
+| streamed `N=1e8, d=2, p=3` `.rcsb` | not run | 273 s (stream) | RSS 18.7 MB |
 
 All VarPro cells reached `sse = 0` at 8 iterations. On a three-constant problem
 the inner beta solve and its line-search trials cost more sweeps than LM's
 three parameters, so VarPro is a correctness/conditioning arm there rather than
 a speed win; it is the structural choice that matters for larger nonlinear
-blocks. The stream arm is 0.83× the resident fit at 1e5 rows (setup dominates)
-and 1.56× faster at 1e6 while keeping only `O(p²)` state. The 1e8-row and
-100-input cells in the issue's matrix were not run on this shared host; the
-implementation does not depend on `N`, but the measurement claim stops here.
+blocks. The `auto` rows are the post-gate measurement: the structural rule keeps
+the historical LM arm on that cell, so the adaptive path is within measurement
+noise of the reference instead of 2.5–3× slower. The stream arm is 0.83× the
+resident fit at 1e5 rows (setup dominates) and 1.56× faster at 1e6 while keeping
+only `O(p²)` state. The 1e8-row and 100-input **search** cells in the issue's
+matrix were not run on this shared host; the single-candidate 1e8 stream probe is
+fit-only evidence. The implementation does not depend on `N`, but the
+measurement claim stops here.
 
 #### `--fit-rows`: fit on a subsample, score and archive on all rows
 
@@ -744,7 +784,13 @@ The search phase uses f32 row arithmetic with f64 accumulators and the solve;
 the final undamped polish runs in f64 on an exact f64 copy of the training rows.
 Candidates with no analytic GPU derivative, more than 16 constants, more than
 96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
-are refit by the exact CPU arm and counted as fallbacks. `--fit-strategy gpu`
+are refit by the exact CPU arm and counted as fallbacks. Before fitting, every
+unfitted offspring is screened on the GPU with its seed constants and only the
+best `max(32, pop/4)` of each island enter the fitted LM batch; the rest keep
+their screening score, so the evaluation count is unchanged while the fit
+volume falls. Every CPU fallback is labelled by cause (`unsupported_plan`,
+`too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
+`launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to the squared/AIC family (the kernel minimises squared error); other
 metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
 training rows in CPU f64 before it is scored and reported, so reported constants

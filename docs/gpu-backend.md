@@ -56,13 +56,18 @@ actionable error naming the target, the detected toolkit, and the minimum
 supported CUDA version. For example, on a CUDA 12.0 machine:
 
 ```text
-error: RCSR_CUDA_ARCH=sm_121 needs CUDA 12.8 or newer, but `nvcc` is CUDA 12.0.
+error: RCSR_CUDA_ARCH=sm_121 needs CUDA 12.9 or newer, but `nvcc` is CUDA 12.0.
 error: sm_121 is the GB10 in the DGX Spark; its DGX OS images ship CUDA 13.0.
 error: Install a newer toolkit and point RCSR_NVCC at it, for example:
-error:   RCSR_NVCC=/usr/local/cuda-12.8/bin/nvcc RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
+error:   RCSR_NVCC=/usr/local/cuda-12.9/bin/nvcc RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
 error: or build for the GPU in this machine, for example:
 error:   RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 ```
+
+CUDA 12.8 was the wrong floor: it added Blackwell (`sm_100`, `sm_120`) but its
+`nvcc --list-gpu-arch` stops at `compute_120`. `sm_121` first appears in CUDA
+12.9 (`compute_121`), so a 12.8 toolkit fails with "not defined for option
+'gpu-architecture'" even though the build script used to let it through.
 
 Environment overrides for the build:
 
@@ -79,7 +84,62 @@ Minimum toolkit per target, as used by the build-script check:
 | `sm_86` | 11.1 | RTX 3060 / Ampere; verified here with CUDA 12.0 |
 | `sm_90` / `sm_90a` | 11.8 / 12.0 | Hopper |
 | `sm_100` | 12.8 | datacentre Blackwell |
-| `sm_121` | 12.8 | GB10 / DGX Spark; DGX OS ships CUDA 13.x |
+| `sm_120` | 12.8 | consumer Blackwell |
+| `sm_121` | 12.9 | GB10 / DGX Spark; DGX OS ships CUDA 13.x |
+
+The build-script check is deliberately about the **compiler**, not the device:
+`RCSR_CUDA_ARCH=sm_121` succeeds on any machine with CUDA ≥ 12.9 and needs no
+GB10 attached.
+
+### `sm_121` compile-only validation (#28)
+
+[`tests/sm121_compile.rs`](../my-version/tests/sm121_compile.rs) compiles the
+real `src/cuda/eval.cu` for `sm_121` and inspects the cubin. It needs CUDA ≥
+12.9 and `cuobjdump`, but no GPU; when no such toolkit is found it prints a skip
+note and the rest of the suite is unaffected. Run it explicitly:
+
+```sh
+RCSR_SM121_NVCC=/path/to/cuda-13/bin/nvcc \
+  cargo test --release --test sm121_compile -- --nocapture
+```
+
+The test asserts that `nvcc`/`ptxas` accept `-arch=sm_121`, that
+`cuobjdump --list-elf` names an `.sm_121.cubin`, that `--dump-sass` is tagged
+`code for sm_121` / `EF_CUDA_SM121`, and that `ptxas -v` reports a resource line
+for `eval_pool_kernel` and `fit_kernel`.
+
+Recorded on 2026-10-21 with CUDA 13.0.88 (V13.0.88) on an x86_64 host, no GPU
+involved:
+
+| Kernel | Registers | Stack | Static smem |
+|---|---|---|---|
+| `eval_pool_kernel` | 30 | 288 B | 1 024 B |
+| `eval_kernel` | 33 | 288 B | 1 024 B |
+| `fit_kernel` | 110 | 1 744 B | 40 672 B |
+| `predict_kernel` | 29 | 288 B | — |
+| `hash_kernel` | 14 | — | — |
+
+`cuobjdump --dump-sass` reports `code for sm_121` and
+`EF_CUDA_SM121 EF_CUDA_VIRTUAL_SM(EF_CUDA_SM121)`; the disassembly contains
+Blackwell instructions (`UMOV.64`, `DFMA`, `LDS.64`). This is **compile
+evidence**: the source and toolchain produce real `sm_121` device code, and the
+resource budget is recorded. It is **not** evidence that a GB10 loaded or ran
+the kernels, and it says nothing about occupancy or speed.
+
+**The runtime half stays open.** `sm_121` execution needs a GB10 (or another
+`sm_121` device) and its driver. Acceptance is therefore split explicitly:
+*compiles for `sm_121`* is local and permanent (the test above); *runs on GB10*
+is one dated remote session recording `nvidia-smi` (device, driver, compute
+capability), the GPU test suite and a benchmark. The second must never be
+marked from cross-compilation alone.
+
+**PTX portability is not `sm_121` performance evidence.** The current `sm_86`
+build embeds `compute_86` PTX (`cuobjdump -lptx` shows `*.sm_86.ptx`), and PTX
+is forward-compatible, so that fatbin can JIT for `sm_121` and run (set
+`CUDA_FORCE_PTX_JIT=1` to force the path). That proves the source is portable
+and is the cheapest first check on a rented Spark; it does not measure native
+`sm_121` codegen, so it cannot replace either the compile test above or the
+native run.
 
 
 ## How it works
@@ -152,17 +212,60 @@ the final archive is always re-scored by the CPU f64 evaluator. The accumulation
 itself is f32 (see the 200 000-row caveat below), so the f32 fitness is a
 search signal, not a reported number.
 
-Static kernel cost measured on `sm_86` (CUDA 12.0, `-O3`), before and after this
-change:
+### Register and occupancy contract (#131)
 
-| kernel | SASS before | SASS after | registers | stack |
-|---|---:|---:|---:|---:|
-| `eval_kernel` (packed / pipeline) | 1 312 | 1 336 (+1.8%) | 27 → 27 | 288 B → 288 B |
-| `eval_pool_kernel` (fixed slots / synchronous) | 1 008 | 1 336 (+32.6%) | 28 → 30 | 288 B → 288 B |
-| `predict_kernel` (test fixtures only) | — | 1 296 | 26 | 288 B |
+The old acceptance wording used a single number ("27 registers") measured on one
+kernel before the pool kernel implemented the #131 opcodes. On `sm_86` that
+number was never the constraint: 27 and 30 registers round to the **same**
+allocation, and the actual occupancy cliff is at 41 registers. The contract is
+therefore per kernel and expressed as occupancy, not as a bare register count:
 
-The pool kernel grew because it previously **did not implement** the #131
-opcodes at all (it fell through to `r = 0.0f`); the growth is the cost of the
+* `eval_kernel`, `eval_pool_kernel` and `predict_kernel` carry
+  `__launch_bounds__(RC_MAX_THREADS, 6)` (`RC_MAX_THREADS` is 256), i.e. PTX
+  `.maxntid 256, 1, 1` and `.minnctapersm 6`;
+* at 256 threads each kernel must stay at or below **40 registers**, keep its
+  288-byte stack frame, and produce **no spill stores/loads**;
+* that gives six resident blocks per SM, 6 × 256 = 1 536 threads = 48 warps =
+  **100 % theoretical occupancy** on `sm_86`.
+
+Measured with the build script's flags (`sm_86`, CUDA 12.0, `-O3`) on
+`main` at `ce3201c` (before) and on this branch (after):
+
+```sh
+nvcc -O3 -std=c++14 -arch=sm_86 -cubin src/cuda/eval.cu \
+     -o /tmp/eval.cubin -Xptxas -v,-warn-spills
+cuobjdump -res-usage /tmp/eval.cubin
+```
+
+| kernel | REG before | REG after | allocated regs/thread | STACK | SHARED | LOCAL | spills | occupancy at 256 threads |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `eval_kernel` (packed / pipeline) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
+| `eval_pool_kernel` (fixed slots / synchronous) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
+| `predict_kernel` (test fixtures only) | 28 | 26 | 32 | 288 B | 0 | 0 | 0 | 100 % (6 blocks) |
+| `fit_kernel` (batched LM, untouched) | 93 | 93 | 96 | 1 744 B | 40 672 B | 0 | 0 | not subject to this contract |
+| `hash_kernel` / `cast_f32_to_f64_kernel` (untouched) | 16 / 12 | 16 / 12 | 16 / 16 | 0 | 0 | 0 | 0 | — |
+
+The before column is today's `main`, after the #121 device stack guards; the
+PR #180 snapshot (27 / 30 registers, same 288-byte stack) predates those guards
+and remains correct for that commit. Both snapshots round to 32 allocated
+registers per thread, so the launch-bounds build changes no occupancy.
+
+Why 32 allocated registers is the floor: for a 256-thread block (8 warps) the
+allocator charges `ceil(regs × 32 / 256) × 256` registers per warp. At 26–32
+registers that is 4 units = 1 024 registers per warp = 32 effective registers
+per thread. A block therefore uses 8 × 1 024 = 8 192 registers, and the SM's
+65 536 registers admit 8 blocks — but the 1 536-thread limit admits only 6, so
+threads bind and registers do not. The cliff is at 41: six blocks need at most
+`65 536 / 6 / 8 = 1 365` registers per warp, which rounds to 5 units = 1 280 =
+**40 registers per thread**. At 41–48 registers the allocator charges 6 units
+and the SM falls to five blocks = 40 warps = 83 % occupancy. `predict_kernel`
+and the 32-thread launch used for tiny `N` are capped by the 16-block limit
+instead (16 warps = 33 %). The harness
+`evaluator_kernels_carry_the_sm86_occupancy_contract` pins the launch bounds,
+the 256-thread constant and the 6 × 256 = 1 536 arithmetic.
+
+The pool kernel's SASS growth came from implementing the #131 opcodes at all
+(it previously fell through to `r = 0.0f`); the growth is the cost of the
 operators it now shares with the packed kernel, not a regression in a working
 path. No kernel's stack frame increased. A CUDA-guided run reports the opcode
 and fallback counts for each generation under `gpu.generations` in `--json`,
@@ -257,8 +360,11 @@ Three honest caveats:
   the GPU numbers are CUDA-event kernel times and are stable.
 
 The kernel time grows from 0.178 ms (60 rows) to 7.29 ms (200 000 rows), so on
-short datasets it is still **latency-bound, not throughput-bound**: with only
-32–256 threads per block and a per-thread local-memory stack, occupancy is low.
+short datasets it is still **latency-bound, not throughput-bound**: at 256
+threads the register/occupancy contract above is designed for full residency,
+but a small `N` launches only 32 threads, where the 16-block cap limits the SM
+to 16 warps (33 %) regardless of registers. The per-thread local-memory stack
+then adds memory latency that a full block would hide.
 At 500 programs × 200 000 rows it reaches ~13 × 10⁹ evaluations/s, still a small
 fraction of the card's FP32 peak, so there is headroom left.
 
@@ -534,12 +640,39 @@ rcsr ... --variation postfix                   # require the flat path
 
 `auto` requires a GPU, `--fit-iters 0`, `islands × pop >= 4096`, the default
 complexity model, no aggregates/custom blocks/dimension constraints, no
-screening or predictor subsampling and no QD layer. The flat engine draws parents
-from the island tournament only: the archive-guided `--front-parents` draw is
-not ported, so `auto` can produce a different (but deterministic) trajectory. Everything else stays on the
-owned-tree path, including all constant fitting (#116), simplification of
-reported expressions, checkpoints and exact `f64` reporting. A fitting run can
-therefore never be silently approximated by the flat engine.
+screening or predictor subsampling and no QD layer. The flat engine now has
+`--front-parents` parity with the owned-tree loop: at the start of a generation
+it compiles the previous front once into fixed-width postfix programs
+(`postfix::FrontParents`) and takes 15 % of parent draws uniformly from it,
+using the same draw order as `pick_parent` (#76). `--no-front-parents` passes an
+empty pool and `front_p = 0`, consumes no random draw and is bit-identical to
+the pre-#76 flat trajectory. Everything else stays on the owned-tree path,
+including all constant fitting (#116), simplification of reported expressions,
+checkpoints and exact `f64` reporting. A fitting run can therefore never be
+silently approximated by the flat engine.
+
+#### Archive-hash contract (#122)
+
+The hash box has two well-posed readings, and only those are claimed:
+
+1. **Same-path determinism.** For a fixed seed, build and configuration the
+   archive hash repeats exactly: repeated runs, one-island and four-island
+   configurations, and a checkpoint/resume trip all reproduce it
+   (`tests/postfix_loop.rs`).
+2. **Content equivalence on a fixed candidate stream.** The front is reduced by
+   `Archive::canonicalize` to a monotone `(cost, error)` staircase: sort by
+   `(cost, error, structural hash)`, keep the best per cost, keep only strictly
+   improving errors as cost rises, then trim the cap deterministically. The
+   hash is FNV-1a over `(cost bits, error bits, structural hash)` in that order,
+   so a fixed member set hashes the same however it arrived
+   (`pareto::tests::hash_is_content_equivalent_for_a_fixed_candidate_stream`).
+3. **Not equality to the pre-#122 trajectory.** That comparison is ill-posed,
+   not merely unimplemented. The old archive was updated by ε-dominance, which
+   is not transitive, and when over capacity `prune` removed
+   `items[len / 2]`; both depend on insertion order, so there is no canonical
+   old hash. The flat engine also deliberately uses a different counter-based
+   RNG contract. We therefore do not claim that the flat archive equals the
+   historical owned-tree archive for the same seed.
 
 ### The `if` cell and the worker pool (#121)
 
@@ -592,6 +725,36 @@ operators, 10 generations, three interleaved runs each on a busy shared host
 | `--variation postfix` | 0.94 / 1.02 / 1.45 | 0.69–1.04 | 9.80 (**6.7×**) |
 | `--variation node --pipeline-depth 0` (best tree setting) | 5.01 / 5.15 / 5.28 | 3.19 | 1.94 |
 
+**Re-measured at the stated `N >= 5 000` (2026-10-21).** The 6.7× above used
+3 750 training rows (a 5 000-row file at the default 25 % test fraction), which
+is below the issue's `N >= 5 000` wording. The same host, file and budget with
+`--test-frac 0` (so **N = 5 000**), three interleaved runs each:
+
+```sh
+./target/release/rcsr --data gpu5k.csv --target y --vars x0,x1 \
+  --no-fit --gpu --pop 10000 --islands 1 --generations 10 --seed 1 \
+  --patience 0 --test-frac 0 --variation node|postfix
+```
+
+| Run | wall, s (three runs) | median wall | generations/s |
+|---|---:|---:|---:|
+| `--variation node` (overlap pipeline, the default) | 6.68 / 7.22 / 6.74 | 6.74 | 1.48 |
+| `--variation postfix` | 0.90 / 0.85 / 0.91 | 0.90 | **11.1 (7.5×)** |
+
+Peak RSS was 128.4 MB for the owned-tree run and **113.5 MB** for the flat run;
+the flat value did not grow from one to ten generations (113.68 MB at one
+generation). The 3 750-row and 5 000-row cells agree, so the target is met at
+the stated row count. This is a no-fit screening cell, not production search
+throughput; fitting remains on the owned-tree path (#116).
+
+**Fallback and memory boxes.** At `P = 4 000`, `--variation auto` keeps the
+owned-tree path and reports `node variation (population 4000 is below the
+4096-genome gate)`; forcing `--variation postfix` refuses the run. The arena is
+fixed capacity: 2.56 MB of program words plus 20 B of metadata per slot at
+`P = 10 000`, and `postfix::tests::ten_thousand_slots_have_a_fixed_memory_bound`
+pins that the next generation has exactly the same byte count
+(`tests/postfix_loop.rs` runs the `N = 5 000` cell).
+
 At a fixed wall of about 2.2–4.1 s the flat path reached a best training error
 of 0.022 (40 and 80 generations) against 0.118 for the owned-tree path in 10
 generations. A 2-D hypervolume over `(complexity, train error)` with reference
@@ -627,15 +790,28 @@ one CUDA block per candidate:
    this arm is selected), so the returned constants are not limited by the f32
    evaluator copy or by f32 row arithmetic.
 
-**Eligibility and fallback.** A candidate is offered to the kernel only for the
-squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no shared block
-constants, an analytic derivative for every operator, and at least `32p` rows.
+**Eligibility, admission and fallback.** A candidate is offered to the kernel
+only for the squared/AIC family, with `p <= 16`, at most 96 flattened nodes, no
+shared block constants, an analytic derivative for every operator, and at least
+`32p` rows. The arm also screens before it fits: every unfitted offspring is
+scored once on the GPU with its seed constants, and only the best
+`max(32, pop/4)` candidates of each island are admitted to the fitted LM batch
+(ties break on complexity and then the fixed population index). The remaining
+offspring keep their screening score. This cuts the fit volume without changing
+the evaluation count or the finalist refit, and the admission set is a pure
+function of the screened errors, so it is reproducible.
+
 The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
 (the undamped Cholesky diagonal ratio exceeds `1e4` or a pivot hits the
 `1e-12` floor), `2` a non-finite value or residual. Status `1`/`2`, unsupported
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
-constants. `--fit-report` and the `gpu.fit` JSON object count
-`attempts`/`gpu`/`fallback`/`refits`; the run manifest records the same ledger.
+constants. Every CPU fallback is labelled by cause: `unsupported_plan`
+(no analytic derivative, too many nodes, shared block constants or no
+constants), `too_few_rows`, `too_many_constants` (`p > 16`), `ill_conditioned`,
+`non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
+`screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
+`seconds` and the whole fit stage's `host_seconds`; the run manifest records the
+same accepted/fallback/refit totals.
 
 **Exactness.** Search fitness is still f32 and only guides selection. Every
 finalist is refit by the exact CPU f64 LM on all training rows before the final
@@ -670,6 +846,32 @@ the fit-stage ratio on eligible candidates, and the fallback/refit share is what
 limits Amdahl. A dispatcher that avoids offering degenerate candidates and a
 lower-cost finalist refit are the follow-ups, not a default change.
 
+**Admission/promotion A/B (WP-169-D).** The pinned fit-heavy 154k cell
+(4 islands, `--pop 256`, five generations, no screening, `--fit-iters 8`,
+smooth finite operators) at equal 5 120 evaluations:
+
+| arm | wall | best error | hypervolume | TTT (exact final × 1.02) |
+|---|---:|---:|---:|---|
+| `exact` CPU | 218.68 s | 1.8589e-2 | 0.5056 | gen 5 / 218.7 s |
+| `gpu` + admission | 93.38 s | 1.0861e-2 | 0.5386 | gen 4 / 19.1 s |
+
+The GPU arm is **2.34×** end-to-end. It screened 6 124 offspring, admitted
+1 536, fitted 1 437 on the device and sent 99 to the CPU (**6.4 %** of admitted;
+all `ill_conditioned`, every other cause zero), then refit 997 finalists
+exactly. The whole fit stage was 32.00 s (34.3 % of wall; kernel 4.39 s) and GPU
+duty was **96.8 %**. Hypervolume and time-to-target are both better than the
+CPU arm at equal evaluations.
+
+The measured fit share is **34.3 %, below the 50 % construction** the issue's
+`>= 1.3×` clause names, so this cell does not evidence that conditional box even
+though its measured e2e and duty exceed the numeric thresholds. A second probe
+at `N = 3.9M`, `pop 128`, one island and two generations (256 evaluations) had a
+low fallback rate (2.1 %) and 99.5 % duty but **failed the quality control**
+(exact best 0.1612 versus GPU 0.4753; hypervolume 0.0032 versus 0.0000; target
+not reached). Two generations at that size are too few for admission by
+seed-constant screening, so the 3.9M hourly cell remains an open follow-up, not
+a passing measurement.
+
 **Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
 arm yet: it scores a tree as soon as it is offered, before the barrier fit
 batch, so the GPU-fit path uses synchronous generation batches.
@@ -691,7 +893,7 @@ Exact build commands:
 # RTX 3060 / Ampere: plain device memory, CUDA 11.1+ (verified with 12.0)
 RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 
-# DGX Spark / GB10: CUDA 12.8+ (13.0+ on DGX OS), unified memory on by default
+# DGX Spark / GB10: CUDA 12.9+ (13.0+ on DGX OS), unified memory on by default
 RCSR_CUDA_ARCH=sm_121 cargo build --release --features cuda
 
 # unified memory on any other target, e.g. to test the path on a discrete GPU
@@ -703,12 +905,14 @@ RCSR_CUDA_ARCH=sm_121 RCSR_GPU_UNIFIED=0 cargo build --release --features cuda
 
 Plan and status:
 
-1. **Native build.** `RCSR_CUDA_ARCH=sm_121`, CUDA 12.8+ `nvcc` (CUDA 13 on DGX
-   OS). Implemented: the architecture is accepted by the validator and the
-   build script reports the required toolkit instead of dumping nvcc output.
-   `sm_121` is a *consumer Blackwell* target; datacentre flags such as `sm_100`
-   will not run on it. **The binary itself has not been built or run here**
-   because this machine's `nvcc` is CUDA 12.0.
+1. **Native build.** `RCSR_CUDA_ARCH=sm_121`, CUDA 12.9+ `nvcc` (CUDA 13 on DGX
+   OS). Implemented: the architecture is accepted by the validator, the build
+   script reports the required toolkit instead of dumping nvcc output, and
+   `tests/sm121_compile.rs` compile-verifies a real `sm_121` cubin with CUDA
+   13.0.88 (see “`sm_121` compile-only validation” above). `sm_121` is a
+   *consumer Blackwell* target; datacentre flags such as `sm_100` will not run
+   on it. **The kernels have not been run on a GB10 here**: compilation is
+   local and permanent, execution is hardware-gated.
 2. **Unified memory.** Implemented. Building for `sm_121` compiles the context
    with `-DRCSR_UNIFIED=1`, which allocates every buffer with
    `cudaMallocManaged` (host-accessible, explicit copies removed). The same
@@ -861,20 +1065,28 @@ substitute for either.
 | SM occupancy / achieved SM throughput | needs `ncu` with counter permission | **unverified here** — reported as `null`, never invented |
 | `--no-gpu` forces the CPU, with and without the feature | any machine, `tests/gpu_loop.rs` | **verified** |
 | Missing device / CUDA error falls back with one note | `RCSR_GPU=0`, `tests/gpu_loop.rs` | **verified** (no-device path; an injected kernel failure is not exercised) |
-| `sm_121` compilation and execution | needs a GB10 with CUDA 12.8+ / 13 | **unverified** — no such hardware here; the build fails early with the version requirement |
+| `sm_121` compilation (cubin + SASS + register/smem audit) | x86_64 host, CUDA 13.0.88, **no GPU** (`tests/sm121_compile.rs`) | **verified — compiled, not run** |
+| `sm_121` execution on a GB10 (device, driver, GPU tests, benchmark) | needs a dated session on `sm_121` hardware | **hardware-gated — not run here** |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 
-What would close the gaps: on a DGX Spark (or any `sm_121` + CUDA 13 machine),
-run
+The compile gap is closed by the test and table above; it can be re-run on any
+machine with CUDA ≥ 12.9. The runtime gap needs a DGX Spark (or any `sm_121` +
+CUDA 13 machine), where the dated session should record:
 
 ```sh
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv
 RCSR_CUDA_ARCH=sm_121 cargo test --release --features cuda
 RCSR_CUDA_ARCH=sm_121 ./target/release/rcsr-gpu-bench --data <set> --batch 8000
+
+# first, the cheap portability check on the existing sm_86 build:
+CUDA_FORCE_PTX_JIT=1 ./target/release/rcsr-gpu-bench --data <set> --batch 8000
 ```
 
 then repeat the benchmark with a dataset whose f32 columns exceed device VRAM,
 and compare the unified run with `RCSR_GPU_UNIFIED=0`. The benchmark prints the
 device, the architecture and `memory : device|unified`, so the result records
-which path produced it.
+which path produced it. The PTX-JIT run proves portability only; the native
+`sm_121` build is what the performance claim needs. Neither run is claimed
+here.
 

@@ -71,7 +71,7 @@ fn main() {
             String::new(),
             "Set it to a target the toolkit supports, for example:".to_string(),
             "  RCSR_CUDA_ARCH=sm_86     # RTX 3060 / Ampere".to_string(),
-            "  RCSR_CUDA_ARCH=sm_121    # GB10 / DGX Spark (needs CUDA 12.8+)".to_string(),
+            "  RCSR_CUDA_ARCH=sm_121    # GB10 / DGX Spark (needs CUDA 12.9+)".to_string(),
         ]),
     };
 

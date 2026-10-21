@@ -8,7 +8,7 @@
 use rcsr::expr::{constant, input, node, Node, Op};
 use rcsr::fit::{
     fit_batch_verified, fit_stream_with, fit_weighted, fit_weighted_strategy, separable_partition,
-    BatchStatus, BatchedFitter, FitStrategy, RowSource,
+    varpro_cost_eligible, BatchStatus, BatchedFitter, FitStrategy, RowSource,
 };
 
 fn fitted(tree: &Node) -> Vec<f64> {
@@ -83,6 +83,79 @@ fn auto_dispatches_linear_and_varpro_without_losing_to_lm() {
     assert!(a <= b * (1.0 + 1e-9) + 1e-12, "auto {a} vs exact {b}");
     let c = fitted(&vp);
     assert!((c[0] - 2.5).abs() < 1e-4 && (c[1] - 1.3).abs() < 1e-4 && (c[2] - 0.7).abs() < 1e-4, "{c:?}");
+}
+
+/// #116: the deterministic `auto` cost gate. `a·sin(b·x) + c` has one
+/// nonlinear parameter and is measured at 0.3–0.4× exact LM, so `auto` must not
+/// select VarPro for it. The explicit `varpro` arm keeps the old behaviour.
+#[test]
+fn auto_skips_varpro_when_the_structural_cost_gate_rejects_it() {
+    let p3 = separable_partition(&separable()).expect("separable partition");
+    assert!(!varpro_cost_eligible(&p3), "s=1, q=2 must be ineligible: {p3:?}");
+    // Two nonlinear parameters make the outer Jacobian worth its cost.
+    let wide = node(
+        Op::Add,
+        vec![
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.4),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(0.5), input(0)])]),
+                        ],
+                    ),
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.3),
+                            node(Op::Cos, vec![node(Op::Mul, vec![constant(0.7), input(0)])]),
+                        ],
+                    ),
+                ],
+            ),
+            constant(0.0),
+        ],
+    );
+    let wp = separable_partition(&wide).expect("wide separable partition");
+    assert!(wp.theta.len() >= 2, "expected two nonlinear constants: {wp:?}");
+    assert!(varpro_cost_eligible(&wp), "s>=2 must be eligible: {wp:?}");
+    let x: Vec<Vec<f64>> = (0..48).map(|i| vec![-2.0 + 4.0 * i as f64 / 47.0]).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|r| 0.4 * (0.5 * r[0]).sin() + 0.3 * (0.7 * r[0]).cos())
+        .collect();
+    let mut a = wide.clone();
+    let auto = fit_weighted_strategy(&mut a, &x, &y, &[], 16, FitStrategy::Auto);
+    let mut b = wide;
+    let exact = fit_weighted(&mut b, &x, &y, &[], 16);
+    assert!(auto <= exact * (1.0 + 1e-9) + 1e-12, "auto {auto} vs exact {exact}");
+}
+
+/// #116: on the rejected p=3 cell `auto` is exactly the historical LM arm and
+/// two runs from the same seed produce bit-identical constants and objective.
+#[test]
+fn auto_is_deterministic_and_bit_identical_to_lm_on_the_rejected_cell() {
+    let x: Vec<Vec<f64>> = (0..64).map(|i| vec![-3.0 + 6.0 * i as f64 / 63.0]).collect();
+    let y: Vec<f64> = x.iter().map(|r| 2.5 * (1.3 * r[0]).sin() + 0.7).collect();
+    let mut lm = separable();
+    let s_lm = fit_weighted(&mut lm, &x, &y, &[], 8);
+    let mut a = separable();
+    let s_a = fit_weighted_strategy(&mut a, &x, &y, &[], 8, FitStrategy::Auto);
+    let mut b = separable();
+    let s_b = fit_weighted_strategy(&mut b, &x, &y, &[], 8, FitStrategy::Auto);
+    assert_eq!(s_a.to_bits(), s_lm.to_bits(), "auto must not run VarPro here");
+    assert_eq!(s_a.to_bits(), s_b.to_bits(), "auto must be deterministic");
+    let ca: Vec<u64> = fitted(&a).iter().map(|v| v.to_bits()).collect();
+    let cb: Vec<u64> = fitted(&b).iter().map(|v| v.to_bits()).collect();
+    let cl: Vec<u64> = fitted(&lm).iter().map(|v| v.to_bits()).collect();
+    assert_eq!(ca, cb);
+    assert_eq!(ca, cl);
+    // The explicit override still takes VarPro.
+    let mut forced = separable();
+    let s_forced = fit_weighted_strategy(&mut forced, &x, &y, &[], 8, FitStrategy::VarPro);
+    assert!(s_forced.is_finite() && s_forced <= s_lm * (1.0 + 1e-9) + 1e-12);
 }
 
 #[test]

@@ -58,6 +58,10 @@ pub struct MembershipConfig {
     pub top: usize,
     /// Minimum trailing ADV in quote currency (0 = no floor).
     pub min_adv_usd: f64,
+    /// First rebalance instant (inclusive). `None` starts at the first bar.
+    pub start: Option<i64>,
+    /// Last rebalance instant (exclusive). `None` runs to the last bar.
+    pub end: Option<i64>,
 }
 
 impl Default for MembershipConfig {
@@ -69,6 +73,8 @@ impl Default for MembershipConfig {
             min_bars: 60,
             top: 100,
             min_adv_usd: 0.0,
+            start: None,
+            end: None,
         }
     }
 }
@@ -126,6 +132,40 @@ pub struct Panel {
 }
 
 impl Panel {
+    /// Restrict the panel to `[start, end)` and recompute the summary fields
+    /// that a manifest reports. Used by `panel build --start/--end`, so an
+    /// explicit evaluated range is both filtered and checked against the
+    /// lockbox.
+    pub fn retain_range(&mut self, start: Option<i64>, end: Option<i64>) {
+        if start.is_none() && end.is_none() {
+            return;
+        }
+        self.rows.retain(|r| {
+            start.map_or(true, |s| r.bar.time >= s) && end.map_or(true, |e| r.bar.time < e)
+        });
+        let mut last: BTreeMap<String, i64> = BTreeMap::new();
+        let mut first_ts = i64::MAX;
+        let mut last_ts = i64::MIN;
+        let mut gaps = 0usize;
+        for r in &self.rows {
+            first_ts = first_ts.min(r.bar.time);
+            last_ts = last_ts.max(r.bar.time);
+            gaps += r.gap_buckets;
+            last.entry(r.symbol.clone())
+                .and_modify(|t| *t = (*t).max(r.bar.time))
+                .or_insert(r.bar.time);
+        }
+        self.symbols = self.rows.iter().map(|r| r.symbol.clone()).collect();
+        self.first_ts = if self.rows.is_empty() { 0 } else { first_ts };
+        self.last_ts = if self.rows.is_empty() { 0 } else { last_ts };
+        self.gaps = gaps;
+        self.delisted = last
+            .into_iter()
+            .filter(|(_, t)| *t < self.last_ts - 30 * 86_400)
+            .map(|(s, _)| s)
+            .collect();
+    }
+
     /// Symbol count per UTC year.
     pub fn counts_per_year(&self) -> BTreeMap<i32, (usize, usize)> {
         let mut rows: BTreeMap<i32, BTreeSet<&str>> = BTreeMap::new();
@@ -176,10 +216,17 @@ pub fn build_membership(
         return Err("membership: no bars".to_string());
     }
     all_times.sort_unstable();
-    let mut as_of = month_start(all_times[0]);
+    // #145: a PIT rebuild may be scoped to an evaluation span (2021-01 ..
+    // 2026-07) while still reading the full trailing lookback before it.
+    let first = cfg.start.map(|s| month_start(s)).unwrap_or_else(|| month_start(all_times[0]));
+    let stop = cfg.end.unwrap_or(last_ts + 1);
+    if stop <= first {
+        return Err("membership: --end must be after --start".to_string());
+    }
+    let mut as_of = first;
     let mut decisions = Vec::new();
     let mut as_ofs = Vec::new();
-    while as_of <= last_ts {
+    while as_of < stop && as_of <= last_ts {
         as_ofs.push(as_of);
         let lookback_start = as_of - cfg.lookback_days * 86_400;
         let mut candidates: Vec<(String, f64, usize)> = Vec::new();
@@ -267,59 +314,84 @@ pub fn build_panel_with_step(
     step_seconds: i64,
 ) -> Result<Panel, String> {
     let step = step_seconds.max(1);
+    let index = membership_index(membership);
     let mut rows = Vec::new();
-    let mut symbols = BTreeSet::new();
-    let mut gaps = 0usize;
-    let mut first_ts = i64::MAX;
-    let mut last_ts = i64::MIN;
+    for (symbol, bars) in series {
+        rows.extend(symbol_panel_rows(
+            symbol,
+            bars,
+            index.get(symbol.as_str()).map(|v| v.as_slice()),
+            step,
+        ));
+    }
+    assemble_panel(rows, series)
+}
+
+type MemberIndex<'a> = BTreeMap<&'a str, Vec<&'a MembershipRow>>;
+
+fn membership_index(membership: &Membership) -> MemberIndex<'_> {
     // One sorted index per symbol: the naive `at()` scan is O(decisions) per
     // bar and turns a 665k-row build into minutes.
-    let mut index: BTreeMap<&str, Vec<&MembershipRow>> = BTreeMap::new();
+    let mut index: MemberIndex<'_> = BTreeMap::new();
     for r in &membership.rows {
         index.entry(r.symbol.as_str()).or_default().push(r);
     }
     for v in index.values_mut() {
         v.sort_by_key(|r| r.as_of);
     }
-    for (symbol, bars) in series {
-        let decisions = index.get(symbol.as_str());
-        let mut prev: Option<i64> = None;
-        for b in bars {
-            let decision = decisions.and_then(|v| {
-                let pos = v.partition_point(|r| r.as_of <= b.time);
-                pos.checked_sub(1).map(|i| v[i])
-            });
-            let Some(decision) = decision else {
-                prev = None;
-                continue;
-            };
-            if !decision.member {
-                // A membership exclusion starts a new chain: it is not a data
-                // gap and must not be counted as one.
-                prev = None;
-                continue;
-            }
-            let missing = match prev {
-                Some(p) if b.time > p => ((b.time - p) / step - 1).max(0) as usize,
-                _ => 0,
-            };
-            gaps += missing;
-            prev = Some(b.time);
-            first_ts = first_ts.min(b.time);
-            last_ts = last_ts.max(b.time);
-            symbols.insert(symbol.clone());
-            rows.push(PanelRow {
-                symbol: symbol.clone(),
-                bar: *b,
-                as_of: decision.as_of,
-                gap_buckets: missing,
-            });
+    index
+}
+
+fn symbol_panel_rows(
+    symbol: &str,
+    bars: &[Bar],
+    decisions: Option<&[&MembershipRow]>,
+    step: i64,
+) -> Vec<PanelRow> {
+    let mut out = Vec::new();
+    let mut prev: Option<i64> = None;
+    for b in bars {
+        let decision = decisions.and_then(|v| {
+            let pos = v.partition_point(|r| r.as_of <= b.time);
+            pos.checked_sub(1).map(|i| v[i])
+        });
+        let Some(decision) = decision else {
+            prev = None;
+            continue;
+        };
+        if !decision.member {
+            // A membership exclusion starts a new chain: it is not a data gap
+            // and must not be counted as one.
+            prev = None;
+            continue;
         }
+        let missing = match prev {
+            Some(p) if b.time > p => ((b.time - p) / step - 1).max(0) as usize,
+            _ => 0,
+        };
+        prev = Some(b.time);
+        out.push(PanelRow {
+            symbol: symbol.to_string(),
+            bar: *b,
+            as_of: decision.as_of,
+            gap_buckets: missing,
+        });
     }
+    out
+}
+
+fn assemble_panel(
+    mut rows: Vec<PanelRow>,
+    series: &BTreeMap<String, Vec<Bar>>,
+) -> Result<Panel, String> {
     if rows.is_empty() {
         return Err("panel: membership selects no rows".to_string());
     }
     rows.sort_by(|a, b| a.bar.time.cmp(&b.bar.time).then(a.symbol.cmp(&b.symbol)));
+    let symbols: BTreeSet<String> = rows.iter().map(|r| r.symbol.clone()).collect();
+    let first_ts = rows.iter().map(|r| r.bar.time).min().unwrap_or(0);
+    let last_ts = rows.iter().map(|r| r.bar.time).max().unwrap_or(0);
+    let gaps = rows.iter().map(|r| r.gap_buckets).sum();
     // A symbol whose last actual bar is well before the panel end is delisted,
     // not forward-filled.
     let delisted: BTreeSet<String> = symbols
@@ -341,6 +413,144 @@ pub fn build_panel_with_step(
         first_ts,
         last_ts,
     })
+}
+
+fn part_name(symbol: &str) -> String {
+    let safe: String = symbol
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    format!("{}.part", safe)
+}
+
+fn write_symbol_part(path: &std::path::Path, rows: &[PanelRow]) -> Result<(), String> {
+    use std::fmt::Write as _;
+    let mut text = String::new();
+    for r in rows {
+        let b = r.bar;
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            b.time,
+            r.as_of,
+            r.gap_buckets,
+            b.open,
+            b.high,
+            b.low,
+            b.close,
+            b.volume,
+            b.quote_volume,
+            b.trades,
+            b.taker_buy_base,
+            b.taker_buy_quote,
+            b.complete as u8,
+            b.traded as u8
+        );
+    }
+    let tmp = path.with_extension("part.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {}", path.display(), e))
+}
+
+fn read_symbol_part(path: &std::path::Path, symbol: &str) -> Result<Vec<PanelRow>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 14 {
+            return Err(format!("{}:{}: expected 14 fields", path.display(), i + 1));
+        }
+        let num = |k: usize| -> Result<f64, String> {
+            f[k].parse().map_err(|_| format!("{}:{}: bad number", path.display(), i + 1))
+        };
+        let mut bar = Bar::new(
+            f[0].parse().map_err(|_| format!("{}:{}: bad ts", path.display(), i + 1))?,
+            num(3)?,
+            num(4)?,
+            num(5)?,
+            num(6)?,
+            num(7)?,
+        );
+        bar.quote_volume = num(8)?;
+        bar.trades = num(9)?;
+        bar.taker_buy_base = num(10)?;
+        bar.taker_buy_quote = num(11)?;
+        bar.complete = f[12] != "0";
+        bar.traded = f[13] != "0";
+        out.push(PanelRow {
+            symbol: symbol.to_string(),
+            bar,
+            as_of: f[1].parse().map_err(|_| format!("{}:{}: bad as_of", path.display(), i + 1))?,
+            gap_buckets: f[2].parse().map_err(|_| format!("{}:{}: bad gap", path.display(), i + 1))?,
+        });
+    }
+    Ok(out)
+}
+
+/// Resumable panel build (issue #145). One part per symbol is written
+/// atomically; a re-run trusts an existing part and skips that symbol. The
+/// state file refuses a resumed directory built with a different step or
+/// membership so a stale part can never enter a new panel.
+pub fn build_panel_resumable(
+    series: &BTreeMap<String, Vec<Bar>>,
+    membership: &Membership,
+    step_seconds: i64,
+    state_dir: &str,
+) -> Result<Panel, String> {
+    let step = step_seconds.max(1);
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("{}: {}", state_dir, e))?;
+    let state_path = std::path::Path::new(state_dir).join("state.txt");
+    let wanted = format!(
+        "step={}\nmembership_rows={}\nfirst_as_of={}\nlast_as_of={}\n",
+        step,
+        membership.rows.len(),
+        membership.as_of.first().copied().unwrap_or(0),
+        membership.as_of.last().copied().unwrap_or(0)
+    );
+    if state_path.exists() {
+        let got = std::fs::read_to_string(&state_path)
+            .map_err(|e| format!("{}: {}", state_path.display(), e))?;
+        if got != wanted {
+            return Err(format!(
+                "{} was built with a different step or membership; remove it or use a new \
+                 --resume directory",
+                state_dir
+            ));
+        }
+    } else {
+        std::fs::write(&state_path, &wanted).map_err(|e| format!("{}: {}", state_path.display(), e))?;
+    }
+    let index = membership_index(membership);
+    let total = series.len();
+    let mut rows = Vec::new();
+    let mut reused = 0usize;
+    for (done, (symbol, bars)) in series.iter().enumerate() {
+        let path = std::path::Path::new(state_dir).join(part_name(symbol));
+        if path.exists() {
+            reused += 1;
+            rows.extend(read_symbol_part(&path, symbol)?);
+        } else {
+            let part = symbol_panel_rows(
+                symbol,
+                bars,
+                index.get(symbol.as_str()).map(|v| v.as_slice()),
+                step,
+            );
+            write_symbol_part(&path, &part)?;
+            rows.extend(part);
+        }
+        if (done + 1) % 25 == 0 || done + 1 == total {
+            eprintln!(
+                "panel build: resume {}/{} symbols ({:.1}%), {} part(s) reused",
+                done + 1,
+                total,
+                100.0 * (done + 1) as f64 / total.max(1) as f64,
+                reused
+            );
+        }
+    }
+    assemble_panel(rows, series)
 }
 
 /// A canonical panel table: `ts, symbol, open..taker_buy_quote, gap, member_asof`.
@@ -421,6 +631,21 @@ pub fn panel_table(panel: &Panel) -> Table {
     )
 }
 
+/// The build-window guard shared by the CLI and tests. A full build (no
+/// explicit start/end) is provenance and is not checked; an explicit range is.
+pub fn check_build_window(
+    first_ts: i64,
+    last_ts: i64,
+    step_seconds: i64,
+    allow_lockbox: bool,
+) -> Result<(), String> {
+    crate::lockbox::Guard::new(allow_lockbox, None).check(
+        "panel build range",
+        first_ts,
+        last_ts.saturating_add(step_seconds.max(1)),
+    )
+}
+
 /// Write a panel store plus a provenance manifest.
 pub fn write_panel_panel(
     out: &str,
@@ -428,10 +653,12 @@ pub fn write_panel_panel(
     membership: &Membership,
     inputs: &[&str],
     group_rows: usize,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
 ) -> Result<String, String> {
     let table = panel_table(panel);
     store::write_store_with_time(out, &table, group_rows, Some(0))?;
-    let text = provenance_json(inputs, membership, panel, out);
+    let text = provenance_json(inputs, membership, panel, out, allow_lockbox, snapshot);
     let manifest_path = format!("{}.manifest.json", out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
     Ok(manifest_path)
@@ -444,6 +671,8 @@ pub fn provenance_json(
     membership: &Membership,
     panel: &Panel,
     output: &str,
+    allow_lockbox: bool,
+    snapshot: Option<&str>,
 ) -> String {
     let mut s = String::from("{\n");
     let _ = writeln!(s, "  \"tool\":\"rcsr panel\",");
@@ -508,6 +737,21 @@ pub fn provenance_json(
             .collect::<Vec<_>>()
             .join(",")
     );
+    // #145: record what the builder retained. A panel may contain the holdout
+    // for provenance; the flag says whether an explicit final test permitted
+    // it, and `evaluated` stays false because building is not scoring.
+    let lb = Lockbox::crypto_2026h2();
+    let overlap = lb.overlap(panel.rows.iter().map(|r| r.bar.time));
+    let _ = writeln!(
+        s,
+        "  \"lockbox\":{},",
+        lb.json(&overlap, allow_lockbox, false, false)
+    );
+    if let Some(snapshot) = snapshot {
+        // The snapshot file is produced by the fetch/verify step; the panel
+        // records it verbatim so the vendor checksums travel with the panel.
+        let _ = writeln!(s, "  \"snapshot\":{},", snapshot.trim());
+    }
     let sha = manifest::sha256_file(output).unwrap_or_else(|_| "unknown".to_string());
     let bytes = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     let _ = writeln!(
@@ -887,6 +1131,8 @@ pub fn run(args: &[String]) -> ! {
     let mut start: Option<i64> = None;
     let mut end: Option<i64> = None;
     let mut allow_lockbox = false;
+    let mut resume: Option<String> = None;
+    let mut snapshot_path: Option<String> = None;
     let mut i = 1usize;
     while i < args.len() {
         let val = |i: usize| -> String {
@@ -953,6 +1199,14 @@ pub fn run(args: &[String]) -> ! {
                 i += 1;
             }
             "--allow-lockbox" => allow_lockbox = true,
+            "--resume" => {
+                resume = Some(val(i));
+                i += 1;
+            }
+            "--snapshot" => {
+                snapshot_path = Some(val(i));
+                i += 1;
+            }
             other => {
                 eprintln!("error: unknown panel option '{}'\n\n{}", other, usage());
                 std::process::exit(2);
@@ -997,6 +1251,9 @@ pub fn run(args: &[String]) -> ! {
             }
         }
     }
+    // `--start/--end` scope the rebalance decisions as well as the output.
+    cfg.start = start;
+    cfg.end = end;
     match cmd {
         "membership" => {
             let m = match build_membership(&series, &cfg) {
@@ -1029,22 +1286,43 @@ pub fn run(args: &[String]) -> ! {
                 Ok(m) => m,
                 Err(e) => fail(&e),
             };
-            let panel = match build_panel_with_step(&series, &m, bar_seconds) {
-                Ok(p) => p,
-                Err(e) => fail(&e),
-            };
-            // Building may include the lockbox: provenance needs the full
-            // panel. A *runner* refuses it; an explicit evaluated range is
-            // checked here as well.
-            if !allow_lockbox {
-                if let (Some(a), Some(b)) = (start, end) {
-                    if let Err(e) = Lockbox::crypto_2026h2().check(a, b) {
-                        fail(&e);
-                    }
+            let mut panel = match &resume {
+                Some(dir) => build_panel_resumable(&series, &m, bar_seconds, dir),
+                None => build_panel_with_step(&series, &m, bar_seconds),
+            }
+            .unwrap_or_else(|e| fail(&e));
+            panel.retain_range(start, end);
+            if panel.rows.is_empty() {
+                fail("panel build range selects no rows");
+            }
+            // Building the full panel may include the lockbox: provenance needs
+            // the retained rows. An explicit evaluated range or a runner must
+            // still clear the one central guard.
+            if start.is_some() || end.is_some() {
+                if let Err(e) =
+                    check_build_window(panel.first_ts, panel.last_ts, bar_seconds, allow_lockbox)
+                {
+                    fail(&e);
                 }
             }
+            let snapshot_text = match &snapshot_path {
+                Some(p) => match std::fs::read_to_string(p) {
+                    Ok(t) if t.trim().starts_with('{') && t.trim().ends_with('}') => Some(t),
+                    Ok(_) => fail(&format!("snapshot '{}' is not a JSON object", p)),
+                    Err(e) => fail(&format!("{}: {}", p, e)),
+                },
+                None => None,
+            };
             let out = out.unwrap_or_else(|| "panel.rcsb".to_string());
-            match write_panel_panel(&out, &panel, &m, &[&data, &mp], group_rows) {
+            match write_panel_panel(
+                &out,
+                &panel,
+                &m,
+                &[&data, &mp],
+                group_rows,
+                allow_lockbox,
+                snapshot_text.as_deref(),
+            ) {
                 Ok(manifest) => eprintln!(
                     "panel build: {} rows, {} symbols, {} delisted, {} gaps -> {} (manifest {})",
                     panel.rows.len(),
@@ -1062,10 +1340,16 @@ pub fn run(args: &[String]) -> ! {
                 Ok(m) => m,
                 Err(e) => fail(&e),
             };
-            let panel = match build_panel_with_step(&series, &m, bar_seconds) {
+            let mut panel = match build_panel_with_step(&series, &m, bar_seconds) {
                 Ok(p) => p,
                 Err(e) => fail(&e),
             };
+            panel.retain_range(start, end);
+            if panel.rows.is_empty() {
+                fail("panel audit range selects no rows");
+            }
+            let lb = Lockbox::crypto_2026h2();
+            let coverage = lb.overlap(panel.rows.iter().map(|r| r.bar.time));
             println!(
                 "# panel: rows={} symbols={} delisted={} gaps={} span={}..{}",
                 panel.rows.len(),
@@ -1074,6 +1358,12 @@ pub fn run(args: &[String]) -> ! {
                 panel.gaps,
                 date(panel.first_ts),
                 date(panel.last_ts)
+            );
+            println!(
+                "# panel: lockbox rows={} windows={} permitted={} complete=false",
+                coverage.rows,
+                coverage.windows.len(),
+                allow_lockbox
             );
             let mut per_period: BTreeMap<i64, usize> = BTreeMap::new();
             for r in &m.rows {
@@ -1217,6 +1507,10 @@ BUILD / AUDIT:
   --start <epoch|date>    build window start (default: panel first bar)
   --end <epoch|date>      build window end (default: panel last bar)
   --allow-lockbox         permit a window overlapping 2026H2 (declared final test only)
+  --resume <dir>          resumable build: cache one atomic .part per symbol; a
+                          re-run skips completed symbols and prints progress
+  --snapshot <json>       embed a verified archive-snapshot manifest verbatim
+                          under the panel manifest's `snapshot` block
 
 `build` refuses 2026H2 by default. Every row is a real bar: delisted symbols
 stop at their last bar, listings start at their first, and no value is

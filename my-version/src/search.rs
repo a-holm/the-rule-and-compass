@@ -25,7 +25,7 @@ use crate::metrics::{score_weighted, Metric};
 use crate::multi;
 use crate::pareto::{Archive, Sol};
 #[cfg(feature = "cuda")]
-use crate::postfix::{Arena, Variation};
+use crate::postfix::{Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
 use crate::progress_stats::{Convergence, ProgressStats};
@@ -121,6 +121,12 @@ pub struct Config {
     /// `0` keeps the historical path and `N` at least the sample size is an
     /// exact no-op. When both are set, `fit_rows` wins and is reported as such.
     pub fit_rows: usize,
+    /// #116: disk-backed rows for the streaming fit arm. `Some` only when the
+    /// CLI resolved a resident `.rcsb` store whose prepared training rows can be
+    /// re-read exactly; it is read by `--fit-strategy stream` and never changes
+    /// selection or scoring. Like [`simd`](Self::simd), it is a path choice and
+    /// is not saved in a checkpoint.
+    pub fit_stream_source: Option<std::sync::Arc<crate::fit::StoreSpec>>,
     /// #76: let the global Pareto front supply a fraction of parents. `false`
     /// is the pre-#76 algorithm, bit for bit; `true` (the default when it is
     /// measured to help) draws a parent from the front with probability
@@ -211,6 +217,7 @@ impl Default for Config {
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
+            fit_stream_source: None,
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
             require_dimensions: false,
@@ -308,6 +315,13 @@ struct Ind {
     error: f64,
     /// Configured complexity from [`Config::complexity_model`].
     complexity: f64,
+    /// #120: behaviour descriptor accumulated from the same prediction vector
+    /// that produced `error`. `None` when the QD layer is off, when the tree
+    /// was scored on the GPU, on a row subset, with a metric that has no
+    /// prediction vector, or before it has been evaluated. The QD archive also
+    /// cross-checks a descriptor against the sample it was computed on before
+    /// trusting it.
+    descriptor: Option<qd::Descriptor>,
 }
 
 impl Ind {
@@ -335,20 +349,30 @@ impl Ind {
         let tree = expr::simplify(&tree);
         let hash = expr::structural_hash(&tree);
         let complexity = cfg.complexity_model.complexity(&tree);
-        let error = if cfg.accepts_dimensions(&tree) {
+        // #120: when the QD layer is on, obtain the descriptor from the same
+        // prediction sweep that scores the candidate. If the fitter's SSE is
+        // reused, that sweep does not happen; the error is still reused
+        // bit-for-bit (the passive layer must not change the trajectory) and
+        // the descriptor costs one separate prediction pass, exactly the old
+        // fallback. The folded path applies whenever scoring already produces
+        // predictions, which is every metric except the squared reuse case.
+        let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
+        let (error, descriptor) = if cfg.accepts_dimensions(&tree) {
             match fitted {
                 Some(fit) if can_reuse_sse(cfg, train, &fit, hash) => {
-                    fit.sse / train.sample.len() as f64
+                    let d = want_descriptor.then(|| qd::descriptor(&tree, train.sample));
+                    (fit.sse / train.sample.len() as f64, d)
                 }
-                _ => score_tree(&tree, train, cfg), // #27
+                _ => eval_error_and_descriptor(&tree, train, cfg.metric, want_descriptor), // #27
             }
         } else {
-            f64::INFINITY
+            (f64::INFINITY, None)
         };
         Ind {
             tree,
             error,
             complexity,
+            descriptor,
         }
     }
 
@@ -371,6 +395,9 @@ impl Ind {
             tree,
             error,
             complexity,
+            // A GPU batch returns the error, not the prediction vector, so the
+            // descriptor is filled by the archive's fallback path.
+            descriptor: None,
         }
     }
 
@@ -378,11 +405,14 @@ impl Ind {
         self.tree = expr::simplify(&self.tree);
         self.complexity = cfg.complexity_model.complexity(&self.tree);
         // #25: re-evaluation must not resurrect a rejected candidate.
-        self.error = if cfg.accepts_dimensions(&self.tree) {
-            score_tree(&self.tree, train, cfg) // #27
+        let want_descriptor = cfg.qd_bins > 0 && !train.sample.is_multi();
+        let (error, descriptor) = if cfg.accepts_dimensions(&self.tree) {
+            eval_error_and_descriptor(&self.tree, train, cfg.metric, want_descriptor) // #27
         } else {
-            f64::INFINITY
+            (f64::INFINITY, None)
         };
+        self.error = error;
+        self.descriptor = descriptor;
     }
 
     // #86: re-fit the constants on the current generation's fit rows *before*
@@ -419,6 +449,9 @@ impl Ind {
             tree: ind.tree,
             error: ind.error,
             complexity: ind.complexity,
+            // A checkpoint stores the tree and score, not the descriptor; the
+            // archive recomputes it on the resumed run like any other candidate.
+            descriptor: None,
         }
     }
 }
@@ -452,8 +485,15 @@ struct GpuSearch {
     fit_attempts: usize,
     fit_gpu: usize,
     fit_fallback: usize,
+    /// #169: pending offspring screened before the fit batch (admission).
+    fit_screened: usize,
+    /// #169: CPU fallback counts labelled by cause.
+    fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     fit_ms: f64,
+    /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
+    /// fallback and write-back), milliseconds.
+    fit_host_ms: f64,
 }
 
 #[cfg(feature = "cuda")]
@@ -504,7 +544,10 @@ impl GpuSearch {
                     fit_attempts: 0,
                     fit_gpu: 0,
                     fit_fallback: 0,
+                    fit_screened: 0,
+                    fit_fallback_by_cause: BTreeMap::new(),
                     fit_ms: 0.0,
+                    fit_host_ms: 0.0,
                 })
             }
             None => Err(format!(
@@ -514,44 +557,46 @@ impl GpuSearch {
         }
     }
 
-    /// #169: move the constants of every pending candidate with the batched
-    /// GPU Levenberg–Marquardt kernel.
+    /// #169: move the constants of the **admitted** pending candidates with
+    /// the batched GPU Levenberg–Marquardt kernel.
     ///
-    /// A candidate is offered to the kernel only when its tree has an analytic
-    /// GPU derivative, at most [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants,
-    /// at most [`crate::fit::GPU_FIT_MAX_NODES`] nodes, and at least `32p`
-    /// rows. Everything else — and every result the kernel marks ill-conditioned
-    /// or non-finite — is refit by the exact CPU f64 arm, seeded with whatever
-    /// constants the kernel produced. Returns `(attempts, gpu, fallback)` for
-    /// this batch.
+    /// The caller screens every unfitted offspring on the GPU with its seed
+    /// constants and promotes only the best fraction of each island, so a
+    /// generation no longer pays a fitted LM attempt for candidates that lose
+    /// the screening round. A candidate is offered to the kernel only when its
+    /// tree has an analytic GPU derivative, at most
+    /// [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants, at most
+    /// [`crate::fit::GPU_FIT_MAX_NODES`] nodes, and at least `32p` rows.
+    /// Everything else — and every result the kernel marks ill-conditioned or
+    /// non-finite — is refit by the exact CPU f64 arm, seeded with whatever
+    /// constants the kernel produced. Each CPU fallback is labelled by cause
+    /// (`unsupported_plan`, `too_few_rows`, `too_many_constants`,
+    /// `ill_conditioned`, `non_finite`, `launch`).
     fn fit_pending(
         &mut self,
         islands: &mut [Vec<Ind>],
+        admitted: &[(usize, usize)],
         train: &Sample,
         cfg: &Config,
-    ) -> (usize, usize, usize) {
+        generation: usize,
+    ) {
         let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
-        let mut fallbacks: Vec<(usize, usize)> = Vec::new();
-        for (i, pop) in islands.iter().enumerate() {
-            for (j, ind) in pop.iter().enumerate() {
-                if !ind.error.is_nan() {
-                    continue;
-                }
-                let eligible = crate::fit::gpu_fit_plan(&ind.tree)
-                    .filter(|p| train.len() >= 32 * p.nconst);
-                match eligible {
-                    Some(plan) => jobs.push((i, j, plan)),
-                    None => fallbacks.push((i, j)),
-                }
+        let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
+        for &(i, j) in admitted {
+            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
+                Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
+                Ok(_) => fallbacks.push((i, j, FitFallbackCause::TooFewRows)),
+                Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
             }
         }
-        let attempts = jobs.len() + fallbacks.len();
-        let mut gpu_ok = 0usize;
-        // #169: a candidate the plan cannot offer (no analytic derivative,
-        // too many constants/nodes, too few rows) is a labelled CPU fallback,
-        // so the process-wide `--fit-report` counter agrees with the run's
-        // `gpu.fit.attempts - gpu.fit.gpu`.
-        for _ in 0..fallbacks.len() {
+        self.fit_attempts += admitted.len();
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
+        stats.fit_attempts += admitted.len();
+        // A candidate the plan cannot offer is a labelled CPU fallback, so the
+        // process-wide `--fit-report` counter agrees with the run ledger.
+        for &(_, _, cause) in &fallbacks {
+            self.note_fit_fallback(generation, cause);
             crate::fit::note_gpu_fit(false);
         }
 
@@ -563,29 +608,37 @@ impl GpuSearch {
             }
             if out.len() == jobs.len() {
                 for ((i, j, plan), res) in jobs.iter().zip(out) {
-                    let usable = res.status == 0 && res.c.iter().all(|v| v.is_finite());
-                    if res.c.iter().all(|v| v.is_finite()) {
+                    let finite = res.c.iter().all(|v| v.is_finite());
+                    if finite {
                         plan.apply(&mut islands[*i][*j].tree, &res.c);
                     }
-                    if usable {
-                        gpu_ok += 1;
+                    if res.status == 0 && finite {
+                        self.fit_gpu += 1;
+                        self.stats.entry(generation).or_default().fit_gpu += 1;
                         crate::fit::note_gpu_fit(true);
                     } else {
-                        fallbacks.push((*i, *j));
+                        let cause = if finite {
+                            status_fallback_cause(res.status)
+                        } else {
+                            FitFallbackCause::NonFinite
+                        };
+                        fallbacks.push((*i, *j, cause));
+                        self.note_fit_fallback(generation, cause);
                         crate::fit::note_gpu_fit(false);
                     }
                 }
             } else {
                 // The launch failed: every offered candidate goes to the CPU.
                 for (i, j, _) in &jobs {
-                    fallbacks.push((*i, *j));
+                    fallbacks.push((*i, *j, FitFallbackCause::Launch));
+                    self.note_fit_fallback(generation, FitFallbackCause::Launch);
                     crate::fit::note_gpu_fit(false);
                 }
             }
         }
 
         // Exact CPU fallback, seeded with the GPU constants when there were any.
-        for &(i, j) in &fallbacks {
+        for &(i, j, _) in &fallbacks {
             let tree = &mut islands[i][j].tree;
             crate::fit::fit_weighted_metric(
                 tree,
@@ -596,11 +649,21 @@ impl GpuSearch {
                 cfg.metric,
             );
         }
+    }
 
-        self.fit_attempts += attempts;
-        self.fit_gpu += gpu_ok;
-        self.fit_fallback += fallbacks.len();
-        (attempts, gpu_ok, fallbacks.len())
+    /// #169: record one CPU fallback for this generation and the whole run.
+    fn note_fit_fallback(&mut self, generation: usize, cause: FitFallbackCause) {
+        self.fit_fallback += 1;
+        *self
+            .fit_fallback_by_cause
+            .entry(cause.label().to_string())
+            .or_default() += 1;
+        let stats = self.stats.entry(generation).or_default();
+        stats.fit_fallback += 1;
+        *stats
+            .fit_fallback_by_cause
+            .entry(cause.label().to_string())
+            .or_default() += 1;
     }
 
     /// Score every pending (`error.is_nan()`) individual in every island in one
@@ -631,14 +694,43 @@ impl GpuSearch {
             return Ok(());
         }
 
-        // #169: the GPU-fit arm leaves offspring with their search constants;
-        // move them with the batched kernel before compiling the score batch.
-        let fit_counts = if defers_fit_to_gpu(cfg, true) {
-            Some(self.fit_pending(islands, train, cfg))
-        } else {
-            None
-        };
+        if defers_fit_to_gpu(cfg, true) {
+            // #169 admission: screen every unfitted offspring with its seed
+            // constants first, then fit only the best fraction of each island.
+            // The non-promoted offspring keep this screening score, so the
+            // generation evaluates every candidate once and only survivors a
+            // second time after the fit.
+            self.fit_screened += pending.len();
+            self.stats.entry(generation).or_default().fit_screened += pending.len();
+            self.evaluate_pending(islands, &pending, train, cfg, generation)?;
+            let admitted = select_promoted(islands, &pending);
+            let fit_start = std::time::Instant::now();
+            self.fit_pending(islands, &admitted, train, cfg, generation);
+            self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
+            // Re-score the survivors so selection sees their fitted constants.
+            self.evaluate_pending(islands, &admitted, train, cfg, generation)?;
+            return Ok(());
+        }
 
+        self.evaluate_pending(islands, &pending, train, cfg, generation)
+    }
+
+    /// #169: compile and score one explicit set of pending candidates in a
+    /// single GPU batch, with their current constants. Candidates the kernel
+    /// cannot compile are scored on the CPU instead, so they never lose
+    /// fitness.
+    ///
+    /// Any CUDA failure returns `Err`; the caller switches the backend off and
+    /// re-scores the pending batch on the CPU, so a failed batch can never
+    /// leave a wrong number behind.
+    fn evaluate_pending(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        pending: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+        generation: usize,
+    ) -> Result<(), String> {
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
         let mut lowered = 0usize;
@@ -661,7 +753,7 @@ impl GpuSearch {
         }
         let pool = self.pool.as_mut().expect("a pool was just allocated");
         pool.begin_generation();
-        for &(i, j) in &pending {
+        for &(i, j) in pending {
             let meta = crate::genome::GenomeMeta {
                 island: i as u16,
                 tag: j as u32,
@@ -697,11 +789,6 @@ impl GpuSearch {
             .as_ref()
             .expect("a GPU search owns its fallback pool")
             .workers();
-        if let Some((attempts, gpu, fallback)) = fit_counts {
-            stats.fit_attempts += attempts;
-            stats.fit_gpu += gpu;
-            stats.fit_fallback += fallback;
-        }
 
         // #121: hand the unsupported trees to the worker pool *before* the
         // kernel launch, so CPU fallback and GPU evaluation overlap. The view
@@ -782,8 +869,11 @@ impl GpuSearch {
             fit_attempts: self.fit_attempts,
             fit_gpu: self.fit_gpu,
             fit_fallback: self.fit_fallback,
+            fit_screened: self.fit_screened,
+            fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
             fit_refits: 0,
             fit_ms: self.fit_ms,
+            fit_host_ms: self.fit_host_ms,
         }
     }
 
@@ -1088,6 +1178,27 @@ fn score_generation(
             // #121: keep the fallback pool alive for the rescore below.
             let fallback = g.take_fallback();
             *gpu = None;
+            // #169 admission: if the CUDA batch failed after the screening pass,
+            // the pending offspring may not have been fitted yet. Fit them with
+            // the exact CPU arm before re-scoring so the fallback never silently
+            // selects on seed constants. A rescore failure after the batch fit
+            // simply warm-starts the same CPU LM again.
+            if defers_fit_to_gpu(cfg, true) {
+                for pop in islands.iter_mut() {
+                    for ind in pop.iter_mut() {
+                        if ind.error.is_nan() {
+                            crate::fit::fit_weighted_metric(
+                                &mut ind.tree,
+                                &train.x,
+                                &train.y,
+                                &train.w,
+                                cfg.fit_iters,
+                                cfg.metric,
+                            );
+                        }
+                    }
+                }
+            }
             // #27: re-scoring the pending batch goes through the SoA view.
             let train_view = EvalSample::new(train, cfg);
             // #121: the same bounded worker pool as the per-batch fallback.
@@ -1283,22 +1394,56 @@ fn reset_transpose_count() {
 }
 
 fn eval_error_on(tree: &Node, data: &EvalSample, metric: Metric) -> f64 {
+    eval_error_and_descriptor(tree, data, metric, false).0
+}
+
+/// #120: score a candidate and, when asked, accumulate its behaviour
+/// descriptor from the *same* prediction vector.
+///
+/// This is the one-pass contract: the scoring reduction already visits every
+/// row of `pred`, so the usage count (a tree walk) and the prediction moments
+/// (`PredictionStats`) are computed without a second tree evaluation. The QD
+/// layer therefore costs the search nothing beyond the statistics themselves
+/// on the CPU scoring path.
+///
+/// Two shapes deliberately have no descriptor: the implicit metric evaluates
+/// per row through the gradient (the fallback evaluates once more), and a
+/// multi-output objective has one prediction vector per output and keeps its
+/// own path. Both are reported by the QD archive's fallback.
+fn eval_error_and_descriptor(
+    tree: &Node,
+    data: &EvalSample,
+    metric: Metric,
+    want_descriptor: bool,
+) -> (f64, Option<qd::Descriptor>) {
     let s = data.sample;
     if s.is_empty() {
-        return f64::INFINITY;
+        return (f64::INFINITY, None);
     }
+    let nvars = s.x.first().map(Vec::len).unwrap_or(0);
     // #14: an implicit metric measures the distance to the level set
     // |f| / ||grad f||. That needs f and its gradient at each row, so it is
     // scored from the tree and the row instead of a prediction vector. Every
     // other metric takes the original path, bit for bit.
     if metric.is_implicit() {
-        return crate::implicit::score(tree, s, metric);
+        let error = crate::implicit::score(tree, s, metric);
+        let descriptor = want_descriptor.then(|| qd::descriptor(tree, s));
+        return (error, descriptor);
     }
     let pred = predictions(tree, data);
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
-    score_weighted(&pred, &s.y, &s.w, metric, expr::count_constants(tree))
+    let error = score_weighted(
+        &pred,
+        &s.y,
+        &s.w,
+        metric,
+        expr::count_constants(tree),
+    );
+    let descriptor =
+        want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
+    (error, descriptor)
 }
 
 /// #27: one candidate's prediction vector.
@@ -1361,6 +1506,34 @@ fn fit_constants_with_iters(
         crate::implicit::fit(tree, &fit.x, &fit.w, iters);
         None
     } else {
+        // #116: when the CLI resolved a disk-backed source for exactly these
+        // training rows, the stream arm reads them group by group instead of
+        // the resident `Sample`. This is the same exact f64 sufficient-
+        // statistic merge; a read/conditioning failure falls through to the
+        // resident strategy below.
+        let squared_family = matches!(
+            cfg.metric,
+            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
+        );
+        let full_training_rows = std::ptr::eq(fit, score)
+            && cfg.fit_samples == 0
+            && cfg.fit_rows == 0
+            && cfg.predictor_samples.is_none();
+        if cfg.fit_strategy == crate::fit::FitStrategy::Stream
+            && squared_family
+            && full_training_rows
+        {
+            if let Some(spec) = &cfg.fit_stream_source {
+                let source = crate::fit::StoreRows::new(spec.clone());
+                if let Some(sse) = crate::fit::fit_stream_source(tree, &source, iters) {
+                    return Some(FitResult {
+                        sse,
+                        hash: expr::structural_hash(tree),
+                        same_rows: true,
+                    });
+                }
+            }
+        }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::fit_weighted_strategy_metric(
             tree,
@@ -1561,6 +1734,129 @@ fn effective_fit_rows(cfg: &Config, sample: &Sample) -> usize {
     } else {
         request
     }
+}
+
+/// #169: why an admitted candidate still needed the exact CPU fit arm.
+///
+/// The labels are stable: they appear in `gpu.fit.fallback_by_cause`, in each
+/// generation's ledger and in `--fit-report`/docs. Structural rejections are
+/// grouped into `unsupported_plan` except the explicit `p > 16` cap, which has
+/// its own label because it is the only limit the kernel could lift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FitFallbackCause {
+    /// No analytic GPU derivative, too many nodes, shared block constants, or
+    /// no constants at all.
+    UnsupportedPlan,
+    /// Fewer than `32p` rows, so the normal-equation system is underdetermined.
+    TooFewRows,
+    /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 16`).
+    TooManyConstants,
+    /// The kernel's conditioning gate rejected the normal equations (status 1).
+    IllConditioned,
+    /// A non-finite value, derivative or residual (status 2).
+    NonFinite,
+    /// The CUDA fit launch failed; the whole batch went to the CPU.
+    Launch,
+}
+
+impl FitFallbackCause {
+    /// Every cause, in reporting order.
+    pub const ALL: [FitFallbackCause; 6] = [
+        FitFallbackCause::UnsupportedPlan,
+        FitFallbackCause::TooFewRows,
+        FitFallbackCause::TooManyConstants,
+        FitFallbackCause::IllConditioned,
+        FitFallbackCause::NonFinite,
+        FitFallbackCause::Launch,
+    ];
+
+    /// Stable JSON label.
+    pub fn label(self) -> &'static str {
+        match self {
+            FitFallbackCause::UnsupportedPlan => "unsupported_plan",
+            FitFallbackCause::TooFewRows => "too_few_rows",
+            FitFallbackCause::TooManyConstants => "too_many_constants",
+            FitFallbackCause::IllConditioned => "ill_conditioned",
+            FitFallbackCause::NonFinite => "non_finite",
+            FitFallbackCause::Launch => "launch",
+        }
+    }
+}
+
+/// #169: map a structural fit-plan rejection to its reported cause.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn plan_fallback_cause(reason: crate::fit::GpuFitReject) -> FitFallbackCause {
+    match reason {
+        crate::fit::GpuFitReject::TooManyConstants => FitFallbackCause::TooManyConstants,
+        _ => FitFallbackCause::UnsupportedPlan,
+    }
+}
+
+/// #169: map the kernel's runtime status to its reported cause.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn status_fallback_cause(status: i32) -> FitFallbackCause {
+    match status {
+        1 => FitFallbackCause::IllConditioned,
+        2 => FitFallbackCause::NonFinite,
+        _ => FitFallbackCause::UnsupportedPlan,
+    }
+}
+
+/// #169: how many offspring of one island are admitted to the fitted LM batch.
+///
+/// The fixed fraction `pop/4` is floored at 32 so a small island still admits
+/// the candidates the kernel is best at, and capped at the island size so the
+/// default and the tiny test configurations are exact no-ops. The choice uses
+/// only the population size, never timing, so it is reproducible.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn admission_count(island_pop: usize) -> usize {
+    ((island_pop / 4).max(32)).min(island_pop).max(1)
+}
+
+/// #169: deterministic admission of pending offspring to the fitted LM batch.
+///
+/// Every pending (`error.is_nan()`) individual is screened with its seed
+/// constants first. Per island, the best `admission_count(island_pop)` are
+/// promoted; ties break on complexity and then on the population index, so the
+/// set depends only on the screened errors and the fixed island/population
+/// order. Non-promoted offspring keep their screening score.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn select_promoted(
+    islands: &[Vec<Ind>],
+    pending: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    let mut promoted = Vec::with_capacity(pending.len());
+    for (i, pop) in islands.iter().enumerate() {
+        let mut ranked: Vec<(usize, f64, f64)> = pending
+            .iter()
+            .filter(|(island, _)| *island == i)
+            .map(|&(_, j)| (j, pop[j].error, pop[j].complexity))
+            // #169: a candidate with no constants has nothing to fit. Keep its
+            // screening score and do not spend an admission slot or bill a
+            // meaningless CPU fallback for it.
+            .filter(|&(j, _, _)| {
+                !matches!(
+                    crate::fit::gpu_fit_plan_reason(&pop[j].tree),
+                    Err(crate::fit::GpuFitReject::NoConstants)
+                )
+            })
+            .collect();
+        ranked.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(
+                    a.2.partial_cmp(&b.2)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(a.0.cmp(&b.0))
+        });
+        let take = admission_count(pop.len()).min(ranked.len());
+        promoted.extend(ranked[..take].iter().map(|&(j, _, _)| (i, j)));
+    }
+    // Fitting order is deterministic; the candidates are independent, but a
+    // stable order keeps the ledger and any debugging output reproducible.
+    promoted.sort_unstable();
+    promoted
 }
 
 /// #169: true when this generation's offspring are left unfitted for the
@@ -2106,6 +2402,10 @@ pub struct GpuGenStats {
     /// #169: candidates refit by the exact CPU arm (unsupported, ill-conditioned
     /// or non-finite).
     pub fit_fallback: usize,
+    /// #169: pending offspring screened before admission.
+    pub fit_screened: usize,
+    /// #169: CPU fallback counts labelled by cause.
+    pub fit_fallback_by_cause: BTreeMap<String, usize>,
 }
 
 /// #131: aggregate GPU usage for a run.
@@ -2120,10 +2420,16 @@ pub struct GpuRunStats {
     pub fit_attempts: usize,
     pub fit_gpu: usize,
     pub fit_fallback: usize,
+    /// #169: pending offspring screened before admission.
+    pub fit_screened: usize,
+    /// #169: CPU fallback counts labelled by cause.
+    pub fit_fallback_by_cause: BTreeMap<String, usize>,
     /// #169: exact CPU f64 refits of finalists before reporting.
     pub fit_refits: usize,
     /// #169: wall time spent in the batched fit kernels, milliseconds.
     pub fit_ms: f64,
+    /// #169: wall time spent in the whole fit stage, milliseconds.
+    pub fit_host_ms: f64,
 }
 
 pub struct Outcome {
@@ -2536,7 +2842,27 @@ fn run_postfix_search(
             break;
         }
         gens_done = gen + 1;
-        let mut next = variation.next_generation(&pool, gen as u32, &restart_flags);
+        // #76/#122: compile the previous generation's front once, then let the
+        // flat engine draw 15 % of parents from it. With the feature off the
+        // pool is empty and `front_p` is 0.0, so the draw consumes no RNG and
+        // the trajectory is exactly the pre-#76 one.
+        let front = if cfg.front_parents {
+            FrontParents::from_front(&archive.items, variation.width, cfg.max_complexity)
+        } else {
+            FrontParents::empty()
+        };
+        let front_p = if cfg.front_parents {
+            FRONT_PARENT_P
+        } else {
+            0.0
+        };
+        let mut next = variation.next_generation_with_front(
+            &pool,
+            gen as u32,
+            &restart_flags,
+            &front,
+            front_p,
+        );
         next.evaluate(&mut gpu.ev, train.len())?;
         restart_flags = vec![false; n_islands];
 
@@ -2571,6 +2897,8 @@ fn run_postfix_search(
             fit_attempts: 0,
             fit_gpu: 0,
             fit_fallback: 0,
+            fit_screened: 0,
+            fit_fallback_by_cause: Default::default(),
         });
 
         if let Some(budget) = cfg.time_budget {
@@ -2656,6 +2984,7 @@ fn run_postfix_search(
                             error: next.err[next.slot_index(i, j)],
                             complexity: next.cost[next.slot_index(i, j)] as f64,
                             tree,
+                            descriptor: None,
                         })
                         .collect()
                 })
@@ -2699,6 +3028,7 @@ fn run_postfix_search(
                         error: pool.err[pool.slot_index(i, j)],
                         complexity: pool.cost[pool.slot_index(i, j)] as f64,
                         tree,
+                        descriptor: None,
                     })
                     .collect()
             })
@@ -2777,8 +3107,11 @@ fn run_postfix_search(
             fit_attempts: gpu.fit_attempts,
             fit_gpu: gpu.fit_gpu,
             fit_fallback: gpu.fit_fallback,
+            fit_screened: gpu.fit_screened,
+            fit_fallback_by_cause: gpu.fit_fallback_by_cause.clone(),
             fit_refits: 0,
             fit_ms: gpu.fit_ms,
+            fit_host_ms: gpu.fit_host_ms,
         }),
         qd: None,
     })
@@ -3186,13 +3519,14 @@ fn run_search(
     // never feeds back into selection, so turning it on cannot change the
     // trajectory or the Pareto front.
     let mut qd_archive = if cfg.qd_bins > 0 {
-        Some(if cfg.qd_control == 2 {
+        let archive = if cfg.qd_control == 2 {
             QdArchive::new_random(cfg.qd_bins, cfg.qd_cell_cap)
         } else if cfg.qd_cvt {
             QdArchive::new_cvt(cfg.qd_bins, cfg.qd_cell_cap)
         } else {
             QdArchive::new(cfg.qd_bins, cfg.qd_cell_cap)
-        })
+        };
+        Some(archive.with_nvars(nvars))
     } else {
         None
     };
@@ -3232,6 +3566,10 @@ fn run_search(
                 None
             };
             let eval_data = screen_data.as_ref().unwrap_or(gen_data);
+            // #120: an `Ind` descriptor is accumulated from the prediction that
+            // scored `eval_data`. It describes `gen_train` only when those are
+            // the same rows: no per-generation subset and no screening subset.
+            let cached_descriptors_valid = gen_sample.is_none() && !screened;
 
             // #86: with predictor subsampling active (and no screening), refit
             // the carried-over population on this generation's fit rows, then
@@ -3529,21 +3867,36 @@ fn run_search(
                                 .as_ref()
                                 .and_then(|q| q.least_occupied_descriptor())
                             {
-                                Some(target) => islands[ii]
-                                    .iter()
-                                    .enumerate()
-                                    .min_by(|(_, a), (_, b)| {
-                                        let da = qd::descriptor(&a.tree, gen_train);
-                                        let db = qd::descriptor(&b.tree, gen_train);
-                                        let score = |d: qd::Descriptor| {
-                                            (d.usage - target.usage).powi(2)
-                                                + (d.skew - target.skew).powi(2)
-                                        };
-                                        score(da)
-                                            .partial_cmp(&score(db))
-                                            .unwrap_or(std::cmp::Ordering::Equal)
-                                    })
-                                    .map(|(i, _)| i),
+                                Some(target) => {
+                                    // #120: reuse the descriptors the scoring
+                                    // pass already accumulated when they
+                                    // describe `gen_train`; only the GPU or
+                                    // subset paths pay for one here.
+                                    let descriptors: Vec<qd::Descriptor> = islands[ii]
+                                        .iter()
+                                        .map(|ind| {
+                                            if cached_descriptors_valid {
+                                                if let Some(d) = ind.descriptor {
+                                                    return d;
+                                                }
+                                            }
+                                            qd::descriptor(&ind.tree, gen_train)
+                                        })
+                                        .collect();
+                                    descriptors
+                                        .iter()
+                                        .enumerate()
+                                        .min_by(|(_, a), (_, b)| {
+                                            let score = |d: &qd::Descriptor| {
+                                                (d.usage - target.usage).powi(2)
+                                                    + (d.skew - target.skew).powi(2)
+                                            };
+                                            score(a)
+                                                .partial_cmp(&score(b))
+                                                .unwrap_or(std::cmp::Ordering::Equal)
+                                        })
+                                        .map(|(i, _)| i)
+                                }
                                 None => None,
                             }
                         } else {
@@ -3671,14 +4024,23 @@ fn run_search(
                 for pop in &islands {
                     for ind in pop {
                         if ind.error.is_finite() {
-                            items.push((ind.tree.clone(), ind.error, ind.complexity));
+                            // #120: the descriptor the scoring pass already
+                            // accumulated. `None` means the archive falls back
+                            // to its known-descriptor cache or one evaluation
+                            // (GPU-scored, subsampled or checkpointed trees).
+                            let d = if cached_descriptors_valid {
+                                ind.descriptor
+                            } else {
+                                None
+                            };
+                            items.push((ind.tree.clone(), ind.error, ind.complexity, d));
                         }
                     }
                 }
                 for s in &archive.items {
-                    items.push((s.tree.clone(), s.error, s.cost));
+                    items.push((s.tree.clone(), s.error, s.cost, None));
                 }
-                qd.record(items, gen_train);
+                qd.record_with_descriptors(items, gen_train);
             }
 
             // A checkpoint is taken only at a generation boundary: all of the
@@ -3877,6 +4239,172 @@ mod tests {
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
     }
 
+    fn pending_ind(error: f64, complexity: f64) -> Ind {
+        Ind {
+            // One fittable constant, so admission does not filter the fixture
+            // as a no-constant tree.
+            tree: node(Op::Add, vec![input(0), constant(1.0)]),
+            error,
+            complexity,
+            descriptor: None,
+        }
+    }
+
+    /// #169: the admission fraction is a pure function of the population size.
+    #[test]
+    fn admission_count_is_the_documented_fraction() {
+        assert_eq!(admission_count(1), 1);
+        assert_eq!(admission_count(24), 24, "small islands admit everyone");
+        assert_eq!(admission_count(64), 32, "max(32, pop/4)");
+        assert_eq!(admission_count(100), 32);
+        assert_eq!(admission_count(128), 32);
+        assert_eq!(admission_count(256), 64);
+    }
+
+    /// #169: promotion is deterministic, per island, and ranks on the same
+    /// (error, complexity, index) key the selector uses. Non-promoted
+    /// offspring keep their screening score because they are not returned.
+    #[test]
+    fn promotion_is_deterministic_and_selects_the_screened_best() {
+        let n = 128;
+        let mut islands = vec![Vec::new(), Vec::new()];
+        for (i, pop) in islands.iter_mut().enumerate() {
+            for j in 0..n {
+                // A mix of pending (one of every 17) and already-scored
+                // individuals. The finite, non-pending ones must never enter
+                // the promotion set.
+                let error = if j % 17 == 0 {
+                    1e9 + j as f64
+                } else {
+                    (((j * 37 + i * 11) % n) as f64) + 0.5
+                };
+                pop.push(pending_ind(error, (j % 5) as f64));
+            }
+        }
+        let pending: Vec<(usize, usize)> = (0..2)
+            .flat_map(|i| (0..n).filter(|j| j % 17 != 0).map(move |j| (i, j)))
+            .collect();
+        let a = select_promoted(&islands, &pending);
+        let b = select_promoted(&islands, &pending);
+        assert_eq!(a, b, "the same screen must yield the same admission set");
+        assert_eq!(a.len(), 64, "32 per island");
+
+        for i in 0..2 {
+            let mut expected: Vec<usize> = pending
+                .iter()
+                .filter(|(island, _)| *island == i)
+                .map(|&(_, j)| j)
+                .collect();
+            expected.sort_by(|&x, &y| {
+                islands[i][x]
+                    .error
+                    .partial_cmp(&islands[i][y].error)
+                    .unwrap()
+                    .then(
+                        islands[i][x]
+                            .complexity
+                            .partial_cmp(&islands[i][y].complexity)
+                            .unwrap(),
+                    )
+                    .then(x.cmp(&y))
+            });
+            let got: Vec<usize> = a
+                .iter()
+                .filter(|(island, _)| *island == i)
+                .map(|&(_, j)| j)
+                .collect();
+            let mut expected_top = expected[..32].to_vec();
+            expected_top.sort_unstable();
+            assert_eq!(got, expected_top, "island {}", i);
+        }
+    }
+
+    /// #169: equal screening errors break on complexity and then on the fixed
+    /// population index, so a shuffled completion order cannot change admission.
+    #[test]
+    fn promotion_breaks_ties_by_complexity_then_index() {
+        let mut islands = vec![Vec::new()];
+        for j in 0..64 {
+            islands[0].push(pending_ind(f64::NAN, if j < 40 { 2.0 } else { 1.0 }));
+        }
+        // Screen every candidate to the same error.
+        for ind in islands[0].iter_mut() {
+            ind.error = 5.0;
+        }
+        let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
+        let got = select_promoted(&islands, &pending);
+        let mut wanted: Vec<(usize, usize)> = (0..8).map(|j| (0, j)).collect();
+        wanted.extend((40..64).map(|j| (0, j)));
+        assert_eq!(got, wanted, "lower complexity wins an error tie");
+    }
+
+    /// #169: a tree with no constants is never admitted: there is nothing to
+    /// fit, so it keeps its screening score and does not consume a slot.
+    #[test]
+    fn promotion_skips_trees_with_no_constants() {
+        let mut islands = vec![Vec::new()];
+        for j in 0..64 {
+            let mut ind = pending_ind(1.0 + j as f64, 1.0);
+            if j % 2 == 0 {
+                ind.tree = input(0); // no constants
+            }
+            islands[0].push(ind);
+        }
+        let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
+        let got = select_promoted(&islands, &pending);
+        assert_eq!(got.len(), 32);
+        assert!(
+            got.iter().all(|&(_, j)| j % 2 == 1),
+            "only trees with constants may be admitted: {:?}",
+            got
+        );
+    }
+
+    /// #169: every CPU fallback cause has a stable label, and both the plan
+    /// rejection and the kernel status map into the documented set.
+    #[test]
+    fn fallback_causes_are_labelled_and_classified() {
+        use crate::fit::GpuFitReject;
+        let labels: Vec<&str> = FitFallbackCause::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "unsupported_plan",
+                "too_few_rows",
+                "too_many_constants",
+                "ill_conditioned",
+                "non_finite",
+                "launch",
+            ]
+        );
+        assert_eq!(
+            plan_fallback_cause(GpuFitReject::TooManyConstants),
+            FitFallbackCause::TooManyConstants
+        );
+        for reason in [
+            GpuFitReject::TooManyNodes,
+            GpuFitReject::NoConstants,
+            GpuFitReject::SharedConstants,
+            GpuFitReject::UnsupportedOp,
+        ] {
+            assert_eq!(
+                plan_fallback_cause(reason),
+                FitFallbackCause::UnsupportedPlan,
+                "{}",
+                reason.label()
+            );
+        }
+        assert_eq!(
+            status_fallback_cause(1),
+            FitFallbackCause::IllConditioned
+        );
+        assert_eq!(status_fallback_cause(2), FitFallbackCause::NonFinite);
+        assert_eq!(
+            status_fallback_cause(0),
+            FitFallbackCause::UnsupportedPlan
+        );
+    }
+
     /// #141: the library default follows the build: a CUDA binary prefers the
     /// GPU, every other build is CPU. Selection still depends on the probe.
     #[test]
@@ -3951,6 +4479,7 @@ mod tests {
             tree: node(Op::Sin, vec![input(0)]),
             error: 1.0,
             complexity: 1.0,
+            descriptor: None,
         }];
 
         let mut rng = Mt::new(11);
@@ -4120,6 +4649,7 @@ mod tests {
             tree: node(Op::Mul, vec![constant(2.0), input(0)]),
             error: f64::INFINITY,
             complexity: 0.0,
+            descriptor: None,
         };
 
         ind.refit_and_reeval(&first_data, &first, &cfg);
@@ -4510,6 +5040,51 @@ mod tests {
         assert!(
             pool.busy.load(std::sync::atomic::Ordering::Relaxed) <= 2,
             "the pool ran more threads than it owns"
+        );
+    }
+
+    /// #120: scoring a candidate with the QD layer on must not require the
+    /// evaluating descriptor fallback, and must not change the error. This is
+    /// the one-pass contract for the CPU scoring path.
+    #[test]
+    fn qd_descriptor_is_folded_into_the_scoring_pass() {
+        let data = sample();
+        let trees = [
+            node(Op::Add, vec![input(0), constant(0.25)]),
+            node(Op::Mul, vec![input(0), node(Op::Add, vec![input(1), constant(0.5)])]),
+            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]),
+        ];
+        let mut off = Config::default();
+        off.fit_iters = 0;
+        let mut on = off.clone();
+        on.qd_bins = 16;
+        let mut view_cfg = Config::default();
+        view_cfg.fit_iters = 0;
+        let off_data = EvalSample::new(&data, &view_cfg);
+        let on_data = EvalSample::new(&data, &on);
+
+        let before = crate::qd::fallback_descriptor_count();
+        for t in &trees {
+            let plain = Ind::evaluated(t.clone(), &off_data, &off);
+            let qd = Ind::evaluated(t.clone(), &on_data, &on);
+            assert_eq!(
+                plain.error.to_bits(),
+                qd.error.to_bits(),
+                "the QD fold changed the reported error"
+            );
+            let want = crate::qd::descriptor_from_prediction(
+                t,
+                &data.x.iter().map(|row| expr::eval(t, row)).collect::<Vec<_>>(),
+                2,
+            );
+            let got = qd.descriptor.expect("QD scoring must attach a descriptor");
+            assert_eq!(got, want, "folded descriptor differs from the evaluating path");
+            assert_eq!(plain.descriptor, None, "QD off must not accumulate moments");
+        }
+        assert_eq!(
+            crate::qd::fallback_descriptor_count(),
+            before,
+            "QD scoring evaluated a tree a second time for its descriptor"
         );
     }
 }

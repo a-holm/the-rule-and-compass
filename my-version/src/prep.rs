@@ -28,6 +28,7 @@ use crate::{manifest, store, zip};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_INPUT: i32 = 3;
@@ -294,6 +295,9 @@ pub struct Options {
     pub dry_run: bool,
     pub jobs: usize,
     pub group_rows: usize,
+    /// #145: permit a labelled build (an evaluation target) inside 2026H2.
+    /// Unlabelled bars are provenance and are always allowed.
+    pub allow_lockbox: bool,
 }
 
 impl Default for Options {
@@ -314,6 +318,7 @@ impl Default for Options {
             dry_run: false,
             jobs: 1,
             group_rows: store::DEFAULT_GROUP_ROWS,
+            allow_lockbox: false,
         }
     }
 }
@@ -921,6 +926,69 @@ impl Audit {
     }
 }
 
+/// Guard a labelled build with the central lockbox module. Exposed so a test
+/// can exercise the same path the CLI uses.
+pub fn check_labelled_rows(times: &[i64], allow_lockbox: bool) -> Result<(), String> {
+    crate::lockbox::Guard::new(allow_lockbox, None)
+        .check_times("prep labelled rows", times)
+        .map(|_| ())
+}
+
+/// Split `items` into at most `jobs` deterministic round-robin chunks.
+///
+/// Every parallel pass uses this helper, so `--jobs` bounds the number of
+/// workers (and therefore the number of in-flight per-symbol matrices) rather
+/// than only the parse pass. With more jobs than items, one worker per item is
+/// enough.
+fn bounded_chunks<T>(items: Vec<T>, jobs: usize) -> Vec<Vec<T>> {
+    let workers = jobs.max(1).min(items.len().max(1));
+    let mut chunks: Vec<Vec<T>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, item) in items.into_iter().enumerate() {
+        chunks[i % workers].push(item);
+    }
+    chunks
+}
+
+#[cfg(test)]
+static PASS4_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PASS4_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct Pass4WorkerGuard;
+
+#[cfg(test)]
+impl Drop for Pass4WorkerGuard {
+    fn drop(&mut self) {
+        PASS4_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+fn enter_pass4_worker() -> Pass4WorkerGuard {
+    let now = PASS4_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    PASS4_MAX.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+    Pass4WorkerGuard
+}
+
+#[cfg(not(test))]
+fn enter_pass4_worker() {}
+
+fn log_rss(tag: &str) {
+    if std::env::var_os("RCSR_PREP_RSS_LOG").is_none() {
+        return;
+    }
+    let kib = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()))
+        })
+        .unwrap_or(0);
+    eprintln!("prep-rss: {} rss_kib={}", tag, kib);
+}
+
 /// Build the table, audit and manifest without writing anything.
 pub fn build(opts: &Options) -> Result<Build, String> {
     let sources = discover(&opts.inputs, opts.symbol.as_deref())?;
@@ -945,11 +1013,7 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         by_symbol.entry(s.symbol.clone()).or_default().push(s);
     }
     let groups: Vec<(String, Vec<Source>)> = by_symbol.into_iter().collect();
-    let threads = opts.jobs.max(1).min(groups.len().max(1));
-    let mut chunks: Vec<Vec<(String, Vec<Source>)>> = (0..threads).map(|_| Vec::new()).collect();
-    for (i, g) in groups.into_iter().enumerate() {
-        chunks[i % threads].push(g);
-    }
+    let chunks = bounded_chunks(groups, opts.jobs);
 
     // Pass 1: parse + timestamp/duplicate normalisation, parallel by symbol.
     let mut parsed: Vec<(String, Vec<Bar>)> = Vec::new();
@@ -992,21 +1056,26 @@ pub fn build(opts: &Options) -> Result<Build, String> {
     // Pass 3: resample each symbol (calendar-aware), parallel.
     let symbols: Vec<(String, Vec<Bar>)> = series.into_iter().collect();
     let mut resampled: Vec<(String, Vec<Bar>)> = Vec::new();
+    let resample_chunks = bounded_chunks(symbols, opts.jobs);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
-        for (symbol, bars) in symbols {
+        for chunk in resample_chunks {
             let resample = opts.resample;
             let calendar = opts.calendar;
-            handles.push(scope.spawn(move || -> Result<(String, Vec<Bar>), String> {
-                let bars = match resample {
-                    Some(tf) => resample_calendar(&bars, tf, calendar)?,
-                    None => bars,
-                };
-                Ok((symbol, bars))
+            handles.push(scope.spawn(move || -> Result<Vec<(String, Vec<Bar>)>, String> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for (symbol, bars) in chunk {
+                    let bars = match resample {
+                        Some(tf) => resample_calendar(&bars, tf, calendar)?,
+                        None => bars,
+                    };
+                    out.push((symbol, bars));
+                }
+                Ok(out)
             }));
         }
         for h in handles {
-            resampled.push(h.join().map_err(|_| "prep worker panicked".to_string())??);
+            resampled.extend(h.join().map_err(|_| "prep worker panicked".to_string())??);
         }
         Ok(())
     })?;
@@ -1015,95 +1084,103 @@ pub fn build(opts: &Options) -> Result<Build, String> {
 
     // A cross-asset feature uses BTC when the panel contains it. The benchmark
     // is joined by timestamp, never by row index.
-    let cross: Option<Vec<Bar>> = resampled
+    // Share one immutable benchmark copy across all workers instead of cloning
+    // the whole series per symbol.
+    let cross: Option<Arc<[Bar]>> = resampled
         .iter()
         .find(|(s, _)| s == "BTCUSDT" || s == "BTCUSD" || s == "BTC")
-        .map(|(_, b)| b.clone());
+        .map(|(_, b)| Arc::from(b.as_slice()));
 
     // Pass 4: features, MTF joins and the label, parallel by symbol.
     let mut panels: Vec<SymbolPanel> = Vec::new();
+    let feature_chunks = bounded_chunks(resampled, opts.jobs);
     std::thread::scope(|scope| -> Result<(), String> {
         let mut handles = Vec::new();
-        for (symbol, bars) in resampled {
+        for chunk in feature_chunks {
             let spec = opts.features.clone();
             let mtf = opts.mtf.clone();
             let label = opts.label;
             let calendar = opts.calendar;
             let cross = cross.clone();
-            handles.push(scope.spawn(move || -> Result<SymbolPanel, String> {
-                let mut values: Vec<(String, Vec<f64>)> = Vec::new();
-                let mut warmup = 0usize;
-                let mut notes = Vec::new();
-                if !spec.is_empty() {
-                    let cols = features::compute_with_cross(
-                        &bars,
-                        tf,
-                        &spec,
-                        cross.as_deref(),
-                    )?;
-                    for c in &cols {
-                        warmup = warmup.max(c.warmup);
-                        values.push((c.name.clone(), c.values.clone()));
-                    }
-                }
-                for htf in mtf {
-                    let higher = resample_calendar(&bars, htf, calendar)?;
-                    if spec.is_empty() {
-                        let vals: Vec<f64> = higher.iter().map(|b| b.close).collect();
-                        let joined = join_column_causal(&bars, &higher, htf, &vals)?;
-                        values.push((
-                            format!("mtf_{}_close", htf.name()),
-                            joined.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
-                        ));
-                    } else {
-                        let cols = features::compute(&higher, htf, &spec)?;
-                        for c in &cols {
-                            let joined = join_column_causal(&bars, &higher, htf, &c.values)?;
-                            values.push((
-                                format!("mtf_{}_{}", htf.name(), c.name),
-                                joined.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
-                            ));
+            handles.push(scope.spawn(move || -> Result<Vec<SymbolPanel>, String> {
+                let mut out = Vec::with_capacity(chunk.len());
+                for (symbol, bars) in chunk {
+                    let _guard = enter_pass4_worker();
+                    let mut values: Vec<(String, Vec<f64>)> = Vec::new();
+                    let mut warmup = 0usize;
+                    let mut notes = Vec::new();
+                    if !spec.is_empty() {
+                        let cols = features::compute_with_cross(
+                            &bars,
+                            tf,
+                            &spec,
+                            cross.as_deref(),
+                        )?;
+                        for c in cols {
+                            warmup = warmup.max(c.warmup);
+                            values.push((c.name, c.values));
                         }
                     }
-                }
-                let (label_values, gap_rows, stride_rows) = match label {
-                    Some(spec) => {
-                        let l = features::forward_label(&bars, tf, &spec);
-                        (l.values, l.gap_rows, l.stride_rows)
+                    for &htf in &mtf {
+                        let higher = resample_calendar(&bars, htf, calendar)?;
+                        if spec.is_empty() {
+                            let vals: Vec<f64> = higher.iter().map(|b| b.close).collect();
+                            let joined = join_column_causal(&bars, &higher, htf, &vals)?;
+                            values.push((
+                                format!("mtf_{}_close", htf.name()),
+                                joined.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
+                            ));
+                        } else {
+                            let cols = features::compute(&higher, htf, &spec)?;
+                            for c in &cols {
+                                let joined = join_column_causal(&bars, &higher, htf, &c.values)?;
+                                values.push((
+                                    format!("mtf_{}_{}", htf.name(), c.name),
+                                    joined.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect(),
+                                ));
+                            }
+                        }
                     }
-                    None => (Vec::new(), 0, 0),
-                };
-                if bars.is_empty() {
-                    notes.push(format!("symbol {} has no bars after resampling", symbol));
+                    let (label_values, gap_rows, stride_rows) = match label {
+                        Some(spec) => {
+                            let l = features::forward_label(&bars, tf, &spec);
+                            (l.values, l.gap_rows, l.stride_rows)
+                        }
+                        None => (Vec::new(), 0, 0),
+                    };
+                    if bars.is_empty() {
+                        notes.push(format!("symbol {} has no bars after resampling", symbol));
+                    }
+                    if !label_values.is_empty() {
+                        values.push(("label".to_string(), label_values));
+                    }
+                    let names: Vec<String> = values.iter().map(|(n, _)| n.clone()).collect();
+                    let seq = SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let spool = std::env::temp_dir().join(format!(
+                        "rcsr-prep-{}-{}-{}.spool",
+                        std::process::id(),
+                        seq,
+                        symbol.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+                    ));
+                    write_spool(&spool, &symbol, &bars, &values)?;
+                    let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
+                    out.push(SymbolPanel {
+                        symbol,
+                        times,
+                        rows: bars.len(),
+                        names,
+                        spool,
+                        warmup,
+                        gap_rows,
+                        stride_rows,
+                        notes,
+                    });
                 }
-                if !label_values.is_empty() {
-                    values.push(("label".to_string(), label_values));
-                }
-                let names: Vec<String> = values.iter().map(|(n, _)| n.clone()).collect();
-                let seq = SPOOL_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let spool = std::env::temp_dir().join(format!(
-                    "rcsr-prep-{}-{}-{}.spool",
-                    std::process::id(),
-                    seq,
-                    symbol.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
-                ));
-                write_spool(&spool, &symbol, &bars, &values)?;
-                let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
-                Ok(SymbolPanel {
-                    symbol,
-                    times,
-                    rows: bars.len(),
-                    names,
-                    spool,
-                    warmup,
-                    gap_rows,
-                    stride_rows,
-                    notes,
-                })
+                Ok(out)
             }));
         }
         for h in handles {
-            panels.push(h.join().map_err(|_| "prep worker panicked".to_string())??);
+            panels.extend(h.join().map_err(|_| "prep worker panicked".to_string())??);
         }
         Ok(())
     })?;
@@ -1129,7 +1206,14 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         }
     }
     let total: usize = panels.iter().map(|p| p.rows).sum();
-    let mut columns: Vec<Vec<f64>> = vec![Vec::with_capacity(total); names.len()];
+    // `vec![empty; n]` clones the *length* (zero), not the capacity, so the
+    // per-column buffers would each grow from zero and leave reallocated
+    // blocks behind. Reserve every column exactly once here.
+    log_rss("assembly:start");
+    let mut columns: Vec<Vec<f64>> = (0..names.len())
+        .map(|_| Vec::with_capacity(total))
+        .collect();
+    log_rss("assembly:columns-reserved");
     let mut times: Vec<i64> = Vec::with_capacity(total);
     let canon_start = if with_symbol { 2 } else { 1 };
     let mut symbol_codes: Vec<u32> = Vec::new();
@@ -1140,7 +1224,12 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         .map(|(i, n)| (n.clone(), i))
         .collect();
     let extra_start = canon_start + CANONICAL.len() - 1;
+    let mut panel_no = 0usize;
     for p in panels {
+        panel_no += 1;
+        if panel_no % 10 == 0 || panel_no + 1 == audit.symbols {
+            log_rss(&format!("assembly:panel-{panel_no}-of-{}", audit.symbols));
+        }
         let code = if with_symbol {
             let c = symbol_levels
                 .iter()
@@ -1200,6 +1289,7 @@ pub fn build(opts: &Options) -> Result<Build, String> {
             }
         }
     }
+    log_rss("assembly:panels-read");
     let mut out_columns: Vec<Column> = Vec::with_capacity(names.len());
     let mut numeric: Vec<bool> = Vec::with_capacity(names.len());
     for (j, _name) in names.iter().enumerate() {
@@ -1221,7 +1311,18 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         numeric.push(true);
         out_columns.push(Column { values, ints, dict });
     }
+    log_rss("assembly:out-columns");
     let table = Table::from_parts(names.clone(), numeric, out_columns, total, 0);
+    log_rss("assembly:table-built");
+
+    // #145: a labelled build creates an evaluation target. If any row is in the
+    // lockbox, the same central guard decides. Unlabelled bars are provenance
+    // and may retain the holdout.
+    let lb = crate::lockbox::Lockbox::crypto_2026h2();
+    let coverage = lb.overlap(times.iter().copied());
+    if opts.label.is_some() {
+        check_labelled_rows(&times, opts.allow_lockbox)?;
+    }
 
     let input_hashes: Vec<(String, String, u64)> = sources
         .iter()
@@ -1310,6 +1411,11 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         );
     }
     let _ = writeln!(manifest_text, "  ],");
+    let _ = writeln!(
+        manifest_text,
+        "  \"lockbox\":{},",
+        lb.json(&coverage, opts.allow_lockbox, false, false)
+    );
     let _ = writeln!(manifest_text, "  \"audit\":{},", audit.json());
     let _ = writeln!(
         manifest_text,
@@ -1317,8 +1423,8 @@ pub fn build(opts: &Options) -> Result<Build, String> {
         total,
         names.len(),
         audit.symbols,
-        times.first().copied().unwrap_or(0),
-        times.last().copied().unwrap_or(0)
+        times.iter().copied().min().unwrap_or(0),
+        times.iter().copied().max().unwrap_or(0)
     );
     manifest_text.push_str("}\n");
 
@@ -1494,6 +1600,7 @@ pub fn run(args: &[String]) -> ! {
             },
             "--out" | "-o" => opts.out = Some(val!()),
             "--dry-run" => opts.dry_run = true,
+            "--allow-lockbox" => opts.allow_lockbox = true,
             "--jobs" | "-j" => {
                 let v = val!();
                 opts.jobs = v.parse().unwrap_or(0);
@@ -1597,6 +1704,7 @@ TRANSFORMS:
   --group-rows <n>        column-store group size (default 65536)
   --out, -o <store.rcsb>  output store (required unless --dry-run)
   --dry-run               print the audit and manifest, write nothing
+  --allow-lockbox         permit labelled rows in 2026H2 (final test only)
 
 FEATURES (explicit names):
   ret1 ret5 ma20_ratio ma60_ratio bb20_z atr14 natr14 rsi14 adx14 di_plus
@@ -1653,5 +1761,56 @@ mod tests {
         assert_eq!(m[0].k, 1.0169);
         assert_eq!(m[1].k, 60.0);
         assert_eq!(m[1].tolerance, 0.005);
+    }
+
+    #[test]
+    fn bounded_chunks_never_exceed_jobs_and_lose_no_item() {
+        for jobs in [1usize, 2, 3, 8] {
+            let chunks = bounded_chunks((0..109).collect::<Vec<_>>(), jobs);
+            assert!(chunks.len() <= jobs, "jobs={jobs} spawned {} chunks", chunks.len());
+            let mut seen: Vec<usize> = chunks.into_iter().flatten().collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..109).collect::<Vec<_>>());
+        }
+        // Fewer items than jobs: one worker per item, never idle empties.
+        assert_eq!(bounded_chunks(vec![1, 2], 8).len(), 2);
+        assert_eq!(bounded_chunks(Vec::<i32>::new(), 8).len(), 1);
+    }
+
+    #[test]
+    fn pass_four_worker_count_is_bounded_by_jobs() {
+        let dir = std::env::temp_dir().join(format!(
+            "rcsr-prep-workers-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for s in 0..9 {
+            let mut text = String::new();
+            for i in 0..8 {
+                let t = 1_704_067_200_000i64 + (i as i64) * 60_000;
+                text.push_str(&format!(
+                    "{t},100,101,99,100,10,1000,1,6,600,0\n"
+                ));
+            }
+            std::fs::write(dir.join(format!("sym{s}.csv")), text).unwrap();
+        }
+        PASS4_ACTIVE.store(0, std::sync::atomic::Ordering::SeqCst);
+        PASS4_MAX.store(0, std::sync::atomic::Ordering::SeqCst);
+        let opts = Options {
+            inputs: vec![dir.to_string_lossy().to_string()],
+            format: Layout::Binance,
+            jobs: 3,
+            ..Default::default()
+        };
+        let build = build(&opts).unwrap();
+        assert_eq!(build.table.len(), 72);
+        let peak = PASS4_MAX.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(peak >= 1);
+        assert!(
+            peak <= 3,
+            "pass 4 used {peak} concurrent workers with --jobs 3"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
