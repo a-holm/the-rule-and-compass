@@ -27,8 +27,10 @@ pub use gpu::{
     backend_description, fit_batch_verified, refit_finalists_exact, BatchStatus, BatchedFitter,
     VerifiedBatch,
 };
-pub use stream::{fit_stream, fit_stream_with, RowSource, SliceRows, STREAM_BLOCK_ROWS};
-pub use varpro::VarProPartition;
+pub use stream::{
+    fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
+};
+pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
 const INV_SQRT_PI: f64 = 0.564_189_583_547_756_3;
@@ -1259,7 +1261,17 @@ pub fn fit_weighted_strategy(
                 return s;
             }
         }
-        if try_varpro {
+        // #116: structural cost eligibility. `auto` and the direct-GPU fallback
+        // only select VarPro when the partition is measured to amortise the
+        // outer Jacobian (`s >= 2` or `q >= 4`); otherwise the exact LM arm is
+        // both cheaper and the reference. The explicit `varpro` arm is a user
+        // override and keeps the old behaviour.
+        let auto_like = matches!(strategy, FitStrategy::Auto | FitStrategy::Gpu);
+        let varpro_eligible = !auto_like
+            || separable_partition(tree)
+                .map(|part| varpro::cost_eligible(&part))
+                .unwrap_or(false);
+        if try_varpro && varpro_eligible {
             // `auto` promises never to be worse than the reference LM arm.
             // VarPro is not a global solver for a general separable problem,
             // so run the exact LM path from the same starting tree and keep
@@ -1288,6 +1300,16 @@ pub fn fit_weighted_strategy(
     }
     EXACT_FITS.fetch_add(1, Ordering::Relaxed);
     fit_lm(tree, x, y, w, iters)
+}
+
+/// #116: run the streaming arm over an explicit row source and record the arm
+/// count. This is the entry point the search uses when a disk-backed
+/// [`StoreRows`] was resolved for the training rows. `None` means the caller
+/// must fall back to the exact resident arm.
+pub fn fit_stream_source<S: RowSource>(tree: &mut Node, source: &S, iters: usize) -> Option<f64> {
+    let sse = stream::fit_stream_with(tree, source, iters)?;
+    STREAM_FITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some(sse)
 }
 
 /// #116: the structural partition VarPro would use, for tests and `--fit-report`.

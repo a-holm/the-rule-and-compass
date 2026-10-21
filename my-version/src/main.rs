@@ -2142,6 +2142,7 @@ fn main() {
     };
     let mut out_of_core_note: Option<String> = None;
     let mut csv_shape: Option<data::CsvShape> = None;
+    let mut store_resident = false;
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -2175,6 +2176,7 @@ fn main() {
                 let estimate = fs.estimated_resident_bytes();
                 let resident = force || budget.map_or(true, |limit| estimate <= limit);
                 if resident {
+                    store_resident = true;
                     fs.to_table()
                 } else {
                     let limit = budget.unwrap_or(estimate);
@@ -2660,16 +2662,48 @@ fn main() {
         filter,
         dtypes: dtypes.clone(),
     };
+    // #116: `--fit-strategy stream` can read the training rows back from a
+    // resident `.rcsb` store instead of keeping a second resident copy. This is
+    // exact only when the store's raw rows *are* the prepared population and
+    // the preparation is affine (centre/scale) or absent; smoothing, fill,
+    // filters, exclusions and lags rewrite values or row ids and fall back to
+    // the resident sample. The row ids cost one `usize` per training row and
+    // are requested only for this arm.
+    let stream_store_candidate = cfg.fit_strategy == fit::FitStrategy::Stream
+        && data_path != "-"
+        && store::is_store_path(&data_path)
+        && store_resident
+        && !multi_output
+        && !implicit_mode
+        && lags == 0
+        && history_frac == 0.0
+        && prep.fill == data::FillMethod::None
+        && prep.outlier_iqr.is_none()
+        && prep.smooth == 0
+        && prep.filter.is_none()
+        && spec.exclude.is_none();
     let mut rng = Mt::new(cfg.seed);
-    let mut prepared = match data::prepare_full_targets_weighted_with(
-        &table,
-        &vars,
-        &target_refs,
-        weight_name.as_deref(),
-        &spec,
-        &mut rng,
-        &prep,
-    ) {
+    let mut prepared = match if stream_store_candidate {
+        data::prepare_full_targets_weighted_with_indices(
+            &table,
+            &vars,
+            &target_refs,
+            weight_name.as_deref(),
+            &spec,
+            &mut rng,
+            &prep,
+        )
+    } else {
+        data::prepare_full_targets_weighted_with(
+            &table,
+            &vars,
+            &target_refs,
+            weight_name.as_deref(),
+            &spec,
+            &mut rng,
+            &prep,
+        )
+    } {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
@@ -2677,6 +2711,38 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    if stream_store_candidate {
+        let resolved = (|| -> Result<fit::StoreSpec, String> {
+            let fs = std::sync::Arc::new(store::FileStore::open(&data_path)?);
+            let columns = vars
+                .iter()
+                .map(|v| table.index_of(v))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut stream_spec = fit::StoreSpec::new(fs, columns, table.index_of(target_refs[0])?)?;
+            if let Some(name) = weight_name.as_deref() {
+                stream_spec = stream_spec.with_weight(table.index_of(name)?)?;
+            }
+            stream_spec = stream_spec
+                .with_standardisation(prepared.means.clone(), prepared.stds.clone())?
+                .with_rows(prepared.train_indices.clone())?;
+            Ok(stream_spec)
+        })();
+        match resolved {
+            Ok(stream_spec) => {
+                cfg.fit_stream_source = Some(std::sync::Arc::new(stream_spec));
+                notes.push(format!(
+                    "stream: fitting from '{}' group by group ({} training rows, O(p²) resident state)",
+                    data_path,
+                    prepared.train_indices.len()
+                ));
+            }
+            Err(e) => notes.push(format!(
+                "stream: disk row source unavailable ({}); using the resident training sample",
+                e
+            )),
+        }
+    }
 
     // #112: report the guard's estimate and its rows x columns basis in the
     // normal preparation block, not only when the guard refuses the file. Use
