@@ -424,3 +424,22 @@ fn replace_overwrites_the_existing_values() {
     assert!(r1[1].is_finite() && r1[1].abs() > 0.0, "r1 was not recomputed");
     assert_eq!(r1[0].is_nan(), true);
 }
+
+#[test]
+fn time_major_panel_stores_are_refused_with_a_clear_message() {
+    let dir = tmp_dir("timemajor");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    // Interleave two symbols by timestamp.
+    let mut rows = Vec::new();
+    for t in 0..20i64 {
+        for sym in ["AAA", "BBB"] {
+            let p = 100.0 + t as f64 + if sym == "AAA" { 0.0 } else { 10.0 };
+            rows.push((t * 3600, sym.to_string(), p, p + 0.2, p - 0.2, p + 0.1, 1.0));
+        }
+    }
+    write_store(&src, &rows, 4);
+    let err = enrich::build(&opts(&src, &out, "r1")).unwrap_err();
+    assert!(err.contains("time-major"), "unexpected error: {err}");
+    assert!(!std::path::Path::new(&out).exists());
+}

@@ -950,8 +950,10 @@ fn segments(store: &FileStore, time_col: usize, symbol_col: Option<usize>) -> Re
             if current.as_ref().map(|(s, _)| s != &sym).unwrap_or(true) {
                 if seen.contains(&sym) {
                     return Err(format!(
-                        "symbol '{}' is not contiguous: it reappears after another symbol; \
-                         sort the store by (symbol, time) or run `rcsr panel` first",
+                        "symbol '{}' is not contiguous: the store is time-major (symbol rows \
+                         interleave) or unsorted. `rcsr enrich` currently needs one contiguous \
+                         run per symbol, as written by `rcsr prep`; time-major `rcsr panel` \
+                         stores are a follow-up",
                         sym
                     ));
                 }

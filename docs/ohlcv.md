@@ -187,6 +187,12 @@ meaning and are computed by `rcsr::features`, not copied into this module.
 
 ### Causality, gaps and warm-up
 
+`rcsr enrich` reads one symbol at a time, so the input must contain one
+contiguous run of rows per symbol (the layout written by `rcsr prep` and the
+pilot hourly stores). A time-major `rcsr panel` store interleaves symbols and is
+refused with an explicit message; streaming state across a time-major panel is a
+follow-up. A store without a symbol column is treated as one series.
+
 A feature at row `i` reads only bars at or before `i`. A window is valid only
 when every bucket between its first and last bar is present at the inferred
 (or `--bar-seconds`) spacing. A window that spans a listing, delisting,
