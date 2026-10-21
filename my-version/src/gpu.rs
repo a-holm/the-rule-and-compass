@@ -592,7 +592,7 @@ extern "C" {
         off: *const u32,
         nprog: i32,
     ) -> i32;
-    fn rc_eval(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    fn rc_eval(ctx: *mut RawCtx, out: *mut f32, loss: i32) -> f32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
@@ -607,7 +607,7 @@ extern "C" {
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
     fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
-    fn rc_pool_eval(ctx: *mut RawCtx, which: i32, nprog: i32, width: i32, out: *mut f32) -> f32;
+    fn rc_pool_eval(ctx: *mut RawCtx, which: i32, nprog: i32, width: i32, out: *mut f32, loss: i32) -> f32;
     fn rc_pool_hash(
         ctx: *mut RawCtx,
         which: i32,
@@ -617,8 +617,9 @@ extern "C" {
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
-    fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64) -> i32;
-    /* #169: batched LM constant fitting over the resident dataset. */
+    fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
+    /* #169: batched LM constant fitting over the resident dataset.
+       #229: `metric` selects the objective: 0 = squared, 1 = log-squashed. */
     fn rc_fit_batch(
         ctx: *mut RawCtx,
         prog: *const u32,
@@ -628,6 +629,7 @@ extern "C" {
         kmax: i32,
         c0: *const f64,
         iters: i32,
+        metric: i32,
         outc: *mut f64,
         outsse: *mut f64,
         outstatus: *mut i32,
@@ -859,6 +861,10 @@ pub struct GpuEvaluator {
     n_rows: u64,
     /// #118: accumulated host-time ledger for every batch scored here.
     stats: GpuStats,
+    /// #229: the objective every evaluation accumulates. Defaults to squared;
+    /// the search sets it from `--metric` only when [`DeviceLoss::for_metric`]
+    /// names a native kernel objective.
+    loss: crate::fit::DeviceLoss,
 }
 
 impl GpuEvaluator {
@@ -875,15 +881,34 @@ impl GpuEvaluator {
                 pool_width: 0,
                 pool_last: 0,
                 stats: GpuStats::default(),
+                loss: crate::fit::DeviceLoss::Squared,
             })
         }
+    }
+
+    /// #229: the objective this evaluator accumulates. The search sets it once
+    /// per run; it must match the metric the search ranks on, or a robust run
+    /// would be ranked by squared error (the bug #236 closed the gate for).
+    pub(crate) fn set_loss(&mut self, loss: crate::fit::DeviceLoss) {
+        self.loss = loss;
+    }
+
+    /// #229: the objective this evaluator currently accumulates. Test-only:
+    /// the search sets it once and never needs to read it back.
+    #[cfg(test)]
+    pub(crate) fn loss(&self) -> crate::fit::DeviceLoss {
+        self.loss
     }
 
     /// #169: upload exact f64 training columns for the batched fit's final
     /// polish. Column-major `cols[var * n_rows + row]`. Returns `false` when
     /// the device allocation fails (the CPU arm then remains authoritative).
-    pub(crate) fn set_fit_data(&mut self, cols: &[f64], y: &[f64]) -> bool {
-        unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr()) == 0 }
+    ///
+    /// #229: `w` is the base `--weight` row vector; an empty slice means
+    /// unweighted and uploads no weight array (bit-for-bit the old path).
+    pub(crate) fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
+        let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
+        unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 }
     }
 
     pub fn device_name() -> String {
@@ -954,7 +979,7 @@ impl GpuEvaluator {
                     return (Vec::new(), -1.0);
                 }
                 let mut out = vec![0.0f32; nprog];
-                let ms = rc_eval(self.ctx, out.as_mut_ptr());
+                let ms = rc_eval(self.ctx, out.as_mut_ptr(), self.loss.code());
                 if ms < 0.0 {
                     ok = false;
                 }
@@ -994,7 +1019,7 @@ impl GpuEvaluator {
                     return (Vec::new(), -1.0);
                 }
                 let mut out = vec![0.0f32; n];
-                let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+                let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr(), self.loss.code());
                 if ms < 0.0 {
                     ok = false;
                 }
@@ -1080,7 +1105,7 @@ impl GpuEvaluator {
                 return (Vec::new(), -1.0);
             }
             let mut out = vec![0.0f32; n];
-            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr());
+            let ms = rc_pool_eval(self.ctx, which, n as i32, width as i32, out.as_mut_ptr(), self.loss.code());
             if ms < 0.0 {
                 ok = false;
             }
@@ -1126,6 +1151,7 @@ impl GpuEvaluator {
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         iters: usize,
+        loss: crate::fit::DeviceLoss,
     ) -> (Vec<GpuFitOutput>, f32) {
         let nprog = plans.len();
         if nprog == 0 {
@@ -1159,6 +1185,7 @@ impl GpuEvaluator {
                 kmax as i32,
                 c0.as_ptr(),
                 iters as i32,
+                loss.code(),
                 outc.as_mut_ptr(),
                 outsse.as_mut_ptr(),
                 outstatus.as_mut_ptr(),
@@ -2546,7 +2573,7 @@ mod fit_tests {
                     cols64[k * n + i] = x[i][k];
                 }
             }
-            assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+            assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
 
             let mut cpu_tree = linear_model(&start);
             crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
@@ -2556,7 +2583,7 @@ mod fit_tests {
             let mut gpu_tree = linear_model(&start);
             let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("well-conditioned plan");
             assert_eq!(plan.nconst, p, "p={}", p);
-            let (out, ms) = ev.fit_batch(&[&plan], 8);
+            let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
             assert!(ms >= 0.0, "fit kernel ran for p={}", p);
             assert_eq!(out.len(), 1);
             let res = &out[0];
@@ -2623,14 +2650,14 @@ mod fit_tests {
         for i in 0..n {
             cols64[i] = x[i][0];
         }
-        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
         let mut cpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
         let cpu_sse = crate::fit::fit_weighted(&mut cpu_tree, &x, &y, &[], 8);
         let cpu_c = constants(&cpu_tree);
 
         let mut gpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
         let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("nonlinear plan");
-        let (out, _) = ev.fit_batch(&[&plan], 8);
+        let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
         assert_eq!(out[0].status, 0, "the nonlinear fixture is well conditioned");
         plan.apply(&mut gpu_tree, &out[0].c);
         let gpu_c = constants(&gpu_tree);
@@ -2713,7 +2740,7 @@ mod fit_tests {
                 cols64[k * n + i] = x[i][k];
             }
         }
-        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
 
         let ps = [4usize, 17, 18, 19, 20];
         let mut starts = Vec::new();
@@ -2729,7 +2756,7 @@ mod fit_tests {
                 &(0..p).map(|k| 0.25 + 0.07 * k as f64).collect::<Vec<_>>(),
             ))
             .expect("plan");
-            let (out, _) = ev.fit_batch(&[&plan], 8);
+            let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
             assert_eq!(out[0].status, 0, "p={} must be well conditioned", p);
             singles.push(out[0].clone());
         }
@@ -2741,7 +2768,7 @@ mod fit_tests {
             .map(|s| crate::fit::gpu_fit_plan(&linear_model(s)).expect("plan"))
             .collect();
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (mixed, _) = ev.fit_batch(&refs, 8);
+        let (mixed, _) = ev.fit_batch(&refs, 8, crate::fit::DeviceLoss::Squared);
         assert_eq!(mixed.len(), ps.len());
 
         let mut errors = Vec::new();
@@ -2825,7 +2852,7 @@ mod fit_tests {
         );
         let tree = collinear;
         let plan = crate::fit::gpu_fit_plan(&tree).expect("collinear plan");
-        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
         assert!(ms >= 0.0);
         assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
 
@@ -2841,7 +2868,7 @@ mod fit_tests {
         }
         let plan = crate::fit::gpu_fit_plan(&wide).expect("p=20 collinear plan");
         assert_eq!(plan.nconst, 20);
-        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
         assert!(ms >= 0.0);
         assert_eq!(out[0].status, 1, "p=20 rank deficiency must be labelled");
 
@@ -2857,7 +2884,7 @@ mod fit_tests {
         let (cols, y32) = cols_from(&x, &y);
         let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
         let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
-        let (out, _) = ev.fit_batch(&[&plan], 4);
+        let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::Squared);
         assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
 
         // Unsupported (piecewise-constant) operators never reach the kernel.
@@ -2984,12 +3011,12 @@ mod fit_tests {
             for i in 0..n {
                 cols64[i] = x[i][0];
             }
-            ev.set_fit_data(&cols64, &y);
+            ev.set_fit_data(&cols64, &y, &[]);
             let plan = crate::fit::gpu_fit_plan(&nl(&start)).expect("plan");
             let plans: Vec<&crate::fit::GpuFitPlan> =
                 (0..candidates).map(|_| &plan).collect();
             let t1 = std::time::Instant::now();
-            let (out, ms) = ev.fit_batch(&plans, 8);
+            let (out, ms) = ev.fit_batch(&plans, 8, crate::fit::DeviceLoss::Squared);
             let gpu = t1.elapsed().as_secs_f64();
             let ok = out.iter().filter(|r| r.status == 0).count();
             eprintln!(
@@ -3075,11 +3102,11 @@ mod fit_tests {
                     cols64[k * n + i] = x[i][k];
                 }
             }
-            assert!(ev.set_fit_data(&cols64, y), "f64 rows uploaded");
+            assert!(ev.set_fit_data(&cols64, y, &[]), "f64 rows uploaded");
             let plan = crate::fit::gpu_fit_plan(&linear_model(&start)).expect("plan");
             let plans: Vec<&crate::fit::GpuFitPlan> = (0..candidates).map(|_| &plan).collect();
             let t1 = std::time::Instant::now();
-            let (out, ms) = ev.fit_batch(&plans, 8);
+            let (out, ms) = ev.fit_batch(&plans, 8, crate::fit::DeviceLoss::Squared);
             let gpu = t1.elapsed().as_secs_f64();
             let mut by_status = [0usize; 3];
             for r in &out {
@@ -3106,8 +3133,7 @@ mod fit_tests {
         pmax: usize,
         p: usize,
         n: usize,
-    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>) {
-        let target: Vec<f64> = (0..p).map(|k| 1.0 + 0.31 * k as f64).collect();
+    ) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>) {        let target: Vec<f64> = (0..p).map(|k| 1.0 + 0.31 * k as f64).collect();
         let mut x = vec![vec![0.0; pmax]; n];
         let mut cols = vec![0.0f32; n * pmax];
         let mut y = Vec::with_capacity(n);
@@ -3129,10 +3155,133 @@ mod fit_tests {
         (x, y, cols, y32)
     }
 
+    /// #229 measurement (ignored): fit-stage throughput and endpoint quality for
+    /// the robust arm. The CPU side is the exact IRLS path
+    /// (`fit::fit_weighted_metric(.., LogSquashed)`); the GPU side is the
+    /// batched weighted-LM kernel. Both fit the same candidates on the same
+    /// heavy-tailed rows, so the ratio is paired. Prints wall, speed-up, the
+    /// mean configured loss of each endpoint and the fraction where the GPU
+    /// endpoint is no worse. Run with
+    /// `cargo test --release --features cuda --lib bench_batched_fit_log_squashed -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_batched_fit_log_squashed() {
+        let n = std::env::var("RCSR_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000usize);
+        let threads = 8usize;
+        let pmax = 20usize;
+        for (p, candidates) in [(4usize, 64usize), (8, 64)] {
+            let (x, mut y, cols, _) = bench_fixture(pmax, p, n);
+            // 10 % gross outliers: the robust and least-squares optima differ.
+            for i in (3..n).step_by(10) {
+                y[i] += 15.0;
+            }
+            let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+            let start: Vec<f64> = (0..p).map(|k| 0.25 + 0.07 * k as f64).collect();
+            let loss_of = |c: &[f64]| -> f64 {
+                let t = linear_model(c);
+                let pred: Vec<f64> = x.iter().map(|r| eval(&t, r)).collect();
+                metrics::score_weighted(&pred, &y, &[], Metric::LogSquashed, p)
+            };
+
+            let t0 = std::time::Instant::now();
+            let per = candidates.div_ceil(threads);
+            let cpu_losses: Vec<Vec<f64>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let x = &x;
+                        let y = &y;
+                        let start = &start;
+                        scope.spawn(move || {
+                            let mut out = Vec::with_capacity(per);
+                            for _ in 0..per {
+                                let mut t = linear_model(start);
+                                crate::fit::fit_weighted_metric(
+                                    &mut t,
+                                    x,
+                                    y,
+                                    &[],
+                                    8,
+                                    Metric::LogSquashed,
+                                );
+                                out.push(constants(&t));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("cpu fit thread"))
+                    .collect()
+            });
+            let cpu = t0.elapsed().as_secs_f64();
+
+            let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU benchmark: no usable device");
+                    return;
+                }
+            };
+            let mut cols64 = vec![0.0f64; n * pmax];
+            for r in 0..n {
+                for k in 0..pmax {
+                    cols64[k * n + r] = x[r][k];
+                }
+            }
+            ev.set_fit_data(&cols64, &y, &[]);
+            let plan = crate::fit::gpu_fit_plan(&linear_model(&start)).expect("plan");
+            let plans: Vec<&crate::fit::GpuFitPlan> = (0..candidates).map(|_| &plan).collect();
+            let t1 = std::time::Instant::now();
+            let (out, ms) = ev.fit_batch(&plans, 8, crate::fit::DeviceLoss::LogSquashed);
+            let gpu = t1.elapsed().as_secs_f64();
+            let ok = out.iter().filter(|r| r.status == 0).count();
+
+            let mut no_worse = 0usize;
+            let mut cpu_sum = 0.0;
+            let mut gpu_sum = 0.0;
+            for (c_res, c_cpu) in out.iter().zip(&cpu_losses) {
+                let g = if c_res.status == 0 {
+                    loss_of(&c_res.c)
+                } else {
+                    f64::INFINITY
+                };
+                let c = loss_of(c_cpu);
+                cpu_sum += c;
+                if g <= c * (1.0 + 1e-6) {
+                    no_worse += 1;
+                }
+                if g.is_finite() {
+                    gpu_sum += g;
+                }
+            }
+            let npairs = cpu_losses.len().min(out.len()).max(1);
+            eprintln!(
+                "log_squashed p={} N={} P={} cpu={:.3}s gpu={:.3}s (kernel {:.1}ms, status0 {}/{}) fit speedup={:.1}x mean_loss cpu={:.6e} gpu={:.6e} no_worse={}/{}",
+                p,
+                n,
+                candidates,
+                cpu,
+                gpu,
+                ms,
+                ok,
+                out.len(),
+                cpu / gpu.max(1e-9),
+                cpu_sum / npairs as f64,
+                gpu_sum / npairs as f64,
+                no_worse,
+                npairs
+            );
+        }
+    }
+
     /// #169 diagnostic (ignored): does the batched kernel still match the CPU
     /// LM at the hourly cell's row count? Run with
-    /// `cargo test --release --features cuda --lib diagnostic_gpu_fit_matches_cpu_at_one_million_rows -- --ignored --nocapture`.
-    #[cfg(feature = "cuda")]
+    /// `cargo test --release --features cuda --lib diagnostic_gpu_fit_matches_cpu_at_one_million_rows -- --ignored --nocapture`.    #[cfg(feature = "cuda")]
     #[test]
     #[ignore]
     fn diagnostic_gpu_fit_matches_cpu_at_one_million_rows() {
@@ -3166,7 +3315,7 @@ mod fit_tests {
             cols64[r] = row[0];
             cols64[n + r] = row[1];
         }
-        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
         let ops = [
             Op::Add, Op::Sub, Op::Mul, Op::Sin, Op::Cos, Op::Tanh, Op::Gauss, Op::Square,
             Op::Cube, Op::Neg,
@@ -3184,7 +3333,7 @@ mod fit_tests {
             .map(|t| crate::fit::gpu_fit_plan(t).expect("plan"))
             .collect();
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (out, ms) = ev.fit_batch(&refs, 8);
+        let (out, ms) = ev.fit_batch(&refs, 8, crate::fit::DeviceLoss::Squared);
         eprintln!("kernel {:.1} ms for {} candidates", ms, out.len());
         let sample = crate::data::Sample {
             x,
@@ -3227,7 +3376,7 @@ mod fit_tests {
         };
         let start = model(&[0.3, 0.2, 0.1]);
         let alone = crate::fit::gpu_fit_plan(&start).expect("plan");
-        let (out_alone, _) = ev.fit_batch(&[&alone], 6);
+        let (out_alone, _) = ev.fit_batch(&[&alone], 6, crate::fit::DeviceLoss::Squared);
         assert_eq!(out_alone[0].status, 0);
 
         // Same candidate repeated four times: every block owns one candidate,
@@ -3236,11 +3385,273 @@ mod fit_tests {
             .map(|_| crate::fit::gpu_fit_plan(&start).expect("plan"))
             .collect();
         let plan_refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (out, _) = ev.fit_batch(&plan_refs, 6);
+        let (out, _) = ev.fit_batch(&plan_refs, 6, crate::fit::DeviceLoss::Squared);
         for r in &out {
             assert_eq!(r.status, 0);
             assert_eq!(r.c, out_alone[0].c, "batch composition changed constants");
             assert_eq!(r.sse.to_bits(), out_alone[0].sse.to_bits());
         }
+    }
+
+    // ---- #229: LogSquashed on the batched kernel -------------------------
+
+    use crate::metrics::{self, Metric};
+
+    /// An affine model whose rows carry 12.5 % gross outliers. The robust
+    /// optimum and the least-squares optimum are different points, which is
+    /// what makes an SSE gate visible.
+    fn robust_fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>, Vec<f32>, Vec<f32>) {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
+            x.push(vec![t]);
+            let noise = (((i * 37) % 11) as f64 - 5.0) * 1e-3;
+            let outlier = i % 8 == 3;
+            y.push(0.5 + 1.75 * t + noise + if outlier { 25.0 } else { 0.0 });
+        }
+        let (cols, y32) = cols_from(&x, &y);
+        (x, y, cols, y32)
+    }
+
+    /// `mean ln(1 + r²)` for `tree` at its current constants — the configured
+    /// objective, scored by the same CPU function the archive uses.
+    fn log_squashed_at(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64]) -> f64 {
+        let pred: Vec<f64> = x.iter().map(|r| eval(tree, r)).collect();
+        metrics::score_weighted(&pred, y, w, Metric::LogSquashed, crate::expr::count_constants(tree))
+    }
+
+    /// #229 parity: the batched weighted-LM/IRLS kernel must reach the CPU
+    /// IRLS objective on a heavy-tailed fixture — not merely improve SSE.
+    #[test]
+    fn gpu_log_squashed_fit_matches_the_cpu_irls() {
+        let n = 400;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+        let start = model(&[0.2, 1.0]);
+        let mut cpu_tree = start.clone();
+        let cpu = crate::fit::fit_weighted_metric(&mut cpu_tree, &x, &y, &[], 8, Metric::LogSquashed);
+        assert!(cpu.is_finite() && cpu < log_squashed_at(&start, &x, &y, &[]));
+
+        let plan = crate::fit::gpu_fit_plan(&start).expect("affine plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
+        assert!(ms >= 0.0, "the log-squashed fit kernel ran");
+        assert_eq!(out[0].status, 0, "the outlier fixture is well conditioned");
+        let mut gpu_tree = start.clone();
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu = log_squashed_at(&gpu_tree, &x, &y, &[]);
+        let rel = (gpu - cpu).abs() / cpu.abs().max(1e-12);
+        assert!(
+            gpu <= cpu * (1.0 + 1e-6),
+            "the GPU fit is worse than the CPU IRLS on its own objective: gpu={:.12e} cpu={:.12e}",
+            gpu,
+            cpu
+        );
+        assert!(rel <= 1e-6, "GPU/CPU objective gap {:.3e} (gpu {:.12e}, cpu {:.12e})", rel, gpu, cpu);
+        // The robust endpoint is measurably better than the least-squares one
+        // on this fixture, so the comparison above is not vacuous.
+        let mut l2 = start.clone();
+        crate::fit::fit_weighted(&mut l2, &x, &y, &[], 8);
+        assert!(
+            log_squashed_at(&l2, &x, &y, &[]) > gpu + 1e-3,
+            "the fixture must separate the robust and least-squares optima"
+        );
+    }
+
+    /// #229: the same candidate produces bit-identical constants and the same
+    /// objective whichever batch it travels in, twice in a row.
+    #[test]
+    fn gpu_log_squashed_fit_is_deterministic_and_composition_free() {
+        let n = 400;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]));
+        let start = model(&[0.2, 1.0]);
+        let plan = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (a, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
+        let (b, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
+        assert_eq!(a[0].c, b[0].c, "a repeated run must be bit-identical");
+        assert_eq!(a[0].sse.to_bits(), b[0].sse.to_bits());
+
+        let plans: Vec<_> = (0..4).map(|_| crate::fit::gpu_fit_plan(&start).expect("plan")).collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (batch, _) = ev.fit_batch(&refs, 8, crate::fit::DeviceLoss::LogSquashed);
+        for r in &batch {
+            assert_eq!(r.c, a[0].c, "batch composition changed the robust constants");
+            assert_eq!(r.sse.to_bits(), a[0].sse.to_bits());
+        }
+    }
+
+    /// #229: the robust arm labels a rank-deficient system and a non-finite row
+    /// instead of returning constants (those candidates go to the exact CPU
+    /// arm with a cause).
+    #[test]
+    fn gpu_log_squashed_labels_ill_conditioning_and_non_finite_rows() {
+        let n = 400;
+        let (x, _y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let x0 = input(0);
+        let collinear = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.1), x0.clone()]),
+                node(Op::Mul, vec![constant(0.2), x0.clone()]),
+            ],
+        );
+        let plan = crate::fit::gpu_fit_plan(&collinear).expect("collinear plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 1, "a rank-deficient robust system must be labelled");
+
+        // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
+        let bad = node(
+            Op::Sqrt,
+            vec![node(Op::Sub, vec![constant(0.25), node(Op::Square, vec![input(0)])])],
+        );
+        let y_bad: Vec<f64> = x.iter().map(|r| eval(&bad, r)).collect();
+        let (cols, y32) = cols_from(&x, &y_bad);
+        let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
+        let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
+        let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::LogSquashed);
+        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+    }
+
+    /// #229: the base `--weight` vector scales the per-row IRLS weight, and a
+    /// zero-weight row is skipped before any arithmetic. The reference is the
+    /// exact CPU `log_squashed` arm on the same weights.
+    ///
+    /// The fixture separates two groups whose residuals are `O(1)` — a robust
+    /// loss down-weights gross outliers by itself, so only *moderately* bad
+    /// rows with a small base weight can show that `w` arrived at all. The
+    /// low-weight half wants slope `-1`, the rest wants `+1.75`; a kernel that
+    /// dropped `w` would land between them.
+    #[test]
+    fn gpu_log_squashed_honours_the_base_weight() {
+        let n = 400;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut w = vec![1.0f64; n];
+        for i in 0..n {
+            let t = (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
+            x.push(vec![t]);
+            if i % 10 == 7 {
+                // Masked: wild target, must never influence the fit.
+                w[i] = 0.0;
+                y.push(50.0 - 3.0 * t);
+            } else if i % 2 == 0 {
+                w[i] = 1.0;
+                y.push(1.75 * t);
+            } else {
+                w[i] = 1e-2;
+                y.push(-1.0 * t);
+            }
+        }
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &w), "f64 rows and weights uploaded");
+        let start = model(&[0.2, 0.0]);
+        let mut cpu_tree = start.clone();
+        let cpu = crate::fit::fit_weighted_metric(&mut cpu_tree, &x, &y, &w, 8, Metric::LogSquashed);
+        let plan = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 0);
+        let mut gpu_tree = start.clone();
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu = log_squashed_at(&gpu_tree, &x, &y, &w);
+        assert!(
+            gpu <= cpu * (1.0 + 1e-6),
+            "weighted GPU fit worse than the CPU arm: gpu={:.12e} cpu={:.12e}",
+            gpu,
+            cpu
+        );
+        // A kernel that ignored `w` would fit both groups together.
+        let mut unweighted = start.clone();
+        crate::fit::fit_weighted_metric(&mut unweighted, &x, &y, &[], 8, Metric::LogSquashed);
+        let wrong = log_squashed_at(&unweighted, &x, &y, &w);
+        assert!(
+            wrong > gpu + 1e-2,
+            "the fixture must punish ignoring the base weight (got {:.6e} vs {:.6e})",
+            wrong,
+            gpu
+        );
+    }
+
+    /// #229: the evaluator itself accumulates the configured objective. A
+    /// `log_squashed` run must be ranked by `mean ln(1+r²)`, never by MSE.
+    #[test]
+    fn the_evaluator_scores_the_configured_loss_natively() {
+        let n = 512;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let trees = vec![model(&[0.5, 1.75]), model(&[3.0, -0.5]), node(Op::Sin, vec![input(0)])];
+        let mut pop = Population::new();
+        for t in &trees {
+            assert!(pop.add(t));
+        }
+        ev.set_loss(crate::fit::DeviceLoss::LogSquashed);
+        assert_eq!(ev.loss(), crate::fit::DeviceLoss::LogSquashed);
+        let (loss, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0);
+        for (t, &got) in trees.iter().zip(&loss) {
+            // `eval_population` returns the raw sum; the search divides by the
+            // row count, which is the mean loss the archive would report.
+            let mean = got as f64 / n as f64;
+            let want = log_squashed_at(t, &x, &y, &[]);
+            let rel = (mean - want).abs() / want.abs().max(1e-12);
+            assert!(rel <= 1e-5, "device mean loss {:.9e} vs CPU {:.9e} (rel {:.2e})", mean, want, rel);
+        }
+        // The squared mode still accumulates SSE, so the two modes differ.
+        ev.set_loss(crate::fit::DeviceLoss::Squared);
+        let (sse, _) = ev.eval_population(&pop);
+        let pred: Vec<f64> = x.iter().map(|r| eval(&trees[0], r)).collect();
+        let want_sse = metrics::score(&pred, &y, Metric::Squared);
+        let rel = (sse[0] as f64 / n as f64 - want_sse).abs() / want_sse.abs().max(1e-12);
+        assert!(rel <= 1e-5, "device mean SSE {:.9e} vs CPU {:.9e}", sse[0] / n as f32, want_sse);
+        assert_ne!(sse[0], loss[0], "the two native objectives must not coincide");
     }
 }
