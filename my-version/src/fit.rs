@@ -213,7 +213,14 @@ pub fn gpu_fit_counts() -> (u64, u64, u64) {
 }
 
 /// #169: largest number of constants the batched GPU kernel fits.
-pub const GPU_FIT_MAX_CONSTANTS: usize = 16;
+///
+/// The kernel is instantiated for 16 constants with a 256-row chunk (about
+/// 39.7 KB of shared memory) and for 20 constants with a 128-row chunk (about
+/// 38.1 KB). Both fit two blocks per SM on `sm_86`; the larger alternative,
+/// 20 constants with a 256-row chunk, needs about 49.6 KB and only one block
+/// per SM. Any candidate with more than this many constants is labelled
+/// `too_many_constants` and refit by the exact CPU arm.
+pub const GPU_FIT_MAX_CONSTANTS: usize = 20;
 
 /// #169: largest flattened program (nodes) the batched GPU kernel fits.
 pub const GPU_FIT_MAX_NODES: usize = 96;
@@ -311,7 +318,7 @@ impl GpuFitPlan {
 /// and from the search-level "too few rows" guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuFitReject {
-    /// Too many constants for the static kernel layout (`p > 16`).
+    /// Too many constants for the kernel's instantiations (`p > 20`).
     TooManyConstants,
     /// The flattened program exceeds [`GPU_FIT_MAX_NODES`].
     TooManyNodes,
@@ -2413,6 +2420,37 @@ pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
 mod tests {
     use super::*;
     use crate::expr::{constant, input, node};
+
+    /// #169: the GPU fit plan's constant cap is 20. `p <= 20` is offered to the
+    /// kernel (no silent fallback) and `p = 21` is the first labelled
+    /// `too_many_constants` rejection. CPU-only: the plan builder is shared by
+    /// every build.
+    #[test]
+    fn the_gpu_fit_plan_accepts_twenty_constants_not_twenty_one() {
+        fn many_constants(p: usize) -> Node {
+            let mut t = node(Op::Mul, vec![constant(0.1), input(0)]);
+            for k in 1..p {
+                t = node(
+                    Op::Add,
+                    vec![
+                        t,
+                        node(Op::Mul, vec![constant(0.2 + 0.01 * k as f64), input(k)]),
+                    ],
+                );
+            }
+            t
+        }
+        assert_eq!(GPU_FIT_MAX_CONSTANTS, 20);
+        for p in 17..=20usize {
+            let plan = gpu_fit_plan_reason(&many_constants(p))
+                .unwrap_or_else(|e| panic!("p={} must be accepted: {:?}", p, e));
+            assert_eq!(plan.nconst, p);
+        }
+        assert_eq!(
+            gpu_fit_plan_reason(&many_constants(21)).err(),
+            Some(GpuFitReject::TooManyConstants)
+        );
+    }
 
     /// Gradient of the root w.r.t. every constant, via the adjoint sweep.
     fn analytic_grad(tree: &Node, x: &[f64]) -> Vec<f64> {
