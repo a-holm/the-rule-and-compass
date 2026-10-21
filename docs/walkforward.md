@@ -133,30 +133,29 @@ break-even hit rate differ. The per-group turnover and every P&L number match.
 
 Measured with the release binary on an Intel i7-3770K (8 threads), 31 GiB,
 Linux, using the 3,943,856 x 56 hourly store
-(`/mnt/lager/tmp/opencode/panel_hourly_v2.rcsb`, 2024 test window, 850,584 test
-rows, target `y60`, expression `r16`, streamed one 65,536-row group at a time):
+(`arbeidsmappe/crypto-rcsr/pilot/panel_hourly_v2.rcsb`, 2024 test window,
+target `y60`, expression `r16`, streamed one group at a time). The purge-matched
+window is train `[2021-01-01, 2024-01-01)`, test `[2024-01-03, 2025-01-01)`,
+horizon 172,800 s, q70, 10 bp/side, 8,760 periods/year.
 
-| run | wall | peak RSS |
-|---|---:|---:|
-| `rcsr walkforward ... --group-by symbol --horizon 172800` | 1.49 s | 110 MB |
+| side | wall | peak RSS | q70 threshold |
+|---|---:|---:|---:|
+| pinned Python row-wise reference (`benchmarks/eval_python_reference.py`) | 81.4 s | 104.9 MiB | `0.007034873088967409` |
+| `rcsr walkforward --group-by symbol --horizon 172800` | 4.06 s | 107.7 MiB | `0.007034873088967409` |
 
-A direct 10x comparison against the pilot Python path on this 4M-row panel is
-**not runnable from this checkout**, for two concrete reasons:
+The committed warm-cache report measures **20.1x**, above the 10x target. The
+feasibility pass measured a colder cache and reported **51x–75x** for the two
+pilot Python variants (125.5 s and 185.3 s against 2.46 s); the range is
+cache/load-sensitive but every measurement clears 10x. The threshold is
+bit-identical in both. Test rows differ by 6 out of 845,928 because the Rust
+evaluator drops non-finite score/target rows while the Python reference still
+charges their cost; see the report's `test_row_delta`.
 
-1. The Python reference (`pilot/evaluate_walkforward.py`) reads
-   `pilot/panel_daily_long.csv` (154,674 rows), not the hourly store. There is
-   no CSV projection of the 3.9M-row hourly panel in the repository or in the
-   benchmark workspace, and the source 25 GB CSV the issue mentions is not
-   available either. Rebuilding it would create a multi-gigabyte text artifact
-   just to time a path the Rust tool no longer uses.
-2. The 60-second benchmark cap applies, while the Python script loads every
-   column into per-row Python objects (`csv.DictReader`) before evaluating any
-   expression; its 154k-row run already takes 2.48 s just to reach the fourth
-   window, and it aborts there because `pilot/wf/2022.json` is empty. Extrapolating
-   the row-count factor alone puts the 3.9M-row Python path far above the cap,
-   and the memory footprint above the 31 GiB host.
+The full protocol — corpus hashes, window, command, why the reference is
+row-wise and not a vectorised rewrite, and the generated evidence — is in
+[`eval-benchmark.md`](eval-benchmark.md) and
+[`../benchmarks/results/issue-124-eval-10x.md`](../benchmarks/results/issue-124-eval-10x.md).
+Run it with `python3 benchmarks/eval_10x.py --repeats 2` or the ignored test
+`walkforward_bench`. The 10x box is evidenced by the ratio gate in that report,
+not by a fixed wall time on a different host.
 
-The honest claim is therefore: the Rust evaluator reads the store directly and
-completes the 4M-row window in 1.49 s with 110 MB RSS. The 10x box stays open
-until the missing hourly CSV (or the Python reference's store reader) and its
-exact artifact are available; no number is fabricated from a different fixture.
