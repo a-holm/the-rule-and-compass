@@ -48,6 +48,68 @@ fn write_store(path: &str, rows: &[(i64, String, f64, f64, f64, f64, f64)], grou
     store::write_store_with_time(path, &t, group_rows, Some(0)).unwrap();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_flow_store(
+    path: &str,
+    rows: &[(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)],
+    with_vwap: bool,
+    group_rows: usize,
+) {
+    let mut text = String::from("ts,symbol,open,high,low,close,volume,quote_volume,trades,taker_buy_base,taker_buy_quote");
+    if with_vwap {
+        text.push_str(",vwap");
+    }
+    text.push('\n');
+    for (t, sym, o, h, l, c, v, qv, n, tb, tbq) in rows {
+        text.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{}",
+            t, sym, o, h, l, c, v, qv, n, tb, tbq
+        ));
+        if with_vwap {
+            let vw = if *v > 0.0 { *qv / *v } else { f64::NAN };
+            text.push_str(&format!(",{}", vw));
+        }
+        text.push('\n');
+    }
+    let t = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    store::write_store_with_time(path, &t, group_rows, Some(0)).unwrap();
+}
+
+/// Write a store that carries the full raw OHLCV/flow block from seven-column
+/// bar tuples (quote volume and taker flow are derived deterministically).
+fn write_store_with_flow(
+    path: &str,
+    rows: &[(i64, String, f64, f64, f64, f64, f64)],
+    group_rows: usize,
+) {
+    let rich: Vec<(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = rows
+        .iter()
+        .map(|(t, s, o, h, l, c, v)| {
+            let qv = *v * (*h + *l + *c) / 3.0;
+            (*t, s.clone(), *o, *h, *l, *c, *v, qv, 100.0 + *v, *v * 0.5, *v * 0.5 * *c)
+        })
+        .collect();
+    write_flow_store(path, &rich, false, group_rows);
+}
+
+fn flow_rows(n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
+    (0..n)
+        .map(|i| {
+            let p = 100.0 + (i as f64 * 0.17).sin() * 1.5 + i as f64 * 0.02;
+            let o = p - 0.13;
+            let c = p + 0.07;
+            let h = p.max(o).max(c) + 0.21;
+            let l = p.min(o).min(c) - 0.19;
+            let v = 100.0 + i as f64 * 0.5;
+            let qv = v * (p + 0.03) + (i % 7) as f64 * 0.11;
+            let trades = 50.0 + i as f64 * 0.25;
+            let tb = v * 0.61 + (i % 5) as f64 * 0.07;
+            let tbq = tb * p;
+            (i as i64 * 900, "AAA".to_string(), o, h, l, c, v, qv, trades, tb, tbq)
+        })
+        .collect()
+}
+
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rcsr-enrich-{}-{}-{}",
@@ -95,6 +157,24 @@ fn catalogue_expands_every_family_and_refuses_typos() {
         assert!(all.contains(&n.to_string()), "all is missing {n}");
     }
     assert_eq!(enrich::py15m_names().len(), 35);
+    let flow = enrich::expand("flow").unwrap();
+    assert_eq!(flow, enrich::flow_names());
+    assert_eq!(flow.len(), 10);
+    for n in [
+        "vwap",
+        "taker_ratio96",
+        "taker_imb16",
+        "trade_intensity96",
+        "avg_trade_size96",
+        "amihud96",
+        "zero_ret_share96",
+        "obv_z96",
+        "cvd_proxy",
+        "vwap_dev96",
+    ] {
+        assert!(flow.contains(&n.to_string()), "flow is missing {n}");
+    }
+    assert!(enrich::usage().contains("flow"));
     assert!(enrich::expand("nope_not_a_feature").is_err());
     assert!(enrich::expand("ta:core").unwrap().contains(&"ret1".to_string()));
 }
@@ -430,6 +510,36 @@ fn default_financial_registry_is_complete_and_explicit() {
         let e = reg.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
         assert!(e.available, "{name} must be available");
     }
+    // Complete OHLCV/flow family (#270): vwap plus the nine derived columns.
+    for name in enrich::FLOW_NAMES {
+        let e = reg
+            .iter()
+            .find(|e| e.name == *name)
+            .unwrap_or_else(|| panic!("flow {name} missing from registry"));
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.family, "flow", "{name} family");
+        assert_eq!(e.timeframe, "15m", "{name} timeframe");
+        assert!(e.formula.contains("mean") || e.formula.contains("quote_volume") || e.formula.contains("OBV") || e.formula.contains("cumulative"), "{name} formula: {}", e.formula);
+        let schema = rcsr::schema::json();
+        assert!(schema.contains(&format!("\"name\":\"{name}\"")), "{name} absent from schema");
+    }
+    // Every raw OHLCV/flow field is registered with original units.
+    for name in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "vwap",
+    ] {
+        let e = reg.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.source, if name == "vwap" { "raw OHLCV/flow columns" } else { "input" }, "{name} source");
+    }
     // Unavailable families are explicit, never silently omitted.
     let unavailable: Vec<&enrich::RegistryEntry> = reg.iter().filter(|e| !e.available).collect();
     assert!(!unavailable.is_empty());
@@ -527,6 +637,312 @@ fn compact_flow_features_require_raw_trades_and_taker_columns() {
     assert!(err.contains("trades"), "unexpected error: {err}");
     let err = enrich::build(&opts(&src, &out, "taker_ratio96")).unwrap_err();
     assert!(err.contains("taker_buy_base"), "unexpected error: {err}");
+}
+
+/// Every derived flow formula on hand-built bars, to 1e-12 absolute-or-relative.
+#[test]
+fn flow_formulas_match_hand_built_bars() {
+    let dir = tmp_dir("flow_formulas");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows = flow_rows(160);
+    write_flow_store(&src, &rows, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+
+    let i = rows.len() - 1;
+    let lo = i + 1 - 96;
+    let close: Vec<f64> = rows.iter().map(|r| r.5).collect();
+    let vol: Vec<f64> = rows.iter().map(|r| r.6).collect();
+    let qv: Vec<f64> = rows.iter().map(|r| r.7).collect();
+    let trades: Vec<f64> = rows.iter().map(|r| r.8).collect();
+    let tb: Vec<f64> = rows.iter().map(|r| r.9).collect();
+    let mean = |x: &[f64], a: usize, b: usize| -> f64 {
+        x[a..=b].iter().sum::<f64>() / (b - a + 1) as f64
+    };
+    let close_at = |name: &str| column(&out, name)[i];
+    let check = |name: &str, got: f64, want: f64| {
+        let a = (got - want).abs();
+        let r = a / want.abs().max(1e-300);
+        assert!(
+            a <= 1e-12 || r <= 1e-12,
+            "{name}: got {got}, expected {want}, abs {a:e} rel {r:e}"
+        );
+    };
+
+    check("vwap", close_at("vwap"), qv[i] / vol[i]);
+    check(
+        "taker_ratio96",
+        close_at("taker_ratio96"),
+        mean(&tb, lo, i) / mean(&vol, lo, i),
+    );
+    let lo16 = i + 1 - 16;
+    check(
+        "taker_imb16",
+        close_at("taker_imb16"),
+        (2.0 * mean(&tb, lo16, i) - mean(&vol, lo16, i)) / mean(&vol, lo16, i),
+    );
+    check(
+        "trade_intensity96",
+        close_at("trade_intensity96"),
+        (1.0 + mean(&trades, lo, i) / mean(&vol, lo, i)).ln(),
+    );
+    let per_trade: Vec<f64> = (0..=i).map(|j| qv[j] / trades[j].max(1.0)).collect();
+    check(
+        "avg_trade_size96",
+        close_at("avg_trade_size96"),
+        (1.0 + mean(&per_trade, lo, i)).ln(),
+    );
+
+    let mut lr = vec![f64::NAN; rows.len()];
+    for j in 1..=i {
+        lr[j] = (close[j] / close[j - 1]).ln();
+    }
+    let amihud: Vec<f64> = (0..=i).map(|j| lr[j].abs() / qv[j]).collect();
+    check("amihud96", close_at("amihud96"), mean(&amihud, lo, i) * 1e6);
+    let zero: Vec<f64> = (0..=i).map(|j| if lr[j] == 0.0 { 1.0 } else { 0.0 }).collect();
+    check("zero_ret_share96", close_at("zero_ret_share96"), mean(&zero, lo, i));
+
+    let mut obv = vec![0.0f64; rows.len()];
+    for j in 1..=i {
+        let sign = if close[j] > close[j - 1] { 1.0 } else if close[j] < close[j - 1] { -1.0 } else { 0.0 };
+        obv[j] = obv[j - 1] + sign * vol[j];
+    }
+    let om = mean(&obv, lo, i);
+    let osd = (obv[lo..=i].iter().map(|x| (x - om) * (x - om)).sum::<f64>() / 96.0).sqrt();
+    check("obv_z96", close_at("obv_z96"), (obv[i] - om) / osd);
+
+    let mut cvd = vec![0.0f64; rows.len()];
+    for j in 0..=i {
+        cvd[j] = (if j == 0 { 0.0 } else { cvd[j - 1] }) + (2.0 * tb[j] - vol[j]);
+    }
+    let cm = mean(&cvd, lo, i);
+    let csd = (cvd[lo..=i].iter().map(|x| (x - cm) * (x - cm)).sum::<f64>() / 96.0).sqrt();
+    check("cvd_proxy", close_at("cvd_proxy"), cvd[i] / csd);
+
+    let vwap96 = mean(&qv, lo, i) / mean(&vol, lo, i);
+    check("vwap_dev96", close_at("vwap_dev96"), (close[i] - vwap96) / vwap96);
+}
+
+/// Zero volume and zero trades yield NaN for the affected ratios and
+/// illiquidity; `avg_trade_size96` keeps its explicit max(trades, 1).
+#[test]
+fn flow_zero_volume_and_zero_trades_are_nan_not_zero() {
+    let dir = tmp_dir("flow_zero");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = flow_rows(160);
+    for r in &mut rows {
+        r.6 = 0.0;
+        r.7 = 0.0;
+        r.8 = 0.0;
+        r.9 = 0.0;
+        r.10 = 0.0;
+    }
+    write_flow_store(&src, &rows, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+    let last = rows.len() - 1;
+    for name in [
+        "vwap",
+        "vwap_dev96",
+        "taker_ratio96",
+        "taker_imb16",
+        "trade_intensity96",
+        "amihud96",
+        "obv_z96",
+        "cvd_proxy",
+    ] {
+        assert!(column(&out, name)[last].is_nan(), "{name} must be NaN at zero volume/trades");
+    }
+
+    let dir = tmp_dir("flow_zero_trades");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = flow_rows(160);
+    for r in &mut rows {
+        r.8 = 0.0;
+    }
+    write_flow_store(&src, &rows, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+    let last = rows.len() - 1;
+    assert!(column(&out, "trade_intensity96")[last].is_nan(), "zero trades must make trade_intensity96 NaN");
+    assert!(
+        column(&out, "avg_trade_size96")[last].is_finite(),
+        "avg_trade_size96 uses max(trades,1) and stays finite"
+    );
+    assert!(column(&out, "taker_ratio96")[last].is_finite(), "taker ratio is unaffected by zero trades");
+}
+
+/// A flow window that spans a hole is NaN; raw vwap is still finite and
+/// nothing is forward-filled.
+#[test]
+fn flow_windows_are_gap_masked() {
+    let dir = tmp_dir("flow_gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = flow_rows(300);
+    for r in &mut rows {
+        if (120..123).contains(&(r.0 / 900)) {
+            r.0 += 3 * 900;
+        } else if r.0 / 900 >= 123 {
+            r.0 += 3 * 900;
+        }
+    }
+    write_flow_store(&src, &rows, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+    let names = [
+        "taker_ratio96",
+        "trade_intensity96",
+        "avg_trade_size96",
+        "amihud96",
+        "zero_ret_share96",
+        "obv_z96",
+        "cvd_proxy",
+        "vwap_dev96",
+    ];
+    for name in names {
+        let v = column(&out, name);
+        for i in 120..=120 + 94 {
+            assert!(v[i].is_nan(), "{name} bridged the gap at row {i}");
+        }
+    }
+    let imb = column(&out, "taker_imb16");
+    for i in 120..=120 + 14 {
+        assert!(imb[i].is_nan(), "taker_imb16 bridged the gap at row {i}");
+    }
+    assert!(column(&out, "vwap_dev96")[215].is_finite(), "a full post-gap window must become finite again");
+    let vwap = column(&out, "vwap");
+    assert!(vwap.iter().all(|x| x.is_finite()), "raw vwap does not need a window");
+}
+
+/// The four flow names shared with the compact profile pass the compact
+/// regression fixture at abs/rel <= 1e-12.
+#[test]
+fn flow_shared_names_match_the_compact_regression_fixture() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
+    let input = base.join("compact_15m_ohlcv.csv");
+    let expected_path = base.join("compact_15m_expected.csv");
+    let dir = tmp_dir("flow_parity");
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    enrich::build(&opts(&input.to_string_lossy(), &out, "flow")).unwrap();
+
+    let text = std::fs::read_to_string(&expected_path).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let wanted = ["taker_ratio96", "taker_imb16", "trade_intensity96", "vwap_dev96"];
+    let start_ts = 1_680_271_200i64;
+    let rows_per_symbol = 3600usize;
+    let out_cols: Vec<Vec<f64>> = wanted.iter().map(|n| column(&out, n)).collect();
+    let mut compared = 0usize;
+    let mut worst = 0.0f64;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        let ts: i64 = fields[0].parse().unwrap();
+        let sym = fields[1];
+        let seg = if sym == "AAVEUSDT" { 0 } else { 1 };
+        let idx = seg * rows_per_symbol + ((ts - start_ts) / 900) as usize;
+        for (j, name) in wanted.iter().enumerate() {
+            let col = header.iter().position(|h| h == name).unwrap();
+            let expected = fields[col].parse::<f64>().unwrap();
+            let got = out_cols[j][idx];
+            match (got.is_nan(), expected.is_nan()) {
+                (true, true) => continue,
+                (true, false) => panic!("{name} at {sym}/{ts}: got NaN, expected {expected}"),
+                (false, true) => panic!("{name} at {sym}/{ts}: got {got}, expected NaN"),
+                (false, false) => {}
+            }
+            let a = (got - expected).abs();
+            let r = a / expected.abs().max(1e-300);
+            worst = worst.max(a.max(r));
+            assert!(
+                a <= 1e-12 || r <= 1e-12,
+                "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 300 * wanted.len());
+    eprintln!("flow compact parity: worst abs/rel {worst:e}");
+}
+
+/// A raw OHLCV/flow fixture round-trips every field exactly, including the
+/// optional `vwap` column, while enrich appends derived columns.
+#[test]
+fn raw_ohlcv_flow_fields_round_trip_exactly() {
+    let dir = tmp_dir("flow_roundtrip");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows = flow_rows(80);
+    write_flow_store(&src, &rows, true, 16);
+    let before = FileStore::open(&src).unwrap();
+    let old_names = before.header().names();
+    let old_dtypes = before.header().dtypes();
+    let old: Vec<Vec<f64>> = [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "vwap",
+    ]
+    .iter()
+    .map(|n| column(&src, n))
+    .collect();
+    enrich::build(&opts(&src, &out, "taker_ratio96")).unwrap();
+    let after = FileStore::open(&out).unwrap();
+    assert_eq!(&after.header().names()[..old_names.len()], &old_names[..]);
+    assert_eq!(&after.header().dtypes()[..old_dtypes.len()], &old_dtypes[..]);
+    for (j, name) in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "trades",
+        "taker_buy_base",
+        "taker_buy_quote",
+        "vwap",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let got = column(&out, name);
+        assert_eq!(got.len(), old[j].len());
+        for (i, (a, b)) in got.iter().zip(&old[j]).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{name} changed at row {i}");
+        }
+    }
+}
+
+/// The flow family fails closed when a raw field is missing, naming both the
+/// feature and the column; an unknown name is still a hard error.
+#[test]
+fn flow_family_requires_raw_fields_and_unknown_names_fail() {
+    let dir = tmp_dir("flow_missing");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &bars("AAA", 120, 0, 900), 16);
+    let cases = [
+        ("vwap", "quote_volume"),
+        ("trade_intensity96", "trades"),
+        ("taker_ratio96", "taker_buy_base"),
+        ("avg_trade_size96", "quote_volume"),
+        ("amihud96", "quote_volume"),
+        ("cvd_proxy", "taker_buy_base"),
+    ];
+    for (feature, column) in cases {
+        let err = enrich::build(&opts(&src, &out, feature)).unwrap_err();
+        assert!(err.contains(feature), "error for {feature} does not name the feature: {err}");
+        assert!(err.contains(column), "error for {feature} does not name '{column}': {err}");
+    }
+    assert!(enrich::expand("flow_not_a_feature").is_err());
 }
 
 /// Parity against the independent Python compact builder on a contiguous 15 m
@@ -707,7 +1123,7 @@ fn advertised_column_set_is_exactly_what_a_real_run_appends() {
     let mut rows = wavy("AAA", 0.0);
     rows.extend(wavy("BBB", 1.3));
     rows.extend(wavy("BTCUSDT", 2.1));
-    write_store(&src, &rows, 64);
+    write_store_with_flow(&src, &rows, 64);
     let input_names = FileStore::open(&src).unwrap().header().names();
 
     for (spec, expected) in [("all", 171usize), ("py15m", 35), ("all,py15m", 201)] {

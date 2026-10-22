@@ -128,6 +128,15 @@ changes the stored feature value or bridges a gap in the producer. The compact
 52-name profile follows the same rule, even where the historical compact builder
 used positional windows that bridged a hole.
 
+The OHLCV/flow family (#270) follows that rule as well: `taker_ratio96`,
+`taker_imb16`, `trade_intensity96`, `avg_trade_size96`, `amihud96`,
+`zero_ret_share96`, `obv_z96`, `cvd_proxy` and `vwap_dev96` are `NaN` for a
+window that spans a gap, `OBV`/`CVD` state restarts after the gap, and zero
+volume or zero trades produces `NaN` for the affected ratios and illiquidity
+instead of a fake `0`. Those `NaN`s are producer values, not a missing-cell
+error; projection or a later explicit `--fill` decides what the search does with
+them.
+
 `--fill <method>` chooses what to do:
 
 | method | what happens | use when | do not use when |

@@ -181,7 +181,8 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by timestamp |
 | `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
 | `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
-| `all` | every legacy group above except `py15m`, `compact` | |
+| `flow` | `vwap` plus `taker_ratio96 taker_imb16 trade_intensity96 avg_trade_size96 amihud96 zero_ret_share96 obv_z96 cvd_proxy vwap_dev96` | the complete OHLCV/flow family (#270) |
+| `all` | every legacy group above except `py15m`, `compact`, `flow` | |
 
 `ta:core`, `ta:full`, `exotic:cheap`, `candle:geometry`, `cross:btc` and
 `calendar` keep their #125 meaning and are computed by `rcsr::features`, not
@@ -226,6 +227,54 @@ The test `wasym1_identity_holds_on_finite_range_bars` checks the identity to
 `1e-12`. Degenerate `H == L` bars follow the compact builder exactly:
 `clv1 = -0.5`, `body1 = 0`, `wasym1 = NaN`, `lower_wick = NaN`; the identity is
 undefined there.
+
+### OHLCV/flow family (#270)
+
+The `flow` group materialises the derived part of the family. The ten raw
+fields are input columns and are copied through unchanged in their original
+units:
+
+`open high low close volume quote_volume trades taker_buy_base
+taker_buy_quote vwap`
+
+`vwap = quote_volume / volume` in price units. It is normally stored by
+`rcsr prep` (#259); `rcsr enrich --features vwap` can also materialise it (use
+`--replace` when the store already carries the column).
+
+All windows are 15 m bars, trailing and inclusive of `t`:
+
+| column | definition | warm-up |
+|---|---|---:|
+| `taker_ratio96` | `mean(taker_buy_base,96)/mean(volume,96)` | 95 |
+| `taker_imb16` | `(2·mean(tb,16)−mean(volume,16))/mean(volume,16)` | 15 |
+| `trade_intensity96` | `ln(1+mean(trades,96)/mean(volume,96))` | 95 |
+| `avg_trade_size96` | `ln(1+mean(quote_volume/max(trades,1),96))` | 95 |
+| `amihud96` | `1e6·mean(|ln(C_t/C_{t−1})|/quote_volume,96)` | 96 |
+| `zero_ret_share96` | `mean(1[ln(C_t/C_{t−1})==0],96)` | 96 |
+| `obv_z96` | z-score of `OBV`, `OBV_t=OBV_{t−1}+sign(C_t−C_{t−1})·volume_t` | 95 |
+| `cvd_proxy` | cumulative `2·taker_buy_base−volume`, divided by its 96-bar population std | 95 |
+| `vwap_dev96` | `(close−vwap96)/vwap96`, `vwap96=mean(quote_volume,96)/mean(volume,96)` | 95 |
+
+NaN policy:
+
+* a window whose timestamps are not one contiguous run at the inferred bar
+  spacing is `NaN`; nothing is forward-filled and a listing, delisting,
+  migration or outage boundary is not bridged;
+* `OBV` and `CVD` cumulative state restarts after a gap;
+* zero volume makes `vwap`, `vwap_dev96`, the taker ratios, trade intensity,
+  Amihud and `cvd_proxy` `NaN`, never `0`;
+* zero trades makes trade intensity `NaN`; `avg_trade_size96` uses the explicit
+  `max(trades,1)` in the definition and therefore stays finite;
+* missing raw fields fail closed with an error naming both the feature and the
+  missing column.
+
+`vwap_dev96`, `taker_ratio96`, `taker_imb16` and `trade_intensity96` also occur
+in the compact subset. There is exactly **one** implementation of each name:
+the quote-volume definition above. The compact regression fixture pins these
+four against that definition; the legacy Python builder used a typical-price
+VWAP proxy, which differs on rows where exchange `quote_volume` is not exactly
+`typical_price × volume`. The four values are compared at
+`abs/rel <= 1e-12` by `flow_shared_names_match_the_compact_regression_fixture`.
 
 ### Compact parity fixture
 
