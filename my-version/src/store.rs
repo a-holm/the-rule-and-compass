@@ -1022,6 +1022,56 @@ pub fn write_store_appending(
     source: &FileStore,
     extras: &[AppendColumn],
 ) -> Result<(), String> {
+    let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    write_store_appending_to(&mut file, path, source, extras)
+}
+
+/// Like [`write_store_appending`], but also return the SHA-256 of the bytes it
+/// wrote.
+///
+/// Hashing happens while the blocks stream to disk, so the caller does not have
+/// to read a multi-gigabyte output a second time just to checksum it.
+pub fn write_store_appending_hashed(
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+) -> Result<String, String> {
+    let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    let mut hasher = crate::manifest::Sha256Hasher::new();
+    {
+        let mut out = HashWriter {
+            inner: &mut file,
+            hasher: &mut hasher,
+        };
+        write_store_appending_to(&mut out, path, source, extras)?;
+        out.flush().map_err(|e| format!("{}: {}", path, e))?;
+    }
+    Ok(hasher.finalize())
+}
+
+/// `Write` adapter that feeds every byte to a SHA-256 state.
+struct HashWriter<'a> {
+    inner: &'a mut File,
+    hasher: &'a mut crate::manifest::Sha256Hasher,
+}
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn write_store_appending_to<W: Write>(
+    out: &mut W,
+    path: &str,
+    source: &FileStore,
+    extras: &[AppendColumn],
+) -> Result<(), String> {
     if extras.is_empty() {
         return Err("append needs at least one column".to_string());
     }
@@ -1141,7 +1191,7 @@ pub fn write_store_appending(
         .map(|e| File::open(&e.file).map_err(|err| format!("{}: {}", e.file.display(), err)))
         .collect::<Result<_, _>>()?;
 
-    let mut file = File::create(path).map_err(|e| format!("{}: {}", path, e))?;
+    let file = out;
     file.write_all(MAGIC)
         .and_then(|_| file.write_all(&VERSION.to_le_bytes()))
         .and_then(|_| file.write_all(&(json.len() as u32).to_le_bytes()))

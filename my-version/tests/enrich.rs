@@ -118,6 +118,13 @@ fn append_preserves_every_existing_column_and_metadata() {
     assert_eq!(report.columns_in, old_names.len());
     assert_eq!(report.columns_out, old_names.len() + 2);
     assert_eq!(report.rows, 120);
+    // The append writer hashes while writing; the digest must equal a plain
+    // re-read of the output file.
+    assert_eq!(
+        report.output_sha256,
+        rcsr::manifest::sha256_file(&out).unwrap(),
+        "streamed output hash differs from a re-read"
+    );
 
     let dst = FileStore::open(&out).unwrap();
     let new_names = dst.header().names();
@@ -464,4 +471,94 @@ fn time_major_panel_stores_are_refused_with_a_clear_message() {
     let err = enrich::build(&opts(&src, &out, "r1")).unwrap_err();
     assert!(err.contains("time-major"), "unexpected error: {err}");
     assert!(!std::path::Path::new(&out).exists());
+}
+
+/// Every advertised name must appear in a real output store, with a per-column
+/// hash that reproduces the bytes actually written, not only in the dry-run
+/// catalogue. `all` has 171 columns, `py15m` 35, and their union 201 (five
+/// names are shared).
+#[test]
+fn advertised_column_set_is_exactly_what_a_real_run_appends() {
+    let dir = tmp_dir("advertised");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    // A two-sided series: zero-loss windows make RSI undefined (NaN) by the
+    // Python definition, so a monotonic ramp cannot exercise `rsi6`.
+    let wavy = |symbol: &str, phase: f64| -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+        (0..300usize)
+            .map(|i| {
+                let t = i as f64;
+                let p = 100.0 + 5.0 * (t * 0.37 + phase).sin() + 0.02 * t;
+                (
+                    i as i64 * 3600,
+                    symbol.to_string(),
+                    p,
+                    p + 1.0,
+                    p - 1.0,
+                    p + 0.5 * (t * 0.7).sin(),
+                    10.0 + (i % 7) as f64,
+                )
+            })
+            .collect()
+    };
+    let mut rows = wavy("AAA", 0.0);
+    rows.extend(wavy("BBB", 1.3));
+    rows.extend(wavy("BTCUSDT", 2.1));
+    write_store(&src, &rows, 64);
+    let input_names = FileStore::open(&src).unwrap().header().names();
+
+    for (spec, expected) in [("all", 171usize), ("py15m", 35), ("all,py15m", 201)] {
+        let advertised = enrich::expand(spec).unwrap();
+        assert_eq!(advertised.len(), expected, "{spec} catalogue size");
+        let out = dir.join(format!("{}.rcsb", spec.replace(',', "-"))).to_string_lossy().into_owned();
+        let dry_out = format!("{}.dry", out);
+
+        let mut dry = opts(&src, &dry_out, spec);
+        dry.dry_run = true;
+        let dry_report = enrich::build(&dry).unwrap();
+        let real = enrich::build(&opts(&src, &out, spec)).unwrap();
+
+        // The dry run predicts exactly the schema the real run writes.
+        assert_eq!(
+            dry_report.columns_out,
+            input_names.len() + advertised.len(),
+            "{spec}: dry-run schema"
+        );
+        assert_eq!(dry_report.columns_out, real.columns_out, "{spec}: dry-run vs real schema");
+
+        let store = FileStore::open(&out).unwrap();
+        let names = store.header().names();
+        assert_eq!(&names[..input_names.len()], &input_names[..], "{spec}: input order changed");
+        let appended = &names[input_names.len()..];
+        assert_eq!(appended.len(), advertised.len(), "{spec}: appended column count");
+        for (i, name) in advertised.iter().enumerate() {
+            assert_eq!(&appended[i], name, "{spec}: column {} is out of catalogue order", i);
+            assert_eq!(store.header().column_index(name), Some(input_names.len() + i));
+        }
+
+        // Report order and hashes follow the file, and each hash is the digest
+        // of that column's little-endian f64 bytes in the output store.
+        assert_eq!(real.features.len(), advertised.len());
+        for (f, name) in real.features.iter().zip(advertised.iter()) {
+            assert_eq!(&f.name, name);
+            let values = column(&out, name);
+            let mut bytes = Vec::with_capacity(values.len() * 8);
+            for v in &values {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            assert_eq!(
+                f.hash,
+                rcsr::manifest::sha256_hex(&bytes),
+                "{spec}: reported hash for '{name}' is not the output column digest"
+            );
+            assert!(
+                f.nan_rows < real.rows,
+                "{spec}: '{name}' is NaN on every row of the fixture"
+            );
+        }
+        assert_eq!(
+            real.output_sha256,
+            rcsr::manifest::sha256_file(&out).unwrap(),
+            "{spec}: streamed output checksum"
+        );
+    }
 }
