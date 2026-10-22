@@ -245,7 +245,8 @@ fn json_string(s: &str) -> String {
 /// #223: the web front end parses the same flags, so it must refuse the same
 /// contradiction. Silently fitting on the CPU would give the browser run a
 /// different objective from the one the request named. #229 makes
-/// `log_squashed` a native kernel objective, so it is accepted with `gpu`.
+/// `log_squashed` a device objective and #230 makes the rank family one (the
+/// exact polish), so both are accepted with `gpu`.
 #[test]
 fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
     let args = |metric: &str| {
@@ -256,17 +257,25 @@ fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
             metric.to_string(),
         ]
     };
-    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
+    for metric in [
+        "squared",
+        "aic",
+        "aicc",
+        "bic",
+        "log_squashed",
+        "rank_correlation",
+        "rank_correlation_signed",
+    ] {
         assert!(
             gui::parse_web_args_for_test(&args(metric)).is_ok(),
-            "--metric {metric} is fitted by least squares and must be accepted"
+            "--metric {metric} has a device fit objective and must be accepted"
         );
     }
     for metric in ["absolute", "median", "log_loss"] {
         let err = gui::parse_web_args_for_test(&args(metric))
             .expect_err(&format!("--metric {metric} must be refused"));
         assert!(
-            err.contains("minimises squared error or log-squashed loss only"),
+            err.contains("minimises squared error, log-squashed loss or the"),
             "--metric {metric}: {err}"
         );
         assert!(err.contains("--metric squared"), "--metric {metric}: {err}");
