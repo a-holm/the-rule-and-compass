@@ -858,25 +858,32 @@ fn rcsr(args: &[&str]) -> std::process::Output {
         .expect("run rcsr")
 }
 
-/// Every metric without a native device objective is refused with exit 2 and a
-/// message that names what the GPU LM minimises and every way out. #229 admits
-/// `log_squashed` because the kernel now fits it, so the refused set is exactly
-/// the complement of `fit::fit_loss`. Iterating over `Metric::all()` means a
-/// future metric cannot inherit the old silent path.
+/// Every metric without a device fit objective is refused with exit 2 and a
+/// message that names what the GPU arms minimise and every way out. #229 admits
+/// `log_squashed` because the kernel now fits it and #230 admits the rank
+/// family through the exact rank polish (a fit-only arm), so the refused set is
+/// the complement of `fit_loss ∪ rank_fit_only`. Iterating over `Metric::all()`
+/// means a future metric cannot inherit the old silent path.
 #[test]
 fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     let refused: Vec<&str> = Metric::all()
         .iter()
-        .filter(|m| rcsr::fit::fit_loss(**m).is_none())
+        .filter(|m| {
+            rcsr::fit::fit_loss(**m).is_none() && rcsr::fit::rank_fit_only(**m).is_none()
+        })
         .map(|m| m.name())
         .collect();
     assert!(
-        refused.contains(&"absolute") && refused.contains(&"rank_correlation"),
-        "the native-objective family changed unexpectedly: {refused:?}"
+        refused.contains(&"absolute") && !refused.contains(&"rank_correlation"),
+        "the device-fit family changed unexpectedly: {refused:?}"
     );
     assert!(
         !refused.contains(&"log_squashed"),
         "log_squashed is fitted by the kernel since #229 and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"rank_correlation") && !refused.contains(&"rank_correlation_signed"),
+        "the rank family is fitted by the exact polish since #230 and must not be refused"
     );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
@@ -893,8 +900,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "--metric {metric}: {stderr}");
         assert!(
-            stderr.contains("--fit-strategy gpu minimises squared error or log-squashed loss only"),
-            "--metric {metric} must say what the GPU LM minimises: {stderr}"
+            stderr.contains(
+                "--fit-strategy gpu minimises squared error, log-squashed loss or the"
+            ),
+            "--metric {metric} must say what the GPU arms minimise: {stderr}"
         );
         assert!(
             stderr.contains(&format!("--metric {metric}")),

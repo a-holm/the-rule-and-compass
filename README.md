@@ -34,15 +34,18 @@ arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. An explicit `gpu` with a metric that has no native device
-objective is a usage error, because the kernel would otherwise fit a different
-loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
-the default LM path when it cannot prove a safe result, and the default remains
-the historical LM path bit for bit. `--metric signed` (the absolute mean residual) is
-the one non-squared metric with an exact closed form: its constants are
-projected in f64 onto the zero-mean-residual manifold by a constrained
-least-squares step (two passes, no optimiser), and when no constant can
-move the mean the arm says so instead of fabricating a fit — see
+forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+the same arm fits the exact integer rank polish on the device (fit-only: the
+fitness and the finalist refit stay on the CPU, because native rank scoring is
+still open). An explicit `gpu` with a metric that has no device fit objective is
+a usage error, because the kernel would otherwise fit a different loss; use
+`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+Every arm falls back to the default LM path when it cannot prove a safe result,
+and the default remains the historical LM path bit for bit. `--metric signed`
+(the absolute mean residual) is the one non-squared metric with an exact closed
+form: its constants are projected in f64 onto the zero-mean-residual manifold by
+a constrained least-squares step (two passes, no optimiser), and when no
+constant can move the mean the arm says so instead of fabricating a fit — see
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
@@ -899,15 +902,18 @@ arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. An explicit `gpu` with a metric that has no native device
-objective is a usage error, because the kernel would otherwise fit a different
-loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
-the default LM path when it cannot prove a safe result, and the default remains
-the historical LM path bit for bit. `--metric signed` (the absolute mean residual) is
-the one non-squared metric with an exact closed form: its constants are
-projected in f64 onto the zero-mean-residual manifold by a constrained
-least-squares step (two passes, no optimiser), and when no constant can
-move the mean the arm says so instead of fabricating a fit — see
+forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+the same arm fits the exact integer rank polish on the device (fit-only: the
+fitness and the finalist refit stay on the CPU, because native rank scoring is
+still open). An explicit `gpu` with a metric that has no device fit objective is
+a usage error, because the kernel would otherwise fit a different loss; use
+`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+Every arm falls back to the default LM path when it cannot prove a safe result,
+and the default remains the historical LM path bit for bit. `--metric signed`
+(the absolute mean residual) is the one non-squared metric with an exact closed
+form: its constants are projected in f64 onto the zero-mean-residual manifold by
+a constrained least-squares step (two passes, no optimiser), and when no
+constant can move the mean the arm says so instead of fabricating a fit — see
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for

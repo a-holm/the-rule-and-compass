@@ -21,11 +21,13 @@
  */
 
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 #include <math_constants.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 /* Opcodes. Keep in sync with src/gpu.rs. */
@@ -132,6 +134,11 @@ struct RcCtx {
     int pool_cap;
     int pool_width;
     int hash_cap;
+    /* #230: cached target ranks. `B` is twice the centred average rank of `y`
+       (an integer), computed once per fit sample; the rank-correlation stage
+       reuses it for every trial instead of re-sorting the target. */
+    long long *d_rank_b;
+    int rank_ready;
     int n;
     int v;
     int nprog;
@@ -1888,6 +1895,254 @@ static void rc_download(void *dst, const void *src, size_t bytes)
 }
 #endif
 
+
+/* --- #230: exact rank-correlation stage ----------------------------------
+ *
+ * `1 - rho` / `1 - |rho|` over average ranks. Twice the centred rank
+ *
+ *     A_i = 2 r_i - (n + 1)
+ *
+ * is an integer in [-(n-1), n-1] and `Sigma A_i = 0`, so
+ *
+ *     rho = Sigma A_i B_i / sqrt(Sigma A_i^2 Sigma B_i^2)
+ *
+ * with `B` the same quantity for the target. The three sums are exact and
+ * order-independent, which is why this stage needs no atomics and gives the
+ * same bits on one island and on four.
+ *
+ * Pipeline per call, over `ns` segments of `n` rows:
+ *   1. `k_rank_predict` writes an order-preserving u64 key per (segment, row);
+ *   2. `cub::DeviceSegmentedRadixSort` sorts the keys with the row as payload;
+ *   3. `k_rank_flags` marks run starts and gathers the cached target ranks;
+ *   4. two CUB scans turn the flags into run ordinals and the gathered ranks
+ *      into prefix sums (both exact integer sums);
+ *   5. `k_rank_starts` scatters each run's first position;
+ *   6. `k_rank_contrib` accumulates, per run, `A * Sigma B` and `A^2 * length`
+ *      into a 128-bit pair built from two u64 halves, then reduces the block.
+ *
+ * Ties are exact float equality: `-0.0` is canonicalised to `+0.0` before
+ * keying so the two share a rank exactly like the CPU's `==`, and the order
+ * inside a tie run is irrelevant because the whole run gets the average rank.
+ */
+
+__device__ __forceinline__ unsigned long long rank_key(double v)
+{
+    if (v == 0.0) v = 0.0;              /* -0.0 == +0.0 is one tie */
+    if (isnan(v)) return 0xFFFFFFFFFFFFFFFFULL;
+    unsigned long long bits;
+    memcpy(&bits, &v, sizeof(bits));
+    return (bits & 0x8000000000000000ULL) ? ~bits : (bits | 0x8000000000000000ULL);
+}
+
+/* Two's-complement 128-bit addition of (ah:al) into (hi:lo). */
+__device__ __forceinline__ void rank_add128(unsigned long long *hi,
+                                            unsigned long long *lo,
+                                            unsigned long long ah,
+                                            unsigned long long al)
+{
+    const unsigned long long old = *lo;
+    *lo += al;
+    *hi += ah + (*lo < old ? 1ULL : 0ULL);
+}
+
+/* Exact 64x64 -> 128 product of two signed values, as a u64 pair. */
+__device__ __forceinline__ void rank_mul128(long long a, long long b,
+                                            unsigned long long *hi,
+                                            unsigned long long *lo)
+{
+    const unsigned long long ua =
+        (a < 0) ? (unsigned long long)(-(a + 1)) + 1ULL : (unsigned long long)a;
+    const unsigned long long ub =
+        (b < 0) ? (unsigned long long)(-(b + 1)) + 1ULL : (unsigned long long)b;
+    *lo = ua * ub;
+    *hi = __umul64hi(ua, ub);
+    if ((a < 0) != (b < 0)) {
+        *lo = ~*lo + 1ULL;
+        *hi = ~*hi + (*lo == 0 ? 1ULL : 0ULL);
+    }
+}
+
+__global__ void k_rank_predict(const unsigned int *__restrict__ prog,
+                               const unsigned int *__restrict__ off,
+                               const double *__restrict__ c0, int kmax,
+                               const double *__restrict__ cols, int n, int ns,
+                               int ntrials,
+                               unsigned long long *__restrict__ keys,
+                               unsigned int *__restrict__ rows,
+                               int *__restrict__ status)
+{
+    const long long total = (long long)n * (long long)ns;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += stride) {
+        const int seg = (int)(i / n);
+        const int row = (int)(i % n);
+        /* `off` has one entry per *candidate*; a candidate owns `ntrials`
+           consecutive segments (its ladder trials). */
+        const int cand = seg / ntrials;
+        const unsigned int *nd = prog + off[cand];
+        const int m = (int)((off[cand + 1] - off[cand]) / 4u);
+        const double *c = c0 + (size_t)seg * (size_t)kmax;
+        double v[FT_MAX_NODES];
+        ft_forward_d(nd, m, cols, n, row, c, v);
+        const double pred = v[m - 1];
+        if (!isfinite(pred)) {
+            keys[i] = 0xFFFFFFFFFFFFFFFFULL;
+            status[seg] = 2; /* non-finite prediction, mapped to `non_finite` */
+        } else {
+            keys[i] = rank_key(pred);
+        }
+        rows[i] = (unsigned int)row;
+    }
+}
+
+/* One key per row, without a program: the target side. */
+__global__ void k_rank_keys_from_double(const double *__restrict__ v, long long total,
+                                        unsigned long long *__restrict__ keys,
+                                        unsigned int *__restrict__ rows)
+{
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += stride) {
+        keys[i] = rank_key(v[i]);
+        rows[i] = (unsigned int)i;
+    }
+}
+
+__global__ void k_rank_flags(const unsigned long long *__restrict__ keys,
+                             const unsigned int *__restrict__ rows,
+                             const long long *__restrict__ b, int n, long long total,
+                             int *__restrict__ flags, long long *__restrict__ gather)
+{
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x; p < total;
+         p += stride) {
+        const bool start = (p % n == 0) || keys[p] != keys[p - 1];
+        flags[p] = start ? 1 : 0;
+        gather[p] = (b != 0) ? b[rows[p]] : 0LL;
+    }
+}
+
+/* Close the exclusive prefix sums: `prefix[total]` is the total of all rows,
+ * which a run ending at the last position needs. */
+__global__ void k_rank_tail(long long *__restrict__ prefix,
+                            const long long *__restrict__ gather, long long total)
+{
+    if (total > 0) prefix[total] = prefix[total - 1] + gather[total - 1];
+}
+
+__global__ void k_rank_starts(const int *__restrict__ flags,
+                              const int *__restrict__ ord,
+                              long long *__restrict__ starts, long long total)
+{
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long p = (long long)blockIdx.x * blockDim.x + threadIdx.x; p < total;
+         p += stride) {
+        if (flags[p]) starts[ord[p] - 1] = p;
+    }
+}
+
+/* Per-run contribution to the two 128-bit sums, reduced inside one block per
+ * segment. No atomics: the block tree is a fixed order, so the result is the
+ * same on every run and on every device. */
+__global__ void k_rank_contrib(const long long *__restrict__ starts,
+                               const long long *__restrict__ prefix,
+                               const int *__restrict__ ord, int n, long long total,
+                               int nsegs, unsigned long long *__restrict__ out)
+{
+    __shared__ unsigned long long shi[256];
+    __shared__ unsigned long long slo[256];
+    const int tid = threadIdx.x;
+    const int seg = blockIdx.x;
+    const long long first = (long long)seg * n;
+    const long long last = first + n - 1;
+    const int base = ord[first] - 1;
+    const int end = (last < total) ? ord[last] : ord[total - 1];
+    const int runs = end - base;
+    unsigned long long hi_ab = 0ULL, lo_ab = 0ULL;
+    unsigned long long hi_aa = 0ULL, lo_aa = 0ULL;
+    for (int r = base + tid; r < end; r += 256) {
+        const long long i = starts[r];
+        const long long j = (r + 1 < end) ? starts[r + 1] : (first + n);
+        const long long a = (i - first) + (j - first) - (long long)n;
+        const long long bsum = prefix[j] - prefix[i];
+        unsigned long long h, l;
+        rank_mul128(a, bsum, &h, &l);
+        rank_add128(&hi_ab, &lo_ab, h, l);
+        rank_mul128(a * a, j - i, &h, &l);
+        rank_add128(&hi_aa, &lo_aa, h, l);
+    }
+    shi[tid] = hi_ab;
+    slo[tid] = lo_ab;
+    __syncthreads();
+    /* Reduce the pair (hi, lo) with a carry-aware add. */
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) {
+            rank_add128(&shi[tid], &slo[tid], shi[tid + st], slo[tid + st]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[(size_t)seg * 4 + 0] = shi[0];
+        out[(size_t)seg * 4 + 1] = slo[0];
+    }
+    __syncthreads();
+    shi[tid] = hi_aa;
+    slo[tid] = lo_aa;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) {
+            rank_add128(&shi[tid], &slo[tid], shi[tid + st], slo[tid + st]);
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[(size_t)seg * 4 + 2] = shi[0];
+        out[(size_t)seg * 4 + 3] = slo[0];
+        (void)runs;
+    }
+}
+
+/* Write `A` (the centred doubled rank of a run) back to every row of the run. */
+__global__ void k_rank_fill_b(const unsigned int *__restrict__ rows_sorted,
+                              const long long *__restrict__ starts, int nruns, int n,
+                              long long *__restrict__ b)
+{
+    for (int r = blockIdx.x * blockDim.x + threadIdx.x; r < nruns;
+         r += gridDim.x * blockDim.x) {
+        const int i = (int)starts[r];
+        const int j = (r + 1 < nruns) ? (int)starts[r + 1] : n;
+        const long long a = (long long)(i + j) - (long long)n;
+        for (int q = i; q < j; ++q) b[rows_sorted[q]] = a;
+    }
+}
+
+/* `Sigma B^2` in a 128-bit pair. Used once per call and by the tests. */
+__global__ void k_rank_bb(const long long *__restrict__ b, int n,
+                          unsigned long long *__restrict__ out)
+{
+    __shared__ unsigned long long shi[256];
+    __shared__ unsigned long long slo[256];
+    const int tid = threadIdx.x;
+    unsigned long long hi = 0ULL, lo = 0ULL;
+    for (int r = tid; r < n; r += 256) {
+        unsigned long long h, l;
+        rank_mul128(b[r], b[r], &h, &l);
+        rank_add128(&hi, &lo, h, l);
+    }
+    shi[tid] = hi;
+    slo[tid] = lo;
+    __syncthreads();
+    for (int st = 128; st > 0; st >>= 1) {
+        if (tid < st) rank_add128(&shi[tid], &slo[tid], shi[tid + st], slo[tid + st]);
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out[0] = shi[0];
+        out[1] = slo[0];
+    }
+}
+
 extern "C" {
 
 void *rc_create(const float *cols, int n, int v, const float *y)
@@ -1929,6 +2184,7 @@ void rc_destroy(void *ctx)
     if (c->d_pool[0]) cudaFree(c->d_pool[0]);
     if (c->d_pool[1]) cudaFree(c->d_pool[1]);
     if (c->d_hash) cudaFree(c->d_hash);
+    if (c->d_rank_b) cudaFree(c->d_rank_b);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -2345,6 +2601,277 @@ int rc_fit_kernel_info(int kmax, int *threads, int *smem_bytes, int *max_constan
 {
     if (!threads || !smem_bytes || !max_constants) return -1;
     return ft_kernel_shape(kmax, threads, smem_bytes, max_constants);
+}
+
+
+/* --- #230: host side of the exact rank stage ------------------------------ */
+
+typedef struct RcRankWork {
+    unsigned long long *keys;
+    unsigned long long *keys_out;
+    unsigned int *rows;
+    unsigned int *rows_out;
+    int *flags;
+    int *ord;
+    long long *gather;
+    long long *prefix;
+    long long *starts;
+    void *temp;
+    size_t temp_bytes;
+} RcRankWork;
+
+static void rc_rank_work_free(RcRankWork *w)
+{
+    if (w->keys) cudaFree(w->keys);
+    if (w->keys_out) cudaFree(w->keys_out);
+    if (w->rows) cudaFree(w->rows);
+    if (w->rows_out) cudaFree(w->rows_out);
+    if (w->flags) cudaFree(w->flags);
+    if (w->ord) cudaFree(w->ord);
+    if (w->gather) cudaFree(w->gather);
+    if (w->prefix) cudaFree(w->prefix);
+    if (w->starts) cudaFree(w->starts);
+    if (w->temp) cudaFree(w->temp);
+    memset(w, 0, sizeof(*w));
+}
+
+static int rc_rank_work_alloc(RcRankWork *w, long long total)
+{
+    memset(w, 0, sizeof(*w));
+    int ok = 1;
+    if (rc_alloc((void **)&w->keys, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->keys_out, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->rows, sizeof(unsigned int) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->rows_out, sizeof(unsigned int) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->flags, sizeof(int) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->ord, sizeof(int) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->gather, sizeof(long long) * (size_t)total) != 0) ok = 0;
+    /* `prefix` has one extra slot: a run's end may be `total`, and the
+       contribution kernel reads `prefix[end]`. The scan writes into the base
+       allocation (CUB expects aligned output pointers; scanning into
+       `prefix + 1` is misaligned and produced wrong sums), and
+       `k_rank_tail` fills the last slot afterwards. */
+    if (ok && rc_alloc((void **)&w->prefix, sizeof(long long) * (size_t)(total + 1)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&w->starts, sizeof(long long) * (size_t)total) != 0) ok = 0;
+    if (!ok) rc_rank_work_free(w);
+    return ok ? 0 : -1;
+}
+
+/* Sort, mark run starts, prefix-sum the gathered target ranks and scatter the
+ * run starts. `d_b` may be NULL for a run-only sweep (the target stage). */
+static int rc_rank_runs(RcRankWork *w, const long long *d_b, int n, long long total,
+                        int nsegs, int *d_off)
+{
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    if (blocks < 1) blocks = 1;
+    /* Size the temporary storage for the largest of the three primitives. */
+    size_t tb = 0, ts = 0, tsc = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        NULL, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
+        d_off + 1);
+    cub::DeviceScan::InclusiveSum(NULL, ts, w->flags, w->ord, (int)total);
+    cub::DeviceScan::ExclusiveSum(NULL, tsc, w->gather, w->prefix, (int)total);
+    if (ts > tb) tb = ts;
+    if (tsc > tb) tb = tsc;
+    /* CUB may report a zero-byte requirement for a tiny input; cudaMalloc(0)
+       is not portable, so ask for at least one byte. */
+    if (tb == 0) tb = 1;
+    if (rc_alloc(&w->temp, tb) != 0) return -1;
+    w->temp_bytes = tb;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        w->temp, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
+        d_off + 1);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    k_rank_flags<<<(int)blocks, threads>>>(w->keys_out, w->rows_out, d_b, n, total,
+                                           w->flags, w->gather);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    cub::DeviceScan::InclusiveSum(w->temp, tb, w->flags, w->ord, (int)total);
+    cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total);
+    k_rank_tail<<<1, 1>>>(w->prefix, w->gather, total);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    k_rank_starts<<<(int)blocks, threads>>>(w->flags, w->ord, w->starts, total);
+    if (cudaGetLastError() != cudaSuccess) return -1;
+    return 0;
+}
+
+/* Ensure the f64 twin of the target exists (the rank stage needs f64 input). */
+static int rc_rank_ensure_y64(RcCtx *c)
+{
+    if (c->d_y64) return 0;
+    if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
+        c->d_y64 = 0;
+        return -1;
+    }
+    int threads = 256;
+    long long yblocks = (c->n + threads - 1) / threads;
+    cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(c->d_y64);
+        c->d_y64 = 0;
+        return -1;
+    }
+    return 0;
+}
+
+/* Compute and cache `B`, twice the centred average rank of the target rows. */
+static int rc_rank_prepare(void *ctx)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    if (c->rank_ready) return 0;
+    if (c->n <= 0) return -1;
+    if (rc_rank_ensure_y64(c) != 0) return -1;
+    if (rc_alloc((void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
+        c->d_rank_b = 0;
+        return -1;
+    }
+    RcRankWork w;
+    long long total = c->n;
+    if (rc_rank_work_alloc(&w, total) != 0) return -1;
+    int *d_off = 0;
+    int host_off[2] = {0, c->n};
+    int ok = (rc_alloc((void **)&d_off, sizeof(int) * 2) == 0);
+    if (ok) {
+        rc_upload(d_off, host_off, sizeof(int) * 2);
+        int threads = 256;
+        long long blocks = (total + threads - 1) / threads;
+        if (blocks > 65535) blocks = 65535;
+        k_rank_keys_from_double<<<(int)blocks, threads>>>(c->d_y64, total, w.keys, w.rows);
+        ok = (cudaGetLastError() == cudaSuccess) && (rc_rank_runs(&w, NULL, c->n, total, 1, d_off) == 0);
+    }
+    if (ok) {
+        int nruns = 0;
+        rc_download(&nruns, w.ord + (total - 1), sizeof(int));
+        long long nrun = nruns;
+        int tb = 256;
+        long long rb = (nrun + tb - 1) / tb;
+        if (rb > 65535) rb = 65535;
+        k_rank_fill_b<<<(int)rb, tb>>>(w.rows_out, w.starts, (int)nrun, c->n, c->d_rank_b);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (d_off) cudaFree(d_off);
+    rc_rank_work_free(&w);
+    if (!ok) {
+        cudaFree(c->d_rank_b);
+        c->d_rank_b = 0;
+        return -1;
+    }
+    c->rank_ready = 1;
+    return 0;
+}
+
+/* Exact rank sums of `nsets * ntrials` prediction vectors against the target.
+ *
+ * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
+ * matching `rc_fit_batch`'s per-candidate layout extended by one trial axis.
+ * `out` holds four u64 per segment: `(num_hi, num_lo, aa_hi, aa_lo)`, the two
+ * exact 128-bit sums `Sigma A B` and `Sigma A A`. `out_bb` receives the
+ * target's `Sigma B B` as `(hi, lo)`. Returns the stage time in ms, or a
+ * negative value when nothing may be trusted (the caller then uses the CPU).
+ */
+float rc_rank_score_batch(void *ctx,
+                          const unsigned int *prog,
+                          const unsigned int *off,
+                          const int *pcount,
+                          int nsets,
+                          int ntrials,
+                          int kmax,
+                          const double *c0,
+                          unsigned long long *out,
+                          int *out_status,
+                          unsigned long long *out_bb)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (c->n <= 1) return -1.0f;
+    if (rc_rank_prepare(ctx) != 0) return -1.0f;
+    if (rc_rank_ensure_y64(c) != 0) return -1.0f;
+    const int nsegs = nsets * ntrials;
+    const long long total = (long long)nsegs * (long long)c->n;
+    if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
+    unsigned int *d_prog = 0, *d_off = 0;
+    int *d_p = 0;
+    double *d_c0 = 0;
+    unsigned long long *d_out = 0;
+    int *d_status = 0;
+    unsigned long long *d_bb = 0;
+    int *d_seg_off = 0;
+    RcRankWork w;
+    memset(&w, 0, sizeof(w));
+    int ok = 1;
+    const size_t prog_words = (size_t)off[nsets];
+    if (rc_alloc((void **)&d_prog, sizeof(unsigned int) * prog_words) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nsets + 1)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nsets) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_c0, sizeof(double) * (size_t)nsegs * (size_t)kmax) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_out, sizeof(unsigned long long) * 4 * (size_t)nsegs) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nsegs) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_bb, sizeof(unsigned long long) * 2) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_seg_off, sizeof(int) * (size_t)(nsegs + 1)) != 0) ok = 0;
+    if (ok) {
+        rc_upload(d_prog, prog, sizeof(unsigned int) * prog_words);
+        rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+        rc_upload(d_p, pcount, sizeof(int) * (size_t)nsets);
+        rc_upload(d_c0, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
+        int *host_seg = (int *)malloc(sizeof(int) * (size_t)(nsegs + 1));
+        if (!host_seg) {
+            ok = 0;
+        } else {
+            for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
+            rc_upload(d_seg_off, host_seg, sizeof(int) * (size_t)(nsegs + 1));
+            free(host_seg);
+        }
+        cudaMemset(d_status, 0, sizeof(int) * (size_t)nsegs);
+    }
+    if (ok && rc_rank_work_alloc(&w, total) != 0) ok = 0;
+    float ms = -1.0f;
+    if (ok) {
+        int threads = 256;
+        long long blocks = (total + threads - 1) / threads;
+        if (blocks > 65535) blocks = 65535;
+        cudaEventRecord(c->t0, 0);
+        k_rank_predict<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
+                                                 c->n, nsegs, ntrials, w.keys, w.rows, d_status);
+        ok = cudaGetLastError() == cudaSuccess;
+        if (ok && rc_rank_runs(&w, c->d_rank_b, c->n, total, nsegs, d_seg_off) != 0) ok = 0;
+        if (ok) {
+            k_rank_contrib<<<nsegs, 256>>>(w.starts, w.prefix, w.ord, c->n, total, nsegs, d_out);
+            k_rank_bb<<<1, 256>>>(c->d_rank_b, c->n, d_bb);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        cudaEventRecord(c->t1, 0);
+        cudaEventSynchronize(c->t1);
+        if (ok) {
+            cudaEventElapsedTime(&ms, c->t0, c->t1);
+            rc_download(out, d_out, sizeof(unsigned long long) * 4 * (size_t)nsegs);
+            rc_download(out_status, d_status, sizeof(int) * (size_t)nsegs);
+            rc_download(out_bb, d_bb, sizeof(unsigned long long) * 2);
+        }
+    }
+    if (d_prog) cudaFree(d_prog);
+    if (d_off) cudaFree(d_off);
+    if (d_p) cudaFree(d_p);
+    if (d_c0) cudaFree(d_c0);
+    if (d_out) cudaFree(d_out);
+    if (d_status) cudaFree(d_status);
+    if (d_bb) cudaFree(d_bb);
+    if (d_seg_off) cudaFree(d_seg_off);
+    rc_rank_work_free(&w);
+    if (!ok) return -1.0f;
+    return ms;
+}
+
+/* #230 test hook: copy the cached target ranks to the host so a parity test
+   can check the per-row `B` instead of only the sums. */
+int rc_rank_debug_b(void *ctx, long long *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    if (rc_rank_prepare(ctx) != 0) return -1;
+    rc_download(out, c->d_rank_b, sizeof(long long) * (size_t)c->n);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.

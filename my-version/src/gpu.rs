@@ -638,6 +638,25 @@ extern "C" {
         outsse: *mut f64,
         outstatus: *mut i32,
     ) -> f32;
+    /* #230: exact rank sums of a batch of prediction vectors against the cached
+       target ranks. `out` holds four u64 per segment `(num_hi, num_lo, aa_hi,
+       aa_lo)`; `out_bb` receives the target's `Sigma B^2`. */
+    fn rc_rank_score_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nsets: i32,
+        ntrials: i32,
+        kmax: i32,
+        c0: *const f64,
+        out: *mut u64,
+        out_status: *mut i32,
+        out_bb: *mut u64,
+    ) -> f32;
+    /* #230 test hook: the cached target ranks, per row. */
+    #[cfg(test)]
+    fn rc_rank_debug_b(ctx: *mut RawCtx, out: *mut i64) -> i32;
     /* #169: block width, dynamic shared bytes and constant cap of the fit-kernel
        instantiation a batch with `kmax` constants would use. Diagnostics. */
     fn rc_fit_kernel_info(
@@ -1218,6 +1237,205 @@ impl GpuEvaluator {
         (out, ms)
     }
 
+    /// #230: device memory the rank stage may use for one wave, in bytes.
+    ///
+    /// The evaluator keeps the resident dataset and the fit buffers alive, and
+    /// a long search may share the device, so the wave that fits one call is
+    /// sized conservatively rather than by "whatever cudaMalloc gives". A
+    /// smaller wave changes only how many calls are made; the integer sums are
+    /// exact, so the score does not depend on the split.
+    const RANK_WAVE_BYTES: u64 = 512 * 1024 * 1024;
+
+    /// #230: exact rank sums for `plans.len() * ntrials` prediction vectors.
+    ///
+    /// `trials[k][t]` is candidate `k`'s trial `t`, in constant-slot order.
+    /// Returns `None` when the device declined (allocation, launch or a bad
+    /// shape); a segment whose prediction was not finite is reported as
+    /// `Some(None)`, which the exact scorer maps to `+inf` like the CPU.
+    pub(crate) fn rank_score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<crate::metrics::RankSums>>>> {
+        use crate::metrics::RankSums;
+        let nsets = plans.len();
+        if nsets == 0 || trials.len() != nsets {
+            return None;
+        }
+        let ntrials = trials[0].len();
+        if ntrials == 0 || trials.iter().any(|t| t.len() != ntrials) {
+            return None;
+        }
+        let n = self.n_rows as usize;
+        if n < 2 {
+            return None;
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max()?;
+        // One segment holds `n` rows; the stage keeps six 8- or 4-byte buffers
+        // per row plus fixed workspace, so charge 64 bytes a row.
+        let per_seg = (n as u64).saturating_mul(64).saturating_add(1 << 20);
+        let wave_sets = (Self::RANK_WAVE_BYTES / per_seg.max(1) / ntrials as u64).max(1) as usize;
+        let mut out: Vec<Vec<Option<RankSums>>> = vec![vec![None; ntrials]; nsets];
+        let join = |hi: u64, lo: u64| -> i128 { (((hi as u128) << 64) | lo as u128) as i128 };
+        let mut start = 0usize;
+        while start < nsets {
+            let end = (start + wave_sets).min(nsets);
+            let wave = &plans[start..end];
+            let mut words: Vec<u32> = Vec::new();
+            let mut off: Vec<u32> = Vec::with_capacity(wave.len() + 1);
+            let mut pcount: Vec<i32> = Vec::with_capacity(wave.len());
+            off.push(0);
+            for plan in wave {
+                words.extend_from_slice(&plan.words);
+                off.push(words.len() as u32);
+                pcount.push(plan.nconst as i32);
+            }
+            let segs = (end - start) * ntrials;
+            let mut c0 = vec![0.0f64; segs * kmax];
+            for (k, list) in trials[start..end].iter().enumerate() {
+                for (t, c) in list.iter().enumerate() {
+                    let base = (k * ntrials + t) * kmax;
+                    if c.len() != wave[k].nconst || c.len() > kmax {
+                        return None;
+                    }
+                    c0[base..base + c.len()].copy_from_slice(c);
+                }
+            }
+            let mut raw = vec![0u64; segs * 4];
+            let mut status = vec![0i32; segs];
+            let mut bb = [0u64; 2];
+            let ms = unsafe {
+                rc_rank_score_batch(
+                    self.ctx,
+                    words.as_ptr(),
+                    off.as_ptr(),
+                    pcount.as_ptr(),
+                    (end - start) as i32,
+                    ntrials as i32,
+                    kmax as i32,
+                    c0.as_ptr(),
+                    raw.as_mut_ptr(),
+                    status.as_mut_ptr(),
+                    bb.as_mut_ptr(),
+                )
+            };
+            if ms < 0.0 {
+                return None;
+            }
+            let sum_bb = join(bb[0], bb[1]);
+            for seg in 0..segs {
+                let k = start + seg / ntrials;
+                let t = seg % ntrials;
+                // status != 0: a non-finite prediction in that segment, which
+                // the exact scorer maps to +inf exactly like the CPU.
+                out[k][t] = if status[seg] == 0 {
+                    Some(RankSums {
+                        ab: join(raw[seg * 4], raw[seg * 4 + 1]),
+                        aa: join(raw[seg * 4 + 2], raw[seg * 4 + 3]),
+                        bb: sum_bb,
+                    })
+                } else {
+                    None
+                };
+            }
+            start = end;
+        }
+        Some(out)
+    }
+
+    /// #230: the squared LM start followed by the exact rank polish, on device.
+    ///
+    /// This is the GPU counterpart of `fit_weighted_metric` for
+    /// `rank_correlation` / `rank_correlation_signed`: the same squared start,
+    /// the same ladder, the same first-improver rule and the same exact integer
+    /// score. A candidate whose polish cannot be scored, or whose prediction is
+    /// not finite, is reported with a non-zero status so the caller refits it
+    /// with the exact CPU arm and labels the fallback.
+    pub(crate) fn rank_fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+        y: &[f64],
+        signed: bool,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        // The squared LM start is the same one `fit_weighted_metric` uses for
+        // the rank family; the polished constants are judged against the
+        // **incoming** constants, which is that CPU arm's monotone gate.
+        let incoming: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
+        let (mut out, lm_ms) = self.fit_batch(plans, iters, crate::fit::DeviceLoss::Squared);
+        if out.is_empty() || out.len() != plans.len() {
+            return (out, -1.0);
+        }
+        let target = match crate::metrics::RankTarget::new(y) {
+            Some(t) if t.len() == self.n_rows as usize => t,
+            _ => return (out, -1.0),
+        };
+        let idx: Vec<usize> = (0..out.len())
+            .filter(|&k| out[k].status == 0 && out[k].c.iter().all(|v| v.is_finite()))
+            .collect();
+        if idx.is_empty() {
+            return (out, lm_ms);
+        }
+        let sub: Vec<&crate::fit::GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
+        let starts: Vec<Vec<f64>> = idx.iter().map(|&k| out[k].c.clone()).collect();
+        let started = std::time::Instant::now();
+        let Some(res) = crate::fit::polish_rank_batch(self, &sub, &starts, &target, signed, iters)
+        else {
+            for &k in &idx {
+                out[k].status = 3; // the labelled `rank_declined` fallback
+            }
+            return (out, -1.0);
+        };
+        // The CPU arm keeps the incoming constants unless the polished squared
+        // start is strictly better on the configured objective. Score the
+        // incoming constants in one batch so the device arm obeys the same
+        // monotone contract (a squared start can be worse on rho).
+        let base_trials: Vec<Vec<Vec<f64>>> = idx
+            .iter()
+            .map(|&k| vec![incoming[k].clone()])
+            .collect();
+        let baseline = self.rank_score_trials(&sub, &base_trials);
+        let polish_ms = started.elapsed().as_secs_f32() * 1000.0;
+        for (j, &k) in idx.iter().enumerate() {
+            let c = &res.constants[j];
+            if c.len() != plans[k].nconst || !c.iter().all(|v| v.is_finite()) {
+                out[k].status = 1;
+                continue;
+            }
+            if !res.scores[j].is_finite() {
+                // A prediction the exact rank stage cannot score is invalid,
+                // not a better fit: label it `non_finite` and let the CPU arm
+                // decide.
+                out[k].status = 2;
+                continue;
+            }
+            let start_score = baseline
+                .as_ref()
+                .and_then(|b| b.get(j))
+                .and_then(|t| t.first())
+                .copied()
+                .flatten()
+                .map(|s| {
+                    let s = crate::metrics::RankSums {
+                        bb: target.sum_bb(),
+                        ..s
+                    };
+                    crate::metrics::score_rank_sums(Some(s), signed)
+                })
+                .unwrap_or(f64::INFINITY);
+            if start_score.is_finite() && res.scores[j] >= start_score {
+                // Keep the incoming constants (slot order) and its exact score:
+                // the CPU arm would have done the same.
+                out[k].c = incoming[k].clone();
+                out[k].sse = start_score;
+                continue;
+            }
+            out[k].c = c.clone();
+            out[k].sse = res.scores[j];
+        }
+        (out, lm_ms + polish_ms)
+    }
+
     /// Score a whole [`Population`] in one call: one program upload and one
     /// kernel launch for every expression in the population, returning one SSE
     /// per program.
@@ -1229,6 +1447,20 @@ impl GpuEvaluator {
         let (prog, offsets) = population.programs();
         self.eval_batch(prog, offsets)
     }
+}
+
+/// #230: the device is the `RankTrialScorer` the batched exact-rank polish
+/// drives. Every call returns the integer sums of the rank statistic, so the
+/// polish cannot observe a floating-point reduction order.
+impl crate::fit::RankTrialScorer for GpuEvaluator {
+    fn score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<crate::metrics::RankSums>>>> {
+        self.rank_score_trials(plans, trials)
+    }
+
 }
 
 impl Drop for GpuEvaluator {
@@ -2483,7 +2715,7 @@ mod fit_tests {
     }
 
     fn dataset(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
-        let mut x = Vec::with_capacity(n);
+        let mut x: Vec<Vec<f64>> = Vec::with_capacity(n);
         for i in 0..n {
             let a = (i as f64 / (n - 1) as f64) * 5.0 - 2.5;
             x.push(vec![a]);
@@ -3879,5 +4111,375 @@ mod fit_tests {
             "correlation fit paired: N={n} P={candidates} p=3 cpu={cpu:.3}s gpu={gpu:.3}s kernel={kernel_ms:.1}ms speedup={:.1}x fallbacks={fallbacks} accepted={accepted}/{candidates} gpu<=cpu+1e-6={wins}/{candidates} median_delta={median:.3e} worst_delta={worst:.3e}",
             cpu / gpu.max(1e-9)
         );
+    }
+}
+
+/// #230: device-side exact rank stage.
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod rank_tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+    use crate::fit::{fit_weighted_metric, gpu_fit_plan_reason, polish_rank_batch};
+    use crate::metrics::{Metric, RankSums, RankTarget};
+
+    struct Fixture {
+        cols32: Vec<f32>,
+        cols64: Vec<f64>,
+        n: usize,
+        nv: usize,
+        y32: Vec<f32>,
+        y: Vec<f64>,
+        x: Vec<Vec<f64>>,
+    }
+
+    /// A 2-column sample with duplicated rows in both `x` and `y`, so ties,
+    /// duplicate predictions and `-0.0`/`+0.0` can all be exercised.
+    fn fixture(n: usize) -> Fixture {
+        let nv = 2;
+        let mut cols32 = vec![0.0f32; nv * n];
+        let mut cols64 = vec![0.0f64; nv * n];
+        let mut x: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = -2.0 + 4.0 * i as f64 / (n - 1) as f64;
+            // Every third row repeats the previous x value (prediction ties),
+            // and `sign` alternates so `abs(x0)` creates two tied groups.
+            let t = if i % 3 == 2 && i > 0 { x[i - 1][0] } else { t };
+            let s: f64 = if i % 2 == 0 { 0.0 } else { -0.0 };
+            let v = 1.4 * (0.9 * t).sin() + 0.3 * t;
+            let v = if i % 5 == 4 { 0.0 } else { v };
+            x.push(vec![t, s]);
+            y.push(v);
+            cols32[i] = t as f32;
+            cols32[n + i] = s as f32;
+            cols64[i] = t;
+            cols64[n + i] = s;
+        }
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        Fixture {
+            cols32,
+            cols64,
+            n,
+            nv,
+            y32,
+            y,
+            x,
+        }
+    }
+
+    fn evaluator(f: &Fixture) -> Option<GpuEvaluator> {
+        let mut ev = match GpuEvaluator::new(&f.cols32, f.n, f.nv, &f.y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return None;
+            }
+        };
+        assert!(ev.set_fit_data(&f.cols64, &f.y, &[]), "f64 fit data upload");
+        Some(ev)
+    }
+
+    fn plan(t: &Node) -> crate::fit::GpuFitPlan {
+        gpu_fit_plan_reason(t).expect("an eligible plan")
+    }
+
+    fn cpu_pred(f: &Fixture, t: &Node) -> Vec<f64> {
+        f.x.iter().map(|r| crate::expr::eval(t, r)).collect()
+    }
+
+    fn score_of(sums: Option<RankSums>, target: &RankTarget, signed: bool) -> f64 {
+        let sums = sums.map(|s| RankSums {
+            bb: target.sum_bb(),
+            ..s
+        });
+        crate::metrics::score_rank_sums(sums, signed)
+    }
+
+    fn linear() -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.15)],
+        )
+    }
+
+    fn tied() -> Node {
+        node(Op::Abs, vec![node(Op::Add, vec![input(0), constant(-0.25)])])
+    }
+
+    fn flat() -> Node {
+        node(Op::Mul, vec![constant(0.0), input(0)])
+    }
+
+    /// Every fixture: exact integer sums on the device equal the CPU's, bit for
+    /// bit, including ties and duplicates.
+    /// #230 measurement (ignored): paired CPU-exact versus device polish for
+    /// one candidate, plus the per-call rank-stage cost. Run with
+    /// `cargo test --release --features cuda --lib bench_rank_polish -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_rank_polish() {
+        let n: usize = std::env::var("RCSR_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(154_000);
+        let f = fixture(n);
+        let Some(mut ev) = evaluator(&f) else { return };
+        // Five constants: the pinned cell's p = 5.
+        let t = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.8),
+                        node(
+                            Op::Sin,
+                            vec![node(
+                                Op::Add,
+                                vec![
+                                    node(Op::Mul, vec![constant(0.9), input(0)]),
+                                    constant(0.1),
+                                ],
+                            )],
+                        ),
+                    ],
+                ),
+                node(Op::Mul, vec![constant(0.2), input(1)]),
+            ],
+        );
+        let p = plan(&t);
+        assert_eq!(p.nconst, 4);
+        let target = RankTarget::new(&f.y).unwrap();
+        // CPU: the exact ladder, target ranks cached once (as the engine does).
+        let mut cpu = t.clone();
+        let cpu_start = std::time::Instant::now();
+        crate::fit::coordinate_polish(&mut cpu, &f.x, &f.y, &[], Metric::RankCorrelation, 8);
+        let cpu_ms = cpu_start.elapsed().as_secs_f64() * 1000.0;
+        // GPU: the same ladder, batched through the device rank stage.
+        let gpu_start = std::time::Instant::now();
+        let out = polish_rank_batch(&mut ev, &[&p], &[p.c0.clone()], &target, false, 8)
+            .expect("device polish");
+        let gpu_ms = gpu_start.elapsed().as_secs_f64() * 1000.0;
+        // One batched call's cost, to expose the sort-dominated stage.
+        let one_start = std::time::Instant::now();
+        let mut trials = Vec::new();
+        for k in 0..6 {
+            let mut c = p.c0.clone();
+            c[0] *= 1.0 + 0.01 * (k as f64 + 1.0);
+            trials.push(c);
+        }
+        for _ in 0..3 {
+            let _ = ev.rank_score_trials(&[&p], &[trials.clone()]).expect("rank call");
+        }
+        let call_ms = one_start.elapsed().as_secs_f64() * 1000.0 / 3.0;
+        // One segment isolates the fixed per-call overhead from the sort work:
+        // six segments should cost close to six times this if the stage is
+        // sort-bound rather than latency-bound.
+        let single_start = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = ev
+                .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+                .expect("rank call");
+        }
+        let single_seg_ms = single_start.elapsed().as_secs_f64() * 1000.0 / 3.0;
+        // Same constants? The device path must reproduce the CPU ladder.
+        let cpu_c = crate::fit::constants_slots(&cpu);
+        let same = cpu_c.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            == out.constants[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        eprintln!(
+            "N={} p={} cpu_polish={:.1}ms gpu_polish={:.1}ms speedup={:.2}x call_6seg={:.2}ms call_1seg={:.2}ms ratio={:.2} same_constants={}",
+            n,
+            p.nconst,
+            cpu_ms,
+            gpu_ms,
+            cpu_ms / gpu_ms.max(1e-9),
+            call_ms,
+            single_seg_ms,
+            call_ms / single_seg_ms.max(1e-9),
+            same
+        );
+    }
+
+    /// The cached target ranks are the CPU's `B`, row for row, on a target
+    /// with duplicates and `-0.0`/`+0.0` pairs.
+    #[test]
+    fn target_ranks_match_the_cpu() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        let mut b = vec![0i64; f.n];
+        let rc = unsafe { rc_rank_debug_b(ev.ctx, b.as_mut_ptr()) };
+        assert_eq!(rc, 0, "the target stage ran");
+        assert_eq!(b, target.ranks(), "device B differs from the CPU average ranks");
+    }
+
+    #[test]
+    fn rank_sums_are_bit_identical_to_the_cpu() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        for t in [linear(), tied(), flat()] {
+            let p = plan(&t);
+            let pred = cpu_pred(&f, &t);
+            let cpu = target.sums(&pred).expect("cpu sums");
+            let gpu = ev
+                .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+                .expect("device rank call");
+            let got = gpu[0][0].expect("a finite segment");
+            assert_eq!(got.ab, cpu.ab, "Sigma A B differs");
+            assert_eq!(got.aa, cpu.aa, "Sigma A A differs");
+            assert_eq!(got.bb, cpu.bb, "Sigma B B differs");
+            assert_eq!(got.bb, target.sum_bb());
+        }
+    }
+
+    /// Ties, duplicated predictions and `-0.0`/`+0.0` produce the same score on
+    /// both sides; a constant prediction is exactly 1.0 (never NaN).
+    #[test]
+    fn ties_and_constant_predictions_score_exactly() {
+        let f = fixture(90);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        for (t, expect_constant) in [(tied(), false), (flat(), true)] {
+            let p = plan(&t);
+            let pred = cpu_pred(&f, &t);
+            let cpu = target.score(&pred, false);
+            let gpu_sums = ev
+                .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+                .expect("device rank call");
+            let gpu = score_of(gpu_sums[0][0], &target, false);
+            assert_eq!(gpu.to_bits(), cpu.to_bits(), "tie handling differs: {gpu} vs {cpu}");
+            if expect_constant {
+                assert_eq!(gpu, 1.0);
+            } else {
+                assert!(0.0 <= gpu && gpu <= 1.0);
+            }
+        }
+        // Signed variant: 1 - rho, still exact.
+        let p = plan(&tied());
+        let pred = cpu_pred(&f, &tied());
+        let cpu = target.score(&pred, true);
+        let gpu_sums = ev
+            .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("device rank call");
+        assert_eq!(score_of(gpu_sums[0][0], &target, true).to_bits(), cpu.to_bits());
+    }
+
+    /// The batched device polish commits the same constants as the CPU ladder
+    /// from the same start (the exactness claim of #230).
+    #[test]
+    fn device_polish_matches_the_cpu_ladder() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        for metric in [Metric::RankCorrelation, Metric::RankCorrelationSigned] {
+            let signed = crate::fit::rank_metric_signed(metric).unwrap();
+            let mut cpu = linear();
+            crate::fit::coordinate_polish(&mut cpu, &f.x, &f.y, &[], metric, 8);
+            let cpu_c = crate::fit::constants_slots(&cpu);
+            let t = linear();
+            let p = plan(&t);
+            let out = polish_rank_batch(&mut ev, &[&p], &[p.c0.clone()], &target, signed, 8)
+                .expect("device polish");
+            assert_eq!(
+                out.constants[0].iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                cpu_c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{metric:?}: device polish must reproduce the CPU constants"
+            );
+            assert!(out.scores[0].is_finite());
+        }
+    }
+
+    /// Splitting the same trials across two calls cannot change the sums: the
+    /// integer reduction has no floating-point order to lose.
+    #[test]
+    fn sums_are_independent_of_the_batch_split() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = linear();
+        let p = plan(&t);
+        let mut trials: Vec<Vec<f64>> = Vec::new();
+        for k in 0..6 {
+            let mut c = p.c0.clone();
+            c[0] += 0.01 * (k as f64 + 1.0);
+            trials.push(c);
+        }
+        let all = ev
+            .rank_score_trials(&[&p], &[trials.clone()])
+            .expect("one call");
+        let mut split = Vec::new();
+        for t1 in &trials {
+            let part = ev.rank_score_trials(&[&p], &[vec![t1.clone()]]).expect("split call");
+            split.push(part[0][0]);
+        }
+        assert_eq!(all[0], split, "the split changed the integer sums");
+        // And repeating the call is bit-identical.
+        let again = ev.rank_score_trials(&[&p], &[trials]).expect("repeat");
+        assert_eq!(all, again);
+    }
+
+    /// The end-to-end device arm returns constants at least as good as the
+    /// squared start on the exact score, and never a non-finite score.
+    #[test]
+    fn rank_fit_batch_never_returns_a_worse_score() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![constant(1.2), node(Op::Sin, vec![node(Op::Mul, vec![constant(0.9), input(0)])])],
+                ),
+                constant(0.05),
+            ],
+        );
+        let p = plan(&t);
+        let start_tree = t.clone();
+        let (out, ms) = ev.rank_fit_batch(&[&p], 6, &f.y, false);
+        assert!(ms > 0.0, "the rank arm ran on the device");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, 0, "the fixture candidate is eligible");
+        assert!(out[0].sse.is_finite());
+        let target = RankTarget::new(&f.y).unwrap();
+        let start_score = {
+            let mut cpu_start = start_tree.clone();
+            // The squared start is what the device LM began from.
+            fit_weighted_metric(&mut cpu_start, &f.x, &f.y, &[], 6, Metric::RankCorrelation);
+            let pred = cpu_pred(&f, &cpu_start);
+            target.score(&pred, false)
+        };
+        // The device starts from its own LM constants, so this is a sanity
+        // bound: the reported exact score is within the start's scale and no
+        // worse than the (unpolished) plan start.
+        let plan_start = target.score(&cpu_pred(&f, &start_tree), false);
+        assert!(
+            out[0].sse <= start_score.max(plan_start) + 1e-12,
+            "device score {} worse than start {}",
+            out[0].sse,
+            start_score.max(plan_start)
+        );
+    }
+
+    /// A tree whose prediction is not finite is reported, not scored: the
+    /// caller refits it on the CPU and labels the fallback.
+    #[test]
+    fn non_finite_predictions_are_refused_not_scored() {
+        let f = fixture(32);
+        let Some(mut ev) = evaluator(&f) else { return };
+        // ln(-1 - x0) is NaN everywhere on this sample.
+        let bad = node(
+            Op::Ln,
+            vec![node(Op::Mul, vec![constant(-1.0), node(Op::Add, vec![input(0), constant(1.0)])])],
+        );
+        let p = plan(&bad);
+        let Some(res) = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]) else {
+            // A refusal of the whole call is also a correct answer.
+            return;
+        };
+        assert!(res[0][0].is_none(), "a non-finite prediction must not be scored");
+        let target = RankTarget::new(&f.y).unwrap();
+        assert_eq!(score_of(res[0][0], &target, false), f64::INFINITY);
     }
 }

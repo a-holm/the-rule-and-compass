@@ -414,16 +414,19 @@ SEARCH:
                              training rows and every candidate with constants
                              at or above that size, then refits finalists
                              exactly. It minimises the configured objective:
-                             squared/AIC least squares, or log_squashed with
-                             per-row IRLS weights (#229). Without a batch
-                             backend it uses the exact CPU arms (never a
-                             no-op). The kernel minimises one of those two
-                             objectives, so `gpu` with any other metric is a
-                             usage error; use `--metric squared`,
-                             `--metric log_squashed` or a CPU strategy.
-                             `--metric signed` is in that group: it keeps the
-                             exact CPU projection (#228) and says so, because
-                             the device has no native signed scorer yet (#236)
+                             squared/AIC least squares, log_squashed with
+                             per-row IRLS weights (#229), or — for
+                             rank_correlation / rank_correlation_signed — the
+                             exact integer rank polish after a squared LM start
+                             (#230; fit-only, the fitness stays on the CPU).
+                             Without a batch backend it uses the exact CPU arms
+                             (never a no-op). The device refuses any other
+                             metric instead of substituting an objective: use
+                             `--metric squared`, `--metric log_squashed`, a
+                             rank metric, or a CPU strategy. `--metric signed`
+                             is in that group: it keeps the exact CPU
+                             projection (#228) and says so, because the device
+                             has no native signed scorer yet (#236)
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run

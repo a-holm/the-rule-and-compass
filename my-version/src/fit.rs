@@ -21,6 +21,7 @@ use crate::metrics::{self, Metric};
 // share one arithmetic story and one fallback contract.
 mod correlation;
 mod gpu;
+mod rank;
 mod stream;
 mod varpro;
 
@@ -33,6 +34,13 @@ pub use gpu::BatchedGpu;
 pub use stream::{
     fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
 };
+// The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
+// the module (its unit tests) without re-exporting anything.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) use rank::polish_rank_batch;
+#[cfg(any(feature = "cuda", test))]
+#[allow(unused_imports)]
+pub(crate) use rank::{exact_rank_score, RankTrialScorer};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
@@ -178,14 +186,34 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if fit_loss(metric).is_some() {
         return None;
     }
+    // #230: the rank family is honoured by the exact integer rank polish
+    // (`rank_fit_only`), which is a **fit-only** device arm: the evaluator
+    // still has no native rank scorer, so the fitness stays on the CPU.
+    if rank_metric_signed(metric).is_some() {
+        return None;
+    }
     Some(format!(
-        "--fit-strategy gpu minimises squared error or log-squashed loss only, but \
-         --metric {} has no native device objective, so the GPU LM cannot fit it. \
-         Use --metric squared (aic, aicc and bic also fit by least squares) or \
-         --metric log_squashed, or a CPU fit strategy: --fit-strategy exact, auto, \
-         linear, varpro or stream.",
+        "--fit-strategy gpu minimises squared error, log-squashed loss or the \
+         exact rank objectives, but --metric {} has no device fit objective, so \
+         the GPU arms cannot fit it. Use --metric squared (aic, aicc and bic \
+         also fit by least squares), --metric log_squashed, \
+         --metric rank_correlation or rank_correlation_signed, or a CPU fit \
+         strategy: --fit-strategy exact, auto, linear, varpro or stream.",
         metric.name()
     ))
+}
+
+/// #230: `Some(signed)` when `--fit-strategy gpu` can fit `metric` on the
+/// device through the batched exact rank polish, `None` otherwise.
+///
+/// This is deliberately **not** [`fit_loss`]: the batched LM kernel does not
+/// minimise Spearman's rho, the rank stage does. It is also not
+/// [`DeviceLoss::for_metric`]: the evaluator cannot score rho yet, so a run
+/// using this arm keeps every fitness value on the CPU. Callers use this
+/// predicate for the fit dispatch; the *scoring* gate remains
+/// [`DeviceLoss::for_metric`].
+pub fn rank_fit_only(metric: Metric) -> Option<bool> {
+    rank_metric_signed(metric)
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -383,10 +411,15 @@ fn gpu_fit_opcode(op: Op) -> Option<u32> {
 /// slot]`; constants are kept in `c0` so the kernel can move them, and `flat`
 /// is retained so the fitted values can be written back into the tree exactly
 /// like the CPU LM path does.
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 pub(crate) struct GpuFitPlan {
     pub(crate) words: Vec<u32>,
     pub(crate) nconst: usize,
     pub(crate) c0: Vec<f64>,
+    /// #230: slots in the order `const_positions` visits the constant nodes,
+    /// which is the order the CPU coordinate polish moves them in. The CUDA
+    /// rank polish walks this list so a batch commits the same first improver.
+    pub(crate) order: Vec<usize>,
     /// #224: the free affine pair (`scale`, `offset`) as constant slots, `-1`
     /// when absent. The correlation kernel freezes these slots and
     /// renormalises them; other metrics ignore the field.
@@ -394,6 +427,7 @@ pub(crate) struct GpuFitPlan {
     flat: Flat,
 }
 
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 impl GpuFitPlan {
     /// Write `c` back into `tree`'s constant slots.
     pub(crate) fn apply(&self, tree: &mut Node, c: &[f64]) {
@@ -472,11 +506,36 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
             c0[f.cslot[i] as usize] = f.val[i];
         }
     }
+    // #230: map pre-order tree positions onto constant slots. A block body
+    // aliases one slot from several tree positions, so the two orderings stop
+    // being a permutation; such a tree is rejected by `SharedConstants` above.
+    let mut positions = Vec::with_capacity(f.nconst);
+    let mut counter = 0usize;
+    const_positions(tree, &mut positions, &mut counter);
+    if positions.len() != f.nconst {
+        return Err(GpuFitReject::SharedConstants);
+    }
+    let mut slot_of_pos = vec![usize::MAX; counter.max(1)];
+    for (slot, &pos) in f.slot_pos.iter().enumerate() {
+        if pos >= slot_of_pos.len() || slot_of_pos[pos] != usize::MAX {
+            return Err(GpuFitReject::SharedConstants);
+        }
+        slot_of_pos[pos] = slot;
+    }
+    let mut order = Vec::with_capacity(f.nconst);
+    for &pos in &positions {
+        let slot = slot_of_pos.get(pos).copied().unwrap_or(usize::MAX);
+        if slot == usize::MAX {
+            return Err(GpuFitReject::SharedConstants);
+        }
+        order.push(slot);
+    }
     let gauge = correlation::gauge_of(&f).slots();
     Ok(GpuFitPlan {
         words,
         nconst: f.nconst,
         c0,
+        order,
         gauge,
         flat: f,
     })
@@ -508,6 +567,13 @@ struct Flat {
     /// The constant slots of ordinary (non-body) constants, in the same order
     /// as `const_positions` visits them. Body constants are omitted.
     normal_order: Vec<usize>,
+    /// #230: pre-order node index (`expr::nth` numbering) of each constant
+    /// slot, indexed by slot. `slot_pos[s]` is the tree position that holds
+    /// slot `s`, which is what maps the CUDA slot order onto the CPU polish's
+    /// `const_positions` order.
+    slot_pos: Vec<usize>,
+    /// Pre-order counter used to fill `slot_pos`.
+    next_pos: usize,
 }
 
 fn push_flat(f: &mut Flat, op: Op, val: f64, kids: Vec<usize>, cslot: i32) -> usize {
@@ -519,6 +585,8 @@ fn push_flat(f: &mut Flat, op: Op, val: f64, kids: Vec<usize>, cslot: i32) -> us
 }
 
 fn build(n: &Node, f: &mut Flat) -> usize {
+    let my_pos = f.next_pos;
+    f.next_pos += 1;
     // A block call is inlined for the fit: the body is built in parameter
     // space, its parameter leaves are replaced by the argument sub-trees, and
     // its constants are shared (see `Flat::shared`).
@@ -538,6 +606,7 @@ fn build(n: &Node, f: &mut Flat) -> usize {
         let s = f.nconst as i32;
         f.nconst += 1;
         f.normal_order.push(s as usize);
+        f.slot_pos.push(my_pos);
         s
     } else {
         -1
@@ -605,6 +674,8 @@ fn flatten(root: &Node) -> Flat {
         nconst: 0,
         shared: std::collections::HashMap::new(),
         normal_order: Vec::new(),
+        slot_pos: Vec::new(),
+        next_pos: 0,
     };
     f.root = build(root, &mut f);
     f
@@ -2650,9 +2721,18 @@ fn logistic_irls(
 ///
 /// The squared fit supplies the starting point. Each constant is then moved by
 /// one of six geometric steps (`±10%, ±3%, ±1%` of `max(|c|, 1)`) and the move
-/// is kept only if the configured metric strictly improves. Sweeps stop early
-/// when a full pass makes no improvement. No randomness is involved.
-fn coordinate_polish(
+/// is kept only if the configured metric strictly improves. The **first**
+/// improver in that fixed ladder order is committed, never a later or larger
+/// one, so the trajectory is reproducible. Sweeps stop early when a full pass
+/// makes no improvement. No randomness is involved.
+///
+/// #230: for `rank_correlation` and `rank_correlation_signed` the trial score is
+/// the **exact integer** form from [`metrics::RankTarget`] instead of the f64
+/// Pearson-on-ranks value. The two agree to a few ulps; the integer form is
+/// order-independent, which is what lets the CUDA rank stage reproduce this
+/// ladder constant for constant (see [`rank::polish_rank_batch`]). The target
+/// ranks are computed once per call instead of once per trial.
+pub(crate) fn coordinate_polish(
     tree: &mut Node,
     x: &[Vec<f64>],
     y: &[f64],
@@ -2660,7 +2740,21 @@ fn coordinate_polish(
     metric: Metric,
     sweeps: usize,
 ) {
-    let mut best = metric_score(tree, x, y, w, metric);
+    let signed = rank_metric_signed(metric);
+    // The exact path is used only when it is defined (finite target, no
+    // weights); otherwise the f64 metric stays the authority, exactly as before.
+    let target = match signed {
+        Some(_) if w.is_empty() && x.len() == y.len() => metrics::RankTarget::new(y),
+        _ => None,
+    };
+    let score_of = |tree: &Node| match (&target, signed) {
+        (Some(t), Some(signed)) => {
+            let pred = predictions(tree, x);
+            t.score(&pred, signed)
+        }
+        _ => metric_score(tree, x, y, w, metric),
+    };
+    let mut best = score_of(tree);
     if !best.is_finite() {
         return;
     }
@@ -2679,19 +2773,12 @@ fn coordinate_polish(
             let original = node.val;
             let scale = original.abs().max(1.0);
             let mut accepted = false;
-            for &(mul, sign) in &[
-                (0.1, 1.0),
-                (0.1, -1.0),
-                (0.03, 1.0),
-                (0.03, -1.0),
-                (0.01, 1.0),
-                (0.01, -1.0),
-            ] {
+            for (mul, sign) in LADDER {
                 let trial_value = original + sign * mul * scale;
                 if let Some(node) = expr::nth_mut(tree, pos) {
                     node.val = trial_value;
                 }
-                let score = metric_score(tree, x, y, w, metric);
+                let score = score_of(tree);
                 if score.is_finite() && score < best {
                     best = score;
                     improved = true;
@@ -2711,6 +2798,45 @@ fn coordinate_polish(
         }
     }
 }
+
+/// #230: the tree's constants in `GpuFitPlan` slot order (test/debug helper).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn constants_slots(tree: &Node) -> Vec<f64> {
+    let f = flatten(tree);
+    let mut c = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    c
+}
+
+/// #230: `Some(signed)` when `metric` is one of the exact-rank objectives.
+///
+/// `signed` distinguishes `1 − ρ` (`RankCorrelationSigned`) from `1 − |ρ|`
+/// (`RankCorrelation`); every other metric returns `None`.
+pub(crate) fn rank_metric_signed(metric: Metric) -> Option<bool> {
+    match metric {
+        Metric::RankCorrelation => Some(false),
+        Metric::RankCorrelationSigned => Some(true),
+        _ => None,
+    }
+}
+
+/// #230: the fixed coordinate-polish ladder, in acceptance order.
+///
+/// `(step fraction, sign)`: `+10%, −10%, +3%, −3%, +1%, −1%` of
+/// `max(|c|, 1)`. The CPU polish, the CUDA rank stage and the tests all read
+/// this one table, so "the first improver" cannot drift between them.
+pub(crate) const LADDER: [(f64, f64); 6] = [
+    (0.1, 1.0),
+    (0.1, -1.0),
+    (0.03, 1.0),
+    (0.03, -1.0),
+    (0.01, 1.0),
+    (0.01, -1.0),
+];
 
 /// Write the fitted shared constants back into every block body in `tree`.
 fn apply_shared_constants(
@@ -4102,23 +4228,23 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223 + #229: an explicit GPU request is refused for every metric without
-    /// a native device objective, and the refusal says why and what to use
-    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares and
-    /// `log_squashed` fits by weighted IRLS on the device (#229), so both are
-    /// accepted.
+    /// #223 + #229 + #230: an explicit GPU request is refused for every metric
+    /// without a device fit objective, and the refusal says why and what to use
+    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares,
+    /// `log_squashed` by weighted IRLS (#229) and the rank family by the exact
+    /// integer polish (#230), so all three groups are accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if fit_loss(*m).is_some() {
+            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
             let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
             assert!(
-                why.contains("minimises squared error or log-squashed loss only"),
-                "the refusal must name the GPU LM's objective: {why}"
+                why.contains("minimises squared error, log-squashed loss or the"),
+                "the refusal must name the device objectives: {why}"
             );
             assert!(
                 why.contains(&format!("--metric {}", m.name())),
@@ -4139,9 +4265,15 @@ mod tests {
                 );
             }
         }
-        // The robust arm is native since #229: it must never be refused.
+        // The robust arm is native since #229 and the rank arm fits since
+        // #230: neither may be refused.
         assert!(gpu_fit_metric_error(Metric::LogSquashed).is_none());
         assert!(gpu_fit_metric_error(Metric::Squared).is_none());
+        assert!(gpu_fit_metric_error(Metric::RankCorrelation).is_none());
+        assert!(gpu_fit_metric_error(Metric::RankCorrelationSigned).is_none());
+        assert_eq!(rank_fit_only(Metric::RankCorrelation), Some(false));
+        assert_eq!(rank_fit_only(Metric::RankCorrelationSigned), Some(true));
+        assert_eq!(rank_fit_only(Metric::Squared), None);
         assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
     }
 
