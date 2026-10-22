@@ -131,6 +131,11 @@ fn gpu_columns_match_cpu_and_report_the_share() {
     assert!(gpu.gpu_kernel_seconds > 0.0);
     assert!(gpu.gpu_transfer_bytes > 0);
     assert!(gpu.json().contains("\"gpu\":{"), "JSON must carry the GPU share");
+    assert!(
+        gpu.json().contains("\"projection\":{\"hash\":"),
+        "JSON must carry the projected read hash and column list: {}",
+        gpu.json()
+    );
 
     // Deterministic: a repeated GPU run writes the same values and hashes.
     let gpu_hashes: Vec<_> = gpu.features.iter().map(|f| (f.name.clone(), f.hash.clone())).collect();

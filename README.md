@@ -369,7 +369,12 @@ atomically instead of streaming it. See
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
   `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
-  the preparation block, manifest and dev log. `rcsr
+  the preparation block, manifest and dev log. When a store is read with
+  `--vars` and `--time`, the default **projects the read** to those variables,
+  targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
+  the guard charges only them, and the resolved hash and column list go into
+  `--run-manifest` (`--no-project` restores the full-column load for an A/B
+  run). `rcsr
   import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
   v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).
@@ -413,8 +418,9 @@ atomically instead of streaming it. See
   mapping for every name shared by several groups. The CPU path is always
   available; a per-family cost model
 
-  decides CPU vs GPU and records the reason, GPU builds upload the source
-  columns once and report the GPU column share, and the 3.9M-row measurement
+  decides CPU vs GPU and records the reason, GPU builds read only the required
+  source blocks into a bounded pinned ring and copy them straight to the device
+  (no full `Table`), report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the
   16.1M-row OHLCV panel the GPU feature phase is **1.49x** the CPU (72.1 % of
   columns dispatched, zero fallbacks) while end-to-end wall is decided by the
@@ -502,7 +508,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
-     [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
      [--allow-lockbox]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]

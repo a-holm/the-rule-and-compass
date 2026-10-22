@@ -2043,8 +2043,9 @@ impl PrepReport {
         let store = match self.store_estimate {
             Some(m) => format!(
                 "{{\"estimate_bytes\":{},\"rows\":{},\"columns\":{},\"used_columns\":{},\
-                 \"scan_columns\":{},\"storage_bytes\":{},\"directory_bytes\":{},\
-                 \"group_buffer_bytes\":{},\"search_bytes\":{},\"fit_copy_bytes\":{},\
+                 \"scan_columns\":{},\"projected_columns\":{},\"storage_bytes\":{},\
+                 \"directory_bytes\":{},\"group_buffer_bytes\":{},\"search_bytes\":{},\
+                 \"fit_copy_bytes\":{},\"ring_bytes\":{},\"device_tile_bytes\":{},\
                  \"fixed_bytes\":{},\"slack_bytes\":{},\"saturated\":{},\
                  \"basis\":\"store header: dtypes + row groups + projection\"}}",
                 m.total_bytes,
@@ -2052,11 +2053,14 @@ impl PrepReport {
                 m.cols,
                 m.used_cols,
                 m.scan_cols,
+                m.projected_cols,
                 m.storage_bytes,
                 m.directory_bytes,
                 m.group_buffer_bytes,
                 m.search_bytes,
                 m.fit_copy_bytes,
+                m.ring_bytes,
+                m.device_tile_bytes,
                 m.fixed_bytes,
                 m.slack_bytes,
                 m.saturated
