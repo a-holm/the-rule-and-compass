@@ -268,13 +268,15 @@ fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
         "rank_correlation",
         "rank_correlation_signed",
         "median",
+        // #234: log_loss has a native device fit objective (fit-only).
+        "log_loss",
     ] {
         assert!(
             gui::parse_web_args_for_test(&args(metric)).is_ok(),
             "--metric {metric} has a device fit objective and must be accepted"
         );
     }
-    for metric in ["log_loss", "interquartile"] {
+    for metric in ["interquartile", "hinge"] {
         let err = gui::parse_web_args_for_test(&args(metric))
             .expect_err(&format!("--metric {metric} must be refused"));
         assert!(

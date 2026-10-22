@@ -5334,6 +5334,8 @@ mod tests {
                 "launch",
                 "rank_declined",
                 "median_declined",
+                "single_class",
+                "log_loss_worse",
             ]
         );
         assert_eq!(
