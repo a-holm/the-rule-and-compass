@@ -70,6 +70,49 @@ close instead, and `join_column_causal` joins a scalar feature column.
 bar would not have closed; a correct join returns an empty vector, and a
 deliberately future-shifted column is caught by the test suite.
 
+### The 36-column multi-timeframe family (`rcsr enrich --features mtf`)
+
+`src/enrich.rs` materialises twelve leaves for each of `1h`, `4h` and `1d`,
+named `mtf_<timeframe>_<leaf>` (36 columns):
+
+| leaf | definition, in higher-timeframe bars |
+|---|---|
+| `ret1`, `ret4`, `ret24` | `close_t/close_{t-k} - 1` |
+| `ma_ratio` | `close_t/MA20_t - 1` |
+| `vol` | population sd of one-bar simple returns over 20 bars |
+| `atr_pct` | Wilder `ATR14_t/close_t` |
+| `rsi` | `RSI14_t/50 - 1` |
+| `close_pos` | `(close_t-low_t)/(high_t-low_t) - 0.5` |
+| `donchian_pos` | `(close_t-min low20)/(max high20-min low20) - 0.5` |
+| `range_pct` | `(high_t-low_t)/close_t` |
+| `trend_slope` | `MA20_t/MA20_{t-20} - 1` |
+| `bar_age` | seconds since the higher bar closed at the base decision time |
+
+The base series is resampled per symbol with [`resample`] (empty buckets remain
+gaps, no forward fill), the leaf is evaluated on the higher bars, and the
+result is joined at the **last closed** higher bucket:
+
+```text
+visible <=> higher.time + higher_tf.seconds() <= base.time
+```
+
+A partial or current higher bucket is never visible, so a 10:15 decision on a
+15 m base sees the 09:00 hourly bar (closed at 10:00), not the in-progress
+10:00 bar. `bar_age` is exactly `base.time - (higher.time +
+higher_tf.seconds())`: zero at the close instant and, for example, 900/1800/2700
+seconds mid-hour on a 15 m base. Windows count higher-timeframe bars and require
+contiguous higher buckets; a gap is `NaN`, and Wilder ATR/RSI restart after it.
+If the expected last-closed higher bucket is missing, every value leaf is
+`NaN` while `bar_age` stays finite and reports the staleness. Because both
+resampling and the join are prefix operations, truncating later base bars does
+not change an earlier MTF value.
+
+The registry (`rcsr schema`) marks all 36 `available:true` with
+`family=mtf`, `timeframe` `1h|4h|1d`, warm-up in higher bars and the PIT rule.
+`docs/mtf-inventory.json` is the reviewable 36-row inventory with formula and
+test id; `tests/enrich.rs` pins hand-built higher-bar values, NaN/gap behaviour,
+the future-shift failure and prefix replay.
+
 ## Corporate actions
 
 `adjust(actions, bars)` returns an `AdjustedSeries` with three parallel views:
@@ -180,9 +223,10 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp cross-section, `(rank-1)/(n-1)` |
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by timestamp |
 | `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
+| `mtf` | 36 columns | `mtf_<1h|4h|1d>_<12 leaves>`, higher-timeframe resample + causal close join |
 | `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
 | `flow` | `vwap` plus `taker_ratio96 taker_imb16 trade_intensity96 avg_trade_size96 amihud96 zero_ret_share96 obv_z96 cvd_proxy vwap_dev96` | the complete OHLCV/flow family (#270) |
-| `all` | every legacy group above except `py15m`, `compact`, `flow` | |
+| `all` | every legacy group above except `py15m`, `mtf`, `compact`, `flow` | |
 
 `ta:core`, `ta:full`, `exotic:cheap`, `candle:geometry`, `cross:btc` and
 `calendar` keep their #125 meaning and are computed by `rcsr::features`, not
@@ -199,8 +243,10 @@ expanded panel. It is the union of:
 * every engine column above (`all` + `py15m` + the #125 groups), currently 216
   distinct names;
 * the compact 52-name regression subset;
-* multi-timeframe context, cross-sectional market-state/rank and reserved
-  derivative columns.
+* the 36 multi-timeframe columns (`--features mtf`), which are
+  `available:true` with a tested causal join;
+* cross-sectional market-state/rank and reserved derivative columns, which
+  remain `available:false` with an explicit dependency.
 
 `rcsr schema` prints `feature_registry`, one object per column with `name`,
 `family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,

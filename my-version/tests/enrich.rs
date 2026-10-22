@@ -3,6 +3,7 @@
 
 use rcsr::data;
 use rcsr::enrich::{self, GpuMode, OpClass, Options};
+use rcsr::ohlcv::{self, Bar, Timeframe};
 use rcsr::store::{self, FileStore};
 
 fn csv_of(rows: &[(i64, &str, f64, f64, f64, f64, f64)]) -> String {
@@ -540,10 +541,29 @@ fn default_financial_registry_is_complete_and_explicit() {
         assert!(e.available, "{name} must be available");
         assert_eq!(e.source, if name == "vwap" { "raw OHLCV/flow columns" } else { "input" }, "{name} source");
     }
+    // All 36 multi-timeframe columns are registered and available.
+    let mtf = enrich::mtf_names();
+    assert_eq!(mtf.len(), 36);
+    for name in &mtf {
+        let e = reg
+            .iter()
+            .find(|e| e.name == *name)
+            .unwrap_or_else(|| panic!("{name} missing from registry"));
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.family, "mtf");
+        assert!(matches!(e.timeframe, "1h" | "4h" | "1d"));
+        assert!(e.reason.is_none());
+        assert_eq!(
+            enrich::expand(name).unwrap(),
+            vec![name.clone()],
+            "{name} must expand to itself"
+        );
+    }
+    assert_eq!(enrich::expand("mtf").unwrap().len(), 36);
+
     // Unavailable families are explicit, never silently omitted.
     let unavailable: Vec<&enrich::RegistryEntry> = reg.iter().filter(|e| !e.available).collect();
     assert!(!unavailable.is_empty());
-    assert!(unavailable.iter().any(|e| e.family.starts_with("mtf_")));
     assert!(unavailable.iter().any(|e| e.family == "price_action"));
     assert!(unavailable.iter().any(|e| e.family == "market_state"));
     assert!(unavailable.iter().any(|e| e.family == "derivatives"));
@@ -555,9 +575,7 @@ fn default_financial_registry_is_complete_and_explicit() {
         assert!(!e.available);
         assert!(e.reason.as_deref().unwrap().contains("no local"));
     }
-    for name in enrich::mtf_names() {
-        assert!(enrich::expand(&name).unwrap_err().contains("unavailable"));
-    }
+    assert!(enrich::expand("mtf_2h_ret1").unwrap_err().contains("unknown"));
     assert!(enrich::expand("funding_rate").unwrap_err().contains("unavailable"));
     // The schema prints the registry.
     assert!(rcsr::schema::json().contains("\"feature_registry\""));
@@ -1180,5 +1198,355 @@ fn advertised_column_set_is_exactly_what_a_real_run_appends() {
             rcsr::manifest::sha256_file(&out).unwrap(),
             "{spec}: streamed output checksum"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-timeframe family (#272)
+// ---------------------------------------------------------------------------
+
+/// Build one base bar per higher bucket, so resampling is an identity and the
+/// higher OHLC used by the feature test is exactly the fixture OHLC.
+fn mtf_single_bar_fixture(step: i64, n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    (0..n)
+        .map(|k| {
+            let o = 100.0 + k as f64 * 0.1 + (k as f64 * 0.7).sin() * 2.0;
+            let c = o + (k as f64 * 0.31).sin() * 1.5;
+            let h = o.max(c) + 0.6 + (k % 3) as f64 * 0.1;
+            let l = o.min(c) - 0.5 - (k % 2) as f64 * 0.1;
+            (k as i64 * step, "AAA".to_string(), o, h, l, c, 10.0 + k as f64)
+        })
+        .collect()
+}
+
+fn higher_arrays(rows: &[(i64, String, f64, f64, f64, f64, f64)]) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    (
+        rows.iter().map(|r| r.2).collect(),
+        rows.iter().map(|r| r.3).collect(),
+        rows.iter().map(|r| r.4).collect(),
+        rows.iter().map(|r| r.5).collect(),
+    )
+}
+
+fn mean(x: &[f64], lo: usize, hi: usize) -> f64 {
+    x[lo..=hi].iter().sum::<f64>() / (hi - lo + 1) as f64
+}
+
+fn expected_leaf(
+    leaf: &str,
+    _o: &[f64],
+    h: &[f64],
+    l: &[f64],
+    c: &[f64],
+    i: usize,
+) -> f64 {
+    let ret = |k: usize| c[i] / c[i - k] - 1.0;
+    match leaf {
+        "ret1" => ret(1),
+        "ret4" => ret(4),
+        "ret24" => ret(24),
+        "ma_ratio" => c[i] / mean(c, i - 19, i) - 1.0,
+        "vol" => {
+            let r: Vec<f64> = (i - 19..=i).map(|j| c[j] / c[j - 1] - 1.0).collect();
+            let m = r.iter().sum::<f64>() / 20.0;
+            (r.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / 20.0).sqrt()
+        }
+        "atr_pct" => {
+            let mut tr = Vec::with_capacity(i + 1);
+            for j in 0..=i {
+                tr.push(if j == 0 {
+                    h[j] - l[j]
+                } else {
+                    (h[j] - l[j])
+                        .max((h[j] - c[j - 1]).abs())
+                        .max((l[j] - c[j - 1]).abs())
+                });
+            }
+            let seed = tr[..14].iter().sum::<f64>() / 14.0;
+            let mut atr = seed;
+            for x in tr.iter().skip(14) {
+                atr += (x - atr) / 14.0;
+            }
+            atr / c[i]
+        }
+        "rsi" => {
+            let mut gain = 0.0;
+            let mut loss = 0.0;
+            for j in 1..=14 {
+                let d = c[j] - c[j - 1];
+                gain += d.max(0.0);
+                loss += (-d).max(0.0);
+            }
+            let (mut ag, mut al) = (gain / 14.0, loss / 14.0);
+            for j in 15..=i {
+                let d = c[j] - c[j - 1];
+                ag = (ag * 13.0 + d.max(0.0)) / 14.0;
+                al = (al * 13.0 + (-d).max(0.0)) / 14.0;
+            }
+            let rsi = if al > 0.0 { 100.0 - 100.0 / (1.0 + ag / al) } else { 100.0 };
+            rsi / 50.0 - 1.0
+        }
+        "close_pos" => (c[i] - l[i]) / (h[i] - l[i]) - 0.5,
+        "donchian_pos" => {
+            let lo = l[i - 19..=i].iter().fold(f64::INFINITY, |a, &b| a.min(b));
+            let hi = h[i - 19..=i].iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+            (c[i] - lo) / (hi - lo) - 0.5
+        }
+        "range_pct" => (h[i] - l[i]) / c[i],
+        "trend_slope" => mean(c, i - 19, i) / mean(c, i - 39, i - 20) - 1.0,
+        other => panic!("no expected value for {other}"),
+    }
+}
+
+#[test]
+fn mtf_36_columns_match_hand_built_higher_bars() {
+    // One base bar per higher bucket: at base row i the last closed bucket is
+    // i-1, so the joined value is the feature evaluated at higher index i-1.
+    for (tf_name, step) in [("1h", 3600i64), ("4h", 14_400), ("1d", 86_400)] {
+        let rows = mtf_single_bar_fixture(step, 60);
+        let (o, h, l, c) = higher_arrays(&rows);
+        let dir = tmp_dir(&format!("mtf-unit-{tf_name}"));
+        let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+        let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+        write_store(&src, &rows, 32);
+        let report = enrich::build(&opts(&src, &out, "mtf")).unwrap();
+        assert_eq!(report.features.len(), 36, "{tf_name}: 36 MTF columns");
+
+        let base_i = 50usize;
+        let higher_i = base_i - 1;
+        for leaf in enrich::MTF_LEAVES {
+            let name = format!("mtf_{tf_name}_{leaf}");
+            let got = column(&out, &name);
+            assert_eq!(got.len(), rows.len());
+            // Warm-up rows are NaN.
+            let warm = enrich::mtf_warmup(leaf);
+            for j in 0..warm.min(base_i) {
+                assert!(got[j].is_nan(), "{name}: row {j} must be warm-up NaN");
+            }
+            if *leaf == "bar_age" {
+                // Base and higher bucket share a step: the bucket before the
+                // decision closed exactly at the decision instant, age zero.
+                assert_eq!(got[base_i], 0.0, "{name} at {tf_name}");
+            } else {
+                let want = expected_leaf(leaf, &o, &h, &l, &c, higher_i);
+                assert!(
+                    (got[base_i] - want).abs() <= 1e-12,
+                    "{name} at row {base_i}: got {}, want {want}",
+                    got[base_i]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn mtf_gap_is_nan_and_bar_age_reports_staleness() {
+    let step = 900i64;
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for hour in 0..12i64 {
+        if hour == 5 {
+            continue; // an entire higher bucket is missing
+        }
+        for q in 0..4i64 {
+            let t = hour * 3600 + q * step;
+            let p = 100.0 + hour as f64 + q as f64 * 0.1;
+            rows.push((t, "AAA".to_string(), p, p + 0.5, p - 0.4, p + 0.05, 10.0));
+        }
+    }
+    let dir = tmp_dir("mtf-gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 32);
+    enrich::build(&opts(&src, &out, "mtf_1h_ret1,mtf_1h_ret4,mtf_1h_close_pos,mtf_1h_bar_age")).unwrap();
+
+    let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let idx = |t: i64| times.iter().position(|x| *x == t).unwrap();
+    let ret1 = column(&out, "mtf_1h_ret1");
+    let ret4 = column(&out, "mtf_1h_ret4");
+    let pos = column(&out, "mtf_1h_close_pos");
+    let age = column(&out, "mtf_1h_bar_age");
+
+    // The first decision after the missing hour expects bucket 05 but the last
+    // closed bucket is 04: value features must not bridge the gap.
+    let i = idx(6 * 3600 + step);
+    assert!(ret1[i].is_nan());
+    assert!(ret4[i].is_nan());
+    assert!(pos[i].is_nan());
+    // Age is exact: bucket 04 closed at 05:00, the decision is 06:15.
+    assert_eq!(age[i], (6 * 3600 + 900 - 5 * 3600) as f64);
+
+    // Bucket 06 exists, so its bar-position features are valid, but the ret4
+    // window (03..06) crosses the missing bucket 05 and stays NaN.
+    let j = idx(7 * 3600);
+    assert!(pos[j].is_finite());
+    assert!(ret4[j].is_nan());
+    assert_eq!(age[j], 0.0);
+
+    // Once the window no longer spans the gap, ret4 becomes valid again.
+    let k = idx(11 * 3600);
+    assert!(ret4[k].is_finite(), "ret4 must recover after the gap leaves the window");
+}
+
+fn mtf_15m_rows(hours: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for hour in 0..hours {
+        for q in 0..4i64 {
+            let t = hour as i64 * 3600 + q * 900;
+            let p = 100.0 + hour as f64 * 0.4 + q as f64 * 0.15;
+            rows.push((t, "AAA".to_string(), p, p + 0.4, p - 0.3, p + 0.05, 10.0 + q as f64));
+        }
+    }
+    rows
+}
+
+#[test]
+fn mtf_join_is_causal_and_a_future_shift_is_caught() {
+    let rows = mtf_15m_rows(48);
+    let bars: Vec<Bar> = rows
+        .iter()
+        .map(|r| Bar {
+            time: r.0,
+            open: r.2,
+            high: r.3,
+            low: r.4,
+            close: r.5,
+            volume: r.6,
+            quote_volume: 0.0,
+            trades: 0.0,
+            taker_buy_base: 0.0,
+            taker_buy_quote: 0.0,
+            complete: true,
+            traded: true,
+        })
+        .collect();
+    let higher = ohlcv::resample(&bars, Timeframe::H1).unwrap();
+    let joined = ohlcv::join_causal(&bars, &higher, Timeframe::H1).unwrap();
+    assert!(ohlcv::lookahead_violations(&bars, &joined, Timeframe::H1).is_empty());
+
+    // Moving the visible value one bucket earlier is a look-ahead leak: the
+    // base row now sees a bar that has not closed yet.
+    let mut shifted = joined.clone();
+    for i in 0..shifted.len().saturating_sub(1) {
+        shifted[i] = joined[i + 1];
+    }
+    assert!(
+        !ohlcv::lookahead_violations(&bars, &shifted, Timeframe::H1).is_empty(),
+        "a future-shifted join must be detected"
+    );
+
+    // The enrich column at a 10:15 decision uses the 09:00 hourly bar (closed
+    // at 10:00), never the in-progress 10:00 bar.
+    let dir = tmp_dir("mtf-causal");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 32);
+    enrich::build(&opts(&src, &out, "mtf_1h_ret1,mtf_1h_bar_age")).unwrap();
+    let ret1 = column(&out, "mtf_1h_ret1");
+    let age = column(&out, "mtf_1h_bar_age");
+    let i = rows.iter().position(|r| r.0 == 10 * 3600 + 900).unwrap();
+    let want = higher[9].close / higher[8].close - 1.0; // 09:00 over 08:00
+    assert!((ret1[i] - want).abs() <= 1e-12);
+    assert_eq!(age[i], 900.0);
+    let current = higher[10].close / higher[9].close - 1.0; // 10:00 bar, not closed
+    assert!((ret1[i] - current).abs() > 1e-6);
+}
+
+#[test]
+fn mtf_prefix_truncation_replay_changes_no_earlier_value() {
+    let rows = mtf_15m_rows(96);
+    let prefix_len = 200usize;
+    let prefix_rows = &rows[..prefix_len];
+    let dir = tmp_dir("mtf-prefix");
+    let full_src = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full-out.rcsb").to_string_lossy().into_owned();
+    let pre_src = dir.join("pre.rcsb").to_string_lossy().into_owned();
+    let pre_out = dir.join("pre-out.rcsb").to_string_lossy().into_owned();
+    write_store(&full_src, &rows, 32);
+    write_store(&pre_src, prefix_rows, 32);
+    enrich::build(&opts(&full_src, &full_out, "mtf")).unwrap();
+    enrich::build(&opts(&pre_src, &pre_out, "mtf")).unwrap();
+
+    for name in enrich::mtf_names() {
+        let full = column(&full_out, &name);
+        let pre = column(&pre_out, &name);
+        assert_eq!(pre.len(), prefix_len);
+        for i in 0..prefix_len {
+            assert_eq!(
+                full[i].to_bits(),
+                pre[i].to_bits(),
+                "{name} changed at row {i} under a prefix replay"
+            );
+        }
+    }
+}
+
+#[test]
+fn mtf_registry_and_schema_expose_all_36_inventory_rows() {
+    let names = enrich::mtf_names();
+    assert_eq!(names.len(), 36);
+    for tf in enrich::MTF_TIMEFRAMES {
+        assert_eq!(
+            names.iter().filter(|n| n.starts_with(&format!("mtf_{tf}_"))).count(),
+            12,
+            "{tf} has twelve leaves"
+        );
+    }
+    let schema = rcsr::schema::json();
+    for name in &names {
+        assert!(schema.contains(&format!("\"name\":\"{name}\"")), "schema misses {name}");
+    }
+
+    // The checked-in inventory JSON is the reviewable 36-row evidence artifact.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs/mtf-inventory.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(text.matches("\"name\"").count(), 36, "inventory must have 36 rows");
+    for name in &names {
+        assert!(text.contains(&format!("\"name\": \"{name}\"")), "inventory misses {name}");
+    }
+}
+
+#[test]
+fn mtf_every_column_is_nan_when_its_higher_bucket_is_missing() {
+    // Drop one complete higher bucket of each timeframe from a 15m base. The
+    // first decision after the hole expects that bucket, so every value leaf
+    // must be NaN; bar_age remains exact staleness.
+    let cases = [
+        ("1h", 31usize, 32usize, 32i64 * 3600),
+        ("4h", 28usize, 32usize, 32i64 * 3600),
+        ("1d", 48usize, 72usize, 72i64 * 3600),
+    ];
+    for (tf, drop_lo, drop_hi, decision) in cases {
+        let mut rows = Vec::new();
+        for hour in 0..144i64 {
+            if (hour as usize) >= drop_lo && (hour as usize) < drop_hi {
+                continue;
+            }
+            for q in 0..4i64 {
+                let t = hour * 3600 + q * 900;
+                let p = 100.0 + hour as f64 * 0.05 + q as f64 * 0.01;
+                rows.push((t, "AAA".to_string(), p, p + 0.4, p - 0.3, p + 0.02, 10.0));
+            }
+        }
+        let dir = tmp_dir(&format!("mtf-missing-{tf}"));
+        let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+        let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+        write_store(&src, &rows, 32);
+        enrich::build(&opts(&src, &out, "mtf")).unwrap();
+        let times: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        let i = times.iter().position(|t| *t == decision).unwrap();
+        for leaf in enrich::MTF_LEAVES {
+            let name = format!("mtf_{tf}_{leaf}");
+            let got = column(&out, &name);
+            if *leaf == "bar_age" {
+                // The last closed bucket ended exactly at the dropped bucket's
+                // close, so staleness spans the missing bucket(s).
+                let expected = (decision - (drop_lo as i64 * 3600)) as f64;
+                assert_eq!(got[i], expected, "{name} bar_age after a gap");
+            } else {
+                assert!(got[i].is_nan(), "{name} must be NaN when its bucket is missing");
+            }
+        }
     }
 }
