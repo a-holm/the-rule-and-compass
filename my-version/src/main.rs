@@ -505,7 +505,11 @@ SEARCH:
                              change the trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
-                             measured separately with ncu
+                             measured separately with ncu. The packed batch
+                             arena allocates once, keeps a <=64 MiB pinned
+                             staging ring and copies on separate streams; set
+                             RCSR_GPU_SYNC=1 to force the labelled blocking
+                             fallback (#285)
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
