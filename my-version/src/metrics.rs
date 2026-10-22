@@ -612,7 +612,10 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
 /// Split the target into two classes at its midpoint. The engine normalises the
 /// target, so an absolute 0.5 threshold would be wrong; the midpoint of the two
 /// observed extremes is invariant under the affine normalisation.
-fn binary_labels(y: &[f64]) -> Vec<f64> {
+/// #233: this is **the** label rule for `auc`, `log_loss`, `hinge` and for the
+/// class-balanced surrogate the GPU fit arm steps on, so it is exposed inside
+/// the crate instead of being re-implemented next to each caller.
+pub(crate) fn binary_labels(y: &[f64]) -> Vec<f64> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for &v in y {
         lo = lo.min(v);
@@ -620,6 +623,17 @@ fn binary_labels(y: &[f64]) -> Vec<f64> {
     }
     let mid = 0.5 * (lo + hi);
     y.iter().map(|&v| if v > mid { 1.0 } else { 0.0 }).collect()
+}
+
+/// #233: `(positives, negatives)` under [`binary_labels`].
+///
+/// Used by the AUC fit arm to refuse a sample where one class is too small for
+/// the metric to mean anything (and for the class-balanced weights, which would
+/// reach 50x the majority weight).
+pub fn class_counts(y: &[f64]) -> (usize, usize) {
+    let labels = binary_labels(y);
+    let pos = labels.iter().filter(|&&l| l > 0.5).count();
+    (pos, labels.len() - pos)
 }
 
 /// Why `y` cannot be used with a binary classification metric, if it cannot.

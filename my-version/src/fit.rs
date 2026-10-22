@@ -24,8 +24,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, fit_batch_verified, refit_finalists_exact, BatchStatus, BatchedFitter,
-    VerifiedBatch,
+    backend_description, balanced_logistic_loss, fit_batch_verified, gate_auc_proposal,
+    gpu_fitness_blocker, gpu_proposal_loss, refit_finalists_exact, BatchStatus, BatchedFitter,
+    GateReport, GateVerdict, VerifiedBatch,
 };
 pub use stream::{
     fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
@@ -159,11 +160,21 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
+/// #233: `auc` is the one exception, and only because the search never lets the
+/// kernel's loss decide: [`crate::fit::gate_auc_proposal`] judges every proposal
+/// on the exact AUC and the class-balanced surrogate, and the fitness stays on
+/// the exact CPU evaluator.
 /// The CLI and the web front end turn this into a usage error before any data
 /// is read; the search's own dispatch requires the same predicate, so the
 /// refusal and the dispatch can never disagree.
 pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if fit_loss(metric).is_some() {
+        return None;
+    }
+    // #233: `auc` is admitted, but only as a proposal. The kernel still
+    // minimises squared error on the `{0, 1}` label; the exact CPU AUC and the
+    // class-balanced logistic surrogate decide whether the constants are kept.
+    if metric == Metric::Auc {
         return None;
     }
     Some(format!(
@@ -3575,7 +3586,9 @@ mod tests {
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if fit_loss(*m).is_some() {
+            // #233: `auc` is accepted only because the exact gate owns the
+            // acceptance decision; the rest of the family is refused.
+            if fit_loss(*m).is_some() || *m == Metric::Auc {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
@@ -3607,6 +3620,10 @@ mod tests {
         assert!(gpu_fit_metric_error(Metric::LogSquashed).is_none());
         assert!(gpu_fit_metric_error(Metric::Squared).is_none());
         assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
+        // #233: the auc proposal gate is the only reason it is accepted.
+        assert!(gpu_fit_metric_error(Metric::Auc).is_none());
+        assert!(gpu_fit_metric_error(Metric::LogLoss).is_some());
+        assert!(gpu_fit_metric_error(Metric::Hinge).is_some());
     }
 
     #[test]
