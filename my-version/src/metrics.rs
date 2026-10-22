@@ -573,6 +573,190 @@ pub fn rank_correlation(a: &[f64], b: &[f64]) -> f64 {
     correlation(&ranks(a), &ranks(b))
 }
 
+/// #230: twice the centred average rank, `A_i = 2·r_i − (n + 1)`.
+///
+/// Average ranks are half-integers and the average rank of any input is
+/// exactly `(n + 1)/2` even with ties, so every `A_i` is an integer in
+/// `[−(n−1), n−1]` and `Σ A_i = 0`. This is the value the exact rank-correlation
+/// path ([`RankSums`]) accumulates, on the CPU and in the CUDA kernel alike.
+///
+/// Ties are **exact `f64` equality**, so `-0.0` and `+0.0` share a rank (both
+/// compare `Equal` and are `==`), and the run order inside a tie block never
+/// matters because every member receives the same average rank. Returns `None`
+/// when any value is not finite: the rank stage is only defined on finite
+/// values, and the scorers reject a non-finite prediction before it gets here.
+pub fn centred_ranks_doubled(v: &[f64]) -> Option<Vec<i64>> {
+    let n = v.len();
+    if v.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut a = vec![0i64; n];
+    let mut i = 0usize;
+    while i < n {
+        let mut j = i + 1;
+        while j < n && v[idx[j]] == v[idx[i]] {
+            j += 1;
+        }
+        // Run `[i, j)` holds sorted positions `i+1 ..= j`, whose average rank is
+        // `(i + 1 + j)/2`; doubled and centred that is exactly `i + j - n`.
+        let centred = (i + j) as i64 - n as i64;
+        for &k in &idx[i..j] {
+            a[k] = centred;
+        }
+        i = j;
+    }
+    Some(a)
+}
+
+/// #230: exact integer ingredients of the (tie-corrected) Spearman statistic.
+///
+/// `ρ = Σ A_i B_i / sqrt(Σ A_i² · Σ B_i²)` with the integer vectors from
+/// [`centred_ranks_doubled`]. Every term is exact; only the final division and
+/// square root are floating point, so the value does not depend on the order in
+/// which the sums were reduced. The CUDA rank stage returns exactly these three
+/// integers, which is what makes CPU and GPU scores bit-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct RankSums {
+    /// `Σ A_i B_i`.
+    pub ab: i128,
+    /// `Σ A_i²`.
+    pub aa: i128,
+    /// `Σ B_i²`.
+    pub bb: i128,
+}
+
+impl RankSums {
+    /// `Σ A_i B_i`, `Σ A_i²` and `Σ B_i²` for two equal-length rank vectors.
+    pub fn between(a: &[i64], b: &[i64]) -> Option<RankSums> {
+        if a.len() != b.len() {
+            return None;
+        }
+        let mut s = RankSums::default();
+        for (&x, &y) in a.iter().zip(b) {
+            let xv = x as i128;
+            let yv = y as i128;
+            s.ab += xv * yv;
+            s.aa += xv * xv;
+            s.bb += yv * yv;
+        }
+        Some(s)
+    }
+
+    /// The correlation itself. Zero variance on either side (a constant
+    /// prediction or a constant target) is `0.0`, never `0/0`.
+    pub fn correlation(&self) -> f64 {
+        if self.aa <= 0 || self.bb <= 0 {
+            return 0.0;
+        }
+        (self.ab as f64) / ((self.aa as f64) * (self.bb as f64)).sqrt()
+    }
+}
+
+/// #230: the rank-correlation statistic computed exactly from integer ranks.
+///
+/// Equivalent to [`rank_correlation`] (same tie handling, same value up to the
+/// rounding of one division) but independent of reduction order. `None` when an
+/// input is empty, of unequal length, or not finite.
+pub fn rank_correlation_exact(a: &[f64], b: &[f64]) -> Option<f64> {
+    if a.len() != b.len() || a.is_empty() {
+        return None;
+    }
+    let ra = centred_ranks_doubled(a)?;
+    let rb = centred_ranks_doubled(b)?;
+    let sums = RankSums::between(&ra, &rb)?;
+    Some(sums.correlation())
+}
+
+/// #230: the target side of the exact rank score, cached per fit sample.
+///
+/// `coordinate_polish` used to re-sort the target on every trial
+/// (`metric_score` → `metrics::ranks`); sorting `y` once per fit removes half
+/// the sorts and cannot change the score, because `B` depends only on `y`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct RankTarget {
+    b: Vec<i64>,
+    bb: i128,
+}
+
+impl RankTarget {
+    /// Rank the target once. `None` when `y` holds a non-finite value.
+    pub fn new(y: &[f64]) -> Option<RankTarget> {
+        let b = centred_ranks_doubled(y)?;
+        let mut bb = 0i128;
+        for &v in &b {
+            let v = v as i128;
+            bb += v * v;
+        }
+        Some(RankTarget { b, bb })
+    }
+
+    pub fn len(&self) -> usize {
+        self.b.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.b.is_empty()
+    }
+
+    /// Cached `B` values, indexed by row.
+    pub fn ranks(&self) -> &[i64] {
+        &self.b
+    }
+
+    /// `Σ B²`, zero when the target is constant.
+    pub fn sum_bb(&self) -> i128 {
+        self.bb
+    }
+
+    /// Exact rank sums of `pred` against this target.
+    pub fn sums(&self, pred: &[f64]) -> Option<RankSums> {
+        if pred.len() != self.b.len() {
+            return None;
+        }
+        let a = centred_ranks_doubled(pred)?;
+        let mut ab = 0i128;
+        let mut aa = 0i128;
+        for (&x, &y) in a.iter().zip(&self.b) {
+            let xv = x as i128;
+            ab += xv * (y as i128);
+            aa += xv * xv;
+        }
+        Some(RankSums { ab, aa, bb: self.bb })
+    }
+
+    /// Exact score of `pred`: `1 − |ρ|` or `1 − ρ`, with the same degenerate
+    /// conventions as [`score_with_constants`] (`n < 2` → `1.0`, a constant
+    /// prediction → `1.0`, a non-finite prediction → `+inf`).
+    pub fn score(&self, pred: &[f64], signed: bool) -> f64 {
+        score_rank_sums(self.sums(pred), signed)
+    }
+}
+
+/// #230: turn exact rank sums into the reported score.
+///
+/// `None` means "the prediction or its length was unusable", which the metric
+/// contract maps to `+inf`. A one-row sample scores `1.0` like the f64 path.
+pub fn score_rank_sums(sums: Option<RankSums>, signed: bool) -> f64 {
+    match sums {
+        None => f64::INFINITY,
+        Some(s) => {
+            if s.aa == 0 && s.bb == 0 && s.ab == 0 {
+                // Only reachable with `n ≤ 1` (or an all-zero row), where the
+                // f64 path also returns 1.0.
+                return 1.0;
+            }
+            let rho = s.correlation();
+            if signed {
+                1.0 - rho
+            } else {
+                1.0 - rho.abs()
+            }
+        }
+    }
+}
+
 /// Pearson correlation.
 pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
     let n = a.len() as f64;
@@ -956,5 +1140,125 @@ mod tests {
             score(&dup_a, &dup_b, Metric::Correlation),
             1e-12
         ));
+    }
+
+    // --- #230: exact integer ranks -------------------------------------
+
+    /// Deterministic pseudo-random `f64`s in `[0, scale)` (LCG; no crate).
+    fn lcg(n: usize, mut s: u64, scale: f64) -> Vec<f64> {
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((s >> 11) as f64 / (1u64 << 53) as f64) * scale
+            })
+            .collect()
+    }
+
+    fn ulps(a: f64, b: f64) -> u64 {
+        if a == b {
+            return 0;
+        }
+        let ia = a.to_bits() as i64;
+        let ib = b.to_bits() as i64;
+        (ia - ib).unsigned_abs()
+    }
+
+    #[test]
+    fn doubled_centred_ranks_are_integers_that_sum_to_zero() {
+        // Strictly increasing: ranks 1..n, so A = 2i - (n-1) in reverse order.
+        let v = [10.0, 20.0, 30.0];
+        assert_eq!(centred_ranks_doubled(&v).unwrap(), vec![-2, 0, 2]);
+        // All tied: every rank is (n+1)/2, so every A is zero.
+        assert_eq!(centred_ranks_doubled(&[5.0; 4]).unwrap(), vec![0; 4]);
+        // A partial tie block [1, 2, 2] ranks 1, 2.5, 2.5 -> A = -2, 1, 1.
+        assert_eq!(centred_ranks_doubled(&[1.0, 2.0, 2.0]).unwrap(), vec![-2, 1, 1]);
+        for n in [1usize, 2, 3, 17, 1000] {
+            let v = lcg(n, 7 + n as u64, 5.0);
+            let a = centred_ranks_doubled(&v).unwrap();
+            assert_eq!(a.iter().map(|&x| x as i128).sum::<i128>(), 0, "n={n}");
+            assert!(a.iter().all(|&x| (x as i64).abs() < n as i64 || n <= 1));
+        }
+    }
+
+    #[test]
+    fn negative_zero_is_a_tie_and_duplicates_share_the_average_rank() {
+        let a = [-0.0, 0.0, 1.0, 1.0, 1.0, 2.0];
+        let doubled = centred_ranks_doubled(&a).unwrap();
+        // Sorted: -0.0/0.0 (tie, ranks 1.5) then 1.0 x3 (ranks 3, 4, 5 -> 4)
+        // then 2.0 (rank 6). Doubled centred (n = 6, centre 3.5):
+        // -0.0 -> -4, 0.0 -> -4, the three 1.0 rows -> 1, 2.0 -> 5.
+        assert_eq!(doubled, vec![-4, -4, 1, 1, 1, 5]);
+        // The f64 path agrees: a perfect monotone match is still rho = 1.
+        assert_eq!(rank_correlation_exact(&a, &a), Some(1.0));
+    }
+
+    #[test]
+    fn exact_rank_correlation_agrees_with_the_f64_pearson_path() {
+        for (seed, n, scale) in [(1u64, 2usize, 3.0), (2, 17, 1e-9), (3, 1000, 5.0)] {
+            let a = lcg(n, seed, scale);
+            let b: Vec<f64> = a.iter().map(|v| (v * 0.7).sin() + v / scale).collect();
+            let slow = rank_correlation(&a, &b);
+            let exact = rank_correlation_exact(&a, &b).unwrap();
+            assert!(
+                ulps(slow, exact) <= 4,
+                "n={n}: f64 {slow:?} vs exact {exact:?} ({} ulps)",
+                ulps(slow, exact)
+            );
+        }
+        // Heavy ties: all four values come from two levels, so the tie-corrected
+        // form is the only correct one.
+        let a = [0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
+        let b = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        let slow = rank_correlation(&a, &b);
+        let exact = rank_correlation_exact(&a, &b).unwrap();
+        assert!(approx(slow, exact, 1e-15), "{slow} vs {exact}");
+    }
+
+    #[test]
+    fn exact_rank_score_matches_the_metric_on_unambiguous_cases() {
+        let y = [1.0, 2.5, 3.0, 4.0, 9.0];
+        let target = RankTarget::new(&y).unwrap();
+        // Strictly increasing: rho = 1.
+        assert_eq!(target.score(&[-5.0, 0.0, 7.0, 8.0, 100.0], false), 0.0);
+        // Strictly decreasing: rho = -1, so the unsigned score is 0 and the
+        // signed score is 2.
+        assert_eq!(target.score(&[5.0, 4.0, 3.0, 2.0, 1.0], false), 0.0);
+        assert_eq!(target.score(&[5.0, 4.0, 3.0, 2.0, 1.0], true), 2.0);
+        // Constant prediction: zero variance -> rho = 0 -> 1.0, never NaN.
+        let flat = target.score(&[3.0; 5], false);
+        assert_eq!(flat, 1.0);
+        assert!(flat.is_finite());
+        // A constant *target* is also 1.0.
+        let flat_target = RankTarget::new(&[2.0; 5]).unwrap();
+        assert_eq!(flat_target.score(&[1.0, 2.0, 3.0, 4.0, 5.0], false), 1.0);
+        // One row is 1.0 by contract.
+        let one = RankTarget::new(&[1.0]).unwrap();
+        assert_eq!(one.score(&[4.0], false), 1.0);
+        // Non-finite predictions are invalid, not a rank.
+        assert_eq!(target.score(&[f64::NAN, 0.0, 7.0, 8.0, 100.0], false), f64::INFINITY);
+        assert_eq!(target.score(&[0.0, 1.0], false), f64::INFINITY, "length mismatch");
+    }
+
+    #[test]
+    fn exact_rank_sums_are_order_independent() {
+        // The three integer sums are what the CUDA kernel returns; summing them
+        // in a different order (or on a different machine) cannot change them.
+        let a = lcg(500, 11, 9.0);
+        let b = lcg(500, 12, 9.0);
+        let ra = centred_ranks_doubled(&a).unwrap();
+        let rb = centred_ranks_doubled(&b).unwrap();
+        let forward = RankSums::between(&ra, &rb).unwrap();
+        let mut rev_a = ra.clone();
+        let mut rev_b = rb.clone();
+        rev_a.reverse();
+        rev_b.reverse();
+        let reverse = RankSums::between(&rev_a, &rev_b).unwrap();
+        assert_eq!(forward, reverse);
+        // Covariance under a strictly increasing map (rho is invariant).
+        let scaled: Vec<f64> = a.iter().map(|v| v * 3.0 + 1.0).collect();
+        assert_eq!(
+            RankSums::between(&centred_ranks_doubled(&scaled).unwrap(), &rb).unwrap(),
+            forward
+        );
     }
 }

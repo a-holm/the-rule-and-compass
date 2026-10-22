@@ -395,8 +395,12 @@ SEARCH:
                              best max(32,pop/4) per island below 1 048 576
                              training rows and every candidate with constants
                              at or above that size, then refits finalists
-                             exactly. Without a batch backend it uses the exact
-                             CPU arms (never a no-op)
+                             exactly. With --metric rank_correlation or
+                             rank_correlation_signed it runs the exact integer
+                             rank polish on the device after the squared start;
+                             the fitness is still scored by the CPU. Without a
+                             batch backend it uses the exact CPU arms (never a
+                             no-op)
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit) at the
                              end of the run (diagnostics only)

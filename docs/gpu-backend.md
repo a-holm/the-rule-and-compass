@@ -413,11 +413,18 @@ on the CPU and in `f64` throughout.
 
 The GPU path is used for single-output, unweighted, full-sample
 `--metric squared` runs. Multi-output (`--target y1,y2`), `--weight`, every
-non-squared metric (including implicit, classification, correlation, rank,
-slope and AIC/AICc/BIC) and `--predictor-samples` keep the CPU evaluator,
-because they need more than one prediction per row, a different objective, or a
-different set of rows every generation; the reason is printed in the one-line
-note.
+non-squared metric (including implicit, classification, correlation, slope and
+AIC/AICc/BIC) and `--predictor-samples` keep the CPU evaluator, because they
+need more than one prediction per row, a different objective, or a different
+set of rows every generation; the reason is printed in the one-line note.
+
+The one exception is the **fit** stage of the rank family
+(`--metric rank_correlation` / `rank_correlation_signed`) with
+`--fit-strategy gpu`: those constants are moved by the exact rank stage of
+[#230](#exact-rank-correlation-fitting-issue-230) on the device, but their
+**fitness is still the CPU rank score**. The squared-error kernel never ranks a
+rank-metric population; `GpuSearch::native_metric` is false for this arm, so
+every candidate is scored by the CPU evaluator exactly as before.
 
 Fallback and the flags:
 
@@ -836,7 +843,8 @@ trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
 constants), `too_few_rows`, `too_many_constants` (`p > 20`), `ill_conditioned`,
-`non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
+`non_finite`, `launch`, or — for the #230 rank arm — `rank_declined` (the
+device declined a rank call and the exact CPU rank arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
@@ -1200,3 +1208,105 @@ which path produced it. The PTX-JIT run proves portability only; the native
 `sm_121` build is what the performance claim needs. Neither run is claimed
 here.
 
+
+## Exact rank-correlation fitting (issue #230)
+
+`--metric rank_correlation` (`1 − |ρ|`) and `rank_correlation_signed`
+(`1 − ρ`) are fitted on the CPU as a squared LM start followed by a
+deterministic coordinate polish on the rank objective. The polish is the cost
+centre: `coordinate_polish` re-sorts the prediction **and** the target on every
+trial, up to `12·p·6 + 1` `O(n log n)` sorts per candidate on one core. #230
+moves that tail to the device and leaves the objective exactly as it is.
+
+**Why the score can be exact.** With average ranks `r`, twice the centred rank
+
+```
+A_i = 2 r_i − (n + 1)          B_i = 2 rank_y(i) − (n + 1)
+ρ = Σ A_i B_i / sqrt(Σ A_i² · Σ B_i²)
+```
+
+is an integer in `[−(n−1), n−1]` with `Σ A_i = 0`, ties included: the average
+rank of a tie block is a half-integer and twice the centred value is its integer
+midpoint. The three sums are therefore exact integers, independent of the order
+in which they are reduced. The device accumulates them as two `u64` halves of a
+128-bit two's-complement value, one block per segment, with a carry-aware tree
+reduction and **no atomics**. The host turns them into `i128` and performs the
+single division, so a CPU and a GPU score are equal bit for bit, and 1 versus 4
+islands cannot change a fitted constant.
+
+**Pipeline per generation step.** For the admitted candidates, one call scores
+all six ladder trials of all of them:
+
+1. `k_rank_predict` evaluates each candidate's program in **f64**
+   (`ft_forward_d`) and writes an order-preserving `u64` key and the row index;
+2. `cub::DeviceSegmentedRadixSort::SortPairs` sorts every `(candidate, trial)`
+   segment (the same primitive `cuda/enrich.cu` already uses);
+3. `k_rank_flags` marks run starts (exact `f64` equality, so `-0.0` and `+0.0`
+   share a rank like the CPU's `==`) and gathers the cached target ranks;
+4. two CUB integer scans give the run ordinals and the per-row prefix sums of
+   `B`;
+5. `k_rank_contrib` turns each run's `[start, end)` into
+   `A = start + end − n` and accumulates `A·ΣB` and `A²·length`, reducing the
+   block deterministically.
+
+The target's `B` is computed once per fit sample and cached on the device, so
+the target is never re-sorted per trial.
+
+**Trajectory compatibility.** The device arm runs the *same* ladder
+`(+10 %, −10 %, +3 %, −3 %, +1 %, −1 %) × max(|c|, 1)` in the same constant
+order and **commits the first strict improver**, never the best of the six
+trials. A test drives `coordinate_polish` and the device polish from the same
+starting constants and asserts bit-identical constants, for the unsigned and the
+signed objective. `--no-fit` never enters the arm (nothing to fit), and the
+`--fit-strategy exact` default keeps the CPU path bit for bit.
+
+**Fallbacks.** A candidate is offered only when it has a GPU fit plan (`p ≤ 20`,
+≤ 96 nodes, no shared block constants, analytic operators) and at least `32p`
+rows. A non-finite prediction makes that segment unscorable; a failed
+allocation/launch, a declined device call, or a non-finite constant is returned
+as a non-zero status. Every such candidate is refit by the exact CPU arm
+(`fit_weighted_metric`, i.e. squared LM plus the exact rank polish) and counted
+under the labelled causes (`unsupported_plan`, `too_few_rows`,
+`too_many_constants`, `non_finite`, `launch`, and `rank_declined` when a device
+rank call itself fails). The fitness of every candidate,
+GPU-fitted or not, is the CPU rank score, and every reported finalist is still
+refit exactly by the CPU before the archive is rebuilt.
+
+**Measured cost (RTX 3060, shared with a 10-hour GPU run, so indicative).**
+One candidate, `p = 4`, up to 8 sweeps, CPU exact polish versus the device
+polish on the same start (identical constants in every row):
+
+| rows `n` | CPU polish | GPU polish | speed-up | one call (6 trials) |
+|---|---|---|---|---|
+| 5 000 | 38.5 ms | 9.6 ms | 4.0× | 0.55 ms |
+| 20 000 | 237.7 ms | 26.7 ms | 8.9× | 3.1 ms |
+| 50 000 | 430.2 ms | 74.5 ms | 5.8× | 3.3 ms |
+| 154 000 | 1 335.8 ms | 112.9 ms | 11.8× | 7.5 ms |
+
+The stage cost splits into a fixed per-call part and a per-segment part. On the
+same run at `n = 154 000`, one segment cost 5.20 ms and six segments (all six
+ladder trials) 7.46 ms, i.e. **≈ 4.7 ms fixed + 0.45 ms per segment**. The fixed
+part is allocation, uploads, CUB temporary-size queries and eight launches; the
+per-segment part is the segmented radix sort of `n` 64-bit keys plus the integer
+reduction, and it grows with `n` (at 3.9M rows it is the dominant term). Because
+one call covers every live candidate, the fixed part is amortised across the
+batch and the per-candidate cost approaches the sort. The cost model is
+therefore
+
+```
+T_polish ≈ calls · (t_fixed + segs · t_sort(n)),   calls ≈ 1 + sweeps · p
+```
+
+with `segs` = live candidates × 6. Reusing the per-call buffers in the context
+(and folding the two scans into one) is the obvious next optimisation; it would
+remove most of `t_fixed` and is not needed for exactness. End to end on `n = 20 000`, `pop = 48`, 2 generations, 1 island, 96
+evaluations: 3.74 s exact CPU versus 2.10 s GPU/rank (1.78×) at the same best
+error (`1.095749e-1`), with 72/78 admitted fits on the device, 6 labelled CPU
+fallbacks (7.7 %) and the fit stage at 39.5 % of wall.
+
+**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
+device, single-output unweighted full-sample data, and `--fit-iters > 0`. Below
+roughly `n ≈ 10⁴` the CPU polish is latency-competitive for a single candidate,
+so the device arm pays off through batching; the threshold is not a hidden
+switch — any configuration outside the list above is labelled by
+`gpu_blocker`'s reason in the one-line note.

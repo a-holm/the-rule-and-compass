@@ -589,11 +589,17 @@ struct GpuSearch {
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
+    /// #230: true only when the CUDA evaluator scores this run's metric
+    /// itself. The rank family is *fitted* on the device (squared LM start +
+    /// exact rank polish) but still *scored* by the CPU, because the evaluator
+    /// kernel accumulates squared error; scoring it there would silently rank
+    /// the population by MSE (the #236 bug).
+    native_metric: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
-    fn new(train: &Sample, fit_data: bool) -> Result<Self, String> {
+    fn new(train: &Sample, fit_data: bool, native_metric: bool) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -643,6 +649,7 @@ impl GpuSearch {
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_host_ms: 0.0,
+                    native_metric,
                 })
             }
             None => Err(format!(
@@ -697,7 +704,16 @@ impl GpuSearch {
 
         if !jobs.is_empty() {
             let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
-            let (out, ms) = self.ev.fit_batch(&plans, cfg.fit_iters);
+            // #230: the rank family runs its own device arm — the same squared
+            // LM start as `fit_weighted_metric`, followed by the batched exact
+            // rank polish under the same first-improver ladder. Every other
+            // metric stays on the squared LM kernel of #169.
+            let (out, ms) = match crate::fit::rank_metric_signed(cfg.metric) {
+                Some(signed) => self
+                    .ev
+                    .rank_fit_batch(&plans, cfg.fit_iters, &train.y, signed),
+                None => self.ev.fit_batch(&plans, cfg.fit_iters),
+            };
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
             }
@@ -854,9 +870,13 @@ impl GpuSearch {
                 tag: j as u32,
                 ..Default::default()
             };
-            // #131: one guarded entry point (lower + stack bound) for the
-            // synchronous pool path; #121's lowering/stack split is kept.
-            let compiled = crate::gpu::compile_program(&islands[i][j].tree).ok();
+            // #230: the rank family is fitted on the device but scored on the
+            // CPU, so its fitness never comes from the squared-error kernel.
+            let compiled = if self.native_metric {
+                crate::gpu::compile_program(&islands[i][j].tree).ok()
+            } else {
+                None
+            };
             let pushed = compiled
                 .as_ref()
                 .map_or(false, |c| c.words().len() <= width && pool.push(c.words(), meta));
@@ -1407,7 +1427,16 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     // otherwise a slope/absolute/rank run can silently rank by MSE. This is a
     // correctness gate, not a performance preference: remove it only together
     // with a tested native scorer for the metric.
-    if cfg.metric != crate::metrics::Metric::Squared {
+    //
+    // #230: the rank family is the one exception, and only for **fitting**: its
+    // constants are moved by the squared LM start plus the exact integer rank
+    // polish on the device (see `GpuSearch::rank_fit_batch`), while its fitness
+    // keeps coming from the CPU evaluator (`GpuSearch::native_metric == false`).
+    // The objective is therefore never scored by the squared-error kernel.
+    let rank_fit = crate::fit::rank_metric_signed(cfg.metric).is_some()
+        && cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0;
+    if cfg.metric != crate::metrics::Metric::Squared && !rank_fit {
         return Some("metric is not scored natively on the GPU");
     }
     if subsampling_active(cfg, train) {
@@ -1882,17 +1911,21 @@ pub enum FitFallbackCause {
     NonFinite,
     /// The CUDA fit launch failed; the whole batch went to the CPU.
     Launch,
+    /// #230: the device rank stage declined (allocation, launch or an
+    /// inconsistent score) and the exact CPU rank arm took over.
+    RankDeclined,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 6] = [
+    pub const ALL: [FitFallbackCause; 7] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
         FitFallbackCause::IllConditioned,
         FitFallbackCause::NonFinite,
         FitFallbackCause::Launch,
+        FitFallbackCause::RankDeclined,
     ];
 
     /// Stable JSON label.
@@ -1904,6 +1937,7 @@ impl FitFallbackCause {
             FitFallbackCause::IllConditioned => "ill_conditioned",
             FitFallbackCause::NonFinite => "non_finite",
             FitFallbackCause::Launch => "launch",
+            FitFallbackCause::RankDeclined => "rank_declined",
         }
     }
 }
@@ -1923,6 +1957,7 @@ fn status_fallback_cause(status: i32) -> FitFallbackCause {
     match status {
         1 => FitFallbackCause::IllConditioned,
         2 => FitFallbackCause::NonFinite,
+        3 => FitFallbackCause::RankDeclined,
         _ => FitFallbackCause::UnsupportedPlan,
     }
 }
@@ -2018,10 +2053,10 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
     defer_gpu
         && cfg.fit_strategy.defers_to_gpu()
         && cfg.fit_iters > 0
-        && matches!(
+        && (matches!(
             cfg.metric,
             Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
-        )
+        ) || crate::fit::rank_metric_signed(cfg.metric).is_some())
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -3612,7 +3647,11 @@ fn run_search(
                 backend_reason = Some(reason.to_string());
                 None
             }
-            None => match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu()) {
+            None => match GpuSearch::new(
+                train,
+                cfg.fit_strategy.defers_to_gpu(),
+                cfg.metric == crate::metrics::Metric::Squared,
+            ) {
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
@@ -3635,10 +3674,18 @@ fn run_search(
                                 (cfg.pop / cfg.pipeline_depth.max(1)).max(1)
                             )
                         };
+                        let fitness = if cfg.metric == crate::metrics::Metric::Squared {
+                            "f32 fitness, reported numbers stay f64"
+                        } else {
+                            // #230: the rank family is fitted on the device but
+                            // scored by the CPU, so its fitness is exact f64.
+                            "CPU f64 fitness, device-fitted constants"
+                        };
                         eprintln!(
-                            "# gpu: {} ({}; f32 fitness, reported numbers stay f64)",
+                            "# gpu: {} ({}; {})",
                             crate::gpu::GpuEvaluator::device_name(),
-                            scheduling
+                            scheduling,
+                            fitness
                         );
                     }
                     backend_device = Some(device);
@@ -3669,8 +3716,9 @@ fn run_search(
     #[cfg(feature = "cuda")]
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
-            "# gpu-fit: off (the batched kernel minimises squared error; \
-             --metric must be squared, aic, aicc or bic)"
+            "# gpu-fit: off (the batched kernel fits squared error and the exact \
+             rank objectives; --metric must be squared, aic, aicc, bic, \
+             rank_correlation or rank_correlation_signed)"
         );
     }
     #[cfg(feature = "cuda")]
@@ -4966,6 +5014,7 @@ mod tests {
                 "ill_conditioned",
                 "non_finite",
                 "launch",
+                "rank_declined",
             ]
         );
         assert_eq!(
@@ -4990,6 +5039,10 @@ mod tests {
             FitFallbackCause::IllConditioned
         );
         assert_eq!(status_fallback_cause(2), FitFallbackCause::NonFinite);
+        assert_eq!(
+            status_fallback_cause(3),
+            FitFallbackCause::RankDeclined
+        );
         assert_eq!(
             status_fallback_cause(0),
             FitFallbackCause::UnsupportedPlan

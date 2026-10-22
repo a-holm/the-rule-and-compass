@@ -75,6 +75,28 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     w: &[f64],
     iters: usize,
 ) -> VerifiedBatch {
+    fit_batch_verified_metric(backend, trees, x, y, w, iters, Metric::Squared)
+}
+
+/// #230: the same gate against the **configured** metric.
+///
+/// The squared-error gate is only a correct acceptance test for the squared
+/// family. For `rank_correlation`/`rank_correlation_signed` a proposal is
+/// accepted when its exact integer rank score is finite and no worse than the
+/// starting constants', and the CPU fallback is
+/// [`fit_weighted_metric`](super::fit_weighted_metric), i.e. the same squared
+/// start plus the exact rank polish the CPU uses. No loss is substituted
+/// silently: the objective that decides acceptance is the one that will be
+/// reported.
+pub fn fit_batch_verified_metric<B: BatchedFitter + ?Sized>(
+    backend: &B,
+    trees: &mut [Node],
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> VerifiedBatch {
     let proposals = backend.fit_batch(trees, x, y, w, iters);
     let mut sse = Vec::with_capacity(trees.len());
     let mut status = Vec::with_capacity(trees.len());
@@ -82,13 +104,13 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
         let proposal = proposals.get(i).and_then(|p| p.as_ref());
         let (value, state) = match proposal {
             None => (
-                fit_weighted_strategy(tree, x, y, w, iters, FitStrategy::Exact),
+                fit_weighted_metric(tree, x, y, w, iters, metric),
                 BatchStatus::Unsupported,
             ),
-            Some(c) => match verify_proposal(tree, c, x, y, w) {
+            Some(c) => match verify_proposal(tree, c, x, y, w, metric) {
                 Some(v) => (v, BatchStatus::Gpu),
                 None => (
-                    fit_weighted_strategy(tree, x, y, w, iters, FitStrategy::Exact),
+                    fit_weighted_metric(tree, x, y, w, iters, metric),
                     BatchStatus::Worse,
                 ),
             },
@@ -108,25 +130,72 @@ fn verify_proposal(
     x: &[Vec<f64>],
     y: &[f64],
     w: &[f64],
+    metric: Metric,
 ) -> Option<f64> {
     let f = flatten(tree);
     if proposal.len() != f.nconst || !proposal.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let mut v = vec![0.0; f.op.len()];
     let mut c0 = vec![0.0; f.nconst];
     for i in 0..f.op.len() {
         if f.cslot[i] >= 0 {
             c0[f.cslot[i] as usize] = f.val[i];
         }
     }
-    let start = sse(&f, x, y, w, &c0, &mut v);
-    let candidate = sse(&f, x, y, w, proposal, &mut v);
+    // #230: the squared family keeps the historical weighted SSE (bit for
+    // bit); the rank family is judged by the exact integer statistic; every
+    // other metric by its own `f64` score on the same rows.
+    let score = |c: &[f64]| -> f64 {
+        match metric {
+            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic => {
+                let mut v = vec![0.0; f.op.len()];
+                sse(&f, x, y, w, c, &mut v)
+            }
+            Metric::RankCorrelation | Metric::RankCorrelationSigned => {
+                flat_rank_score(&f, x, y, w, c, metric).unwrap_or(f64::INFINITY)
+            }
+            _ => {
+                if !w.is_empty() {
+                    return f64::INFINITY; // the caller must not thin a weighted fit
+                }
+                let pred: Vec<f64> = x.iter().map(|row| flat_predict(&f, row, c)).collect();
+                metrics::score(&pred, y, metric)
+            }
+        }
+    };
+    let start = score(&c0);
+    let candidate = score(proposal);
     if !candidate.is_finite() || !start.is_finite() || candidate > start {
         return None;
     }
     write_constants(tree, &f, proposal);
     Some(candidate)
+}
+
+/// #230: exact rank score of one flattened program at `c`.
+fn flat_rank_score(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    c: &[f64],
+    metric: Metric,
+) -> Option<f64> {
+    let signed = super::rank_metric_signed(metric)?;
+    if !w.is_empty() || x.len() != y.len() {
+        return None;
+    }
+    let target = metrics::RankTarget::new(y)?;
+    let pred: Vec<f64> = x.iter().map(|row| flat_predict(f, row, c)).collect();
+    let s = target.score(&pred, signed);
+    s.is_finite().then_some(s)
+}
+
+/// Evaluate a flattened program on one row (same arithmetic as `sse`).
+fn flat_predict(f: &Flat, row: &[f64], c: &[f64]) -> f64 {
+    let mut v = vec![0.0; f.op.len()];
+    eval_row(f, row, c, &mut v);
+    v[f.root]
 }
 
 /// #169: the exact `f64` refit every reported finalist receives, whatever arm
@@ -146,7 +215,7 @@ pub fn refit_finalists_exact(trees: &mut [Node], x: &[Vec<f64>], y: &[f64], w: &
 /// present.
 pub fn backend_description() -> &'static str {
     if cfg!(feature = "cuda") {
-        "gpu batch verifier ready; LM kernel supplied by #169"
+        "gpu batch verifier ready; LM kernel supplied by #169; exact rank stage by #230"
     } else {
         "no CUDA feature: --fit-strategy gpu uses the exact CPU arms"
     }

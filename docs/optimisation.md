@@ -250,6 +250,7 @@ is mathematically well posed:
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
 | `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
 | `correlation`, `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
@@ -264,6 +265,18 @@ The fitted loss is reported in `--json` under `fitting` (`loss` names the
 objective, `value` is the best fitted training loss). A non-smooth metric whose
 polish cannot improve on the squared fit keeps the squared constants and the same
 reported score.
+
+The rank polish uses the **exact integer** form of Spearman's ρ internally
+(twice-centred average ranks, `i128` sums) on both the CPU and, when
+`--fit-strategy gpu` is selected, the device. That form agrees with the
+f64 Pearson-on-ranks value to a few ulps; it is used for the accept/reject
+decision because it is order-independent, which is what makes CPU and GPU
+trajectories identical. The *reported* score is still produced by the metric
+implementation (`metrics::score_weighted`) on the fitted constants, and every
+finalist is refit by the exact CPU arm before reporting. See
+[`gpu-backend.md`](gpu-backend.md#exact-rank-correlation-fitting-issue-230) for
+the pipeline, fallback labels and the measured 4–11× polish speed-up at
+`n = 5k…154k`.
 
 ### 3.1 Measured results
 
