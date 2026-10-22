@@ -412,10 +412,19 @@ SEARCH:
                              no-op). The kernel minimises one of those two
                              objectives, so `gpu` with any other metric is a
                              usage error; use `--metric squared`,
-                             `--metric log_squashed` or a CPU strategy
+                             `--metric log_squashed` or a CPU strategy. The one
+                             exception is `--metric auc`: the kernel only
+                             *proposes* constants, a proposal is kept only when
+                             the class-balanced logistic surrogate and the exact
+                             CPU AUC are both no worse than the starting
+                             constants, otherwise it is reverted and refit on
+                             the CPU. The auc fitness is always the exact CPU
+                             AUC; log_loss and hinge keep the CPU arm
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit) at the
-                             end of the run (diagnostics only)
+                             end of the run (diagnostics only). For --metric auc
+                             the AUC fallback causes are auc_worse,
+                             auc_surrogate_worse and auc_degenerate
   --fit-rows <N>             fit constants on a deterministic N-row subsample
                              and score/archive on all training rows (default 0
                              = off; N >= train rows is an exact full fit). The

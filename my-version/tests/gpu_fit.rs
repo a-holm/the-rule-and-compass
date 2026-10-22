@@ -743,9 +743,11 @@ fn rcsr(args: &[&str]) -> std::process::Output {
 /// future metric cannot inherit the old silent path.
 #[test]
 fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
+    // #233: `auc` is the documented exception — the device proposes and the
+    // exact CPU AUC gates — so it is expected to pass the usage check.
     let refused: Vec<&str> = Metric::all()
         .iter()
-        .filter(|m| rcsr::fit::fit_loss(**m).is_none())
+        .filter(|m| rcsr::fit::fit_loss(**m).is_none() && **m != Metric::Auc)
         .map(|m| m.name())
         .collect();
     assert!(
@@ -755,6 +757,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     assert!(
         !refused.contains(&"log_squashed"),
         "log_squashed is fitted by the kernel since #229 and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"auc"),
+        "auc reaches the proposal gate and must not be refused"
     );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
@@ -799,7 +805,9 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
 /// file (exit 3) rather than on the fit strategy.
 #[test]
 fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
-    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
+    // #233: `auc` is accepted too; the device proposes and the exact gate
+    // decides, so the run reaches the loader like the native losses.
+    for metric in ["squared", "aic", "aicc", "bic", "log_squashed", "auc"] {
         let out = rcsr(&[
             "--data", "missing-223.csv", "--target", "y", "--vars", "x",
             "--fit-strategy", "gpu", "--metric", metric,
@@ -823,4 +831,375 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
             "--fit-strategy {strategy} keeps metric-aware CPU fitting: {stderr}"
         );
     }
+}
+
+// ---------------------------------------------------------------- #233 ------
+//
+// The AUC arm: the device proposes constants, the exact CPU AUC decides. These
+// tests pin that the fitness never comes from the device, that every proposal
+// is gated on the exact metric, that degenerate/imbalanced samples are labelled
+// and that `--no-fit` stays a no-op.
+
+/// #233: a two-class target. `t` carries the signal and `s` a deterministic
+/// nuisance; the top `positives` rows by `t + 0.3·s` are labelled `1`. The
+/// label rule (`y > (min+max)/2`) therefore splits `{0, 1}` at `0.5` and a model
+/// `c0 + c1·x0` can rank the classes.
+fn auc_sample(n: usize, positives: usize, seed: u32) -> Sample {
+    let mut x = Vec::with_capacity(n);
+    let mut s = Vec::with_capacity(n);
+    let mut t = Vec::with_capacity(n);
+    for i in 0..n {
+        let ti = i as f64 / (n - 1) as f64 * 6.0 - 3.0;
+        let si = (((i as u32).wrapping_mul(2_654_435_761) ^ seed) as f64 / u32::MAX as f64) * 2.0 - 1.0;
+        x.push(vec![ti, si]);
+        t.push(ti);
+        s.push(si);
+    }
+    let mut score: Vec<(f64, usize)> = t
+        .iter()
+        .zip(&s)
+        .enumerate()
+        .map(|(i, (&ti, &si))| (ti + 0.3 * si, i))
+        .collect();
+    score.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.cmp(&b.1))
+    });
+    let mut y = vec![0.0; n];
+    for &(_, i) in score.iter().take(positives) {
+        y[i] = 1.0;
+    }
+    Sample { x, y, w: Vec::new(), ys: Vec::new() }
+}
+
+/// #233: `auc` with the GPU fit arm. The fitness must stay the exact CPU AUC —
+/// a device fitness would rank by another objective — while the device proposes
+/// constants through the class-balanced surrogate and the exact-AUC gate.
+#[cfg(feature = "cuda")]
+#[test]
+fn auc_gpu_fit_scores_exactly_on_the_cpu() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = auc_sample(240, 120, 41);
+    let test = auc_sample(80, 40, 42);
+    let cfg = Config {
+        metric: Metric::Auc,
+        ..gpu_config(43)
+    };
+    let out = search::run(&cfg, &train, &test);
+    assert_eq!(
+        out.backend,
+        rcsr::backend::Kind::Cpu,
+        "auc fitness is exact CPU AUC, never a device objective"
+    );
+    let reason = out.backend_reason.clone().unwrap_or_default();
+    assert!(
+        reason.contains("exactly on the CPU"),
+        "the backend report must say where the fitness came from: {reason:?}"
+    );
+    let g = out.gpu.as_ref().expect("a fit ledger even without a device fitness");
+    assert!(g.fit_attempts > 0, "the fit arm must have been offered work: {:?}", g);
+    assert!(
+        g.fit_gpu > 0,
+        "the device must actually propose and pass the exact-AUC gate: {:?}",
+        g
+    );
+    assert!(
+        g.fit_refits > 0,
+        "the metric-aware finalist refit must run: {:?}",
+        g
+    );
+    assert_fit_ledger(g);
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Auc);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "every reported error is the exact CPU AUC of the stored tree"
+        );
+    }
+}
+
+/// #233: a fixed seed and device give the same archive on repeated runs.
+#[cfg(feature = "cuda")]
+#[test]
+fn auc_gpu_fit_is_deterministic() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = auc_sample(240, 120, 51);
+    let test = auc_sample(80, 40, 52);
+    let cfg = Config {
+        metric: Metric::Auc,
+        ..gpu_config(53)
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b));
+    assert_eq!(a.test_errors, b.test_errors);
+}
+
+/// #233: `--fit-iters 0` (`--no-fit`) is a true no-op for `auc`: the arm is not
+/// entered, and the run is bit-identical to the exact CPU arm.
+#[test]
+fn auc_no_fit_is_an_exact_no_op() {
+    let train = auc_sample(160, 80, 61);
+    let test = auc_sample(40, 20, 62);
+    let base = Config {
+        generations: 3,
+        islands: 1,
+        pop: 16,
+        max_complexity: 10,
+        fit_iters: 0,
+        patience: 0,
+        seed: 63,
+        metric: Metric::Auc,
+        gpu: true,
+        ..Default::default()
+    };
+    let exact = search::run(
+        &Config { fit_strategy: FitStrategy::Exact, ..base.clone() },
+        &train,
+        &test,
+    );
+    let gpu = search::run(&Config { fit_strategy: FitStrategy::Gpu, ..base }, &train, &test);
+    assert_eq!(describe(&exact), describe(&gpu));
+    assert!(gpu.gpu.is_none(), "no fit ran, so there is no GPU ledger");
+    assert_eq!(gpu.backend, rcsr::backend::Kind::Cpu);
+}
+
+/// #233: fewer than ten rows of one class. AUC is chance-level noise there and
+/// the balanced weights are unbounded, so every admitted candidate is a
+/// **labelled** CPU fallback instead of a device fit.
+#[cfg(feature = "cuda")]
+#[test]
+fn auc_degenerate_classes_fall_back_with_a_label() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = auc_sample(240, 3, 71);
+    let test = auc_sample(80, 40, 72);
+    let cfg = Config {
+        metric: Metric::Auc,
+        ..gpu_config(73)
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a fit ledger");
+    assert!(g.fit_attempts > 0, "the admitted set must be reported: {:?}", g);
+    assert_eq!(g.fit_gpu, 0, "no candidate may be fitted on the device: {:?}", g);
+    assert_eq!(
+        g.fit_fallback_by_cause.get("auc_degenerate").copied().unwrap_or(0),
+        g.fit_attempts,
+        "every fallback names the degenerate classes: {:?}",
+        g
+    );
+    assert_fit_ledger(g);
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Auc);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
+}
+
+/// #233: a 5 %-positive sample keeps the ledger honest and every reported
+/// number exact: the balanced surrogate must not push a class out of the fit.
+#[cfg(feature = "cuda")]
+#[test]
+fn auc_class_imbalance_keeps_the_exact_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = auc_sample(400, 20, 81);
+    let test = auc_sample(120, 60, 82);
+    let (pos, neg) = rcsr::metrics::class_counts(&train.y);
+    assert_eq!((pos, neg), (20, 380));
+    let cfg = Config {
+        metric: Metric::Auc,
+        ..gpu_config(83)
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a fit ledger");
+    assert_fit_ledger(g);
+    assert_eq!(
+        g.fit_fallback_by_cause.get("auc_degenerate").copied().unwrap_or(0),
+        0,
+        "20 positives are above the ten-row floor: {:?}",
+        g
+    );
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Auc);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
+}
+
+/// #233 measurement (ignored): paired CPU-vs-GPU `auc` run at equal
+/// evaluations. The `exact` arm is the CPU logistic-IRLS path; the `auc/gpu`
+/// arm lets the device propose constants and keeps them only when both the
+/// class-balanced logistic surrogate and the exact CPU AUC are no worse.
+///
+/// Run with
+/// `cargo test --release --features cuda --test gpu_fit bench_auc_end_to_end -- --ignored --nocapture`.
+/// `RCSR_BENCH_N` (rows), `RCSR_BENCH_POP`, `RCSR_BENCH_ISLANDS`,
+/// `RCSR_BENCH_GENS`, `RCSR_BENCH_ITERS`, `RCSR_BENCH_POS` (positives),
+/// `RCSR_BENCH_NOISE` (label flips per mille) and `RCSR_BENCH_ARMS=exact|auc`
+/// select the cell.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn bench_auc_end_to_end() {
+    if !device_available() {
+        eprintln!("skipping GPU benchmark: no usable CUDA device");
+        return;
+    }
+    let env = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let n = env("RCSR_BENCH_N", 20_000);
+    let pop = env("RCSR_BENCH_POP", 64);
+    let islands = env("RCSR_BENCH_ISLANDS", 2);
+    let generations = env("RCSR_BENCH_GENS", 3);
+    let fit_iters = env("RCSR_BENCH_ITERS", 8);
+    let positives = env("RCSR_BENCH_POS", n / 20);
+    let noise = env("RCSR_BENCH_NOISE", 0) as u32;
+    let mut train = auc_sample(n, positives, 91);
+    if noise > 0 {
+        // Deterministic label noise: the true AUC is below one, so a quality
+        // difference between the arms is measurable.
+        for (i, v) in train.y.iter_mut().enumerate() {
+            let h = ((i as u32).wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 8) % 1_000;
+            if h < noise {
+                *v = 1.0 - *v;
+            }
+        }
+    }
+    let test = auc_sample(2_000, 1_000, 92);
+    let (pos, neg) = rcsr::metrics::class_counts(&train.y);
+    eprintln!(
+        "auc cell: N={n} positives={pos} negatives={neg} pop={pop} islands={islands} gens={generations} iters={fit_iters}"
+    );
+    use rcsr::expr::Op;
+    let base = Config {
+        generations,
+        islands,
+        pop,
+        max_complexity: 14,
+        fit_iters,
+        metric: Metric::Auc,
+        fit_samples: 0,
+        predictor_samples: None,
+        ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Tanh, Op::Gauss, Op::Square, Op::Cube, Op::Neg],
+        seed: 93,
+        patience: 0,
+        gpu_notes: false,
+        ..Default::default()
+    };
+    let arms = std::env::var("RCSR_BENCH_ARMS").unwrap_or_else(|_| "exact,auc".to_string());
+    let wanted = |name: &str| arms.split(',').map(str::trim).any(|a| a.eq_ignore_ascii_case(name));
+    let mut runs = Vec::new();
+    for (name, strategy, gpu) in [("exact", FitStrategy::Exact, false), ("auc", FitStrategy::Gpu, true)] {
+        if !wanted(name) {
+            continue;
+        }
+        let cfg = Config { fit_strategy: strategy, gpu, ..base.clone() };
+        let t0 = std::time::Instant::now();
+        let mut history: Vec<(usize, f64, f64)> = Vec::new();
+        let out = search::run_resumable(&cfg, &train, &test, None, 1, |cp| {
+            let best = cp
+                .archive
+                .items
+                .iter()
+                .map(|s| s.error)
+                .fold(f64::INFINITY, f64::min);
+            if history.last().map(|h| h.0) != Some(cp.generations) {
+                history.push((cp.generations, best, t0.elapsed().as_secs_f64()));
+            }
+        })
+        .expect("benchmark search");
+        let wall = t0.elapsed().as_secs_f64();
+        let best = out.archive.items.iter().map(|s| s.error).fold(f64::INFINITY, f64::min);
+        eprintln!(
+            "arm={} N={} evals={} wall={:.2}s best_auc={:.6}",
+            name,
+            n,
+            base.generations * base.islands * base.pop,
+            wall,
+            1.0 - best
+        );
+        let trajectory: Vec<String> = history
+            .iter()
+            .map(|(g, b, t)| format!("g{}={:.6}@{:.1}s", g, 1.0 - b, t))
+            .collect();
+        eprintln!("  history(auc): {}", trajectory.join(" "));
+        if let Some(g) = &out.gpu {
+            let causes = rcsr::search::FitFallbackCause::ALL
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}={}",
+                        c.label(),
+                        g.fit_fallback_by_cause.get(c.label()).copied().unwrap_or(0)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let rate = if g.fit_attempts == 0 {
+                0.0
+            } else {
+                100.0 * g.fit_fallback as f64 / g.fit_attempts as f64
+            };
+            eprintln!(
+                "  fit: screened={} admitted={} gpu={} fallback={} rate={:.1}% causes=[{}] refits={}",
+                g.fit_screened, g.fit_attempts, g.fit_gpu, g.fit_fallback, rate, causes, g.fit_refits
+            );
+            eprintln!(
+                "  time: fit_host={:.2}s ({:.1}% of wall) fit_kernel={:.2}s eval_duty={:.1}% fit_kernel_share={:.1}%",
+                g.fit_host_ms / 1000.0,
+                100.0 * (g.fit_host_ms / 1000.0) / wall,
+                g.fit_ms / 1000.0,
+                100.0 * g.accounting.duty_cycle(),
+                100.0 * (g.fit_ms / 1000.0) / wall
+            );
+            assert_fit_ledger(g);
+            assert_eq!(out.backend, rcsr::backend::Kind::Cpu, "auc fitness stays on the CPU");
+        }
+        for s in &out.archive.items {
+            let cpu = search::eval_error(&s.tree, &train, Metric::Auc);
+            assert_eq!(s.error.to_bits(), cpu.to_bits(), "reported error is exact CPU AUC");
+        }
+        runs.push((name, wall, history, out));
+    }
+    if runs.len() < 2 {
+        eprintln!("one arm selected; paired comparison needs both");
+        return;
+    }
+    let all: Vec<(f64, f64)> = runs.iter().flat_map(|r| front_points(&r.3)).collect();
+    let cmin = all.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+    let cmax = all.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+    let emin = all.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+    let emax = all.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+    let exact_best = runs[0].3.archive.items.iter().map(|s| s.error).fold(f64::INFINITY, f64::min);
+    let target = exact_best * 1.02;
+    for (name, _, history, out) in &runs {
+        let hv = hypervolume(&front_points(out), cmin, cmax, emin, emax);
+        let ttt = history
+            .iter()
+            .find(|h| h.1 <= target)
+            .map(|h| format!("gen {} / {:.1}s", h.0, h.2))
+            .unwrap_or_else(|| "not reached".to_string());
+        eprintln!("control: arm={} hypervolume={:.6} ttt={}", name, hv, ttt);
+    }
+    let speedup = runs[0].1 / runs[1].1;
+    eprintln!(
+        "paired: exact {:.2}s vs auc {:.2}s -> {:.2}x; best 1-auc exact={:.6} gpu={:.6}",
+        runs[0].1,
+        runs[1].1,
+        speedup,
+        1.0 - runs[0].3.archive.items.iter().map(|s| s.error).fold(f64::INFINITY, f64::min),
+        1.0 - runs[1].3.archive.items.iter().map(|s| s.error).fold(f64::INFINITY, f64::min)
+    );
 }

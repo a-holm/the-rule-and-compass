@@ -590,11 +590,20 @@ struct GpuSearch {
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
+    /// #233: the device proposes constants but never produces a fitness. Set
+    /// for `--metric auc`, where every candidate is scored with the exact CPU
+    /// AUC; the CUDA evaluator would rank by another objective.
+    fit_only: bool,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
-    fn new(train: &Sample, fit_data: bool, loss: crate::fit::DeviceLoss) -> Result<Self, String> {
+    fn new(
+        train: &Sample,
+        fit_data: bool,
+        loss: crate::fit::DeviceLoss,
+        fit_only: bool,
+    ) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -648,6 +657,7 @@ impl GpuSearch {
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_host_ms: 0.0,
+                    fit_only,
                 })
             }
             None => Err(format!(
@@ -684,8 +694,36 @@ impl GpuSearch {
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
         // #229: the objective the batched kernel minimises. `defers_fit_to_gpu`
         // keeps a run without a native loss off this path; if it ever reaches
-        // here, refuse the device rather than guess an objective.
-        let fit_loss = crate::fit::fit_loss(cfg.metric);
+        // here, refuse the device rather than guess an objective. #233: for
+        // `auc` this is the *proposal* loss (squared on the `{0, 1}` label); the
+        // gate below, never this loss, decides whether the constants are kept.
+        let fit_loss = crate::fit::gpu_proposal_loss(cfg.metric);
+        let auc = cfg.metric == Metric::Auc;
+        if auc {
+            // #233: at least ten rows of each class. Below that AUC is noise
+            // and the balanced weights reach 50x the majority weight, so the
+            // whole admitted set is a labelled CPU fallback.
+            let (pos, neg) = crate::metrics::class_counts(&train.y);
+            if pos < 10 || neg < 10 {
+                self.fit_attempts += admitted.len();
+                let stats = self.stats.entry(generation).or_default();
+                stats.generation = generation;
+                stats.fit_attempts += admitted.len();
+                for &(i, j) in admitted {
+                    self.note_fit_fallback(generation, FitFallbackCause::AucDegenerate);
+                    crate::fit::note_gpu_fit(false);
+                    crate::fit::fit_weighted_metric(
+                        &mut islands[i][j].tree,
+                        &train.x,
+                        &train.y,
+                        &train.w,
+                        cfg.fit_iters,
+                        cfg.metric,
+                    );
+                }
+                return;
+            }
+        }
         for &(i, j) in admitted {
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
                 _ if fit_loss.is_none() => {
@@ -717,6 +755,53 @@ impl GpuSearch {
             if out.len() == jobs.len() {
                 for ((i, j, plan), res) in jobs.iter().zip(out) {
                     let finite = res.c.iter().all(|v| v.is_finite());
+                    if auc {
+                        // #233: never accept on squared error. A proposal whose
+                        // kernel status is bad, or whose exact AUC or balanced
+                        // surrogate is worse than the starting constants, keeps
+                        // `c0` (the gate never writes) and is refit by the exact
+                        // CPU classification arm below.
+                        let cause = if res.status != 0 {
+                            Some(status_fallback_cause(res.status))
+                        } else if !finite {
+                            Some(FitFallbackCause::NonFinite)
+                        } else {
+                            let report = crate::fit::gate_auc_proposal(
+                                &mut islands[*i][*j].tree,
+                                Some(res.c.as_slice()),
+                                &train.x,
+                                &train.y,
+                                &train.w,
+                            );
+                            match report.verdict {
+                                crate::fit::GateVerdict::Accept => None,
+                                crate::fit::GateVerdict::NoProposal
+                                | crate::fit::GateVerdict::WrongShape
+                                | crate::fit::GateVerdict::NonFinite => {
+                                    Some(FitFallbackCause::NonFinite)
+                                }
+                                crate::fit::GateVerdict::MetricWorse => {
+                                    Some(FitFallbackCause::AucWorse)
+                                }
+                                crate::fit::GateVerdict::SurrogateWorse => {
+                                    Some(FitFallbackCause::SurrogateWorse)
+                                }
+                            }
+                        };
+                        match cause {
+                            None => {
+                                self.fit_gpu += 1;
+                                self.stats.entry(generation).or_default().fit_gpu += 1;
+                                crate::fit::note_gpu_fit(true);
+                            }
+                            Some(cause) => {
+                                fallbacks.push((*i, *j, cause));
+                                self.note_fit_fallback(generation, cause);
+                                crate::fit::note_gpu_fit(false);
+                            }
+                        }
+                        continue;
+                    }
                     if finite {
                         plan.apply(&mut islands[*i][*j].tree, &res.c);
                     }
@@ -823,6 +908,40 @@ impl GpuSearch {
         self.evaluate_pending(islands, &pending, train, cfg, generation)
     }
 
+    /// #233: score one explicit set of candidates with the exact CPU evaluator.
+    ///
+    /// Used by the `--metric auc` fit-only mode, where the device never produces
+    /// a fitness. The job order is the caller's list and the merge is by index,
+    /// so the result does not depend on the worker count or the completion
+    /// order.
+    fn score_pending_cpu(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        pending: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+    ) -> f64 {
+        if pending.is_empty() {
+            return 0.0;
+        }
+        let jobs: Vec<(usize, Node)> = pending
+            .iter()
+            .enumerate()
+            .map(|(k, &(i, j))| (k, islands[i][j].tree.clone()))
+            .collect();
+        let view = EvalSample::new(train, cfg);
+        let pool = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool");
+        let (errors, seconds) = pool.score(jobs, &view, cfg);
+        debug_assert_eq!(errors.len(), pending.len());
+        for (k, &(i, j)) in pending.iter().enumerate() {
+            islands[i][j].error = errors[k];
+        }
+        seconds
+    }
+
     /// #169: compile and score one explicit set of pending candidates in a
     /// single GPU batch, with their current constants. Candidates the kernel
     /// cannot compile are scored on the CPU instead, so they never lose
@@ -839,6 +958,17 @@ impl GpuSearch {
         cfg: &Config,
         generation: usize,
     ) -> Result<(), String> {
+        if self.fit_only {
+            // #233: `--metric auc`. The device has no native AUC scorer, so the
+            // fitness of every candidate — screening and fitted alike — is the
+            // exact CPU value on the same rows. Only the constants come from the
+            // kernel. Nothing is compiled or launched here, so the per-
+            // generation program counters stay untouched; the fit ledger
+            // (`fit_attempts`/`fit_gpu`/`fit_fallback`) carries what ran.
+            self.stats.entry(generation).or_default().generation = generation;
+            self.score_pending_cpu(islands, pending, train, cfg);
+            return Ok(());
+        }
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
         let mut lowered = 0usize;
@@ -1294,7 +1424,11 @@ fn score_generation(
     };
     match g.score(islands, train, cfg, generation) {
         Ok(()) => {
-            *used = true;
+            // #233: an `auc` fit-only pass produces no device fitness, so the
+            // run must not claim a GPU-scored backend.
+            if !g.fit_only {
+                *used = true;
+            }
             true
         }
         Err(e) => {
@@ -1399,6 +1533,12 @@ fn score_pipeline_batch(
 /// generation, weighted rows need a per-row weight array the evaluator does not
 /// have, and every metric without a native kernel loss would be ranked by a
 /// proxy it is not defined on. Each of those keeps the CPU evaluator.
+///
+/// #233: the classification clause is no longer blanket. `auc` is admitted when
+/// `--fit-strategy gpu` selects the fit arm, because that arm keeps its fitness
+/// on the **exact CPU AUC** (`GpuSearch::fit_only`) and only the constant
+/// proposal runs on the device. `log_loss` and `hinge` stay on the CPU until the
+/// kernel can step on their own loss.
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
@@ -1410,19 +1550,19 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if cfg.metric.is_implicit() {
         return Some("implicit objective");
     }
-    if cfg.metric.is_classification() {
-        return Some("classification metric");
-    }
     if cfg.metric.is_parameter_aware() {
         return Some("parameter-aware metric");
     }
-    // #236: the CUDA evaluator accumulates squared error; #229 adds one more
-    // native objective. A metric may use the device only when the kernel
-    // computes that objective itself, or a slope/absolute/rank run is silently
-    // ranked by MSE (observed: a different Pareto point for `--metric slope`).
-    // This is a correctness gate, not a performance preference.
-    if crate::fit::DeviceLoss::for_metric(cfg.metric).is_none() {
-        return Some("metric is not scored natively on the GPU");
+    // #236/#229/#233: the CUDA evaluator accumulates one native kernel loss. A
+    // metric may use the device only when the kernel computes its objective, or
+    // a slope/absolute/rank run is silently ranked by MSE (observed: a
+    // different Pareto point for `--metric slope`). `auc` is the one exception,
+    // and only for the fit: its fitness stays exact CPU AUC. This is a
+    // correctness gate, not a performance preference.
+    if let Some(reason) =
+        crate::fit::gpu_fitness_blocker(cfg.metric, cfg.fit_strategy, cfg.fit_iters)
+    {
+        return Some(reason);
     }
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
@@ -1452,7 +1592,13 @@ pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
             )
             && gpu_blocker(cfg, train).is_none()
         {
-            return Backend::Gpu;
+            // #233: an `auc` run's fitness is the exact CPU AUC even when
+            // `--fit-strategy gpu` lets the device propose constants. The label
+            // follows the evaluator that guides selection, which is also what a
+            // checkpoint records.
+            if cfg.metric != Metric::Auc {
+                return Backend::Gpu;
+            }
         }
     }
     let _ = (cfg, train);
@@ -1922,11 +2068,21 @@ pub enum FitFallbackCause {
     NonFinite,
     /// The CUDA fit launch failed; the whole batch went to the CPU.
     Launch,
+    /// #233: the device proposal is worse on the exact AUC than the starting
+    /// constants, so it was reverted to `c0` and refit on the CPU.
+    AucWorse,
+    /// #233: the device proposal is worse on the class-balanced logistic
+    /// surrogate than the starting constants, so it was reverted to `c0` and
+    /// refit on the CPU. Counts measurable surrogate-vs-exact disagreement.
+    SurrogateWorse,
+    /// #233: fewer than ten rows of one class. AUC is chance-level noise there
+    /// and the balanced weights are unbounded, so the arm is not offered.
+    AucDegenerate,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 7] = [
+    pub const ALL: [FitFallbackCause; 10] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -1934,6 +2090,9 @@ impl FitFallbackCause {
         FitFallbackCause::IllConditioned,
         FitFallbackCause::NonFinite,
         FitFallbackCause::Launch,
+        FitFallbackCause::AucWorse,
+        FitFallbackCause::SurrogateWorse,
+        FitFallbackCause::AucDegenerate,
     ];
 
     /// Stable JSON label.
@@ -1946,6 +2105,9 @@ impl FitFallbackCause {
             FitFallbackCause::IllConditioned => "ill_conditioned",
             FitFallbackCause::NonFinite => "non_finite",
             FitFallbackCause::Launch => "launch",
+            FitFallbackCause::AucWorse => "auc_worse",
+            FitFallbackCause::SurrogateWorse => "auc_surrogate_worse",
+            FitFallbackCause::AucDegenerate => "auc_degenerate",
         }
     }
 }
@@ -2054,16 +2216,21 @@ fn select_promoted(
 }
 
 /// #169: true when this generation's offspring are left unfitted for the
-/// batched GPU LM arm. The kernel minimises one objective per launch, so only a
-/// metric with a native device objective qualifies (#229: `squared`, the
-/// information criteria via [`Metric::is_least_squares`], and `log_squashed`
-/// with its IRLS weights); every other configuration keeps the CPU fit path it
-/// had before.
+/// batched GPU LM arm.
+///
+/// The kernel minimises one objective per launch, so only a metric with a
+/// native device objective qualifies (#229: `squared`, the information criteria
+/// via [`Metric::is_least_squares`], and `log_squashed` with its IRLS weights).
+/// #233 adds `auc`, where the kernel only *proposes* with the squared loss and
+/// the accepted constants must be no worse on the class-balanced logistic
+/// surrogate **and** on the exact CPU AUC, so the arm cannot change the
+/// configured objective (see [`crate::fit::gate_auc_proposal`]). Every other
+/// configuration keeps the CPU fit path it had before.
 fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
     defer_gpu
         && cfg.fit_strategy.defers_to_gpu()
         && cfg.fit_iters > 0
-        && crate::fit::fit_loss(cfg.metric).is_some()
+        && crate::fit::gpu_proposal_loss(cfg.metric).is_some()
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -3659,15 +3826,28 @@ fn run_search(
                 // natively, so this is always `Some`. It panics rather than
                 // defaulting to squared error, because a silent MSE ranking is
                 // exactly the #236 defect.
-                let loss = crate::fit::DeviceLoss::for_metric(cfg.metric)
-                    .expect("gpu_blocker admits only native device losses");
-                match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu(), loss) {
+                // #229/#233: the loss the *evaluator* accumulates. For `auc`
+                // the evaluator is never asked for a score (`fit_only`), so the
+                // proposal loss stands in; `gpu_blocker` admitted the run.
+                let loss = crate::fit::gpu_proposal_loss(cfg.metric)
+                    .expect("gpu_blocker admits only native device objectives");
+                match GpuSearch::new(
+                    train,
+                    cfg.fit_strategy.defers_to_gpu(),
+                    loss,
+                    cfg.metric == Metric::Auc,
+                ) {
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
                         // #169: the GPU-fit arm runs at the generation
                         // barrier, so the overlap pipeline is off for it.
                         let scheduling = if cfg.fit_strategy.defers_to_gpu()
+                            && defers_fit_to_gpu(cfg, true)
+                            && cfg.metric == Metric::Auc
+                        {
+                            "auc fit-only batches (synchronous; exact CPU fitness)".to_string()
+                        } else if cfg.fit_strategy.defers_to_gpu()
                             && defers_fit_to_gpu(cfg, true)
                         {
                             "GPU-fit batches (synchronous)".to_string()
@@ -3684,10 +3864,18 @@ fn run_search(
                                 (cfg.pop / cfg.pipeline_depth.max(1)).max(1)
                             )
                         };
+                        // #233: an `auc` run never takes a fitness from the
+                        // device; say so instead of implying f32 fitness.
+                        let fitness = if cfg.metric == Metric::Auc {
+                            "exact CPU auc fitness, reported numbers stay f64"
+                        } else {
+                            "f32 fitness, reported numbers stay f64"
+                        };
                         eprintln!(
-                            "# gpu: {} ({}; f32 fitness, reported numbers stay f64)",
+                            "# gpu: {} ({}; {})",
                             crate::gpu::GpuEvaluator::device_name(),
-                            scheduling
+                            scheduling,
+                            fitness
                         );
                     }
                     backend_device = Some(device);
@@ -3720,13 +3908,22 @@ fn run_search(
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
             "# gpu-fit: off (the batched kernel minimises squared error or \
-             log-squashed; --metric must be squared, log_squashed, aic, aicc or bic)"
+             log-squashed; --metric must be squared, log_squashed, aic, aicc or bic, \
+             or auc with the exact AUC gate)"
         );
     }
     #[cfg(feature = "cuda")]
     let mut defer_gpu = gpu.is_some();
     #[cfg(not(feature = "cuda"))]
     let defer_gpu = false;
+    // #233: the `auc` fit-only arm never produces a fitness, so the backend
+    // report states the split instead of claiming a device-scored run.
+    #[cfg(feature = "cuda")]
+    if gpu.as_ref().map_or(false, |g| g.fit_only) {
+        backend_reason = Some(
+            "auc is scored exactly on the CPU; the device proposes constants only".to_string(),
+        );
+    }
     #[cfg(feature = "cuda")]
     let mut gpu_used = false;
     #[cfg(not(feature = "cuda"))]
@@ -4648,7 +4845,11 @@ fn run_search(
             // A checkpoint is taken only at a generation boundary: all of the
             // generation's work, including migration and restarts, is done.
             if save_every > 0 && gens_done % save_every == 0 {
-                let backend = if defer_gpu || gpu_used {
+                // #233: the checkpoint records the *fitness* backend. An `auc`
+                // fit-only run scores every candidate on the CPU, so it stays
+                // `cpu` even though the device proposed constants; every other
+                // GPU run keeps the historical `defer_gpu || gpu_used` rule.
+                let backend = if gpu_used || (defer_gpu && cfg.metric != Metric::Auc) {
                     Backend::Gpu
                 } else {
                     Backend::Cpu
@@ -4689,7 +4890,7 @@ fn run_search(
     // full-data archive rebuild, so the saved archive is the search archive at
     // the last completed generation.
     if on_checkpoint.is_some() {
-        let backend = if defer_gpu || gpu_used {
+        let backend = if gpu_used || (defer_gpu && cfg.metric != Metric::Auc) {
             Backend::Gpu
         } else {
             Backend::Cpu
@@ -4714,9 +4915,18 @@ fn run_search(
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
-    let gpu_fit_used = cfg.fit_strategy.defers_to_gpu() && gpu_used;
+    // #233: the exact finalist refit is owed whenever the arm proposed
+    // constants, including the `auc` fit-only mode where no fitness came from
+    // the device.
+    #[cfg(feature = "cuda")]
+    let fit_arm_ran = gpu.as_ref().map_or(false, |g| g.fit_attempts > 0);
+    #[cfg(not(feature = "cuda"))]
+    let fit_arm_ran = false;
+    let gpu_fit_used = cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_arm_ran);
     let mut gpu_fit_refits = 0usize;
-    if subsampling_active(cfg, train) || gpu_used || resumed || fit_screened {
+    // #233: an `auc` fit-only run never sets `gpu_used`, but its finalists still
+    // carry device-proposed constants, so they owe the same exact refit.
+    if subsampling_active(cfg, train) || gpu_used || resumed || fit_screened || fit_arm_ran {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
         // training row with the CPU in f64. From here on the archive and every
@@ -4773,7 +4983,7 @@ fn run_search(
     // #131: the GPU report is emitted only for a run that actually used the
     // device, so a CPU run's JSON is byte-identical to before.
     #[cfg(feature = "cuda")]
-    let gpu_stats = if gpu_used {
+    let gpu_stats = if gpu_used || fit_arm_ran {
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
@@ -4784,7 +4994,7 @@ fn run_search(
     };
     #[cfg(not(feature = "cuda"))]
     let gpu_stats: Option<GpuRunStats> = {
-        let _ = gpu_fit_refits;
+        let _ = (gpu_fit_refits, fit_arm_ran);
         None
     };
 
@@ -4817,7 +5027,7 @@ fn run_search(
             crate::backend::Kind::Cpu
         },
         backend_reason,
-        device: if gpu_used { backend_device } else { None },
+        device: if gpu_used || fit_arm_ran { backend_device } else { None },
         gpu: gpu_stats,
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
@@ -5017,6 +5227,10 @@ mod tests {
                 "ill_conditioned",
                 "non_finite",
                 "launch",
+                // #233: the auc gate's own causes.
+                "auc_worse",
+                "auc_surrogate_worse",
+                "auc_degenerate",
             ]
         );
         assert_eq!(
@@ -5068,6 +5282,12 @@ mod tests {
             };
             assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
         }
+        // #233: `auc` is admitted, but as a proposal: the exact gate decides.
+        let auc = Config {
+            metric: Metric::Auc,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&auc, true), "auc reaches the proposal gate");
         for metric in [Metric::Absolute, Metric::Slope, Metric::Median, Metric::Correlation] {
             let cfg = Config {
                 metric,
