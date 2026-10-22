@@ -225,7 +225,7 @@ pub fn json() -> String {
          \"enrich\":{{\"command\":\"rcsr enrich\",\"summary\":\"append causal, gap-aware OHLCV features to an existing .rcsb store without rebuilding it\",\"doc\":\"docs/ohlcv.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"existing .rcsb store or a CSV (loaded once into a temporary store)\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"<data>.enriched.rcsb\",\"description\":\"output store; existing columns are copied byte for byte\"}},\
-{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"default financial feature set: returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, py15m, compact, flow, all, or explicit names; #125 names/groups also accepted. compact is the exact 52-name parity/smoke subset; flow is vwap plus the nine derived OHLCV/flow columns. feature_registry lists every default-set column as available:true or available:false with its missing dependency; an unavailable or unknown name fails closed\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"default financial feature set: returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, cross, py15m, compact, flow, all, or explicit names; #125 names/groups also accepted. compact is the exact 52-name parity/smoke subset; flow is vwap plus the nine derived OHLCV/flow columns; cross is the complete #273 BTC/ETH benchmark, market-state, breadth, dispersion, average-correlation and [-1,1] rank family. feature_registry lists every default-set column as available:true or available:false with its missing dependency; an unavailable or unknown name fails closed\"}},\
 {{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n> (repeatable; labels are targets)\"}},\
 {{\"name\":\"--replace\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"overwrite an existing numeric column in place; default refuses a duplicate and preserves every column\"}},\
 {{\"name\":\"--chunk-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"read/compute batch; arithmetic and output hashes are identical for every size\"}},\
@@ -235,6 +235,8 @@ pub fn json() -> String {
 {{\"name\":\"--symbol\",\"type\":\"string\",\"default\":\"auto\",\"description\":\"panel symbol column\"}},\
 {{\"name\":\"--cross-symbol\",\"type\":\"string\",\"default\":\"BTCUSDT\",\"description\":\"benchmark symbol for btc/cross features\"}},\
 {{\"name\":\"--cross-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"benchmark store when --data does not contain it\"}},\
+{{\"name\":\"--eth-symbol\",\"type\":\"string\",\"default\":\"ETHUSDT\",\"description\":\"ETH benchmark symbol for eth/cross features\"}},\
+{{\"name\":\"--eth-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"ETH benchmark store when --data does not contain it\"}},\
 {{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; auto uses a registered exact kernel only when it beats the CPU, on forces it above the 1M-row floor, off runs the CPU reference\"}},\
 {{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\

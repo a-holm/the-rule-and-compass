@@ -383,7 +383,7 @@ atomically instead of streaming it. See
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
 * **Incremental feature enrichment**: `rcsr enrich --data old.rcsb --out
-  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc`
+  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc,cross`
   appends pre-computed columns without rebuilding rows: existing value/code
   blocks are copied byte for byte, dtypes and dictionaries survive, a duplicate
   name needs an explicit `--replace`, and every change is chunk-size stable.
@@ -394,11 +394,13 @@ atomically instead of streaming it. See
   nine derived OHLCV/flow columns (taker ratios, trade intensity, average trade
   size, Amihud illiquidity, zero-return share, OBV z-score, CVD proxy and VWAP
   deviation) with the documented zero-volume/zero-trade and gap policies. The
-  default financial feature set is
-  registered in `rcsr schema` (`feature_registry`): every available column has a
-  tested producer, and registered-but-unavailable MTF, market-state and
-  derivative columns fail closed with the missing dependency instead of being
-  silently dropped. The CPU path is always available; a per-family cost model
+  `cross` group adds the complete #273 BTC/ETH benchmark context, equal-weight
+  market state, breadth, dispersion, average-correlation proxy, ex-self
+  relative returns and `[-1,1]` PIT cross-sectional ranks. The default financial
+  feature set is registered in `rcsr schema` (`feature_registry`): every
+  available column has a tested producer, and registered-but-unavailable MTF
+  and derivative columns fail closed with the missing dependency instead of
+  being silently dropped. The CPU path is always available; a per-family cost model
   decides CPU vs GPU and records the reason, GPU builds upload the source
   columns once and report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the

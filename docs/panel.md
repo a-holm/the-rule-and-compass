@@ -49,6 +49,19 @@ Migrations are applied before membership with the verified
 tolerance of the declared `k`, prices are divided by `k`, base volume is
 multiplied by `k`, and the overlap is removed. A wrong `k` is a hard error.
 
+### Cross-sections use the same PIT rule
+
+`rcsr enrich --features cross` computes equal-weight market state, breadth,
+dispersion, the average-correlation proxy and cross-sectional ranks only from
+rows that are live at the timestamp. The pass reads `member_asof` when the
+store carries it and requires `member_asof <= t`; a pre-listing or
+post-delisting row is excluded from every statistic and receives `NaN` for the
+cross-sectional columns. It never injects a symbol from a later membership
+decision, never forward-fills a missing timestamp, and requires at least 20
+valid members. A symbol whose last bar is before the panel end therefore
+cannot enter a later breadth, dispersion or rank value. See
+[`ohlcv.md`](ohlcv.md#cross-asset-breadth-and-rank-family-273).
+
 ## Resumable builds
 
 A full hourly rebuild from 25,000 monthly archives is longer than one short

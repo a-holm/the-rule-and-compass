@@ -276,6 +276,28 @@ done
 **What fails.** One profitable symbol can carry the mean while the model loses
 on every other symbol. The per-group spread, not the pooled mean, is the result.
 
+### Cross-sectional context is a PIT join, not a survivor list
+
+`rcsr enrich --features cross` produces equal-weight market state, breadth,
+dispersion, the average-correlation proxy and `[-1,1]` ranks. Treat them as
+time-clustered panel columns:
+
+* the statistic at `t` uses only rows live at `t` (`member_asof <= t` when the
+  store carries it); a pre-listing or delisted row is excluded and its own
+  cross-sectional output is `NaN`;
+* `N < 20` valid members makes the timestamp `NaN`, never a rank over a
+  partial cross-section;
+* benchmark joins (`btc_*`, `eth_*`) use the exact timestamp; a missing
+  benchmark bucket is `NaN`, never forward-filled;
+* a cross-sectional rank is a property of the timestamp, so effective `N` for
+  inference is the number of timestamps, not the number of asset rows. Block
+  bootstrap by time (and, when appropriate, by symbol cluster), not i.i.d. rows.
+
+The tests
+`tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit`,
+`a_partial_cross_section_is_nan_and_a_prefix_is_causal` and
+`btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails` pin these rules.
+
 ---
 
 ## 7. Count every trial, then deflate

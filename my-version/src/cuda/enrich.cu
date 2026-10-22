@@ -651,9 +651,9 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
     unsigned int finite = counts[g];
     unsigned int pos = (unsigned int)p - (unsigned int)off[g];
     double v = NAN;
-    if (pos < finite && finite >= 2 &&
+    if (pos < finite && finite >= 20 &&
         keys[p] != 0xFFFFFFFFFFFFFFFFULL) {
-        v = (double)pos / (double)(finite - 1);
+        v = 2.0 * (double)pos / (double)(finite - 1) - 1.0;
     }
     out[rows[p]] = v;
 }

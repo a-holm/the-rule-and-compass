@@ -177,12 +177,20 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `donchian` | `don20 don96` | close position in the trailing high/low channel; `don96` is centred on 0 |
 | `calendar` | `dow_* hour_* month_* dom_*` (sin/cos) | UTC calendar cycles |
 | `lags` | `lag_r1_1` .. `lag_r1_10` | causal copies of `r1`, refused across a gap |
-| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp cross-section, `(rank-1)/(n-1)` |
-| `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by timestamp |
+| `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp PIT rank in `[-1,1]`, `N>=20` |
+| `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by exact timestamp |
+| `cross` | 45 columns | the complete #273 cross-asset, ETH, market-state, breadth, dispersion, average-correlation and rank family |
 | `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
 | `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
 | `flow` | `vwap` plus `taker_ratio96 taker_imb16 trade_intensity96 avg_trade_size96 amihud96 zero_ret_share96 obv_z96 cvd_proxy vwap_dev96` | the complete OHLCV/flow family (#270) |
-| `all` | every legacy group above except `py15m`, `compact`, `flow` | |
+| `all` | every legacy group above except `cross`, `py15m`, `compact`, `flow` | |
+
+The five `py15m` names `mkt_r16`, `mkt_r96`, `mkt_vol96`, `rel_r16` and
+`rel_r96` predate #273. `mkt_*` are now the canonical equal-weight market
+columns below; on a single-symbol slice they are `NaN` because the market
+requires 20 PIT members. `rel_r16`/`rel_r96` remain the legacy BTC-relative
+py15m columns. This is a deliberate correction of the old six BTC joins, not a
+second implementation.
 
 `ta:core`, `ta:full`, `exotic:cheap`, `candle:geometry`, `cross:btc` and
 `calendar` keep their #125 meaning and are computed by `rcsr::features`, not
@@ -276,6 +284,60 @@ VWAP proxy, which differs on rows where exchange `quote_volume` is not exactly
 `typical_price × volume`. The four values are compared at
 `abs/rel <= 1e-12` by `flow_shared_names_match_the_compact_regression_fixture`.
 
+### Cross-asset, breadth and rank family (#273)
+
+`--features cross` emits the complete inventory. Every name is registered
+`family=cross`, `timeframe=15m`, `available=true`, with its warm-up, formula,
+source and PIT rule in `rcsr schema`.
+
+Benchmark joins (`btc_*`, `eth_*`, `rel_btc_*`, `rel_eth_*`, `beta_*`):
+
+* use the exact same timestamp as the compact builder (`Cross::at`, no nearest
+  or as-of search); a missing benchmark bucket is `NaN`, never `0` and never
+  forward-filled;
+* `btc_r1 r16 r20 r96 r672`, `btc_vol20 vol96`, `rel_btc_r1 r16 r20 r96`,
+  `beta_btc_60 beta_btc_384`, and the same thirteen `eth_*`/`rel_eth_*`
+  columns; `--cross-symbol` (default `BTCUSDT`) and `--eth-symbol` (default
+  `ETHUSDT`) select the series, and `--cross-data`/`--eth-data` load an external
+  store;
+* beta is trailing, gap-contiguous, uses one-bar returns and is clipped to
+  `[-5,5]`; the benchmark's own beta is `1` once its window is complete;
+* a one-bucket timestamp shift changes the value; the test suite asserts that
+  the shifted arm differs from the exact join.
+
+Whole-panel market state, breadth and dispersion:
+
+| column | definition | note |
+|---|---|---|
+| `mkt_r16`, `mkt_r96` | equal-weight mean of PIT member returns | includes self |
+| `mkt_vol96` | equal-weight mean of member `vol96` | includes self |
+| `breadth` | share of PIT members with `r16 > 0` | `[0,1]` |
+| `dispersion` | population std of member `r16` | not annualised |
+| `avg_corr` | mean over members of `corr(r_i, mkt_r1, 96)` | documented proxy for average pairwise correlation; `[-1,1]` |
+| `rel_mkt16`, `rel_mkt96` | `r_i - mean_{j != i} r_j` | strictly ex-self |
+| `mkt_ew_ret1`, `mkt_ew_ret16`, `mkt_breadth`, `mkt_dispersion` | legacy #269 aliases | one implementation, no duplicate formula |
+| `btc_volume_share` | `BTC volume / total PIT member volume` | needs the raw `volume` column |
+
+Every cross-sectional column requires at least **20** valid point-in-time
+members at the timestamp. With `N < 20` the whole timestamp is `NaN`; a
+member with a non-finite source is excluded from the count but does not make a
+different member's market state `NaN`.
+
+Ranks (`xs_rank_r1 r16 r20 vol20 amihud96`, plus the legacy `cs_rank_r60`) are
+`2*(rank-1)/(n-1)-1` in `[-1,1]`. They use finite PIT members only, require
+`N>=20`, and break ties by symbol name then row order. `xs_rank_amihud96`
+inherits the #270 Amihud input requirement (`quote_volume`); a missing raw
+field fails closed naming both the rank and the field.
+
+Point-in-time membership is a row filter, not a survivor universe. When the
+store carries `member_asof`, only rows with `member_asof <= t` enter a
+cross-sectional statistic; a pre-listing or post-delisting row is excluded and
+its own cross-sectional output is `NaN`. Stores without `member_asof` use the
+rows present at `t`, which is the same PIT rule when the store is itself a PIT
+panel. Nothing is forward-filled, so a symbol's first and last bar are hard
+boundaries. `docs/cross-asset-inventory.json` is the machine-readable
+name/family/warm-up/PIT/test inventory.
+
 ### Compact parity fixture
 
 `my-version/tests/fixtures/enrich/compact_15m_ohlcv.csv` is a contiguous 7,200
@@ -311,10 +373,11 @@ prints the nominal warm-up, the observed `NaN` count and the first finite row.
 `cargo test --test enrich every_catalogue_column_is_causal_on_a_prefix` checks
 that truncating the store never changes an earlier value.
 
-`xs_rank_*` ranks each timestamp across symbols, ignores non-finite source
-values, breaks ties by symbol name then row order, and returns `NaN` when fewer
-than two values are present. The pass holds one source column, the time column,
-a row permutation and the rank column (about 32 B/row), never the whole panel.
+`xs_rank_*` ranks each timestamp across PIT symbols, ignores non-finite source
+values, breaks ties by symbol name then row order, maps the rank to `[-1,1]`,
+and returns `NaN` when fewer than 20 finite members are present. The pass holds
+one source column, the time column, a row permutation and the rank column
+(about 32 B/row), never the whole panel.
 `rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
 
 ### `py15m` parity
