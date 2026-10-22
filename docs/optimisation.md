@@ -799,11 +799,18 @@ admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
-`non_finite`, `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+`non_finite`, `launch`, plus `auc_worse`, `auc_surrogate_worse` and
+`auc_degenerate` for the `auc` arm) in `gpu.fit.fallback_by_cause`.
+`--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family, and
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, accepted only when the configured loss improves and gated by a
 scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
+`auc` (#233) is admitted as a **proposal**: the kernel fits the `{0, 1}` label by
+squared error, and the constants are kept only when the class-balanced logistic
+surrogate and the exact CPU AUC are both no worse than at the starting
+constants; otherwise they are reverted and refit by `logistic_irls`. Its fitness
+is always the exact CPU AUC, and the checkpoint records `backend cpu`.
 An explicit `gpu` with any other metric is a usage error (exit 2) naming
 `--metric squared`, `--metric log_squashed` or a CPU strategy (exact, auto,
 linear, varpro, stream), never a silent CPU fit of a different objective

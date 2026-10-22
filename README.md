@@ -32,10 +32,14 @@ device — least squares for the squared/AIC family, IRLS for `log_squashed`
 arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
-constants, so the seed-constant screen cannot cost quality at large `N`) can be
+constants, so the seed-constant screen cannot cost quality at large `N`; for
+`--metric auc` it only *proposes* constants, which are kept only when the
+class-balanced logistic surrogate and the exact CPU AUC are both no worse than
+the starting constants) can be
 forced individually. An explicit `gpu` with a metric that has no native device
-objective is a usage error, because the kernel would otherwise fit a different
-loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
+objective (and is not `auc`) is a usage error, because the kernel would otherwise
+fit a different loss; use `--metric squared`, `--metric log_squashed` or a CPU
+strategy. Every arm falls back to
 the default LM path when it cannot prove a safe result, and the default remains
 the historical LM path bit for bit.
 
@@ -891,10 +895,14 @@ device — least squares for the squared/AIC family, IRLS for `log_squashed`
 arm;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
-constants, so the seed-constant screen cannot cost quality at large `N`) can be
+constants, so the seed-constant screen cannot cost quality at large `N`; for
+`--metric auc` it only *proposes* constants, which are kept only when the
+class-balanced logistic surrogate and the exact CPU AUC are both no worse than
+the starting constants) can be
 forced individually. An explicit `gpu` with a metric that has no native device
-objective is a usage error, because the kernel would otherwise fit a different
-loss; use `--metric squared`, `--metric log_squashed` or a CPU strategy. Every arm falls back to
+objective (and is not `auc`) is a usage error, because the kernel would otherwise
+fit a different loss; use `--metric squared`, `--metric log_squashed` or a CPU
+strategy. Every arm falls back to
 the default LM path when it cannot prove a safe result, and the default remains
 the historical LM path bit for bit.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
@@ -1010,7 +1018,10 @@ always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
 reproduction. A metric may use the GPU only when the kernel computes its
 objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
 every other metric is scored on the CPU, so no run is ever ranked by a proxy
-loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
+loss (#236). The exception is `--metric auc`, whose fitness is always the exact
+CPU AUC: `--fit-strategy gpu` lets the device *propose* constants, which are kept
+only when the class-balanced logistic surrogate and the exact AUC are both no
+worse, and the checkpoint records `backend cpu`. A GPU run also reports a measured `gpu` block (allocation, H2D,
 launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See

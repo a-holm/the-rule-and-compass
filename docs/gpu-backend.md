@@ -426,6 +426,19 @@ because they need more than one prediction per row, a different objective, a
 per-row weight array the evaluator does not carry, or a different set of rows
 every generation; the reason is printed in the one-line note.
 
+The one classification metric that may touch the device is `--metric auc`, and
+only for its **constant fit** (#233): `--fit-strategy gpu --metric auc` opens the
+device as a *proposer* while `GpuSearch::fit_only` scores every candidate with
+the exact CPU AUC. A proposal is accepted only when the class-balanced logistic
+surrogate and the exact AUC at the candidate's constants are both no worse than
+at its starting constants; otherwise the constants are reverted and the exact
+CPU classification arm refits them, so the configured metric can never be
+replaced by squared error. The backend line says
+`exact CPU auc fitness, reported numbers stay f64`, the backend report says
+`auc is scored exactly on the CPU; the device proposes constants only`, and the
+checkpoint records `backend cpu` because that is the evaluator that guided
+selection. `log_loss` and `hinge` still keep the CPU arm.
+
 Fallback and the flags:
 
 * With neither flag, a CUDA build with a usable device selects the GPU **for
@@ -825,15 +838,16 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
 only for a metric with a native device objective (squared/AIC family, and
-`log_squashed` since #229), with `p <= 20`, at most 96 flattened nodes, no
-shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The device objective is also a **CLI contract** (#223, extended by
-#229): an explicit `--fit-strategy gpu` with any metric *without* a native
-device objective — that is, outside `squared`, `aic`, `aicc`, `bic` and
-`log_squashed` — is a usage error (exit code `2`) raised before any data is
-read, because the only alternative would be a silent CPU fit of a different
-objective. The message names the two objectives the kernel minimises and every
-way out (`--metric squared`, `--metric log_squashed`, or a CPU fit strategy). The device-missing fallback below is unchanged: it never
+`log_squashed` since #229) or for `auc` (#233, proposal only), with `p <= 20`, at
+most 96 flattened nodes, no shared block constants, an analytic derivative for
+every operator, and at least `32p` rows. The device objective is also a **CLI
+contract** (#223, extended by #229): an explicit `--fit-strategy gpu` with any
+metric *without* a native device objective — that is, outside `squared`, `aic`,
+`aicc`, `bic`, `log_squashed` and `auc` — is a usage error (exit code `2`)
+raised before any data is read, because the only alternative would be a silent
+CPU fit of a different objective. The message names the objectives the kernel
+minimises and every way out (`--metric squared`, `--metric log_squashed`, or a
+CPU fit strategy). The device-missing fallback below is unchanged: it never
 claims the GPU arm and is recorded with its cause.
 
 The arm also screens before it fits: every unfitted offspring is
@@ -862,6 +876,28 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`), `metric_not_native`
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
+
+**`--metric auc` (#233).** Exact AUC is a rank statistic over all rows of a
+candidate, so the in-block LM cannot host it: a global sort of `P x N` keys is
+outside the kernel's layout. The arm is therefore a *proposer*:
+
+1. the device runs the same squared-error LM over the `{0, 1}` label;
+2. the host forms the **class-balanced logistic surrogate** of `1 - auc` on the
+   same rows in `f64` — per-row weight `n/(2 n_+)` for a positive and
+   `n/(2 n_-)` for a negative, loss `Σ ω·softplus(-t·p) / Σ ω` — at the starting
+   constants `c0` and at the proposal `c`;
+3. **exact AUC at candidate exit**: `1 - auc(c) <= 1 - auc(c0)` and
+   `surrogate(c) <= surrogate(c0)`. Both must hold, so the surrogate is a real
+   in-loop veto (it can reject a proposal that improves AUC but degrades every
+   margin) and the exact metric is the acceptance test;
+4. otherwise the constants are **reverted to `c0`** and the candidate is refit
+   by the exact CPU classification arm (`logistic_irls`), which only accepts
+   improvements in the same metric. The invariant is `metric(final) <=
+   metric(start)` for every candidate, on every device.
+
+Squared error is never the acceptance criterion for `auc`, and the surrogate is
+never reported as, or compared with, an AUC value. The search fitness stays the
+exact CPU AUC and the checkpoint records `backend cpu`.
 
 **Exactness.** Search fitness is still f32 and only guides selection. Every
 finalist is refit by the exact CPU f64 LM on all training rows before the final
@@ -1007,6 +1043,69 @@ and falls back.
 **Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
 arm yet: it scores a tree as soon as it is offered, before the barrier fit
 batch, so the GPU-fit path uses synchronous generation batches.
+
+### AUC on the batched kernel (issue #233)
+
+`--metric auc` is `1 - AUC`, a rank statistic: piecewise constant, zero gradient
+a.e., and `n₊n₋` pairs per candidate. The batched kernel cannot minimise it, and
+a global sort of every candidate's rows is outside its layout. The arm is
+therefore a **proposer with an exact gate**:
+
+```
+exact AUC  = 1 - U/(n₊n₋)                       (host, f64, the acceptance test)
+surrogate  = Σ ω·softplus(-t·p) / Σ ω           (host, f64, the in-loop veto)
+             ω = b·(n/(2n₊)) for a positive, b·(n/(2n₋)) for a negative
+             t = ±1 from the label rule y > (min+max)/2
+```
+
+The device runs the ordinary squared-error LM on the `{0, 1}` label; the host
+keeps the constants only when **both** `1 - auc(c) <= 1 - auc(c0)` and
+`surrogate(c) <= surrogate(c0)`, otherwise it reverts to `c0` and the exact CPU
+classification arm refits from there. The balanced weights are what keep a 1 %-
+positive sample from putting 99 % of the objective on the negative class, and the
+softplus form (`max(-u,0) + ln1p(e^{-|u|})`) is the Lin–Lin–Weng formulation
+that neither overflows nor loses the small-`u` term.
+
+Rejections are labelled (`auc_worse`, `auc_surrogate_worse`, `auc_degenerate`)
+and counted in `gpu.fit.fallback_by_cause`; the fitness is the exact CPU AUC, so
+the run reports `backend cpu` with
+`auc is scored exactly on the CPU; the device proposes constants only`. The
+surrogate is never reported as, or compared with, an AUC value.
+
+### Measured: `--metric auc`
+
+`bench_auc_end_to_end` (RTX 3060, CUDA 12, release build, equal evaluations,
+seed 93, 15 % deterministic label noise, 5 % positives, `--fit-iters 8`, two
+islands, `--pop 64`, three generations = 384 evaluations; the machine also had a
+10-hour run resident, so the wall numbers carry noise):
+
+| cell | arm | wall | best AUC | fit-host share | fit kernel | admitted / device / fallback |
+|---|---|---:|---:|---:|---:|---|
+| N = 20 000 | `exact` | 4.24 s | 0.611376 | – | – | – |
+| N = 20 000 | `auc` + `gpu` | 4.86 s (**0.87×**) | **0.612151** | 69.5 % | 0.17 s (3.5 %) | 248 / 168 / 80 (**32.3 %**) |
+| N = 100 000 | `exact` | 32.21 s | **0.612533** | – | – | – |
+| N = 100 000 | `auc` + `gpu` | 31.32 s (**1.03×**) | 0.612332 | 76.7 % | 0.92 s (3.0 %) | 248 / 168 / 80 (**32.3 %**) |
+
+Fallback causes at both cells: `auc_surrogate_worse` 41–59, `auc_worse` 14–31,
+`ill_conditioned` 7–8, every other cause zero; 128–130 finalists were refit
+exactly on the CPU. Reading:
+
+* **No speed-up.** Wall time is 0.87–1.03× the exact arm. The kernel is only
+  3.0–3.5 % of wall because the exact CPU AUC (screen + rescore) and the exact
+  refits dominate. This cell does **not** meet the ≥10× fit-stage falsifier in
+  `arbeidsmappe/crypto-rcsr/gpu-metrics/classification.md` §9.
+* **No measurable quality change.** Best AUC differs by ±0.0008, inside the
+  spread of 384 evaluations on a noisy 5 %-positive sample. The invariant is
+  exact by construction (`metric(final) <= metric(start)`), not by luck.
+* **The gate is a real veto.** A third of the admitted proposals were reverted:
+  mostly on the class-balanced surrogate (41–59), the rest on the exact AUC
+  (14–31) or conditioning (7–8).
+
+The honest default is therefore unchanged: the arm is opt-in behind
+`--fit-strategy gpu`, and an `auc` run without it is bit-for-bit the CPU path.
+Earning a default needs a device-side scorer for the *fitness* (a global rank
+sort the in-block LM cannot host) or a cheaper exact screen; that is outside this
+slice and tracked in issue #233.
 
 ### LogSquashed on the batched kernel (issue #229)
 
