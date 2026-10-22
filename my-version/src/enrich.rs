@@ -72,6 +72,7 @@ pub const GROUPS: &[&str] = &[
     "btc",
     "py15m",
     "compact",
+    "flow",
     "all",
 ];
 
@@ -94,6 +95,32 @@ pub const COMPACT_NAMES: &[&str] = &[
 
 pub fn compact_names() -> Vec<String> {
     COMPACT_NAMES.iter().map(|s| s.to_string()).collect()
+}
+
+/// The complete OHLCV/flow family: the derived VWAP plus the nine derived flow
+/// columns of issue #270. The raw ten OHLCV/flow fields are input columns and
+/// are registered separately; `vwap` may be either an input column (built by
+/// `rcsr prep`, #259) or materialised by this group.
+///
+/// Every window is trailing and inclusive of `t`, in 15 m bars. A window that
+/// spans a gap is `NaN`; `OBV`/`CVD` cumulative state restarts after a gap so a
+/// listing/delisting/migration boundary is never bridged. Zero volume or zero
+/// trades gives `NaN` for the affected ratios and illiquidity (never `0`).
+pub const FLOW_NAMES: &[&str] = &[
+    "vwap",
+    "taker_ratio96",
+    "taker_imb16",
+    "trade_intensity96",
+    "avg_trade_size96",
+    "amihud96",
+    "zero_ret_share96",
+    "obv_z96",
+    "cvd_proxy",
+    "vwap_dev96",
+];
+
+pub fn flow_names() -> Vec<String> {
+    FLOW_NAMES.iter().map(|s| s.to_string()).collect()
 }
 
 /// Multi-timeframe context columns from the default financial feature set.
@@ -234,6 +261,47 @@ fn compact_formula(name: &str) -> &'static str {
     }
 }
 
+fn flow_formula(name: &str) -> &'static str {
+    match name {
+        "vwap" => "quote_volume / volume",
+        "taker_ratio96" => "mean(taker_buy_base,96)/mean(volume,96)",
+        "taker_imb16" => "(2 mean(tb,16)-mean(V,16))/mean(V,16)",
+        "trade_intensity96" => "ln(1+mean(trades,96)/mean(volume,96))",
+        "avg_trade_size96" => "ln(1+mean(quote_volume/max(trades,1),96))",
+        "amihud96" => "1e6 mean(|ln(C_t/C_{t-1})|/quote_volume,96)",
+        "zero_ret_share96" => "mean(1[ln(C_t/C_{t-1})==0],96)",
+        "obv_z96" => "z-score of OBV over 96; OBV_t=OBV_{t-1}+sign(dC) volume",
+        "cvd_proxy" => "cumulative(2 taker_buy_base-volume)/std(cumulative,96)",
+        "vwap_dev96" => "(C-mean(quote_volume,96)/mean(volume,96))/(mean(quote_volume,96)/mean(volume,96))",
+        _ => "see docs/ohlcv.md",
+    }
+}
+
+/// Raw columns required by one flow feature. `close`/`open`/`high`/`low` are
+/// mandatory for every enrich run; these are the optional raw fields.
+fn flow_requires(name: &str) -> &'static [&'static str] {
+    match name {
+        "vwap" | "vwap_dev96" => &["volume", "quote_volume"],
+        "taker_ratio96" | "taker_imb16" => &["volume", "taker_buy_base"],
+        "trade_intensity96" => &["volume", "trades"],
+        "avg_trade_size96" => &["quote_volume", "trades"],
+        "amihud96" => &["quote_volume"],
+        "zero_ret_share96" => &[],
+        "obv_z96" => &["volume"],
+        "cvd_proxy" => &["volume", "taker_buy_base"],
+        _ => &[],
+    }
+}
+
+fn flow_warmup(name: &str) -> usize {
+    match name {
+        "vwap" => 0,
+        "taker_imb16" => 15,
+        "amihud96" | "zero_ret_share96" => 96,
+        _ => 95,
+    }
+}
+
 /// One registered column in the default financial feature set.
 #[derive(Clone, Debug)]
 pub struct RegistryEntry {
@@ -288,6 +356,24 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             formula: "input column".to_string(),
             source: "input",
             pit: "bar t",
+            reason: None,
+        });
+    }
+    // OHLCV/flow family (#270): vwap plus the nine derived flow columns.
+    // Registered before the compact loop so the canonical flow formula and
+    // family win for the four names the compact subset shares.
+    for name in FLOW_NAMES {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family: "flow",
+            timeframe: "15m",
+            warmup: flow_warmup(name),
+            available: true,
+            derived: false,
+            formula: flow_formula(name).to_string(),
+            source: "raw OHLCV/flow columns",
+            pit: "close of bar t; trailing windows inclusive; gaps are NaN; \
+                  zero volume/trades is NaN for affected ratios",
             reason: None,
         });
     }
@@ -635,6 +721,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "btc" => btc_names(),
             "py15m" => py15m_names(),
             "compact" => compact_names(),
+            "flow" => flow_names(),
             "all" => {
                 let mut v = Vec::new();
                 for g in [
@@ -676,7 +763,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
 
 /// Names implemented by this module (as opposed to delegated to #125).
 pub fn is_own(name: &str) -> bool {
-    if is_compact(name) {
+    if is_compact(name) || FLOW_NAMES.contains(&name) {
         return true;
     }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
@@ -774,6 +861,9 @@ fn compact_warmup(name: &str) -> Option<usize> {
 }
 
 pub fn nominal_warmup(name: &str) -> usize {
+    if FLOW_NAMES.contains(&name) {
+        return flow_warmup(name);
+    }
     if let Some(w) = compact_warmup(name) {
         return w;
     }
@@ -1209,7 +1299,7 @@ pub fn compact_family(name: &str) -> &'static str {
         "natr14" | "adx14" | "di_diff14" | "batr" | "gapatr" => "atr",
         "rsi14" | "mfi14" => "rsi",
         "cmf20" | "taker_ratio96" | "taker_imb16" | "trade_intensity96" => "flow",
-        "vwap_dev96" => "vwap",
+        "vwap_dev96" => "flow",
         "clv1" | "clv4" | "body1" | "wasym1" | "lower_wick" | "rng1" => "candle",
         "ou_hl96" | "acf1" | "vr4" | "rskew96" | "jump_share" | "semivar_asym"
         | "cusum_abs_z" => "exotic",
@@ -1221,6 +1311,9 @@ pub fn compact_family(name: &str) -> &'static str {
 }
 
 pub fn family_of(name: &str) -> &'static str {
+    if FLOW_NAMES.contains(&name) {
+        return "flow";
+    }
     if is_compact(name) {
         return compact_family(name);
     }
@@ -2605,6 +2698,17 @@ fn py15m_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>> 
     out.insert("mkt_vol96".to_string(), mv96);
     out.insert("rel_r16".to_string(), rel16);
     out.insert("rel_r96".to_string(), rel96);
+
+    // py15m shares `obv_z96` and `vwap_dev96` with the flow family; use the one
+    // canonical implementation. With a contiguous fixture and `quote_volume =
+    // typical_price * volume`, this is numerically identical to the legacy
+    // Python formula.
+    let flow = flow_all(s);
+    for name in ["obv_z96", "vwap_dev96"] {
+        if let Some(vals) = flow.get(name) {
+            out.insert(name.to_string(), vals.clone());
+        }
+    }
     out
 }
 
@@ -2638,6 +2742,207 @@ fn div_pos(a: f64, b: f64) -> f64 {
     } else {
         f64::NAN
     }
+}
+
+/// Compute the complete OHLCV/flow family for one symbol (#270).
+///
+/// All windows are trailing and inclusive of `t`; a window whose timestamps are
+/// not one contiguous run at `s.step` is `NaN`. `OBV` and `CVD` cumulative
+/// state restarts after a gap, so a listing/delisting/migration boundary is
+/// never bridged. A zero-volume bar makes `vwap`, the taker ratios, trade
+/// intensity, Amihud and `vwap_dev96` `NaN`; zero trades makes trade intensity
+/// `NaN` and `avg_trade_size96` uses the specified `max(trades, 1)`.
+fn flow_all(s: &Series) -> BTreeMap<String, Vec<f64>> {
+    let n = s.len();
+    let c = &s.close;
+    let v = &s.volume;
+    let qv = &s.quote_volume;
+    let trades = &s.trades;
+    let tb = &s.taker_buy_base;
+    let times = &s.times;
+    let step = s.step;
+    let mut out = BTreeMap::new();
+
+    // vwap is the raw quote-volume / base-volume ratio in price units.
+    out.insert(
+        "vwap".to_string(),
+        (0..n).map(|i| div_pos(qv[i], v[i])).collect(),
+    );
+
+    let v96 = rmean_py(v, 96, times, step);
+    let qv96 = rmean_py(qv, 96, times, step);
+    let tb96 = rmean_py(tb, 96, times, step);
+    let trades96 = rmean_py(trades, 96, times, step);
+    let v16 = rmean_py(v, 16, times, step);
+    let tb16 = rmean_py(tb, 16, times, step);
+
+    out.insert(
+        "taker_ratio96".to_string(),
+        (0..n).map(|i| div_pos(tb96[i], v96[i])).collect(),
+    );
+    out.insert(
+        "taker_imb16".to_string(),
+        (0..n)
+            .map(|i| div_pos(2.0 * tb16[i] - v16[i], v16[i]))
+            .collect(),
+    );
+    out.insert(
+        "trade_intensity96".to_string(),
+        (0..n)
+            .map(|i| {
+                if trades96[i].is_finite() && v96[i] > 0.0 && trades96[i] > 0.0 {
+                    (1.0 + trades96[i] / v96[i]).ln()
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    // Per-bar quote volume per trade, then the trailing log mean. `max(trades,1)`
+    // is explicit in the issue definition, so a zero-trade bar is not a gap.
+    let per_trade: Vec<f64> = (0..n)
+        .map(|i| {
+            if qv[i].is_finite() && qv[i] >= 0.0 && trades[i].is_finite() {
+                qv[i] / trades[i].max(1.0)
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let per_trade96 = rmean_py(&per_trade, 96, times, step);
+    out.insert(
+        "avg_trade_size96".to_string(),
+        (0..n)
+            .map(|i| {
+                if per_trade96[i].is_finite() && per_trade96[i] >= 0.0 {
+                    (1.0 + per_trade96[i]).ln()
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    let lr = ret_k(s, 1);
+    let amihud_bar: Vec<f64> = (0..n)
+        .map(|i| {
+            if lr[i].is_finite() && qv[i].is_finite() && qv[i] > 0.0 {
+                lr[i].abs() / qv[i]
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    out.insert(
+        "amihud96".to_string(),
+        rmean_py(&amihud_bar, 96, times, step)
+            .into_iter()
+            .map(|x| x * 1e6)
+            .collect(),
+    );
+
+    let zero_bar: Vec<f64> = (0..n)
+        .map(|i| {
+            if lr[i].is_finite() {
+                if lr[i] == 0.0 { 1.0 } else { 0.0 }
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    out.insert(
+        "zero_ret_share96".to_string(),
+        rmean_py(&zero_bar, 96, times, step),
+    );
+
+    // OBV restarts at a gap; within a contiguous run it follows the issue's
+    // recurrence with sign(0) = 0.
+    let mut obv = vec![f64::NAN; n];
+    for i in 0..n {
+        if i == 0 {
+            obv[i] = if v[i].is_finite() { 0.0 } else { f64::NAN };
+            continue;
+        }
+        if times[i] - times[i - 1] != step {
+            obv[i] = if v[i].is_finite() { 0.0 } else { f64::NAN };
+            continue;
+        }
+        if !obv[i - 1].is_finite() || !c[i].is_finite() || !c[i - 1].is_finite() || !v[i].is_finite() {
+            obv[i] = f64::NAN;
+            continue;
+        }
+        let sign = if c[i] > c[i - 1] {
+            1.0
+        } else if c[i] < c[i - 1] {
+            -1.0
+        } else {
+            0.0
+        };
+        obv[i] = obv[i - 1] + sign * v[i];
+    }
+    let obv_m = rmean_py(&obv, 96, times, step);
+    let obv_s = rstd_py(&obv, 96, times, step);
+    out.insert(
+        "obv_z96".to_string(),
+        (0..n)
+            .map(|i| {
+                if obv_s[i] > 0.0 && obv[i].is_finite() && obv_m[i].is_finite() {
+                    (obv[i] - obv_m[i]) / obv_s[i]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    // CVD restarts at a gap; the proxy is the cumulative taker imbalance
+    // normalised by its own trailing 96-bar population standard deviation.
+    let mut cvd = vec![f64::NAN; n];
+    for i in 0..n {
+        if i > 0 && times[i] - times[i - 1] != step {
+            cvd[i] = f64::NAN;
+            continue;
+        }
+        if !v[i].is_finite() || !tb[i].is_finite() {
+            cvd[i] = f64::NAN;
+            continue;
+        }
+        let net = 2.0 * tb[i] - v[i];
+        let prev = if i == 0 { 0.0 } else { cvd[i - 1] };
+        cvd[i] = if prev.is_finite() { prev + net } else { net };
+    }
+    let cvd_s = rstd_py(&cvd, 96, times, step);
+    out.insert(
+        "cvd_proxy".to_string(),
+        (0..n)
+            .map(|i| {
+                if cvd[i].is_finite() && cvd_s[i] > 0.0 {
+                    cvd[i] / cvd_s[i]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    // VWAP deviation uses the issue's quote-volume VWAP, not the typical-price
+    // proxy used by the legacy compact/py15m builders.
+    let vwap96: Vec<f64> = (0..n).map(|i| div_pos(qv96[i], v96[i])).collect();
+    out.insert(
+        "vwap_dev96".to_string(),
+        (0..n)
+            .map(|i| {
+                if c[i].is_finite() && vwap96[i] > 0.0 {
+                    (c[i] - vwap96[i]) / vwap96[i]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    out
 }
 
 /// Compute the 52 compact features for one symbol.
@@ -3161,6 +3466,21 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
             .collect(),
     );
 
+    // The four flow names shared with the compact subset use the canonical
+    // #270 definition, including quote-volume VWAP. There is exactly one
+    // implementation per name.
+    let flow = flow_all(s);
+    for name in [
+        "vwap_dev96",
+        "taker_ratio96",
+        "taker_imb16",
+        "trade_intensity96",
+    ] {
+        if let Some(vals) = flow.get(name) {
+            out.insert(name.to_string(), vals.clone());
+        }
+    }
+
     out
 }
 
@@ -3275,6 +3595,7 @@ struct Context<'a> {
     own: Vec<String>,
     py15m_requested: Vec<String>,
     compact: Vec<String>,
+    flow: Vec<String>,
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
     cross: &'a Cross,
@@ -3324,6 +3645,17 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("compact column '{}' was not produced", name))?;
+            if let Some(t) = cols.get_mut(name) {
+                t.write_values(values)?;
+            }
+        }
+    }
+    if !ctx.flow.is_empty() {
+        let all = flow_all(s);
+        for name in &ctx.flow {
+            let values = all
+                .get(name)
+                .ok_or_else(|| format!("flow column '{}' was not produced", name))?;
             if let Some(t) = cols.get_mut(name) {
                 t.write_values(values)?;
             }
@@ -3465,6 +3797,14 @@ fn compute_own(
                 }
             }
             other => {
+                if FLOW_NAMES.contains(&other) {
+                    let mut all = flow_all(s);
+                    return Ok((
+                        all.remove(other)
+                            .ok_or_else(|| format!("flow column '{}' was not produced", other))?,
+                        warm,
+                    ));
+                }
                 if is_compact(other) {
                     let mut all = compact_all(s, b, ctx.cross);
                     return Ok((
@@ -3741,8 +4081,13 @@ fn enrich_inner(
     let mut own = Vec::new();
     let mut py15m_requested = Vec::new();
     let mut compact_requested = Vec::new();
+    let mut flow_requested = Vec::new();
     for n in &requested {
-        if is_compact(n) && (compact_profile || needs_compact(n)) {
+        if FLOW_NAMES.contains(&n.as_str()) {
+            // One canonical implementation for the flow names shared with the
+            // compact and py15m groups.
+            flow_requested.push(n.clone());
+        } else if is_compact(n) && (compact_profile || needs_compact(n)) {
             compact_requested.push(n.clone());
         } else if matches!(
             n.as_str(),
@@ -3775,43 +4120,38 @@ fn enrich_inner(
         }
     }
 
-    // The compact/reference flow features read raw exchange fields. A missing
-    // raw column is a hard input error naming that column, never a zero column.
-    let flow_names = [
-        "cmf20",
-        "mfi14",
-        "vwap_dev96",
-        "vol_z96",
-        "taker_ratio96",
-        "taker_imb16",
-        "trade_intensity96",
-    ];
-    let wants_flow = compact_requested.iter().any(|n| flow_names.contains(&n.as_str()));
-    let wants_trades = compact_requested.iter().any(|n| n == "trade_intensity96");
-    let wants_taker = compact_requested
+    // The flow family and the compact flow names read raw exchange fields. A
+    // missing raw column is a hard input error naming both the feature and the
+    // column, never a zero column.
+    let col_present = |col: &str| match col {
+        "volume" => cols.volume.is_some(),
+        "quote_volume" => cols.quote_volume.is_some(),
+        "trades" => cols.trades.is_some(),
+        "taker_buy_base" => cols.taker_buy_base.is_some(),
+        _ => true,
+    };
+    for name in &requested {
+        for req in flow_requires(name) {
+            if !col_present(req) {
+                return Err(format!(
+                    "{}: feature '{}' needs the raw '{}' column",
+                    input_path, name, req
+                ));
+            }
+        }
+    }
+    let compact_flow_names = ["cmf20", "mfi14", "vol_z96"];
+    let wants_flow = compact_requested
         .iter()
-        .any(|n| matches!(n.as_str(), "taker_ratio96" | "taker_imb16"));
+        .any(|n| compact_flow_names.contains(&n.as_str()));
     if wants_flow && cols.volume.is_none() {
         return Err(format!(
             "{}: compact features {:?} need the raw 'volume' column",
             input_path,
             compact_requested
                 .iter()
-                .filter(|n| flow_names.contains(&n.as_str()))
+                .filter(|n| compact_flow_names.contains(&n.as_str()))
                 .collect::<Vec<_>>()
-        ));
-    }
-    if wants_trades && cols.trades.is_none() {
-        return Err(format!(
-            "{}: compact feature 'trade_intensity96' needs the raw 'trades' column",
-            input_path
-        ));
-    }
-    if wants_taker && cols.taker_buy_base.is_none() {
-        return Err(format!(
-            "{}: compact features 'taker_ratio96'/'taker_imb16' need the raw \
-             'taker_buy_base' (alias 'taker_buy') column",
-            input_path
         ));
     }
 
@@ -3903,6 +4243,8 @@ fn enrich_inner(
     let classify = |name: &str| -> OpClass {
         if name.starts_with("xs_") {
             OpClass::Rank
+        } else if FLOW_NAMES.contains(&name) {
+            OpClass::RollingStd
         } else if name.starts_with("vol")
             || name.starts_with("bb")
             || name == "vz96"
@@ -4178,6 +4520,11 @@ fn enrich_inner(
         .filter(|n| !gpu_done.contains(*n))
         .cloned()
         .collect();
+    let cpu_flow: Vec<String> = flow_requested
+        .iter()
+        .filter(|n| !gpu_done.contains(*n))
+        .cloned()
+        .collect();
     let cpu_labels: Vec<(String, LabelSpec)> = labels
         .iter()
         .filter(|(n, _)| !gpu_done.contains(n))
@@ -4188,6 +4535,7 @@ fn enrich_inner(
         own: cpu_own,
         py15m_requested: cpu_py15m,
         compact: cpu_compact,
+        flow: cpu_flow,
         labels: cpu_labels,
         tf,
         cross: &cross,
@@ -4199,6 +4547,7 @@ fn enrich_inner(
         || !ctx.own.is_empty()
         || !ctx.py15m_requested.is_empty()
         || !ctx.compact.is_empty()
+        || !ctx.flow.is_empty()
         || !ctx.labels.is_empty();
     if has_cpu_work {
         let mut i = 0usize;
@@ -4658,7 +5007,12 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.
-  all        every legacy group above except py15m and compact
+  flow       vwap plus the nine derived flow columns: taker_ratio96,
+             taker_imb16, trade_intensity96, avg_trade_size96, amihud96,
+             zero_ret_share96, obv_z96, cvd_proxy, vwap_dev96. Trailing 15m
+             windows; a gap-spanning window is NaN; zero volume/trades is NaN
+             for the affected ratios and illiquidity.
+  all        every legacy group above except py15m, compact and flow
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
   cross:btc, calendar) are also accepted and are computed by `rcsr::features`.
@@ -4671,8 +5025,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   columns are registered `available:false` until their passes land; derivative
   columns have no local snapshot and are `available:false` with source null.
 
-  Compact flow features read raw `volume`, `trades` and `taker_buy_base`
-  (alias `taker_buy`). A missing raw field is a hard error naming the column.
+  Flow and compact flow features read the raw `volume`, `quote_volume`,
+  `trades` and `taker_buy_base` (alias `taker_buy`) fields. A missing raw field
+  is a hard error naming both the feature and the column. `vwap_dev96` and the
+  other shared names have one canonical quote-volume definition, not a
+  group-dependent one.
 
 GPU (CUDA builds): registered f64 kernels cover returns/lags, calendar, moving
 sums and variances, Donchian, Bollinger/VZ, EMA/Wilder scans, RSI, labels and

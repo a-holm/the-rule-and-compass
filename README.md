@@ -389,8 +389,12 @@ atomically instead of streaming it. See
   name needs an explicit `--replace`, and every change is chunk-size stable.
   Windows are causal and gap-aware, warm-up is reported per column, and the
   `py15m` group reproduces the 35 Python enrichment columns on a committed
-  parity fixture, and the `compact` group emits the exact 52-column
-  smoke/parity subset at the 15 m base. The default financial feature set is
+  parity fixture, the `compact` group emits the exact 52-column smoke/parity
+  subset at the 15 m base, and the `flow` group materialises `vwap` plus the
+  nine derived OHLCV/flow columns (taker ratios, trade intensity, average trade
+  size, Amihud illiquidity, zero-return share, OBV z-score, CVD proxy and VWAP
+  deviation) with the documented zero-volume/zero-trade and gap policies. The
+  default financial feature set is
   registered in `rcsr schema` (`feature_registry`): every available column has a
   tested producer, and registered-but-unavailable MTF, market-state and
   derivative columns fail closed with the missing dependency instead of being

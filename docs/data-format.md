@@ -488,6 +488,12 @@ explicit, in which case the numeric column keeps its schema position and its
 stale dictionary (if any) is dropped. The output is written to a temporary file
 next to `--out` and renamed into place.
 
+The raw OHLCV/flow fields (`open high low close volume quote_volume trades
+taker_buy_base taker_buy_quote vwap`) are copied byte for byte with their
+original units; `--features flow` appends the nine derived flow columns
+documented in `docs/ohlcv.md`. A missing raw field needed by a requested flow
+column is an input error naming the field, never a zero-filled column.
+
 Every appended feature is part of the default financial feature registry printed
 by `rcsr schema` (`feature_registry`). The registry is the contract: each column
 records `family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
