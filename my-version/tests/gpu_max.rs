@@ -120,7 +120,7 @@ fn maximum_gpu_fit_is_opt_in_and_never_the_default() {
 #[cfg(feature = "cuda")]
 #[test]
 fn a_small_sample_keeps_the_labelled_cpu_maximum_arm() {
-    let train = sample(2_000, 4);
+    let train = sample(256, 4);
     let test = sample(200, 5);
     assert!(
         train.len() < rcsr::fit::MAXIMUM_GPU_MIN_ROWS,
