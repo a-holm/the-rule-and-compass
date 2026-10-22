@@ -462,6 +462,10 @@ SEARCH:
                              = off; N >= train rows is an exact full fit). The
                              archive and every reported error are refit on all
                              rows
+  --fit-fallback-max <N>     hard per-generation bound on exact CPU fallback
+                             refits for --fit-strategy gpu (default 4096,
+                             0 = unbounded). Fallbacks beyond the bound keep
+                             their finite device constants and are counted
   --no-fit                   disable constant fitting entirely (= --fit-iters 0)
   --no-dedup                 disable structural de-duplication
   --no-front-parents         draw every parent from the island tournament;
@@ -741,7 +745,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -756,6 +760,9 @@ fn gpu_json(
                 s.fit_gpu,
                 s.fit_fallback,
                 ops_json(&s.fit_fallback_by_cause),
+                jnum(s.fit_fallback_seconds),
+                s.fit_fallback_bounded,
+                s.fit_fallback_workers,
                 ops_json(&s.opcodes)
             )
         })
@@ -791,7 +798,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
         g.fit_screened,
         g.fit_attempts,
@@ -800,7 +807,11 @@ fn gpu_json(
         ops_json(&g.fit_fallback_by_cause),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
-        jnum(g.fit_host_ms / 1000.0)
+        jnum(g.fit_host_ms / 1000.0),
+        jnum(g.fit_fallback_ms / 1000.0),
+        g.fit_fallback_bounded,
+        g.fit_fallback_workers,
+        g.fit_fallback_max
     );
     format!(
         "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
@@ -1562,6 +1573,8 @@ fn main() {
     let mut fit_samples_set = false;
     // #116: explicit --fit-rows for the resume settings check.
     let mut fit_rows_set = false;
+    // #255: explicit --fit-fallback-max for the resume settings check.
+    let mut fit_fallback_max_set = false;
     // #76: remember an explicit --no-front-parents so a resume can refuse a
     // contradiction with the saved configuration.
     let mut front_parents_set = false;
@@ -1868,6 +1881,11 @@ fn main() {
                 }
                 cfg.fit_rows = if n >= 2 { n } else { 0 };
                 fit_rows_set = true;
+            }
+            // #255: hard bound on one generation's exact CPU fallback refits.
+            "--fit-fallback-max" => {
+                cfg.fit_fallback_max = val!().parse().unwrap_or(cfg.fit_fallback_max);
+                fit_fallback_max_set = true;
             }
             // #116: exact constant-fitting arm.
             "--fit-strategy" => {
@@ -2440,6 +2458,14 @@ fn main() {
             conflicts.push(format!(
                 "--fit-rows {} (saved {})",
                 cfg.fit_rows, saved.fit_rows
+            ));
+        }
+        // #255: the fallback bound is saved because reaching it changes which
+        // candidates keep device constants.
+        if fit_fallback_max_set && cfg.fit_fallback_max != saved.fit_fallback_max {
+            conflicts.push(format!(
+                "--fit-fallback-max {} (saved {})",
+                cfg.fit_fallback_max, saved.fit_fallback_max
             ));
         }
         // #76: front feedback is saved search state.
@@ -4140,13 +4166,17 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] refits={}",
+                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_attempts,
                 g.fit_gpu,
                 g.fit_fallback,
                 causes,
-                g.fit_refits
+                g.fit_refits,
+                g.fit_fallback_ms / 1000.0,
+                g.fit_fallback_bounded,
+                g.fit_fallback_max,
+                g.fit_fallback_workers
             );
         }
     }
@@ -8682,9 +8712,15 @@ mod tests {
         g.fit_refits = 5;
         g.fit_ms = 250.0;
         g.fit_host_ms = 500.0;
+        // #255: the fallback time is a subset of host_seconds, and the bound
+        // and worker count are reported beside it.
+        g.fit_fallback_ms = 125.0;
+        g.fit_fallback_bounded = 0;
+        g.fit_fallback_workers = 8;
+        g.fit_fallback_max = 4096;
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu");
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
             json
         );

@@ -121,6 +121,13 @@ pub struct Config {
     /// `0` keeps the historical path and `N` at least the sample size is an
     /// exact no-op. When both are set, `fit_rows` wins and is reported as such.
     pub fit_rows: usize,
+    /// #255: hard bound on how many admitted candidates one generation may
+    /// refit with the exact CPU fallback arm. The first `N` fallbacks in the
+    /// deterministic admission order are refit; any remainder keeps the finite
+    /// constants the device produced and is reported in `fit_fallback_bounded`.
+    /// `0` disables the bound. The default is high enough not to fire on the
+    /// recorded cell, so normal runs are bit-identical to the serial loop.
+    pub fit_fallback_max: usize,
     /// #116: disk-backed rows for the streaming fit arm. `Some` only when the
     /// CLI resolved a resident `.rcsb` store whose prepared training rows can be
     /// re-read exactly; it is read by `--fit-strategy stream` and never changes
@@ -287,6 +294,12 @@ fn eval_counted(counters: Option<&GenCounters>, make: impl FnOnce() -> Ind) -> I
     ind
 }
 
+/// #255: default per-generation cap on exact CPU fallback refits. It is a
+/// safety bound, not a tuning knob: a generation would have to send more than
+/// this many candidates to the CPU before it changes any result. The recorded
+/// cell admitted at most 540 per generation.
+pub const DEFAULT_FIT_FALLBACK_MAX: usize = 4096;
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -310,6 +323,7 @@ impl Default for Config {
             predictor_samples: None,
             fit_samples: 0, // #85: off by default
             fit_rows: 0,    // #116: off by default
+            fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX, // #255
             fit_stream_source: None,
             front_parents: true, // #76: measured on the known-truth suite
             units: None,
@@ -372,6 +386,7 @@ impl Config {
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
         compare!(fit_rows, "fit_rows"); // #116
+        compare!(fit_fallback_max, "fit_fallback_max"); // #255
         compare!(front_parents, "front_parents"); // #76
         compare!(qd_bins, "qd_bins"); // #120
         compare!(qd_cell_cap, "qd_cell_cap"); // #120
@@ -590,6 +605,14 @@ struct GpuSearch {
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
+    /// #255: wall time spent in the exact CPU fallback fits, milliseconds.
+    /// This is a subset of `fit_host_ms`, never added to it twice.
+    fit_fallback_ms: f64,
+    /// #255: candidates left at their finite device constants because the
+    /// per-generation fallback bound was reached.
+    fit_fallback_bounded: usize,
+    /// #255: largest number of scoped workers the fallback batch used.
+    fit_fallback_workers: usize,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself. The rank family is *fitted* on the device (squared LM start +
     /// exact rank polish) but still *scored* by the CPU, because the evaluator
@@ -669,6 +692,9 @@ impl GpuSearch {
                     fit_fallback_by_cause: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_host_ms: 0.0,
+                    fit_fallback_ms: 0.0,
+                    fit_fallback_bounded: 0,
+                    fit_fallback_workers: 0,
                     native_metric,
                 })
             }
@@ -850,18 +876,47 @@ impl GpuSearch {
             }
         }
 
-        // Exact CPU fallback, seeded with the GPU constants when there were any.
-        for &(i, j, _) in &fallbacks {
-            let tree = &mut islands[i][j].tree;
-            crate::fit::fit_weighted_metric(
-                tree,
+        // #255: exact CPU fallback, seeded with the GPU constants when there
+        // were any. The candidates are independent and their admission order is
+        // fixed, so the batch is split across scoped workers exactly like the
+        // finalist refits in `full_data_archive`; the results are written back
+        // in the original order and are bit-identical to the serial loop.
+        let fallback_start = std::time::Instant::now();
+        let (refit, bounded) = fallback_batch_split(fallbacks.len(), cfg.fit_fallback_max);
+        if bounded > 0 {
+            self.fit_fallback_bounded += bounded;
+            let stats = self.stats.entry(generation).or_default();
+            stats.fit_fallback_bounded += bounded;
+        }
+        let mut workers_used = 0usize;
+        if refit > 0 {
+            let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
+                .iter()
+                .map(|&(island, slot, _)| FallbackFitJob {
+                    island,
+                    slot,
+                    tree: islands[island][slot].tree.clone(),
+                })
+                .collect();
+            workers_used = fit_fallback_jobs(
+                &mut jobs,
                 &train.x,
                 &train.y,
                 &train.w,
                 cfg.fit_iters,
                 cfg.metric,
+                fallback_workers(),
             );
+            for job in jobs {
+                islands[job.island][job.slot].tree = job.tree;
+            }
         }
+        let fallback_seconds = fallback_start.elapsed().as_secs_f64();
+        self.fit_fallback_ms += fallback_seconds * 1000.0;
+        self.fit_fallback_workers = self.fit_fallback_workers.max(workers_used);
+        let stats = self.stats.entry(generation).or_default();
+        stats.fit_fallback_seconds += fallback_seconds;
+        stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
     }
 
     /// #169: record one CPU fallback for this generation and the whole run.
@@ -1091,6 +1146,10 @@ impl GpuSearch {
             fit_refits: 0,
             fit_ms: self.fit_ms,
             fit_host_ms: self.fit_host_ms,
+            fit_fallback_ms: self.fit_fallback_ms,
+            fit_fallback_bounded: self.fit_fallback_bounded,
+            fit_fallback_workers: self.fit_fallback_workers,
+            fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
         }
     }
 
@@ -1122,6 +1181,72 @@ impl GpuSearch {
             .take()
             .expect("the fallback pool is taken at most once")
     }
+}
+
+/// #255: split a fallback batch into the part that is refit and the part held
+/// at its finite device constants by the per-generation bound.
+///
+/// A cap of `0` means unbounded. The split is a pure function of the admitted
+/// count and the configured cap, so the same seed and configuration always
+/// choose the same prefix; the caller keeps the first `refit` entries in the
+/// deterministic admission order.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn fallback_batch_split(total: usize, cap: usize) -> (usize, usize) {
+    if cap == 0 {
+        (total, 0)
+    } else {
+        (total.min(cap), total.saturating_sub(cap))
+    }
+}
+
+/// #255: one exact CPU fallback fit, owned so the batch can be split across
+/// scoped workers without aliasing the islands.
+#[cfg(feature = "cuda")]
+struct FallbackFitJob {
+    island: usize,
+    slot: usize,
+    tree: Node,
+}
+
+/// #255: run the exact CPU fallback fits across at most `workers` scoped
+/// threads, in fixed order. Each candidate is independent and writes only its
+/// own tree, so the outcome does not depend on which worker finishes first.
+/// Returns the number of workers that actually received a chunk.
+#[cfg(feature = "cuda")]
+fn fit_fallback_jobs(
+    jobs: &mut [FallbackFitJob],
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+    workers: usize,
+) -> usize {
+    if jobs.is_empty() {
+        return 0;
+    }
+    let workers = workers.max(1).min(jobs.len());
+    if workers == 1 {
+        for job in jobs.iter_mut() {
+            crate::fit::fit_weighted_metric(&mut job.tree, x, y, w, iters, metric);
+        }
+        return 1;
+    }
+    let per = jobs.len().div_ceil(workers);
+    let chunks = jobs.len().div_ceil(per);
+    let blocks = expr::current_blocks();
+    std::thread::scope(|scope| {
+        for chunk in jobs.chunks_mut(per) {
+            let blocks = blocks.clone();
+            scope.spawn(move || {
+                expr::set_blocks(blocks);
+                for job in chunk.iter_mut() {
+                    crate::fit::fit_weighted_metric(&mut job.tree, x, y, w, iters, metric);
+                }
+            });
+        }
+    });
+    chunks
 }
 
 /// Score every still-pending (`error.is_nan()`) individual on the CPU.
@@ -2915,13 +3040,23 @@ pub struct GpuGenStats {
     pub fit_attempts: usize,
     /// #169: candidates the batched GPU fit returned usable constants for.
     pub fit_gpu: usize,
-    /// #169: candidates refit by the exact CPU arm (unsupported, ill-conditioned
-    /// or non-finite).
+    /// #169: candidates sent to the exact CPU fallback arm (unsupported,
+    /// ill-conditioned or non-finite). #255: the ones beyond
+    /// `fit_fallback_bounded` keep their finite device constants and are not
+    /// refit, but they are still fallbacks by cause.
     pub fit_fallback: usize,
     /// #169: pending offspring screened before admission.
     pub fit_screened: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
+    /// #255: wall seconds this generation spent in the exact CPU fallback
+    /// fits. A subset of the run's `fit.host_seconds`.
+    pub fit_fallback_seconds: f64,
+    /// #255: fallbacks held at their finite device constants because the
+    /// per-generation bound was reached.
+    pub fit_fallback_bounded: usize,
+    /// #255: workers the fallback batch used.
+    pub fit_fallback_workers: usize,
 }
 
 /// #131: aggregate GPU usage for a run.
@@ -2946,6 +3081,16 @@ pub struct GpuRunStats {
     pub fit_ms: f64,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
+    /// #255: wall time spent in the exact CPU fallback fits, milliseconds.
+    /// Already included in `fit_host_ms`; report it, never add it again.
+    pub fit_fallback_ms: f64,
+    /// #255: fallbacks held at their finite device constants by the
+    /// per-generation bound.
+    pub fit_fallback_bounded: usize,
+    /// #255: largest worker count the fallback batch used.
+    pub fit_fallback_workers: usize,
+    /// #255: configured per-generation fallback cap (`0` = unbounded).
+    pub fit_fallback_max: usize,
 }
 
 pub struct Outcome {
@@ -3638,6 +3783,9 @@ fn run_postfix_search(
             fit_fallback: 0,
             fit_screened: 0,
             fit_fallback_by_cause: Default::default(),
+            fit_fallback_seconds: 0.0,
+            fit_fallback_bounded: 0,
+            fit_fallback_workers: 0,
         });
 
         if let Some(budget) = cfg.time_budget {
@@ -3914,6 +4062,10 @@ fn run_postfix_search(
             fit_refits: 0,
             fit_ms: gpu.fit_ms,
             fit_host_ms: gpu.fit_host_ms,
+            fit_fallback_ms: gpu.fit_fallback_ms,
+            fit_fallback_bounded: gpu.fit_fallback_bounded,
+            fit_fallback_workers: gpu.fit_fallback_workers,
+            fit_fallback_max: cfg.fit_fallback_max,
         }),
         qd: None,
         stop_reason,
@@ -5225,6 +5377,7 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+            s.fit_fallback_max = cfg.fit_fallback_max;
             s
         })
     } else {
@@ -6242,6 +6395,113 @@ mod tests {
             quad.busy.load(std::sync::atomic::Ordering::Relaxed) > 0,
             "the four-worker pool never ran a job"
         );
+    }
+
+    /// #255: the per-generation bound is a deterministic prefix of the
+    /// admission order: the first `cap` fallbacks are refit, the remainder are
+    /// counted, and `0` means unbounded.
+    #[test]
+    fn fallback_batch_bound_is_a_deterministic_prefix() {
+        assert_eq!(fallback_batch_split(0, 16), (0, 0));
+        assert_eq!(fallback_batch_split(5, 16), (5, 0));
+        assert_eq!(fallback_batch_split(16, 16), (16, 0));
+        assert_eq!(fallback_batch_split(21, 16), (16, 5));
+        assert_eq!(fallback_batch_split(21, 0), (21, 0));
+        // The recorded cell's largest generation is far below the default, so
+        // the bound never changes its result.
+        assert_eq!(fallback_batch_split(540, DEFAULT_FIT_FALLBACK_MAX), (540, 0));
+        for total in [1usize, 7, 64, 4096, 4097] {
+            let (refit, bounded) = fallback_batch_split(total, DEFAULT_FIT_FALLBACK_MAX);
+            assert_eq!(refit + bounded, total);
+            assert_eq!(refit, total.min(DEFAULT_FIT_FALLBACK_MAX));
+        }
+    }
+
+    /// #255: the exact CPU fallback batch is a pure parallelisation. One worker
+    /// and eight workers must produce the same tree bits, in the same order,
+    /// including the seeded constants the device already applied.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn fit_fallback_is_identical_for_one_and_many_workers() {
+        let s = sample();
+        let cfg = Config {
+            fit_iters: 8,
+            metric: Metric::Squared,
+            ..Config::default()
+        };
+        // Distinct starting constants and shapes, so every worker has real work.
+        let trees: Vec<Node> = (0..24u32)
+            .map(|k| {
+                let a = (k as f64 + 1.0) / 7.0;
+                let b = 1.0 + (k % 5) as f64;
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(a), input(0)]),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(b), input(1)])]),
+                    ],
+                )
+            })
+            .collect();
+        let make = || -> Vec<FallbackFitJob> {
+            trees
+                .iter()
+                .enumerate()
+                .map(|(k, t)| FallbackFitJob {
+                    island: k % 2,
+                    slot: k,
+                    tree: t.clone(),
+                })
+                .collect()
+        };
+        let mut one = make();
+        let mut many = make();
+        let used_one = fit_fallback_jobs(
+            &mut one,
+            &s.x,
+            &s.y,
+            &s.w,
+            cfg.fit_iters,
+            cfg.metric,
+            1,
+        );
+        let used_many = fit_fallback_jobs(
+            &mut many,
+            &s.x,
+            &s.y,
+            &s.w,
+            cfg.fit_iters,
+            cfg.metric,
+            8,
+        );
+        assert_eq!(used_one, 1);
+        assert_eq!(used_many, 8);
+        assert_eq!(one.len(), many.len());
+        for (a, b) in one.iter().zip(&many) {
+            assert_eq!((a.island, a.slot), (b.island, b.slot));
+            assert!(
+                expr::same(&a.tree, &b.tree),
+                "worker result differs at island {} slot {}",
+                a.slot,
+                b.slot
+            );
+        }
+        // The parallel result is also the serial reference for each candidate.
+        for (k, job) in many.iter().enumerate() {
+            let mut serial = trees[k].clone();
+            crate::fit::fit_weighted_metric(
+                &mut serial,
+                &s.x,
+                &s.y,
+                &s.w,
+                cfg.fit_iters,
+                cfg.metric,
+            );
+            assert!(
+                expr::same(&job.tree, &serial),
+                "parallel fit differs from the serial arm at job {k}"
+            );
+        }
     }
 
     /// #121: the fallback queue is bounded by construction and the merge order

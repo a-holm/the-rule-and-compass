@@ -863,13 +863,14 @@ fn bench_end_to_end() {
             .map(|s| s.error)
             .fold(f64::INFINITY, f64::min);
         eprintln!(
-            "arm={} metric={} N={} evals={} wall={:.2}s best={:.6e}",
+            "arm={} metric={} N={} evals={} wall={:.2}s best={:.6e} archive_hash={:016x}",
             name,
             metric.name(),
             n,
             base.generations * base.islands * base.pop,
             wall,
-            best
+            best,
+            out.archive.hash()
         );
         // Per-generation archive best, so a quality regression can be located
         // in the trajectory rather than only at the end.
@@ -906,10 +907,14 @@ fn bench_end_to_end() {
                 g.fit_refits
             );
             eprintln!(
-                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s duty={:.1}%",
+                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fallback={:.2}s bounded={}/{} workers={} duty={:.1}%",
                 g.fit_host_ms / 1000.0,
                 100.0 * (g.fit_host_ms / 1000.0) / wall,
                 g.fit_ms / 1000.0,
+                g.fit_fallback_ms / 1000.0,
+                g.fit_fallback_bounded,
+                g.fit_fallback_max,
+                g.fit_fallback_workers,
                 100.0 * g.accounting.duty_cycle()
             );
         }

@@ -900,6 +900,52 @@ the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
 
+**Parallel fallback batch and its bound (#255).** The exact CPU refits are
+independent per candidate and are therefore split across scoped workers with
+the same fixed-order pattern as the finalist refits in `full_data_archive`:
+`ceil(n / workers)` contiguous jobs per worker, one thread-local block registry
+per worker, and the fitted trees written back by their original island/slot in
+admission order. The result is bit-identical to the old serial `for` loop for
+any worker count; `search::tests::fit_fallback_is_identical_for_one_and_many_workers`
+pins one versus eight workers and compares every tree bit with the serial arm.
+The worker count is the same bounded pool setting as the evaluator fallback
+(`RCSR_CPU_FALLBACK_THREADS`, default `min(cores, 8)`, maximum 64).
+
+`--fit-fallback-max N` is a hard per-generation cap on those refits (default
+`4096`, `0` = unbounded). The first `N` fallbacks in deterministic admission
+order are refit; any remainder keeps the finite constants the device produced.
+That case is **reported, never silent**: `gpu.fit.fallback_bounded` and each
+generation's `fit_fallback_bounded` count it, and `fallback_max` records the
+configured bound. The default is above every generation of the recorded cell
+(at most 540 admitted), so normal runs are unchanged; the cap exists so one
+pathological generation cannot spend minutes in an unbounded CPU tail.
+`gpu.fit.fallback_seconds` reports the measured fallback subset, and each
+generation carries `fit_fallback_seconds`, `fit_fallback_bounded` and
+`fit_fallback_workers`. `fallback_seconds` is a **subset** of `host_seconds`
+(kernel + launch + fallback + write-back), so the phase ledger still closes
+without double counting.
+
+Measured on the fit-heavy pinned cell (`tests/gpu_fit.rs::bench_end_to_end`:
+154 000 rows, 21 variables, 4 islands × pop 256, 5 generations, `--fit-iters 8`,
+seed 9, `--metric squared`) on an RTX 3060 with an Intel i7-3770K (4 cores / 8
+logical CPUs), same binary and seed, only `RCSR_CPU_FALLBACK_THREADS` changed:
+
+| fallback workers | fit host | fallback subset | wall | best error | archive hash |
+|---:|---:|---:|---:|---:|---|
+| 1 (serial reference) | 35.00 s | 30.13 s | 93.54 s | 1.086148e-2 | `c257d304ee910746` |
+| **8** | **11.49 s** | **6.93 s** | **63.10 s** | **1.086148e-2** | **`c257d304ee910746`** |
+
+The exact fallback loop is **4.35×** faster, the fit stage **3.05×** and the
+end-to-end run **1.48×**, with the same per-generation trajectory, archive best,
+archive hash and 996 finalist refits. The untouched serial binary recorded 23.33 s
+fit host at 67.02 s wall on the same cell in a separate run, so the change does
+not borrow time from another phase; run-to-run host load moves the absolute
+numbers, which is why the worker pair above is the controlled comparison. The
+recorded 10 h cell is fallback-dominated (95.40 % of process wall in 5 835
+refits), so at this measured ratio its fallback residue projects from 36 362 s
+to about 8 400 s; that projection is not a run on that cell and is labelled as
+such.
+
 **Exactness.** Search fitness is still f32 and only guides selection. Every
 finalist is refit by the exact CPU f64 LM on all training rows before the final
 archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
