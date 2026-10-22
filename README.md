@@ -389,7 +389,12 @@ atomically instead of streaming it. See
   name needs an explicit `--replace`, and every change is chunk-size stable.
   Windows are causal and gap-aware, warm-up is reported per column, and the
   `py15m` group reproduces the 35 Python enrichment columns on a committed
-  parity fixture. The CPU path is always available; a per-family cost model
+  parity fixture, and the `compact` group emits the exact 52-column
+  smoke/parity subset at the 15 m base. The default financial feature set is
+  registered in `rcsr schema` (`feature_registry`): every available column has a
+  tested producer, and registered-but-unavailable MTF, market-state and
+  derivative columns fail closed with the missing dependency instead of being
+  silently dropped. The CPU path is always available; a per-family cost model
   decides CPU vs GPU and records the reason, GPU builds upload the source
   columns once and report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the

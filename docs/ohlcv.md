@@ -169,22 +169,81 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `ma` | `ma5 ma10 ma20 ma50 ma100 ma200` | `close / trailing mean - 1` |
 | `vol` | `vol5 vol20 vol60 vol120` | population std of the 1-bar log returns |
 | `atr` | `atr14 natr14` | #125 Wilder ATR in price units and percent |
-| `rsi` | `rsi14` | #125 Wilder RSI, 0..100 |
+| `rsi` | `rsi14` | `RSI14/50 - 1` (compact definition; the old 0..100 value is gone) |
 | `bollinger` | `bb20_z bb20_bw` | z-score and `4*std/mean` |
 | `vz` | `vz96` | z-score of `log1p(volume)` |
 | `range` | `range1` | `(high - low) / close` |
-| `candle` | `clv1 body1 upper_wick1 lower_wick1 open_gap1` | close-location value and #125 geometry |
-| `donchian` | `don20 don96` | close position in the trailing high/low channel, `[0,1]` |
+| `candle` | `clv1 body1 upper_wick1 lower_wick1 open_gap1` | `clv1 = (C-L)/(H-L)-1/2`; `body1 = (C-O)/(H-L)`; wicks as shares of range |
+| `donchian` | `don20 don96` | close position in the trailing high/low channel; `don96` is centred on 0 |
 | `calendar` | `dow_* hour_* month_* dom_*` (sin/cos) | UTC calendar cycles |
 | `lags` | `lag_r1_1` .. `lag_r1_10` | causal copies of `r1`, refused across a gap |
 | `xs` | `xs_rank_r1 xs_rank_r20 xs_rank_vol20` | per-timestamp cross-section, `(rank-1)/(n-1)` |
 | `btc` | `btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60` | benchmark joins by timestamp |
 | `py15m` | 35 columns | the Python `enrich_panel_15m.py` set, for parity |
-| `all` | every group above except `py15m` | |
+| `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
+| `all` | every legacy group above except `py15m`, `compact` | |
 
-`ta:core`, `ta:full`, `exotic:cheap` and `candle:geometry` keep their #125
-meaning and are computed by `rcsr::features`, not copied into this module.
-`cross_ret1`/`cross_beta20` are accepted and use the `--cross-symbol` series.
+`ta:core`, `ta:full`, `exotic:cheap`, `candle:geometry`, `cross:btc` and
+`calendar` keep their #125 meaning and are computed by `rcsr::features`, not
+copied into this module. `cross_ret1`/`cross_beta20` are accepted and use the
+`--cross-symbol` series.
+
+### Default financial feature set and registry
+
+The production set is the **default financial feature set**, not a single
+expanded panel. It is the union of:
+
+* the raw OHLCV/flow fields (`open high low close volume quote_volume trades
+  taker_buy_base taker_buy_quote`) and identity/quality fields;
+* every engine column above (`all` + `py15m` + the #125 groups), currently 216
+  distinct names;
+* the compact 52-name regression subset;
+* multi-timeframe context, cross-sectional market-state/rank and reserved
+  derivative columns.
+
+`rcsr schema` prints `feature_registry`, one object per column with `name`,
+`family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
+`formula_sha256`, `source`, `pit` and, when unavailable, `reason`. Unknown names
+remain hard errors; a registered-but-unavailable name fails with its missing
+dependency, never an empty column.
+
+The compact profile is computed by one 15 m reference pass. Every window is
+trailing, inclusive of `t`, and gap-masked; Wilder/EMA state restarts after a
+gap. The compact builder used positional NumPy windows and therefore bridged
+gaps; that difference is deliberate and is why a gap row can be finite in the
+old compact CSV and `NaN` here. On contiguous rows the definitions agree.
+
+`wasym1` is registered as `derived`. For `H > L`, with
+`R = H-L`, `B = C-O`, `U = H-max(O,C)`, `D = min(O,C)-L`:
+
+```
+body1 = B/R
+clv1  = (C-L)/R - 1/2
+body1 - 2*clv1 = (H-C-O+L)/R = (U-D)/R = wasym1
+```
+
+The test `wasym1_identity_holds_on_finite_range_bars` checks the identity to
+`1e-12`. Degenerate `H == L` bars follow the compact builder exactly:
+`clv1 = -0.5`, `body1 = 0`, `wasym1 = NaN`, `lower_wick = NaN`; the identity is
+undefined there.
+
+### Compact parity fixture
+
+`my-version/tests/fixtures/enrich/compact_15m_ohlcv.csv` is a contiguous 7,200
+row (two symbols x 3,600 bars) 15 m slice with raw OHLCV/flow. The expected file
+holds the compact builder's 52 columns for the last 300 hourly rows. The test
+`compact_matches_the_python_builder_on_a_contiguous_slice` compares every finite
+value at `abs <= 1e-12` or `rel <= 1e-12`, requires exact NaN masks, and reports
+the per-feature worst error. Expected values are produced by the builder's own
+Python functions on the same slice; the full 25 GB panel is not checked in.
+
+One numerical note belongs in the record: the compact builder accumulates
+`rmean`/`rstd` with `np.cumsum` over the **whole symbol history**. On a 196k-row
+history, cancellation in `cs[i+1]-cs[i+1-w]` perturbs a 96-bar standard
+deviation by up to about `2e-8`, so a slice-local recomputation cannot reproduce
+that artefact to `1e-12` even though the formula is identical. The fixture
+therefore pins the formula and summation order on the same slice; the residual
+against the historical full-panel CSV is recorded in issue #269.
 
 ### Causality, gaps and warm-up
 
