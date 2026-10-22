@@ -38,13 +38,14 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `--metric median` does the same with the exact `f64` median
+still open); `--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|`
 (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
-measured crossover of the batched selection, #226). An explicit `gpu` with a
-metric that has no device fit objective is a usage error, because the kernel
-would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
-or a CPU strategy.
+measured crossover of the batched selection, #226 and #232). An explicit `gpu`
+with a metric that has no device fit objective is a usage error, because the
+kernel would otherwise fit a different loss; use `--metric squared`,
+`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`,
+`--metric interquartile` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
@@ -915,13 +916,14 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `--metric median` does the same with the exact `f64` median
+still open); `--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|`
 (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
-measured crossover of the batched selection, #226). An explicit `gpu` with a
-metric that has no device fit objective is a usage error, because the kernel
-would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
-or a CPU strategy.
+measured crossover of the batched selection, #226 and #232). An explicit `gpu`
+with a metric that has no device fit objective is a usage error, because the
+kernel would otherwise fit a different loss; use `--metric squared`,
+`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`,
+`--metric interquartile` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed

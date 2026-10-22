@@ -254,6 +254,7 @@ is mathematically well posed:
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
+| `interquartile` with `--fit-strategy gpu` (#232) | the same squared start and the same ladder on the same sort, averaging ranks `[⌊n/4⌋, ⌊3n/4⌋)` of `|r|` (all rows below `n = 4`) — the window is by rank, so a repeated boundary value cannot change it. Every trial is scored on that window mean, never on SSE. Fit-only, `n >= 4096` rows, and the score agrees with the CPU to `1e-12` relative (a fixed tree reduction, not bit-identical like the median) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 The correlation family is no longer a squared fit plus polish (issue #224).
@@ -835,11 +836,12 @@ different matter: an explicit `--fit-strategy gpu` with it is refused as a usage
 error before the run (#223, #229, #222), because the CPU arms would fit a
 different objective. The kernel's native objectives are squared/AIC (least
 squares), `log_squashed` (weighted IRLS) and `absolute` (Lawson/L1 IRLS with
-true-MAE acceptance); `rank_correlation`, `rank_correlation_signed` and
-`median` are **fit-only** device arms (#230, #226) whose fitness is still the
-CPU objective. `--fit-report` prints GPU accepted/fallback/refit
-counts and whether a CUDA build is present; the fallback ledger names
-`median_declined` for a median call the device could not complete (#226).
+true-MAE acceptance); `rank_correlation`, `rank_correlation_signed`, `median`
+and `interquartile` are **fit-only** device arms (#230, #226, #232) whose
+fitness is still the CPU objective. `--fit-report` prints GPU
+accepted/fallback/refit counts and whether a CUDA build is present; the fallback
+ledger names `median_declined` for a median call the device could not complete
+(#226) and `interquartile_declined` for the interquartile arm (#232).
 
 #### Exactness and fallbacks
 
@@ -855,7 +857,7 @@ counts and whether a CUDA build is present; the fallback ledger names
 | non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
 | streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
 | GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
-| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` and `log_squashed` are ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking. The rank and median arms are fit-only: the device moves constants, the CPU scores every candidate with the configured objective and refits every finalist (#230, #226) |
+| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` and `log_squashed` are ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking. The rank, median and interquartile arms are fit-only: the device moves constants, the CPU scores every candidate with the configured objective and refits every finalist (#230, #226, #232) |
 
 `auto` is deterministic: it chooses by tree structure and size only, never by
 wall-clock timing, so a seed cannot change path between runs. For separable
@@ -955,7 +957,8 @@ admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
-`non_finite`, `launch`, `rank_declined`, `median_declined`) in
+`non_finite`, `launch`, `rank_declined`, `median_declined`,
+`interquartile_declined`) in
 `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
@@ -963,14 +966,15 @@ accumulator, and `absolute` (#222) with per-row Lawson weights
 `1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps. All robust
 arms are gated by a scale-free `ln det Ã` test instead of the squared arm's
 Cholesky-diagonal ratio.
-The rank and median families are fit-only device arms (#230, #226): the device
-moves the constants, the CPU scores and refits every finalist. The median arm
-also requires at least 4 096 training rows, the measured crossover of the
-batched selection; below it the exact CPU median arm runs with a labelled
-reason. An explicit `gpu` with any other metric is a usage error (exit 2) naming
-`--metric squared`, `--metric log_squashed`, `--metric absolute`, a rank metric,
-`--metric median` or a CPU strategy (exact, auto, linear, varpro, stream), never
-a silent CPU fit of a different objective (#223). Every finalist is refit
+The rank, median and interquartile families are fit-only device arms (#230,
+#226, #232): the device moves the constants, the CPU scores and refits every
+finalist. The median and interquartile arms also require at least 4 096 training
+rows, the measured crossover of the batched selection; below it the exact CPU
+arm runs with a labelled reason. An explicit `gpu` with any other metric is a
+usage error (exit 2) naming `--metric squared`, `--metric log_squashed`,
+`--metric absolute`, a rank metric, `--metric median`, `--metric interquartile`
+or a CPU strategy (exact, auto, linear, varpro, stream), never a silent CPU fit
+of a different objective (#223). Every finalist is refit
 exactly on all training rows in CPU f64 *for
 the configured metric* before it is scored and reported, so reported constants
 and metrics never come from f32. The arm is opt-in and saved in checkpoints;
