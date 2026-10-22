@@ -123,10 +123,14 @@ gaps". Failing loudly names the problem and the fix.
 Feature columns produced by `rcsr enrich` follow a stricter rule than the search
 preparation fills above: a trailing window that spans a missing bucket, listing,
 delisting, migration or outage is `NaN`, and Wilder/EMA state restarts after the
-gap. Preparation `--fill` is a separate, explicit choice made later; it never
-changes the stored feature value or bridges a gap in the producer. The compact
-52-name profile follows the same rule, even where the historical compact builder
-used positional windows that bridged a hole.
+gap. This includes the #125 engine names (`ta:*`, `exotic:cheap`,
+`candle:geometry`, `cross:btc`): `ret1`/`ret5`, the moving-average, Bollinger,
+volume, CMF/MFI/VWAP and close-position windows, `open_gap1`, `cross_ret1` and
+`cross_beta20` are all missing across the boundary. Preparation `--fill` is a
+separate, explicit choice made later; it never changes the stored feature value
+or bridges a gap in the producer. The compact 52-name profile and every name in
+`engine_catalogue` follow the same rule, even where the historical compact
+builder used positional windows that bridged a hole.
 
 The candle/price-action family (#261) is stricter still for its new columns:
 `clv16`, `body16`, `rng_atr`, `prev_range_pos`, `inside_s`, `outside_s`,
