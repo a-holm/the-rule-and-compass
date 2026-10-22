@@ -39,6 +39,13 @@ pub struct Manifest {
     /// #169: batched-GPU fit ledger `(gpu, fallback, exact_refits)`, filled in
     /// after the search. `None` for a run that never used the GPU.
     pub fit: Option<(u64, u64, u64)>,
+    /// #112: `Some(true)` for full rows, `Some(false)` for an explicit
+    /// `--sample-rows` sample, `None` when the source was a CSV or unknown.
+    pub full_rows: Option<bool>,
+    /// #112: rows selected by `--sample-rows` (`None` for a full load).
+    pub sampled_rows: Option<usize>,
+    /// #112: the guard's estimate that justified the decision.
+    pub estimate_bytes: Option<u64>,
 }
 
 impl Manifest {
@@ -64,12 +71,17 @@ impl Manifest {
             jstr(&self.exe_sha256)
         ));
         out.push_str(&format!(
-            "  \"data\":{{\"path\":{},\"sha256\":{},\"train\":{{\"rows\":{},\"fingerprint\":\"{:016x}\"}},\"test\":{{\"rows\":{},\"fingerprint\":\"{:016x}\"}}}},\n",
+            "  \"data\":{{\"path\":{},\"sha256\":{},\"full_rows\":{},\"sampled_rows\":{},\
+             \"estimate_bytes\":{},\"train\":{{\"rows\":{},\"fingerprint\":\"{:016x}\"}},\
+             \"test\":{{\"rows\":{},\"fingerprint\":\"{:016x}\"}}}},\n",
             jstr(&self.data_path),
             self.data_sha256
                 .as_deref()
                 .map(jstr)
                 .unwrap_or_else(|| "null".to_string()),
+            self.full_rows.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+            self.sampled_rows.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+            self.estimate_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
             self.train.rows,
             self.train.hash,
             self.test.rows,
@@ -142,6 +154,9 @@ pub fn collect(
     backend: &str,
     resumed_from: Option<String>,
     backend_change: Option<(String, String)>,
+    full_rows: Option<bool>,
+    sampled_rows: Option<usize>,
+    estimate_bytes: Option<u64>,
 ) -> Manifest {
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_path = exe.to_string_lossy().into_owned();
@@ -172,6 +187,9 @@ pub fn collect(
         resumed_from,
         backend_change,
         fit: None,
+        full_rows,
+        sampled_rows,
+        estimate_bytes,
     }
 }
 

@@ -119,6 +119,10 @@ struct RcCtx {
        for them. */
     double *d_cols64;
     double *d_y64;
+    /* #229: the base `--weight` row vector for the batched fit (null when the
+       run is unweighted). Uploaded with the f64 fit rows, so the fit kernel's
+       per-row IRLS weight can be `sqrt(w_i * 2/(1 + r^2))`. */
+    double *d_w64;
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
@@ -321,6 +325,36 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
     }
 }
 
+/* --- #229: the loss the evaluator accumulates -----------------------------
+ *
+ * #236 closed the gate on every non-squared metric because the evaluator only
+ * summed squared error: a slope/absolute/rank run was silently ranked by MSE.
+ * LogSquashed is admitted again only because the evaluator computes its own
+ * objective, `Σ ln(1 + r^2)`, per row. The host still divides by the row count,
+ * so the number the search ranks on is exactly `Metric::LogSquashed`'s mean
+ * loss (up to f32 rounding); reported numbers are rebuilt in f64 by the CPU.
+ *
+ * `log1pf` is a 1-ULP single-precision device function (CUDA C++ Programming
+ * Guide, mathematical functions). The f32 residual square overflows above
+ * |r| = 1.8e19, where `ln(1+r^2)` is `2 ln|r|` to within 1e-38, so that branch
+ * is both cheaper and correct.
+ */
+#define RC_LOSS_SQUARED 0
+#define RC_LOSS_LOG_SQUASHED 1
+/* #224: fit-only correlation objectives (the evaluator still has no native
+   correlation scorer; these codes are never passed to rc_eval/rc_pool_eval). */
+#define RC_LOSS_CORRELATION 2
+#define RC_LOSS_CORRELATION_SIGNED 3
+
+__device__ __forceinline__ float rc_row_loss(float r, int loss)
+{
+    if (loss == RC_LOSS_LOG_SQUASHED) {
+        const float rr = r * r;
+        return isfinite(rr) ? log1pf(rr) : 2.0f * logf(fabsf(r));
+    }
+    return r * r;
+}
+
 /* #131 register contract: 6 blocks of RC_MAX_THREADS per SM. On sm_86 the
    thread limit (1536) allows 6 blocks of 256, so 6 is the occupancy target;
    ptxas derives a hard ~40-register ceiling from it. Crossing that ceiling is
@@ -331,7 +365,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_kernel(const float *__
                             int v,
                             const unsigned int *__restrict__ prog,
                             const unsigned int *__restrict__ off,
-                            float *__restrict__ out)
+                            float *__restrict__ out,
+                            int loss)
 {
     const int p = blockIdx.x;
     float acc = 0.0f;
@@ -347,7 +382,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_kernel(const float *__
             continue;
         }
         float r = pred - y[i];
-        acc += r * r;
+        acc += rc_row_loss(r, loss);
     }
 
     __shared__ float sh[RC_MAX_THREADS];
@@ -368,7 +403,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const floa
                                  int v,
                                  const unsigned int *__restrict__ prog,
                                  int width,
-                                 float *__restrict__ out)
+                                 float *__restrict__ out,
+                                 int loss)
 {
     const int p = blockIdx.x;
     const unsigned int *code = prog + (size_t)p * (size_t)width;
@@ -381,7 +417,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const floa
             continue;
         }
         float r = pred - y[i];
-        acc += r * r;
+        acc += rc_row_loss(r, loss);
     }
 
     __shared__ float sh[RC_MAX_THREADS];
@@ -456,10 +492,11 @@ struct FtSmem {
     double sred[CHUNK];
     float sg[CHUNK * MAXC];
     float sr[CHUNK];
+    double sdl[CHUNK];
     double sdg[PCHUNK * MAXC];
     double sdr[PCHUNK];
-    /* #224: correlation moments. `[0,p)` = Σg_j, `[p,2p)` = Σg_j·f,
-       `[2p,3p)` = Σg_j·y, `[3p,3p+6)` = W, Σf, Σf², Σf·y, Σy, Σy². */
+    double sdl64[PCHUNK];
+    /* #224: correlation moments and conditioning probes. */
     double scorr[6 + 3 * MAXC];
     double svar;
     double syy;
@@ -768,7 +805,8 @@ __device__ __forceinline__ void ft_backward_d(const unsigned int *nd,
 #define FT_OWNED(MAXC, CHUNK) (((FT_STATS(MAXC)) + (CHUNK) - 1) / (CHUNK))
 
 /* Decode statistic `s` of a p-constant system: 0 = J^T J entry (ei, ej),
- * 1 = J^T r entry, 2 = the SSE. */
+ * 1 = J^T r entry, 2 = the objective `Σ w ρ(r)` (SSE for `squared`, the
+ * log-squashed loss for `log_squashed`). */
 __device__ __forceinline__ int ft_stat_kind(int s, int tri, int p, int *ei, int *ej)
 {
     if (s < tri) {
@@ -793,14 +831,17 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               int m,
                               const double *__restrict__ cols,
                               const double *__restrict__ y,
+                              const double *__restrict__ w,
                               int n,
                               int p,
+                              int metric,
                               const double *c,
                               double *dg,
                               double *dr,
+                              double *dl,
                               double *jtj,
                               double *jtr,
-                              double *psse,
+                              double *ploss,
                               int *bad)
 {
     const int tid = threadIdx.x;
@@ -826,7 +867,8 @@ __device__ void ft_assemble_d(const unsigned int *nd,
         const int rows = min(PCHUNK, n - base);
         if (tid < PCHUNK) {
             const int row = base + tid;
-            if (row < n) {
+            const double wr = (row < n && w) ? w[row] : 1.0;
+            if (row < n && wr > 0.0) {
                 double v[FT_MAX_NODES];
                 double adj[FT_MAX_NODES];
                 double g[MAXC];
@@ -835,15 +877,28 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                 const double r = pred - y[row];
                 bool ok = isfinite(pred) && fabs(pred) <= 1e30 && isfinite(r);
                 ft_backward_d<MAXC>(nd, m, v, adj, g, p);
+                /* #229: the MM/IRLS weight. `2/(1 + r^2)` is `rho'(r)/r`; the
+                   CPU arm uses `1/(1 + r^2)` and the constant 2 cannot move the
+                   weighted least-squares argmin. The weight scales the whole
+                   row (adjoint and residual), so J^T W J stays PSD even where
+                   the true Hessian is indefinite. */
+                double sw = wr;
+                if (metric == RC_LOSS_LOG_SQUASHED) sw = wr * 2.0 / (1.0 + r * r);
+                const double s = sqrt(sw);
                 for (int j = 0; j < p; ++j) {
                     if (!isfinite(g[j])) ok = false;
-                    dg[tid * p + j] = ok ? g[j] : 0.0;
+                    dg[tid * p + j] = ok ? s * g[j] : 0.0;
                 }
-                dr[tid] = ok ? r : 0.0;
+                dr[tid] = ok ? s * r : 0.0;
+                dl[tid] = ok ? wr * (metric == RC_LOSS_LOG_SQUASHED
+                                         ? log1p(r * r)
+                                         : r * r)
+                             : 0.0;
                 if (!ok) *bad = 1;
             } else {
                 for (int j = 0; j < p; ++j) dg[tid * p + j] = 0.0;
                 dr[tid] = 0.0;
+                dl[tid] = 0.0;
             }
         }
         __syncthreads();
@@ -856,7 +911,7 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                 const int which = own[o] - tri;
                 for (int k = 0; k < rows; ++k) acc[o] += dg[k * p + which] * dr[k];
             } else {
-                for (int k = 0; k < rows; ++k) acc[o] += dr[k] * dr[k];
+                for (int k = 0; k < rows; ++k) acc[o] += dl[k];
             }
         }
         __syncthreads();
@@ -867,25 +922,34 @@ __device__ void ft_assemble_d(const unsigned int *nd,
         } else if (own_kind[o] == 1) {
             jtr[own[o] - tri] = acc[o];
         } else {
-            *psse = acc[o];
+            *ploss = acc[o];
         }
     }
     __syncthreads();
 }
 
+/* Value-only objective sweep of `c` for the trial step. Fixed-order f64
+ * reduction: `Σ w ρ(r)` with ρ the configured loss. */
 template <int PCHUNK>
-__device__ double ft_sse_d(const unsigned int *nd,
-                           int m,
-                           const double *__restrict__ cols,
-                           const double *__restrict__ y,
-                           int n,
-                           const double *c,
-                           double *red)
+__device__ double ft_loss_d(const unsigned int *nd,
+                            int m,
+                            const double *__restrict__ cols,
+                            const double *__restrict__ y,
+                            const double *__restrict__ w,
+                            int n,
+                            int metric,
+                            const double *c,
+                            double *red)
 {
     const int tid = threadIdx.x;
     double local = 0.0;
     if (tid < PCHUNK) {
         for (int row = tid; row < n; row += PCHUNK) {
+            const double wr = w ? w[row] : 1.0;
+            /* A zero-weight row is invisible: it is skipped before any
+               arithmetic so a non-finite prediction there cannot poison the
+               sum (`0 * inf`), exactly like `metrics::score_weighted`. */
+            if (wr <= 0.0) continue;
             double v[FT_MAX_NODES];
             ft_forward_d(nd, m, cols, n, row, c, v);
             const double pred = v[m - 1];
@@ -893,7 +957,7 @@ __device__ double ft_sse_d(const unsigned int *nd,
             if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
                 local += 1e30;
             } else {
-                local += r * r;
+                local += wr * (metric == RC_LOSS_LOG_SQUASHED ? log1p(r * r) : r * r);
             }
         }
     }
@@ -908,23 +972,30 @@ __device__ double ft_sse_d(const unsigned int *nd,
     return total;
 }
 
-/* Assemble J^T J, J^T r and the SSE at `c`. Every statistic is owned by one
- * thread and accumulated in block-local fixed row order, so the reduction is
+/* Assemble J^T J, J^T r and the objective at `c`. Every statistic is owned by
+ * one thread and accumulated in block-local fixed row order, so the reduction is
  * deterministic and needs no atomics. When the block is narrower than the
- * statistic count a thread owns several entries (see ft_assemble_d). */
+ * statistic count a thread owns several entries (see ft_assemble_d).
+ *
+ * #229: the objective statistic is `Σ w ρ(r)` in f64, one add per row. The
+ * per-row ρ is the f32 `log1pf` (a comparator, never a reported number);
+ * `squared` keeps the historical `r * r`, so its trajectory is unchanged. */
 template <int MAXC, int CHUNK>
 __device__ void ft_assemble(const unsigned int *nd,
                             int m,
                             const float *__restrict__ cols,
                             const float *__restrict__ y,
+                            const double *__restrict__ w,
                             int n,
                             int p,
+                            int metric,
                             const double *c,
                             float *sg,
                             float *sr,
+                            double *sl,
                             double *jtj,
                             double *jtr,
-                            double *psse,
+                            double *ploss,
                             int *bad)
 {
     const int tid = threadIdx.x;
@@ -945,7 +1016,8 @@ __device__ void ft_assemble(const unsigned int *nd,
     for (int base = 0; base < n; base += CHUNK) {
         const int rows = min(CHUNK, n - base);
         const int row = base + tid;
-        if (row < n) {
+        const double wr = (row < n && w) ? w[row] : 1.0;
+        if (row < n && wr > 0.0) {
             float vt[FT_MAX_NODES];
             float adj[FT_MAX_NODES];
             float g[MAXC];
@@ -954,15 +1026,26 @@ __device__ void ft_assemble(const unsigned int *nd,
             const float r = pred - y[row];
             bool ok = isfinite(pred) && fabsf(pred) <= 1e30f && isfinite(r);
             ft_backward<MAXC>(nd, m, vt, adj, g, p);
+            /* #229: `sqrt(w_i · 2/(1 + r_i^2))` scales the row's adjoint and
+               residual, so the rank-one update below is unchanged and `A`
+               stays positive semidefinite even where ρ'' < 0. */
+            double sw = wr;
+            if (metric == RC_LOSS_LOG_SQUASHED) {
+                const double rr = (double)r * (double)r;
+                sw = wr * 2.0 / (1.0 + rr);
+            }
+            const float s = sqrtf((float)sw);
             for (int j = 0; j < p; ++j) {
                 if (!isfinite(g[j])) ok = false;
-                sg[tid * p + j] = ok ? g[j] : 0.0f;
+                sg[tid * p + j] = ok ? s * g[j] : 0.0f;
             }
-            sr[tid] = ok ? r : 0.0f;
+            sr[tid] = ok ? s * r : 0.0f;
+            sl[tid] = ok ? (double)wr * (double)rc_row_loss(r, metric) : 0.0;
             if (!ok) *bad = 1;
         } else {
             for (int j = 0; j < p; ++j) sg[tid * p + j] = 0.0f;
             sr[tid] = 0.0f;
+            sl[tid] = 0.0;
         }
         __syncthreads();
         for (int o = 0; o < nown; ++o) {
@@ -978,9 +1061,7 @@ __device__ void ft_assemble(const unsigned int *nd,
                     acc[o] += (double)(sg[k * p + which] * sr[k]);
                 }
             } else {
-                for (int k = 0; k < rows; ++k) {
-                    acc[o] += (double)(sr[k] * sr[k]);
-                }
+                for (int k = 0; k < rows; ++k) acc[o] += sl[k];
             }
         }
         __syncthreads();
@@ -991,33 +1072,42 @@ __device__ void ft_assemble(const unsigned int *nd,
         } else if (own_kind[o] == 1) {
             jtr[own[o] - tri] = acc[o];
         } else {
-            *psse = acc[o];
+            *ploss = acc[o];
         }
     }
     __syncthreads();
 }
 
-/* Value-only SSE sweep of `c` for the trial step. Fixed-order f64 reduction. */
+/* Value-only objective sweep of `c` for the trial step. Fixed-order f64
+ * reduction of `Σ w ρ(r)`. */
 template <int CHUNK>
-__device__ double ft_sse(const unsigned int *nd,
-                         int m,
-                         const float *__restrict__ cols,
-                         const float *__restrict__ y,
-                         int n,
-                         const double *c,
-                         double *red)
+__device__ double ft_loss(const unsigned int *nd,
+                          int m,
+                          const float *__restrict__ cols,
+                          const float *__restrict__ y,
+                          const double *__restrict__ w,
+                          int n,
+                          int metric,
+                          const double *c,
+                          double *red)
 {
     const int tid = threadIdx.x;
     double local = 0.0;
     for (int row = tid; row < n; row += CHUNK) {
+        const double wr = w ? w[row] : 1.0;
+        if (wr <= 0.0) continue; /* a masked row never influences the fit */
         float vt[FT_MAX_NODES];
         ft_forward(nd, m, cols, n, row, c, vt);
         const float pred = vt[m - 1];
         const float r = pred - y[row];
         if (!isfinite(pred) || fabsf(pred) > 1e30f || !isfinite(r)) {
             local += 1e30;
+        } else if (metric == RC_LOSS_LOG_SQUASHED) {
+            local += wr * (double)rc_row_loss(r, metric);
         } else {
-            local += (double)r * (double)r;
+            /* Keep the historical f64 square: the f32 product would round the
+               trial score differently from the assembly's own statistic. */
+            local += wr * (double)r * (double)r;
         }
     }
     red[tid] = local;
@@ -1032,38 +1122,68 @@ __device__ double ft_sse(const unsigned int *nd,
 }
 
 /* Damped Cholesky solve in f64. Returns 0 on success, 1 on a non-positive
- * pivot or a condition-number gate (`rho = max L_ii / min L_ii > 1e4`). */
+ * pivot or a conditioning gate.
+ *
+ * `scale_free = 0` (the squared family) keeps the historical gate: an absolute
+ * pivot floor of 1e-18 and a Cholesky diagonal ratio `hi/lo <= 1e4`.
+ *
+ * #229: robust IRLS weights make `A` badly *scaled* without being
+ * ill-conditioned, so for `log_squashed` the gate is the scale-free
+ * `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`, `Ã = D^{-1/2} A D^{-1/2}`, which is
+ * invariant to units and to a global weight scale. `ln det Ã < ln 1e-12` means
+ * the data no longer identifies the parameters, which is exactly when the
+ * exact CPU arm must take over. */
+/* ln(1e-12), the smallest identified fraction of parameter space. */
+#define FT_LN_DET_FLOOR (-27.631021115928547)
+
 template <int MAXC>
 __device__ int ft_solve(const double *jtj,
                         const double *jtr,
                         double lambda,
                         int p,
                         double *delta,
-                        double *L)
+                        double *L,
+                        int scale_free)
 {
     /* Conditioning gate on the UNDAMPED J^T J: damping deliberately hides a
        rank-deficient direction (that is what it is for), so the gate must not
-       see it. A pivot at the 1e-12 diagonal floor or a Cholesky diagonal ratio
-       above 1e4 marks the candidate for the exact CPU refit. */
+       see it. */
+    double sum_ln_L = 0.0;
+    double sum_ln_A = 0.0;
     for (int i = 0; i < p; ++i) {
         for (int j = 0; j <= i; ++j) {
             double s = jtj[i * (i + 1) / 2 + j];
-            if (i == j) s += 1e-12;
+            if (scale_free && i == j) {
+                /* The absolute 1e-12 floor is meaningless once the weights span
+                   decades; only a genuinely non-positive pivot fails here. */
+                if (!(jtj[i * (i + 1) / 2 + i] > 0.0) ||
+                    !isfinite(jtj[i * (i + 1) / 2 + i])) return 1;
+                sum_ln_A += log(jtj[i * (i + 1) / 2 + i]);
+            } else if (i == j) {
+                s += 1e-12;
+            }
             for (int k = 0; k < j; ++k) s -= L[i * p + k] * L[j * p + k];
             if (i == j) {
-                if (!(s > 1e-18) || !isfinite(s)) return 1;
+                if (scale_free ? (!(s > 0.0) || !isfinite(s)) : (!(s > 1e-18) || !isfinite(s)))
+                    return 1;
                 L[i * p + i] = sqrt(s);
+                if (scale_free) sum_ln_L += 0.5 * log(s);
             } else {
                 L[i * p + j] = s / L[j * p + j];
             }
         }
     }
-    double lo = L[0], hi = L[0];
-    for (int i = 1; i < p; ++i) {
-        lo = fmin(lo, L[i * p + i]);
-        hi = fmax(hi, L[i * p + i]);
+    if (scale_free) {
+        const double ln_det = 2.0 * sum_ln_L - sum_ln_A;
+        if (!isfinite(ln_det) || ln_det < FT_LN_DET_FLOOR) return 1;
+    } else {
+        double lo = L[0], hi = L[0];
+        for (int i = 1; i < p; ++i) {
+            lo = fmin(lo, L[i * p + i]);
+            hi = fmax(hi, L[i * p + i]);
+        }
+        if (!(lo > 0.0) || !isfinite(hi) || hi / lo > 1e4) return 1;
     }
-    if (!(lo > 0.0) || !isfinite(hi) || hi / lo > 1e4) return 1;
     /* Damped factorisation for the step itself. */
     for (int i = 0; i < p; ++i) {
         for (int j = 0; j <= i; ++j) {
@@ -1101,22 +1221,23 @@ __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
     if (i < n) dst[i] = (double)src[i];
 }
 
-/* --- #224: exact correlation objective -----------------------------------
+/* --- #224: exact correlation fit objective -------------------------------
  *
- * The kernel minimises exactly 1-|rho| (metric 1) or 1-rho (metric 2), never
- * SSE. Moments are accumulated in f64 from the f32 forward/adjoint values; one
- * owner thread accumulates each statistic in ascending row order, so the
- * reduction is deterministic and needs no atomics, exactly like ft_assemble.
+ * The kernel minimises exactly 1-|rho| (RC_LOSS_CORRELATION) or 1-rho
+ * (RC_LOSS_CORRELATION_SIGNED), never SSE. Moments are accumulated in f64 from
+ * the f32 forward/adjoint values with the same resident row weights the other
+ * objectives use. One owner thread accumulates each statistic in ascending row
+ * order, so the reduction is deterministic and needs no atomics.
  *
- * Statistic layout: triangle C_jk, Σg_j, Σg_j·f, Σg_j·y, then six globals
- * (W, Σf, Σf², Σf·y, Σy, Σy²).
+ * Statistic layout: triangle C_jk, sum w*g_j, sum w*g_j*f, sum w*g_j*y, then
+ * six globals (W, sum w*f, sum w*f^2, sum w*f*y, sum w*y, sum w*y^2).
  */
 #define FT_CORR_STATS(MAXC) (((MAXC) * ((MAXC) + 1) / 2) + 4 * (MAXC) + 6)
 #define FT_CORR_OWNED(MAXC, CHUNK) \
     (((FT_CORR_STATS(MAXC)) + (CHUNK) - 1) / (CHUNK))
 
-/* Decode correlation statistic `s`: 0 = C_ij, 1 = Σg_i, 2 = Σg_i·f,
- * 3 = Σg_i·y, 4 = global moment `i`. */
+/* Decode correlation statistic `s`: 0 = C_ij, 1 = sum w*g_i,
+ * 2 = sum w*g_i*f, 3 = sum w*g_i*y, 4 = global moment `g`. */
 __device__ __forceinline__ int ft_corr_kind(int s, int tri, int p, int *i, int *j, int *g)
 {
     if (s < tri) {
@@ -1150,15 +1271,12 @@ __device__ __forceinline__ int ft_corr_kind(int s, int tri, int p, int *i, int *
     return 4;
 }
 
-/* Assemble the correlation moments, gradient and GN curvature at `c`.
- * `bad` is set when a row is non-finite; `svar`/`syy` carry the two variances
- * so the caller can distinguish an exactly constant prediction (score 1.0)
- * from a near-constant one (conditioning fallback). */
 template <int MAXC, int CHUNK>
 __device__ void ft_corr_assemble(const unsigned int *nd,
                                  int m,
                                  const float *__restrict__ cols,
                                  const float *__restrict__ y,
+                                 const double *__restrict__ w,
                                  int n,
                                  int p,
                                  const double *c,
@@ -1193,7 +1311,8 @@ __device__ void ft_corr_assemble(const unsigned int *nd,
     for (int base = 0; base < n; base += CHUNK) {
         const int rows = min(CHUNK, n - base);
         const int row = base + tid;
-        if (row < n) {
+        const double wr = (row < n && w) ? w[row] : 1.0;
+        if (row < n && wr > 0.0) {
             float vt[FT_MAX_NODES];
             float adj[FT_MAX_NODES];
             float g[MAXC];
@@ -1219,33 +1338,39 @@ __device__ void ft_corr_assemble(const unsigned int *nd,
                 const int ei = own_i[o];
                 const int ej = own_j[o];
                 for (int k = 0; k < rows; ++k) {
-                    acc[o] += (double)(sg[k * p + ei] * sg[k * p + ej]);
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)(sg[k * p + ei] * sg[k * p + ej]);
                 }
             } else if (kind == 1) {
                 const int ei = own_i[o];
-                for (int k = 0; k < rows; ++k) acc[o] += (double)sg[k * p + ei];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei];
+                }
             } else if (kind == 2) {
                 const int ei = own_i[o];
                 for (int k = 0; k < rows; ++k) {
-                    const double f = (double)sr[k];
-                    acc[o] += (double)sg[k * p + ei] * f;
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei] * (double)sr[k];
                 }
             } else if (kind == 3) {
                 const int ei = own_i[o];
                 for (int k = 0; k < rows; ++k) {
-                    acc[o] += (double)sg[k * p + ei] * (double)y[base + k];
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei] * (double)y[base + k];
                 }
             } else {
                 const int gi = own_g[o];
                 for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
                     const double f = (double)sr[k];
                     const double t = (double)y[base + k];
-                    if (gi == 0) acc[o] += 1.0;
-                    else if (gi == 1) acc[o] += f;
-                    else if (gi == 2) acc[o] += f * f;
-                    else if (gi == 3) acc[o] += f * t;
-                    else if (gi == 4) acc[o] += t;
-                    else acc[o] += t * t;
+                    if (gi == 0) acc[o] += wk;
+                    else if (gi == 1) acc[o] += wk * f;
+                    else if (gi == 2) acc[o] += wk * f * f;
+                    else if (gi == 3) acc[o] += wk * f * t;
+                    else if (gi == 4) acc[o] += wk * t;
+                    else acc[o] += wk * t * t;
                 }
             }
         }
@@ -1278,7 +1403,7 @@ __device__ void ft_corr_assemble(const unsigned int *nd,
             syy = sum_t2 - W * mt * mt;
             const double sft = sum_ft - W * mf * mt;
             if (sff > 0.0 && syy > 0.0) rho = sft / sqrt(sff * syy);
-            /* A_j and B_j overwrite Σg and Σg·y; gbar goes into Σg·f. */
+            /* A_j and B_j overwrite sum g and sum g*y; gbar goes into sum g*f. */
             for (int j = 0; j < p; ++j) {
                 const double gbar = mom[j] / W;
                 const double a = mom[p + j] - W * gbar * mf;
@@ -1290,8 +1415,7 @@ __device__ void ft_corr_assemble(const unsigned int *nd,
             if (sff > 0.0 && syy > 0.0) {
                 const double root = sqrt(sff * syy);
                 for (int j = 0; j < p; ++j) {
-                    const double gr = mom[2 * p + j] / root - rho * mom[j] / sff;
-                    jtr[j] = gr;
+                    jtr[j] = mom[2 * p + j] / root - rho * mom[j] / sff;
                 }
                 int k = 0;
                 for (int i = 0; i < p; ++i) {
@@ -1311,35 +1435,37 @@ __device__ void ft_corr_assemble(const unsigned int *nd,
         *psvar = sff;
         *psyy = syy;
         *prho = rho;
-        /* The objective is 1 - |rho| or 1 - rho. */
-        *pscore = (metric == 2) ? (1.0 - rho) : (1.0 - fabs(rho));
+        *pscore = (metric == RC_LOSS_CORRELATION_SIGNED) ? (1.0 - rho) : (1.0 - fabs(rho));
         if (!isfinite(*pscore) || !isfinite(sff) || !isfinite(syy)) *bad = 1;
     }
     __syncthreads();
 }
 
-/* Value-only correlation score at `c`: one row pass, f64 reduction, the same
- * chordal objective. A non-finite row returns a large finite value so the LM
- * rejects the trial; the host gate then labels the candidate `non_finite`. */
+/* Value-only weighted correlation score at `c`: one row pass, f64 reduction,
+ * the same chordal objective. A non-finite row returns a large finite value so
+ * the LM rejects the trial; the host gate then labels the candidate. */
 template <int CHUNK>
 __device__ double ft_corr_score(const unsigned int *nd,
                                 int m,
                                 const float *__restrict__ cols,
                                 const float *__restrict__ y,
+                                const double *__restrict__ w,
                                 int n,
                                 const double *c,
                                 double *red,
                                 int metric)
 {
     const int tid = threadIdx.x;
-    double w = 0.0, sf = 0.0, sf2 = 0.0, sft = 0.0, st = 0.0, st2 = 0.0;
+    double sw = 0.0, sf = 0.0, sf2 = 0.0, sft = 0.0, st = 0.0, st2 = 0.0;
     for (int row = tid; row < n; row += CHUNK) {
+        const double wr = (w) ? w[row] : 1.0;
+        if (wr <= 0.0) continue;
         float vt[FT_MAX_NODES];
         ft_forward(nd, m, cols, n, row, c, vt);
         const double f = (double)vt[m - 1];
         const double t = (double)y[row];
         if (!isfinite(f) || fabs(f) > 1e30 || !isfinite(t)) {
-            w = 1.0;
+            sw = 1.0;
             sf = 1e30;
             sf2 = 1e60;
             sft = 0.0;
@@ -1347,15 +1473,14 @@ __device__ double ft_corr_score(const unsigned int *nd,
             st2 = 0.0;
             break;
         }
-        w += 1.0;
-        sf += f;
-        sf2 += f * f;
-        sft += f * t;
-        st += t;
-        st2 += t * t;
+        sw += wr;
+        sf += wr * f;
+        sf2 += wr * f * f;
+        sft += wr * f * t;
+        st += wr * t;
+        st2 += wr * t * t;
     }
-    /* Six fixed-order block reductions, one after the other. */
-    double vals[6] = {w, sf, sf2, sft, st, st2};
+    double vals[6] = {sw, sf, sf2, sft, st, st2};
     for (int q = 0; q < 6; ++q) {
         red[tid] = vals[q];
         __syncthreads();
@@ -1366,26 +1491,28 @@ __device__ double ft_corr_score(const unsigned int *nd,
         vals[q] = red[0];
         __syncthreads();
     }
-    w = vals[0];
-    if (!(w > 0.0)) return 1e30;
-    const double mf = vals[1] / w;
-    const double mt = vals[4] / w;
-    const double sff = vals[2] - w * mf * mf;
-    const double syy = vals[5] - w * mt * mt;
-    const double sft_c = vals[3] - w * mf * mt;
+    const double W = vals[0];
+    if (!(W > 0.0)) return 1e30;
+    const double mf = vals[1] / W;
+    const double mt = vals[4] / W;
+    const double sff = vals[2] - W * mf * mf;
+    const double syy = vals[5] - W * mt * mt;
+    const double sft_c = vals[3] - W * mf * mt;
     if (!(sff > 0.0) || !(syy > 0.0)) return 1.0;
     const double rho = sft_c / sqrt(sff * syy);
-    return (metric == 2) ? (1.0 - rho) : (1.0 - fabs(rho));
+    return (metric == RC_LOSS_CORRELATION_SIGNED) ? (1.0 - rho) : (1.0 - fabs(rho));
 }
 
-/* Mask the affine gauge slots and turn the ρ gradient into the objective
- * gradient: L = 1 - sigma*rho, so delta = -H^{-1} dL is solved by ft_solve
- * with jtr = dL. A gauge slot gets a zero right-hand side and an identity
+/* Mask the affine gauge slots and turn the rho gradient into the objective
+ * gradient: L = 1 - sigma*rho, so ft_solve with jtr = dL gives
+ * delta = -H^{-1} dL. A gauge slot gets a zero right-hand side and an identity
  * row/column, so its step is exactly zero. */
 __device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, int metric,
                                    const int *gauge)
 {
-    const double sigma = (metric == 2) ? 1.0 : (rho >= 0.0 ? 1.0 : -1.0);
+    const double sigma = (metric == RC_LOSS_CORRELATION_SIGNED)
+                             ? 1.0
+                             : (rho >= 0.0 ? 1.0 : -1.0);
     for (int j = 0; j < p; ++j) jtr[j] = -sigma * jtr[j];
     for (int i = 0; i < p; ++i) {
         const bool gi = (gauge[0] == i) || (gauge[1] == i);
@@ -1399,12 +1526,12 @@ __device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, 
     }
 }
 
-
 template <int MAXC, int CHUNK, int PCHUNK>
 __global__ void fit_kernel(const float *__restrict__ cols,
                            const float *__restrict__ y,
                            const double *__restrict__ cols64,
                            const double *__restrict__ y64,
+                           const double *__restrict__ w64,
                            int n,
                            int v,
                            const unsigned int *__restrict__ prog,
@@ -1413,8 +1540,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            int kmax,
                            const double *__restrict__ c0,
                            const int *__restrict__ gauge,
-                           int metric,
                            int iters,
+                           int metric,
                            double *__restrict__ outc,
                            double *__restrict__ outsse,
                            int *__restrict__ outstatus)
@@ -1425,6 +1552,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     const int words = (int)(off[cand + 1] - off[cand]);
     const int m = words / 4;
     const unsigned int *nd = prog + off[cand];
+    /* #229: the scale-free determinant gate replaces the ratio gate for the
+       robust arm, whose normal equations are badly scaled by construction. */
+    const int scale_free = (metric == RC_LOSS_LOG_SQUASHED);
 
     extern __shared__ char ft_smem_raw[];
     FtSmem<MAXC, CHUNK, PCHUNK> *S =
@@ -1440,9 +1570,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
 
     /* #224: exact correlation LM. The affine gauge pair is renormalised once
        to (sign(a), 0) and then frozen: its step is exactly zero, so the reduced
-       curvature has no null direction and the 1e4 gate below measures only
-       shape collinearity or saturation. */
-    if (metric != 0) {
+       curvature has no null direction and the gate below measures only shape
+       collinearity or saturation. */
+    if (metric == RC_LOSS_CORRELATION || metric == RC_LOSS_CORRELATION_SIGNED) {
         const int *g = gauge + 2 * cand;
         if (tid == 0) {
             const int gs = g[0];
@@ -1456,13 +1586,12 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         int status = 0;
         double best = 1.0;
         if (iters > 0) {
-            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr,
+            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
                                           S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
                                           &S->sbest, &S->srho, &S->sbad, metric);
             if (S->sbad) {
                 status = 2;
             } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
-                /* Exactly degenerate: the metric is exactly 1.0, no step. */
                 best = 1.0;
             } else if (S->svar < 1e-24 * S->syy) {
                 status = 1;
@@ -1472,9 +1601,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 int assembled = 1;
                 for (int it = 0; it < iters && status == 0; ++it) {
                     if (!assembled) {
-                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr,
-                                                      S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
-                                                      &S->sbest, &S->srho, &S->sbad, metric);
+                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
+                                                      S->sr, S->sjtj, S->sjtr, S->scorr,
+                                                      &S->svar, &S->syy, &S->sbest, &S->srho,
+                                                      &S->sbad, metric);
                         assembled = 1;
                         if (S->sbad) {
                             status = 2;
@@ -1487,7 +1617,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
-                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta, S->sL) == 0);
+                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
+                                                     S->sL, 0) == 0);
                     }
                     __syncthreads();
                     if (!S->ssolved) {
@@ -1499,7 +1630,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                         S->strial[tid] = fmin(1e6, fmax(-1e6, t));
                     }
                     __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, n, S->strial, S->sred, metric);
+                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                        S->sred, metric);
                     if (trial < best) {
                         if (tid < p) S->sc[tid] = S->strial[tid];
                         best = trial;
@@ -1512,9 +1644,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     __syncthreads();
                 }
-                /* Undamped Gauss-Newton polish, as on the SSE path. */
                 for (int it = 0; it < 4 && status == 0 && best > 0.0; ++it) {
-                    ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr,
+                    ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
                                                   S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
                                                   &S->sbest, &S->srho, &S->sbad, metric);
                     if (S->sbad) {
@@ -1523,7 +1654,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
-                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL) == 0);
+                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
+                                                     S->sL, 0) == 0);
                     }
                     __syncthreads();
                     if (!S->ssolved) break;
@@ -1532,7 +1664,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                         S->strial[tid] = fmin(1e6, fmax(-1e6, t));
                     }
                     __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, n, S->strial, S->sred, metric);
+                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                        S->sred, metric);
                     if (trial < best) {
                         if (tid < p) S->sc[tid] = S->strial[tid];
                         best = trial;
@@ -1543,7 +1676,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 }
             }
         } else {
-            best = ft_corr_score<CHUNK>(nd, m, cols, y, n, S->sc, S->sred, metric);
+            best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
         }
         __syncthreads();
         if (tid == 0) {
@@ -1559,14 +1692,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     double best = 0.0;
 
     if (iters > 0) {
-        /* First assembly also supplies the baseline SSE. */
-        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+        /* First assembly also supplies the baseline objective. */
+        ft_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
         assembled = 1;
         best = S->sbest;
         if (S->sbad) status = 2;
         for (int it = 0; it < iters && status == 0; ++it) {
             if (!assembled) {
-                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, n, p, S->sc, S->sg, S->sr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
                 assembled = 1;
                 if (S->sbad) {
                     status = 2;
@@ -1574,7 +1707,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 }
             }
             if (tid == 0) {
-                S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL) == 0);
+                S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free) == 0);
             }
             __syncthreads();
             if (!S->ssolved) {
@@ -1586,7 +1719,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_sse<CHUNK>(nd, m, cols, y, n, S->strial, S->sred);
+            double tsse = ft_loss<CHUNK>(nd, m, cols, y, w64, n, metric, S->strial, S->sred);
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
@@ -1599,22 +1732,22 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             }
             __syncthreads();
         }
-        /* Re-baseline the acceptance SSE in f64: `best` so far came from the
-           f32 assembly, and comparing an f64 trial against it would reject
+        /* Re-baseline the acceptance objective in f64: `best` so far came from
+           the f32 assembly, and comparing an f64 trial against it would reject
            every polish step on a systematic rounding difference alone. */
         if (status == 0) {
-            const double exact = ft_sse_d<PCHUNK>(nd, m, cols64, y64, n, S->sc, S->sred);
+            const double exact = ft_loss_d<PCHUNK>(nd, m, cols64, y64, w64, n, metric, S->sc, S->sred);
             if (isfinite(exact)) best = exact;
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
         for (int it = 0; it < 4 && status == 0 && best != 0.0; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, n, p, S->sc, S->sdg, S->sdr, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, w64, n, p, metric, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
             assembled = 1;
             if (S->sbad) {
                 status = 2;
                 break;
             }
-            if (tid == 0) S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL) == 0);
+            if (tid == 0) S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL, scale_free) == 0);
             __syncthreads();
             if (!S->ssolved) break;
             if (tid < p) {
@@ -1622,7 +1755,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 S->strial[tid] = fmin(1e6, fmax(-1e6, t));
             }
             __syncthreads();
-            double tsse = ft_sse_d<PCHUNK>(nd, m, cols64, y64, n, S->strial, S->sred);
+            double tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, w64, n, metric, S->strial, S->sred);
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
@@ -1674,8 +1807,8 @@ static int ft_launch(RcCtx *c,
                      const int *d_p,
                      const double *d_c0,
                      const int *d_gauge,
-                     int metric,
                      int iters,
+                     int metric,
                      double *d_c,
                      double *d_sse,
                      int *d_status)
@@ -1692,8 +1825,8 @@ static int ft_launch(RcCtx *c,
         opted_in = 1;
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes>>>(
-        c->d_cols, c->d_y, c->d_cols64, c->d_y64, c->n, c->v, d_prog, d_off, d_p,
-        kmax, d_c0, d_gauge, metric, iters, d_c, d_sse, d_status);
+        c->d_cols, c->d_y, c->d_cols64, c->d_y64, c->d_w64, c->n, c->v, d_prog, d_off, d_p,
+        kmax, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -1789,6 +1922,7 @@ void rc_destroy(void *ctx)
     cudaFree(c->d_y);
     if (c->d_cols64) cudaFree(c->d_cols64);
     if (c->d_y64) cudaFree(c->d_y64);
+    if (c->d_w64) cudaFree(c->d_w64);
     if (c->d_prog) cudaFree(c->d_prog);
     if (c->d_off) cudaFree(c->d_off);
     if (c->d_out) cudaFree(c->d_out);
@@ -1846,7 +1980,7 @@ int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off
 
 /* Returns elapsed milliseconds; writes nprog errors into `out`. The context's
    RcStats records the full launch+sync+download path. */
-float rc_eval(void *ctx, float *out)
+float rc_eval(void *ctx, float *out, int loss)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1.0f;
@@ -1859,7 +1993,7 @@ float rc_eval(void *ctx, float *out)
     double t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
     eval_kernel<<<c->nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
-                                       c->d_prog, c->d_off, c->d_out);
+                                       c->d_prog, c->d_off, c->d_out, loss);
     cudaEventRecord(c->t1, 0);
     st->launch_ms += rc_now_ms() - t;
     /* Wait for the kernel before reading the result. In the unified build the
@@ -1971,7 +2105,7 @@ int rc_pool_upload(void *ctx, int which, const unsigned int *prog, int nprog)
 
 /* Evaluate the programs already uploaded to `which`; same return contract as
    rc_eval (milliseconds, negative on failure). */
-float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out)
+float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int loss)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !c->d_pool[which & 1] || nprog <= 0) return -1.0f;
@@ -1995,7 +2129,7 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out)
     t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
     eval_pool_kernel<<<nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
-                                         c->d_pool[which & 1], width, c->d_out);
+                                         c->d_pool[which & 1], width, c->d_out, loss);
     cudaEventRecord(c->t1, 0);
     st->launch_ms += rc_now_ms() - t;
     t = rc_now_ms();
@@ -2064,13 +2198,16 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
 /* #169: upload exact f64 training columns for the fit kernel's final polish.
    The evaluator's resident dataset is f32; the batched fit needs the original
    f64 values so its polished constants are not limited by the f32 input
-   rounding. Called once per run when the GPU-fit arm is selected. */
-int rc_set_fit_data(void *ctx, const double *cols, const double *y)
+   rounding. Called once per run when the GPU-fit arm is selected.
+   #229: `w` is the base `--weight` row vector, or null for an unweighted run.
+   It is uploaded once here rather than per batch. */
+int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double *w)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !cols || !y) return -1;
     if (c->d_cols64) { cudaFree(c->d_cols64); c->d_cols64 = 0; }
     if (c->d_y64) { cudaFree(c->d_y64); c->d_y64 = 0; }
+    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
     size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
     size_t yb = sizeof(double) * (size_t)c->n;
     if (rc_alloc((void **)&c->d_cols64, cb) != 0) return -1;
@@ -2081,6 +2218,16 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y)
     }
     rc_upload(c->d_cols64, cols, cb);
     rc_upload(c->d_y64, y, yb);
+    if (w) {
+        if (rc_alloc((void **)&c->d_w64, yb) != 0) {
+            cudaFree(c->d_cols64);
+            c->d_cols64 = 0;
+            cudaFree(c->d_y64);
+            c->d_y64 = 0;
+            return -1;
+        }
+        rc_upload(c->d_w64, w, yb);
+    }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -2088,8 +2235,11 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y)
  *
  * `prog` is the concatenated 4-word node records; `off` has nprog+1 word
  * offsets; `pcount` has one constant count per candidate; constants start at
- * `c0[(cand*kmax)+i]`. Returns the kernel time in milliseconds, or a negative
- * value when the launch failed (the caller then keeps the CPU arm).
+ * `c0[(cand*kmax)+i]`. `metric` selects the objective the loop minimises: 0 is
+ * the sum of squared errors, 1 the log-squashed sum `Σ w ln(1 + r^2)` with
+ * per-row IRLS weights `2/(1 + r^2)` (#229). Returns the kernel time in
+ * milliseconds, or a negative value when the launch failed (the caller then
+ * keeps the CPU arm).
  */
 float rc_fit_batch(void *ctx,
                    const unsigned int *prog,
@@ -2099,8 +2249,8 @@ float rc_fit_batch(void *ctx,
                    int kmax,
                    const double *c0,
                    const int *gauge,
-                   int metric,
                    int iters,
+                   int metric,
                    double *outc,
                    double *outsse,
                    int *outstatus)
@@ -2158,10 +2308,10 @@ float rc_fit_batch(void *ctx,
         int launched;
         if (kmax <= FT_MAX_CONST_SMALL) {
             launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, metric, iters, d_c, d_sse, d_status);
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
         } else {
             launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, metric, iters, d_c, d_sse, d_status);
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
         }
         cudaEventRecord(c->t1, 0);
         cudaEventSynchronize(c->t1);

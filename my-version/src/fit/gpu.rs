@@ -14,6 +14,22 @@
 //!    LM unless the tree is affine/separable), on the untouched tree;
 //! 4. finalists are always refit exactly with [`refit_finalists_exact`].
 //!
+//! #229: the gate and the refit are **metric-aware**. A `log_squashed`
+//! proposal that improves `mean ln(1 + r²)` can be worse in SSE; judging it by
+//! SSE would silently discard exactly the fits the metric exists for (the bug
+//! #236 closed the GPU gate over). Both steps therefore score the metric the
+//! run is configured with, and the squared family keeps its historical
+//! arithmetic bit for bit.
+//!
+//! #228: the gate is also **signed-aware**. `|Σ wᵢ rᵢ| / Σ wᵢ` has a
+//! codimension-1 optimal manifold at value exactly 0, so a proposal is
+//! completed by the exact `f64` constrained-LS projection
+//! ([`super::signed_projection`]) before it is compared, and a model that
+//! cannot move the mean is labelled [`BatchStatus::NotIdentifiable`] instead of
+//! being accepted on an equal objective. [`BatchedFitter::fit_batch_metric`]
+//! additionally guarantees that a backend which only knows squared error can
+//! never answer a non-squared request.
+//!
 //! A backend that returns `None` for every candidate is therefore a correct
 //! (slow) implementation, and a buggy backend can waste work but cannot make a
 //! reported fit worse than the CPU reference. The default build has no backend;
@@ -33,8 +49,31 @@ pub enum BatchStatus {
     NonFinite,
     /// The proposal scored worse than the starting constants in exact `f64`.
     Worse,
+    /// #228: the configured objective is `signed`, the model cannot represent
+    /// the weighted mean residual, and the proposal did not improve the exact
+    /// objective. The starting constants are kept.
+    NotIdentifiable,
     /// No backend is registered in this build.
     NoBackend,
+}
+
+impl BatchStatus {
+    /// Stable label for the ledger and the docs.
+    pub fn label(self) -> &'static str {
+        match self {
+            BatchStatus::Gpu => "gpu",
+            BatchStatus::Unsupported => "unsupported",
+            BatchStatus::NonFinite => "non_finite",
+            BatchStatus::Worse => "worse",
+            BatchStatus::NotIdentifiable => "not_identifiable",
+            BatchStatus::NoBackend => "no_backend",
+        }
+    }
+
+    /// Whether the candidate's constants came from the batch proposal.
+    pub fn is_gpu(self) -> bool {
+        self == BatchStatus::Gpu
+    }
 }
 
 /// A batched fit backend. #169 implements this for the CUDA LM kernel.
@@ -51,25 +90,61 @@ pub trait BatchedFitter {
         y: &[f64],
         w: &[f64],
         iters: usize,
-        metric: Metric,
     ) -> Vec<Option<Vec<f64>>>;
+
+    /// #228: fit constants for the **configured** objective.
+    ///
+    /// The default implementation is metric-aware in the only safe direction:
+    /// the squared family (and the information criteria, whose constants are
+    /// least-squares constants) delegates to [`Self::fit_batch`], and every
+    /// other metric returns `None` so the caller routes it to the exact CPU
+    /// arm. A backend must never answer a non-squared metric with its squared
+    /// proposal: that is a silent substitution of the loss the user chose.
+    fn fit_batch_metric(
+        &self,
+        trees: &[Node],
+        x: &[Vec<f64>],
+        y: &[f64],
+        w: &[f64],
+        iters: usize,
+        metric: Metric,
+    ) -> Vec<Option<Vec<f64>>> {
+        if is_squared_family(metric) {
+            self.fit_batch(trees, x, y, w, iters)
+        } else {
+            vec![None; trees.len()]
+        }
+    }
 }
 
-/// A verified batch result: exact `f64` score and the outcome for each
+/// The metrics whose fitted constants minimise weighted squared error. The
+/// information criteria fit by least squares and add their parameter penalty at
+/// scoring time, exactly like [`fit_weighted_metric`](super::fit_weighted_metric).
+pub fn is_squared_family(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
+    )
+}
+
+/// A verified batch result: exact `f64` objective and the outcome for each
 /// candidate, in input order.
 #[derive(Clone, Debug)]
 pub struct VerifiedBatch {
-    /// The configured metric, exactly as `metrics::score_weighted` reports it.
+    /// The exact objective at the constants now in the tree: the weighted sum
+    /// of squares for the squared family (the historical return value of
+    /// [`fit_weighted`]), the configured loss otherwise — the same convention
+    /// as [`fit_weighted_metric`](super::fit_weighted_metric).
     pub score: Vec<f64>,
     pub status: Vec<BatchStatus>,
 }
 
-/// Run a batched backend through the exactness gate.
+/// Run a batched backend through the exactness gate for `metric`.
 ///
 /// The tree is modified only to the verified constants (or to the exact CPU
 /// fallback's result). Each candidate's final score is the exact `f64` value of
-/// the **configured** metric ([`Metric`]) at the constants now in the tree, so
-/// a correlation run is never judged by SSE.
+/// the **configured objective** of the constants now in the tree, so a robust
+/// proposal is never judged, or accepted, on squared error.
 pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     backend: &B,
     trees: &mut [Node],
@@ -79,7 +154,7 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     iters: usize,
     metric: Metric,
 ) -> VerifiedBatch {
-    let proposals = backend.fit_batch(trees, x, y, w, iters, metric);
+    let proposals = backend.fit_batch_metric(trees, x, y, w, iters, metric);
     let mut score = Vec::with_capacity(trees.len());
     let mut status = Vec::with_capacity(trees.len());
     for (i, tree) in trees.iter_mut().enumerate() {
@@ -90,10 +165,14 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
                 BatchStatus::Unsupported,
             ),
             Some(c) => match verify_proposal(tree, c, x, y, w, metric) {
-                Some(v) => (v, BatchStatus::Gpu),
-                None => (
+                Verdict::Accepted(v) => (v, BatchStatus::Gpu),
+                Verdict::Rejected => (
                     fit_weighted_metric(tree, x, y, w, iters, metric),
                     BatchStatus::Worse,
+                ),
+                Verdict::NotIdentifiable => (
+                    fit_weighted_metric(tree, x, y, w, iters, metric),
+                    BatchStatus::NotIdentifiable,
                 ),
             },
         };
@@ -104,10 +183,31 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     VerifiedBatch { score, status }
 }
 
-/// Apply one proposal to a clone and return its exact configured-metric score
-/// only when it is a legitimate, non-worse fit. The real tree is untouched on
-/// failure. Raw constants are never compared: the metric is invariant to the
-/// affine gauge, so the gate is too.
+/// The outcome of comparing one proposal with the starting constants.
+enum Verdict {
+    /// The proposal was accepted; carries its exact score of the metric.
+    Accepted(f64),
+    /// The proposal was not better (or was not finite): keep the start.
+    Rejected,
+    /// #228: `signed`, and no constant can move the mean, so the proposal has
+    /// no justification on the bias. Keep the start and label it.
+    NotIdentifiable,
+}
+
+/// Apply one proposal to a clone and return its exact score of `metric` only
+/// when it is a legitimate, non-worse fit. The real tree is untouched on
+/// failure.
+///
+/// `Squared` keeps the historical weighted-SSE comparison bit for bit, so every
+/// existing squared trajectory is unchanged; every other metric is compared on
+/// [`metrics::score_weighted`](super::metrics::score_weighted) of the same rows.
+///
+/// #228: `signed` is additionally *completed* first — the proposal is moved
+/// onto the zero-mean-residual manifold by the exact `f64` constrained-LS
+/// projection, and the comparison is on the resulting bias. A projection that
+/// cannot exist means the model cannot represent the mean; then only a strict
+/// objective improvement can justify the proposal, and otherwise the outcome is
+/// [`Verdict::NotIdentifiable`] rather than a squared answer in disguise.
 fn verify_proposal(
     tree: &mut Node,
     proposal: &[f64],
@@ -115,27 +215,184 @@ fn verify_proposal(
     y: &[f64],
     w: &[f64],
     metric: Metric,
-) -> Option<f64> {
+) -> Verdict {
     let f = flatten(tree);
     if proposal.len() != f.nconst || !proposal.iter().all(|v| v.is_finite()) {
-        return None;
+        return Verdict::Rejected;
     }
-    let start = metric_score(tree, x, y, w, metric);
-    let mut trial = tree.clone();
-    write_constants(&mut trial, &f, proposal);
-    // `metric_score` evaluates through `expr::eval`, exactly like the scorer.
-    let candidate = metric_score(&trial, x, y, w, metric);
+    let mut c0 = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c0[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    if metric != Metric::Squared {
+        // #229: the configured loss decides, never SSE.
+        let start = metric_score(tree, x, y, w, metric);
+        let mut trial = tree.clone();
+        write_constants(&mut trial, &f, proposal);
+        // #228: a signed proposal is projected before it is judged.
+        let projected = if metric == Metric::Signed {
+            Some(signed_projection(&mut trial, x, y, w, 2))
+        } else {
+            None
+        };
+        let candidate = metric_score(&trial, x, y, w, metric);
+        let justified = match projected {
+            Some(outcome) => outcome.is_projected() || candidate < start,
+            None => true,
+        };
+        if !candidate.is_finite() || !start.is_finite() || candidate > start || !justified {
+            return match projected {
+                Some(SignedProjection::Unidentifiable) => Verdict::NotIdentifiable,
+                _ => Verdict::Rejected,
+            };
+        }
+        let constants = fitted_constants(&trial);
+        write_constants(tree, &f, &constants);
+        return Verdict::Accepted(candidate);
+    }
+    let mut v = vec![0.0; f.op.len()];
+    let start = sse(&f, x, y, w, &c0, &mut v);
+    let candidate = sse(&f, x, y, w, proposal, &mut v);
     if !candidate.is_finite() || !start.is_finite() || candidate > start {
-        return None;
+        return Verdict::Rejected;
     }
-    *tree = trial;
-    Some(candidate)
+    write_constants(tree, &f, proposal);
+    Verdict::Accepted(candidate)
 }
 
-/// #169/#224: the exact `f64` refit every reported finalist receives, whatever
-/// arm produced it. For the squared family this is the historical LM path, bit
-/// for bit; for a correlation metric it is the exact correlation solver, so the
-/// refit is monotone in the configured objective and never a hidden SSE pass.
+/// The constant values currently in `tree`, in flat slot order.
+fn fitted_constants(tree: &Node) -> Vec<f64> {
+    let f = flatten(tree);
+    let mut c = vec![0.0; f.nconst];
+    for i in 0..f.op.len() {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    c
+}
+
+/// #228: the exact `f64` finalist refit for `--metric signed`.
+///
+/// Runs the same constrained-LS projection the CPU arm uses on the (possibly
+/// GPU-proposed) constants and returns the exact configured objective, which is
+/// what the archive and the report consume. Like [`refit_finalists_exact`] this
+/// is the step that makes the reported number independent of the device's
+/// arithmetic.
+pub fn signed_finalist(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+) -> (f64, SignedProjection) {
+    note_gpu_refit();
+    let outcome = signed_projection(tree, x, y, w, 2);
+    let value = metric_score(tree, x, y, w, Metric::Signed);
+    (value, outcome)
+}
+
+/// #169 + #228: the CUDA LM kernel as a [`BatchedFitter`], so a whole
+/// generation can be driven through the metric-aware verifier.
+///
+/// The kernel fits on the evaluator's **resident** rows (uploaded once with
+/// [`crate::gpu::GpuEvaluator::set_fit_data`] in exact `f64`), so `x`, `y` and
+/// `w` are not uploaded here: the caller must have uploaded the same rows and
+/// the same weights it will verify the proposals on. For a metric with a native
+/// device loss the proposal is the kernel's own optimum. For `signed` the
+/// squared LM proposal is returned as a **warm start** and the verifier
+/// completes it with the exact `f64` projection onto the zero-mean-residual
+/// manifold: the device supplies the row sweep, the exact objective decides
+/// what is kept. Other metrics are declined.
+#[cfg(feature = "cuda")]
+pub struct BatchedGpu<'a> {
+    ev: std::cell::RefCell<&'a mut crate::gpu::GpuEvaluator>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> BatchedGpu<'a> {
+    pub fn new(ev: &'a mut crate::gpu::GpuEvaluator) -> Self {
+        BatchedGpu {
+            ev: std::cell::RefCell::new(ev),
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedGpu<'_> {
+    fn propose(
+        &self,
+        trees: &[Node],
+        iters: usize,
+        loss: DeviceLoss,
+    ) -> Vec<Option<Vec<f64>>> {
+        // A tree the kernel cannot plan is declined and refit by the exact CPU
+        // arm.
+        let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
+        let slots: Vec<(usize, GpuFitPlan)> = trees
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| gpu_fit_plan(t).map(|plan| (i, plan)))
+            .collect();
+        if slots.is_empty() {
+            return out;
+        }
+        let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
+        let (results, ms) = self.ev.borrow_mut().fit_batch(&plans, iters, loss);
+        if ms < 0.0 || results.len() != slots.len() {
+            return out;
+        }
+        for ((i, _), res) in slots.iter().zip(results) {
+            if res.status == 0 && res.c.iter().all(|v| v.is_finite()) {
+                out[*i] = Some(res.c);
+            }
+        }
+        out
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl BatchedFitter for BatchedGpu<'_> {
+    fn fit_batch(
+        &self,
+        trees: &[Node],
+        _x: &[Vec<f64>],
+        _y: &[f64],
+        _w: &[f64],
+        iters: usize,
+    ) -> Vec<Option<Vec<f64>>> {
+        self.propose(trees, iters, DeviceLoss::Squared)
+    }
+
+    fn fit_batch_metric(
+        &self,
+        trees: &[Node],
+        _x: &[Vec<f64>],
+        _y: &[f64],
+        _w: &[f64],
+        iters: usize,
+        metric: Metric,
+    ) -> Vec<Option<Vec<f64>>> {
+        if let Some(loss) = fit_loss(metric) {
+            return self.propose(trees, iters, loss);
+        }
+        if metric == Metric::Signed {
+            // #228: warm start only; `verify_proposal` projects and judges.
+            return self.propose(trees, iters, DeviceLoss::Squared);
+        }
+        vec![None; trees.len()]
+    }
+}
+
+/// #169: the exact `f64` refit every reported finalist receives, whatever arm
+/// produced it.
+///
+/// For `squared`/AIC/AICc/BIC this is the historical LM path bit for bit. #229:
+/// for every other metric it is [`fit_weighted_metric`], which starts from
+/// `best = metric_score(tree)` and only writes improving trials, so the refit
+/// can never make the finalist worse on the configured objective than the
+/// constants the GPU arm produced.
 pub fn refit_finalists_exact(
     trees: &mut [Node],
     x: &[Vec<f64>],
@@ -148,7 +405,11 @@ pub fn refit_finalists_exact(
         .iter_mut()
         .map(|tree| {
             note_gpu_refit();
-            fit_weighted_metric(tree, x, y, w, iters, metric)
+            if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
+                fit_lm(tree, x, y, w, iters)
+            } else {
+                fit_weighted_metric(tree, x, y, w, iters, metric)
+            }
         })
         .collect()
 }
@@ -192,7 +453,23 @@ mod tests {
     }
 
     impl BatchedFitter for Backend {
-        fn fit_batch(&self, trees: &[Node], _: &[Vec<f64>], _: &[f64], _: &[f64], _: usize, _: Metric) -> Vec<Option<Vec<f64>>> {
+        fn fit_batch(&self, trees: &[Node], _: &[Vec<f64>], _: &[f64], _: &[f64], _: usize) -> Vec<Option<Vec<f64>>> {
+            trees.iter().map(|_| self.proposal.clone()).collect()
+        }
+
+        /// #228: a backend that claims to answer a metric must answer it
+        /// explicitly. The default declines every non-squared metric (pinned by
+        /// `a_squared_proposal_is_never_accepted_for_signed_by_default`), so the
+        /// test double overrides it exactly like a real device backend does.
+        fn fit_batch_metric(
+            &self,
+            trees: &[Node],
+            _: &[Vec<f64>],
+            _: &[f64],
+            _: &[f64],
+            _: usize,
+            _: Metric,
+        ) -> Vec<Option<Vec<f64>>> {
             trees.iter().map(|_| self.proposal.clone()).collect()
         }
     }
@@ -246,77 +523,6 @@ mod tests {
         assert_eq!(out.score[0].to_bits(), reference.to_bits());
     }
 
-    fn correlation_model() -> Node {
-        node(
-            Op::Add,
-            vec![
-                node(
-                    Op::Mul,
-                    vec![
-                        constant(0.7),
-                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]),
-                    ],
-                ),
-                constant(0.1),
-            ],
-        )
-    }
-
-    #[test]
-    fn a_correlation_proposal_is_judged_by_correlation_not_sse() {
-        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
-        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 0.3).collect();
-        let mut gpu = vec![correlation_model()];
-        let start = metric_score(&gpu[0], &x, &y, &[], Metric::Correlation);
-        // A constant proposal scores exactly 1.0 on the correlation metric.
-        let out = fit_batch_verified(
-            &Backend { proposal: Some(vec![0.0, 1.3, 0.0]) },
-            &mut gpu,
-            &x,
-            &y,
-            &[],
-            8,
-            Metric::Correlation,
-        );
-        assert_ne!(out.status[0], BatchStatus::Gpu);
-        let mut cpu = correlation_model();
-        let reference = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Correlation);
-        assert_eq!(out.score[0].to_bits(), reference.to_bits());
-        assert!(out.score[0] <= start + 1e-12);
-    }
-
-    #[test]
-    fn the_gate_accepts_a_gauge_equivalent_proposal() {
-        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
-        let y: Vec<f64> = x.iter().map(|r| 1.5 * (0.8 * r[0]).sin() + 0.2).collect();
-        let mut gpu = vec![correlation_model()];
-        let start = metric_score(&gpu[0], &x, &y, &[], Metric::Correlation);
-        // f -> 2*f: rho is unchanged, raw constants are not.
-        let out = fit_batch_verified(
-            &Backend { proposal: Some(vec![1.4, 1.3, 0.2]) },
-            &mut gpu,
-            &x,
-            &y,
-            &[],
-            8,
-            Metric::Correlation,
-        );
-        assert_eq!(out.status[0], BatchStatus::Gpu);
-        assert!(out.score[0] <= start + 1e-12);
-    }
-
-    #[test]
-    fn a_correlation_finalist_refit_is_metric_monotone() {
-        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
-        let y: Vec<f64> = x.iter().map(|r| 0.2 * r[0] + (1.2 * r[0]).sin()).collect();
-        let mut trees = vec![correlation_model()];
-        let start = metric_score(&trees[0], &x, &y, &[], Metric::Correlation);
-        let scores = refit_finalists_exact(&mut trees, &x, &y, &[], 40, Metric::Correlation);
-        assert!(scores[0] <= start + 1e-12, "refit {scores:?} from {start}");
-        let check = metric_score(&trees[0], &x, &y, &[], Metric::Correlation);
-        assert!((check - scores[0]).abs() < 1e-12);
-    }
-
     #[test]
     fn finalists_are_refit_with_the_exact_lm_path() {
         let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
@@ -335,5 +541,257 @@ mod tests {
         let ca: Vec<u64> = fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect();
         let cb: Vec<u64> = fitted(&cpu).iter().map(|v| v.to_bits()).collect();
         assert_eq!(ca, cb);
+    }
+
+    /// #229: a proposal that improves `ln(1+r²)` while making SSE worse must be
+    /// accepted — the exact bug a squared-only gate causes. The fixture is an
+    /// affine fit on rows with 5 % gross outliers, where the robust optimum and
+    /// the least-squares optimum differ.
+    #[test]
+    fn a_robust_proposal_is_judged_by_its_own_metric() {
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![i as f64 / 4.0]).collect();
+        let mut y: Vec<f64> = x.iter().map(|r| 1.0 + 0.5 * r[0]).collect();
+        for i in (3..40).step_by(8) {
+            y[i] += 40.0;
+        }
+        // The robust optimum on the same 40 rows (CPU IRLS, the reference arm).
+        let mut reference = model();
+        let robust = fit_weighted_metric(&mut reference, &x, &y, &[], 8, Metric::LogSquashed);
+        let proposal = fitted(&reference);
+        let sse_worse = sse(&flatten(&model()), &x, &y, &[], &proposal, &mut vec![0.0; 64])
+            > sse(&flatten(&model()), &x, &y, &[], &fitted(&model()), &mut vec![0.0; 64]);
+        assert!(
+            sse_worse,
+            "the fixture must make the robust fit worse in SSE, else it proves nothing"
+        );
+        let mut gpu = vec![model()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(proposal.clone()) },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::LogSquashed,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better log_squashed proposal must not be rejected on SSE"
+        );
+        assert_eq!(out.score[0].to_bits(), robust.to_bits());
+        let c = fitted(&gpu[0]);
+        let want = fitted(&reference);
+        assert_eq!(
+            c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #229: the squared family keeps its exact arithmetic and the log-squashed
+    /// refit is idempotent — a second refit from its own endpoint changes
+    /// nothing, which is what "monotone from the GPU endpoint" means in bits.
+    #[test]
+    fn a_robust_finalist_refit_is_idempotent() {
+        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![-1.5 + 0.05 * i as f64]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 2.0 * (1.3 * r[0]).sin() + if i % 7 == 0 { 6.0 } else { 0.0 })
+            .collect();
+        let tree = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(1.0), node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])])]),
+                constant(0.0),
+            ],
+        );
+        let mut once = vec![tree.clone()];
+        let first = refit_finalists_exact(&mut once, &x, &y, &[], 8, Metric::LogSquashed);
+        let c1 = fitted(&once[0]);
+        let mut twice = once.clone();
+        let second = refit_finalists_exact(&mut twice, &x, &y, &[], 8, Metric::LogSquashed);
+        let c2 = fitted(&twice[0]);
+        assert_eq!(first[0].to_bits(), second[0].to_bits());
+        assert_eq!(
+            c1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            c2.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // And the reported value is the configured loss, not an SSE.
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&twice[0], r)).collect();
+        let scored = crate::metrics::score_weighted(
+            &pred,
+            &y,
+            &[],
+            Metric::LogSquashed,
+            crate::expr::count_constants(&twice[0]),
+        );
+        assert_eq!(second[0].to_bits(), scored.to_bits());
+    }
+
+    /// #229: `--no-fit` (`iters == 0`) is a true no-op for a robust run too:
+    /// the proposal never runs, the constants stay bit-identical and the score
+    /// is the metric at those constants.
+    #[test]
+    fn no_fit_keeps_a_robust_run_untouched() {
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        let tree = model();
+        let before = fitted(&tree);
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![9.0, 9.0]) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::LogSquashed,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
+        let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::LogSquashed, 2);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    // -- #228: the signed arm through the batch gate ------------------------
+
+    /// A backend that answers the configured metric explicitly (the contract a
+    /// real device backend must meet).
+    struct ProposingBackend(Vec<f64>);
+
+    impl BatchedFitter for ProposingBackend {
+        fn fit_batch(
+            &self,
+            trees: &[Node],
+            _: &[Vec<f64>],
+            _: &[f64],
+            _: &[f64],
+            _: usize,
+        ) -> Vec<Option<Vec<f64>>> {
+            trees.iter().map(|_| Some(self.0.clone())).collect()
+        }
+
+        fn fit_batch_metric(
+            &self,
+            trees: &[Node],
+            _: &[Vec<f64>],
+            _: &[f64],
+            _: &[f64],
+            _: usize,
+            _: Metric,
+        ) -> Vec<Option<Vec<f64>>> {
+            trees.iter().map(|_| Some(self.0.clone())).collect()
+        }
+    }
+
+    /// A backend that only knows squared error: every non-squared request must
+    /// be declined by the default `fit_batch_metric`, never answered with SSE.
+    struct SquaredOnlyBackend(Vec<f64>);
+
+    impl BatchedFitter for SquaredOnlyBackend {
+        fn fit_batch(
+            &self,
+            trees: &[Node],
+            _: &[Vec<f64>],
+            _: &[f64],
+            _: &[f64],
+            _: usize,
+        ) -> Vec<Option<Vec<f64>>> {
+            trees.iter().map(|_| Some(self.0.clone())).collect()
+        }
+    }
+
+    #[test]
+    fn a_squared_proposal_is_never_accepted_for_signed_by_default() {
+        let trees = vec![model()];
+        let out = SquaredOnlyBackend(vec![2.0, 3.0]).fit_batch_metric(
+            &trees,
+            &[],
+            &[],
+            &[],
+            8,
+            Metric::Signed,
+        );
+        assert_eq!(
+            out,
+            vec![None],
+            "the default must decline, not answer with SSE"
+        );
+    }
+
+    #[test]
+    fn a_signed_proposal_is_judged_on_the_bias_not_on_sse() {
+        // y = 2x + 4 on x = 1..20, model `a·x` (no intercept). The least-squares
+        // optimum is biased (a·mean(x) != mean(y)); the only zero-bias point is
+        // a = sum(y)/sum(x), and its SSE is strictly higher. The gate must accept
+        // the projection even though SSE got worse: an SSE gate would have
+        // rejected the only signed answer.
+        let x: Vec<Vec<f64>> = (1..=20).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 4.0).collect();
+        let mut start = node(Op::Mul, vec![constant(1.0), input(0)]);
+        fit_weighted(&mut start, &x, &y, &[], 8);
+        let start_sse = metric_score(&start, &x, &y, &[], Metric::Squared);
+        let start_bias = metric_score(&start, &x, &y, &[], Metric::Signed);
+        assert!(start_bias > 0.5, "the squared optimum is biased: {start_bias}");
+
+        let mut gpu = vec![start];
+        let out = fit_batch_verified(
+            &ProposingBackend(vec![2.0]),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Signed,
+        );
+        assert_eq!(out.status, vec![BatchStatus::Gpu]);
+        let scale = y.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+        assert!(out.score[0] <= 1e-14 * scale, "bias {}", out.score[0]);
+        // The accepted constants are *worse* in squared error: the gate is on
+        // the configured objective, not on SSE.
+        assert!(
+            metric_score(&gpu[0], &x, &y, &[], Metric::Squared) > start_sse,
+            "the zero-bias point must have a higher SSE for this test to mean anything"
+        );
+        // The reported objective is the exact metric value at the constants.
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&gpu[0], r)).collect();
+        assert_eq!(
+            out.score[0].to_bits(),
+            crate::metrics::score_weighted(
+                &pred,
+                &y,
+                &[],
+                Metric::Signed,
+                crate::expr::count_constants(&gpu[0])
+            )
+            .to_bits()
+        );
+    }
+
+    #[test]
+    fn a_non_identifiable_model_is_labelled_and_keeps_the_start() {
+        // No intercept and a zero-mean input: no constant can move the mean, so
+        // the bias is a constant of the model and the projection must decline.
+        let x: Vec<Vec<f64>> = (0..20).map(|i| vec![i as f64 - 9.5]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 4.0).collect();
+        let bias_only = node(Op::Mul, vec![constant(1.0), input(0)]);
+        let mut gpu = vec![bias_only];
+        let out = fit_batch_verified(
+            &ProposingBackend(vec![1.5]),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Signed,
+        );
+        assert_eq!(out.status, vec![BatchStatus::NotIdentifiable]);
+        // The reported objective is the exact bias of the model, not zero.
+        assert!((out.score[0] - 4.0).abs() < 1e-12, "{:?}", out.score);
     }
 }

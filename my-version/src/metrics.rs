@@ -182,6 +182,19 @@ impl Metric {
         matches!(self, Metric::Aic | Metric::Aicc | Metric::Bic)
     }
 
+    /// True for the metrics whose fitted objective **is** weighted least
+    /// squares: `squared` and the information criteria, which fit by least
+    /// squares and add their parameter penalty when scoring (#223).
+    ///
+    /// This is the family whose fitted objective is exactly weighted least
+    /// squares. The batched GPU LM also honours `log_squashed` through weighted
+    /// IRLS since #229 ([`crate::fit::fit_loss`]); every other metric fits by
+    /// logistic IRLS or the coordinate polish on the CPU, which is a different
+    /// objective from the one the kernel would minimise.
+    pub fn is_least_squares(self) -> bool {
+        matches!(self, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic)
+    }
+
     /// True for the implicit metrics (issue #14). They are scored from the tree
     /// and a row by [`crate::implicit`], because they need `f` and its gradient
     /// rather than a prediction vector.
@@ -719,6 +732,43 @@ mod tests {
         assert_eq!(Metric::parse_opt("nonsense"), None);
         assert_eq!(Metric::parse_opt("MAE"), Some(Metric::Absolute));
         assert_eq!(Metric::parse_opt("mse"), Some(Metric::Squared));
+    }
+
+    /// #223: exactly the family whose fitted objective is weighted least
+    /// squares. The GPU LM dispatch and the CLI refusal both read this
+    /// predicate, so the two cannot disagree about which metrics it covers.
+    #[test]
+    fn the_least_squares_family_is_squared_and_the_information_criteria() {
+        let mut seen = Vec::new();
+        for m in Metric::all() {
+            if m.is_least_squares() {
+                seen.push(m.name());
+            }
+        }
+        assert_eq!(seen, ["squared", "aic", "aicc", "bic"]);
+        // The information criteria are the parameter-aware least-squares fit;
+        // every parameter-aware metric must be in the family.
+        for m in Metric::all() {
+            if m.is_parameter_aware() {
+                assert!(m.is_least_squares(), "{}", m.name());
+            }
+        }
+        // The other solvers are not: IRLS, logistic IRLS, coordinate polish.
+        for m in [
+            Metric::Absolute,
+            Metric::LogSquashed,
+            Metric::Auc,
+            Metric::LogLoss,
+            Metric::Hinge,
+            Metric::Median,
+            Metric::Maximum,
+            Metric::Correlation,
+            Metric::RankCorrelation,
+            Metric::Slope,
+            Metric::ImplicitDerivative,
+        ] {
+            assert!(!m.is_least_squares(), "{}", m.name());
+        }
     }
 
     #[test]

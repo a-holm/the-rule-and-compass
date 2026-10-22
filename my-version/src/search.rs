@@ -558,12 +558,13 @@ impl Ind {
 /// kernel launch. Constants are still fitted on the CPU *before* the batch: the
 /// GPU only supplies the fitness that selection consumes.
 ///
-/// The kernel sums squared errors in `f32`; [`GpuSearch::score`] divides by the
-/// row count so the search sees a mean squared error. For `--metric squared`
-/// that is the configured objective (up to `f32` rounding); for the other
-/// regression metrics it is a monotone ranking proxy. Either way it is only
-/// used to guide the search: the archive and every reported number are rebuilt
-/// on the full training sample with the CPU `f64` evaluator.
+/// The kernel accumulates one objective in `f32`; [`GpuSearch::score`] divides
+/// by the row count so the search sees its mean. For `--metric squared` that is
+/// the mean squared error and for `--metric log_squashed` the mean
+/// `ln(1 + r²)` (#229), both native on the device; every other metric keeps the
+/// CPU evaluator (#236). Either way the value is only used to guide the search:
+/// the archive and every reported number are rebuilt on the full training
+/// sample with the CPU `f64` evaluator.
 #[cfg(feature = "cuda")]
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
@@ -593,7 +594,7 @@ struct GpuSearch {
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
-    fn new(train: &Sample, fit_data: bool) -> Result<Self, String> {
+    fn new(train: &Sample, fit_data: bool, loss: crate::fit::DeviceLoss) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -618,6 +619,10 @@ impl GpuSearch {
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
         match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
             Some(mut ev) => {
+                // #229: the evaluator must accumulate the objective the run
+                // ranks on. `gpu_blocker` has already refused any metric without
+                // a native kernel loss, so this is the configured objective.
+                ev.set_loss(loss);
                 // #169: the batched fit's final polish runs on the exact f64
                 // rows, so its constants are not limited by the f32 evaluator
                 // copy. Only the GPU-fit arm pays this second resident copy.
@@ -628,7 +633,7 @@ impl GpuSearch {
                             cols64[v * n_rows + r] = x;
                         }
                     }
-                    let _ = ev.set_fit_data(&cols64, &train.y);
+                    let _ = ev.set_fit_data(&cols64, &train.y, &train.w);
                 }
                 Ok(GpuSearch {
                     ev,
@@ -666,7 +671,7 @@ impl GpuSearch {
     /// non-finite — is refit by the exact CPU f64 arm, seeded with whatever
     /// constants the kernel produced. Each CPU fallback is labelled by cause
     /// (`unsupported_plan`, `too_few_rows`, `too_many_constants`,
-    /// `metric_unsupported`, `ill_conditioned`, `non_finite`, `launch`).
+    /// `ill_conditioned`, `non_finite`, `launch`).
     fn fit_pending(
         &mut self,
         islands: &mut [Vec<Ind>],
@@ -677,16 +682,15 @@ impl GpuSearch {
     ) {
         let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
-        // #224: the kernel minimises the configured metric exactly (SSE or
-        // correlation). A metric it cannot score is a labelled fallback, never
-        // a silent SSE substitution.
-        let gpu_metric = crate::gpu::GpuFitMetric::for_metric(cfg.metric);
+        // #229: the objective the batched kernel minimises. `defers_fit_to_gpu`
+        // keeps a run without a native loss off this path; if it ever reaches
+        // here, refuse the device rather than guess an objective.
+        let fit_loss = crate::fit::fit_loss(cfg.metric);
         for &(i, j) in admitted {
-            if gpu_metric.is_none() {
-                fallbacks.push((i, j, FitFallbackCause::MetricUnsupported));
-                continue;
-            }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
+                _ if fit_loss.is_none() => {
+                    fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
+                }
                 Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
                 Ok(_) => fallbacks.push((i, j, FitFallbackCause::TooFewRows)),
                 Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
@@ -704,12 +708,9 @@ impl GpuSearch {
         }
 
         if !jobs.is_empty() {
+            let loss = fit_loss.expect("jobs is only filled when a native loss exists");
             let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
-            let (out, ms) = self.ev.fit_batch(
-                &plans,
-                cfg.fit_iters,
-                gpu_metric.expect("jobs imply a metric"),
-            );
+            let (out, ms) = self.ev.fit_batch(&plans, cfg.fit_iters, loss);
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
             }
@@ -1392,11 +1393,12 @@ fn score_pipeline_batch(
 
 /// #26: whether a run may use the GPU at all.
 ///
-/// Restricted to the single-output, unweighted, full-sample **squared-error**
-/// path: multi-output and implicit objectives need more than one prediction per
-/// row, `--predictor-samples` changes the rows every generation, and every
-/// non-squared metric needs an objective the device does not score yet. Each of
-/// those keeps the CPU evaluator.
+/// Restricted to the single-output, unweighted, full-sample path with a
+/// **native device objective**: multi-output and implicit objectives need more
+/// than one prediction per row, `--predictor-samples` changes the rows every
+/// generation, weighted rows need a per-row weight array the evaluator does not
+/// have, and every metric without a native kernel loss would be ranked by a
+/// proxy it is not defined on. Each of those keeps the CPU evaluator.
 #[cfg(feature = "cuda")]
 fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
@@ -1414,12 +1416,12 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if cfg.metric.is_parameter_aware() {
         return Some("parameter-aware metric");
     }
-    // #236: the CUDA evaluator accumulates squared error. Every other metric
-    // must be scored on the CPU until its objective is native on the device;
-    // otherwise a slope/absolute/rank run can silently rank by MSE. This is a
-    // correctness gate, not a performance preference: remove it only together
-    // with a tested native scorer for the metric.
-    if cfg.metric != crate::metrics::Metric::Squared {
+    // #236: the CUDA evaluator accumulates squared error; #229 adds one more
+    // native objective. A metric may use the device only when the kernel
+    // computes that objective itself, or a slope/absolute/rank run is silently
+    // ranked by MSE (observed: a different Pareto point for `--metric slope`).
+    // This is a correctness gate, not a performance preference.
+    if crate::fit::DeviceLoss::for_metric(cfg.metric).is_none() {
         return Some("metric is not scored natively on the GPU");
     }
     if subsampling_active(cfg, train) {
@@ -1455,6 +1457,29 @@ pub fn effective_backend(cfg: &Config, train: &Sample) -> Backend {
     }
     let _ = (cfg, train);
     Backend::Cpu
+}
+
+/// #236: the labelled cause a requested GPU run will actually be scored on the
+/// CPU, or `None` when the device is usable (or `--gpu` was not requested).
+///
+/// This is the same decision [`effective_backend`] makes. The CLI prints it in
+/// the resource line and records it in the development log, so a run whose
+/// objective the kernel cannot score never claims the GPU in its own evidence
+/// record.
+pub fn backend_blocker_reason(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    #[cfg(feature = "cuda")]
+    {
+        if cfg.gpu
+            && !matches!(
+                std::env::var("RCSR_GPU").as_deref(),
+                Ok("0") | Ok("false") | Ok("off") | Ok("no")
+            )
+        {
+            return gpu_blocker(cfg, train);
+        }
+    }
+    let _ = (cfg, train);
+    None
 }
 
 pub fn eval_error(tree: &Node, s: &Sample, metric: Metric) -> f64 {
@@ -1888,14 +1913,15 @@ pub enum FitFallbackCause {
     TooFewRows,
     /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 20`).
     TooManyConstants,
+    /// #229: the metric has no native device objective (only `squared` and
+    /// `log_squashed` do), so the exact CPU arm owns the fit.
+    MetricNotNative,
     /// The kernel's conditioning gate rejected the normal equations (status 1).
     IllConditioned,
     /// A non-finite value, derivative or residual (status 2).
     NonFinite,
     /// The CUDA fit launch failed; the whole batch went to the CPU.
     Launch,
-    /// #224: the configured metric has no exact device fit objective.
-    MetricUnsupported,
 }
 
 impl FitFallbackCause {
@@ -1904,7 +1930,7 @@ impl FitFallbackCause {
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
-        FitFallbackCause::MetricUnsupported,
+        FitFallbackCause::MetricNotNative,
         FitFallbackCause::IllConditioned,
         FitFallbackCause::NonFinite,
         FitFallbackCause::Launch,
@@ -1916,7 +1942,7 @@ impl FitFallbackCause {
             FitFallbackCause::UnsupportedPlan => "unsupported_plan",
             FitFallbackCause::TooFewRows => "too_few_rows",
             FitFallbackCause::TooManyConstants => "too_many_constants",
-            FitFallbackCause::MetricUnsupported => "metric_unsupported",
+            FitFallbackCause::MetricNotNative => "metric_not_native",
             FitFallbackCause::IllConditioned => "ill_conditioned",
             FitFallbackCause::NonFinite => "non_finite",
             FitFallbackCause::Launch => "launch",
@@ -2028,21 +2054,28 @@ fn select_promoted(
 }
 
 /// #169: true when this generation's offspring are left unfitted for the
-/// batched GPU LM arm. The kernel minimises squared error, so only that metric
-/// qualifies; every other configuration keeps the CPU fit path it had before.
+/// batched GPU LM arm. The kernel minimises one objective per launch, so only a
+/// metric with a native device objective qualifies (#229: `squared`, the
+/// information criteria via [`Metric::is_least_squares`], and `log_squashed`
+/// with its IRLS weights); every other configuration keeps the CPU fit path it
+/// had before.
+///
+/// #228: `signed` is deliberately not deferred — [`crate::fit::fit_loss`] is
+/// `None` for it. Its fit arm (the exact `f64` constrained-LS projection) is a
+/// host step over the same rows, and #236's correctness gate keeps every
+/// non-squared metric on the CPU evaluator until the device has a native,
+/// tested scorer for it. Deferring the fit while the offspring are ranked by
+/// MSE is exactly the silent substitution that gate exists to prevent; on main
+/// this configuration is already refused up front by
+/// [`crate::fit::gpu_fit_metric_error`], and `--metric signed` uses the exact
+/// CPU arm (including the projection). The device-warm-start form of the same
+/// arm (`BatchedGpu` + [`crate::fit::fit_batch_verified`]) is tested directly; it
+/// becomes reachable from the search as soon as a native signed loss lands.
 fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
     defer_gpu
         && cfg.fit_strategy.defers_to_gpu()
         && cfg.fit_iters > 0
-        && matches!(
-            cfg.metric,
-            Metric::Squared
-                | Metric::Aic
-                | Metric::Aicc
-                | Metric::Bic
-                | Metric::Correlation
-                | Metric::CorrelationSigned
-        )
+        && crate::fit::fit_loss(cfg.metric).is_some()
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -3633,7 +3666,14 @@ fn run_search(
                 backend_reason = Some(reason.to_string());
                 None
             }
-            None => match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu()) {
+            None => {
+                // #229: the gate above admits only metrics the kernel scores
+                // natively, so this is always `Some`. It panics rather than
+                // defaulting to squared error, because a silent MSE ranking is
+                // exactly the #236 defect.
+                let loss = crate::fit::DeviceLoss::for_metric(cfg.metric)
+                    .expect("gpu_blocker admits only native device losses");
+                match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu(), loss) {
                 Ok(g) => {
                     let device = crate::gpu::GpuEvaluator::device_name();
                     if cfg.gpu_notes {
@@ -3672,7 +3712,8 @@ fn run_search(
                     backend_reason = Some(e);
                     None
                 }
-            },
+                }
+            }
         }
     };
     #[cfg(not(feature = "cuda"))]
@@ -3690,8 +3731,8 @@ fn run_search(
     #[cfg(feature = "cuda")]
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
-            "# gpu-fit: off (the batched kernel minimises squared error; \
-             --metric must be squared, aic, aicc or bic)"
+            "# gpu-fit: off (the batched kernel minimises squared error or \
+             log-squashed; --metric must be squared, log_squashed, aic, aicc or bic)"
         );
     }
     #[cfg(feature = "cuda")]
@@ -4984,7 +5025,7 @@ mod tests {
                 "unsupported_plan",
                 "too_few_rows",
                 "too_many_constants",
-                "metric_unsupported",
+                "metric_not_native",
                 "ill_conditioned",
                 "non_finite",
                 "launch",
@@ -5016,6 +5057,46 @@ mod tests {
             status_fallback_cause(0),
             FitFallbackCause::UnsupportedPlan
         );
+    }
+
+    /// #229: a metric without a native device objective is labelled
+    /// `metric_not_native`, and the gate keeps such a run off the fit path in
+    /// the first place. `log_squashed` passes because the kernel fits it.
+    #[test]
+    fn the_fit_gate_admits_only_native_device_objectives() {
+        assert!(FitFallbackCause::ALL.contains(&FitFallbackCause::MetricNotNative));
+        assert_eq!(FitFallbackCause::MetricNotNative.label(), "metric_not_native");
+        let gpu_fit = Config {
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_iters: 8,
+            metric: Metric::LogSquashed,
+            ..Default::default()
+        };
+        assert!(defers_fit_to_gpu(&gpu_fit, true), "log_squashed is native");
+        for metric in [Metric::Squared, Metric::Aic, Metric::Aicc, Metric::Bic] {
+            let cfg = Config {
+                metric,
+                ..gpu_fit.clone()
+            };
+            assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
+        }
+        for metric in [Metric::Absolute, Metric::Slope, Metric::Median, Metric::Correlation] {
+            let cfg = Config {
+                metric,
+                ..gpu_fit.clone()
+            };
+            assert!(
+                !defers_fit_to_gpu(&cfg, true),
+                "{metric:?} has no native device loss"
+            );
+        }
+        // `--no-fit` never reaches the kernel, whatever the metric.
+        let no_fit = Config {
+            fit_iters: 0,
+            ..gpu_fit.clone()
+        };
+        assert!(!defers_fit_to_gpu(&no_fit, true));
+        assert!(!defers_fit_to_gpu(&no_fit, false));
     }
 
     /// #169: the kernel's constant cap is 20, so the `too_many_constants`

@@ -34,6 +34,8 @@ timings. It contains:
 | `commit`, `dirty` | `git rev-parse HEAD` and whether the work tree had uncommitted files |
 | `binary.path`, `binary.sha256` | the actual `current_exe` and its SHA-256 (two CUDA-linked binaries at the same commit can differ) |
 | `data.path`, `data.sha256` | raw data file and its SHA-256 (`null` for stdin) |
+| `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` for a full load, `false`/`N` for an explicit `--sample-rows N` sample, `null`/`null` for a CSV |
+| `data.estimate_bytes` | #112: the memory estimate that justified the load decision (`null` for a CSV) |
 | `data.train`, `data.test` | prepared-sample row count and FNV-1a fingerprint, exactly as the checkpoint records them |
 | `config.hash`, `config.seed`, `config.canonical` | the canonical configuration text, its FNV-1a hash and the search seed |
 | `backend`, `device` | `cpu`/`gpu`, device name, driver version and CUDA version |

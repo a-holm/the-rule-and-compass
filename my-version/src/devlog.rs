@@ -602,6 +602,10 @@ pub struct RunStart {
     pub train_fingerprint: String,
     pub test_rows: usize,
     pub test_fingerprint: String,
+    /// #112: `Some(true)` full rows, `Some(false)` explicit sample, `None` CSV.
+    pub full_rows: Option<bool>,
+    pub sampled_rows: Option<usize>,
+    pub estimate_bytes: Option<u64>,
     /// Canonical configuration lines, already `key value` pairs.
     pub config: Vec<(String, String)>,
     pub config_hash: u64,
@@ -641,7 +645,8 @@ pub fn run_start_json(r: &RunStart) -> String {
     format!(
         "{{\"schema\":\"{}\",\"v\":{},\"event\":\"run_start\",\"command\":{},\"version\":{},\
          \"commit\":{},\"dirty\":{},\"binary_sha256\":{},\
-         \"data\":{{\"path\":{},\"sha256\":{},\"train\":{{\"rows\":{},\"fingerprint\":{}}},\
+         \"data\":{{\"path\":{},\"sha256\":{},\"full_rows\":{},\"sampled_rows\":{},\
+         \"estimate_bytes\":{},\"train\":{{\"rows\":{},\"fingerprint\":{}}},\
          \"test\":{{\"rows\":{},\"fingerprint\":{}}}}},\
          \"config_hash\":{},\"config\":{},\
          \"seed\":{},\"backend\":{},\"device\":{},\"threads\":{},\
@@ -659,6 +664,9 @@ pub fn run_start_json(r: &RunStart) -> String {
             Some(s) => text(s),
             None => "null".to_string(),
         },
+        r.full_rows.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+        r.sampled_rows.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
+        r.estimate_bytes.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()),
         r.train_rows,
         text(&r.train_fingerprint),
         r.test_rows,

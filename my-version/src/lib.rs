@@ -28,6 +28,7 @@ pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
 pub mod lockbox; // #145: the 2026H2 holdout
 pub mod manifest;
+pub mod memory;
 pub mod metrics;
 pub mod multi;
 pub mod ohlcv;
