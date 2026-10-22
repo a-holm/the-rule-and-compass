@@ -128,6 +128,15 @@ changes the stored feature value or bridges a gap in the producer. The compact
 52-name profile follows the same rule, even where the historical compact builder
 used positional windows that bridged a hole.
 
+The candle/price-action family (#261) is stricter still for its new columns:
+`clv16`, `body16`, `rng_atr`, `prev_range_pos`, `inside_s`, `outside_s`,
+`engulf_s`, `harami_s`, `nr4` and `trend96` are `NaN` when a bar has `H==L`, a
+zero volume (when the store carries the volume column), or when any bucket in
+the trailing window is missing. The two-bar strengths are `NaN` when `t-1` is
+missing; `run8` resets at a gap. The compact candle names (`clv1`, `body1`,
+`batr`, …) keep the documented compact `H==L` convention so the parity fixture
+has exactly one definition per name.
+
 The OHLCV/flow family (#270) follows that rule as well: `taker_ratio96`,
 `taker_imb16`, `trade_intensity96`, `avg_trade_size96`, `amihud96`,
 `zero_ret_share96`, `obv_z96`, `cvd_proxy` and `vwap_dev96` are `NaN` for a

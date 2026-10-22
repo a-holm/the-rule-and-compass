@@ -393,7 +393,11 @@ atomically instead of streaming it. See
   subset at the 15 m base, and the `flow` group materialises `vwap` plus the
   nine derived OHLCV/flow columns (taker ratios, trade intensity, average trade
   size, Amihud illiquidity, zero-return share, OBV z-score, CVD proxy and VWAP
-  deviation) with the documented zero-volume/zero-trade and gap policies. The
+  deviation) with the documented zero-volume/zero-trade and gap policies, and
+  the `price_action` group adds the continuous candle geometry and multi-bar
+  structure of #261 (`clv16 body16 rng_atr prev_range_pos inside_s outside_s
+  engulf_s harami_s run8 nr4 trend96`; `batr` is shared with `compact`) with
+  strict zero-range/zero-volume and gap masks. The
   default financial feature set is
   registered in `rcsr schema` (`feature_registry`): every available column has a
   tested producer, and registered-but-unavailable MTF, market-state and
