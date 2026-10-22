@@ -618,6 +618,9 @@ extern "C" {
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
     fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
+    /* #234: the per-row label sign `t = 2l - 1` the log-loss fit arm reads. A
+       null pointer clears it, and every log-loss launch is then refused. */
+    fn rc_set_fit_sign(ctx: *mut RawCtx, sign: *const f64) -> i32;
     /* #169: batched LM constant fitting over the resident dataset.
        #229: `metric` selects the objective: 0 = squared, 1 = log-squashed,
        2 = correlation (1-|rho|), 3 = correlation_signed (1-rho).
@@ -952,6 +955,23 @@ impl GpuEvaluator {
     pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
         unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 }
+    }
+
+    /// #234: upload the per-row label sign `t = 2·l − 1` the log-loss arm of
+    /// the batched fit reads, with `l` from the target midpoint
+    /// ([`crate::fit::classification_signs`]). Must follow
+    /// [`Self::set_fit_data`] (the buffer is sized by the resident row count)
+    /// and precede any `DeviceLoss::Logistic` batch; a launch without it is
+    /// refused on the device, so the arm can never fall back to another
+    /// objective. An empty slice clears the vector.
+    pub fn set_fit_sign(&mut self, sign: &[f64]) -> bool {
+        if sign.is_empty() {
+            return unsafe { rc_set_fit_sign(self.ctx, std::ptr::null()) == 0 };
+        }
+        if sign.len() as u64 != self.n_rows {
+            return false;
+        }
+        unsafe { rc_set_fit_sign(self.ctx, sign.as_ptr()) == 0 }
     }
 
     pub fn device_name() -> String {

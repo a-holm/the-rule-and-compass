@@ -1005,6 +1005,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
         !refused.contains(&"median"),
         "median is fitted by the exact median polish since #226 and must not be refused"
     );
+    assert!(
+        !refused.contains(&"log_loss"),
+        "#234: log_loss has a native device fit objective and must not be refused"
+    );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
         // with it, the GPU refusal is the one that must fire.
@@ -1061,6 +1065,7 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
         "rank_correlation",
         "rank_correlation_signed",
         "median",
+        "log_loss",
     ] {
         let out = rcsr(&[
             "--data", "missing-223.csv", "--target", "y", "--vars", "x",

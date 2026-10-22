@@ -605,6 +605,8 @@ impl GpuSearch {
         fit_data: bool,
         loss: crate::fit::DeviceLoss,
         native_metric: bool,
+        // #234: the device fit needs the label sign for a log-loss run.
+        logistic_fit: bool,
     ) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
@@ -645,6 +647,14 @@ impl GpuSearch {
                         }
                     }
                     let _ = ev.set_fit_data(&cols64, &train.y, &train.w);
+                    // #234: the log-loss arm reads the label sign from the
+                    // device. Uploading it here (once per run) keeps the
+                    // midpoint rule over the whole sample in one place; a
+                    // device that refuses the upload turns every log-loss
+                    // candidate into a labelled CPU fallback.
+                    if logistic_fit {
+                        let _ = ev.set_fit_sign(&crate::fit::classification_signs(&train.y));
+                    }
                 }
                 Ok(GpuSearch {
                     ev,
@@ -702,7 +712,18 @@ impl GpuSearch {
         let rank_loss = crate::fit::rank_fit_only(cfg.metric);
         // #226: `median` has no LM loss but its own exact device polish.
         let median_arm = crate::fit::median_fit_only(cfg.metric);
+        // #234: a single-class fit sample has no finite log-loss optimum. The
+        // counts come from the same midpoint rule the CPU arm uses, so the
+        // device never fits a sign the sample does not support.
+        let single_class = crate::fit::fit_only_loss(cfg.metric).is_some() && {
+            let (pos, neg) = crate::fit::class_counts(&train.y);
+            pos == 0 || neg == 0
+        };
         for &(i, j) in admitted {
+            if single_class {
+                fallbacks.push((i, j, FitFallbackCause::SingleClass));
+                continue;
+            }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
                 _ if fit_loss.is_none() && rank_loss.is_none() && !median_arm => {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
@@ -749,8 +770,40 @@ impl GpuSearch {
                 self.fit_ms += ms as f64;
             }
             if out.len() == jobs.len() {
+                // #234: the log-loss arm judges the proposal by the configured
+                // objective in exact f64, against the exact value at the
+                // starting constants. The kernel's acceptance is therefore a
+                // suggestion, never the final word. The other LM arms keep
+                // their historical trajectory (their proposal is the kernel's
+                // own optimum of the same objective).
+                let gated = matches!(cfg.metric, Metric::LogLoss);
                 for ((i, j, plan), res) in jobs.iter().zip(out) {
                     let finite = res.c.iter().all(|v| v.is_finite());
+                    if gated && res.status == 0 && finite {
+                        let tree = &mut islands[*i][*j].tree;
+                        let (_, verdict) = crate::fit::gate_proposal(
+                            tree,
+                            |t| plan.apply(t, &res.c),
+                            &train.x,
+                            &train.y,
+                            &train.w,
+                            cfg.metric,
+                        );
+                        let cause = match verdict {
+                            crate::fit::ProposalGate::Kept => {
+                                self.fit_gpu += 1;
+                                self.stats.entry(generation).or_default().fit_gpu += 1;
+                                crate::fit::note_gpu_fit(true);
+                                continue;
+                            }
+                            crate::fit::ProposalGate::Worse => FitFallbackCause::LogLossWorse,
+                            crate::fit::ProposalGate::NonFinite => FitFallbackCause::NonFinite,
+                        };
+                        fallbacks.push((*i, *j, cause));
+                        self.note_fit_fallback(generation, cause);
+                        crate::fit::note_gpu_fit(false);
+                        continue;
+                    }
                     if finite {
                         plan.apply(&mut islands[*i][*j].tree, &res.c);
                     }
@@ -2030,8 +2083,9 @@ pub enum FitFallbackCause {
     TooFewRows,
     /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 20`).
     TooManyConstants,
-    /// #229/#222: the metric has no native device objective (only `squared`,
-    /// `log_squashed` and `absolute` do), so the exact CPU arm owns the fit.
+    /// #229/#222/#234: the metric has no native device fit objective (only
+    /// `squared`, `log_squashed`, `absolute` and the fit-only `log_loss` do),
+    /// so the exact CPU arm owns the fit.
     MetricNotNative,
     /// The kernel's conditioning gate rejected the normal equations (status 1).
     IllConditioned,
@@ -2045,11 +2099,18 @@ pub enum FitFallbackCause {
     /// #226: the device median stage declined (allocation, launch or an
     /// inconsistent score) and the exact CPU median arm took over.
     MedianDeclined,
+    /// #234: the fit sample holds one class, so the unconstrained log-loss has
+    /// no finite minimiser. The exact CPU arm keeps the candidate rather than
+    /// fitting a sign no row supports.
+    SingleClass,
+    /// #234: the kernel's log-loss constants scored strictly worse than the
+    /// starting constants in exact `f64` `log_loss`, so the start was kept.
+    LogLossWorse,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 9] = [
+    pub const ALL: [FitFallbackCause; 11] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -2059,6 +2120,8 @@ impl FitFallbackCause {
         FitFallbackCause::Launch,
         FitFallbackCause::RankDeclined,
         FitFallbackCause::MedianDeclined,
+        FitFallbackCause::SingleClass,
+        FitFallbackCause::LogLossWorse,
     ];
 
     /// Stable JSON label.
@@ -2073,6 +2136,8 @@ impl FitFallbackCause {
             FitFallbackCause::Launch => "launch",
             FitFallbackCause::RankDeclined => "rank_declined",
             FitFallbackCause::MedianDeclined => "median_declined",
+            FitFallbackCause::SingleClass => "single_class",
+            FitFallbackCause::LogLossWorse => "log_loss_worse",
         }
     }
 }
@@ -3823,10 +3888,24 @@ fn run_search(
         let median_fit = cfg.fit_strategy.defers_to_gpu()
             && cfg.fit_iters > 0
             && crate::fit::median_fit_only(cfg.metric);
-        let fit_only =
-            rank_fit_only_arm(cfg, train).is_some() || (median_fit && median_blocker.is_none());
+        // #234: `log_loss` has a native *fit* objective (the batched LM
+        // kernel) and no native fitness, so it uses the same fit-only shape:
+        // the device moves constants, the exact CPU log-loss scores.
+        let logistic_fit = cfg.fit_strategy.defers_to_gpu()
+            && cfg.fit_iters > 0
+            && crate::fit::fit_only_loss(cfg.metric).is_some();
+        let fit_only = rank_fit_only_arm(cfg, train).is_some()
+            || (median_fit && median_blocker.is_none())
+            || logistic_fit;
         let plan: Option<(crate::fit::DeviceLoss, bool)> = if fit_only {
-            backend_reason = Some("metric is not scored natively on the GPU".to_string());
+            backend_reason = Some(if logistic_fit {
+                format!(
+                    "{} is scored exactly on the CPU; the device fits constants only",
+                    cfg.metric.name()
+                )
+            } else {
+                "metric is not scored natively on the GPU".to_string()
+            });
             Some((crate::fit::DeviceLoss::Squared, false))
         } else {
             match gpu_blocker(cfg, train) {
@@ -3851,7 +3930,13 @@ fn run_search(
         match plan {
             None => None,
             Some((loss, native)) => {
-                match GpuSearch::new(train, cfg.fit_strategy.defers_to_gpu(), loss, native) {
+                match GpuSearch::new(
+                    train,
+                    cfg.fit_strategy.defers_to_gpu(),
+                    loss,
+                    native,
+                    logistic_fit,
+                ) {
                     Ok(g) => {
                         let device = crate::gpu::GpuEvaluator::device_name();
                         if cfg.gpu_notes {
@@ -3881,6 +3966,12 @@ fn run_search(
                                     "native device loss, f32 fitness"
                                 };
                                 eprintln!("# gpu: {} ({}; {})", device, scheduling, fitness);
+                            } else if logistic_fit {
+                                eprintln!(
+                                    "# gpu-fit: {} ({}; exact log-loss fit, CPU f64 fitness and \
+                                     finalists — the evaluator has no label semantics, #234)",
+                                    device, scheduling
+                                );
                             } else if crate::fit::median_fit_only(cfg.metric) {
                                 eprintln!(
                                     "# gpu-fit: {} ({}; exact median polish, CPU f64 \
@@ -5243,6 +5334,8 @@ mod tests {
                 "launch",
                 "rank_declined",
                 "median_declined",
+                "single_class",
+                "log_loss_worse",
             ]
         );
         assert_eq!(

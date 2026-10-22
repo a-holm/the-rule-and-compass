@@ -248,7 +248,8 @@ is mathematically well posed:
 | `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
-| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
+| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights |
+| `log_loss` with `--fit-strategy gpu` (#234) | the same Fisher scoring in the batched kernel (uploaded label sign, `q(1-q)` weights, `t/q` pseudo-response, `softplus` trial objective, `ln det Ã` gate). Fit-only: the exact CPU `f64` log-loss judges every proposal, scores every candidate and refits every finalist |
 | `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
@@ -963,16 +964,23 @@ admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
-`non_finite`, `launch`, `rank_declined`, `median_declined`) in
+`non_finite`, `launch`, `rank_declined`, `median_declined`, `single_class`,
+`log_loss_worse`) in
 `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
-accumulator, and `absolute` (#222) with per-row Lawson weights
-`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps. All robust
-arms are gated by a scale-free `ln det Ã` test instead of the squared arm's
-Cholesky-diagonal ratio.
-The rank and median families are fit-only device arms (#230, #226): the device
-moves the constants, the CPU scores and refits every finalist. The median arm
+accumulator, `absolute` (#222) with per-row Lawson weights
+`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps, and
+`log_loss` (#234) with per-row Fisher weights `q(1-q)`, the uploaded label sign
+`t = 2[y > (min+max)/2] - 1`, the pseudo-response offset `t/q` and a
+`softplus(-t·p)` trial objective. The robust arms and `log_loss` are gated by a
+scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
+`log_loss` is fit-only, like the rank and median families (#230, #226): the
+device moves the constants, the exact CPU objective judges every proposal
+(reverted and labelled when worse), scores every candidate and refits every
+finalist. Its measured fit share is 97.5 % of a `log_loss` run's CPU work, which
+is why this arm attacks the dominant cost where the #233 AUC arm could not
+(3.0–3.5 %). The median arm
 also requires at least 4 096 training rows, the measured crossover of the
 batched selection; below it the exact CPU median arm runs with a labelled
 reason. An explicit `gpu` with any other metric is a usage error (exit 2) naming

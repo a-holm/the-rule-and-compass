@@ -14,6 +14,13 @@
 //!    LM unless the tree is affine/separable), on the untouched tree;
 //! 4. finalists are always refit exactly with [`refit_finalists_exact`].
 //!
+//! #234: `log_loss` is the first metric whose **fit** is native on the device
+//! and whose **fitness** is not ([`DeviceLoss::for_metric`] deliberately
+//! excludes it: the evaluator has no label semantics). The arm is fit-only —
+//! the search scores every candidate with the exact CPU log-loss and only the
+//! constants come from the kernel — and the exact objective is what decides
+//! whether a proposal replaces its starting constants.
+//!
 //! #229: the gate and the refit are **metric-aware**. A `log_squashed`
 //! proposal that improves `mean ln(1 + r²)` can be worse in SSE; judging it by
 //! SSE would silently discard exactly the fits the metric exists for (the bug
@@ -312,6 +319,67 @@ fn fitted_constants(tree: &Node) -> Vec<f64> {
 /// what the archive and the report consume. Like [`refit_finalists_exact`] this
 /// is the step that makes the reported number independent of the device's
 /// arithmetic.
+/// #234: the exact configured objective at a tree's current constants.
+///
+/// Same convention as [`fit_weighted_metric`](super::fit_weighted_metric)'s
+/// return value for a non-squared metric, so the search's proposal gate and the
+/// reported fitness agree by construction.
+pub fn exact_metric_score(
+    tree: &Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> f64 {
+    metric_score(tree, x, y, w, metric)
+}
+
+/// #234: the outcome of the search's device-proposal gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalGate {
+    /// The proposal is finite and no worse than the start; it is now in the tree.
+    Kept,
+    /// The proposal scored strictly worse; the starting constants were kept.
+    Worse,
+    /// The proposal or the start was not a finite objective.
+    NonFinite,
+}
+
+/// #234: apply a device proposal to a clone and keep it only when the
+/// **configured** objective, in exact `f64`, is finite and no worse than at the
+/// starting constants.
+///
+/// This is the invariant the log-loss arm is shipped on: the kernel supplies a
+/// row sweep in f32/f64, but a proposal that does not improve the loss the user
+/// asked for cannot replace the constants the candidate started with. A model
+/// whose proposal is non-finite is rejected (`NonFinite`), and the tree is left
+/// bit-identical in both rejection cases. Returns the exact objective of the
+/// constants now in the tree.
+pub fn gate_proposal<F>(
+    tree: &mut Node,
+    apply: F,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> (f64, ProposalGate)
+where
+    F: FnOnce(&mut Node),
+{
+    let start = metric_score(tree, x, y, w, metric);
+    let mut trial = tree.clone();
+    apply(&mut trial);
+    let candidate = metric_score(&trial, x, y, w, metric);
+    if !start.is_finite() || !candidate.is_finite() {
+        return (start, ProposalGate::NonFinite);
+    }
+    if candidate > start {
+        return (start, ProposalGate::Worse);
+    }
+    *tree = trial;
+    (candidate, ProposalGate::Kept)
+}
+
 pub fn signed_finalist(
     tree: &mut Node,
     x: &[Vec<f64>],
@@ -336,6 +404,12 @@ pub fn signed_finalist(
 /// **warm start** and the verifier completes it with the exact `f64` projection
 /// onto the zero-mean-residual manifold: the device supplies the row sweep, the
 /// exact objective decides what is kept. Other metrics are declined.
+///
+/// #234: for `log_loss` the batch also uploads the label sign
+/// ([`super::classification_signs`]) derived from `y`, because the kernel
+/// cannot compute the target midpoint over the sample; the proposal is then the
+/// kernel's Fisher-scoring optimum of the configured log-loss. Without both
+/// classes the batch is declined.
 #[cfg(feature = "cuda")]
 pub struct BatchedGpu<'a> {
     ev: std::cell::RefCell<&'a mut crate::gpu::GpuEvaluator>,
@@ -449,6 +523,21 @@ impl BatchedFitter for BatchedGpu<'_> {
         metric: Metric,
     ) -> Vec<Option<Vec<f64>>> {
         if let Some(loss) = fit_loss(metric) {
+            // #234: the log-loss arm reads the label sign from the device, so
+            // the caller's `y` is uploaded once per batch. A single-class
+            // target has no finite log-loss optimum and is declined rather
+            // than fitted against a sign the data does not support; the caller
+            // labels it and the exact CPU arm keeps the candidate.
+            if loss == DeviceLoss::Logistic {
+                let (pos, neg) = class_counts(y);
+                if pos == 0 || neg == 0 {
+                    return vec![None; trees.len()];
+                }
+                let sign = classification_signs(y);
+                if !self.ev.borrow_mut().set_fit_sign(&sign) {
+                    return vec![None; trees.len()];
+                }
+            }
             return self.propose(trees, iters, loss);
         }
         // #231: the rank family has a native **fit** objective on the device,

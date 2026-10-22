@@ -28,8 +28,11 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), and the exact
-correlation objective with a frozen affine gauge
+(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
+on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
+constants and the exact CPU `f64` log-loss judges the proposal, scores every
+candidate and refits every finalist), and the exact correlation objective with
+a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
@@ -45,8 +48,8 @@ score, never on SSE or `|rho|` (#231); `--metric median` does the same with the 
 measured crossover of the batched selection, #226). An explicit `gpu` with a
 metric that has no device fit objective is a usage error, because the kernel
 would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
-or a CPU strategy.
+`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
+metric, `--metric median` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
@@ -907,8 +910,11 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), and the exact
-correlation objective with a frozen affine gauge
+(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
+on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
+constants and the exact CPU `f64` log-loss judges the proposal, scores every
+candidate and refits every finalist), and the exact correlation objective with
+a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
@@ -924,8 +930,8 @@ score, never on SSE or `|rho|` (#231); `--metric median` does the same with the 
 measured crossover of the batched selection, #226). An explicit `gpu` with a
 metric that has no device fit objective is a usage error, because the kernel
 would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
-or a CPU strategy.
+`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
+metric, `--metric median` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
