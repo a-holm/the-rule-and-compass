@@ -65,6 +65,7 @@ fn repeat(prog: &[u32], offsets: &[u32], nprog: usize) -> (Vec<u32>, Vec<u32>) {
 }
 
 /// 100 generations of the same shape allocate nothing and keep the ring fixed.
+#[cfg(feature = "cuda")]
 #[test]
 fn steady_state_allocates_nothing_and_keeps_the_pinned_ring_bounded() {
     if !device_available() {
@@ -114,6 +115,7 @@ fn steady_state_allocates_nothing_and_keeps_the_pinned_ring_bounded() {
 }
 
 /// The pinned async path and the forced blocking path agree bit for bit.
+#[cfg(feature = "cuda")]
 #[test]
 fn async_and_synchronous_paths_are_numerically_identical() {
     if !device_available() {
@@ -153,6 +155,7 @@ fn async_and_synchronous_paths_are_numerically_identical() {
 
 /// Batch B is uploaded while batch A's kernel is still outstanding; collecting
 /// A after that reordering must return exactly the sequential result.
+#[cfg(feature = "cuda")]
 #[test]
 fn upload_is_enqueued_behind_an_outstanding_kernel_and_results_match() {
     if !device_available() {
