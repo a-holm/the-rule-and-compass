@@ -773,9 +773,14 @@ pub struct GpuFitOutput {
     pub c: Vec<f64>,
     /// The kernel's final SSE (recomputed exactly on the CPU for finalists).
     pub sse: f64,
-    /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
+    /// #286: `0` usable; `4` rank-deficient but finite; `5` recovered last
+    /// accepted iterate; `6` no improvement, start kept; `7` non-finite start
+    /// (log-only, no fallback); `8` recovered with bad-gradient rows skipped.
+    /// `1` is an arithmetic failure and `2` a non-finite row with no usable
+    /// iterate; only those route to the exact CPU fallback.
     pub status: i32,
 }
+
 
 /// #227: one segment's result from the exact maximum-error scan. Mirrors
 /// `RcMaxOut` in `src/cuda/eval.cu` field for field.
@@ -1643,7 +1648,7 @@ impl GpuEvaluator {
             _ => return (out, -1.0),
         };
         let idx: Vec<usize> = (0..out.len())
-            .filter(|&k| out[k].status == 0 && out[k].c.iter().all(|v| v.is_finite()))
+            .filter(|&k| crate::fit::fit_status_usable(out[k].status) && out[k].c.iter().all(|v| v.is_finite()))
             .collect();
         if idx.is_empty() {
             return (out, lm_ms);
@@ -1917,7 +1922,7 @@ impl GpuEvaluator {
             return (out, -1.0);
         }
         let idx: Vec<usize> = (0..out.len())
-            .filter(|&k| out[k].status == 0 && out[k].c.iter().all(|v| v.is_finite()))
+            .filter(|&k| crate::fit::fit_status_usable(out[k].status) && out[k].c.iter().all(|v| v.is_finite()))
             .collect();
         if idx.is_empty() {
             return (out, lm_ms);
@@ -2217,7 +2222,7 @@ impl GpuEvaluator {
             return (out, -1.0);
         }
         let idx: Vec<usize> = (0..out.len())
-            .filter(|&k| out[k].status == 0 && out[k].c.iter().all(|v| v.is_finite()))
+            .filter(|&k| crate::fit::fit_status_usable(out[k].status) && out[k].c.iter().all(|v| v.is_finite()))
             .collect();
         if idx.is_empty() {
             return (out, lm_ms);
@@ -3957,7 +3962,7 @@ mod fit_tests {
         let plan = crate::fit::gpu_fit_plan(&tree).expect("collinear plan");
         let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
         assert!(ms >= 0.0);
-        assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
+        assert_eq!(out[0].status, 4, "rank-deficient system must be labelled");
 
         // The same gate at the largest constant count: twenty collinear
         // columns leave a rank-1 J^T J, so the ownership path at p=20 must
@@ -3973,7 +3978,7 @@ mod fit_tests {
         assert_eq!(plan.nconst, 20);
         let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Squared);
         assert!(ms >= 0.0);
-        assert_eq!(out[0].status, 1, "p=20 rank deficiency must be labelled");
+        assert_eq!(out[0].status, 4, "p=20 rank deficiency must be labelled");
 
         // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
         let bad = node(
@@ -3988,7 +3993,7 @@ mod fit_tests {
         let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
         let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
         let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::Squared);
-        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+        assert_eq!(out[0].status, 7, "non-finite start must be labelled log-only");
 
         // Unsupported (piecewise-constant) operators never reach the kernel.
         let floor = node(Op::Floor, vec![node(Op::Mul, vec![constant(0.5), input(0)])]);
@@ -4632,7 +4637,7 @@ mod fit_tests {
         let plan = crate::fit::gpu_fit_plan(&collinear).expect("collinear plan");
         let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::LogSquashed);
         assert!(ms >= 0.0);
-        assert_eq!(out[0].status, 1, "a rank-deficient robust system must be labelled");
+        assert_eq!(out[0].status, 4, "a rank-deficient robust system must be labelled");
 
         // sqrt(c - x²) leaves the real domain for |x| > sqrt(c).
         let bad = node(
@@ -4644,7 +4649,7 @@ mod fit_tests {
         let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
         let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
         let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::LogSquashed);
-        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+        assert_eq!(out[0].status, 7, "non-finite start must be labelled log-only");
     }
 
     /// #229: the base `--weight` vector scales the per-row IRLS weight, and a
@@ -4880,7 +4885,7 @@ mod fit_tests {
         assert!(ev.set_fit_data(&cols64, &y, &[]));
         let plan = crate::fit::gpu_fit_plan(&corr_model()).expect("plan");
         let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Correlation);
-        assert_eq!(out[0].status, 2, "non-finite rows are labelled");
+        assert_eq!(out[0].status, 7, "non-finite start is labelled log-only");
     }
 
     /// #224 paired measurement (ignored): historical CPU correlation fitting
@@ -5125,7 +5130,7 @@ mod fit_tests {
         let plan = crate::fit::gpu_fit_plan(&collinear).expect("collinear plan");
         let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
         assert!(ms >= 0.0);
-        assert_eq!(out[0].status, 1, "a rank-deficient L1 system must be labelled");
+        assert_eq!(out[0].status, 4, "a rank-deficient L1 system must be labelled");
 
         let bad = node(
             Op::Sqrt,
@@ -5136,7 +5141,7 @@ mod fit_tests {
         let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
         let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
         let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::Absolute);
-        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+        assert_eq!(out[0].status, 7, "non-finite start must be labelled log-only");
     }
 
     /// #222: exact interpolation is the L1 arm's degeneracy. Every residual is
@@ -5169,7 +5174,7 @@ mod fit_tests {
         let plan = crate::fit::gpu_fit_plan(&model(&[0.2, 1.0])).expect("plan");
         let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
         assert!(
-            out[0].status == 0 || out[0].status == 1,
+            crate::fit::fit_status_usable(out[0].status),
             "a zero-residual fit is exact or ill-conditioned, got {}",
             out[0].status
         );
@@ -6555,10 +6560,9 @@ mod order_stat_tests {
         let p = plan(&t);
         let (out, _) = ev.median_fit_batch(&[&p], 8);
         assert_eq!(
-            out[0].status, 1,
+            out[0].status, 4,
             "the rank-deficient normal equations must be labelled"
         );
-        assert_eq!(out[0].c, p.c0, "no constant may move on a declined start");
     }
 
     /// `--no-fit` never moves a constant through the device arm.
@@ -6898,10 +6902,9 @@ mod order_stat_tests {
         let p = plan(&t);
         let (out, _) = ev.interquartile_fit_batch(&[&p], 8);
         assert_eq!(
-            out[0].status, 1,
+            out[0].status, 4,
             "the rank-deficient normal equations must be labelled"
         );
-        assert_eq!(out[0].c, p.c0, "no constant may move on a declined start");
     }
 
     /// `--no-fit` never moves a constant through the interquartile arm.

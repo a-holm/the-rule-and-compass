@@ -884,9 +884,17 @@ of the screened errors, the row count and the fixed island/population order and
 repeated runs are reproducible. Admission never changes the evaluation count or
 the exact finalist refit.
 
-The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
-(the undamped Cholesky diagonal ratio exceeds `1e4` or a pivot hits the
-`1e-12` floor), `2` a non-finite value or residual. Status `1`/`2`, unsupported
+The kernel returns a status. Status `0` is the ordinary success; `4`–`8` are
+**labels on a finite answer, never CPU fallbacks**: `4` `rank_deficient` (the
+undamped, Jacobi-scaled `ln det Ã` gate says a direction is unidentified, but
+the damped step and the exact finalist refit own the result), `5` `recovered`
+(the last accepted finite iterate survived a failed trial), `6`
+`no_improvement` (the start was kept), `7` `start_unusable` (the start itself
+has no finite value; the CPU arm could not move it either, so this is log-only)
+and `8` `recovered_skipped` (a finite answer whose non-finite *gradient* rows
+were skipped, up to the built-in row guard). Only status `1` (no finite step) and
+`2` (no finite iterate at all) route to the exact CPU arm, together with
+unsupported trees and a failed launch. Status `1`/`2`, unsupported
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
@@ -896,9 +904,10 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `rank_declined` (#230), `median_declined` (#226), `interquartile_declined`
 (#232) and `maximum_declined` (#227) causes (the device declined the call and
 the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
-`screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
-`seconds` and the whole fit stage's `host_seconds`; the run manifest records the
-same accepted/fallback/refit totals.
+`screened`/`attempts`/`gpu`/`fallback`, the per-cause map, the
+`status_by_label` map of finite device answers, `refits`, the kernel `seconds`
+and the whole fit stage's `host_seconds`; the run manifest records the same
+accepted/fallback/refit totals.
 
 **Parallel fallback batch and its bound (#255).** The exact CPU refits are
 independent per candidate and are therefore split across scoped workers with
@@ -1087,9 +1096,17 @@ matches the CPU LM at 1 050 000 rows: status-0 candidates agree to
 `1e-8`–`1e-14` relative SSE, and the one ill-conditioned candidate is labelled
 and falls back.
 
-**Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
-arm yet: it scores a tree as soon as it is offered, before the barrier fit
-batch, so the GPU-fit path uses synchronous generation batches.
+**Overlap (#286).** The overlap pipeline (`--pipeline-depth`) now carries the
+fit arm where doing so cannot change the trajectory: at `N >= 1 048 576` rows
+the serial admission set is already every pending candidate with constants, so
+the queue can score an earlier candidate's seed constants, fit it on the device
+(or the structural CPU residual) and re-score it while the island threads keep
+generating later candidates. Below that row floor, with a fitting subset, and
+for the metric-specific gated arms (`log_loss`, rank, median, interquartile,
+maximum), the synchronous generation batch is still used. Selection and the
+archive still wait at the generation barrier, so all errors, the archive hash
+and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
+synchronous schedule.
 
 ### LogSquashed on the batched kernel (issue #229)
 
@@ -1248,10 +1265,12 @@ loss += w · |r|                  // the accepted objective, f64 sum
 * `sc` is computed in f64 from the f64 residual; the row scaling `√sc` enters
   the existing rank-one update, so `A` stays PSD. The f64 polish re-assembles
   the same weighted system on the exact f64 rows.
-* The conditioning gate is the scale-free `ln det Ã` test of #229, not the
-  squared arm's `hi/lo ≤ 10⁴`: L1 weights span six decades by construction.
-  A rank-deficient or zero-residual system that does fail is status `1` and is
-  refit by the exact CPU IRLS, never reported.
+* The conditioning gate is the scale-free `ln det Ã` test of #229/#286, used by
+  every arm: L1 weights span six decades by construction and the squared arm's
+  old `hi/lo ≤ 10⁴` compared derivative-column units. #286 Jacobi-equilibrates
+  the step (`Ã δ̃ = −D^{-1/2}jᵀr`, `δ = D^{-1/2}δ̃`) and labels a rank-deficient
+  finite answer `rank_deficient`; only a system with no finite step remains
+  status `1` and goes to the exact CPU IRLS.
 * The base `--weight` vector multiplies the L1 weight exactly as in #229; a
   weighted *run* still scores on the CPU evaluator because the evaluator has no
   per-row weight array.

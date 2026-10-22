@@ -32,9 +32,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, exact_metric_score, fit_batch_verified, gate_proposal, is_squared_family,
-    maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus, BatchedFitter,
-    ProposalGate, VerifiedBatch,
+    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable, gate_proposal,
+    is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
+    BatchedFitter, ProposalGate, VerifiedBatch,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;

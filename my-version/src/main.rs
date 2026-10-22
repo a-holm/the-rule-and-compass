@@ -898,13 +898,14 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
         g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
         g.fit_fallback,
         ops_json(&g.fit_fallback_by_cause),
+        ops_json(&g.fit_status_by_label),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
         jnum(g.fit_host_ms / 1000.0),
@@ -4298,13 +4299,20 @@ fn main() {
                 .map(|c| format!("{}={}", c.label(), g.fit_fallback_by_cause.get(c.label()).copied().unwrap_or(0)))
                 .collect::<Vec<_>>()
                 .join(" ");
+            let labels = g
+                .fit_status_by_label
+                .iter()
+                .map(|(label, n)| format!("{}={}", label, n))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
-                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
+                "# fit: gpu-fit screened={} admitted={} gpu={} fallback={} [{}] labels=[{}] refits={} fallback_s={:.3} bounded={}/{} workers={}",
                 g.fit_screened,
                 g.fit_attempts,
                 g.fit_gpu,
                 g.fit_fallback,
                 causes,
+                labels,
                 g.fit_refits,
                 g.fit_fallback_ms / 1000.0,
                 g.fit_fallback_bounded,
@@ -8883,6 +8891,8 @@ mod tests {
         g.fit_fallback_by_cause
             .insert("ill_conditioned".to_string(), 2);
         g.fit_fallback_by_cause.insert("non_finite".to_string(), 1);
+        g.fit_status_by_label
+            .insert("rank_deficient".to_string(), 4);
         g.fit_refits = 5;
         g.fit_ms = 250.0;
         g.fit_host_ms = 500.0;
@@ -8894,7 +8904,7 @@ mod tests {
         g.fit_fallback_max = 4096;
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
             json
         );
