@@ -2066,7 +2066,10 @@ static int rc_rank_work_alloc(RcRankWork *w, long long total)
     if (ok && rc_alloc((void **)&w->ord, sizeof(int) * (size_t)total) != 0) ok = 0;
     if (ok && rc_alloc((void **)&w->gather, sizeof(long long) * (size_t)total) != 0) ok = 0;
     /* `prefix` has one extra slot: a run's end may be `total`, and the
-       contribution kernel reads `prefix[end]`. */
+       contribution kernel reads `prefix[end]`. The scan writes into the base
+       allocation (CUB expects aligned output pointers; scanning into
+       `prefix + 1` is misaligned and produced wrong sums), and
+       `k_rank_tail` fills the last slot afterwards. */
     if (ok && rc_alloc((void **)&w->prefix, sizeof(long long) * (size_t)(total + 1)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&w->starts, sizeof(long long) * (size_t)total) != 0) ok = 0;
     if (!ok) rc_rank_work_free(w);
