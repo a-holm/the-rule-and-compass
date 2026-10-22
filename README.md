@@ -46,11 +46,14 @@ reflected model is rejected and a proposal is judged on the exact oriented
 score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
 exact `f64` median and `--metric interquartile` with the middle-50 % window mean
 of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232). An explicit
-`gpu` with a metric that has no device fit objective is a usage error, because
-the kernel would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
-metric, `--metric median`, `--metric interquartile` or a CPU strategy.
+— the measured crossover of the batched selection, #226 and #232), and
+`--metric maximum` fits the Chebyshev objective by **exact bisection on the
+error level** per constant (fit-only, from 512 training rows — the measured
+cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+objective is a usage error, because the kernel would otherwise fit a different
+loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
+`--metric log_loss`, a rank metric, `--metric median`, `--metric
+interquartile`, `--metric maximum` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
@@ -929,11 +932,14 @@ reflected model is rejected and a proposal is judged on the exact oriented
 score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
 exact `f64` median and `--metric interquartile` with the middle-50 % window mean
 of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232). An explicit
-`gpu` with a metric that has no device fit objective is a usage error, because
-the kernel would otherwise fit a different loss; use `--metric squared`,
-`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
-metric, `--metric median`, `--metric interquartile` or a CPU strategy.
+— the measured crossover of the batched selection, #226 and #232), and
+`--metric maximum` fits the Chebyshev objective by **exact bisection on the
+error level** per constant (fit-only, from 512 training rows — the measured
+cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+objective is a usage error, because the kernel would otherwise fit a different
+loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
+`--metric log_loss`, a rank metric, `--metric median`, `--metric
+interquartile`, `--metric maximum` or a CPU strategy.
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed

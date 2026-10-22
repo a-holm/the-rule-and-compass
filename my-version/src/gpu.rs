@@ -678,6 +678,24 @@ extern "C" {
         out_value: *mut f64,
         out_status: *mut i32,
     ) -> f32;
+    /* #227: exact maximum-error scan of a batch of prediction vectors: per
+       segment the exact `f64` `max |r|`, its lowest maximiser row, and — when
+       `coords`/`levels` are given — the intersection `[lo, hi]` of the per-row
+       feasibility intervals at that error level. Returns the stage time in ms,
+       or a negative value when nothing may be trusted. */
+    fn rc_max_scan_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nsets: i32,
+        ntrials: i32,
+        kmax: i32,
+        c0: *const f64,
+        coords: *const i32,
+        levels: *const f64,
+        out: *mut RawMaxOut,
+    ) -> f32;
     /* #169: block width, dynamic shared bytes and constant cap of the fit-kernel
        instantiation a batch with `kmax` constants would use. Diagnostics. */
     fn rc_fit_kernel_info(
@@ -697,6 +715,24 @@ pub struct GpuFitOutput {
     pub sse: f64,
     /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
     pub status: i32,
+}
+
+/// #227: one segment's result from the exact maximum-error scan. Mirrors
+/// `RcMaxOut` in `src/cuda/eval.cu` field for field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct RawMaxOut {
+    /// Exact `max |pred − y|`; `NaN` when `status != 0`.
+    vmax: f64,
+    /// Largest per-row lower bound on the coordinate step at the requested
+    /// level (`+inf` when the level is infeasible or none was requested).
+    lo: f64,
+    /// Smallest per-row upper bound (`-inf` when infeasible).
+    hi: f64,
+    /// Lowest-index maximiser; `-1` when `status != 0`.
+    row: i32,
+    /// `0` ok; `2` a row was not finite.
+    status: i32,
 }
 
 /// #169: the fit-kernel instantiation that owns a batch whose largest constant
@@ -1761,6 +1797,322 @@ impl GpuEvaluator {
             out[k].sse = res.scores[j];
         }
         (out, lm_ms + polish_ms)
+    }
+
+    /* -- #227: exact maximum-error (minimax) polish ----------------------- */
+
+    /// #227: one exact maximum-error scan over `plans.len() × ntrials`
+    /// segments (`seg = set * ntrials + trial`).
+    ///
+    /// `c0` holds the constants in slot order, `ntrials * kmax` per set.
+    /// `coords`/`levels` are per segment, or `None` for "the maximum only".
+    /// Returns one raw result per segment, or `None` when the device declined
+    /// (bad shape, allocation or launch failure) — the caller then falls back
+    /// to the exact CPU arm and labels it.
+    fn max_scan(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        ntrials: usize,
+        c0: &[f64],
+        coords: Option<&[i32]>,
+        levels: Option<&[f64]>,
+    ) -> Option<Vec<RawMaxOut>> {
+        let nsets = plans.len();
+        if nsets == 0 || ntrials == 0 || plans.iter().any(|p| p.nconst == 0) {
+            return None;
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max()?;
+        if self.n_rows == 0 {
+            return None;
+        }
+        let nsegs = nsets.checked_mul(ntrials)?;
+        if nsegs.checked_mul(self.n_rows as usize)? > i32::MAX as usize {
+            return None;
+        }
+        if c0.len() != nsegs * kmax {
+            return None;
+        }
+        if coords.is_some_and(|c| c.len() != nsegs) || levels.is_some_and(|l| l.len() != nsegs) {
+            return None;
+        }
+        // Every buffer the arena needs is O(segments), never O(rows × segments),
+        // so a wave only bounds a pathological batch (thousands of sets).
+        const MAX_SCAN_WAVE_BYTES: u64 = 512 * 1024 * 1024;
+        let per_trial = (kmax as u64) * 8 + 4 + 8 + 32 + 256;
+        let mut out: Vec<RawMaxOut> = Vec::with_capacity(nsegs);
+        let mut start = 0usize;
+        while start < nsets {
+            let words = plans[start..].iter().map(|p| p.words.len()).max().unwrap_or(0);
+            let per_set = (words as u64) * 4 + (ntrials as u64) * per_trial;
+            let wave = ((MAX_SCAN_WAVE_BYTES / per_set.max(1)).max(1) as usize).min(nsets - start);
+            let end = start + wave;
+            let wave_plans = &plans[start..end];
+            let mut prog: Vec<u32> = Vec::new();
+            let mut off: Vec<u32> = Vec::with_capacity(wave_plans.len() + 1);
+            let mut pcount: Vec<i32> = Vec::with_capacity(wave_plans.len());
+            off.push(0);
+            for plan in wave_plans {
+                prog.extend_from_slice(&plan.words);
+                off.push(prog.len() as u32);
+                pcount.push(plan.nconst as i32);
+            }
+            let wave_segs = wave_plans.len() * ntrials;
+            let base = start * ntrials;
+            let w_coords = coords.map(|c| c[base..base + wave_segs].to_vec());
+            let w_levels = levels.map(|l| l[base..base + wave_segs].to_vec());
+            let mut res = vec![
+                RawMaxOut {
+                    vmax: f64::NAN,
+                    lo: f64::INFINITY,
+                    hi: f64::NEG_INFINITY,
+                    row: -1,
+                    status: 2,
+                };
+                wave_segs
+            ];
+            let ms = unsafe {
+                rc_max_scan_batch(
+                    self.ctx,
+                    prog.as_ptr(),
+                    off.as_ptr(),
+                    pcount.as_ptr(),
+                    wave_plans.len() as i32,
+                    ntrials as i32,
+                    kmax as i32,
+                    c0[base * kmax..].as_ptr(),
+                    w_coords
+                        .as_ref()
+                        .map(|v| v.as_ptr())
+                        .unwrap_or(std::ptr::null()),
+                    w_levels
+                        .as_ref()
+                        .map(|v| v.as_ptr())
+                        .unwrap_or(std::ptr::null()),
+                    res.as_mut_ptr(),
+                )
+            };
+            if ms < 0.0 {
+                return None;
+            }
+            out.extend_from_slice(&res);
+            start = end;
+        }
+        Some(out)
+    }
+
+    /// #227: the exact `max |r|` and its lowest maximiser for every
+    /// `(candidate, trial)`.
+    ///
+    /// A maximum is order-free, so this statistic adds no rounding: the value
+    /// is the exact `f64` maximum of `|pred − y|` over the resident rows, and a
+    /// tie always reports the lowest row index. `Some(None)` marks a segment
+    /// with a non-finite row; `None` means the device declined.
+    pub(crate) fn max_score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<crate::fit::MaxStat>>>> {
+        let nsets = plans.len();
+        if nsets == 0 || trials.len() != nsets {
+            return None;
+        }
+        let ntrials = trials[0].len();
+        if ntrials == 0 || trials.iter().any(|t| t.len() != ntrials) {
+            return None;
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max()?;
+        let mut c0 = vec![0.0f64; nsets * ntrials * kmax];
+        for (k, list) in trials.iter().enumerate() {
+            for (t, c) in list.iter().enumerate() {
+                if c.len() != plans[k].nconst || c.iter().any(|v| !v.is_finite()) {
+                    return None;
+                }
+                let base = (k * ntrials + t) * kmax;
+                c0[base..base + c.len()].copy_from_slice(c);
+            }
+        }
+        let raw = self.max_scan(plans, ntrials, &c0, None, None)?;
+        let mut out: Vec<Vec<Option<crate::fit::MaxStat>>> = vec![vec![None; ntrials]; nsets];
+        for (seg, r) in raw.iter().enumerate() {
+            let (k, t) = (seg / ntrials, seg % ntrials);
+            out[k][t] = if r.status == 0 && r.vmax.is_finite() && r.row >= 0 {
+                Some(crate::fit::MaxStat {
+                    value: r.vmax,
+                    row: r.row as usize,
+                })
+            } else {
+                None
+            };
+        }
+        Some(out)
+    }
+
+    /// #227: the exact level-interval test for one coordinate per candidate.
+    ///
+    /// `constants[k]` is candidate `k`'s current constants (slot order) and
+    /// `coords[k][j]`/`levels[k][j]` the constant slot and error level to test.
+    /// `Some(interval)` with `lo > hi` is the exact statement "this level is not
+    /// attainable along the coordinate"; `None` marks a non-finite row.
+    pub(crate) fn max_intervals(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        constants: &[Vec<f64>],
+        coords: &[Vec<i32>],
+        levels: &[Vec<f64>],
+    ) -> Option<Vec<Vec<Option<crate::fit::LevelInterval>>>> {
+        let nsets = plans.len();
+        if nsets == 0 || constants.len() != nsets || coords.len() != nsets || levels.len() != nsets {
+            return None;
+        }
+        let maxn = coords.iter().map(|c| c.len()).max().unwrap_or(0);
+        if maxn == 0 {
+            return Some(vec![Vec::new(); nsets]);
+        }
+        let kmax = plans.iter().map(|p| p.nconst).max()?;
+        let mut c0 = vec![0.0f64; nsets * maxn * kmax];
+        let mut cd = vec![-1i32; nsets * maxn];
+        let mut lv = vec![f64::NAN; nsets * maxn];
+        for k in 0..nsets {
+            if constants[k].len() != plans[k].nconst || levels[k].len() != coords[k].len() {
+                return None;
+            }
+            for j in 0..maxn {
+                let seg = k * maxn + j;
+                c0[seg * kmax..seg * kmax + constants[k].len()].copy_from_slice(&constants[k]);
+                if j < coords[k].len() {
+                    cd[seg] = coords[k][j];
+                    lv[seg] = levels[k][j];
+                }
+            }
+        }
+        let raw = self.max_scan(plans, maxn, &c0, Some(&cd), Some(&lv))?;
+        let mut out: Vec<Vec<Option<crate::fit::LevelInterval>>> = Vec::with_capacity(nsets);
+        for k in 0..nsets {
+            let mut per = Vec::with_capacity(coords[k].len());
+            for j in 0..coords[k].len() {
+                let r = raw[k * maxn + j];
+                per.push(if r.status == 0 {
+                    Some(crate::fit::LevelInterval { lo: r.lo, hi: r.hi })
+                } else {
+                    None
+                });
+            }
+            out.push(per);
+        }
+        Some(out)
+    }
+
+    /// #227: the squared LM warm start followed by the exact minimax polish,
+    /// on the device.
+    ///
+    /// This is the GPU counterpart of `fit_weighted_metric(.., Metric::Maximum)`
+    /// for the tail it can prove: the same squared start, then the exact
+    /// one-dimensional minimiser per constant by bisection on the error level,
+    /// and the same exact objective comparison. The reported `sse` field carries
+    /// the exact `max |r|` (the configured objective), never an SSE.
+    ///
+    /// A candidate whose polish cannot be scored, or whose prediction is not
+    /// finite, is reported with a non-zero status so the caller refits it with
+    /// the exact CPU arm and labels the fallback. `iters == 0` is a true no-op:
+    /// the incoming constants are returned unchanged with status 0.
+    pub(crate) fn max_fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        let incoming: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
+        if iters == 0 {
+            // `--no-fit`: no LM step and no polish.
+            let out = incoming
+                .iter()
+                .map(|c| GpuFitOutput {
+                    c: c.clone(),
+                    sse: f64::NAN,
+                    status: 0,
+                })
+                .collect();
+            return (out, 0.0);
+        }
+        let (mut out, lm_ms) = self.fit_batch(plans, iters, crate::fit::DeviceLoss::Squared);
+        if out.is_empty() || out.len() != plans.len() {
+            return (out, -1.0);
+        }
+        let idx: Vec<usize> = (0..out.len())
+            .filter(|&k| out[k].status == 0 && out[k].c.iter().all(|v| v.is_finite()))
+            .collect();
+        if idx.is_empty() {
+            return (out, lm_ms);
+        }
+        let sub: Vec<&crate::fit::GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
+        let starts: Vec<Vec<f64>> = idx.iter().map(|&k| out[k].c.clone()).collect();
+        let started = std::time::Instant::now();
+        let Some(res) = crate::fit::polish_minimax_batch(self, &sub, &starts, iters.max(1))
+        else {
+            for &k in &idx {
+                out[k].status = 3; // the labelled `maximum_declined` fallback
+            }
+            return (out, -1.0);
+        };
+        // The CPU arm keeps the incoming constants unless the polished squared
+        // start is strictly better on the configured objective. Score them in
+        // one batch so the device arm obeys the same monotone contract.
+        let base_trials: Vec<Vec<Vec<f64>>> = idx
+            .iter()
+            .map(|&k| vec![incoming[k].clone()])
+            .collect();
+        let baseline = self.max_score_trials(&sub, &base_trials);
+        let polish_ms = started.elapsed().as_secs_f32() * 1000.0;
+        for (j, &k) in idx.iter().enumerate() {
+            let c = &res.constants[j];
+            if c.len() != plans[k].nconst || !c.iter().all(|v| v.is_finite()) {
+                out[k].status = 1;
+                continue;
+            }
+            if !res.scores[j].is_finite() {
+                out[k].status = 2;
+                continue;
+            }
+            let start_score = baseline
+                .as_ref()
+                .and_then(|b| b.get(j))
+                .and_then(|t| t.first())
+                .copied()
+                .flatten()
+                .map(|s| s.value)
+                .unwrap_or(f64::INFINITY);
+            if start_score.is_finite() && res.scores[j] >= start_score {
+                out[k].c = incoming[k].clone();
+                out[k].sse = start_score;
+                continue;
+            }
+            out[k].c = c.clone();
+            out[k].sse = res.scores[j];
+        }
+        (out, lm_ms + polish_ms)
+    }
+}
+
+/// #227: the device is the `MinimaxTrialScorer` the batched exact minimax
+/// polish drives. Every call returns an order-free statistic (the exact
+/// maximum, its lowest maximiser, and the exact level interval), so the polish
+/// cannot observe a reduction order or a scheduling artefact.
+impl crate::fit::MinimaxTrialScorer for GpuEvaluator {
+    fn score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<crate::fit::MaxStat>>>> {
+        self.max_score_trials(plans, trials)
+    }
+
+    fn intervals(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        constants: &[Vec<f64>],
+        coords: &[Vec<i32>],
+        levels: &[Vec<f64>],
+    ) -> Option<Vec<Vec<Option<crate::fit::LevelInterval>>>> {
+        self.max_intervals(plans, constants, coords, levels)
     }
 }
 
@@ -5381,6 +5733,378 @@ mod rank_tests {
         assert!(res[0][0].is_none(), "a non-finite prediction must not be scored");
         let target = RankTarget::new(&f.y).unwrap();
         assert_eq!(score_of(res[0][0], &target, false), f64::INFINITY);
+    }
+}
+
+/// #227: the exact maximum-error arm on the device.
+#[cfg(test)]
+mod maximum_tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+    use crate::fit::{gpu_fit_plan_reason, maximum_finalist, polish_minimax_batch};
+    use crate::metrics::{score_weighted, Metric};
+
+    struct Fixture {
+        cols32: Vec<f32>,
+        cols64: Vec<f64>,
+        n: usize,
+        nv: usize,
+        y32: Vec<f32>,
+        y: Vec<f64>,
+        x: Vec<Vec<f64>>,
+    }
+
+    /// A one-column sample with a gross outlier (so the least-squares start is
+    /// a poor minimax start), exact duplicate targets (so maximiser ties
+    /// happen) and enough rows for the f64 sweeps to be exercised.
+    fn fixture(n: usize) -> Fixture {
+        let mut cols32 = vec![0.0f32; n];
+        let mut cols64 = vec![0.0f64; n];
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = -2.0 + 4.0 * i as f64 / (n.max(2) - 1) as f64;
+            let v = 1.4 * (0.9 * t).sin() + 0.3 * t;
+            let v = if i % 5 == 4 && i > 0 { y[i - 1] } else { v };
+            let v = if i == n / 3 { 40.0 } else { v };
+            x.push(vec![t, 0.0]);
+            y.push(v);
+            cols32[i] = t as f32;
+            cols64[i] = t;
+        }
+        Fixture {
+            cols32,
+            cols64,
+            n,
+            nv: 1,
+            y32: y.iter().map(|&v| v as f32).collect(),
+            y,
+            x,
+        }
+    }
+
+    fn evaluator(f: &Fixture) -> Option<GpuEvaluator> {
+        let mut ev = match GpuEvaluator::new(&f.cols32, f.n, f.nv, &f.y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return None;
+            }
+        };
+        assert!(ev.set_fit_data(&f.cols64, &f.y, &[]), "f64 fit data upload");
+        Some(ev)
+    }
+
+    fn plan(t: &Node) -> crate::fit::GpuFitPlan {
+        gpu_fit_plan_reason(t).expect("an eligible plan")
+    }
+
+    /// `a·x + b`: arithmetic only, so the device's f64 forward sweep and
+    /// `expr::eval` agree to the last bit and the values compare exactly.
+    fn affine() -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.7), input(0)]), constant(0.1)],
+        )
+    }
+
+    fn with_constants(t: &Node, c: &[f64]) -> Node {
+        let p = plan(t);
+        let mut out = t.clone();
+        p.apply(&mut out, c);
+        out
+    }
+
+    fn cpu_max(f: &Fixture, t: &Node) -> f64 {
+        let pred: Vec<f64> = f.x.iter().map(|r| crate::expr::eval(t, r)).collect();
+        score_weighted(&pred, &f.y, &[], Metric::Maximum, crate::expr::count_constants(t))
+    }
+
+    /// The exact maximum and the lowest maximiser row, on the CPU.
+    fn cpu_maximiser(f: &Fixture, t: &Node) -> (f64, usize) {
+        let mut best = (0.0f64, 0usize);
+        for (row, r) in f.x.iter().enumerate() {
+            let v = (crate::expr::eval(t, r) - f.y[row]).abs();
+            if v > best.0 || (v == best.0 && row < best.1) {
+                best = (v, row);
+            }
+        }
+        best
+    }
+
+    /// The device maximum is exactly `Metric::Maximum` of the prediction, and
+    /// its maximiser is the lowest row that attains it.
+    #[test]
+    fn the_device_maximum_is_the_configured_metric_and_its_lowest_maximiser() {
+        for n in [5usize, 32, 97, 256] {
+            let f = fixture(n);
+            let Some(mut ev) = evaluator(&f) else { return };
+            let t = affine();
+            let p = plan(&t);
+            for c in [p.c0.clone(), vec![0.0, 0.0], vec![1.0, 0.5], vec![-1.0, 2.0]] {
+                let got = ev
+                    .max_score_trials(&[&p], &[vec![c.clone()]])
+                    .expect("the device answered")[0][0]
+                    .expect("a finite prediction");
+                let want = cpu_maximiser(&f, &with_constants(&t, &c));
+                assert_eq!(got.value.to_bits(), want.0.to_bits(), "n={n}, c={c:?}");
+                assert_eq!(got.row, want.1, "n={n}, c={c:?}");
+                assert_eq!(
+                    got.value.to_bits(),
+                    cpu_max(&f, &with_constants(&t, &c)).to_bits(),
+                    "n={n}, c={c:?}: the value is the configured maximum"
+                );
+            }
+        }
+    }
+
+    /// A non-unique maximiser: two rows at the same `|r|` report the lowest of
+    /// them, and the answer does not depend on how the batch is composed.
+    #[test]
+    fn a_tied_maximum_reports_the_lowest_row_on_the_device() {
+        // y = ±2 on a constant-zero prediction: rows 0 and 1 are both 2 away.
+        let n = 8;
+        let f = Fixture {
+            cols32: vec![0.0f32; n],
+            cols64: vec![0.0f64; n],
+            n,
+            nv: 1,
+            y32: (0..n).map(|i| if i % 2 == 0 { 2.0f32 } else { -2.0 }).collect(),
+            y: (0..n).map(|i| if i % 2 == 0 { 2.0 } else { -2.0 }).collect(),
+            x: vec![vec![0.0]; n],
+        };
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = node(Op::Mul, vec![constant(0.0), input(0)]);
+        let p = plan(&t);
+        let one = ev
+            .max_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("device")[0][0]
+            .expect("finite");
+        assert_eq!(one.value, 2.0);
+        assert_eq!(one.row, 0, "the lowest maximiser is reported");
+        // Batched next to other candidates and trials: same answer.
+        let three = ev
+            .max_score_trials(
+                &[&p],
+                &[vec![vec![9.0], p.c0.clone(), vec![-9.0]]],
+            )
+            .expect("device")[0][1]
+            .expect("finite");
+        assert_eq!(three.value.to_bits(), one.value.to_bits());
+        assert_eq!(three.row, one.row);
+    }
+
+    /// The level-interval test is exact for an affine coordinate: at the exact
+    /// minimax level the interval contains the exact step, one ulp below it is
+    /// infeasible, and a constant-only row cannot move the coordinate.
+    #[test]
+    fn the_level_interval_is_exact_for_an_affine_coordinate() {
+        // One constant, targets 1, 2, 4: the minimax constant is 2.5 (level
+        // 1.5). Rows 0 and 2 are the tight pair (1.5 ± 1.5 either side of 4
+        // and 1), so they pin the step to the single point 2.5.
+        let x: Vec<Vec<f64>> = (0..3).map(|i| vec![i as f64]).collect();
+        let y = [1.0, 2.0, 4.0];
+        let n = 3;
+        let f = Fixture {
+            cols32: x.iter().map(|r| r[0] as f32).collect(),
+            cols64: x.iter().map(|r| r[0]).collect(),
+            n,
+            nv: 1,
+            y32: y.iter().map(|&v| v as f32).collect(),
+            y: y.to_vec(),
+            x: x.clone(),
+        };
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = constant(0.0);
+        let p = plan(&t);
+        let c = vec![0.0];
+        let at = |ev: &mut GpuEvaluator, level: f64| {
+            ev.max_intervals(&[&p], &[c.clone()], &[vec![0]], &[vec![level]])
+                .expect("device")[0][0]
+                .expect("finite rows")
+        };
+        let exact = at(&mut ev, 1.5);
+        assert!(exact.is_feasible(), "level 1.5 is attainable: {exact:?}");
+        assert!(
+            (exact.lo - 2.5).abs() <= 1e-12 && (exact.hi - 2.5).abs() <= 1e-12,
+            "row 2 pins the step at 2.5: {exact:?}"
+        );
+        let below = at(&mut ev, 1.5 - 1e-9);
+        assert!(!below.is_feasible(), "level 1.5 - 1e-9 is not: {below:?}");
+        // A looser level admits a range of steps: `|c − y| <= 4` for 1 and 4
+        // leaves `c ∈ [0, 5]`, and the middle target never binds.
+        let loose = at(&mut ev, 4.0);
+        assert!(loose.is_feasible(), "{loose:?}");
+        assert_eq!((loose.lo, loose.hi), (0.0, 5.0), "{loose:?}");
+    }
+
+    /// The batched device polish reaches the exact 1-D minimiser, is monotone
+    /// in the incoming constants, and reports the exact objective of the
+    /// constants it returns.
+    #[test]
+    fn the_device_polish_reaches_the_exact_minimiser_and_is_monotone() {
+        // A bare constant on 1, 2, 4: the minimax constant is the midrange 2.5.
+        let n = 3;
+        let y = [1.0, 2.0, 4.0];
+        let f = Fixture {
+            cols32: vec![0.0f32; n],
+            cols64: vec![0.0f64; n],
+            n,
+            nv: 1,
+            y32: y.iter().map(|&v| v as f32).collect(),
+            y: y.to_vec(),
+            x: vec![vec![0.0]; n],
+        };
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = constant(7.0 / 3.0);
+        let p = plan(&t);
+        let out = polish_minimax_batch(&mut ev, &[&p], &[p.c0.clone()], 8)
+            .expect("the device scorer answered");
+        assert!((out.constants[0][0] - 2.5).abs() <= 1e-6, "{:?}", out.constants[0]);
+        assert!(
+            (out.scores[0] - 1.5).abs() <= 1e-6,
+            "exact minimax 1.5, got {}",
+            out.scores[0]
+        );
+        // |2.5 − 1| = |2.5 − 4| = 1.5: rows 0 and 2 tie, so the reported
+        // maximiser is the lowest of them.
+        assert_eq!(out.maximisers[0], Some(0), "the lowest maximiser is reported");
+
+        // The full arm (squared start plus polish) never reports a worse
+        // maximum than the constants it was given, and its number is the exact
+        // objective of its constants.
+        let g = fixture(97);
+        let Some(mut ev) = evaluator(&g) else { return };
+        let tree = affine();
+        let plan = plan(&tree);
+        let incoming = cpu_max(&g, &tree);
+        let (out, ms) = ev.max_fit_batch(&[&plan], 8);
+        assert!(ms > 0.0, "the maximum arm ran on the device");
+        assert_eq!(out[0].status, 0, "the fixture candidate is eligible");
+        assert!(
+            out[0].sse <= incoming,
+            "device maximum {} worse than the incoming constants {}",
+            out[0].sse,
+            incoming
+        );
+        let applied = with_constants(&tree, &out[0].c);
+        assert_eq!(cpu_max(&g, &applied).to_bits(), out[0].sse.to_bits());
+        // And the CPU polish on the device constants never beats the finalist.
+        let mut tree_mut = applied.clone();
+        let finalist = maximum_finalist(&mut tree_mut, &g.x, &g.y, &[], 8);
+        assert!(finalist <= out[0].sse);
+        assert_eq!(finalist.to_bits(), cpu_max(&g, &tree_mut).to_bits());
+    }
+
+    /// A batch whose candidates have different constant counts is fitted for
+    /// every candidate: the device declines nothing (`status == 0`) and the
+    /// reported objective is the exact maximum of the returned constants.
+    #[test]
+    fn a_mixed_batch_of_constant_counts_is_fitted_for_every_candidate() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let trees = vec![
+            node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)]),
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.8),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                        ],
+                    ),
+                    constant(0.0),
+                ],
+            ),
+            constant(0.25),
+        ];
+        let plans: Vec<crate::fit::GpuFitPlan> = trees.iter().map(plan).collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (out, ms) = ev.max_fit_batch(&refs, 8);
+        assert!(ms > 0.0);
+        assert_eq!(out.len(), trees.len());
+        for (k, res) in out.iter().enumerate() {
+            assert_eq!(res.status, 0, "candidate {k} (p = {}) was declined", plans[k].nconst);
+            assert!(res.sse.is_finite());
+            let applied = with_constants(&trees[k], &res.c);
+            assert_eq!(cpu_max(&f, &applied).to_bits(), res.sse.to_bits());
+        }
+    }
+
+    /// Results do not depend on how the batch is composed or on repetition.
+    #[test]
+    fn the_maximum_scan_is_deterministic_across_batch_composition() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = affine();
+        let p = plan(&t);
+        let c = vec![0.8, -0.2];
+        let alone = ev
+            .max_score_trials(&[&p], &[vec![c.clone()]])
+            .expect("device")[0][0]
+            .expect("finite");
+        let three = ev
+            .max_score_trials(&[&p], &[vec![c.clone(), p.c0.clone(), vec![0.0, 0.0]]])
+            .expect("device")[0][0]
+            .expect("finite");
+        assert_eq!(alone.value.to_bits(), three.value.to_bits());
+        assert_eq!(alone.row, three.row);
+        let mixed = ev
+            .max_score_trials(&[&p, &p], &[vec![vec![2.0, 2.0]], vec![c.clone()]])
+            .expect("device");
+        assert_eq!(mixed[1][0].expect("finite").value.to_bits(), alone.value.to_bits());
+        let again = ev
+            .max_score_trials(&[&p], &[vec![c.clone()]])
+            .expect("device")[0][0]
+            .expect("finite");
+        assert_eq!(again.value.to_bits(), alone.value.to_bits());
+        assert_eq!(again.row, alone.row);
+    }
+
+    /// A non-finite prediction is refused, never scored as a huge finite one.
+    #[test]
+    fn a_non_finite_prediction_is_not_a_maximum() {
+        let f = fixture(32);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let bad = node(
+            Op::Ln,
+            vec![node(Op::Mul, vec![constant(-1.0), node(Op::Add, vec![input(0), constant(1.0)])])],
+        );
+        let p = plan(&bad);
+        let Some(res) = ev.max_score_trials(&[&p], &[vec![p.c0.clone()]]) else {
+            return; // a whole-call refusal is also correct
+        };
+        assert!(res[0][0].is_none(), "a non-finite prediction must not be scored");
+    }
+
+    /// A rank-deficient squared start is labelled and left to the CPU arm.
+    #[test]
+    fn an_ill_conditioned_squared_start_is_labelled() {
+        let f = fixture(48);
+        let Some(mut ev) = evaluator(&f) else { return };
+        // Two constants that only ever appear as a sum: the squared design is
+        // rank deficient, so the LM start cannot identify them.
+        let t = node(Op::Add, vec![constant(2.0), constant(1.0)]);
+        let p = plan(&t);
+        let (out, ms) = ev.max_fit_batch(&[&p], 8);
+        assert!(ms >= 0.0);
+        assert_ne!(out[0].status, 0, "a singular start must be labelled, not polished");
+    }
+
+    /// `iters == 0` (`--no-fit`) is a true no-op: no LM step, no polish, the
+    /// incoming constants unchanged.
+    #[test]
+    fn no_fit_does_not_enter_the_maximum_arm() {
+        let f = fixture(32);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = affine();
+        let p = plan(&t);
+        let (out, ms) = ev.max_fit_batch(&[&p], 0);
+        assert_eq!(ms, 0.0);
+        assert_eq!(out[0].status, 0);
+        assert_eq!(out[0].c, p.c0);
     }
 }
 

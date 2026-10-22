@@ -148,6 +148,12 @@ struct RcCtx {
        reuses it for every trial instead of re-sorting the target. */
     long long *d_rank_b;
     int rank_ready;
+    /* #227: reusable device arena for the exact maximum-error scan. The
+       bisection on the error level calls the scan once per round, so the
+       per-call `cudaMalloc`/`cudaFree` churn of the one-shot selection arms
+       would dominate; the arena is grown, never shrunk. */
+    void *d_mm;
+    size_t mm_bytes;
     int n;
     int v;
     int nprog;
@@ -2366,6 +2372,7 @@ void rc_destroy(void *ctx)
     if (c->d_pool[1]) cudaFree(c->d_pool[1]);
     if (c->d_hash) cudaFree(c->d_hash);
     if (c->d_rank_b) cudaFree(c->d_rank_b);
+    if (c->d_mm) cudaFree(c->d_mm);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -3226,6 +3233,287 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         __syncthreads();
     }
     if (tid == 0) out[seg] = part[0] / (double)(hi - lo);
+}
+
+/* #227: the exact maximum-error scan, one block per `(candidate, trial)`
+ * segment.
+ *
+ * Every thread strides the resident exact rows and the block reduces
+ *
+ *   - `max |pred − y|` in f64. A maximum is order-free — reordering the rows
+ *     cannot change the value — and `|r| >= 0`, so its IEEE-754 `u64` pattern
+ *     orders exactly like the value and the reduction is an **integer** max.
+ *     There is no float summation anywhere, so the statistic carries no
+ *     rounding and no run-to-run variation;
+ *   - the **lowest** row index that attains it, as a min over ties, so the
+ *     active set and any tie-break built on it are reproducible;
+ *   - when `coords[seg]` is a constant slot and `levels[seg]` is a finite
+ *     level `t`, the intersection of the per-row feasibility intervals of the
+ *     affine coordinate model `r_i(delta) = a_i + b_i·delta`:
+ *
+ *         −t <= a_i + b_i·delta <= t   =>   delta in [min(e1,e2), max(e1,e2)]
+ *
+ *     with `a_i = r_i` and `b_i = ∂r_i/∂c` from the exact adjoint sweep. The
+ *     intersection is `[max lo_i, min hi_i]` and it is non-empty exactly when
+ *     `t` is attainable along that coordinate. A row with `b_i == 0` can only
+ *     veto the level (`|a_i| > t`), it constrains no `delta`. That is the
+ *     feasibility test the host-side bisection on the error level drives.
+ *
+ * No atomics: every reduction is a fixed-structure shared-memory tree of
+ * order-free operators (integer max, min, max/min on f64, bitwise or), so the
+ * result cannot depend on how the batch is composed or scheduled. */
+#define FT_MM_THREADS 256
+
+struct RcMaxOut {
+    double vmax;  /* exact max |r|, NaN when status != 0 */
+    double lo;    /* max of the per-row lower bounds (`t` requested) */
+    double hi;    /* min of the per-row upper bounds (`t` requested) */
+    int row;      /* lowest-index maximiser, -1 when status != 0 */
+    int status;   /* 0 ok; 2 a row was not finite */
+};
+
+__global__ void k_max_scan(const unsigned int *__restrict__ prog,
+                           const unsigned int *__restrict__ off,
+                           const int *__restrict__ pcount,
+                           const double *__restrict__ c0, int kmax,
+                           const int *__restrict__ coords,
+                           const double *__restrict__ levels,
+                           const double *__restrict__ cols,
+                           const double *__restrict__ y, int n, int ns,
+                           int ntrials,
+                           RcMaxOut *__restrict__ out)
+{
+    __shared__ unsigned long long skey[FT_MM_THREADS];
+    __shared__ int srow[FT_MM_THREADS];
+    __shared__ double slo[FT_MM_THREADS];
+    __shared__ double shi[FT_MM_THREADS];
+    __shared__ int sbad[FT_MM_THREADS];
+    const int seg = blockIdx.x;
+    if (seg >= ns) return;
+    const int tid = threadIdx.x;
+    /* `off` has one entry per *candidate*; a candidate owns `ntrials`
+       consecutive segments (its trials, or its coordinates). */
+    const int cand = seg / ntrials;
+    const unsigned int *nd = prog + off[cand];
+    const int m = (int)((off[cand + 1] - off[cand]) / 4u);
+    const int p = pcount[cand];
+    const double *c = c0 + (size_t)seg * (size_t)kmax;
+    const int coord = (coords && p > 0 && coords[seg] >= 0 && coords[seg] < p)
+                          ? coords[seg]
+                          : -1;
+    const double level = levels ? levels[seg] : CUDART_NAN;
+    const int want_level = (coord >= 0) && isfinite(level) && level >= 0.0;
+
+    unsigned long long mykey = 0ULL;
+    int myrow = 0x7FFFFFFF;
+    double mylo = -CUDART_INF;
+    double myhi = CUDART_INF;
+    int mybad = 0;    /* bit 0: non-finite row; bit 1: level infeasible */
+    for (int row = tid; row < n; row += blockDim.x) {
+        double v[FT_MAX_NODES];
+        ft_forward_d(nd, m, cols, n, row, c, v);
+        const double pred = v[m - 1];
+        const double r = pred - y[row];
+        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+            mybad |= 1;
+            break;
+        }
+        const unsigned long long key = md_abs_key(r);
+        if (key > mykey || (key == mykey && row < myrow)) {
+            mykey = key;
+            myrow = row;
+        }
+        if (want_level && (mybad & 2) == 0) {
+            double adj[FT_MAX_NODES];
+            double g[FT_MAX_CONST_LARGE];
+            ft_backward_d<FT_MAX_CONST_LARGE>(nd, m, v, adj, g, p);
+            const double b = g[coord];
+            if (!isfinite(b)) {
+                mybad |= 1;
+                break;
+            }
+            if (b == 0.0) {
+                /* A row the coordinate cannot move: it only vetoes. */
+                if (fabs(r) > level) mybad |= 2;
+            } else {
+                const double e1 = (-level - r) / b;
+                const double e2 = (level - r) / b;
+                const double lo_i = fmin(e1, e2);
+                const double hi_i = fmax(e1, e2);
+                if (lo_i > mylo) mylo = lo_i;
+                if (hi_i < myhi) myhi = hi_i;
+            }
+        }
+    }
+    skey[tid] = mykey;
+    srow[tid] = myrow;
+    slo[tid] = mylo;
+    shi[tid] = myhi;
+    sbad[tid] = mybad;
+    __syncthreads();
+    for (int st = FT_MM_THREADS / 2; st > 0; st >>= 1) {
+        if (tid < st) {
+            const int j = tid + st;
+            if (skey[j] > skey[tid] || (skey[j] == skey[tid] && srow[j] < srow[tid])) {
+                skey[tid] = skey[j];
+                srow[tid] = srow[j];
+            }
+            if (slo[j] > slo[tid]) slo[tid] = slo[j];
+            if (shi[j] < shi[tid]) shi[tid] = shi[j];
+            sbad[tid] |= sbad[j];
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        const int bad = sbad[0];
+        RcMaxOut o;
+        o.status = (bad & 1) ? 2 : 0;
+        o.vmax = (bad & 1) ? CUDART_NAN : md_key_value(skey[0]);
+        o.row = (bad & 1) ? -1 : srow[0];
+        o.lo = (bad & 2) ? CUDART_INF : slo[0];
+        o.hi = (bad & 2) ? -CUDART_INF : shi[0];
+        out[seg] = o;
+    }
+}
+
+/* #227: make sure the f64 twins of the resident rows exist. Same lazy cast the
+ * median arm does, factored out because the maximum arm calls the scan dozens
+ * of times per candidate. */
+static int rc_mm_f64(RcCtx *c)
+{
+    if (c->d_cols64 && c->d_y64) return 0;
+    if (!c->d_cols64) {
+        if (rc_alloc((void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
+            c->d_cols64 = 0;
+            return -1;
+        }
+        int threads = 256;
+        long long total = (long long)c->n * (long long)c->v;
+        long long blocks = (total + threads - 1) / threads;
+        cast_f32_to_f64_kernel<<<(int)blocks, threads>>>(c->d_cols, c->d_cols64, total);
+    }
+    if (!c->d_y64) {
+        if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
+            c->d_y64 = 0;
+            return -1;
+        }
+        int threads = 256;
+        long long yblocks = (c->n + threads - 1) / threads;
+        cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* Reserve `bytes` from the reusable arena, aligned to 256 bytes. */
+static int rc_mm_reserve(RcCtx *c, size_t bytes)
+{
+    if (bytes <= c->mm_bytes) return 0;
+    if (c->d_mm) {
+        cudaFree(c->d_mm);
+        c->d_mm = 0;
+        c->mm_bytes = 0;
+    }
+    size_t want = bytes + (bytes >> 1) + 4096;
+    if (rc_alloc(&c->d_mm, want) != 0) {
+        c->d_mm = 0;
+        return -1;
+    }
+    c->mm_bytes = want;
+    return 0;
+}
+
+/* Exact maximum-error scan of `nsets * ntrials` prediction vectors.
+ *
+ * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
+ * the layout `rc_fit_batch`/`rc_rank_score_batch`/`rc_order_stat_score_batch` use.
+ * `coords` and `levels` hold one entry per segment: `coords[seg] < 0` (or a
+ * level that is not finite) asks for the maximum only, otherwise the segment
+ * also returns the interval intersection at that level.
+ *
+ * Returns the stage time in ms, or a negative value when nothing may be
+ * trusted (the caller then uses the exact CPU arm). */
+float rc_max_scan_batch(void *ctx,
+                        const unsigned int *prog,
+                        const unsigned int *off,
+                        const int *pcount,
+                        int nsets,
+                        int ntrials,
+                        int kmax,
+                        const double *c0,
+                        const int *coords,
+                        const double *levels,
+                        RcMaxOut *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_LARGE) return -1.0f;
+    if (c->n <= 0) return -1.0f;
+    if (rc_mm_f64(c) != 0) return -1.0f;
+    const int nsegs = nsets * ntrials;
+    if ((long long)nsegs * (long long)c->n > 0x7FFFFFFFLL) return -1.0f;
+    const size_t prog_words = (size_t)off[nsets];
+    const size_t align = 256;
+    const size_t sz_prog = ((sizeof(unsigned int) * prog_words + align - 1) / align) * align;
+    const size_t sz_off = ((sizeof(unsigned int) * (size_t)(nsets + 1) + align - 1) / align) * align;
+    const size_t sz_p = ((sizeof(int) * (size_t)nsets + align - 1) / align) * align;
+    const size_t sz_c0 =
+        ((sizeof(double) * (size_t)nsegs * (size_t)kmax + align - 1) / align) * align;
+    const size_t sz_coords = ((sizeof(int) * (size_t)nsegs + align - 1) / align) * align;
+    const size_t sz_levels = ((sizeof(double) * (size_t)nsegs + align - 1) / align) * align;
+    const size_t sz_out = ((sizeof(RcMaxOut) * (size_t)nsegs + align - 1) / align) * align;
+    const size_t total_bytes = sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels + sz_out;
+    if (rc_mm_reserve(c, total_bytes) != 0) return -1.0f;
+    char *base = (char *)c->d_mm;
+    unsigned int *d_prog = (unsigned int *)base;
+    unsigned int *d_off = (unsigned int *)(base + sz_prog);
+    int *d_p = (int *)(base + sz_prog + sz_off);
+    double *d_c0 = (double *)(base + sz_prog + sz_off + sz_p);
+    int *d_coords = (int *)(base + sz_prog + sz_off + sz_p + sz_c0);
+    double *d_levels = (double *)(base + sz_prog + sz_off + sz_p + sz_c0 + sz_coords);
+    RcMaxOut *d_out = (RcMaxOut *)(base + sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels);
+
+    /* One host->device copy for the whole request. The bisection calls this
+       once per round, so six separately synchronised `cudaMemcpy` calls per
+       round would be most of its latency on a small batch. The host block uses
+       the same aligned layout as the arena. A null `coords`/`levels` means
+       "maximum only": `-1` / NaN for every segment, filled here on the host. */
+    const size_t in_bytes = sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels;
+    char *host = (char *)calloc(1, in_bytes);
+    if (!host) return -1.0f;
+    memcpy(host, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + sz_prog, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + sz_prog + sz_off, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + sz_prog + sz_off + sz_p, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
+    int *h_coords = (int *)(host + sz_prog + sz_off + sz_p + sz_c0);
+    double *h_levels = (double *)(host + sz_prog + sz_off + sz_p + sz_c0 + sz_coords);
+    for (int seg = 0; seg < nsegs; ++seg) {
+        h_coords[seg] = coords ? coords[seg] : -1;
+        if (levels && coords) {
+            h_levels[seg] = levels[seg];
+        } else {
+            memcpy(&h_levels[seg], "\xff\xff\xff\xff\xff\xff\xff\xff", sizeof(double));
+        }
+    }
+    rc_upload(base, host, in_bytes);
+    free(host);
+    float ms = -1.0f;
+    int ok = cudaGetLastError() == cudaSuccess;
+    if (ok) {
+        cudaEventRecord(c->t0, 0);
+        k_max_scan<<<nsegs, FT_MM_THREADS>>>(d_prog, d_off, d_p, d_c0, kmax, d_coords,
+                                             d_levels, c->d_cols64, c->d_y64, c->n, nsegs,
+                                             ntrials, d_out);
+        ok = cudaGetLastError() == cudaSuccess;
+        cudaEventRecord(c->t1, 0);
+        cudaEventSynchronize(c->t1);
+        if (ok && cudaGetLastError() != cudaSuccess) ok = 0;
+    }
+    if (ok) {
+        cudaEventElapsedTime(&ms, c->t0, c->t1);
+        rc_download(out, d_out, sizeof(RcMaxOut) * (size_t)nsegs);
+        if (cudaGetLastError() != cudaSuccess) ok = 0;
+    }
+    if (!ok) return -1.0f;
+    return ms;
 }
 
 /* Exact median (what = 0) or interquartile mean of the absolute errors

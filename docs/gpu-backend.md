@@ -892,8 +892,9 @@ constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `metric_not_native` (no device fit objective for the configured metric),
 `ill_conditioned`, `non_finite`, `launch`, or — for the fit-only arms — the
-`rank_declined` (#230), `median_declined` (#226) and `interquartile_declined`
-(#232) causes (the device declined the call and the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
+`rank_declined` (#230), `median_declined` (#226), `interquartile_declined`
+(#232) and `maximum_declined` (#227) causes (the device declined the call and
+the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
@@ -1391,7 +1392,9 @@ change), and since #228 it also guarantees *where the proposal came from*:
   `bic`) and returns `None` for every other metric, so a backend that only knows
   squared error can never answer `signed`, `absolute`, `median`,
   `interquartile`, `maximum`, `correlation`, … . `BatchedGpu` overrides it with
-  the device loss registry (`fit::fit_loss`) plus the signed warm start below.
+  the device loss registry (`fit::fit_loss`) plus the signed warm start, and the
+  exact median/interquartile order-statistic polish (#226/#232) and the exact
+  maximum-error polish (#227) below.
 * `verify_proposal` completes a `signed` proposal with the exact `f64`
   constrained-LS projection (`fit::signed_projection`) **before** comparing, and
   accepts only when the achieved `|Σ wᵢ rᵢ| / Σ wᵢ` is finite, no worse, and
@@ -1638,6 +1641,9 @@ substitute for either.
 | `log_loss` **native fitness** on the device (a log-loss scorer in `rc_eval`) | — | **not built**: the evaluator has no label semantics, so the fitness is exact CPU; a device fitness is only worth it once the fit stage is cheap (it is 8.1 % of wall now) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
+| Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |
+| Maximum paired fit stage (CPU ladder vs bisection on the error level) | RTX 3060, `tests/gpu_max.rs` (`the_paired_maximum_measurement_shows_the_device_tail_is_faster`) | **measured on three sample sizes** — 5.8–9.1× at 24 candidates, 2.6–8.4× at the search's 32-candidate batch; one-candidate batches lose (0.2–0.5×) and are never used |
+| Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows (`--fit-iters 8`), 5 generations, pop 60 | **measured on three seeds** — 1.75–4.0× end-to-end (9.38/3.72/8.48 s exact vs 2.36/2.12/2.89 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`, zero `maximum_declined`; the fitness is still CPU, so Amdahl caps the gain |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
@@ -2101,3 +2107,170 @@ device, single-output unweighted full-sample data, `--fit-iters > 0` and
 scorer, so every fitness value is the CPU window mean, the backend stays `cpu`,
 and the device use is recorded in `gpu.fit` (with `interquartile_declined` among
 the labelled causes).
+
+## Maximum absolute error fitting (issue #227)
+
+`--metric maximum` scores `maxᵢ |yᵢ − f(xᵢ;c)|` (Chebyshev / L∞). The CPU arm
+is a squared fit followed by `coordinate_polish` on that maximum: per constant
+six fixed ladder steps, so it can only land on `±1 %, ±3 %, ±10 %` of
+`max(|c|,1)` and cannot resolve a minimum between two rungs — and it pays
+`6·p·sweeps` full prediction sweeps. The objective is not an SSE and has no
+smooth Hessian: with a unique maximiser its subgradient is the rank-one
+`sign(r*)·g*`, so the squared LM cannot drive it.
+
+#227 replaces that tail with an **exact one-dimensional minimisation per
+constant**, batched over a whole generation, and proves two dominance claims.
+
+**The level test.** With the other constants fixed and a tree affine in the
+chosen coordinate, the residual is `rᵢ(δ) = aᵢ + bᵢ·δ`, where `aᵢ = rᵢ` and
+`bᵢ = ∂rᵢ/∂c` from the exact adjoint sweep the fit kernel already forms. The
+level `t` is attainable along the coordinate **exactly** when the per-row
+intervals
+
+```text
+−t ≤ aᵢ + bᵢ·δ ≤ t   ⇔   δ ∈ [min(e₁,e₂), max(e₁,e₂)],
+                          e₁ = (−t − aᵢ)/bᵢ,  e₂ = (t − aᵢ)/bᵢ
+```
+
+intersect: `max loᵢ ≤ min hiᵢ`. A row with `bᵢ = 0` constrains no `δ` and only
+vetoes the level when `|aᵢ| > t`. The device returns that intersection with the
+maximum in one scan (`k_max_scan`, `rc_max_scan_batch`), and the host
+**bisects on the error level** `t ∈ [0, J(c)]`: `J(c)` is feasible at `δ = 0`
+by definition, `t = 0` is the lower end, and the committed step is the midpoint
+of the intersecting interval at the last feasible level. At most
+`MINIMAX_BISECT_ROUNDS = 32` rounds, stopping as soon as the bracket is within
+`1e-9` relative — a closed, ordered, deterministic search with no step ladder
+and no unbounded optimiser.
+
+For a tree that is **not** affine in the coordinate (a fitted exponent, a
+threshold, `log(c·x)`) the residual is not affine in `δ`, so the interval test
+is a *linearised* feasibility test, not an exact one. It is documented as a
+heuristic where it applies: it proposes a step, and the exact accept test keeps
+the monotonicity claim true. The exactness claim is made only for affine
+coordinates, and the tests pin it there (a hand-solved midrange, a two-constant
+Chebyshev line, and the exact interval at the exact optimum).
+
+**The exact maximum and its maximiser.** `k_max_scan` reduces, one block per
+`(candidate, coordinate)` segment,
+
+* `max |pred − y|` in `f64`. A maximum is **order-free** — reordering the rows
+  cannot change it — and `|r| ≥ 0`, so its IEEE bit pattern orders exactly like
+  the value and the reduction is an **integer max**: no float summation, no
+  rounding, no run-to-run variation;
+* the **lowest** row index that attains it (`min` over ties), so a non-unique
+  maximiser is reported identically on every run and the active set is
+  reproducible;
+* the level interval above, when a coordinate and a level are requested.
+
+Every reduction is a fixed-structure shared-memory tree of order-free
+operators; there are no atomics anywhere. Tests pin the device maximum against
+`metrics::score_weighted(.., maximum)` **bit for bit**, the lowest maximiser on
+a tied fixture, and identical results alone, repeated, or batched next to other
+candidates.
+
+**Pipeline per generation step.** For the admitted candidates:
+
+1. the resident rows are fitted by the squared LM kernel (the same warm start
+   `fit_weighted_metric` uses, same `--fit-iters`);
+2. one scan scores the baseline `max |r|` of the incoming constants;
+3. per sweep, 32 level scans run over all candidates and all their coordinates
+   at once, then one batched call scores the proposed constants; the best
+   **strict** improver is committed (ties go to the lowest constant index);
+   a sweep that commits nothing ends the polish, at most `min(iters, 12)`
+   sweeps;
+4. the arm keeps the **incoming** constants unless the polished maximum is
+   strictly lower.
+
+**Dominance, twice.**
+
+* *Over the start* — structural: a step is committed only when the exact
+  `max |r|` of the trial is strictly less than the best so far, so the arm can
+  never report a constant it made worse, whatever the device returned.
+* *Over the CPU polish* — `maximum_finalist` runs `fit_weighted_metric(..,
+  maximum)` (the CPU ladder) on the device constants for every finalist and
+  keeps whichever exact objective is lower, with a plain `f64` `<` and **zero
+  tolerance**. A test asserts `J_device ≤ J_cpu_polish` on the same candidates
+  from the same warm start.
+
+**Metric-aware gate, not SSE.** Proposals pass through
+`fit_batch_verified`/`fit_pending`, which score the **configured maximum** in
+exact `f64`; the device's own `GpuFitOutput.sse` field carries `max |r|` for
+this arm, never an SSE. A squared-only backend returns `None` for a maximum
+request and the exact CPU arm runs instead.
+
+**Fallbacks (all labelled).** A candidate is offered only with a GPU fit plan
+(`p ≤ 20`, ≤ 96 nodes, no shared block constants, analytic operators) and at
+least `32p` rows; every other candidate, and every batch the device marks
+non-finite (`non_finite`), ill-conditioned (`ill_conditioned`), launches badly
+(`launch`) or whose maximum scan declines (`maximum_declined`), is refit by the
+exact CPU maximum arm. The run-level decision has a reason too: the device arm
+needs `n ≥ MAXIMUM_GPU_MIN_ROWS = 512`, and below it the exact CPU arm runs
+with `# gpu-fit: off (maximum fit arm: the sample is too small for the device
+polish)` and the same string in `backend_reason`. `--no-fit` never enters the
+arm: the evaluator is not created and the archive is identical to the exact
+CPU run, bit for bit.
+
+**Paired measurement (RTX 3060, shared machine, indicative).** 24 affine
+candidates `a·x + b`, `--fit-iters 8`, same squared warm start on both arms:
+
+| rows `n` | CPU arm | GPU arm | speed-up |
+|---|---|---|---|
+| 5 000 | 277.9 ms | 48.1 ms | 5.8× |
+| 20 000 | 1 116.3 ms | 123.5 ms | 9.0× |
+| 50 000 | 2 620.6 ms | 287.3 ms | 9.1× |
+
+and at the search's **minimum admitted batch** (32 candidates, `p = 2`, best of
+three): 256 rows 23.4 vs 9.1 ms (2.6×), 512 rows 43.1 vs 10.9 ms (3.95×),
+1 024 rows 78.3 vs 10.4 ms (7.6×), 8 192 rows 623.8 vs 74.2 ms (8.4×). On a
+**single** candidate the device loses (0.2–0.5×): 266 sequential launches
+cannot be amortised over one block, which is why the arm is only ever reached
+through the batched search.
+
+The cost model in `src/fit.rs` is per candidate:
+
+```text
+cpu_s = START_S + sweeps·p·6·CPU_EVAL_ROW_S·n
+gpu_s = START_S + calls·GPU_CALL_S + sweeps·ROUNDS·p·GPU_SCAN_ROW_S·n
+calls = 2 + sweeps·(ROUNDS + 1)
+START_S = 1.5e-4, CPU_EVAL_ROW_S = 2.46e-8, GPU_CALL_S = 8.2e-7, GPU_SCAN_ROW_S = 5.0e-10
+```
+
+Every coordinate of a candidate rides in **one** call, so the device term scales
+with `p` per row but not per call, and the modelled speed-up grows with `p`. The
+one-call packing matters: six separately synchronised `cudaMemcpy` calls per
+round were most of the latency before the request buffer was packed into a
+single upload (`rc_max_scan_batch`). The admission floor is **512 rows** — above
+the measured crossover, where the model predicts a speed-up for every `p = 1..=20`
+and the measurement shows at least 3.9× at the search's batch size.
+`maximum_fit_cost(n, p, sweeps)` exposes the model and a unit test pins the
+floor, the monotonicity in `n` and in `p`, and the coefficients' signs.
+
+**Measured end-to-end (three seeds, 20 000 rows, 5 generations, `--pop 60`).**
+CPU `--fit-strategy exact` 9.38 / 3.72 / 8.48 s against the device arm
+2.36 / 2.12 / 2.89 s (1.75–4.0×, the machine is shared so these are
+indicative), with best front error 3.90 / 3.63 / 3.42 against 3.79 / 3.91 /
+3.66 — the fit is kept monotone per candidate, but the search trajectory
+differs, so this is not a quality claim. Fallback share is
+8.6–10.2 %, entirely `non_finite`, `unsupported_plan` and `ill_conditioned`;
+zero `maximum_declined` after the mixed-`p` batch fix (below). Because the arm is
+**fit-only**, the fitness evaluation stays on the CPU and Amdahl caps the
+end-to-end gain.
+
+**Mixed constant counts.** The driver sends one level/interval vector per
+constant of **each** candidate (`plan.order`), not one per slot of the batch's
+largest `p`. Mixing those up made the device decline every batch that held a
+`p = 1` candidate next to a `p = 3` one, which the search then reported as
+`maximum_declined` and refit on the CPU: correct, but a large silent regression
+in device use. Two tests pin it — a driver test that polishes a `p = 1, 2, 3`
+batch and compares it bit for bit with three single-candidate runs, and a device
+test that requires `status == 0` for every candidate of a mixed batch.
+
+**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
+device, single-output unweighted full-sample data (a **weighted** maximum has no
+defined objective — `weights_supported` excludes `maximum` — so it is never
+fitted on the device), `--fit-iters > 0` and `n ≥ 512`. It is **fit-only**: the
+evaluator has no native maximum scorer, so every fitness value is the CPU
+maximum, the backend stays `cpu`, and the device use is recorded in `gpu.fit`
+(with `maximum_declined` among the labelled causes). Lawson IRLS on the weighted
+assembly (`minimax-bias.md` §2.3) and native maximum scoring remain open; the
+bisection is the research note's `R1`, which the note recommends first.

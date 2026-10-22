@@ -256,6 +256,7 @@ is mathematically well posed:
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230, signed: #231) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; `rank_correlation_signed` scores `1 − ρ` and can never accept a reflected model or an SSE/`|ρ|` proxy (#231); the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | `interquartile` with `--fit-strategy gpu` (#232) | the same squared start and the same ladder on the same sort, averaging ranks `[⌊n/4⌋, ⌊3n/4⌋)` of `|r|` (all rows below `n = 4`) — the window is by rank, so a repeated boundary value cannot change it. Every trial is scored on that window mean, never on SSE. Fit-only, `n >= 4096` rows, and the score agrees with the CPU to `1e-12` relative (a fixed tree reduction, not bit-identical like the median) |
+| `maximum` with `--fit-strategy gpu` (#227) | the same squared start, then the **exact one-dimensional minimiser per constant**: with `rᵢ(δ) = aᵢ + bᵢ·δ` and the exact adjoint, the level `t` is attainable iff `max loᵢ <= min hiᵢ`, so a bisection on the error level `t ∈ [0, J(c)]` (at most 32 rounds, `1e-9` relative) finds the exact coordinate minimum with no step ladder. Steps are accepted only on a strictly lower exact `max |r|`, and every finalist keeps `min(J_device, J_cpu_polish)` with zero tolerance. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 512` rows (the measured cost-model floor) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 The correlation family is no longer a squared fit plus polish (issue #224).
@@ -847,10 +848,11 @@ different objective. The kernel's native objectives are squared/AIC (least
 squares), `log_squashed` (weighted IRLS) and `absolute` (Lawson/L1 IRLS with
 true-MAE acceptance); `rank_correlation`, `rank_correlation_signed`, `median`
 and `interquartile` are **fit-only** device arms (#230, #226, #232) whose
-fitness is still the CPU objective. `--fit-report` prints GPU
-accepted/fallback/refit counts and whether a CUDA build is present; the fallback
-ledger names `median_declined` for a median call the device could not complete
-(#226) and `interquartile_declined` for the interquartile arm (#232).
+fitness is still the CPU objective, as `maximum` is (#227). `--fit-report` prints
+GPU accepted/fallback/refit counts and whether a CUDA build is present; the
+fallback ledger names `median_declined` for a median call the device could not
+complete (#226), `interquartile_declined` for the interquartile arm (#232) and
+`maximum_declined` for a maximum scan the device could not complete (#227).
 
 #### Exactness and fallbacks
 
@@ -967,7 +969,8 @@ were fitted, while the batched kernel is still 17–25× faster per candidate, s
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
 `non_finite`, `launch`, `rank_declined`, `median_declined`,
-`interquartile_declined`, `single_class`, `log_loss_worse`) in
+`interquartile_declined`, `single_class`, `log_loss_worse`,
+`maximum_declined`) in
 `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
@@ -977,17 +980,19 @@ accumulator, `absolute` (#222) with per-row Lawson weights
 `t = 2[y > (min+max)/2] - 1`, the pseudo-response offset `t/q` and a
 `softplus(-t·p)` trial objective. The robust arms and `log_loss` are gated by a
 scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
-`log_loss` is fit-only, like the rank, median and interquartile families (#230,
-#226, #232): the device moves the constants, the exact CPU objective judges
+`log_loss` is fit-only, like the rank, median, interquartile and maximum
+families (#230, #226, #232, #227): the device moves the constants, the exact CPU objective judges
 every proposal (reverted and labelled when worse), scores every candidate and
 refits every finalist. Its measured fit share is 97.5 % of a `log_loss` run's
 CPU work, which is why this arm attacks the dominant cost where the #233 AUC arm
 could not (3.0–3.5 %). The median and interquartile arms also require at least
-4 096 training rows, the measured crossover of the batched selection; below it
-the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
+4 096 training rows, the measured crossover of the batched selection, and the
+maximum arm at least 512 rows, the measured floor of the bisection on the error
+level; below either bound the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
 metric is a usage error (exit 2) naming `--metric squared`,
 `--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
-metric, `--metric median`, `--metric interquartile` or a CPU strategy (exact,
+metric, `--metric median`, `--metric interquartile`, `--metric maximum` or a
+CPU strategy (exact,
 auto, linear, varpro, stream), never a silent CPU fit of a different objective
 (#223). Every finalist is refit
 exactly on all training rows in CPU f64 *for
