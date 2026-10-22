@@ -2935,7 +2935,7 @@ float rc_rank_score_batch(void *ctx,
     return ms;
 }
 
-/* --- #226: host side of the exact median stage ---------------------------- */
+/* --- #226/#232: host side of the exact order-statistic stage --------------- */
 
 /* `|r|` as a `u64`. The absolute residual is non-negative, so its IEEE-754
  * bit pattern orders exactly like the value; sorting the patterns is sorting
@@ -2960,7 +2960,7 @@ __device__ __forceinline__ double md_key_value(unsigned long long k)
  * `|pred − y|` in exact f64. `status[seg] = 2` marks a segment with a
  * non-finite prediction or residual, which the caller reads as `non_finite`
  * and hands to the exact CPU arm (the landed #169 guard, never a silent 1e30). */
-__global__ void k_median_keys(const unsigned int *__restrict__ prog,
+__global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
                               const unsigned int *__restrict__ off,
                               const double *__restrict__ c0, int kmax,
                               const double *__restrict__ cols,
@@ -2994,55 +2994,115 @@ __global__ void k_median_keys(const unsigned int *__restrict__ prog,
     }
 }
 
-/* Turn one sorted segment into its median. Odd `n`: the middle value. Even
- * `n`: `0.5 * (a + b)` of the two middle values, the same expression
- * `metrics::median_abs` evaluates. Ties need no tie-break: the median is a
- * function of the multiset, so equal keys cannot change it. */
-__global__ void k_median_pick(const unsigned long long *__restrict__ keys,
-                              int n, int ns, double *__restrict__ out,
-                              int *__restrict__ status)
+/* Threads per segment in the order-statistic pick. Fixed on purpose: the
+ * interquartile window sum is a tree reduction, and a fixed width is what makes
+ * that reduction's rounding order (hence its value) reproducible. */
+#define RC_OS_PICK_THREADS 256
+
+/* The rank window `[lo, hi)` that `metrics::interquartile_mean_abs` averages:
+ * `lo = n/4`, `hi = (3n)/4` for `n >= 4`. Below four rows the CPU arm has no
+ * interquartile window and scores the plain mean of **all** rows, so the window
+ * is `[0, n)` there. */
+__device__ __forceinline__ void md_iqr_window(int n, int *lo, int *hi)
 {
+    if (n < 4) {
+        *lo = 0;
+        *hi = n;
+        return;
+    }
+    *lo = n / 4;
+    *hi = (3 * n) / 4;
+}
+
+/* Turn one sorted segment into its order statistic. `what` 0 is the median,
+ * `what` 1 is the interquartile mean of `|r|`.
+ *
+ * Median. Odd `n`: the middle value. Even `n`: `0.5 * (a + b)` of the two
+ * middle values, the same expression `metrics::median_abs` evaluates.
+ *
+ * Interquartile. The mean of the sorted keys at ranks `[lo, hi)` where
+ * `lo = floor(n/4)` and `hi = floor(3n/4)` (all rows when `n < 4`), exactly the
+ * slice `metrics::interquartile_mean_abs` averages. Membership is decided by
+ * *rank*, never by a value interval: with a repeated boundary value the two
+ * differ (sorted `1,2,3,3` with `n = 4` averages `2,3` in the window but
+ * `2,3,3` over the value range). The sum is a fixed 256-thread tree reduction
+ * over the window in block order, so the value is deterministic for a fixed
+ * `n`; it agrees with the CPU's left-to-right `f64` sum to rounding, not to the
+ * last bit. (The median is a single value and does agree bit for bit.)
+ *
+ * Ties need no tie-break in either case: both statistics are functions of the
+ * multiset `{|r_i|}`, so equal keys cannot change the value.
+ */
+__global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
+                                  int n, int ns, int what,
+                                  double *__restrict__ out,
+                                  int *__restrict__ status)
+{
+    __shared__ double part[RC_OS_PICK_THREADS];
     const int seg = blockIdx.x;
-    if (threadIdx.x != 0 || seg >= ns) return;
+    const int tid = threadIdx.x;
+    if (seg >= ns) return;
     if (status[seg] != 0 || n <= 0) {
-        if (n <= 0) status[seg] = 2;
-        out[seg] = CUDART_NAN;
+        if (tid == 0) {
+            if (n <= 0) status[seg] = 2;
+            out[seg] = CUDART_NAN;
+        }
         return;
     }
     const unsigned long long *k = keys + (size_t)seg * (size_t)n;
-    if (n & 1) {
-        out[seg] = md_key_value(k[n / 2]);
-    } else {
-        out[seg] = 0.5 * (md_key_value(k[n / 2 - 1]) + md_key_value(k[n / 2]));
+    if (what == 0) {
+        if (tid != 0) return;
+        if (n & 1) {
+            out[seg] = md_key_value(k[n / 2]);
+        } else {
+            out[seg] = 0.5 * (md_key_value(k[n / 2 - 1]) + md_key_value(k[n / 2]));
+        }
+        return;
     }
+    int lo, hi;
+    md_iqr_window(n, &lo, &hi);
+    double s = 0.0;
+    for (int i = lo + tid; i < hi; i += RC_OS_PICK_THREADS) s += md_key_value(k[i]);
+    part[tid] = s;
+    __syncthreads();
+    for (int stride = RC_OS_PICK_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) part[tid] += part[tid + stride];
+        __syncthreads();
+    }
+    if (tid == 0) out[seg] = part[0] / (double)(hi - lo);
 }
 
-/* Exact median absolute error of `nsets * ntrials` prediction vectors.
+/* Exact median (what = 0) or interquartile mean of the absolute errors
+ * (what = 1) of `nsets * ntrials` prediction vectors.
  *
  * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
- * the same layout `rc_fit_batch`/`rc_rank_score_batch` use. `out_median`
- * receives the exact `f64` median per segment and `out_status` the labelled
+ * the same layout `rc_fit_batch`/`rc_rank_score_batch` use. `out_value`
+ * receives the exact `f64` statistic per segment and `out_status` the labelled
  * status (0 ok, 2 non-finite). Returns the stage time in ms, or a negative
  * value when nothing may be trusted (the caller then uses the exact CPU arm).
  *
  * The keys are predictably cheap to sort: one prediction sweep, then CUB's
  * segmented radix sort of the `u64` patterns (four byte passes over keys
- * already in memory), then one pick. No atomics, no float reduction, so the
- * value is bit-identical however the batch is composed.
+ * already in memory), then one pick. No atomics, no float atomics and no
+ * data-dependent reduction order, so the value is bit-identical however the
+ * batch is composed (the interquartile mean's own tree reduction is fixed by
+ * the constant window and the constant thread count).
  */
-float rc_median_score_batch(void *ctx,
-                            const unsigned int *prog,
-                            const unsigned int *off,
-                            const int *pcount,
-                            int nsets,
-                            int ntrials,
-                            int kmax,
-                            const double *c0,
-                            double *out_median,
-                            int *out_status)
+float rc_order_stat_score_batch(void *ctx,
+                                const unsigned int *prog,
+                                const unsigned int *off,
+                                const int *pcount,
+                                int nsets,
+                                int ntrials,
+                                int kmax,
+                                const double *c0,
+                                int what,
+                                double *out_value,
+                                int *out_status)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (what != 0 && what != 1) return -1.0f;
     if (c->n <= 0) return -1.0f;
     if (!c->d_cols64 || !c->d_y64) {
         /* The f64 twins are normally uploaded once by `rc_set_fit_data`; a
@@ -3079,7 +3139,7 @@ float rc_median_score_batch(void *ctx,
     double *d_c0 = 0;
     unsigned long long *d_keys = 0;
     unsigned long long *d_keys_out = 0;
-    double *d_med = 0;
+    double *d_val = 0;
     int *d_status = 0;
     int *d_seg_off = 0;
     void *d_temp = 0;
@@ -3092,7 +3152,7 @@ float rc_median_score_batch(void *ctx,
     if (ok && rc_alloc((void **)&d_c0, sizeof(double) * (size_t)nsegs * (size_t)kmax) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_keys, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_keys_out, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_med, sizeof(double) * (size_t)nsegs) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_val, sizeof(double) * (size_t)nsegs) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nsegs) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_seg_off, sizeof(int) * (size_t)(nsegs + 1)) != 0) ok = 0;
     if (ok) {
@@ -3124,7 +3184,7 @@ float rc_median_score_batch(void *ctx,
         if (blocks > 65535) blocks = 65535;
         if (blocks < 1) blocks = 1;
         cudaEventRecord(c->t0, 0);
-        k_median_keys<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
+        k_order_stat_keys<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
                                                 c->d_y64, c->n, nsegs, ntrials, d_keys,
                                                 d_status);
         ok = cudaGetLastError() == cudaSuccess;
@@ -3135,7 +3195,8 @@ float rc_median_score_batch(void *ctx,
             ok = cudaGetLastError() == cudaSuccess;
         }
         if (ok) {
-            k_median_pick<<<nsegs, 1>>>(d_keys_out, c->n, nsegs, d_med, d_status);
+            k_order_stat_pick<<<nsegs, RC_OS_PICK_THREADS>>>(d_keys_out, c->n, nsegs, what,
+                                                             d_val, d_status);
             ok = cudaGetLastError() == cudaSuccess;
         }
         cudaEventRecord(c->t1, 0);
@@ -3143,7 +3204,7 @@ float rc_median_score_batch(void *ctx,
         if (ok && cudaGetLastError() != cudaSuccess) ok = 0;
         if (ok) {
             cudaEventElapsedTime(&ms, c->t0, c->t1);
-            rc_download(out_median, d_med, sizeof(double) * (size_t)nsegs);
+            rc_download(out_value, d_val, sizeof(double) * (size_t)nsegs);
             rc_download(out_status, d_status, sizeof(int) * (size_t)nsegs);
             if (cudaGetLastError() != cudaSuccess) ok = 0;
         }
@@ -3154,7 +3215,7 @@ float rc_median_score_batch(void *ctx,
     if (d_c0) cudaFree(d_c0);
     if (d_keys) cudaFree(d_keys);
     if (d_keys_out) cudaFree(d_keys_out);
-    if (d_med) cudaFree(d_med);
+    if (d_val) cudaFree(d_val);
     if (d_status) cudaFree(d_status);
     if (d_seg_off) cudaFree(d_seg_off);
     if (d_temp) cudaFree(d_temp);

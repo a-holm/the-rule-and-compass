@@ -19,7 +19,7 @@
 //!    waste work but can never change the reported objective.
 //!
 //! The device computes the median as a **segmented sort of the `|r|` bit
-//! patterns** (see `src/cuda/eval.cu`, `rc_median_score_batch`). Because
+//! patterns** (see `src/cuda/eval.cu`, `rc_order_stat_score_batch`). Because
 //! `|r| ≥ 0`, its IEEE-754 `u64` pattern orders exactly like the value, so the
 //! sorted keys give the two middle values of the CPU's
 //! [`metrics::score_weighted`] directly. The `f32` prediction is *not* used:
@@ -28,29 +28,33 @@
 //! trees (transcendental operators may differ by an ulp per row, exactly as in
 //! the landed #169 arm).
 //!
-//! This is one slice of issue #226: the warm start is the squared LM kernel.
-//! The Huber/IRLS continuation and the interquartile window mean need the
-//! weighted assembly that the `absolute` arm will land (`l1-quantile.md` §4.2),
-//! and stay open.
+//! #232: the driver below is **shared with the interquartile arm**
+//! ([`super::interquartile`]). Both metrics are order statistics of the same
+//! sorted key array and both belong to the CPU's squared-fit-plus-ladder
+//! family, so they use one ladder runner and one [`OrderStat`] switch; only the
+//! pick differs (see `k_order_stat_pick`: one value for the median, the mean of
+//! ranks `[n/4, ⌊3n/4⌋)` for the interquartile window).
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
 use super::rank::PolishResult;
 use super::*;
 
-/// One scorer call: the exact median absolute residual for every
-/// `(candidate, trial)` pair.
+/// One scorer call: the exact order statistic of the absolute residual for
+/// every `(candidate, trial)` pair.
 ///
 /// `plans[k]` is the flattened program of candidate `k`; `trials[k][t]` is the
-/// constant vector (slot order) to predict with. The result has the same shape:
-/// `None` for a segment whose prediction was not finite, and `None` for the
-/// whole vector when the device declined the call.
-pub(crate) trait MedianTrialScorer {
+/// constant vector (slot order) to predict with; `want` is the statistic to
+/// score. The result has the same shape: `None` for a segment whose prediction
+/// was not finite, and `None` for the whole vector when the device declined the
+/// call.
+pub(crate) trait OrderStatTrialScorer {
     /// One `Vec` per candidate, one entry per trial in `trials[k]`.
     fn score_trials(
         &mut self,
         plans: &[&GpuFitPlan],
         trials: &[Vec<Vec<f64>>],
+        want: OrderStat,
     ) -> Option<Vec<Vec<Option<f64>>>>;
 }
 
@@ -65,11 +69,12 @@ pub(crate) trait MedianTrialScorer {
 /// the **first** trial whose exact score is finite and strictly below the best
 /// seen so far; stop a sweep when no constant improved; at most
 /// `min(sweeps, 12)` sweeps.
-pub(crate) fn polish_median_batch<S: MedianTrialScorer + ?Sized>(
+pub(crate) fn polish_order_stat_batch<S: OrderStatTrialScorer + ?Sized>(
     scorer: &mut S,
     plans: &[&GpuFitPlan],
     starts: &[Vec<f64>],
     sweeps: usize,
+    want: OrderStat,
 ) -> Option<PolishResult> {
     let n = plans.len();
     if n != starts.len() {
@@ -89,7 +94,7 @@ pub(crate) fn polish_median_batch<S: MedianTrialScorer + ?Sized>(
     // the scorer cannot score is inactive, exactly like the CPU polish
     // returning early on a non-finite score.
     let baseline: Vec<Vec<Vec<f64>>> = c.iter().map(|v| vec![v.clone()]).collect();
-    let values = scorer.score_trials(plans, &baseline)?;
+    let values = scorer.score_trials(plans, &baseline, want)?;
     if values.len() != n || values.iter().any(|t| t.len() != 1) {
         return None;
     }
@@ -135,7 +140,7 @@ pub(crate) fn polish_median_batch<S: MedianTrialScorer + ?Sized>(
                 trials.push(list);
             }
             let sub: Vec<&GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
-            let values = scorer.score_trials(&sub, &trials)?;
+            let values = scorer.score_trials(&sub, &trials, want)?;
             if values.len() != idx.len() || values.iter().any(|t| t.len() != LADDER.len()) {
                 return None;
             }
@@ -165,6 +170,17 @@ pub(crate) fn polish_median_batch<S: MedianTrialScorer + ?Sized>(
     })
 }
 
+/// The median arm of [`polish_order_stat_batch`]: the same driver with
+/// [`OrderStat::Median`], so the IQR arm below and this one cannot drift.
+pub(crate) fn polish_median_batch<S: OrderStatTrialScorer + ?Sized>(
+    scorer: &mut S,
+    plans: &[&GpuFitPlan],
+    starts: &[Vec<f64>],
+    sweeps: usize,
+) -> Option<PolishResult> {
+    polish_order_stat_batch(scorer, plans, starts, sweeps, OrderStat::Median)
+}
+
 /// Exact median of a `|r|` key multiset, the rule the device reproduces.
 ///
 /// The keys are the `f64` bit patterns of the (non-negative) absolute residual,
@@ -186,26 +202,28 @@ pub(crate) fn median_of_keys(keys: &mut [u64]) -> Option<f64> {
     })
 }
 
+/// #226/#232: the reference scorers and fixtures the median and interquartile
+/// test modules share. Nothing here is compiled into a release build.
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use crate::expr::{constant, input, node};
-    use crate::metrics::score_weighted;
 
     /// The reference scorer: evaluates the tree with `expr::eval` in `f64` and
-    /// scores with the configured metric, exactly like `metric_score`. It
-    /// deliberately shares no code with the device selection.
-    struct CpuScorer<'a> {
-        tree: &'a Node,
-        x: &'a [Vec<f64>],
-        y: &'a [f64],
+    /// scores with the configured metric of `want`, exactly like
+    /// `metric_score`. It deliberately shares no code with the device
+    /// selection.
+    pub(crate) struct CpuScorer<'a> {
+        pub(crate) tree: &'a Node,
+        pub(crate) x: &'a [Vec<f64>],
+        pub(crate) y: &'a [f64],
     }
 
-    impl MedianTrialScorer for CpuScorer<'_> {
+    impl OrderStatTrialScorer for CpuScorer<'_> {
         fn score_trials(
             &mut self,
             plans: &[&GpuFitPlan],
             trials: &[Vec<Vec<f64>>],
+            want: OrderStat,
         ) -> Option<Vec<Vec<Option<f64>>>> {
             let flat = super::super::flatten(self.tree);
             let mut out = Vec::with_capacity(plans.len());
@@ -219,7 +237,13 @@ mod tests {
                     let mut t = self.tree.clone();
                     super::super::write_constants(&mut t, &flat, c);
                     let pred: Vec<f64> = self.x.iter().map(|r| crate::expr::eval(&t, r)).collect();
-                    let v = score_weighted(&pred, self.y, &[], Metric::Median, plan.nconst);
+                    let v = crate::metrics::score_weighted(
+                        &pred,
+                        self.y,
+                        &[],
+                        want.metric(),
+                        plan.nconst,
+                    );
                     per_trial.push(if v.is_finite() { Some(v) } else { None });
                 }
                 out.push(per_trial);
@@ -228,12 +252,12 @@ mod tests {
         }
     }
 
-    fn fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+    /// A smooth target with exact duplicates and a few gross outliers, so ties
+    /// and the rank structure of the statistic both matter.
+    pub(crate) fn fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
         let x: Vec<Vec<f64>> = (0..n)
             .map(|i| vec![-2.0 + 4.0 * i as f64 / (n - 1) as f64])
             .collect();
-        // A smooth target with exact duplicates and a few gross outliers, so
-        // ties and the median's rank structure both matter.
         let y: Vec<f64> = (0..n)
             .map(|i| {
                 if i % 5 == 2 {
@@ -248,36 +272,44 @@ mod tests {
         (x, y)
     }
 
-    fn tree() -> Node {
-        node(
+    /// `0.7·sin(0.6·x) + 0.1`: three constants, all in the ladder's path.
+    pub(crate) fn tree() -> Node {
+        crate::expr::node(
             Op::Add,
             vec![
-                node(
+                crate::expr::node(
                     Op::Mul,
                     vec![
-                        constant(0.7),
-                        node(Op::Sin, vec![node(Op::Mul, vec![constant(0.6), input(0)])]),
+                        crate::expr::constant(0.7),
+                        crate::expr::node(
+                            Op::Sin,
+                            vec![crate::expr::node(
+                                Op::Mul,
+                                vec![crate::expr::constant(0.6), crate::expr::input(0)],
+                            )],
+                        ),
                     ],
                 ),
-                constant(0.1),
+                crate::expr::constant(0.1),
             ],
         )
     }
 
-    fn plan_of(t: &Node) -> GpuFitPlan {
+    pub(crate) fn plan_of(t: &Node) -> GpuFitPlan {
         super::super::gpu_fit_plan_reason(t).expect("plan")
     }
 
-    fn constants_of(t: &Node) -> Vec<f64> {
-        let f = super::super::flatten(t);
-        let mut c = vec![0.0; f.nconst];
-        for i in 0..f.op.len() {
-            if f.cslot[i] >= 0 {
-                c[f.cslot[i] as usize] = f.val[i];
-            }
-        }
-        c
+    pub(crate) fn constants_of(t: &Node) -> Vec<f64> {
+        super::super::constants_slots(t)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    use crate::expr::constant;
+    use crate::metrics::score_weighted;
 
     /// The key rule (sort the `|r|` bit patterns, average the two middles for
     /// even `n`) is exactly `metrics::score_weighted(.., Median)`.
@@ -322,7 +354,13 @@ mod tests {
             x: &x,
             y: &y,
         };
-        let out = polish_median_batch(&mut scorer, &[&plan], &[plan.c0.clone()], 8)
+        let out = polish_order_stat_batch(
+            &mut scorer,
+            &[&plan],
+            &[plan.c0.clone()],
+            8,
+            OrderStat::Median,
+        )
             .expect("cpu scorer");
         assert_eq!(
             out.constants[0]
@@ -355,7 +393,13 @@ mod tests {
             x: &x,
             y: &y,
         };
-        let out = polish_median_batch(&mut scorer, &[&plan], &[plan.c0.clone()], 4)
+        let out = polish_order_stat_batch(
+            &mut scorer,
+            &[&plan],
+            &[plan.c0.clone()],
+            4,
+            OrderStat::Median,
+        )
             .expect("cpu scorer");
         // |pred − y| = 0.5, 2.5, 0.5, 2.5, 1.5, 5.5, 1.5, 2.5 -> sorted middles
         // 1.5 and 2.5 -> median 2.0. `3.5` is the median of the target, so no
@@ -380,7 +424,7 @@ mod tests {
             y: &y,
         };
         // `0` sweeps: the baseline score of the start, no ladder step.
-        let out = polish_median_batch(&mut scorer, &[&plan], &[vec![0.0]], 0).unwrap();
+        let out = polish_order_stat_batch(&mut scorer, &[&plan], &[vec![0.0]], 0, OrderStat::Median).unwrap();
         assert_eq!(out.scores[0], 0.5 * (2.0 + 3.0));
         // n = 5 residuals 1, 2, 3, 10, 11 -> middle 3.
         let x = vec![vec![0.0]; 5];
@@ -390,7 +434,7 @@ mod tests {
             x: &x,
             y: &y,
         };
-        let out = polish_median_batch(&mut scorer, &[&plan], &[vec![0.0]], 0).unwrap();
+        let out = polish_order_stat_batch(&mut scorer, &[&plan], &[vec![0.0]], 0, OrderStat::Median).unwrap();
         assert_eq!(out.scores[0], 3.0);
     }
 
@@ -398,18 +442,22 @@ mod tests {
     #[test]
     fn a_scorer_that_declines_reports_failure_instead_of_a_wrong_answer() {
         struct Decline;
-        impl MedianTrialScorer for Decline {
+        impl OrderStatTrialScorer for Decline {
             fn score_trials(
                 &mut self,
                 _: &[&GpuFitPlan],
                 _: &[Vec<Vec<f64>>],
+                _: OrderStat,
             ) -> Option<Vec<Vec<Option<f64>>>> {
                 None
             }
         }
         let t = tree();
         let plan = plan_of(&t);
-        assert!(polish_median_batch(&mut Decline, &[&plan], &[plan.c0.clone()], 4).is_none());
+        assert!(
+            polish_order_stat_batch(&mut Decline, &[&plan], &[plan.c0.clone()], 4, OrderStat::Median)
+                .is_none()
+        );
     }
 
     /// The same candidate three times in one batch reaches the same constants,
@@ -427,7 +475,7 @@ mod tests {
             };
             let plans: Vec<&GpuFitPlan> = vec![&plan; 3];
             let starts = vec![plan.c0.clone(); 3];
-            polish_median_batch(&mut scorer, &plans, &starts, 8)
+            polish_order_stat_batch(&mut scorer, &plans, &starts, 8, OrderStat::Median)
                 .unwrap()
                 .constants
                 .iter()
@@ -449,11 +497,12 @@ mod tests {
         let t = constant(1.0);
         let _ = (&x, &y, &t);
         struct NonFinite;
-        impl MedianTrialScorer for NonFinite {
+        impl OrderStatTrialScorer for NonFinite {
             fn score_trials(
                 &mut self,
                 plans: &[&GpuFitPlan],
                 trials: &[Vec<Vec<f64>>],
+                _: OrderStat,
             ) -> Option<Vec<Vec<Option<f64>>>> {
                 Some(
                     plans
@@ -465,7 +514,14 @@ mod tests {
             }
         }
         let plan = plan_of(&t);
-        let out = polish_median_batch(&mut NonFinite, &[&plan], &[plan.c0.clone()], 4).unwrap();
+        let out = polish_order_stat_batch(
+            &mut NonFinite,
+            &[&plan],
+            &[plan.c0.clone()],
+            4,
+            OrderStat::Median,
+        )
+        .unwrap();
         assert_eq!(out.constants[0], plan.c0);
         assert!(!out.scores[0].is_finite());
         assert!(!out.improved);

@@ -268,13 +268,16 @@ fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
         "rank_correlation",
         "rank_correlation_signed",
         "median",
+        // #232: the interquartile arm is the same device polish on the middle
+        // 50 % window mean, so the web front end accepts it too.
+        "interquartile",
     ] {
         assert!(
             gui::parse_web_args_for_test(&args(metric)).is_ok(),
             "--metric {metric} has a device fit objective and must be accepted"
         );
     }
-    for metric in ["log_loss", "interquartile"] {
+    for metric in ["log_loss"] {
         let err = gui::parse_web_args_for_test(&args(metric))
             .expect_err(&format!("--metric {metric} must be refused"));
         assert!(

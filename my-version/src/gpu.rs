@@ -657,10 +657,12 @@ extern "C" {
     /* #230 test hook: the cached target ranks, per row. */
     #[cfg(test)]
     fn rc_rank_debug_b(ctx: *mut RawCtx, out: *mut i64) -> i32;
-    /* #226: exact median absolute error of a batch of prediction vectors, one
-       `f64` per segment (set x trial), with a labelled status (0 ok, 2
-       non-finite). The selection is a segmented sort of the |r| bit patterns. */
-    fn rc_median_score_batch(
+    /* #226/#232: an exact order statistic of the absolute errors of a batch of
+       prediction vectors, one `f64` per segment (set x trial), with a labelled
+       status (0 ok, 2 non-finite). `what` selects the statistic: 0 = median,
+       1 = interquartile mean of ranks [n/4, 3n/4). The selection is a segmented
+       sort of the |r| bit patterns. */
+    fn rc_order_stat_score_batch(
         ctx: *mut RawCtx,
         prog: *const u32,
         off: *const u32,
@@ -669,7 +671,8 @@ extern "C" {
         ntrials: i32,
         kmax: i32,
         c0: *const f64,
-        out_median: *mut f64,
+        what: i32,
+        out_value: *mut f64,
         out_status: *mut i32,
     ) -> f32;
     /* #169: block width, dynamic shared bytes and constant cap of the fit-kernel
@@ -1473,23 +1476,51 @@ impl GpuEvaluator {
     const MEDIAN_WAVE_BYTES: u64 = 512 * 1024 * 1024;
 
     /// #226: exact median absolute error for `plans.len() * ntrials`
-    /// prediction vectors.
-    ///
-    /// `trials[k][t]` is candidate `k`'s trial `t`, in constant-slot order.
-    /// Returns `None` when the device declined (allocation, launch or a bad
-    /// shape); a segment whose prediction was not finite is reported as
-    /// `Some(None)`, which the caller maps to an inactive trial and the exact
-    /// CPU arm, never to a fabricated median.
-    ///
-    /// The value is the exact `f64` median of `|pred − y|` over the resident
-    /// rows: the device sorts the `u64` bit patterns of the absolute residuals
-    /// per segment (CUB `DeviceSegmentedRadixSort::SortKeys`) and averages the
-    /// two middle values for even `n`, which is what
-    /// [`crate::metrics::score_weighted`] reports for `median`.
+    /// prediction vectors (see [`Self::order_stat_score_trials`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn median_score_trials(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<f64>>>> {
+        self.order_stat_score_trials(plans, trials, crate::fit::OrderStat::Median)
+    }
+
+    /// #232: interquartile absolute error for `plans.len() * ntrials`
+    /// prediction vectors (see [`Self::order_stat_score_trials`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn interquartile_score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+    ) -> Option<Vec<Vec<Option<f64>>>> {
+        self.order_stat_score_trials(plans, trials, crate::fit::OrderStat::Interquartile)
+    }
+
+    /// #226/#232: an exact order statistic of the absolute errors for
+    /// `plans.len() * ntrials` prediction vectors.
+    ///
+    /// `trials[k][t]` is candidate `k`'s trial `t`, in constant-slot order;
+    /// `want` selects the statistic ([`crate::fit::OrderStat`]).
+    /// Returns `None` when the device declined (allocation, launch or a bad
+    /// shape); a segment whose prediction was not finite is reported as
+    /// `Some(None)`, which the caller maps to an inactive trial and the exact
+    /// CPU arm, never to a fabricated value.
+    ///
+    /// The device predicts in exact `f64` from the resident rows, sorts the
+    /// `u64` bit patterns of `|pred − y|` per segment (CUB
+    /// `DeviceSegmentedRadixSort::SortKeys`, which is stable) and then either
+    /// * `median`: averages the two middle values for even `n` — exactly what
+    ///   [`crate::metrics::score_weighted`] reports, bit for bit;
+    /// * `interquartile`: averages the sorted keys at ranks `[⌊n/4⌋, ⌊3n/4⌋)`
+    ///   (all rows below `n = 4`) with a fixed 256-thread tree reduction, which
+    ///   is the configured objective to `f64` rounding (`≤ 1e-12` relative),
+    ///   not bit for bit.
+    pub(crate) fn order_stat_score_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        want: crate::fit::OrderStat,
     ) -> Option<Vec<Vec<Option<f64>>>> {
         let nsets = plans.len();
         if nsets == 0 || trials.len() != nsets {
@@ -1545,7 +1576,7 @@ impl GpuEvaluator {
             let mut values = vec![f64::NAN; nsegs];
             let mut status = vec![0i32; nsegs];
             let ms = unsafe {
-                rc_median_score_batch(
+                rc_order_stat_score_batch(
                     self.ctx,
                     words.as_ptr(),
                     off.as_ptr(),
@@ -1554,6 +1585,7 @@ impl GpuEvaluator {
                     ntrials as i32,
                     kmax as i32,
                     c0.as_ptr(),
+                    want.device_code(),
                     values.as_mut_ptr(),
                     status.as_mut_ptr(),
                 )
@@ -1576,28 +1608,51 @@ impl GpuEvaluator {
     }
 
     /// #226: the squared LM warm start followed by the exact median polish, on
-    /// the device.
-    ///
-    /// This is the GPU counterpart of `fit_weighted_metric(.., Metric::Median)`
-    /// for the tail it can prove: the same squared start, the same ladder, the
-    /// same first-improver rule and the same exact `f64` median score. The
-    /// reported `sse` field carries that exact median (the configured
-    /// objective), never an SSE.
-    ///
-    /// A candidate whose polish cannot be scored, or whose prediction is not
-    /// finite, is reported with a non-zero status so the caller refits it with
-    /// the exact CPU arm and labels the fallback. `iters == 0` is a true no-op:
-    /// the incoming constants are returned unchanged with status 0.
+    /// the device (see [`Self::order_stat_fit_batch`]).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn median_fit_batch(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         iters: usize,
     ) -> (Vec<GpuFitOutput>, f32) {
+        self.order_stat_fit_batch(plans, iters, crate::fit::OrderStat::Median)
+    }
+
+    /// #232: the squared LM warm start followed by the exact interquartile
+    /// polish, on the device (see [`Self::order_stat_fit_batch`]).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn interquartile_fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+    ) -> (Vec<GpuFitOutput>, f32) {
+        self.order_stat_fit_batch(plans, iters, crate::fit::OrderStat::Interquartile)
+    }
+
+    /// #226/#232: the squared LM warm start followed by the exact order-
+    /// statistic polish, on the device.
+    ///
+    /// This is the GPU counterpart of `fit_weighted_metric(.., want.metric())`
+    /// for the tail it can prove: the same squared start, the same ladder, the
+    /// same first-improver rule and the same `f64` score (bit for bit for the
+    /// median, to f64 rounding for the interquartile mean). The reported `sse`
+    /// field carries that configured objective, never an SSE.
+    ///
+    /// A candidate whose polish cannot be scored, or whose prediction is not
+    /// finite, is reported with a non-zero status so the caller refits it with
+    /// the exact CPU arm and labels the fallback. `iters == 0` is a true no-op:
+    /// the incoming constants are returned unchanged with status 0.
+    pub(crate) fn order_stat_fit_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        iters: usize,
+        want: crate::fit::OrderStat,
+    ) -> (Vec<GpuFitOutput>, f32) {
         let incoming: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
         if iters == 0 {
-            // `--no-fit`: no LM step and no polish. The median of the incoming
-            // constants is still the exact objective, so the caller's gate can
-            // compare it with itself and accept nothing.
+            // `--no-fit`: no LM step and no polish. The statistic of the
+            // incoming constants is still the exact objective, so the caller's
+            // gate can compare it with itself and accept nothing.
             let out = incoming
                 .iter()
                 .map(|c| GpuFitOutput {
@@ -1621,9 +1676,19 @@ impl GpuEvaluator {
         let sub: Vec<&crate::fit::GpuFitPlan> = idx.iter().map(|&k| plans[k]).collect();
         let starts: Vec<Vec<f64>> = idx.iter().map(|&k| out[k].c.clone()).collect();
         let started = std::time::Instant::now();
-        let Some(res) = crate::fit::polish_median_batch(self, &sub, &starts, iters.max(1)) else {
+        let res = match want {
+            crate::fit::OrderStat::Median => {
+                crate::fit::polish_median_batch(self, &sub, &starts, iters.max(1))
+            }
+            crate::fit::OrderStat::Interquartile => {
+                crate::fit::polish_interquartile_batch(self, &sub, &starts, iters.max(1))
+            }
+        };
+        let Some(res) = res else {
             for &k in &idx {
-                out[k].status = 3; // the labelled `median_declined` fallback
+                // The labelled `median_declined` / `interquartile_declined`
+                // fallback; the caller names it from the status and the metric.
+                out[k].status = 3;
             }
             return (out, -1.0);
         };
@@ -1634,7 +1699,7 @@ impl GpuEvaluator {
             .iter()
             .map(|&k| vec![incoming[k].clone()])
             .collect();
-        let baseline = self.median_score_trials(&sub, &base_trials);
+        let baseline = self.order_stat_score_trials(&sub, &base_trials, want);
         let polish_ms = started.elapsed().as_secs_f32() * 1000.0;
         for (j, &k) in idx.iter().enumerate() {
             let c = &res.constants[j];
@@ -1665,15 +1730,16 @@ impl GpuEvaluator {
     }
 }
 
-/// #226: the device is the `MedianTrialScorer` the batched exact median polish
-/// drives.
-impl crate::fit::MedianTrialScorer for GpuEvaluator {
+/// #226/#232: the device is the `OrderStatTrialScorer` the batched exact
+/// median and interquartile polishes drive.
+impl crate::fit::OrderStatTrialScorer for GpuEvaluator {
     fn score_trials(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         trials: &[Vec<Vec<f64>>],
+        want: crate::fit::OrderStat,
     ) -> Option<Vec<Vec<Option<f64>>>> {
-        self.median_score_trials(plans, trials)
+        self.order_stat_score_trials(plans, trials, want)
     }
 }
 
@@ -5092,7 +5158,7 @@ mod rank_tests {
 
 /// #226: the exact median arm on the device.
 #[cfg(test)]
-mod median_tests {
+mod order_stat_tests {
     use super::*;
     use crate::expr::{constant, input, node};
     use crate::fit::{fit_weighted_metric, gpu_fit_plan_reason, refit_finalists_exact};
@@ -5157,8 +5223,8 @@ mod median_tests {
     }
 
     /// `a·x + b`: arithmetic-only, so the device's f64 forward sweep and
-    /// `expr::eval` agree to the last bit and the median values can be compared
-    /// exactly.
+    /// `expr::eval` agree to the last bit and the order statistics can be
+    /// compared exactly.
     fn affine() -> Node {
         node(
             Op::Add,
@@ -5167,8 +5233,17 @@ mod median_tests {
     }
 
     fn cpu_median(f: &Fixture, t: &Node) -> f64 {
+        cpu_metric(f, t, Metric::Median)
+    }
+
+    /// #232: the configured interquartile window mean of the same rows.
+    fn cpu_iqr(f: &Fixture, t: &Node) -> f64 {
+        cpu_metric(f, t, Metric::Interquartile)
+    }
+
+    fn cpu_metric(f: &Fixture, t: &Node, metric: Metric) -> f64 {
         let pred: Vec<f64> = f.x.iter().map(|r| crate::expr::eval(t, r)).collect();
-        score_weighted(&pred, &f.y, &[], Metric::Median, crate::expr::count_constants(t))
+        score_weighted(&pred, &f.y, &[], metric, crate::expr::count_constants(t))
     }
 
     /// The same tree with the plan's constant slots set to `c`.
@@ -5462,5 +5537,342 @@ mod median_tests {
         let via_cpu = fit_weighted_metric(&mut expect, &f.x, &f.y, &[], 8, Metric::Median);
         assert_eq!(via_cpu.to_bits(), after[0].to_bits());
         assert_eq!(constants_of(&tree), constants_of(&expect));
+    }
+
+    // -- #232: the interquartile arm ----------------------------------------
+
+    /// Relative agreement the interquartile score must meet. The device sums
+    /// the middle-50 % window with a fixed 256-thread tree reduction while the
+    /// CPU sums the sorted slice left to right, so the two differ by rounding;
+    /// `1e-12` relative is the tolerance `l1-quantile.md` §7 prescribes.
+    const IQR_REL_TOL: f64 = 1e-12;
+
+    fn close(a: f64, b: f64, rel: f64) -> bool {
+        let scale = a.abs().max(b.abs()).max(f64::MIN_POSITIVE);
+        (a - b).abs() <= rel * scale
+    }
+
+    /// The device interquartile mean is the configured metric for odd, even and
+    /// sub-window row counts, including a negative start and a zero column.
+    #[test]
+    fn the_device_interquartile_is_the_configured_metric() {
+        for n in [2usize, 3, 4, 5, 6, 7, 31, 32, 97, 128] {
+            let f = fixture(n);
+            let Some(mut ev) = evaluator(&f) else { return };
+            let t = affine();
+            let p = plan(&t);
+            for c in [
+                p.c0.clone(),
+                vec![0.0, 0.0],
+                vec![1.0, 0.5],
+                vec![-1.0, 2.0],
+                vec![12.0, -7.0],
+            ] {
+                let got = ev
+                    .interquartile_score_trials(&[&p], &[vec![c.clone()]])
+                    .expect("the device answered")[0][0]
+                    .expect("a finite prediction");
+                let want = cpu_iqr(&f, &with_constants(&t, &c));
+                assert!(
+                    close(got, want, IQR_REL_TOL),
+                    "n={n}, c={c:?}: device {got} vs CPU {want}"
+                );
+            }
+        }
+    }
+
+    /// A window boundary tie selects the same value as the CPU: ranks, not a
+    /// value interval. Residuals `1, 2, 3, 3` have window mean `2.5`; the
+    /// value-range shortcut would report `8/3`.
+    #[test]
+    fn a_top_boundary_tie_selects_the_rank_window_not_the_value_range() {
+        let n = 4usize;
+        let f = Fixture {
+            cols32: vec![0.0f32; n],
+            cols64: vec![0.0f64; n],
+            n,
+            nv: 1,
+            y32: vec![1.0f32, 2.0, 3.0, 3.0],
+            y: vec![1.0, 2.0, 3.0, 3.0],
+            x: vec![vec![0.0]; n],
+        };
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = node(Op::Mul, vec![constant(1.0), input(0)]);
+        let p = plan(&t);
+        let got = ev
+            .interquartile_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("the device answered")[0][0]
+            .expect("finite");
+        assert!(close(got, 2.5, IQR_REL_TOL), "got {got}");
+        assert!(!close(got, 8.0 / 3.0, 1e-9), "the value-range rule must not be used");
+        assert!(close(cpu_iqr(&f, &t), 2.5, 0.0), "the CPU reference is 2.5");
+    }
+
+    /// An entirely tied residual multiset (constant prediction, constant
+    /// target) selects exactly that value at every size, including `n < 4`
+    /// where the CPU arm averages all rows.
+    #[test]
+    fn entirely_tied_residuals_select_the_exact_window_mean() {
+        for n in [2usize, 3, 4, 5, 6, 7, 8, 9] {
+            let f = Fixture {
+                cols32: vec![0.0f32; n],
+                cols64: vec![0.0f64; n],
+                n,
+                nv: 1,
+                y32: vec![1.0f32; n],
+                y: vec![1.0f64; n],
+                x: vec![vec![0.0]; n],
+            };
+            let Some(mut ev) = evaluator(&f) else { return };
+            let t = node(Op::Mul, vec![constant(1.0), input(0)]);
+            let p = plan(&t);
+            let got = ev
+                .interquartile_score_trials(&[&p], &[vec![p.c0.clone()]])
+                .expect("the device answered")[0][0]
+                .expect("finite");
+            // pred = c0 * 0 = 0, y = 1 -> every |r| = 1.
+            assert_eq!(got, 1.0, "n={n}");
+        }
+    }
+
+    /// Results do not depend on how the batch is composed: alone, repeated, or
+    /// next to unrelated candidates and trials — bit for bit, because the
+    /// reduction order is fixed by the window and the thread count.
+    #[test]
+    fn interquartile_selection_is_deterministic_across_batch_composition() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = affine();
+        let p = plan(&t);
+        let c = vec![0.8, -0.2];
+        let alone = ev
+            .interquartile_score_trials(&[&p], &[vec![c.clone()]])
+            .expect("alone")[0][0]
+            .expect("finite");
+        let triples = ev
+            .interquartile_score_trials(&[&p], &[vec![c.clone(), p.c0.clone(), vec![0.0, 0.0]]])
+            .expect("three trials")[0][0]
+            .expect("finite");
+        assert_eq!(alone.to_bits(), triples.to_bits());
+        let batch = ev
+            .interquartile_score_trials(&[&p, &p], &[vec![vec![2.0, 2.0]], vec![c.clone()]])
+            .expect("mixed batch");
+        assert_eq!(batch[1][0].expect("finite").to_bits(), alone.to_bits());
+        let again = ev
+            .interquartile_score_trials(&[&p], &[vec![c.clone()]])
+            .expect("again")[0][0]
+            .expect("finite");
+        assert_eq!(again.to_bits(), alone.to_bits(), "repeated calls must agree");
+    }
+
+    /// A non-finite prediction is refused, never scored as a huge finite one.
+    #[test]
+    fn a_non_finite_prediction_is_not_an_interquartile_mean() {
+        let f = fixture(32);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let bad = node(
+            Op::Ln,
+            vec![node(
+                Op::Mul,
+                vec![constant(-1.0), node(Op::Add, vec![input(0), constant(1.0)])],
+            )],
+        );
+        let p = plan(&bad);
+        let Some(res) = ev.interquartile_score_trials(&[&p], &[vec![p.c0.clone()]]) else {
+            return; // a whole-call refusal is also correct
+        };
+        assert!(
+            res[0][0].is_none(),
+            "a non-finite prediction must not be scored"
+        );
+    }
+
+    /// The batched device polish commits the same ladder rungs as the exact CPU
+    /// `coordinate_polish` from the same start. The scores agree to the window
+    /// reduction's rounding, and the rungs are 1 % apart, so agreement at
+    /// `1e-9` relative identifies the same rung.
+    #[test]
+    fn the_device_interquartile_polish_matches_the_cpu_polish() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let start = affine();
+        let p = plan(&start);
+        for from in [p.c0.clone(), vec![1.0, 0.5], vec![-1.0, 2.0]] {
+            let batched = crate::fit::polish_interquartile_batch(
+                &mut ev,
+                &[&p],
+                std::slice::from_ref(&from),
+                8,
+            )
+            .expect("the device scorer answered");
+            let mut cpu = with_constants(&start, &from);
+            crate::fit::coordinate_polish(&mut cpu, &f.x, &f.y, &[], Metric::Interquartile, 8);
+            let device_c = &batched.constants[0];
+            let cpu_c = constants_of(&cpu);
+            for (a, b) in device_c.iter().zip(&cpu_c) {
+                assert!(
+                    close(*a, *b, 1e-9),
+                    "from {from:?}: device {device_c:?} vs CPU {cpu_c:?}"
+                );
+            }
+            assert!(
+                close(batched.scores[0], cpu_iqr(&f, &cpu), 1e-12),
+                "from {from:?}: score {} vs {}",
+                batched.scores[0],
+                cpu_iqr(&f, &cpu)
+            );
+        }
+    }
+
+    /// The full arm (squared start plus interquartile polish) is monotone in
+    /// the window mean of the constants it was given, and its reported value is
+    /// the exact CPU interquartile mean of the reported constants.
+    #[test]
+    fn the_device_arm_never_reports_a_worse_interquartile_than_its_start() {
+        let f = fixture(80);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = with_constants(&affine(), &[4.0, -3.0]);
+        let p = plan(&t);
+        let before = cpu_iqr(&f, &t);
+        let (out, ms) = ev.interquartile_fit_batch(&[&p], 8);
+        assert!(ms > 0.0, "the interquartile arm ran on the device");
+        assert_eq!(out[0].status, 0, "the fixture candidate is eligible");
+        assert!(out[0].sse <= before, "{} > {}", out[0].sse, before);
+        let reported = cpu_iqr(&f, &with_constants(&affine(), &out[0].c));
+        assert!(close(out[0].sse, reported, 1e-12), "{} vs {reported}", out[0].sse);
+        // The exact CPU finalist refit is the same arm and never worse.
+        let mut tree = with_constants(&affine(), &out[0].c);
+        let after = refit_finalists_exact(
+            std::slice::from_mut(&mut tree),
+            &f.x,
+            &f.y,
+            &[],
+            8,
+            Metric::Interquartile,
+        );
+        assert!(after[0] <= out[0].sse);
+        let mut expect = with_constants(&affine(), &out[0].c);
+        let via_cpu = fit_weighted_metric(&mut expect, &f.x, &f.y, &[], 8, Metric::Interquartile);
+        assert_eq!(via_cpu.to_bits(), after[0].to_bits());
+        assert_eq!(constants_of(&tree), constants_of(&expect));
+    }
+
+    /// A rank-deficient design is labelled ill-conditioned and handed to the
+    /// CPU; the interquartile arm never polishes from a singular start.
+    #[test]
+    fn an_ill_conditioned_interquartile_start_is_labelled() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = node(Op::Add, vec![constant(2.0), constant(1.0)]);
+        let p = plan(&t);
+        let (out, _) = ev.interquartile_fit_batch(&[&p], 8);
+        assert_eq!(
+            out[0].status, 1,
+            "the rank-deficient normal equations must be labelled"
+        );
+        assert_eq!(out[0].c, p.c0, "no constant may move on a declined start");
+    }
+
+    /// `--no-fit` never moves a constant through the interquartile arm.
+    #[test]
+    fn the_interquartile_arm_is_a_no_op_with_zero_iterations() {
+        let f = fixture(48);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = affine();
+        let p = plan(&t);
+        let (out, _) = ev.interquartile_fit_batch(&[&p], 0);
+        assert_eq!(out[0].status, 0);
+        assert_eq!(out[0].c, p.c0);
+    }
+
+    /// #232 measurement (ignored): the paired fit-stage timing the interquartile
+    /// cost model is calibrated with. For each `n` it times the exact CPU arm,
+    /// the CPU interquartile polish tail from the device's own warm start, the
+    /// device arm, and one six-trial scorer call. Run with
+    /// `cargo test --release --features cuda --lib order_stat_tests::bench_interquartile
+    /// -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "measurement: run explicitly with --ignored --nocapture"]
+    fn bench_interquartile_fit_stage() {
+        let ns: Vec<usize> = std::env::var("RCSR_BENCH_ROWS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|s| s.parse().ok()).collect())
+            .unwrap_or_else(|| vec![1_024, 2_048, 4_096, 10_000, 20_000, 50_000, 154_000]);
+        let reps: usize = std::env::var("RCSR_BENCH_REPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3);
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(1.2),
+                        node(
+                            Op::Sin,
+                            vec![node(Op::Mul, vec![constant(0.9), input(0)])],
+                        ),
+                    ],
+                ),
+                node(Op::Mul, vec![constant(0.3), input(0)]),
+            ],
+        );
+        println!(
+            "n\tcpu_fit_ms\tcpu_polish_ms\tgpu_fit_ms\tgpu_polish_ms\tgpu_call_ms\tcpu_polish/gpu_polish"
+        );
+        for n in ns {
+            let f = fixture(n);
+            let Some(mut ev) = evaluator(&f) else { return };
+            let p = plan(&tree);
+            let mut cpu_fit = f64::INFINITY;
+            let mut cpu_polish = f64::INFINITY;
+            let mut gpu_fit = f64::INFINITY;
+            let mut gpu_polish = f64::INFINITY;
+            let mut gpu_call = f64::INFINITY;
+            for _ in 0..reps.max(1) {
+                let mut cpu = tree.clone();
+                let t0 = std::time::Instant::now();
+                fit_weighted_metric(&mut cpu, &f.x, &f.y, &[], 8, Metric::Interquartile);
+                cpu_fit = cpu_fit.min(t0.elapsed().as_secs_f64() * 1000.0);
+                let (warm, _) = ev.fit_batch(&[&p], 8, crate::fit::DeviceLoss::Squared);
+                let warm_tree = with_constants(&tree, &warm[0].c);
+                let t0 = std::time::Instant::now();
+                let mut cpu_tail = warm_tree.clone();
+                crate::fit::coordinate_polish(
+                    &mut cpu_tail,
+                    &f.x,
+                    &f.y,
+                    &[],
+                    Metric::Interquartile,
+                    8,
+                );
+                cpu_polish = cpu_polish.min(t0.elapsed().as_secs_f64() * 1000.0);
+                let t0 = std::time::Instant::now();
+                let (_out, _) = ev.interquartile_fit_batch(&[&p], 8);
+                gpu_fit = gpu_fit.min(t0.elapsed().as_secs_f64() * 1000.0);
+                let t0 = std::time::Instant::now();
+                let _ = crate::fit::polish_interquartile_batch(
+                    &mut ev,
+                    &[&p],
+                    &[warm[0].c.clone()],
+                    8,
+                );
+                gpu_polish = gpu_polish.min(t0.elapsed().as_secs_f64() * 1000.0);
+                let mut trials = Vec::new();
+                for (mul, sign) in crate::fit::LADDER {
+                    let mut c = warm[0].c.clone();
+                    c[0] = c[0] + sign * mul * c[0].abs().max(1.0);
+                    trials.push(c);
+                }
+                let t0 = std::time::Instant::now();
+                let _ = ev.interquartile_score_trials(&[&p], &[trials]);
+                gpu_call = gpu_call.min(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!(
+                "{n}\t{cpu_fit:.2}\t{cpu_polish:.2}\t{gpu_fit:.2}\t{gpu_polish:.2}\t{gpu_call:.2}\t{:.2}",
+                cpu_polish / gpu_polish
+            );
+        }
     }
 }
