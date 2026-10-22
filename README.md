@@ -404,7 +404,10 @@ atomically instead of streaming it. See
   `rcsr schema` (`feature_registry`): every available column has a tested
   producer, and registered-but-unavailable market-state and
   derivative columns fail closed with the missing dependency instead of being
-  silently dropped. The CPU path is always available; a per-family cost model
+  silently dropped. The `engine_catalogue` block enumerates all 254 engine
+  names (216 in `all,py15m,ta:full,exotic:cheap,cross:btc` plus 38
+  compact-only names) with family, warm-up, availability, exact formula and the
+  explicit canonical mapping for every name shared by several groups. The CPU path is always available; a per-family cost model
   decides CPU vs GPU and records the reason, GPU builds upload the source
   columns once and report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the

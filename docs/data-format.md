@@ -495,12 +495,16 @@ documented in `docs/ohlcv.md`. A missing raw field needed by a requested flow
 column is an input error naming the field, never a zero-filled column.
 
 Every appended feature is part of the default financial feature registry printed
-by `rcsr schema` (`feature_registry`). The registry is the contract: each column
-records `family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
-`formula_sha256`, `source` and `pit`. Available columns have a tested
-implementation; unavailable columns name their missing data dependency and fail
-closed when requested. The compact 52-name profile is a regression subset of this
-registry, not a separate store format; see `docs/ohlcv.md`.
+by `rcsr schema` (`feature_registry`). `engine_catalogue` is the narrower
+machine-readable engine inventory: 216 names in
+`all,py15m,ta:full,exotic:cheap,cross:btc` plus the 38 compact-only engine names
+(254 total), each with its family, warm-up and exact formula. The registry is the
+contract: each column records `family`, `timeframe`, `warmup`, `available`,
+`derived`, `formula`, `formula_sha256`, `source` and `pit`. Available columns
+have a tested implementation; unavailable columns name their missing data
+dependency and fail closed when requested. The compact 52-name profile is a
+regression subset of this registry, not a separate store format; see
+`docs/ohlcv.md`.
 
 The multi-timeframe block is part of that contract: `--features mtf` appends all
 36 `mtf_<1h|4h|1d>_<leaf>` columns, each registered `available:true` with

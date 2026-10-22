@@ -514,30 +514,9 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             reason: None,
         });
     }
-    // Existing engine catalogue.
-    let mut engine: Vec<String> = expand("all").unwrap_or_default();
-    for n in py15m_names() {
-        if !engine.contains(&n) {
-            engine.push(n);
-        }
-    }
-    for g in [
-        "ta:core",
-        "ta:full",
-        "exotic:cheap",
-        "candle:geometry",
-        "cross:btc",
-        "calendar",
-    ] {
-        if let Ok(v) = features::expand(g) {
-            for n in v {
-                if !engine.contains(&n) {
-                    engine.push(n);
-                }
-            }
-        }
-    }
-    for name in engine {
+    // The complete engine feature-bucket inventory, including the compact
+    // engine names that no catalogue group emits (`r672`, `ma96`, ...).
+    for name in engine_names() {
         if out.iter().any(|x| x.name == name) {
             continue;
         }
@@ -547,9 +526,9 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: nominal_warmup(&name),
             available: true,
             derived: false,
-            formula: "see docs/ohlcv.md".to_string(),
+            formula: engine_formula(&name).to_string(),
             source: "ohlcv::Bar",
-            pit: "close of bar t; gaps are NaN",
+            pit: "close of bar t; trailing windows inclusive; gaps are NaN; no forward fill",
             reason: None,
             name,
         });
@@ -644,6 +623,58 @@ pub fn registry_json() -> String {
         })
         .collect();
     format!("[{}]", entries.join(","))
+}
+
+/// Names that appear in more than one engine group, mapped to the single
+/// implementation that wins regardless of the requesting group. This is the
+/// explicit alias/collision audit; a name never means two formulas.
+pub const CANONICAL_ENGINE_NAMES: &[(&str, &str)] = &[
+    ("rsi14", "compact"),
+    ("mfi14", "compact"),
+    ("cmf20", "compact"),
+    ("adx14", "compact"),
+    ("clv1", "compact"),
+    ("don96", "compact"),
+    ("macd_hist", "compact"),
+    ("vwap_dev96", "flow"),
+    ("obv_z96", "flow"),
+    ("taker_ratio96", "flow"),
+    ("taker_imb16", "flow"),
+    ("trade_intensity96", "flow"),
+    ("bb20_bw", "py15m/standalone (same formula)"),
+    ("natr14", "features/compact (same formula)"),
+];
+
+/// Machine-readable engine inventory for `rcsr schema`.
+pub fn engine_catalogue_json() -> String {
+    let names = engine_names();
+    let engine: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+    let reg = default_registry();
+    let entries: Vec<String> = engine
+        .iter()
+        .filter_map(|name| reg.iter().find(|e| e.name == *name))
+        .map(|e| {
+            format!(
+                "{{\"name\":{},\"family\":{},\"warmup\":{},\"available\":{},\"formula\":{}}}",
+                jstr(&e.name),
+                jstr(e.family),
+                e.warmup,
+                e.available,
+                jstr(&e.formula)
+            )
+        })
+        .collect();
+    let aliases: Vec<String> = CANONICAL_ENGINE_NAMES
+        .iter()
+        .map(|(n, source)| format!("{{\"name\":{},\"canonical\":{}}}", jstr(n), jstr(source)))
+        .collect();
+    format!(
+        "{{\"count\":{},\"catalogue_count\":{},\"names\":[{}],\"shared_names\":[{}]}}",
+        engine.len(),
+        catalogue_names().len(),
+        entries.join(","),
+        aliases.join(",")
+    )
 }
 
 pub fn is_compact(name: &str) -> bool {
@@ -803,6 +834,196 @@ pub fn py15m_names() -> Vec<String> {
     .iter()
     .map(|s| s.to_string())
     .collect()
+}
+
+/// The engine catalogue emitted by
+/// `--features all,py15m,ta:full,exotic:cheap,cross:btc`, in fixed group order,
+/// with duplicates kept once. This is the ~216-name engine bucket set.
+pub fn catalogue_names() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for group in ["all", "py15m", "ta:full", "exotic:cheap", "cross:btc"] {
+        if let Ok(names) = expand(group) {
+            for n in names {
+                if !out.contains(&n) {
+                    out.push(n);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The complete engine feature-bucket inventory: [`catalogue_names`] plus the
+/// compact engine columns that have no catalogue group (`r672`, `ma96`, ...).
+/// Each name here must have exactly one registry entry and one canonical
+/// producer.
+pub fn engine_names() -> Vec<String> {
+    let mut out = catalogue_names();
+    for n in compact_names() {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Exact formula for an engine name, independent of which group requested it.
+/// Compact names keep [`compact_formula`]; this table covers the catalogue names
+/// that are not in the compact subset.
+fn engine_formula(name: &str) -> &'static str {
+    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
+        return match k {
+            1 => "ln(C_t / C_{t-1})",
+            5 => "ln(C_t / C_{t-5})",
+            _ => "ln(C_t / C_{t-k}) over exactly k contiguous bars",
+        };
+    }
+    if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
+        let _ = w;
+        return "C_t / SMA_w(t) - 1, SMA_w trailing and contiguous";
+    }
+    if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
+        let _ = w;
+        return "population sd of 1-bar log returns over w contiguous bars";
+    }
+    if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
+        let _ = k;
+        return "r1 at t-k; NaN unless the two bars are exactly k steps apart";
+    }
+    if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
+        let _ = w;
+        return "(C_t - min L_w)/(max H_w - min L_w); don96 is centred by -1/2";
+    }
+    if let Some(rest) = name.strip_prefix("xs_rank_") {
+        return match rest {
+            "r1" => "per-timestamp rank of r1: (rank-1)/(n_finite-1)",
+            "r20" => "per-timestamp rank of r20: (rank-1)/(n_finite-1)",
+            "vol20" => "per-timestamp rank of vol20: (rank-1)/(n_finite-1)",
+            _ => "per-timestamp cross-sectional rank: (rank-1)/(n_finite-1)",
+        };
+    }
+    match name {
+        "atr14" => "Wilder ATR(14) in price units, seeded on the first 14 true ranges",
+        "natr14" => "100 * ATR14 / C_t",
+        "atr50" => "ATR50 / C_t (fractional, Python py15m definition)",
+        "bb20_z" => "(C_t - SMA20) / sd20, population sd",
+        "bb20_bw" => "4 * sd20 / SMA20",
+        "bb50" => "clip((C_t - SMA50)/(2 sd50), -1, 1)",
+        "bb50_bw" => "4 * sd50 / SMA50",
+        "vz96" => "(ln(1+V_t) - mean96(ln(1+V))) / sd96(ln(1+V))",
+        "range1" => "(H_t - L_t) / C_t",
+        "upper_wick1" => "(H_t - max(O_t,C_t)) / (H_t - L_t)",
+        "lower_wick1" => "(min(O_t,C_t) - L_t) / (H_t - L_t)",
+        "open_gap1" => "O_t / C_{t-1} - 1; NaN across a gap",
+        "dow_sin" | "dow_cos" => "sin/cos(2*pi*weekday/7), Monday=0, UTC",
+        "hour_sin" | "hour_cos" => "sin/cos(2*pi*seconds_into_day/86400), UTC",
+        "month_sin" | "month_cos" => "sin/cos(2*pi*(month-1)/12), UTC",
+        "dom_sin" | "dom_cos" => "sin/cos(2*pi*(day_of_month-1)/days_in_month), UTC",
+        "ema8" | "ema20" | "ema50" | "ema100" | "ema200" => {
+            "C_t / EMA_span(t) - 1, EMA seeded and restarted after a gap"
+        }
+        "macd" => "EMA12/EMA26 - 1",
+        "macd_sig" => "EMA9 of macd",
+        "macd_hist" => "macd - EMA9(macd)",
+        "rsi6" => "RSI6/50 - 1",
+        "rsi28" => "RSI28/50 - 1",
+        "stoch_k" => "clip((C_t-min L14)/(max H14-min L14)-1/2, -1/2, 1/2)",
+        "stoch_d" => "mean3(stoch_k)",
+        "adx14" => "ADX14/100",
+        "di_plus" => "PDI14/100",
+        "di_minus" => "MDI14/100",
+        "obv_z96" => "z-score of OBV over 96; OBV_t=OBV_{t-1}+sign(dC)V_t",
+        "vwap_dev96" => "(C_t - VWAP96)/VWAP96, VWAP96=mean(quote_volume,96)/mean(volume,96)",
+        "park16" => "sqrt(mean(log(H/L)^2,16)/(4 ln 2))",
+        "gk16" => "sqrt(max(0.5 mean(log(H/L)^2,16) - (2 ln2 -1) mean(log(C/O)^2,16)))",
+        "skew96" | "kurt96" => "third/fourth population moment of 1-bar log returns over 96",
+        "r192" => "ln(C_t / C_{t-192}) over exactly 192 contiguous bars",
+        "mkt_r16" => "benchmark r16 at the same timestamp",
+        "mkt_r96" => "benchmark r96 at the same timestamp",
+        "mkt_vol96" => "benchmark vol96 at the same timestamp",
+        "rel_r16" => "r16 - benchmark r16 at the same timestamp",
+        "rel_r96" => "r96 - benchmark r96 at the same timestamp",
+        "btc_r1" => "benchmark 1-bar log return at the same timestamp",
+        "btc_r20" => "benchmark 20-bar log return at the same timestamp",
+        "btc_vol20" => "benchmark population sd of 1-bar log returns over 20",
+        "rel_btc_r1" => "r1 - benchmark r1",
+        "rel_btc_r20" => "r20 - benchmark r20",
+        "beta_btc_60" => "cov(r_self,r_benchmark,60)/var(r_benchmark,60)",
+        "cross_ret1" => "benchmark 1-bar log return at the same timestamp",
+        "cross_beta20" => "cov(r_self,r_benchmark,20)/var(r_benchmark,20)",
+        "ret1" => "ln(C_t / C_{t-1}); NaN across a gap",
+        "ret5" => "ln(C_t / C_{t-5}) over exactly 5 contiguous bars",
+        "ma20_ratio" | "ma60_ratio" => "C_t / SMA_w(t) - 1, w=20 or 60",
+        "vol20_ratio" => "V_t / mean20(V)",
+        "vwap20_dev" => "(C_t - VWAP20)/VWAP20, VWAP20=sum(quote_volume,20)/sum(volume,20)",
+        "rmean5" => "mean of the last 5 one-bar log returns",
+        "rstd5" => "population sd of the last 5 one-bar log returns",
+        "skew20" | "kurt20" => "third/fourth population moment of 1-bar log returns over 20",
+        "close_pos20" => "(C_t - min L20)/(max H20 - min L20)",
+        "di_diff14" => "(PDI14 - MDI14)/100",
+        "batr" => "(C_t - O_t)/ATR14",
+        "gapatr" => "(O_t - C_{t-1})/ATR14",
+        "volrat" => "ATR16/ATR96",
+        "bb96" => "clip((C_t - SMA96)/(2 sd96), -1, 1)",
+        "bb_width96" => "4 sd96 / SMA96",
+        _ => "see docs/ohlcv.md",
+    }
+}
+
+/// Nominal warm-up for an engine catalogue name. Compact names use
+/// [`compact_warmup`] so the reference profile stays authoritative.
+fn engine_warmup(name: &str) -> usize {
+    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
+        return k;
+    }
+    if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
+        return w.saturating_sub(1);
+    }
+    if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
+        return w;
+    }
+    if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
+        return k;
+    }
+    if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
+        return w.saturating_sub(1);
+    }
+    match name {
+        "ret1" => 1,
+        "ret5" => 5,
+        "ma20_ratio" => 19,
+        "ma60_ratio" => 59,
+        "vol20_ratio" => 19,
+        "bb20_z" | "bb20_bw" => 19,
+        "bb50" | "bb50_bw" => 49,
+        "vz96" => 95,
+        "range1" | "upper_wick1" | "lower_wick1" | "open_gap1" => 0,
+        "atr14" | "natr14" | "di_plus" | "di_minus" | "adx14" => 14,
+        "atr50" => 50,
+        "rsi6" => 6,
+        "rsi28" => 28,
+        "stoch_k" | "stoch_d" => 13,
+        "ema8" | "ema20" | "ema50" | "ema100" | "ema200" | "macd" | "macd_sig"
+        | "macd_hist" => 0,
+        "obv_z96" | "vwap_dev96" => 95,
+        "park16" | "gk16" => 15,
+        "skew96" | "kurt96" => 96,
+        "r192" => 192,
+        "mkt_r16" | "rel_r16" => 16,
+        "mkt_r96" | "rel_r96" | "mkt_vol96" => 96,
+        "btc_r1" | "cross_ret1" => 1,
+        "btc_r20" | "btc_vol20" | "rel_btc_r20" | "cross_beta20" => 20,
+        "rel_btc_r1" => 1,
+        "beta_btc_60" => 59,
+        "xs_rank_r1" => 1,
+        "xs_rank_r20" | "xs_rank_vol20" => 20,
+        "vwap20_dev" | "close_pos20" => 19,
+        "rmean5" | "rstd5" => 5,
+        "skew20" | "kurt20" => 20,
+        "dow_sin" | "dow_cos" | "hour_sin" | "hour_cos" | "month_sin" | "month_cos"
+        | "dom_sin" | "dom_cos" => 0,
+        _ => 0,
+    }
 }
 
 /// Expand a comma-separated catalogue specification.
@@ -1000,48 +1221,7 @@ pub fn nominal_warmup(name: &str) -> usize {
     if let Some(w) = compact_warmup(name) {
         return w;
     }
-    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
-        return k;
-    }
-    if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        return w.saturating_sub(1);
-    }
-    if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
-        return w;
-    }
-    if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
-        return k;
-    }
-    if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
-        return w.saturating_sub(1);
-    }
-    match name {
-        "atr14" | "natr14" => 14,
-        "rsi14" => 14,
-        "bb20_z" | "bb20_bw" => 19,
-        "vz96" => 95,
-        "range1" | "clv1" | "body1" | "upper_wick1" | "lower_wick1" | "open_gap1" => 0,
-        "dow_sin" | "dow_cos" | "hour_sin" | "hour_cos" | "month_sin" | "month_cos"
-        | "dom_sin" | "dom_cos" => 0,
-        "beta_btc_60" => 59,
-        "btc_r20" | "rel_btc_r20" | "btc_vol20" => 20,
-        "ema8" | "macd" | "macd_sig" | "macd_hist" => 0,
-        "ema20" => 0,
-        "ema50" => 0,
-        "ema100" => 0,
-        "ema200" => 0,
-        "rsi6" => 6,
-        "rsi28" => 28,
-        "bb50" | "bb50_bw" => 49,
-        "atr50" => 50,
-        "stoch_k" | "stoch_d" => 13,
-        "adx14" | "di_plus" | "di_minus" => 14,
-        "obv_z96" | "vwap_dev96" => 95,
-        "park16" | "gk16" => 15,
-        "skew96" | "kurt96" => 96,
-        "r192" => 192,
-        _ => 0,
-    }
+    engine_warmup(name)
 }
 
 // ---------------------------------------------------------------------------
@@ -1487,6 +1667,13 @@ pub fn family_of(name: &str) -> &'static str {
     }
     if is_mtf(name) {
         return "mtf";
+    }
+    match name {
+        "ret1" | "ret5" => return "returns",
+        "rmean5" | "rstd5" | "close_pos20" => return "exotic",
+        "vwap20_dev" => return "flow",
+        "rel_r16" | "rel_r96" => return "btc",
+        _ => {}
     }
     if name.starts_with("r") && name[1..].parse::<usize>().is_ok() {
         "returns"
@@ -2259,7 +2446,10 @@ fn rsi_py(close: &[f64], period: usize, gap: &[bool]) -> Vec<f64> {
     let n = close.len();
     let mut d = vec![0.0f64; n];
     for i in 1..n {
-        if close[i].is_finite() && close[i - 1].is_finite() {
+        if gap.get(i).copied().unwrap_or(false) {
+            // The close-to-close move spans the hole; it is missing, not zero.
+            d[i] = f64::NAN;
+        } else if close[i].is_finite() && close[i - 1].is_finite() {
             d[i] = close[i] - close[i - 1];
         }
     }
@@ -3029,6 +3219,12 @@ fn py15m_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>> 
     let mut pdm = vec![0.0f64; n];
     let mut mdm = vec![0.0f64; n];
     for i in 1..n {
+        if times[i] - times[i - 1] != step {
+            // Directional movement across a hole is missing, not zero.
+            pdm[i] = f64::NAN;
+            mdm[i] = f64::NAN;
+            continue;
+        }
         let up = h[i] - h[i - 1];
         let dn = l[i - 1] - l[i];
         if up > dn && up > 0.0 {
@@ -3868,6 +4064,8 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
     let mut mdm = vec![0.0f64; n];
     for i in 1..n {
         if times[i] - times[i - 1] != step {
+            pdm[i] = f64::NAN;
+            mdm[i] = f64::NAN;
             continue;
         }
         let up = h[i] - h[i - 1];
@@ -3928,6 +4126,8 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
     let mut neg = vec![0.0f64; n];
     for i in 1..n {
         if times[i] - times[i - 1] != step {
+            pos[i] = f64::NAN;
+            neg[i] = f64::NAN;
             continue;
         }
         if tp[i] > tp[i - 1] {
@@ -5878,12 +6078,15 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
 
   The default financial feature set is the union of the groups above, the
   compact subset, the raw OHLCV/flow fields and the registered multi-timeframe,
-  cross-sectional market-state and reserved derivative columns. `rcsr schema`
-  prints the registry; a registered-but-unavailable name fails closed with the
-  missing data dependency instead of being silently dropped. All 36
-  multi-timeframe columns are `available:true`; market-state columns are
-  `available:false` until their passes land; derivative columns have no local
-  snapshot and are `available:false` with source null.
+  cross-sectional market-state and reserved derivative columns. The engine
+  inventory has 254 names: 216 in `all,py15m,ta:full,exotic:cheap,cross:btc`
+  plus 38 compact-only engine names. `rcsr schema` prints `engine_catalogue`
+  (name, family, warm-up, availability, exact formula and the canonical
+  shared-name map) and `feature_registry`; a registered-but-unavailable name
+  fails closed with the missing data dependency instead of being silently
+  dropped. All 36 multi-timeframe columns are `available:true`; market-state
+  columns are `available:false` until their passes land; derivative columns have
+  no local snapshot and are `available:false` with source null.
 
   Flow and compact flow features read the raw `volume`, `quote_volume`,
   `trades` and `taker_buy_base` (alias `taker_buy`) fields. A missing raw field
