@@ -666,7 +666,7 @@ impl GpuSearch {
     /// non-finite — is refit by the exact CPU f64 arm, seeded with whatever
     /// constants the kernel produced. Each CPU fallback is labelled by cause
     /// (`unsupported_plan`, `too_few_rows`, `too_many_constants`,
-    /// `ill_conditioned`, `non_finite`, `launch`).
+    /// `metric_unsupported`, `ill_conditioned`, `non_finite`, `launch`).
     fn fit_pending(
         &mut self,
         islands: &mut [Vec<Ind>],
@@ -677,7 +677,15 @@ impl GpuSearch {
     ) {
         let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
+        // #224: the kernel minimises the configured metric exactly (SSE or
+        // correlation). A metric it cannot score is a labelled fallback, never
+        // a silent SSE substitution.
+        let gpu_metric = crate::gpu::GpuFitMetric::for_metric(cfg.metric);
         for &(i, j) in admitted {
+            if gpu_metric.is_none() {
+                fallbacks.push((i, j, FitFallbackCause::MetricUnsupported));
+                continue;
+            }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
                 Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
                 Ok(_) => fallbacks.push((i, j, FitFallbackCause::TooFewRows)),
@@ -697,7 +705,11 @@ impl GpuSearch {
 
         if !jobs.is_empty() {
             let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
-            let (out, ms) = self.ev.fit_batch(&plans, cfg.fit_iters);
+            let (out, ms) = self.ev.fit_batch(
+                &plans,
+                cfg.fit_iters,
+                gpu_metric.expect("jobs imply a metric"),
+            );
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
             }
@@ -1882,14 +1894,17 @@ pub enum FitFallbackCause {
     NonFinite,
     /// The CUDA fit launch failed; the whole batch went to the CPU.
     Launch,
+    /// #224: the configured metric has no exact device fit objective.
+    MetricUnsupported,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 6] = [
+    pub const ALL: [FitFallbackCause; 7] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
+        FitFallbackCause::MetricUnsupported,
         FitFallbackCause::IllConditioned,
         FitFallbackCause::NonFinite,
         FitFallbackCause::Launch,
@@ -1901,6 +1916,7 @@ impl FitFallbackCause {
             FitFallbackCause::UnsupportedPlan => "unsupported_plan",
             FitFallbackCause::TooFewRows => "too_few_rows",
             FitFallbackCause::TooManyConstants => "too_many_constants",
+            FitFallbackCause::MetricUnsupported => "metric_unsupported",
             FitFallbackCause::IllConditioned => "ill_conditioned",
             FitFallbackCause::NonFinite => "non_finite",
             FitFallbackCause::Launch => "launch",
@@ -2020,7 +2036,12 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
         && cfg.fit_iters > 0
         && matches!(
             cfg.metric,
-            Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic
+            Metric::Squared
+                | Metric::Aic
+                | Metric::Aicc
+                | Metric::Bic
+                | Metric::Correlation
+                | Metric::CorrelationSigned
         )
 }
 
@@ -4963,6 +4984,7 @@ mod tests {
                 "unsupported_plan",
                 "too_few_rows",
                 "too_many_constants",
+                "metric_unsupported",
                 "ill_conditioned",
                 "non_finite",
                 "launch",

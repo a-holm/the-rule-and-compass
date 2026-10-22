@@ -224,6 +224,7 @@ impl BatchedFitter for FakeGpu {
         _: &[f64],
         _: &[f64],
         _: usize,
+        _: rcsr::metrics::Metric,
     ) -> Vec<Option<Vec<f64>>> {
         trees.iter().map(|_| self.0.clone()).collect()
     }
@@ -235,15 +236,15 @@ fn gpu_verifier_accepts_good_and_rejects_bad_proposals() {
     let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 3.0).collect();
 
     let mut good = vec![affine()];
-    let out = fit_batch_verified(&FakeGpu(Some(vec![2.0, 3.0])), &mut good, &x, &y, &[], 8);
+    let out = fit_batch_verified(&FakeGpu(Some(vec![2.0, 3.0])), &mut good, &x, &y, &[], 8, rcsr::metrics::Metric::Squared);
     assert_eq!(out.status, vec![BatchStatus::Gpu]);
 
     for bad in [Some(vec![f64::NAN, 3.0]), Some(vec![2.0]), None] {
         let mut gpu = vec![affine()];
-        let out = fit_batch_verified(&FakeGpu(bad), &mut gpu, &x, &y, &[], 8);
+        let out = fit_batch_verified(&FakeGpu(bad), &mut gpu, &x, &y, &[], 8, rcsr::metrics::Metric::Squared);
         let mut cpu = affine();
         let reference = fit_weighted(&mut cpu, &x, &y, &[], 8);
-        assert_eq!(out.sse[0].to_bits(), reference.to_bits());
+        assert_eq!(out.score[0].to_bits(), reference.to_bits());
         assert_eq!(fitted(&gpu[0]), fitted(&cpu));
     }
 }

@@ -249,8 +249,21 @@ is mathematically well posed:
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
 | `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
-| `correlation`, `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
+| `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
+
+The correlation family is no longer a squared fit plus polish. For
+`ρ = S_fy / √(S_ff·S_yy)` the fit uses the exact gradient
+`∂ρ/∂c_j = B_j/√(S_ff S_yy) − ρ·A_j/S_ff` and the `y`-free Gauss–Newton matrix
+`H_jk = (C_jk − A_j A_k/S_ff)/S_ff` (issue #224). A free `a·T+b` pair is an
+exact two-dimensional null space; the outer pair is frozen at `a = ±1, b = 0`,
+which removes it without losing a shape direction. A tree affine in every
+constant uses the closed-form weighted least-squares optimum (the rank-one GEVP),
+and a constant prediction or target scores exactly the metric's worst value
+`1.0`, matching `metrics::correlation`. The remaining polish metrics are
+monotone too: the squared pre-fit runs on a clone, so a polish that finds no
+improvement keeps the incoming constants.
 
 Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
 and writes a trial back only when the configured loss improves. `squared`

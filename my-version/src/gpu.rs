@@ -627,6 +627,8 @@ extern "C" {
         nprog: i32,
         kmax: i32,
         c0: *const f64,
+        gauge: *const i32,
+        metric: i32,
         iters: i32,
         outc: *mut f64,
         outsse: *mut f64,
@@ -647,10 +649,47 @@ extern "C" {
 pub struct GpuFitOutput {
     /// Fitted constants (exact slots, length is the candidate's `p`).
     pub c: Vec<f64>,
-    /// The kernel's final SSE (recomputed exactly on the CPU for finalists).
-    pub sse: f64,
+    /// The kernel's final value of the configured objective: SSE for the
+    /// squared family, `1 - |rho|` or `1 - rho` for correlation. The host
+    /// still recomputes it exactly in f64 before accepting a proposal.
+    pub score: f64,
     /// `0` usable; `1` ill-conditioned/rank-deficient; `2` non-finite row.
     pub status: i32,
+}
+
+/// #224: the objective the batched fit kernel minimises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GpuFitMetric {
+    /// The historical weighted SSE kernel.
+    Squared,
+    /// `1 - |rho|`.
+    Correlation,
+    /// `1 - rho`.
+    CorrelationSigned,
+}
+
+impl GpuFitMetric {
+    /// Map the configured metric to a kernel mode, or `None` when the device
+    /// has no exact scorer for it (the caller then labels `metric_unsupported`).
+    pub(crate) fn for_metric(metric: crate::metrics::Metric) -> Option<Self> {
+        match metric {
+            crate::metrics::Metric::Squared
+            | crate::metrics::Metric::Aic
+            | crate::metrics::Metric::Aicc
+            | crate::metrics::Metric::Bic => Some(GpuFitMetric::Squared),
+            crate::metrics::Metric::Correlation => Some(GpuFitMetric::Correlation),
+            crate::metrics::Metric::CorrelationSigned => Some(GpuFitMetric::CorrelationSigned),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> i32 {
+        match self {
+            GpuFitMetric::Squared => 0,
+            GpuFitMetric::Correlation => 1,
+            GpuFitMetric::CorrelationSigned => 2,
+        }
+    }
 }
 
 /// #169: the fit-kernel instantiation that owns a batch whose largest constant
@@ -1126,6 +1165,7 @@ impl GpuEvaluator {
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         iters: usize,
+        metric: GpuFitMetric,
     ) -> (Vec<GpuFitOutput>, f32) {
         let nprog = plans.len();
         if nprog == 0 {
@@ -1139,12 +1179,14 @@ impl GpuEvaluator {
         let mut off: Vec<u32> = Vec::with_capacity(nprog + 1);
         let mut pcount: Vec<i32> = Vec::with_capacity(nprog);
         let mut c0 = vec![0.0f64; nprog * kmax];
+        let mut gauge = vec![-1i32; nprog * 2];
         off.push(0);
         for (k, plan) in plans.iter().enumerate() {
             words.extend_from_slice(&plan.words);
             off.push(words.len() as u32);
             pcount.push(plan.nconst as i32);
             c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+            gauge[k * 2..k * 2 + 2].copy_from_slice(&plan.gauge);
         }
         let mut outc = vec![0.0f64; nprog * kmax];
         let mut outsse = vec![0.0f64; nprog];
@@ -1158,6 +1200,8 @@ impl GpuEvaluator {
                 nprog as i32,
                 kmax as i32,
                 c0.as_ptr(),
+                gauge.as_ptr(),
+                metric.code(),
                 iters as i32,
                 outc.as_mut_ptr(),
                 outsse.as_mut_ptr(),
@@ -1172,7 +1216,7 @@ impl GpuEvaluator {
             .enumerate()
             .map(|(k, plan)| GpuFitOutput {
                 c: outc[k * kmax..k * kmax + plan.nconst].to_vec(),
-                sse: outsse[k],
+                score: outsse[k],
                 status: outstatus[k],
             })
             .collect();
@@ -2525,6 +2569,310 @@ mod fit_tests {
         tree
     }
 
+    fn correlation_fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![-3.0 + 6.0 * i as f64 / (n - 1) as f64])
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let noise = (((i * 29) % 13) as f64 - 6.0) * 1e-4;
+                1.6 * (0.7 * r[0]).sin() + 0.35 * r[0] + 0.2 + noise
+            })
+            .collect();
+        (x, y)
+    }
+
+    fn corr_model() -> Node {
+        node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.8),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.1), input(0)])]),
+                    ],
+                ),
+                constant(0.25),
+            ],
+        )
+    }
+
+    fn exact_corr(tree: &Node, x: &[Vec<f64>], y: &[f64]) -> f64 {
+        let pred: Vec<f64> = x.iter().map(|r| eval(tree, r)).collect();
+        crate::metrics::score_weighted(&pred, y, &[], crate::metrics::Metric::Correlation, 0)
+    }
+
+    /// #224: the kernel minimises `1 - |rho|`, freezes and renormalises the
+    /// affine gauge, and is deterministic for a fixed device and seed. The
+    /// exact CPU f64 score is the reference; the GPU proposal must not lose to
+    /// the CPU correlation fit on this well-conditioned fixture.
+    #[test]
+    fn gpu_correlation_fit_matches_the_cpu_objective() {
+        let n = 600usize;
+        let (x, y) = correlation_fixture(n);
+        let cols: Vec<f32> = x.iter().map(|r| r[0] as f32).collect();
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        assert!(ev.set_fit_data(&cols64, &y), "f64 fit rows uploaded");
+
+        let mut gpu_tree = corr_model();
+        let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("correlation plan");
+        assert_eq!(plan.gauge, [0, 2], "outer a*T+b pair");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Correlation);
+        assert!(ms >= 0.0, "correlation kernel ran");
+        let res = &out[0];
+        assert_eq!(res.status, 0, "well-conditioned correlation fixture");
+        plan.apply(&mut gpu_tree, &res.c);
+        // The gauge is canonical: a = +-1 and b = 0.
+        assert!(res.c[0] == 1.0 || res.c[0] == -1.0, "scale={}", res.c[0]);
+        assert_eq!(res.c[2], 0.0, "offset={}", res.c[2]);
+        let gpu_score = exact_corr(&gpu_tree, &x, &y);
+
+        let mut cpu_tree = corr_model();
+        let cpu_score = crate::fit::fit_weighted_metric(
+            &mut cpu_tree,
+            &x,
+            &y,
+            &[],
+            8,
+            crate::metrics::Metric::Correlation,
+        );
+        assert!(
+            gpu_score <= cpu_score + 1e-6,
+            "GPU {gpu_score} must match the CPU correlation fit {cpu_score}"
+        );
+
+        // Determinism: the same device, batch and constants twice.
+        let (again, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Correlation);
+        assert_eq!(
+            again[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            res.c.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(again[0].score.to_bits(), res.score.to_bits());
+    }
+
+    #[test]
+    fn gpu_signed_correlation_never_worsens_the_start() {
+        let n = 500usize;
+        let (x, _) = correlation_fixture(n);
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| -(1.4 * (0.9 * r[0]).sin() + 0.2))
+            .collect();
+        let cols: Vec<f32> = x.iter().map(|r| r[0] as f32).collect();
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        assert!(ev.set_fit_data(&cols64, &y));
+        let tree = corr_model();
+        let start = {
+            let pred: Vec<f64> = x.iter().map(|r| eval(&tree, r)).collect();
+            crate::metrics::score_weighted(&pred, &y, &[], crate::metrics::Metric::CorrelationSigned, 0)
+        };
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::CorrelationSigned);
+        assert_eq!(out[0].status, 0);
+        let mut fitted = tree;
+        plan.apply(&mut fitted, &out[0].c);
+        let got = {
+            let pred: Vec<f64> = x.iter().map(|r| eval(&fitted, r)).collect();
+            crate::metrics::score_weighted(&pred, &y, &[], crate::metrics::Metric::CorrelationSigned, 0)
+        };
+        assert!(got <= start + 1e-6, "signed GPU {got} from {start}");
+    }
+
+    /// #224 paired measurement (ignored): the historical CPU correlation fit
+    /// (squared LM + coordinate polish) against the batched GPU correlation
+    /// kernel on the same rows and starting constants. Run with
+    /// `cargo test --release --features cuda --lib bench_correlation_fit_paired -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_correlation_fit_paired() {
+        let n = 50_000usize;
+        let (x, y) = correlation_fixture(n);
+        let cols: Vec<f32> = x.iter().map(|r| r[0] as f32).collect();
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU benchmark: no usable device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        ev.set_fit_data(&cols64, &y);
+        let candidates = 64usize;
+        let starts: Vec<f64> = (0..candidates)
+            .map(|k| 0.4 + 1.6 * k as f64 / candidates as f64)
+            .collect();
+
+        let t0 = std::time::Instant::now();
+        let mut cpu_scores = Vec::with_capacity(candidates);
+        let mut start_scores = Vec::with_capacity(candidates);
+        for &b in &starts {
+            let mut t = node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.8),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(b), input(0)])]),
+                        ],
+                    ),
+                    constant(0.25),
+                ],
+            );
+            let start = t.clone();
+            let start_pred: Vec<f64> = x.iter().map(|r| eval(&start, r)).collect();
+            start_scores.push(crate::metrics::score_weighted(
+                &start_pred,
+                &y,
+                &[],
+                crate::metrics::Metric::Correlation,
+                0,
+            ));
+            cpu_scores.push(crate::fit::fit_weighted_metric(
+                &mut t,
+                &x,
+                &y,
+                &[],
+                8,
+                crate::metrics::Metric::Correlation,
+            ));
+        }
+        let cpu = t0.elapsed().as_secs_f64();
+
+        let plans: Vec<crate::fit::GpuFitPlan> = starts
+            .iter()
+            .map(|&b| {
+                crate::fit::gpu_fit_plan(&node(
+                    Op::Add,
+                    vec![
+                        node(
+                            Op::Mul,
+                            vec![
+                                constant(0.8),
+                                node(Op::Sin, vec![node(Op::Mul, vec![constant(b), input(0)])]),
+                            ],
+                        ),
+                        constant(0.25),
+                    ],
+                ))
+                .expect("plan")
+            })
+            .collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let t1 = std::time::Instant::now();
+        let (out, kernel_ms) = ev.fit_batch(&refs, 8, GpuFitMetric::Correlation);
+        let gpu = t1.elapsed().as_secs_f64();
+        let mut gpu_scores = Vec::with_capacity(candidates);
+        let mut fallbacks = 0usize;
+        let mut wins = 0usize;
+        let mut accepted = 0usize;
+        let mut deltas: Vec<f64> = Vec::new();
+        for (k, res) in out.iter().enumerate() {
+            if res.status != 0 {
+                fallbacks += 1;
+                gpu_scores.push(f64::INFINITY);
+                continue;
+            }
+            let mut t = node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.8),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(starts[k]), input(0)])]),
+                        ],
+                    ),
+                    constant(0.25),
+                ],
+            );
+            plans[k].apply(&mut t, &res.c);
+            let pred: Vec<f64> = x.iter().map(|r| eval(&t, r)).collect();
+            let s = crate::metrics::score_weighted(
+                &pred,
+                &y,
+                &[],
+                crate::metrics::Metric::Correlation,
+                0,
+            );
+            if s <= start_scores[k] + 1e-9 {
+                accepted += 1;
+            }
+            deltas.push(s - cpu_scores[k]);
+            if s <= cpu_scores[k] + 1e-6 {
+                wins += 1;
+            }
+            gpu_scores.push(s);
+        }
+        deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let median = deltas.get(deltas.len() / 2).copied().unwrap_or(f64::NAN);
+        let worst = deltas.last().copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "correlation fit paired: N={n} P={candidates} p=3 cpu={cpu:.3}s gpu={gpu:.3}s kernel={kernel_ms:.1}ms speedup={:.1}x fallbacks={fallbacks} accepted={accepted}/{candidates} gpu<=cpu+1e-6={wins}/{candidates} median_delta={median:.3e} worst_delta={worst:.3e}",
+            cpu / gpu.max(1e-9)
+        );
+    }
+
+    #[test]
+    fn gpu_correlation_reports_degenerate_and_non_finite() {
+        let n = 200usize;
+        let (x, mut y) = correlation_fixture(n);
+        let cols: Vec<f32> = x.iter().map(|r| r[0] as f32).collect();
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        assert!(ev.set_fit_data(&cols64, &y));
+
+        // Constant prediction: exactly 1.0, status 0, no step.
+        let flat = node(
+            Op::Add,
+            vec![
+                node(Op::Sin, vec![node(Op::Mul, vec![constant(0.0), input(0)])]),
+                constant(0.5),
+            ],
+        );
+        let plan = crate::fit::gpu_fit_plan(&flat).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Correlation);
+        assert_eq!(out[0].status, 0);
+        assert_eq!(out[0].score, 1.0);
+        assert_eq!(out[0].c, plan.c0);
+
+        // A non-finite target row is labelled 2.
+        y[7] = f64::NAN;
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("device");
+        assert!(ev.set_fit_data(&cols64, &y));
+        let plan = crate::fit::gpu_fit_plan(&corr_model()).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Correlation);
+        assert_eq!(out[0].status, 2, "non-finite rows are labelled");
+    }
+
     #[test]
     fn gpu_fit_matches_the_cpu_lm_for_p_1_to_20() {
         let n = 800;
@@ -2556,7 +2904,7 @@ mod fit_tests {
             let mut gpu_tree = linear_model(&start);
             let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("well-conditioned plan");
             assert_eq!(plan.nconst, p, "p={}", p);
-            let (out, ms) = ev.fit_batch(&[&plan], 8);
+            let (out, ms) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Squared);
             assert!(ms >= 0.0, "fit kernel ran for p={}", p);
             assert_eq!(out.len(), 1);
             let res = &out[0];
@@ -2630,7 +2978,7 @@ mod fit_tests {
 
         let mut gpu_tree = model(&[1.0, 0.2, 0.4, 0.1, 0.5]);
         let plan = crate::fit::gpu_fit_plan(&gpu_tree).expect("nonlinear plan");
-        let (out, _) = ev.fit_batch(&[&plan], 8);
+        let (out, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Squared);
         assert_eq!(out[0].status, 0, "the nonlinear fixture is well conditioned");
         plan.apply(&mut gpu_tree, &out[0].c);
         let gpu_c = constants(&gpu_tree);
@@ -2729,7 +3077,7 @@ mod fit_tests {
                 &(0..p).map(|k| 0.25 + 0.07 * k as f64).collect::<Vec<_>>(),
             ))
             .expect("plan");
-            let (out, _) = ev.fit_batch(&[&plan], 8);
+            let (out, _) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Squared);
             assert_eq!(out[0].status, 0, "p={} must be well conditioned", p);
             singles.push(out[0].clone());
         }
@@ -2741,7 +3089,7 @@ mod fit_tests {
             .map(|s| crate::fit::gpu_fit_plan(&linear_model(s)).expect("plan"))
             .collect();
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (mixed, _) = ev.fit_batch(&refs, 8);
+        let (mixed, _) = ev.fit_batch(&refs, 8, GpuFitMetric::Squared);
         assert_eq!(mixed.len(), ps.len());
 
         let mut errors = Vec::new();
@@ -2753,7 +3101,7 @@ mod fit_tests {
                 "p={} changed in a padded batch",
                 p
             );
-            assert_eq!(mixed[k].sse.to_bits(), singles[k].sse.to_bits());
+            assert_eq!(mixed[k].score.to_bits(), singles[k].score.to_bits());
             let mut tree = linear_model(&starts[k]);
             plans[k].apply(&mut tree, &mixed[k].c);
             let gpu_c = constants(&tree);
@@ -2825,7 +3173,7 @@ mod fit_tests {
         );
         let tree = collinear;
         let plan = crate::fit::gpu_fit_plan(&tree).expect("collinear plan");
-        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        let (out, ms) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Squared);
         assert!(ms >= 0.0);
         assert_eq!(out[0].status, 1, "rank-deficient system must be labelled");
 
@@ -2841,7 +3189,7 @@ mod fit_tests {
         }
         let plan = crate::fit::gpu_fit_plan(&wide).expect("p=20 collinear plan");
         assert_eq!(plan.nconst, 20);
-        let (out, ms) = ev.fit_batch(&[&plan], 8);
+        let (out, ms) = ev.fit_batch(&[&plan], 8, GpuFitMetric::Squared);
         assert!(ms >= 0.0);
         assert_eq!(out[0].status, 1, "p=20 rank deficiency must be labelled");
 
@@ -2857,7 +3205,7 @@ mod fit_tests {
         let (cols, y32) = cols_from(&x, &y);
         let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
         let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
-        let (out, _) = ev.fit_batch(&[&plan], 4);
+        let (out, _) = ev.fit_batch(&[&plan], 4, GpuFitMetric::Squared);
         assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
 
         // Unsupported (piecewise-constant) operators never reach the kernel.
@@ -2989,7 +3337,7 @@ mod fit_tests {
             let plans: Vec<&crate::fit::GpuFitPlan> =
                 (0..candidates).map(|_| &plan).collect();
             let t1 = std::time::Instant::now();
-            let (out, ms) = ev.fit_batch(&plans, 8);
+            let (out, ms) = ev.fit_batch(&plans, 8, GpuFitMetric::Squared);
             let gpu = t1.elapsed().as_secs_f64();
             let ok = out.iter().filter(|r| r.status == 0).count();
             eprintln!(
@@ -3079,7 +3427,7 @@ mod fit_tests {
             let plan = crate::fit::gpu_fit_plan(&linear_model(&start)).expect("plan");
             let plans: Vec<&crate::fit::GpuFitPlan> = (0..candidates).map(|_| &plan).collect();
             let t1 = std::time::Instant::now();
-            let (out, ms) = ev.fit_batch(&plans, 8);
+            let (out, ms) = ev.fit_batch(&plans, 8, GpuFitMetric::Squared);
             let gpu = t1.elapsed().as_secs_f64();
             let mut by_status = [0usize; 3];
             for r in &out {
@@ -3184,7 +3532,7 @@ mod fit_tests {
             .map(|t| crate::fit::gpu_fit_plan(t).expect("plan"))
             .collect();
         let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (out, ms) = ev.fit_batch(&refs, 8);
+        let (out, ms) = ev.fit_batch(&refs, 8, GpuFitMetric::Squared);
         eprintln!("kernel {:.1} ms for {} candidates", ms, out.len());
         let sample = crate::data::Sample {
             x,
@@ -3227,7 +3575,7 @@ mod fit_tests {
         };
         let start = model(&[0.3, 0.2, 0.1]);
         let alone = crate::fit::gpu_fit_plan(&start).expect("plan");
-        let (out_alone, _) = ev.fit_batch(&[&alone], 6);
+        let (out_alone, _) = ev.fit_batch(&[&alone], 6, GpuFitMetric::Squared);
         assert_eq!(out_alone[0].status, 0);
 
         // Same candidate repeated four times: every block owns one candidate,
@@ -3236,11 +3584,11 @@ mod fit_tests {
             .map(|_| crate::fit::gpu_fit_plan(&start).expect("plan"))
             .collect();
         let plan_refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
-        let (out, _) = ev.fit_batch(&plan_refs, 6);
+        let (out, _) = ev.fit_batch(&plan_refs, 6, GpuFitMetric::Squared);
         for r in &out {
             assert_eq!(r.status, 0);
             assert_eq!(r.c, out_alone[0].c, "batch composition changed constants");
-            assert_eq!(r.sse.to_bits(), out_alone[0].sse.to_bits());
+            assert_eq!(r.score.to_bits(), out_alone[0].score.to_bits());
         }
     }
 }

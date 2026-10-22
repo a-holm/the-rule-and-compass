@@ -385,8 +385,11 @@ fn a_gpu_run_and_a_gpu_resume_match_exactly() {
     }
     let train = sample(240);
     let test = sample(80);
+    // #236: only the squared family is scored natively on the device, so this
+    // backend-parity test must use a metric the GPU evaluator can rank.
     let mut full = Config {
         generations: 20,
+        metric: rcsr::metrics::Metric::Squared,
         ..config(17)
     };
     full.gpu = true;

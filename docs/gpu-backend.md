@@ -116,7 +116,7 @@ involved:
 |---|---|---|---|
 | `eval_pool_kernel` | 30 | 288 B | 1 024 B |
 | `eval_kernel` | 33 | 288 B | 1 024 B |
-| `fit_kernel` | 110 | 1 744 B | 40 672 B |
+| `fit_kernel` | 110 | 1 744 B | 41 128 B |
 | `predict_kernel` | 29 | 288 B | — |
 | `hash_kernel` | 14 | — | — |
 
@@ -243,7 +243,7 @@ cuobjdump -res-usage /tmp/eval.cubin
 | `eval_kernel` (packed / pipeline) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
 | `eval_pool_kernel` (fixed slots / synchronous) | 32 | 31 | 32 | 288 B | 1 024 B | 0 | 0 | 100 % (6 blocks) |
 | `predict_kernel` (test fixtures only) | 28 | 26 | 32 | 288 B | 0 | 0 | 0 | 100 % (6 blocks) |
-| `fit_kernel` (batched LM, untouched) | 93 | 93 | 96 | 1 744 B | 40 672 B | 0 | 0 | not subject to this contract |
+| `fit_kernel` (batched LM, untouched) | 93 | 93 | 96 | 1 744 B | 41 128 B | 0 | 0 | not subject to this contract |
 | `hash_kernel` / `cast_f32_to_f64_kernel` (untouched) | 16 / 12 | 16 / 12 | 16 / 16 | 0 | 0 | 0 | 0 | — |
 
 The before column is today's `main`, after the #121 device stack guards; the
@@ -403,9 +403,13 @@ Each generation then runs as:
 The GPU never produces a number a user reads. The kernel sums squared errors;
 the search divides that by the row count and uses it as a mean-squared fitness.
 That is exact only for `--metric squared`. Every other metric is scored by the
-CPU evaluator: the kernel has no MAE, rank, minimax, correlation, slope or
-classification objective, and using MSE as a ranking proxy silently changes the
-search (`--metric slope` was observed to select a different Pareto point). At
+CPU evaluator: the *scoring* kernel has no MAE, rank, minimax, correlation,
+slope or classification objective, and using MSE as a ranking proxy silently
+changes the search (`--metric slope` was observed to select a different Pareto
+point). The separate constant-fit kernel does minimise correlation exactly (see
+[Correlation constant fitting](#correlation-constant-fitting-224)), but ranking
+a correlation run still needs the CPU scorer until a native correlation
+evaluation kernel exists. At
 the end `full_data_archive` re-scores the surviving trees on the full training
 sample with the CPU evaluator in `f64`, and the reported train/test errors,
 Pareto front and convergence statistics come from that rebuild. Constants stay
@@ -797,8 +801,8 @@ one CUDA block per candidate:
 
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
-chunk it was measured with (about 39.7 KB of shared memory); `17 <= p <= 20`
-uses a 128-thread block and a 128-row chunk (about 38.1 KB). Both fit two blocks
+chunk it was measured with (about 40.2 KB of shared memory); `17 <= p <= 20`
+uses a 128-thread block and a 128-row chunk (about 38.6 KB). Both fit two blocks
 per SM on `sm_86`. The larger alternative — 20 constants with a 256-row chunk —
 needs about 50.8 KB, past the 48 KB static ceiling and only one block per SM, so
 the shared block is dynamic (`extern __shared__`) and the opt-in limit is raised
@@ -811,8 +815,27 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 `a_mixed_p_batch_matches_single_fits_and_the_cpu_lm` asserts for `p = 4` beside
 `p = 17..20`.
 
+**Correlation constant fitting (#224).** The same block-per-candidate loop can
+minimise `1 − |ρ|` (`--metric correlation`) or `1 − ρ`
+(`--metric correlation_signed`) directly. The kernel accumulates the weighted
+centred moments in f64, derives the exact gradient and Gauss–Newton matrix, and
+solves the same damped Cholesky system. The outer affine `a·T+b` pair is
+renormalised once to `a = ±1, b = 0` and frozen (its step is exactly zero), so
+the curvature has no affine null space and the `1e4` gate measures only shape
+collinearity. An exactly constant prediction scores `1.0` with status `0` and no
+step, mirroring `metrics::correlation`; a near-constant one is labelled
+`ill_conditioned`, and a non-finite row is status `2`. The exact f64 host gate
+and finalist refit use `metrics::score_weighted(..., metric, k)`, never SSE, so
+a correlation proposal with a better `ρ` and a worse SSE is still accepted.
+
+The evaluator gate from #236 is unchanged: the CUDA **scorer** still sums squared
+error, so an end-to-end `--metric correlation` search stays on the CPU until a
+native correlation evaluator exists. The correlation fit kernel is exercised
+through the batch API and its own CUDA tests; it is not silently substituted for
+the SSE kernel in a squared run.
+
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
-only for the squared/AIC family, with `p <= 20`, at most 96 flattened nodes, no
+only for the squared/AIC family or the two correlation metrics, with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
 `32p` rows. The arm also screens before it fits: every unfitted offspring is
 scored once on the GPU with its seed constants, and the screened ranking decides
@@ -842,8 +865,9 @@ constants), `too_few_rows`, `too_many_constants` (`p > 20`), `ill_conditioned`,
 same accepted/fallback/refit totals.
 
 **Exactness.** Search fitness is still f32 and only guides selection. Every
-finalist is refit by the exact CPU f64 LM on all training rows before the final
-archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
+finalist is refit by the exact CPU f64 arm for the configured metric on all
+training rows (LM for squared/AIC, the exact correlation solver for
+`correlation`/`correlation_signed`) before the final archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
 constants and metrics therefore never come from f32. The unit tests upload the
 same f64 rows the CPU arm uses; the kernel's final constants then match the CPU
 LM to machine precision (median `2e-15` in the p=1..20 test, median relative
@@ -856,6 +880,19 @@ copy (a device-allocation failure) the polish runs on f32-rounded inputs and the
 constants differ by roughly `1e-7` relative; the finalist refit still makes the
 reported numbers exact.
 
+**Paired correlation measurement (#224).** `bench_correlation_fit_paired`
+(N=50 000, P=64, p=3, `a·sin(b·x)+c`, `--fit-iters 8`) measured 7.75 s serial
+CPU correlation fitting against 0.366 s for the batched correlation kernel
+(**21.2× fit-stage**; repeated runs ranged 12.8–21.2× with machine load),
+kernel duty ≈100 %, status-0 proposals 64/64, and every proposal no worse than
+its incoming constants. The metric delta against the exact CPU correlation fit
+was `2.3e-14` at the median and `9.0e-2` at the worst of 64 multi-start
+candidates: the kernel is a local solver, so the exact host gate and the CPU
+finalist refit remain authoritative. The cost model is the SSE kernel plus
+`3p+6` additional f64 moment cells (p=8: 30 extra cells, +8–20 % of one assembly
+pass) and the same `O(p³)` solve; the correlation polish it replaces cost 1–72
+full prediction passes per candidate.
+
 **Constant cap and the p=17..20 instantiation (#169).** The cap is 20 constants.
 `p = 1..16` keeps the original 256-thread instantiation; `p = 17..20` runs the
 second one. Their resources, from `cuobjdump -res-usage` on the built
@@ -863,8 +900,8 @@ second one. Their resources, from `cuobjdump -res-usage` on the built
 
 | constant cap | block | row chunk | dynamic shared | registers | stack (local frame) |
 |---:|---:|---:|---:|---:|---:|
-| 16 | 256 | 256 | 40 672 B | 89 | 1 792 B |
-| 20 | 128 | 128 | 38 992 B | 85 | 1 824 B |
+| 16 | 256 | 256 | 41 128 B | 89 | 1 792 B |
+| 20 | 128 | 128 | 39 544 B | 85 | 1 824 B |
 
 Both stay under the 48 KB static ceiling and fit two blocks per SM on `sm_86`.
 The rejected alternative — 20 constants with a 256-thread block and a 256-row
@@ -873,7 +910,7 @@ iterations, one batch per cell:
 
 | `p` instantiation | shared | kernel at `N=1e5` | kernel at `N=1e6` |
 |---|---:|---:|---:|
-| 20, 128 threads / 128 rows | 38 992 B | 4 038.7 ms | 40 232.7 ms |
+| 20, 128 threads / 128 rows | 39 544 B | 4 038.7 ms | 40 232.7 ms |
 | 20, 256 threads / 256 rows | 50 768 B | 4 404.6 ms (+9.1 %) | 45 237.0 ms (+12.4 %) |
 
 The two-block-per-SM variant wins, so `FT_CHUNK_LARGE` is 128. Fit-stage

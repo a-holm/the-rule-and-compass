@@ -51,6 +51,7 @@ pub trait BatchedFitter {
         y: &[f64],
         w: &[f64],
         iters: usize,
+        metric: Metric,
     ) -> Vec<Option<Vec<f64>>>;
 }
 
@@ -58,15 +59,17 @@ pub trait BatchedFitter {
 /// candidate, in input order.
 #[derive(Clone, Debug)]
 pub struct VerifiedBatch {
-    pub sse: Vec<f64>,
+    /// The configured metric, exactly as `metrics::score_weighted` reports it.
+    pub score: Vec<f64>,
     pub status: Vec<BatchStatus>,
 }
 
 /// Run a batched backend through the exactness gate.
 ///
 /// The tree is modified only to the verified constants (or to the exact CPU
-/// fallback's result). Each candidate's final SSE is the exact weighted SSE of
-/// the constants now in the tree.
+/// fallback's result). Each candidate's final score is the exact `f64` value of
+/// the **configured** metric ([`Metric`]) at the constants now in the tree, so
+/// a correlation run is never judged by SSE.
 pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     backend: &B,
     trees: &mut [Node],
@@ -74,69 +77,78 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
     y: &[f64],
     w: &[f64],
     iters: usize,
+    metric: Metric,
 ) -> VerifiedBatch {
-    let proposals = backend.fit_batch(trees, x, y, w, iters);
-    let mut sse = Vec::with_capacity(trees.len());
+    let proposals = backend.fit_batch(trees, x, y, w, iters, metric);
+    let mut score = Vec::with_capacity(trees.len());
     let mut status = Vec::with_capacity(trees.len());
     for (i, tree) in trees.iter_mut().enumerate() {
         let proposal = proposals.get(i).and_then(|p| p.as_ref());
         let (value, state) = match proposal {
             None => (
-                fit_weighted_strategy(tree, x, y, w, iters, FitStrategy::Exact),
+                fit_weighted_metric(tree, x, y, w, iters, metric),
                 BatchStatus::Unsupported,
             ),
-            Some(c) => match verify_proposal(tree, c, x, y, w) {
+            Some(c) => match verify_proposal(tree, c, x, y, w, metric) {
                 Some(v) => (v, BatchStatus::Gpu),
                 None => (
-                    fit_weighted_strategy(tree, x, y, w, iters, FitStrategy::Exact),
+                    fit_weighted_metric(tree, x, y, w, iters, metric),
                     BatchStatus::Worse,
                 ),
             },
         };
         note_gpu_fit(state == BatchStatus::Gpu);
-        sse.push(value);
+        score.push(value);
         status.push(state);
     }
-    VerifiedBatch { sse, status }
+    VerifiedBatch { score, status }
 }
 
-/// Apply one proposal to a clone and return its exact SSE only when it is a
-/// legitimate, non-worse fit. The real tree is untouched on failure.
+/// Apply one proposal to a clone and return its exact configured-metric score
+/// only when it is a legitimate, non-worse fit. The real tree is untouched on
+/// failure. Raw constants are never compared: the metric is invariant to the
+/// affine gauge, so the gate is too.
 fn verify_proposal(
     tree: &mut Node,
     proposal: &[f64],
     x: &[Vec<f64>],
     y: &[f64],
     w: &[f64],
+    metric: Metric,
 ) -> Option<f64> {
     let f = flatten(tree);
     if proposal.len() != f.nconst || !proposal.iter().all(|v| v.is_finite()) {
         return None;
     }
-    let mut v = vec![0.0; f.op.len()];
-    let mut c0 = vec![0.0; f.nconst];
-    for i in 0..f.op.len() {
-        if f.cslot[i] >= 0 {
-            c0[f.cslot[i] as usize] = f.val[i];
-        }
-    }
-    let start = sse(&f, x, y, w, &c0, &mut v);
-    let candidate = sse(&f, x, y, w, proposal, &mut v);
+    let start = metric_score(tree, x, y, w, metric);
+    let mut trial = tree.clone();
+    write_constants(&mut trial, &f, proposal);
+    // `metric_score` evaluates through `expr::eval`, exactly like the scorer.
+    let candidate = metric_score(&trial, x, y, w, metric);
     if !candidate.is_finite() || !start.is_finite() || candidate > start {
         return None;
     }
-    write_constants(tree, &f, proposal);
+    *tree = trial;
     Some(candidate)
 }
 
-/// #169: the exact `f64` refit every reported finalist receives, whatever arm
-/// produced it. This is the historical LM path, bit for bit.
-pub fn refit_finalists_exact(trees: &mut [Node], x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> Vec<f64> {
+/// #169/#224: the exact `f64` refit every reported finalist receives, whatever
+/// arm produced it. For the squared family this is the historical LM path, bit
+/// for bit; for a correlation metric it is the exact correlation solver, so the
+/// refit is monotone in the configured objective and never a hidden SSE pass.
+pub fn refit_finalists_exact(
+    trees: &mut [Node],
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> Vec<f64> {
     trees
         .iter_mut()
         .map(|tree| {
             note_gpu_refit();
-            fit_lm(tree, x, y, w, iters)
+            fit_weighted_metric(tree, x, y, w, iters, metric)
         })
         .collect()
 }
@@ -180,7 +192,7 @@ mod tests {
     }
 
     impl BatchedFitter for Backend {
-        fn fit_batch(&self, trees: &[Node], _: &[Vec<f64>], _: &[f64], _: &[f64], _: usize) -> Vec<Option<Vec<f64>>> {
+        fn fit_batch(&self, trees: &[Node], _: &[Vec<f64>], _: &[f64], _: &[f64], _: usize, _: Metric) -> Vec<Option<Vec<f64>>> {
             trees.iter().map(|_| self.proposal.clone()).collect()
         }
     }
@@ -191,9 +203,9 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 3.0).collect();
         let mut trees = vec![model()];
         let backend = Backend { proposal: Some(vec![2.0, 3.0]) };
-        let out = fit_batch_verified(&backend, &mut trees, &x, &y, &[], 8);
+        let out = fit_batch_verified(&backend, &mut trees, &x, &y, &[], 8, Metric::Squared);
         assert_eq!(out.status, vec![BatchStatus::Gpu]);
-        assert!(out.sse[0] < 1e-20);
+        assert!(out.score[0] < 1e-20);
         let c = fitted(&trees[0]);
         assert!((c[0] - 2.0).abs() < 1e-12 && (c[1] - 3.0).abs() < 1e-12);
     }
@@ -204,10 +216,10 @@ mod tests {
         let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 3.0).collect();
         for proposal in [Some(vec![f64::NAN, 3.0]), Some(vec![2.0]), None] {
             let mut gpu = vec![model()];
-            let out = fit_batch_verified(&Backend { proposal }, &mut gpu, &x, &y, &[], 8);
+            let out = fit_batch_verified(&Backend { proposal }, &mut gpu, &x, &y, &[], 8, Metric::Squared);
             let mut cpu = model();
             let reference = fit_weighted(&mut cpu, &x, &y, &[], 8);
-            assert_eq!(out.sse[0].to_bits(), reference.to_bits());
+            assert_eq!(out.score[0].to_bits(), reference.to_bits());
             let a: Vec<u64> = fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect();
             let b: Vec<u64> = fitted(&cpu).iter().map(|v| v.to_bits()).collect();
             assert_eq!(a, b);
@@ -226,11 +238,83 @@ mod tests {
             &y,
             &[],
             8,
+            Metric::Squared,
         );
         assert_ne!(out.status[0], BatchStatus::Gpu);
         let mut cpu = model();
         let reference = fit_weighted(&mut cpu, &x, &y, &[], 8);
-        assert_eq!(out.sse[0].to_bits(), reference.to_bits());
+        assert_eq!(out.score[0].to_bits(), reference.to_bits());
+    }
+
+    fn correlation_model() -> Node {
+        node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.7),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.3), input(0)])]),
+                    ],
+                ),
+                constant(0.1),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_correlation_proposal_is_judged_by_correlation_not_sse() {
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 2.0 * r[0] + 0.3).collect();
+        let mut gpu = vec![correlation_model()];
+        let start = metric_score(&gpu[0], &x, &y, &[], Metric::Correlation);
+        // A constant proposal scores exactly 1.0 on the correlation metric.
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![0.0, 1.3, 0.0]) },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Correlation,
+        );
+        assert_ne!(out.status[0], BatchStatus::Gpu);
+        let mut cpu = correlation_model();
+        let reference = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Correlation);
+        assert_eq!(out.score[0].to_bits(), reference.to_bits());
+        assert!(out.score[0] <= start + 1e-12);
+    }
+
+    #[test]
+    fn the_gate_accepts_a_gauge_equivalent_proposal() {
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.5 * (0.8 * r[0]).sin() + 0.2).collect();
+        let mut gpu = vec![correlation_model()];
+        let start = metric_score(&gpu[0], &x, &y, &[], Metric::Correlation);
+        // f -> 2*f: rho is unchanged, raw constants are not.
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![1.4, 1.3, 0.2]) },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Correlation,
+        );
+        assert_eq!(out.status[0], BatchStatus::Gpu);
+        assert!(out.score[0] <= start + 1e-12);
+    }
+
+    #[test]
+    fn a_correlation_finalist_refit_is_metric_monotone() {
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 0.2 * r[0] + (1.2 * r[0]).sin()).collect();
+        let mut trees = vec![correlation_model()];
+        let start = metric_score(&trees[0], &x, &y, &[], Metric::Correlation);
+        let scores = refit_finalists_exact(&mut trees, &x, &y, &[], 40, Metric::Correlation);
+        assert!(scores[0] <= start + 1e-12, "refit {scores:?} from {start}");
+        let check = metric_score(&trees[0], &x, &y, &[], Metric::Correlation);
+        assert!((check - scores[0]).abs() < 1e-12);
     }
 
     #[test]
@@ -245,7 +329,7 @@ mod tests {
             ],
         )];
         let mut cpu = gpu[0].clone();
-        let a = refit_finalists_exact(&mut gpu, &x, &y, &[], 40);
+        let a = refit_finalists_exact(&mut gpu, &x, &y, &[], 40, Metric::Squared);
         let b = fit_weighted(&mut cpu, &x, &y, &[], 40);
         assert_eq!(a[0].to_bits(), b.to_bits());
         let ca: Vec<u64> = fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect();

@@ -28,6 +28,9 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device and labels every larger or unsupported candidate for the exact CPU arm;
+`correlation`/`correlation_signed` use the exact analytic `ρ` gradient and a
+frozen affine gauge, and the batched kernel supports the same objective, while
+the search-level correlation scorer remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
@@ -876,6 +879,9 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device and labels every larger or unsupported candidate for the exact CPU arm;
+`correlation`/`correlation_signed` use the exact analytic `ρ` gradient and a
+frozen affine gauge, and the batched kernel supports the same objective, while
+the search-level correlation scorer remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be

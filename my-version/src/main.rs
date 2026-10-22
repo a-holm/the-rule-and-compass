@@ -376,8 +376,10 @@ SEARCH:
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
                              log_squashed use IRLS; auc/log_loss/hinge use
-                             logistic IRLS; rank/order/correlation losses use a
-                             deterministic coordinate polish
+                             logistic IRLS; correlation/correlation_signed use
+                             the exact analytic rho gradient with a frozen affine
+                             gauge; rank/order losses use a deterministic
+                             coordinate polish
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
