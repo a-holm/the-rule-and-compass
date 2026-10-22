@@ -42,6 +42,12 @@
 //! additionally guarantees that a backend which only knows squared error can
 //! never answer a non-squared request.
 //!
+//! #226/#232: `median` and `interquartile` are **fit-only** device arms. The
+//! device proposes constants from the squared LM start plus the batched exact
+//! order-statistic polish ([`super::OrderStat`]), the gate below judges them on
+//! the configured statistic, and the finalist refit is the exact CPU
+//! [`fit_weighted_metric`](super::fit_weighted_metric) for that metric.
+//!
 //! A backend that returns `None` for every candidate is therefore a correct
 //! (slow) implementation, and a buggy backend can waste work but cannot make a
 //! reported fit worse than the CPU reference. The default build has no backend;
@@ -554,9 +560,10 @@ impl BatchedFitter for BatchedGpu<'_> {
         }
         // #226: `median` is fitted by the batched exact median polish (squared
         // LM start, then the same first-improver ladder on the exact `f64`
-        // median). The verifier below judges it on the configured median, so
-        // the proposal is never accepted on SSE.
-        if median_fit_only(metric) && iters > 0 {
+        // median), and #232: `interquartile` by the same polish on the
+        // middle-50 % window mean. The verifier below judges the proposal on
+        // the configured metric, so it is never accepted on SSE.
+        if let Some(want) = OrderStat::for_metric(metric).filter(|_| iters > 0) {
             let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
             let slots: Vec<(usize, GpuFitPlan)> = trees
                 .iter()
@@ -567,7 +574,7 @@ impl BatchedFitter for BatchedGpu<'_> {
                 return out;
             }
             let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
-            let (results, ms) = self.ev.borrow_mut().median_fit_batch(&plans, iters);
+            let (results, ms) = self.ev.borrow_mut().order_stat_fit_batch(&plans, iters, want);
             if ms < 0.0 || results.len() != slots.len() {
                 return out;
             }
@@ -1031,6 +1038,210 @@ mod tests {
         let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
         let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Median, 2);
         assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    // -- #232: the interquartile arm through the batch gate ------------------
+
+    /// #232: a proposal that improves the middle-50 % window mean while making
+    /// SSE worse must be accepted for `--metric interquartile`.
+    ///
+    /// Fixture: `y = 1 + 0.5x` on 40 rows with every 8th row displaced by 40.
+    /// The least-squares line is tilted by those rows, so its own interquartile
+    /// mean is positive, while `1 + 0.5x` puts 87.5 % of the residuals at
+    /// exactly 0 and drives the middle 50 % to 0. The gate must accept the
+    /// interquartile answer although its SSE is strictly larger.
+    #[test]
+    fn an_interquartile_proposal_is_judged_by_the_window_mean_not_by_sse() {
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![i as f64 / 4.0]).collect();
+        let mut y: Vec<f64> = x.iter().map(|r| 1.0 + 0.5 * r[0]).collect();
+        for i in (3..40).step_by(8) {
+            y[i] += 40.0;
+        }
+        let mut start = model();
+        fit_weighted(&mut start, &x, &y, &[], 8);
+        let start_c = fitted(&start);
+        let proposal = vec![0.5, 1.0];
+        let iqr_at = |c: &[f64]| {
+            metric_score(
+                &with_constants(&model(), c),
+                &x,
+                &y,
+                &[],
+                Metric::Interquartile,
+            )
+        };
+        let sse_at = |c: &[f64]| sse(&flatten(&model()), &x, &y, &[], c, &mut vec![0.0; 64]);
+        assert_eq!(iqr_at(&proposal), 0.0, "the proposal must reach the window optimum");
+        assert!(
+            iqr_at(&start_c) > 1e-3,
+            "the least-squares line must have a positive window mean: {}",
+            iqr_at(&start_c)
+        );
+        assert!(
+            sse_at(&proposal) > sse_at(&start_c),
+            "the fixture must make the interquartile answer worse in SSE"
+        );
+
+        let mut gpu = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend {
+                proposal: Some(proposal.clone()),
+            },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Interquartile,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better interquartile proposal must not be rejected on SSE"
+        );
+        assert_eq!(out.score[0], 0.0);
+        assert_eq!(
+            fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            proposal.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #232: the exact finalist refit for `interquartile` is the CPU
+    /// squared-fit-plus-ladder arm, bit for bit, it never makes the reported
+    /// model worse, and it is idempotent from its own endpoint.
+    #[test]
+    fn an_interquartile_finalist_refit_is_exact_and_never_worse() {
+        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![-1.5 + 0.05 * i as f64]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 2.0 * (1.3 * r[0]).sin() + if i % 7 == 0 { 6.0 } else { 0.0 })
+            .collect();
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(1.0),
+                        node(
+                            Op::Sin,
+                            vec![node(Op::Mul, vec![constant(1.0), input(0)])],
+                        ),
+                    ],
+                ),
+                constant(0.0),
+            ],
+        );
+        let before = metric_score(&tree, &x, &y, &[], Metric::Interquartile);
+        let mut once = vec![tree.clone()];
+        let first = refit_finalists_exact(&mut once, &x, &y, &[], 8, Metric::Interquartile);
+        assert!(first[0].is_finite());
+        assert!(first[0] <= before, "refit {} > start {}", first[0], before);
+        let mut cpu = tree.clone();
+        let want = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Interquartile);
+        assert_eq!(first[0].to_bits(), want.to_bits());
+        assert_eq!(
+            fitted(&once[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // Monotone, not bit-idempotent: the arm restarts from a squared
+        // pre-fit, so a second pass starts the LM from the polished constants
+        // and may land on a marginally different squared optimum. The contract
+        // is "never worse", and that is what is pinned here.
+        let mut twice = once.clone();
+        let second = refit_finalists_exact(&mut twice, &x, &y, &[], 8, Metric::Interquartile);
+        assert!(
+            second[0] <= first[0],
+            "a second refit must not be worse: {} > {}",
+            second[0],
+            first[0]
+        );
+        // And the reported number is the configured objective, not an SSE.
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&twice[0], r)).collect();
+        assert_eq!(
+            second[0].to_bits(),
+            crate::metrics::score_weighted(
+                &pred,
+                &y,
+                &[],
+                Metric::Interquartile,
+                crate::expr::count_constants(&twice[0]),
+            )
+            .to_bits()
+        );
+    }
+
+    /// #232: `--no-fit` (`iters == 0`) is a bit-exact no-op for the
+    /// interquartile arm, and the score is the window mean at the untouched
+    /// constants.
+    #[test]
+    fn no_fit_keeps_an_interquartile_run_untouched() {
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        let tree = model();
+        let before = fitted(&tree);
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &Backend {
+                proposal: Some(vec![9.0, 9.0]),
+            },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::Interquartile,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
+        let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Interquartile, 2);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    /// #232: a squared-only backend never answers an interquartile request, and
+    /// the fallback is the exact CPU interquartile arm bit for bit — never a
+    /// squared answer in disguise.
+    #[test]
+    fn a_squared_proposal_is_never_answered_for_interquartile() {
+        let trees = vec![model()];
+        assert_eq!(
+            SquaredOnlyBackend(vec![2.0, 3.0]).fit_batch_metric(
+                &trees,
+                &[],
+                &[],
+                &[],
+                8,
+                Metric::Interquartile
+            ),
+            vec![None],
+            "the default must decline an interquartile request"
+        );
+        let x: Vec<Vec<f64>> = (0..40).map(|i| vec![i as f64]).collect();
+        let mut y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        y[7] += 30.0;
+        let mut gpu = vec![model()];
+        let out = fit_batch_verified(
+            &SquaredOnlyBackend(vec![2.0, 3.0]),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Interquartile,
+        );
+        assert_eq!(out.status[0], BatchStatus::Unsupported);
+        let mut cpu = model();
+        let want = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Interquartile);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+        assert_eq!(
+            fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     // -- #228: the signed arm through the batch gate ------------------------

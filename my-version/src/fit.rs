@@ -22,6 +22,8 @@ use crate::metrics::{self, Metric};
 mod correlation;
 mod gpu;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+mod interquartile;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 mod median;
 mod rank;
 mod stream;
@@ -40,7 +42,13 @@ pub use stream::{
 // #226: the median polish tail is only wired into the CUDA arm; a CPU-only
 // build keeps the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
-pub(crate) use median::{polish_median_batch, MedianTrialScorer};
+#[allow(unused_imports)]
+pub(crate) use median::{polish_median_batch, OrderStatTrialScorer};
+// #232: the interquartile arm is the same ladder on the middle-50 % window
+// mean; it shares the driver above and differs only in the statistic.
+#[cfg(any(feature = "cuda", test))]
+#[allow(unused_imports)]
+pub(crate) use interquartile::polish_interquartile_batch;
 // The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
 // the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
@@ -256,19 +264,21 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     }
     // #226: `median` is honoured by the batched exact median polish
     // (`median_fit_only`), also fit-only: the device sorts the residual bits,
-    // the CPU scores every candidate with the configured median.
-    if median_fit_only(metric) {
+    // the CPU scores every candidate with the configured median. #232: the
+    // `interquartile` arm is the same stage on the middle-50 % window mean.
+    if order_stat_fit_only(metric) {
         return None;
     }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
-         absolute error, the logistic log-loss or the exact rank and median \
-         objectives, but --metric {} has no device fit objective, so the GPU \
-         arms cannot fit it. Use --metric squared (aic, aicc and bic also fit \
-         by least squares), --metric log_squashed, --metric absolute, --metric \
-         log_loss, --metric rank_correlation or rank_correlation_signed, \
-         --metric median, or a CPU fit strategy: --fit-strategy exact, auto, \
-         linear, varpro or stream.",
+         absolute error, the logistic log-loss or the exact rank, median and \
+         interquartile objectives, but --metric {} has no device fit \
+         objective, so the GPU arms cannot fit it. Use --metric squared (aic, \
+         aicc and bic also fit by least squares), --metric log_squashed, \
+         --metric absolute, --metric log_loss, --metric rank_correlation or \
+         rank_correlation_signed, --metric median, --metric interquartile, or \
+         a CPU fit strategy: --fit-strategy exact, auto, linear, varpro or \
+         stream.",
         metric.name()
     ))
 }
@@ -286,6 +296,61 @@ pub fn rank_fit_only(metric: Metric) -> Option<bool> {
     rank_metric_signed(metric)
 }
 
+/// #226/#232: which order statistic of `|r|` an arm scores.
+///
+/// The two members share the ladder, the batched driver and the device sort;
+/// they differ only in the pick. `metric()` is the CPU objective that is the
+/// authority for the arm, so a device score can never be compared with a
+/// different loss.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+pub(crate) enum OrderStat {
+    /// `metrics::median_abs`: the middle value, or the mean of the two middles.
+    Median,
+    /// `metrics::interquartile_mean_abs`: the mean of ranks `[⌊n/4⌋, ⌊3n/4⌋)`.
+    Interquartile,
+}
+
+impl OrderStat {
+    /// The configured CPU metric this statistic is the definition of.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn metric(self) -> Metric {
+        match self {
+            OrderStat::Median => Metric::Median,
+            OrderStat::Interquartile => Metric::Interquartile,
+        }
+    }
+
+    /// The `what` code `rc_order_stat_score_batch` takes. Keep in sync with
+    /// `src/cuda/eval.cu` (`k_order_stat_pick`).
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    pub(crate) fn device_code(self) -> i32 {
+        match self {
+            OrderStat::Median => 0,
+            OrderStat::Interquartile => 1,
+        }
+    }
+
+    /// The statistic for a metric, or `None` for every other metric.
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+    pub(crate) fn for_metric(metric: Metric) -> Option<Self> {
+        match metric {
+            Metric::Median => Some(OrderStat::Median),
+            Metric::Interquartile => Some(OrderStat::Interquartile),
+            _ => None,
+        }
+    }
+
+    /// Stable label for the ledger, the docs and the fallback names.
+    #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            OrderStat::Median => "median",
+            OrderStat::Interquartile => "interquartile",
+        }
+    }
+}
+
 /// #226: `true` when `--fit-strategy gpu` can fit `median` on the device
 /// through the batched exact median polish, `false` for every other metric.
 ///
@@ -296,6 +361,28 @@ pub fn rank_fit_only(metric: Metric) -> Option<bool> {
 /// remains [`DeviceLoss::for_metric`] and every fitness value stays CPU `f64`.
 pub fn median_fit_only(metric: Metric) -> bool {
     metric == Metric::Median
+}
+
+/// #232: `true` when `--fit-strategy gpu` can fit `interquartile` on the
+/// device through the batched middle-50 % window polish, `false` otherwise.
+///
+/// Like [`median_fit_only`] this is a **fit-only** arm, not a [`fit_loss`]: the
+/// device sorts the `|r|` bit patterns, averages ranks `[⌊n/4⌋, ⌊3n/4⌋)` in
+/// `f64` and never accumulates an SSE. The evaluator cannot score the
+/// interquartile mean, so this predicate selects the fit stage only.
+pub fn interquartile_fit_only(metric: Metric) -> bool {
+    metric == Metric::Interquartile
+}
+
+/// #226/#232: `true` when `--fit-strategy gpu` fits `metric` through the
+/// batched **order-statistic** polish (median or interquartile), the arm those
+/// two metrics share.
+///
+/// Both are fit-only: the device moves constants, the CPU scores and refits.
+/// Every dispatch site reads this one predicate, so the arm and the admission
+/// gate cannot disagree about which metrics it covers.
+pub fn order_stat_fit_only(metric: Metric) -> bool {
+    median_fit_only(metric) || interquartile_fit_only(metric)
 }
 
 /// #226: rows below which the device median polish is not worth its per-call
@@ -378,6 +465,92 @@ pub fn median_fit_cost(n: usize, p: usize, sweeps: usize) -> MedianFitCost {
 /// CPU polish for a sample of `n` rows and `p` constants.
 pub fn median_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
     n >= MEDIAN_GPU_MIN_ROWS && median_fit_cost(n, p, sweeps).prefers_gpu()
+}
+
+// --- #232: interquartile arm -------------------------------------------------
+
+/// #232: rows below which the device interquartile polish is not worth its
+/// per-call latency and the exact CPU arm stays.
+///
+/// Derived from [`interquartile_fit_cost`] (measured on the RTX 3060, see
+/// `docs/gpu-backend.md` §"Interquartile absolute error fitting"): like the
+/// median arm the device pays a fixed launch/sort cost per call and wins on
+/// rows, so a small sample keeps the CPU's single sort. The decision is a row
+/// count, never a timing measurement, so it is reproducible.
+pub const INTERQUARTILE_GPU_MIN_ROWS: usize = 4_096;
+
+/// #232: fixed cost of one device interquartile call (uploads, CUB size query,
+/// buffer allocation, launches and sync), seconds. Measured: a six-trial call
+/// costs 0.18 ms at 2 000 rows and 3.75 ms at 154 000, which is an intercept of
+/// ~0.16 ms and a 6·3.9 ns/row slope.
+const IQR_GPU_CALL_S: f64 = 1.6e-4;
+/// #232: per-row cost of one device interquartile trial (f64 predict, segmented
+/// radix sort of the keys, 256-thread window reduction), seconds. Measured
+/// slope of the six-trial call: 3.9 ns/row — the parallel window sum is inside
+/// the sort's noise, which is why it is below the median arm's 3.95 ns.
+const IQR_GPU_ROW_S: f64 = 3.9e-9;
+
+/// #232: modelled CPU-vs-device cost of the interquartile polish tail.
+///
+/// Both sides run `sweeps · p` calls of six trials. The CPU side is exactly the
+/// median arm's per-trial work (one prediction sweep plus one `n log n` sort of
+/// `f64` residuals, hence the shared [`MEDIAN_CPU_ROW_S`]); the device side is
+/// the same sort as the median arm plus a **parallel** 256-thread window sum
+/// over ~`n/2` keys, whose measured cost is inside the sort's noise (the
+/// per-row coefficient is 3.9 ns, below the median's 3.95 ns). Both arms keep
+/// the median arm's cost shape:
+///
+/// ```text
+/// cpu_s = sweeps·p·6·MEDIAN_CPU_ROW_S·n
+/// gpu_s = sweeps·p·(IQR_GPU_CALL_S + 6·IQR_GPU_ROW_S·n) + IQR_GPU_CALL_S
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InterquartileFitCost {
+    /// Modelled CPU polish time, seconds.
+    pub cpu_s: f64,
+    /// Modelled device polish time, seconds.
+    pub gpu_s: f64,
+}
+
+impl InterquartileFitCost {
+    /// `cpu_s / gpu_s`, the modelled speed-up of the device tail.
+    pub fn speedup(&self) -> f64 {
+        if self.gpu_s > 0.0 {
+            self.cpu_s / self.gpu_s
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Whether the model prefers the device for this shape.
+    pub fn prefers_gpu(&self) -> bool {
+        self.gpu_s < self.cpu_s
+    }
+}
+
+/// #232: modelled CPU-vs-device cost of the interquartile polish tail, in
+/// seconds.
+///
+/// The CPU side deliberately uses the median arm's per-trial coefficient: the
+/// two metrics sort the same residual multiset, so the *shape* is identical.
+/// The measured IQR runs (RTX 3060, see `docs/gpu-backend.md`) take longer per
+/// trial because the IQR ladder more often improves on every sweep and so runs
+/// all of them; charging the median's coefficient therefore under-counts the
+/// CPU side and makes the admission model conservative.
+pub fn interquartile_fit_cost(n: usize, p: usize, sweeps: usize) -> InterquartileFitCost {
+    let nf = n.max(1) as f64;
+    let trials = (sweeps.max(1) * p.max(1) * 6) as f64;
+    let calls = (sweeps.max(1) * p.max(1)) as f64;
+    InterquartileFitCost {
+        cpu_s: trials * MEDIAN_CPU_ROW_S * nf,
+        gpu_s: calls * (IQR_GPU_CALL_S + 6.0 * IQR_GPU_ROW_S * nf) + IQR_GPU_CALL_S,
+    }
+}
+
+/// #232: whether the device interquartile polish is predicted to be faster
+/// than the exact CPU arm for a sample of `n` rows and `p` constants.
+pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
+    n >= INTERQUARTILE_GPU_MIN_ROWS && interquartile_fit_cost(n, p, sweeps).prefers_gpu()
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -4497,7 +4670,10 @@ mod tests {
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() || median_fit_only(*m) {
+            if fit_loss(*m).is_some()
+                || rank_fit_only(*m).is_some()
+                || order_stat_fit_only(*m)
+            {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
@@ -4545,6 +4721,16 @@ mod tests {
         assert!(median_fit_only(Metric::Median));
         assert!(!median_fit_only(Metric::Absolute));
         assert!(!median_fit_only(Metric::RankCorrelation));
+        // #232: `interquartile` is the same polish on the middle-50 % window
+        // mean, so it is accepted and labelled as its own arm.
+        assert!(gpu_fit_metric_error(Metric::Interquartile).is_none());
+        assert!(interquartile_fit_only(Metric::Interquartile));
+        assert!(!interquartile_fit_only(Metric::Median));
+        assert!(order_stat_fit_only(Metric::Median));
+        assert!(order_stat_fit_only(Metric::Interquartile));
+        assert!(!order_stat_fit_only(Metric::Maximum));
+        assert!(!order_stat_fit_only(Metric::Slope));
+        assert!(!order_stat_fit_only(Metric::Absolute));
     }
 
     /// #226: the measured cost model, as a decision. Below the row floor the
@@ -4578,6 +4764,61 @@ mod tests {
         let below = median_fit_cost(MEDIAN_GPU_MIN_ROWS - 1, 4, 8);
         assert!(!median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS - 1, 4, 8));
         assert!(below.cpu_s > 0.0 && below.gpu_s > 0.0);
+    }
+
+    /// #232: the interquartile cost model is a decision, not a guess. Below the
+    /// measured row floor the exact CPU arm stays; at and above it the device
+    /// wins for every constant count the kernel accepts, the model is monotone
+    /// in `n` and in `p`, and its CPU side is the median arm's per-trial cost
+    /// (predict + sort) by construction.
+    #[test]
+    fn the_interquartile_cost_model_prefers_the_device_only_above_its_row_floor() {
+        assert!(!interquartile_gpu_fit_worthwhile(
+            INTERQUARTILE_GPU_MIN_ROWS - 1,
+            4,
+            8
+        ));
+        for p in 1..=20 {
+            assert!(
+                interquartile_gpu_fit_worthwhile(INTERQUARTILE_GPU_MIN_ROWS, p, 8),
+                "p={p} must be admitted at the floor"
+            );
+            assert!(
+                interquartile_gpu_fit_worthwhile(154_000, p, 8),
+                "p={p} must be admitted at 154k rows"
+            );
+            assert!(
+                interquartile_fit_cost(154_000, p, 8).speedup() > 1.0,
+                "p={p}: the model must show a speed-up at 154k rows"
+            );
+        }
+        // Monotone in the sample size and in the constant count.
+        let small = interquartile_fit_cost(5_000, 4, 8);
+        let large = interquartile_fit_cost(154_000, 4, 8);
+        assert!(large.speedup() > small.speedup());
+        assert!(
+            interquartile_fit_cost(154_000, 8, 8).speedup()
+                > interquartile_fit_cost(154_000, 1, 8).speedup()
+        );
+        // The floor itself is admitted and the row below it is not.
+        let floor = interquartile_fit_cost(INTERQUARTILE_GPU_MIN_ROWS, 4, 8);
+        assert!(floor.prefers_gpu(), "floor cost {floor:?}");
+        assert!(floor.cpu_s > 0.0 && floor.gpu_s > 0.0);
+        // The CPU side is the median arm's per-trial cost: the two metrics sort
+        // the same residual multiset.
+        let iqr = interquartile_fit_cost(154_000, 4, 8);
+        let med = median_fit_cost(154_000, 4, 8);
+        assert_eq!(iqr.cpu_s.to_bits(), med.cpu_s.to_bits());
+        // Label and device code are distinct, so the C entry point cannot mix
+        // the two statistics up.
+        assert_eq!(OrderStat::for_metric(Metric::Interquartile), Some(OrderStat::Interquartile));
+        assert_eq!(OrderStat::for_metric(Metric::Median), Some(OrderStat::Median));
+        assert_eq!(OrderStat::for_metric(Metric::Absolute), None);
+        assert_ne!(
+            OrderStat::Interquartile.device_code(),
+            OrderStat::Median.device_code()
+        );
+        assert_eq!(OrderStat::Interquartile.label(), "interquartile");
     }
 
     #[test]

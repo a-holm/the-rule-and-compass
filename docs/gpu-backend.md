@@ -440,17 +440,20 @@ per-row weight array the evaluator does not carry, or a different set of rows
 every generation; the reason is printed in the one-line note.
 
 The exception is the **fit** stage: `--fit-strategy gpu` moves the constants of
-a rank (`rank_correlation` / `rank_correlation_signed`) or median run on the
-device — the exact rank stage of
-[#230](#exact-rank-correlation-fitting-issue-230) and the exact median polish of
-[#226](#median-absolute-error-fitting-issue-226) — but their **fitness is still
-the CPU objective** and the backend stays `cpu` with
+a rank (`rank_correlation` / `rank_correlation_signed`), median or interquartile
+run on the device — the exact rank stage of
+[#230](#exact-rank-correlation-fitting-issue-230), the exact median polish of
+[#226](#median-absolute-error-fitting-issue-226) and the middle-50 % window
+polish of
+[#232](#interquartile-absolute-error-fitting-issue-232) — but their **fitness is
+still the CPU objective** and the backend stays `cpu` with
 `backend_reason = "metric is not scored natively on the GPU"`. `GpuSearch`'s
 `native_metric` is false for these arms, so every candidate is scored by the CPU
 evaluator exactly as before; only the `gpu.fit` counters (and the device field)
-record the device use. The median arm additionally needs at least
-[`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows, the
-measured crossover below which the CPU polish is cheaper; a smaller sample
+record the device use. The median and interquartile arms additionally need at
+least [`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 and
+[`INTERQUARTILE_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows,
+the measured crossovers below which the CPU polish is cheaper; a smaller sample
 keeps the CPU arm and records that reason.
 
 Fallback and the flags:
@@ -889,8 +892,8 @@ constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `metric_not_native` (no device fit objective for the configured metric),
 `ill_conditioned`, `non_finite`, `launch`, or — for the fit-only arms — the
-`rank_declined` (#230) and `median_declined` (#226) causes (the device declined
-the call and the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
+`rank_declined` (#230), `median_declined` (#226) and `interquartile_declined`
+(#232) causes (the device declined the call and the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
@@ -1386,9 +1389,9 @@ change), and since #228 it also guarantees *where the proposal came from*:
 * `BatchedFitter::fit_batch_metric` receives the metric. Its default
   implementation delegates for the squared family (`squared`, `aic`, `aicc`,
   `bic`) and returns `None` for every other metric, so a backend that only knows
-  squared error can never answer `signed`, `absolute`, `median`, `maximum`,
-  `correlation`, … . `BatchedGpu` overrides it with the device loss registry
-  (`fit::fit_loss`) plus the signed warm start below.
+  squared error can never answer `signed`, `absolute`, `median`,
+  `interquartile`, `maximum`, `correlation`, … . `BatchedGpu` overrides it with
+  the device loss registry (`fit::fit_loss`) plus the signed warm start below.
 * `verify_proposal` completes a `signed` proposal with the exact `f64`
   constrained-LS projection (`fit::signed_projection`) **before** comparing, and
   accepts only when the achieved `|Σ wᵢ rᵢ| / Σ wᵢ` is finite, no worse, and
@@ -1636,6 +1639,8 @@ substitute for either.
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
+| Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
+| `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 | `absolute` paired fit stage and end-to-end quality | RTX 3060, `bench_batched_fit_absolute` and `bench_end_to_end` (`RCSR_BENCH_METRIC=absolute`) | **measured on one workload** — 32.4–35.7× fit stage, no-worse 64/64 at `p=4,8`, 3.55× end-to-end, 6.0 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 
 The compile gap is closed by the test and table above; it can be re-run on any
@@ -1958,6 +1963,141 @@ device, single-output unweighted full-sample data, `--fit-iters > 0` and
 `n ≥ 4 096`. It is **fit-only**: the evaluator has no native median scorer, so
 every fitness value is the CPU median, the backend stays `cpu`, and the device
 use is recorded in `gpu.fit` (with `median_declined` among the labelled
-causes). Native median scoring on the device is open; the interquartile arm
-needs the weighted assembly that the `absolute` objective will land
-(`l1-quantile.md` §4.2–4.3) and stays a follow-up.
+causes). Native median scoring on the device is open; the interquartile arm is
+[#232](#interquartile-absolute-error-fitting-issue-232) below.
+
+## Interquartile absolute error fitting (issue #232)
+
+`--metric interquartile` scores the **mean of the absolute residuals between the
+25th and 75th percentile**, `metrics::interquartile_mean_abs`: with
+`a = sorted |rᵢ|` and `n = a.len()`,
+
+```
+n < 4 :  mean(a)                        (no window; the CPU small-n rule)
+else  :  mean(a[n / 4 .. (3 * n) / 4])   (integer division, so ⌊·⌋)
+```
+
+The CPU arm is the same family as `median` (#226): a squared pre-fit followed by
+`coordinate_polish` on that window mean — six ladder steps per constant
+(`±10 %, ±3 %, ±1 %` of `max(|c|,1)`), the **first strict improver** committed,
+up to 12 sweeps, each trial paying a full prediction sweep **and** a full sort.
+
+#232 runs that ladder on the device through the same driver as #226
+(`fit::polish_order_stat_batch`, one `fit::OrderStat` switch), so the two arms
+cannot drift:
+
+1. the same `LADDER` table, the same constant order, the first strict improver,
+   at most `min(sweeps, 12)` sweeps;
+2. the same objective, scored from the resident **exact `f64`** rows;
+3. the same contract: a declined call (`None`) hands the batch to the exact CPU
+   arm with a labelled cause.
+
+**Rank window, not a value range.** The window is `[⌊n/4⌋, ⌊3n/4⌋)` by *rank*.
+Selecting "every key in `[a[lo], a[hi−1]]`" is wrong when the top boundary value
+repeats: `a = 1, 2, 3, 3` (`n = 4`) averages `2, 3` in the window (`2.5`) but
+`2, 3, 3` over the value range (`8/3`). A device test pins `2.5` and asserts the
+value-range answer is rejected. The device therefore selects ranks from the same
+`u64` bit-pattern sort the median arm uses (`rc_order_stat_score_batch`, `what =
+1`) and averages exactly those ranks.
+
+**Ties.** The window mean is a function of the multiset `{|rᵢ|}`, so ties cannot
+change the value at either boundary, and CUB's radix sort is stable (equal keys
+keep row order), so the selected *set* is reproducible as well. Tests cover all
+tied residuals, an all-equal multiset, a top-boundary tie, a bottom-boundary
+tie, half the rows tied at the top, and `n = 2..9` (the `n < 4` fallback).
+
+**Exactness and the f32 boundary risk.** The window sum is a **fixed 256-thread
+tree reduction** over ranks `[lo, hi)` (`k_order_stat_pick`), because a
+single-thread left-to-right sum is bit-identical to the CPU but costs ~200 µs
+per trial at 154 000 rows. The consequence is stated exactly:
+
+* the interquartile device score is deterministic (fixed window, fixed thread
+  count, no float atomics) and agrees with `metrics::score_weighted` to
+  **≤ 1e-12 relative** — not bit for bit, unlike the median pick, which is a
+  single value. Tests assert the relative bound, not equality of bits;
+* the boundary *risk* is one ulp: moving one boundary row by one ulp moves the
+  mean by at most `ulp / window`, pinned by a unit test. The arm predicts in
+  `f64` from the exact resident rows, so this does not arise on the scored path;
+  only the missing-f64-twin fallback in `rc_order_stat_score_batch` casts
+  `f32 → f64`, where one boundary row can move by one **f32** ulp (2.4e-7 at
+  `|r| = 2`), i.e. ~3e-8 of the window mean — far above the 1e-12 parity
+  tolerance. That is why the search always uploads the f64 twins and why the
+  f32 path is not a parity path.
+
+**Metric-aware gate and refit.** The device proposal passes through
+`fit_batch_verified`/`fit_pending`, which score the **configured interquartile
+window mean** in exact `f64`; a proposal is accepted only when the window mean is
+finite and no worse. A test builds a proposal whose window mean is exactly `0`
+while its SSE is strictly larger than the least-squares optimum's and asserts it
+is accepted for `interquartile` — an SSE gate would reject it. A squared-only
+backend returns `None` for an interquartile request and the exact CPU arm runs
+instead. Finalists are refit by `refit_finalists_exact` →
+`fit_weighted_metric(.., interquartile)`. That refit is monotone but not
+bit-idempotent: the arm restarts from a squared pre-fit, so a second pass begins
+the LM at the polished constants and can land on a marginally different squared
+optimum. The guarantee is "never worse", and that is what the test pins.
+
+**Fallbacks (all labelled).** A candidate is offered only with a GPU fit plan
+(`p ≤ 20`, ≤ 96 nodes, no shared block constants, analytic operators) and at
+least `32p` rows. Every other candidate — and every batch the device marks
+non-finite (`non_finite`), ill-conditioned (`ill_conditioned`), launches badly
+(`launch`) or whose interquartile call declines (`interquartile_declined`) — is
+refit by the exact CPU interquartile arm. The run-level decision has a reason
+too: the arm needs `n ≥ INTERQUARTILE_GPU_MIN_ROWS = 4 096`, and below it the
+CPU arm runs with `# gpu-fit: off (interquartile fit arm: the sample is too
+small for the device polish)` and the same string in `backend_reason`.
+`--no-fit` never enters the arm: the evaluator is not created and the archive
+is identical to the exact CPU run, bit for bit.
+
+**Measured fit stage (RTX 3060, machine shared with other jobs, best of three;
+3-constant sin/linear tree, `--fit-iters 8`, p = 3).**
+
+| rows `n` | CPU arm | CPU polish tail | GPU arm | one call (6 trials) | tail ratio |
+|---|---|---|---|---|---|
+| 2 000 | 15.3 ms | 8.2 ms | 5.0 ms | 0.18 ms | 3.4× |
+| 4 096 | 63.0 ms | 53.8 ms | 10.8 ms | 0.22 ms | 8.1× |
+| 10 000 | 109.7 ms | 92.0 ms | 15.6 ms | 0.37 ms | 14.7× |
+| 20 000 | 207.6 ms | 162.4 ms | 29.8 ms | 0.61 ms | 14.9× |
+| 50 000 | 710.7 ms | 563.8 ms | 75.9 ms | 1.68 ms | 18.0× |
+| 154 000 | 3 850.0 ms | 3 307.0 ms | 325.3 ms | 3.75 ms | 32.2× |
+
+The parallel window sum does not show up above the sort's noise: the six-trial
+call costs 3.75 ms at 154 000 rows, the same as the median arm's 4.00 ms. The
+cost model is the median arm's shape with measured constants
+(`IQR_GPU_CALL_S = 1.6e-4`, `IQR_GPU_ROW_S = 3.9e-9`, CPU side
+`MEDIAN_CPU_ROW_S`):
+
+```
+T_cpu_tail ≈ calls · (c_cpu · n)                    c_cpu ≈ 3.3e-8 s/row
+T_gpu_tail ≈ calls · (t_fixed + 6 · c_gpu · n)      t_fixed ≈ 0.16 ms, c_gpu ≈ 3.9e-9 s/row
+calls = 1 + sweeps · p
+```
+
+`interquartile_fit_cost(n, p, sweeps)` exposes it, `interquartile_gpu_fit_worthwhile`
+is the decision, and the admission floor is **4 096 rows** — a row count, never
+a timing measurement. The model is deliberately conservative on the CPU side:
+the IQR ladder more often improves on every sweep and so runs all of them, while
+the model charges the median's per-trial coefficient.
+
+**Measured end to end (equal evaluations, seed 9, `bench_end_to_end`).**
+
+| cell | exact CPU | GPU fit + CPU scoring | speed-up | best error | fallbacks | fit stage |
+|---|---|---|---|---|---|---|
+| `N = 20 000`, `pop = 48`, 2 gens, 1 island (a 3-constant tanh fit reaches the final answer on the device) | 2.86 s | 1.13 s | 2.5× | 5.39e-1 / **1.57e-1** | 1/80 = 1.2 % (`ill_conditioned`) | 0.33 s = 29 % of wall |
+| `N = 50 000`, `pop = 96`, 2 gens, 1 island | 17.33 s | 4.25 s | 4.1× | 4.05e-1 / 4.05e-1 (same) | 3/96 = 3.1 % (`ill_conditioned`) | 1.28 s = 30 % of wall |
+
+The 50 000-row cell reaches the same archive best and hypervolume (0.348) and the
+same time-to-target generation, 9.6× sooner in wall time (1.8 s vs 17.3 s). The
+20 000-row cell's lower error is a trajectory effect (the device warm start finds
+a different minimum of a non-convex objective), not a quality guarantee; the
+guarantee is per candidate: the gate never accepts a worse window mean. The
+`gpu.accounting` duty counter reads 0.0 % on these runs because a fit-only arm
+does not feed the evaluator accounting; the device-time share is the fit stage's
+`fit_ms / wall` (0.23 s / 4.25 s in the 50 000-row cell).
+
+**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
+device, single-output unweighted full-sample data, `--fit-iters > 0` and
+`n ≥ 4 096`. It is **fit-only**: the evaluator has no native interquartile
+scorer, so every fitness value is the CPU window mean, the backend stays `cpu`,
+and the device use is recorded in `gpu.fit` (with `interquartile_declined` among
+the labelled causes).

@@ -764,9 +764,16 @@ fn bench_end_to_end() {
     let metric = match std::env::var("RCSR_BENCH_METRIC").as_deref() {
         Ok("log_squashed") | Ok("log-squashed") | Ok("log") => Metric::LogSquashed,
         Ok("absolute") | Ok("mae") | Ok("l1") => Metric::Absolute,
+        // #232: the fit-only order-statistic arms, so the same paired
+        // measurement covers them.
+        Ok("median") => Metric::Median,
+        Ok("interquartile") | Ok("iqr") | Ok("iqmae") => Metric::Interquartile,
         _ => Metric::Squared,
     };
-    let train = if matches!(metric, Metric::LogSquashed | Metric::Absolute) {
+    let train = if matches!(
+        metric,
+        Metric::LogSquashed | Metric::Absolute | Metric::Median | Metric::Interquartile
+    ) {
         sample_with_outliers(n, 21)
     } else {
         sample(n, 21)
@@ -985,7 +992,7 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
         .filter(|m| {
             rcsr::fit::fit_loss(**m).is_none()
                 && rcsr::fit::rank_fit_only(**m).is_none()
-                && !rcsr::fit::median_fit_only(**m)
+                && !rcsr::fit::order_stat_fit_only(**m)
         })
         .map(|m| m.name())
         .collect();
@@ -1004,6 +1011,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     assert!(
         !refused.contains(&"median"),
         "median is fitted by the exact median polish since #226 and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"interquartile"),
+        "interquartile is fitted by the same device polish since #232 and must not be refused"
     );
     assert!(
         !refused.contains(&"log_loss"),

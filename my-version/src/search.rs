@@ -710,8 +710,9 @@ impl GpuSearch {
         // labelled rather than guessed.
         let fit_loss = crate::fit::fit_loss(cfg.metric);
         let rank_loss = crate::fit::rank_fit_only(cfg.metric);
-        // #226: `median` has no LM loss but its own exact device polish.
-        let median_arm = crate::fit::median_fit_only(cfg.metric);
+        // #226/#232: `median` and `interquartile` have no LM loss but their own
+        // exact device polish on the same squared start and ladder.
+        let order_stat_arm = crate::fit::order_stat_fit_only(cfg.metric);
         // #234: a single-class fit sample has no finite log-loss optimum. The
         // counts come from the same midpoint rule the CPU arm uses, so the
         // device never fits a sign the sample does not support.
@@ -725,7 +726,7 @@ impl GpuSearch {
                 continue;
             }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
-                _ if fit_loss.is_none() && rank_loss.is_none() && !median_arm => {
+                _ if fit_loss.is_none() && rank_loss.is_none() && !order_stat_arm => {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
                 }
                 Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
@@ -748,11 +749,13 @@ impl GpuSearch {
             let plans: Vec<&crate::fit::GpuFitPlan> = jobs.iter().map(|(_, _, p)| p).collect();
             // #230: the rank family runs its own device arm — the same squared
             // LM start as `fit_weighted_metric`, followed by the batched exact
-            // rank polish under the same first-improver ladder. #226: `median`
-            // does the same on the exact median objective. Every other metric
-            // stays on the LM kernel of #169/#229.
-            let (out, ms) = if median_arm {
-                self.ev.median_fit_batch(&plans, cfg.fit_iters)
+            // rank polish under the same first-improver ladder. #226/#232:
+            // `median` and `interquartile` do the same on their own exact order
+            // statistic. Every other metric stays on the LM kernel of
+            // #169/#229.
+            let want = crate::fit::OrderStat::for_metric(cfg.metric);
+            let (out, ms) = if let Some(want) = want {
+                self.ev.order_stat_fit_batch(&plans, cfg.fit_iters, want)
             } else {
                 match crate::fit::rank_metric_signed(cfg.metric) {
                     Some(signed) => self
@@ -760,7 +763,7 @@ impl GpuSearch {
                         .rank_fit_batch(&plans, cfg.fit_iters, &train.y, signed),
                     None => {
                         let loss = fit_loss.expect(
-                            "jobs is only filled when a native, rank or median arm exists",
+                            "jobs is only filled when a native, rank or order-statistic arm exists",
                         );
                         self.ev.fit_batch(&plans, cfg.fit_iters, loss)
                     }
@@ -814,8 +817,8 @@ impl GpuSearch {
                     } else {
                         let cause = if !finite {
                             FitFallbackCause::NonFinite
-                        } else if median_arm {
-                            median_status_fallback_cause(res.status)
+                        } else if let Some(want) = want {
+                            order_stat_status_fallback_cause(res.status, want)
                         } else {
                             status_fallback_cause(res.status)
                         };
@@ -1568,25 +1571,25 @@ fn rank_fit_only_arm(cfg: &Config, train: &Sample) -> Option<bool> {
     Some(signed)
 }
 
-/// #226: `Some(reason)` when a `--metric median` run with
-/// `--fit-strategy gpu` must keep the exact CPU fit arm for this run.
+/// #226/#232: `Some(reason)` when a `--metric median` or `--metric
+/// interquartile` run with `--fit-strategy gpu` must keep the exact CPU fit arm
+/// for this run.
 ///
-/// The device median polish is a **fit-only** arm (`native_metric = false`:
-/// the evaluator cannot score a median), so it reuses the rank arm's gates and
-/// adds one measured cost-model check: below
-/// [`crate::fit::MEDIAN_GPU_MIN_ROWS`] the per-call latency of the batched
-/// selection is not repaid by a small sample, and the CPU polish stays. The
-/// reason is recorded in the backend note and the run's `backend_reason`, so a
-/// CPU fallback here is labelled, never silent. `None` for a run that is not a
-/// median GPU-fit run at all.
+/// The device order-statistic polish is a **fit-only** arm (`native_metric =
+/// false`: the evaluator cannot score a median or an interquartile mean), so it
+/// reuses the rank arm's gates and adds one measured cost-model check per
+/// metric: below [`crate::fit::MEDIAN_GPU_MIN_ROWS`] (median) or
+/// [`crate::fit::INTERQUARTILE_GPU_MIN_ROWS`] (interquartile) the per-call
+/// latency of the batched selection is not repaid by a small sample, and the
+/// CPU polish stays. The reason is recorded in the backend note and the run's
+/// `backend_reason`, so a CPU fallback here is labelled, never silent. `None`
+/// for a run that is not an order-statistic GPU-fit run at all.
 #[cfg(feature = "cuda")]
-fn median_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
-    if !crate::fit::median_fit_only(cfg.metric)
-        || !cfg.fit_strategy.defers_to_gpu()
-        || cfg.fit_iters == 0
-    {
-        return None;
-    }
+fn order_stat_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    let want = match crate::fit::OrderStat::for_metric(cfg.metric) {
+        Some(want) if cfg.fit_strategy.defers_to_gpu() && cfg.fit_iters > 0 => want,
+        _ => return None,
+    };
     if train.is_multi() {
         return Some("multi-output objective");
     }
@@ -1600,8 +1603,18 @@ fn median_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static str>
     if fit_rows > 0 && fit_rows < train.len() {
         return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
     }
-    if !crate::fit::median_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters) {
-        return Some("median fit arm: the sample is too small for the device polish");
+    let (worthwhile, why) = match want {
+        crate::fit::OrderStat::Median => (
+            crate::fit::median_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters),
+            "median fit arm: the sample is too small for the device polish",
+        ),
+        crate::fit::OrderStat::Interquartile => (
+            crate::fit::interquartile_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters),
+            "interquartile fit arm: the sample is too small for the device polish",
+        ),
+    };
+    if !worthwhile {
+        return Some(why);
     }
     None
 }
@@ -2099,6 +2112,9 @@ pub enum FitFallbackCause {
     /// #226: the device median stage declined (allocation, launch or an
     /// inconsistent score) and the exact CPU median arm took over.
     MedianDeclined,
+    /// #232: the device interquartile stage declined (allocation, launch or an
+    /// inconsistent score) and the exact CPU interquartile arm took over.
+    InterquartileDeclined,
     /// #234: the fit sample holds one class, so the unconstrained log-loss has
     /// no finite minimiser. The exact CPU arm keeps the candidate rather than
     /// fitting a sign no row supports.
@@ -2110,7 +2126,7 @@ pub enum FitFallbackCause {
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 11] = [
+    pub const ALL: [FitFallbackCause; 12] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -2120,6 +2136,7 @@ impl FitFallbackCause {
         FitFallbackCause::Launch,
         FitFallbackCause::RankDeclined,
         FitFallbackCause::MedianDeclined,
+        FitFallbackCause::InterquartileDeclined,
         FitFallbackCause::SingleClass,
         FitFallbackCause::LogLossWorse,
     ];
@@ -2136,6 +2153,7 @@ impl FitFallbackCause {
             FitFallbackCause::Launch => "launch",
             FitFallbackCause::RankDeclined => "rank_declined",
             FitFallbackCause::MedianDeclined => "median_declined",
+            FitFallbackCause::InterquartileDeclined => "interquartile_declined",
             FitFallbackCause::SingleClass => "single_class",
             FitFallbackCause::LogLossWorse => "log_loss_worse",
         }
@@ -2162,14 +2180,21 @@ fn status_fallback_cause(status: i32) -> FitFallbackCause {
     }
 }
 
-/// #226: the median arm's status 3 is its own labelled cause, so a declined
-/// median polish is never reported as a declined rank polish.
+/// #226/#232: the order-statistic arm's status 3 is its own labelled cause, so
+/// a declined median polish is never reported as a declined rank polish, and a
+/// declined interquartile polish is never reported as a declined median one.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn median_status_fallback_cause(status: i32) -> FitFallbackCause {
+fn order_stat_status_fallback_cause(
+    status: i32,
+    want: crate::fit::OrderStat,
+) -> FitFallbackCause {
     match status {
         1 => FitFallbackCause::IllConditioned,
         2 => FitFallbackCause::NonFinite,
-        3 => FitFallbackCause::MedianDeclined,
+        3 => match want {
+            crate::fit::OrderStat::Median => FitFallbackCause::MedianDeclined,
+            crate::fit::OrderStat::Interquartile => FitFallbackCause::InterquartileDeclined,
+        },
         _ => FitFallbackCause::UnsupportedPlan,
     }
 }
@@ -2282,7 +2307,7 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
         && cfg.fit_iters > 0
         && (crate::fit::fit_loss(cfg.metric).is_some()
             || crate::fit::rank_fit_only(cfg.metric).is_some()
-            || crate::fit::median_fit_only(cfg.metric))
+            || crate::fit::order_stat_fit_only(cfg.metric))
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -3879,15 +3904,16 @@ fn run_search(
         // scored by the CPU (`native_metric = false`). The backend itself stays
         // `cpu`, and `backend_reason` names the open native scorer.
         //
-        // #226: `--metric median` uses the same fit-only shape with the batched
-        // exact median polish. Its measured cost-model gate can decline the
-        // arm for a small sample; that refusal is recorded as the reason.
-        let median_blocker = median_fit_only_blocker(cfg, train);
+        // #226/#232: `--metric median` and `--metric interquartile` use the
+        // same fit-only shape with the batched exact order-statistic polish.
+        // Their measured cost-model gate can decline the arm for a small
+        // sample; that refusal is recorded as the reason.
+        let order_stat_blocker = order_stat_fit_only_blocker(cfg, train);
         // `--no-fit` (or a non-gpu strategy) has nothing to fit on the device,
         // so the fit-only evaluator must not be created for it.
-        let median_fit = cfg.fit_strategy.defers_to_gpu()
+        let order_stat_fit = cfg.fit_strategy.defers_to_gpu()
             && cfg.fit_iters > 0
-            && crate::fit::median_fit_only(cfg.metric);
+            && crate::fit::order_stat_fit_only(cfg.metric);
         // #234: `log_loss` has a native *fit* objective (the batched LM
         // kernel) and no native fitness, so it uses the same fit-only shape:
         // the device moves constants, the exact CPU log-loss scores.
@@ -3895,7 +3921,7 @@ fn run_search(
             && cfg.fit_iters > 0
             && crate::fit::fit_only_loss(cfg.metric).is_some();
         let fit_only = rank_fit_only_arm(cfg, train).is_some()
-            || (median_fit && median_blocker.is_none())
+            || (order_stat_fit && order_stat_blocker.is_none())
             || logistic_fit;
         let plan: Option<(crate::fit::DeviceLoss, bool)> = if fit_only {
             backend_reason = Some(if logistic_fit {
@@ -3972,11 +3998,21 @@ fn run_search(
                                      finalists — the evaluator has no label semantics, #234)",
                                     device, scheduling
                                 );
-                            } else if crate::fit::median_fit_only(cfg.metric) {
+                            } else if let Some(want) =
+                                crate::fit::OrderStat::for_metric(cfg.metric)
+                            {
                                 eprintln!(
-                                    "# gpu-fit: {} ({}; exact median polish, CPU f64 \
-                                     fitness — native median scoring is open, #226)",
-                                    device, scheduling
+                                    "# gpu-fit: {} ({}; exact {} polish, CPU f64 \
+                                     fitness — native {} scoring is open, #{})",
+                                    device,
+                                    scheduling,
+                                    want.label(),
+                                    want.label(),
+                                    if want == crate::fit::OrderStat::Median {
+                                        "226"
+                                    } else {
+                                        "232"
+                                    }
                                 );
                             } else {
                                 eprintln!(
@@ -4019,16 +4055,27 @@ fn run_search(
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
             "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank and median \
-             objectives; --metric must be squared, log_squashed, absolute, aic, \
-             aicc, bic, rank_correlation, rank_correlation_signed or median)"
+             log-squashed, mean absolute error or the exact rank, median and \
+             interquartile objectives; --metric must be squared, log_squashed, \
+             absolute, aic, aicc, bic, rank_correlation, rank_correlation_signed, \
+             median or interquartile)"
         );
     }
+    // #226/#232: only a run that actually asked for the device fit arm can be
+    // refused by it. `--no-fit` (or a CPU strategy) has nothing to fit, so it
+    // must not borrow this label.
     #[cfg(feature = "cuda")]
-    if cfg.gpu_notes && crate::fit::median_fit_only(cfg.metric) && gpu.is_none() {
-        let why = median_fit_only_blocker(cfg, train)
-            .unwrap_or("no usable device");
-        eprintln!("# gpu-fit: off ({}); the exact CPU median arm runs", why);
+    if cfg.gpu_notes
+        && cfg.fit_strategy.defers_to_gpu()
+        && cfg.fit_iters > 0
+        && crate::fit::order_stat_fit_only(cfg.metric)
+        && gpu.is_none()
+    {
+        let why = order_stat_fit_only_blocker(cfg, train).unwrap_or("no usable device");
+        let stat = crate::fit::OrderStat::for_metric(cfg.metric)
+            .map(|w| w.label())
+            .unwrap_or("median");
+        eprintln!("# gpu-fit: off ({}); the exact CPU {} arm runs", why, stat);
         if backend_reason.is_none() {
             backend_reason = Some(why.to_string());
         }
@@ -5334,6 +5381,7 @@ mod tests {
                 "launch",
                 "rank_declined",
                 "median_declined",
+                "interquartile_declined",
                 "single_class",
                 "log_loss_worse",
             ]
@@ -5368,18 +5416,47 @@ mod tests {
             status_fallback_cause(0),
             FitFallbackCause::UnsupportedPlan
         );
-        // #226: the median arm's declined polish has its own label and never
-        // borrows the rank one.
+        // #226/#232: each order-statistic arm's declined polish has its own
+        // label and never borrows the rank or the other statistic's one.
+        let median = crate::fit::OrderStat::Median;
+        let iqr = crate::fit::OrderStat::Interquartile;
         assert_eq!(
-            median_status_fallback_cause(3),
+            order_stat_status_fallback_cause(3, median),
             FitFallbackCause::MedianDeclined
         );
-        assert_eq!(median_status_fallback_cause(3).label(), "median_declined");
         assert_eq!(
-            median_status_fallback_cause(1),
+            order_stat_status_fallback_cause(3, median).label(),
+            "median_declined"
+        );
+        assert_eq!(
+            order_stat_status_fallback_cause(3, iqr),
+            FitFallbackCause::InterquartileDeclined
+        );
+        assert_eq!(
+            order_stat_status_fallback_cause(3, iqr).label(),
+            "interquartile_declined"
+        );
+        assert_ne!(
+            order_stat_status_fallback_cause(3, iqr),
+            order_stat_status_fallback_cause(3, median),
+            "the two declined causes must stay distinguishable"
+        );
+        assert_eq!(
+            order_stat_status_fallback_cause(1, iqr),
             FitFallbackCause::IllConditioned
         );
-        assert_eq!(median_status_fallback_cause(2), FitFallbackCause::NonFinite);
+        assert_eq!(
+            order_stat_status_fallback_cause(2, iqr),
+            FitFallbackCause::NonFinite
+        );
+        assert_eq!(
+            order_stat_status_fallback_cause(1, median),
+            FitFallbackCause::IllConditioned
+        );
+        assert_eq!(
+            order_stat_status_fallback_cause(2, median),
+            FitFallbackCause::NonFinite
+        );
     }
 
     /// #229: a metric without a native device objective is labelled
