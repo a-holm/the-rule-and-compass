@@ -232,8 +232,13 @@ __global__ void k_clv(const double *__restrict__ high, const double *__restrict_
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    if (!(isfinite(high[i]) && isfinite(low[i]) && isfinite(close[i]))) {
+        out[i] = NAN;
+        return;
+    }
     double r = high[i] - low[i];
-    out[i] = r > 0.0 ? ((close[i] - low[i]) - (high[i] - close[i])) / r : NAN;
+    // Compact definition: (C-L)/(H-L) - 1/2; H==L uses the compact -1/2.
+    out[i] = r > 0.0 ? (close[i] - low[i]) / r - 0.5 : -0.5;
 }
 
 __global__ void k_calendar(const long long *__restrict__ t, int n, int which,

@@ -118,7 +118,13 @@ fn gpu_columns_match_cpu_and_report_the_share() {
     assert_eq!(cpu.cpu_columns, cpu.features.len());
     assert!(gpu.gpu_columns > 0, "the cost model must dispatch a real kernel");
     assert_eq!(gpu.backend, "gpu");
-    assert_eq!(gpu.gpu_columns, cpu.features.len(), "every column has a kernel");
+    assert_eq!(
+        gpu.gpu_columns,
+        cpu.features.len(),
+        "every column has a kernel; plans={:?} fallback={}",
+        gpu.plans,
+        gpu.gpu_fallback
+    );
     assert_eq!(gpu.cpu_columns, 0);
     assert!((gpu.gpu_share - 1.0).abs() < 1e-12);
     assert_eq!(gpu.gpu_fallback, 0);

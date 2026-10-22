@@ -1296,9 +1296,12 @@ pub fn gpu_supports(name: &str) -> bool {
     if !cfg!(feature = "cuda") {
         return false;
     }
-    if is_compact(name) {
-        // The compact profile is computed by one CPU reference pass; no compact
-        // kernel is registered yet, so never claim GPU support for it.
+    if is_compact(name)
+        && !matches!(name, "clv1" | "dow_sin" | "dow_cos" | "macd_hist")
+    {
+        // The compact profile is computed by one CPU reference pass. Only the
+        // compact names whose arithmetic is already bit-identical to a
+        // registered kernel (clv1, weekday calendar, macd_hist) may dispatch.
         return false;
     }
     if name.starts_with("xs_rank_") {
@@ -4170,6 +4173,11 @@ fn enrich_inner(
         .filter(|n| !gpu_done.contains(*n))
         .cloned()
         .collect();
+    let cpu_compact: Vec<String> = compact_requested
+        .iter()
+        .filter(|n| !gpu_done.contains(*n))
+        .cloned()
+        .collect();
     let cpu_labels: Vec<(String, LabelSpec)> = labels
         .iter()
         .filter(|(n, _)| !gpu_done.contains(n))
@@ -4179,7 +4187,7 @@ fn enrich_inner(
         legacy: cpu_legacy,
         own: cpu_own,
         py15m_requested: cpu_py15m,
-        compact: compact_requested,
+        compact: cpu_compact,
         labels: cpu_labels,
         tf,
         cross: &cross,
