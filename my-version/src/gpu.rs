@@ -906,7 +906,12 @@ impl GpuEvaluator {
     ///
     /// #229: `w` is the base `--weight` row vector; an empty slice means
     /// unweighted and uploads no weight array (bit-for-bit the old path).
-    pub(crate) fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
+    ///
+    /// #228: public because it is part of the [`crate::fit::BatchedGpu`]
+    /// contract: a caller that drives a whole generation through
+    /// [`crate::fit::BatchedFitter`] must have uploaded the same rows (and the
+    /// same weights) it will verify the proposals on.
+    pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
         unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 }
     }

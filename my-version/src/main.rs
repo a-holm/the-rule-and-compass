@@ -330,7 +330,10 @@ SEARCH:
                              inverted model; the _signed variants score 1-r and
                              require the right direction. auc/log_loss/hinge treat
                              the target as two classes and reject targets with
-                             more than two distinct values.
+                             more than two distinct values. signed scores the
+                             absolute mean residual |mean(y-f)| (a weighted mean
+                             with --weight); it has a documented degeneracy: its
+                             optimum is a whole manifold at exactly 0.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -386,8 +389,11 @@ SEARCH:
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
                              log_squashed use IRLS; auc/log_loss/hinge use
-                             logistic IRLS; rank/order/correlation losses use a
-                             deterministic coordinate polish
+                             logistic IRLS; signed uses the squared fit plus a
+                             constrained least-squares projection onto the
+                             zero-mean-residual manifold (exact to f64, two
+                             passes, no optimiser); rank/order/correlation
+                             losses use a deterministic coordinate polish
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
@@ -412,10 +418,14 @@ SEARCH:
                              no-op). The kernel minimises one of those two
                              objectives, so `gpu` with any other metric is a
                              usage error; use `--metric squared`,
-                             `--metric log_squashed` or a CPU strategy
+                             `--metric log_squashed` or a CPU strategy.
+                             `--metric signed` is in that group: it keeps the
+                             exact CPU projection (#228) and says so, because
+                             the device has no native signed scorer yet (#236)
   --fit-report               print the constant-fitting arm counts (linear,
-                             varpro, stream, exact, GPU fallback/refit) at the
-                             end of the run (diagnostics only)
+                             varpro, stream, exact, GPU fallback/refit, signed
+                             projection labels) at the end of the run
+                             (diagnostics only)
   --fit-rows <N>             fit constants on a deterministic N-row subsample
                              and score/archive on all training rows (default 0
                              = off; N >= train rows is an exact full fit). The
@@ -4072,6 +4082,17 @@ fn main() {
             counts.gpu_refits
         );
         eprintln!("# fit: {}", fit::backend_description());
+        // #228: the signed-bias projection is the only non-squared metric with
+        // an exact closed-form arm. Its labels say why a candidate left the arm.
+        let signed: u64 = fit::signed_fit_counts().iter().map(|(_, n)| n).sum();
+        if signed > 0 {
+            let labels = fit::signed_fit_counts()
+                .iter()
+                .map(|(label, n)| format!("{}={}", label, n))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("# fit: signed projection [{}]", labels);
+        }
         if let Some(g) = &outcome.gpu {
             let causes = search::FitFallbackCause::ALL
                 .iter()

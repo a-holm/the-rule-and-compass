@@ -454,6 +454,128 @@ fn log_squashed_gpu_no_fit_is_a_true_noop() {
     }
 }
 
+/// #228: the CUDA LM kernel is a warm start for `--metric signed`; the exact
+/// `f64` constrained-LS projection completed on the host is what decides. The
+/// arm must reach the same constants as the CPU arm (both are on the
+/// zero-bias manifold) and must be deterministic.
+///
+/// A projection moves constants onto `Σ wᵢ rᵢ = 0` and therefore *raises* SSE,
+/// so this also proves the gate is metric-aware: a squared-SSE gate would
+/// reject the projection by construction.
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_arm_projects_the_device_proposal_exactly() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchStatus, BatchedGpu};
+    use rcsr::metrics::score_weighted;
+
+    // Two variables with an intercept: the squared LM gets close, the
+    // projection finishes the job in exact f64.
+    let s = sample(512, 5);
+    let x = s.x.clone();
+    let y = s.y.clone();
+    let n = y.len();
+    let nv = x[0].len();
+    let cols: Vec<f32> = (0..nv)
+        .flat_map(|v| x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let mut cols64 = vec![0.0f64; n * nv];
+    for (r, row) in x.iter().enumerate() {
+        for (v, &val) in row.iter().enumerate().take(nv) {
+            cols64[v * n + r] = val;
+        }
+    }
+    let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
+        Some(ev) => ev,
+        None => {
+            eprintln!("skipping GPU test: evaluator construction failed");
+            return;
+        }
+    };
+    assert!(
+        ev.set_fit_data(&cols64, &y, &[]),
+        "f64 fit rows uploaded"
+    );
+
+    let model = || {
+        rcsr::expr::node(
+            rcsr::expr::Op::Add,
+            vec![
+                rcsr::expr::node(
+                    rcsr::expr::Op::Mul,
+                    vec![rcsr::expr::constant(1.0), rcsr::expr::input(0)],
+                ),
+                rcsr::expr::constant(0.0),
+            ],
+        )
+    };
+    let objective = |t: &rcsr::expr::Node| {
+        let p: Vec<f64> = x.iter().map(|row| rcsr::expr::eval(t, row)).collect();
+        score_weighted(&p, &y, &[], Metric::Signed, rcsr::expr::count_constants(t))
+    };
+    let constants = |t: &rcsr::expr::Node| {
+        let mut out = Vec::new();
+        fn walk(n: &rcsr::expr::Node, out: &mut Vec<f64>) {
+            if n.op == rcsr::expr::Op::Const {
+                out.push(n.val);
+            }
+            for k in &n.kids {
+                walk(k, out);
+            }
+        }
+        walk(t, &mut out);
+        out
+    };
+
+    let mut batch = vec![model(), model()];
+    let backend = BatchedGpu::new(&mut ev);
+    let out = fit_batch_verified(&backend, &mut batch, &x, &y, &[], 8, Metric::Signed);
+    assert_eq!(
+        out.status,
+        vec![BatchStatus::Gpu, BatchStatus::Gpu],
+        "the device proposal must pass the signed gate"
+    );
+    // Each reported objective is the exact metric value at the final constants,
+    // at the f64 rounding scale of the bias: the intercept makes the optimum
+    // exactly 0 in exact arithmetic, not bit-identically in f64.
+    let scale = y.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+    for (i, t) in batch.iter().enumerate() {
+        assert_eq!(out.score[i].to_bits(), objective(t).to_bits());
+        assert!(
+            out.score[i] <= 1e-14 * scale,
+            "bias {:e} must be at the rounding scale",
+            out.score[i]
+        );
+    }
+    // Determinism: a second batch over fresh trees yields identical bits.
+    let mut again = vec![model(), model()];
+    let backend = BatchedGpu::new(&mut ev);
+    let out2 = fit_batch_verified(&backend, &mut again, &x, &y, &[], 8, Metric::Signed);
+    assert_eq!(
+        out.score.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        out2.score.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(constants(&batch[0]), constants(&again[0]));
+
+    // CPU parity: the exact arm from the same start reaches the same objective
+    // (the two constant sets may differ by f32 row rounding of the warm start,
+    // which the exact projection then removes).
+    let mut cpu = model();
+    let cpu_value = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Signed);
+    assert!(cpu_value <= 1e-14 * scale, "cpu bias {cpu_value:e}");
+    let (a, b) = (constants(&batch[0]), constants(&cpu));
+    for (ca, cb) in a.iter().zip(&b) {
+        assert!(
+            (ca - cb).abs() <= 1e-5 * (1.0 + cb.abs()),
+            "constant {ca} vs CPU {cb}"
+        );
+    }
+}
+
 /// #169 measurement (ignored): end-to-end wall time of a fit-heavy
 /// configuration on the CPU exact arm versus the GPU-fit arm.
 /// Run with `cargo test --release --features cuda --test gpu_fit bench_end_to_end -- --ignored --nocapture`.
