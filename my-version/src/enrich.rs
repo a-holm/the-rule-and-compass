@@ -39,7 +39,9 @@
 
 use crate::features::{self, LabelSpec};
 use crate::manifest::{self, Sha256Hasher};
-use crate::ohlcv::{civil_from_days, weekday, Bar, Timeframe};
+use crate::ohlcv::{
+    civil_from_days, join_causal, resample, weekday, Bar, Timeframe,
+};
 use crate::store::{self, AppendColumn, DType, FileStore};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -72,6 +74,7 @@ pub const GROUPS: &[&str] = &[
     "btc",
     "cross",
     "py15m",
+    "mtf",
     "compact",
     "flow",
     "all",
@@ -124,22 +127,91 @@ pub fn flow_names() -> Vec<String> {
     FLOW_NAMES.iter().map(|s| s.to_string()).collect()
 }
 
+/// Higher timeframes materialised by the multi-timeframe family.
+pub const MTF_TIMEFRAMES: &[&str] = &["1h", "4h", "1d"];
+
+/// The twelve feature names per higher timeframe.
+///
+/// Their windows count **higher-timeframe bars**, not base bars. Every window
+/// requires contiguous higher buckets; a gap makes the window `NaN`.
+pub const MTF_LEAVES: &[&str] = &[
+    "ret1",
+    "ret4",
+    "ret24",
+    "ma_ratio",
+    "vol",
+    "atr_pct",
+    "rsi",
+    "close_pos",
+    "donchian_pos",
+    "range_pct",
+    "trend_slope",
+    "bar_age",
+];
+
 /// Multi-timeframe context columns from the default financial feature set.
 ///
-/// They are registered now and will be produced by the MTF join pass; until that
-/// pass lands in `rcsr enrich` they are explicitly unavailable rather than
-/// silently missing. The 15 m bars needed to build them are present.
+/// The names are `mtf_<timeframe>_<leaf>` (`mtf_1h_ret1`, ..., `mtf_1d_bar_age`),
+/// twelve leaves for each of [`MTF_TIMEFRAMES`] — 36 columns in total. The
+/// registry and `rcsr schema` use this function as their single source of
+/// truth; a name that is not returned here is not an MTF feature.
 pub fn mtf_names() -> Vec<String> {
     let mut out = Vec::new();
-    for tf in ["h1", "h4", "d1"] {
-        for leaf in [
-            "ret1", "ma20_ratio", "ma60_ratio", "vol20", "atr14_pct", "rsi14",
-            "bb20_z", "channel_pos96", "don_slope", "ema20_ratio", "range1", "bar_age",
-        ] {
-            out.push(format!("{}_{}", tf, leaf));
+    for tf in MTF_TIMEFRAMES {
+        for leaf in MTF_LEAVES {
+            out.push(format!("mtf_{}_{}", tf, leaf));
         }
     }
     out
+}
+
+/// True when `name` belongs to the multi-timeframe family.
+pub fn is_mtf(name: &str) -> bool {
+    mtf_parts(name).is_some()
+}
+
+fn mtf_parts(name: &str) -> Option<(&str, &str)> {
+    let (tf, leaf) = name.strip_prefix("mtf_")?.split_once('_')?;
+    if MTF_TIMEFRAMES.contains(&tf) && MTF_LEAVES.contains(&leaf) {
+        Some((tf, leaf))
+    } else {
+        None
+    }
+}
+
+/// Nominal warm-up, in higher-timeframe bars, for one MTF leaf.
+pub fn mtf_warmup(leaf: &str) -> usize {
+    match leaf {
+        "ret1" => 1,
+        "ret4" => 4,
+        "ret24" => 24,
+        "ma_ratio" => 19,
+        "vol" => 20,
+        "atr_pct" | "rsi" => 14,
+        "close_pos" | "range_pct" | "bar_age" => 0,
+        "donchian_pos" => 19,
+        "trend_slope" => 39,
+        _ => 0,
+    }
+}
+
+/// Formula text for one MTF leaf, in higher-timeframe bars.
+fn mtf_formula(leaf: &str) -> &'static str {
+    match leaf {
+        "ret1" => "C_t/C_{t-1} - 1",
+        "ret4" => "C_t/C_{t-4} - 1",
+        "ret24" => "C_t/C_{t-24} - 1",
+        "ma_ratio" => "C_t/MA20_t - 1",
+        "vol" => "population sd of one-bar simple returns over 20 bars",
+        "atr_pct" => "ATR14_t/C_t (Wilder, seeded on 14 contiguous true ranges)",
+        "rsi" => "RSI14_t/50 - 1",
+        "close_pos" => "(C_t-L_t)/(H_t-L_t) - 0.5",
+        "donchian_pos" => "(C_t-min L20)/(max H20-min L20) - 0.5",
+        "range_pct" => "(H_t-L_t)/C_t",
+        "trend_slope" => "MA20_t/MA20_{t-20} - 1",
+        "bar_age" => "base_time - (higher.time + timeframe_seconds)",
+        _ => "higher-timeframe feature",
+    }
 }
 
 /// Candle/price-action columns from the default set that do not yet have an
@@ -338,12 +410,6 @@ pub const DERIVATIVE_NAMES: &[&str] = &[
 
 /// Reason a registered name cannot be computed yet, if it is unavailable.
 pub fn unavailable_reason(name: &str) -> Option<&'static str> {
-    if mtf_names().iter().any(|n| n == name) {
-        return Some(
-            "multi-timeframe resample/join pass is not wired into rcsr enrich yet; \
-             the 15m source bars are available",
-        );
-    }
     if PRICE_ACTION_NAMES.contains(&name) {
         return Some(
             "candle/price-action producer is registered but not implemented in rcsr enrich yet; \
@@ -615,27 +681,25 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             name,
         });
     }
-    // Registered but not materialised yet.
-    for name in mtf_names() {
-        let family = name.split('_').next().unwrap_or("mtf");
-        let family: &'static str = match family {
-            "h1" => "mtf_h1",
-            "h4" => "mtf_h4",
-            "d1" => "mtf_d1",
-            _ => "mtf",
-        };
-        push_unique(&mut out, RegistryEntry {
-            name: name.clone(),
-            family,
-            timeframe: family,
-            warmup: 0,
-            available: false,
-            derived: false,
-            formula: "higher-timeframe resample + causal as-of join".to_string(),
-            source: "15m base bars",
-            pit: "last closed higher-timeframe bar strictly before t",
-            reason: unavailable_reason(&name).map(|s| s.to_string()),
-        });
+    // Multi-timeframe family: 12 leaves x {1h,4h,1d}. The join is causal and
+    // the partial current higher bucket is never visible.
+    for tf in MTF_TIMEFRAMES {
+        for leaf in MTF_LEAVES {
+            let name = format!("mtf_{}_{}", tf, leaf);
+            push_unique(&mut out, RegistryEntry {
+                name,
+                family: "mtf",
+                timeframe: tf,
+                warmup: mtf_warmup(leaf),
+                available: true,
+                derived: false,
+                formula: format!("resample to {}; {}; causal close join", tf, mtf_formula(leaf)),
+                source: "base OHLCV bars",
+                pit: "higher.time + timeframe_seconds() <= t; last closed higher bar only; \
+                      partial/current higher bar never used; gaps are NaN",
+                reason: None,
+            });
+        }
     }
     for name in PRICE_ACTION_NAMES {
         push_unique(&mut out, RegistryEntry {
@@ -890,6 +954,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "btc" => btc_names(),
             "cross" => cross_names(),
             "py15m" => py15m_names(),
+            "mtf" => mtf_names(),
             "compact" => compact_names(),
             "flow" => flow_names(),
             "all" => {
@@ -933,7 +998,11 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
 
 /// Names implemented by this module (as opposed to delegated to #125).
 pub fn is_own(name: &str) -> bool {
-    if is_compact(name) || FLOW_NAMES.contains(&name) || cross_names().iter().any(|n| n == name) {
+    if is_compact(name)
+        || FLOW_NAMES.contains(&name)
+        || is_mtf(name)
+        || cross_names().iter().any(|n| n == name)
+    {
         return true;
     }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
@@ -1036,6 +1105,9 @@ pub fn nominal_warmup(name: &str) -> usize {
     }
     if cross_names().iter().any(|n| n == name) {
         return cross_warmup(name);
+    }
+    if let Some((_, leaf)) = mtf_parts(name) {
+        return mtf_warmup(leaf);
     }
     if let Some(w) = compact_warmup(name) {
         return w;
@@ -1493,6 +1565,9 @@ pub fn family_of(name: &str) -> &'static str {
     }
     if is_compact(name) {
         return compact_family(name);
+    }
+    if is_mtf(name) {
+        return "mtf";
     }
     if name.starts_with("r") && name[1..].parse::<usize>().is_ok() {
         "returns"
@@ -2389,6 +2464,314 @@ fn donchian(s: &Series, w: usize) -> Vec<f64> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Multi-timeframe family
+// ---------------------------------------------------------------------------
+
+fn series_from_bars(bars: &[Bar], step: i64) -> Series {
+    Series {
+        symbol: String::new(),
+        times: bars.iter().map(|b| b.time).collect(),
+        open: bars.iter().map(|b| b.open).collect(),
+        high: bars.iter().map(|b| b.high).collect(),
+        low: bars.iter().map(|b| b.low).collect(),
+        close: bars.iter().map(|b| b.close).collect(),
+        volume: bars.iter().map(|b| b.volume).collect(),
+        quote_volume: bars.iter().map(|b| b.quote_volume).collect(),
+        trades: bars.iter().map(|b| b.trades).collect(),
+        taker_buy_base: bars.iter().map(|b| b.taker_buy_base).collect(),
+        step,
+    }
+}
+
+/// Simple close-to-close return over `k` contiguous higher bars.
+fn mtf_ret(h: &Series, k: usize) -> Vec<f64> {
+    let mut out = vec![f64::NAN; h.len()];
+    for i in k..h.len() {
+        if h.times[i] - h.times[i - k] == k as i64 * h.step
+            && h.close[i].is_finite()
+            && h.close[i - k].is_finite()
+            && h.close[i - k] > 0.0
+        {
+            out[i] = h.close[i] / h.close[i - k] - 1.0;
+        }
+    }
+    out
+}
+
+/// Population standard deviation of one-bar simple returns over 20 bars.
+fn mtf_vol(h: &Series, w: usize) -> Vec<f64> {
+    let returns = mtf_ret(h, 1);
+    rstd_py(&returns, w, &h.times, h.step)
+}
+
+/// Wilder ATR seeded on `period` contiguous true ranges. A gap resets the
+/// seed, so ATR never carries state across an outage.
+fn mtf_atr(h: &Series, period: usize) -> Vec<f64> {
+    let tr = true_range(h);
+    let mut out = vec![f64::NAN; h.len()];
+    let mut count = 0usize;
+    let mut sum = 0.0f64;
+    let mut prev = f64::NAN;
+    for i in 0..h.len() {
+        if i > 0 && h.times[i] - h.times[i - 1] != h.step {
+            count = 0;
+            sum = 0.0;
+            prev = f64::NAN;
+        }
+        if !tr[i].is_finite() {
+            count = 0;
+            sum = 0.0;
+            prev = f64::NAN;
+            continue;
+        }
+        if count < period {
+            sum += tr[i];
+            count += 1;
+            if count == period {
+                prev = sum / period as f64;
+                out[i] = prev;
+            }
+        } else {
+            prev += (tr[i] - prev) / period as f64;
+            out[i] = prev;
+        }
+    }
+    out
+}
+
+fn rsi_norm(gain: f64, loss: f64) -> f64 {
+    let rsi = if loss > 0.0 {
+        100.0 - 100.0 / (1.0 + gain / loss)
+    } else if gain > 0.0 {
+        100.0
+    } else {
+        50.0
+    };
+    rsi / 50.0 - 1.0
+}
+
+/// Wilder RSI(14), normalised as `RSI/50 - 1`. Seeded on 14 contiguous
+/// up/down deltas and reset after a gap.
+fn mtf_rsi(h: &Series, period: usize) -> Vec<f64> {
+    let mut out = vec![f64::NAN; h.len()];
+    let mut gain = 0.0f64;
+    let mut loss = 0.0f64;
+    let mut count = 0usize;
+    let mut avg_gain = f64::NAN;
+    let mut avg_loss = f64::NAN;
+    for i in 1..h.len() {
+        if h.times[i] - h.times[i - 1] != h.step
+            || !h.close[i].is_finite()
+            || !h.close[i - 1].is_finite()
+        {
+            gain = 0.0;
+            loss = 0.0;
+            count = 0;
+            avg_gain = f64::NAN;
+            avg_loss = f64::NAN;
+            continue;
+        }
+        let d = h.close[i] - h.close[i - 1];
+        let up = d.max(0.0);
+        let dn = (-d).max(0.0);
+        if !avg_gain.is_finite() {
+            gain += up;
+            loss += dn;
+            count += 1;
+            if count == period {
+                avg_gain = gain / period as f64;
+                avg_loss = loss / period as f64;
+                out[i] = rsi_norm(avg_gain, avg_loss);
+            }
+        } else {
+            avg_gain = (avg_gain * (period as f64 - 1.0) + up) / period as f64;
+            avg_loss = (avg_loss * (period as f64 - 1.0) + dn) / period as f64;
+            out[i] = rsi_norm(avg_gain, avg_loss);
+        }
+    }
+    out
+}
+
+fn mtf_close_pos(h: &Series) -> Vec<f64> {
+    (0..h.len())
+        .map(|i| {
+            let r = h.high[i] - h.low[i];
+            if r > 0.0 && h.close[i].is_finite() && h.high[i].is_finite() && h.low[i].is_finite() {
+                (h.close[i] - h.low[i]) / r - 0.5
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+fn mtf_donchian_pos(h: &Series, w: usize) -> Vec<f64> {
+    let mut out = vec![f64::NAN; h.len()];
+    for i in 0..h.len() {
+        if !contig(&h.times, i, w, h.step) {
+            continue;
+        }
+        let lo = i + 1 - w;
+        let mut hi = f64::NEG_INFINITY;
+        let mut low = f64::INFINITY;
+        let mut finite = true;
+        for j in lo..=i {
+            if !h.high[j].is_finite() || !h.low[j].is_finite() {
+                finite = false;
+                break;
+            }
+            hi = hi.max(h.high[j]);
+            low = low.min(h.low[j]);
+        }
+        if finite && hi > low && h.close[i].is_finite() {
+            out[i] = (h.close[i] - low) / (hi - low) - 0.5;
+        }
+    }
+    out
+}
+
+fn mtf_range_pct(h: &Series) -> Vec<f64> {
+    (0..h.len())
+        .map(|i| {
+            if h.close[i].is_finite()
+                && h.close[i] > 0.0
+                && h.high[i].is_finite()
+                && h.low[i].is_finite()
+            {
+                (h.high[i] - h.low[i]) / h.close[i]
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
+}
+
+fn mtf_trend_slope(h: &Series) -> Vec<f64> {
+    let p = Prefix::new(&h.close);
+    let mut out = vec![f64::NAN; h.len()];
+    for i in 39..h.len() {
+        if !contig(&h.times, i, 40, h.step) {
+            continue;
+        }
+        if let (Some(now), Some(prev)) = (p.mean(i, 20), p.mean(i - 20, 20)) {
+            if prev > 0.0 {
+                out[i] = now / prev - 1.0;
+            }
+        }
+    }
+    out
+}
+
+fn mtf_leaf_values(h: &Series, leaf: &str) -> Vec<f64> {
+    match leaf {
+        "ret1" => mtf_ret(h, 1),
+        "ret4" => mtf_ret(h, 4),
+        "ret24" => mtf_ret(h, 24),
+        "ma_ratio" => ma_ratio(h, 20),
+        "vol" => mtf_vol(h, 20),
+        "atr_pct" => {
+            let atr = mtf_atr(h, 14);
+            (0..h.len())
+                .map(|i| {
+                    if atr[i].is_finite() && h.close[i].is_finite() && h.close[i] > 0.0 {
+                        atr[i] / h.close[i]
+                    } else {
+                        f64::NAN
+                    }
+                })
+                .collect()
+        }
+        "rsi" => mtf_rsi(h, 14),
+        "close_pos" => mtf_close_pos(h),
+        "donchian_pos" => mtf_donchian_pos(h, 20),
+        "range_pct" => mtf_range_pct(h),
+        "trend_slope" => mtf_trend_slope(h),
+        _ => vec![f64::NAN; h.len()],
+    }
+}
+
+/// Compute every requested MTF column for one symbol.
+///
+/// The base series is resampled to each requested higher timeframe, the leaf is
+/// evaluated on the higher bars, and the scalar column is joined at the last
+/// higher bucket whose **close** is at or before the base decision time:
+///
+/// ```text
+/// visible <=> higher.time + higher_tf.seconds() <= base.time
+/// ```
+///
+/// A partial or current higher bucket is therefore never used. If the expected
+/// last-closed higher bucket is missing (a gap or outage), every value leaf is
+/// `NaN`; `bar_age` stays finite and reports the exact staleness in seconds.
+fn mtf_all(s: &Series, requested: &[String]) -> Result<BTreeMap<String, Vec<f64>>, String> {
+    let base = s.bars();
+    let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for tf_name in MTF_TIMEFRAMES {
+        let leaves: Vec<(&str, &str)> = requested
+            .iter()
+            .filter_map(|name| {
+                let (tf, leaf) = mtf_parts(name)?;
+                if tf == *tf_name {
+                    Some((name.as_str(), leaf))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if leaves.is_empty() {
+            continue;
+        }
+        let tf = Timeframe::parse(tf_name)?;
+        let higher = resample(&base, tf)?;
+        let h = series_from_bars(&higher, tf.seconds());
+        let joined = join_causal(&base, &higher, tf)?;
+        let index: BTreeMap<i64, usize> = higher
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.time, i))
+            .collect();
+        let mut cache: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
+        for (name, leaf) in leaves {
+            let values = if leaf == "bar_age" {
+                joined
+                    .iter()
+                    .enumerate()
+                    .map(|(i, slot)| {
+                        slot.map(|b| (base[i].time - (b.time + tf.seconds())) as f64)
+                            .unwrap_or(f64::NAN)
+                    })
+                    .collect()
+            } else {
+                let raw = cache
+                    .entry(leaf)
+                    .or_insert_with(|| mtf_leaf_values(&h, leaf));
+                let mut vals = Vec::with_capacity(base.len());
+                for (i, slot) in joined.iter().enumerate() {
+                    match slot {
+                        Some(b) => {
+                            // Reject a stale snapshot: the last closed bucket
+                            // must be the one immediately preceding this base
+                            // decision bucket. Otherwise the higher series has
+                            // a gap and the value would bridge it.
+                            let expected = tf.bucket_start(base[i].time) - tf.seconds();
+                            if b.time == expected {
+                                vals.push(index.get(&b.time).map(|j| raw[*j]).unwrap_or(f64::NAN));
+                            } else {
+                                vals.push(f64::NAN);
+                            }
+                        }
+                        None => vals.push(f64::NAN),
+                    }
+                }
+                vals
+            };
+            out.insert(name.to_string(), values);
+        }
+    }
+    Ok(out)
 }
 
 fn lag(s: &Series, b: &Base, k: usize) -> Vec<f64> {
@@ -3846,6 +4229,7 @@ struct Context<'a> {
     py15m_requested: Vec<String>,
     compact: Vec<String>,
     flow: Vec<String>,
+    mtf: Vec<String>,
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
     cross: &'a Cross,
@@ -3907,6 +4291,17 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("flow column '{}' was not produced", name))?;
+            if let Some(t) = cols.get_mut(name) {
+                t.write_values(values)?;
+            }
+        }
+    }
+    if !ctx.mtf.is_empty() {
+        let all = mtf_all(s, &ctx.mtf)?;
+        for name in &ctx.mtf {
+            let values = all
+                .get(name)
+                .ok_or_else(|| format!("multi-timeframe column '{}' was not produced", name))?;
             if let Some(t) = cols.get_mut(name) {
                 t.write_values(values)?;
             }
@@ -4803,6 +5198,7 @@ fn enrich_inner(
     let mut py15m_requested = Vec::new();
     let mut compact_requested = Vec::new();
     let mut flow_requested = Vec::new();
+    let mut mtf_requested = Vec::new();
     for n in &requested {
         if FLOW_NAMES.contains(&n.as_str()) {
             // One canonical implementation for the flow names shared with the
@@ -4834,6 +5230,9 @@ fn enrich_inner(
             // Computed in the whole-panel market-state pass. The five py15m
             // names are still produced by `py15m_all` and overwritten by the
             // canonical #273 pass below, so they are tracked there.
+        } else if is_mtf(n) {
+            // Computed by the per-symbol resample + causal join pass.
+            mtf_requested.push(n.clone());
         } else if is_own(n) {
             own.push(n.clone());
         } else {
@@ -5253,6 +5652,11 @@ fn enrich_inner(
         .filter(|n| !gpu_done.contains(*n))
         .cloned()
         .collect();
+    let cpu_mtf: Vec<String> = mtf_requested
+        .iter()
+        .filter(|n| !gpu_done.contains(*n))
+        .cloned()
+        .collect();
     let cpu_labels: Vec<(String, LabelSpec)> = labels
         .iter()
         .filter(|(n, _)| !gpu_done.contains(n))
@@ -5264,6 +5668,7 @@ fn enrich_inner(
         py15m_requested: cpu_py15m,
         compact: cpu_compact,
         flow: cpu_flow,
+        mtf: cpu_mtf,
         labels: cpu_labels,
         tf,
         cross: &cross,
@@ -5277,6 +5682,7 @@ fn enrich_inner(
         || !ctx.py15m_requested.is_empty()
         || !ctx.compact.is_empty()
         || !ctx.flow.is_empty()
+        || !ctx.mtf.is_empty()
         || !ctx.labels.is_empty();
     if has_cpu_work {
         let mut i = 0usize;
@@ -5775,6 +6181,13 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              legacy mkt_ew_* / cs_rank_r60 aliases. Ranks are [-1,1] and need
              >=20 point-in-time members; a smaller cross-section is NaN.
   py15m      the 35 columns added by the Python enrich_panel_15m.py step
+  mtf        the 36 multi-timeframe columns: mtf_<1h|4h|1d>_<leaf> for the
+             twelve leaves ret1 ret4 ret24 ma_ratio vol atr_pct rsi close_pos
+             donchian_pos range_pct trend_slope bar_age. Each higher bar is
+             resampled from the base series and joined only after it closes:
+             higher.time + timeframe_seconds <= base.time. Windows count
+             higher-timeframe bars; a gap is NaN, and bar_age reports the
+             exact seconds since the last closed higher bar.
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.
@@ -5783,7 +6196,7 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              zero_ret_share96, obv_z96, cvd_proxy, vwap_dev96. Trailing 15m
              windows; a gap-spanning window is NaN; zero volume/trades is NaN
              for the affected ratios and illiquidity.
-  all        every legacy group above except py15m, compact and flow
+  all        every legacy group above except cross, py15m, mtf, compact and flow
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
   cross:btc, calendar) are also accepted and are computed by `rcsr::features`.
@@ -5792,10 +6205,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   compact subset, the raw OHLCV/flow fields and the registered multi-timeframe,
   cross-sectional market-state and reserved derivative columns. `rcsr schema`
   prints the registry; a registered-but-unavailable name fails closed with the
-  missing data dependency instead of being silently dropped. MTF columns are
-  registered `available:false` until their pass lands; derivative columns have
-  no local snapshot and are `available:false` with source null. The complete
+  missing data dependency instead of being silently dropped. All 36
+  multi-timeframe columns are `available:true`, and the complete
   cross-asset/breadth/rank family is `available:true`; `cross` expands it.
+  Derivative columns have no local snapshot and are `available:false` with
+  source null.
 
   Flow and compact flow features read the raw `volume`, `quote_volume`,
   `trades` and `taker_buy_base` (alias `taker_buy`) fields. A missing raw field

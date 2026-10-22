@@ -182,6 +182,31 @@ neighbours; the reported test error is better than any live forecast can be.
   `preparation.rows_filled`, `preparation.smoothed` and
   `preparation.smooth_mode`.
 
+### Multi-timeframe features
+
+**Check.** A higher-timeframe value is usable only after its bar has closed.
+`rcsr enrich --features mtf` produces the 36 `mtf_<1h|4h|1d>_<leaf>` columns
+with the rule `higher.time + higher_tf.seconds() <= base.time`; the partial
+current higher bar is never visible. `bar_age` reports the exact seconds since
+the last closed higher bar.
+
+* A window counts **higher-timeframe** bars. A missing higher bucket is `NaN`
+  and no mean/ATR/RSI window bridges it; Wilder state restarts after the gap.
+* If the expected last-closed higher bucket is absent, every value leaf is
+  `NaN`; `bar_age` remains finite and tells you how stale the snapshot is.
+* The join is by timestamp, not row index, and a prefix truncation must not
+  change an earlier value.
+
+**What fails.** Joining the current, still-forming hourly/daily bar gives the
+model the future close. Shifting a higher column one bucket earlier is a leak
+that can turn a flat strategy into a spectacular one.
+
+**Verify.** `tests/enrich.rs` pins hand-built higher-bar values for all 36
+columns, the NaN/gap cases, `bar_age` (0 at the close and mid-bucket values), the
+future-shift failure through `ohlcv::lookahead_violations`, and prefix replay.
+`docs/mtf-inventory.json` is the 36-row inventory; `rcsr schema` lists every
+column with `family=mtf`, timeframe and PIT rule.
+
 ---
 
 ## 5. Select on validation, keep a lockbox

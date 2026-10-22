@@ -501,3 +501,11 @@ records `family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
 implementation; unavailable columns name their missing data dependency and fail
 closed when requested. The compact 52-name profile is a regression subset of this
 registry, not a separate store format; see `docs/ohlcv.md`.
+
+The multi-timeframe block is part of that contract: `--features mtf` appends all
+36 `mtf_<1h|4h|1d>_<leaf>` columns, each registered `available:true` with
+`family=mtf`, its `timeframe`, warm-up in higher bars and the close-time PIT
+rule. The values are joined from the last higher bucket that has closed at the
+decision timestamp; a partial bucket is never written and a higher-series gap is
+`NaN`. `docs/mtf-inventory.json` lists the complete inventory with formulas and
+test ids.
