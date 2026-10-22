@@ -176,36 +176,150 @@ fn no_fit_is_a_true_noop_for_the_rank_gpu_arm() {
     }
     let train = sample(160, 7);
     let test = sample(40, 8);
-    let base = Config {
-        fit_iters: 0,
-        metric: Metric::RankCorrelation,
-        ..rank_config(13, Metric::RankCorrelation)
+    // #231: the signed orientation has its own arm; `--no-fit` must be a no-op
+    // for it too, not only for `1 - |rho|`.
+    for metric in [Metric::RankCorrelation, Metric::RankCorrelationSigned] {
+        let base = Config {
+            fit_iters: 0,
+            metric,
+            ..rank_config(13, metric)
+        };
+        let gpu = search::run(
+            &Config {
+                fit_strategy: FitStrategy::Gpu,
+                gpu: true,
+                ..base.clone()
+            },
+            &train,
+            &test,
+        );
+        let cpu = search::run(
+            &Config {
+                fit_strategy: FitStrategy::Exact,
+                gpu: false,
+                ..base
+            },
+            &train,
+            &test,
+        );
+        // `--no-fit` means "do not move constants": both arms must produce the
+        // same archive, bit for bit, and the GPU path must not be entered.
+        assert_eq!(describe(&gpu), describe(&cpu), "{metric:?}");
+        // With nothing to fit the evaluator is not even created: the rank arm is
+        // never a silent no-op that still costs a device context.
+        assert!(gpu.gpu.is_none(), "{metric:?}: --no-fit must not spin up the fit evaluator");
+        assert_eq!(gpu.backend, rcsr::backend::Kind::Cpu);
+    }
+}
+
+/// #231: the signed arm is deterministic for a fixed seed and device, whatever
+/// the island count, and every archive row is the exact CPU signed score.
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_rank_gpu_fit_is_deterministic_across_runs_and_island_counts() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(240, 41);
+    let test = sample(60, 42);
+    let one = rank_config(19, Metric::RankCorrelationSigned);
+    let four = Config {
+        islands: 4,
+        ..rank_config(19, Metric::RankCorrelationSigned)
     };
-    let gpu = search::run(
-        &Config {
-            fit_strategy: FitStrategy::Gpu,
-            gpu: true,
-            ..base.clone()
-        },
-        &train,
-        &test,
-    );
-    let cpu = search::run(
-        &Config {
-            fit_strategy: FitStrategy::Exact,
-            gpu: false,
-            ..base
-        },
-        &train,
-        &test,
-    );
-    // `--no-fit` means "do not move constants": both arms must produce the
-    // same archive, bit for bit, and the GPU path must not be entered at all.
-    assert_eq!(describe(&gpu), describe(&cpu));
-    // With nothing to fit the evaluator is not even created: the rank arm is
-    // never a silent no-op that still costs a device context.
-    assert!(gpu.gpu.is_none(), "--no-fit must not spin up the fit evaluator");
-    assert_eq!(gpu.backend, rcsr::backend::Kind::Cpu);
+    let a = search::run(&one, &train, &test);
+    let b = search::run(&one, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "repeated seed differs");
+    let c = search::run(&four, &train, &test);
+    let d = search::run(&four, &train, &test);
+    assert_eq!(describe(&c), describe(&d), "repeated 4-island seed differs");
+    assert_eq!(c.test_errors, d.test_errors);
+    for out in [&a, &c] {
+        assert!(out.device.is_some());
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert!(g.fit_gpu > 0, "the signed arm must run on the device: {g:?}");
+        for s in &out.archive.items {
+            let cpu = search::eval_error(&s.tree, &train, Metric::RankCorrelationSigned);
+            assert_eq!(
+                s.error.to_bits(),
+                cpu.to_bits(),
+                "an archive row is not the exact CPU signed score"
+            );
+        }
+    }
+}
+
+/// #231: the public batched verifier (`BatchedGpu` + `fit_batch_verified`) is
+/// rank-native and judges the device proposal on the **exact** configured rank
+/// objective. Before #231 it declined every rank metric, so a rank run could
+/// only ever reach the device through the search's own arm.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_batched_verifier_is_rank_native_and_exact() {
+    use rcsr::expr::{constant, input, node, Op};
+    use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchStatus, BatchedGpu};
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(400, 51);
+    let x = train.x.clone();
+    let y = train.y.clone();
+    let n = y.len();
+    let nv = x[0].len();
+    let cols: Vec<f32> = (0..nv)
+        .flat_map(|v| x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let mut cols64 = vec![0.0f64; n * nv];
+    for (r, row) in x.iter().enumerate() {
+        for (v, &val) in row.iter().enumerate().take(nv) {
+            cols64[v * n + r] = val;
+        }
+    }
+    let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
+        Some(ev) => ev,
+        None => {
+            eprintln!("skipping GPU test: evaluator construction failed");
+            return;
+        }
+    };
+    assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+    let model = || {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)],
+        )
+    };
+    let k = rcsr::expr::count_constants(&model());
+    let score = |t: &rcsr::expr::Node, metric: Metric| {
+        let pred: Vec<f64> = x.iter().map(|row| rcsr::expr::eval(t, row)).collect();
+        rcsr::metrics::score_weighted(&pred, &y, &[], metric, k)
+    };
+    for metric in [Metric::RankCorrelation, Metric::RankCorrelationSigned] {
+        let mut batch = vec![model()];
+        let backend = BatchedGpu::new(&mut ev);
+        let out = fit_batch_verified(&backend, &mut batch, &x, &y, &[], 8, metric);
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "{metric:?}: the rank proposal must come from the device arm"
+        );
+        // The reported number is the exact configured rank score of the final
+        // constants, not an SSE and not the other orientation.
+        assert_eq!(out.score[0].to_bits(), score(&batch[0], metric).to_bits());
+        // Monotone against the incoming constants...
+        assert!(out.score[0] <= score(&model(), metric));
+        // ... and no worse than the exact CPU arm from the same start.
+        let mut cpu = model();
+        let cpu_score = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, metric);
+        assert!(
+            out.score[0] <= cpu_score + 1e-12,
+            "{metric:?}: device {} is worse than the CPU arm {cpu_score}",
+            out.score[0]
+        );
+    }
 }
 
 /// #230 measurement (ignored): paired CPU-exact versus GPU rank fit on the
@@ -239,77 +353,82 @@ fn bench_rank_end_to_end() {
     let train = sample(n, 21);
     let test = sample(1_000, 22);
     use rcsr::expr::Op;
-    let base = Config {
-        generations,
-        islands,
-        pop,
-        max_complexity: 12,
-        fit_iters: 8,
-        metric: Metric::RankCorrelation,
-        ops: vec![
-            Op::Add,
-            Op::Sub,
-            Op::Mul,
-            Op::Sin,
-            Op::Cos,
-            Op::Tanh,
-            Op::Square,
-            Op::Neg,
-            Op::Div,
-        ],
-        seed: 9,
-        patience: 0,
-        gpu_notes: false,
-        ..Default::default()
-    };
-    for (name, strategy, gpu) in [
-        ("exact/cpu", FitStrategy::Exact, false),
-        ("gpu/rank", FitStrategy::Gpu, true),
-    ] {
-        let cfg = Config {
-            fit_strategy: strategy,
-            gpu,
-            ..base.clone()
+    // #231: both rank orientations, paired CPU exact versus GPU rank fit on the
+    // same seed and rows. `1 - rho` and `1 - |rho|` share the device work.
+    for metric in [Metric::RankCorrelation, Metric::RankCorrelationSigned] {
+        let base = Config {
+            generations,
+            islands,
+            pop,
+            max_complexity: 12,
+            fit_iters: 8,
+            metric,
+            ops: vec![
+                Op::Add,
+                Op::Sub,
+                Op::Mul,
+                Op::Sin,
+                Op::Cos,
+                Op::Tanh,
+                Op::Square,
+                Op::Neg,
+                Op::Div,
+            ],
+            seed: 9,
+            patience: 0,
+            gpu_notes: false,
+            ..Default::default()
         };
-        let t0 = std::time::Instant::now();
-        let out = search::run(&cfg, &train, &test);
-        let wall = t0.elapsed().as_secs_f64();
-        let best = out
-            .archive
-            .items
-            .iter()
-            .map(|s| s.error)
-            .fold(f64::INFINITY, f64::min);
-        eprintln!(
-            "arm={} N={} evals={} wall={:.2}s best={:.6e}",
-            name,
-            n,
-            base.generations * base.islands * base.pop,
-            wall,
-            best
-        );
-        if let Some(g) = &out.gpu {
-            let rate = if g.fit_attempts == 0 {
-                0.0
-            } else {
-                100.0 * g.fit_fallback as f64 / g.fit_attempts as f64
+        for (name, strategy, gpu) in [
+            ("exact/cpu", FitStrategy::Exact, false),
+            ("gpu/rank", FitStrategy::Gpu, true),
+        ] {
+            let cfg = Config {
+                fit_strategy: strategy,
+                gpu,
+                ..base.clone()
             };
+            let t0 = std::time::Instant::now();
+            let out = search::run(&cfg, &train, &test);
+            let wall = t0.elapsed().as_secs_f64();
+            let best = out
+                .archive
+                .items
+                .iter()
+                .map(|s| s.error)
+                .fold(f64::INFINITY, f64::min);
             eprintln!(
-                "  fit: screened={} admitted={} gpu={} fallback={} rate={:.1}% refits={}",
-                g.fit_screened, g.fit_attempts, g.fit_gpu, g.fit_fallback, rate, g.fit_refits
+                "metric={} arm={} N={} evals={} wall={:.2}s best={:.6e}",
+                metric.name(),
+                name,
+                n,
+                base.generations * base.islands * base.pop,
+                wall,
+                best
             );
-            eprintln!(
-                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fit_duty={:.1}% eval_duty={:.1}%",
-                g.fit_host_ms / 1000.0,
-                100.0 * (g.fit_host_ms / 1000.0) / wall.max(1e-9),
-                g.fit_ms / 1000.0,
-                if g.fit_host_ms > 0.0 {
-                    100.0 * g.fit_ms / g.fit_host_ms
-                } else {
+            if let Some(g) = &out.gpu {
+                let rate = if g.fit_attempts == 0 {
                     0.0
-                },
-                100.0 * g.accounting.duty_cycle()
-            );
+                } else {
+                    100.0 * g.fit_fallback as f64 / g.fit_attempts as f64
+                };
+                eprintln!(
+                    "  fit: screened={} admitted={} gpu={} fallback={} rate={:.1}% refits={}",
+                    g.fit_screened, g.fit_attempts, g.fit_gpu, g.fit_fallback, rate, g.fit_refits
+                );
+                eprintln!(
+                    "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fit_duty={:.1}% eval_duty={:.1}%",
+                    g.fit_host_ms / 1000.0,
+                    100.0 * (g.fit_host_ms / 1000.0) / wall.max(1e-9),
+                    g.fit_ms / 1000.0,
+                    if g.fit_host_ms > 0.0 {
+                        100.0 * g.fit_ms / g.fit_host_ms
+                    } else {
+                        0.0
+                    },
+                    100.0 * g.accounting.duty_cycle()
+                );
+            }
         }
     }
 }

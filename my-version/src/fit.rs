@@ -47,6 +47,9 @@ pub(crate) use rank::polish_rank_batch;
 #[cfg(any(feature = "cuda", test))]
 #[allow(unused_imports)]
 pub(crate) use rank::{exact_rank_score, RankTrialScorer};
+// #231: the exact, orientation-aware rank gate is shared by the CPU verifier,
+// the batched verifier and the device arm, so it exists in every build.
+pub(crate) use rank::{choose_rank_fit, score_constants, RankFitChoice};
 pub use varpro::{cost_eligible as varpro_cost_eligible, VarProPartition};
 
 /// `1/sqrt(pi)`, the constant in the error-function derivative.
