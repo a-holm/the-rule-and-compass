@@ -113,6 +113,19 @@ static double rc_now_ms(void)
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
+/* #285: host-visible arena state. `steady_alloc_calls` counts allocator calls
+   after the first successful batch; the hot-path acceptance is that it stays
+   at zero while the batch shape is stable. */
+typedef struct RcArenaReport {
+    int async_copy;
+    char reason[96];
+    unsigned long long pinned_bytes;
+    unsigned long long alloc_calls;
+    unsigned long long steady_alloc_calls;
+    unsigned long long overlapped_uploads;
+    unsigned long long batches;
+} RcArenaReport;
+
 struct RcCtx {
     float *d_cols;
     float *d_y;
@@ -163,7 +176,190 @@ struct RcCtx {
        clock, so `wall_ms` covers the whole begin..download path. */
     RcStats stats;
     double batch_start_ms;
+
+    /* --- #285: persistent batch arena, pinned staging, streams and events ---
+     *
+     * The batch API used to call `cudaFree`/`cudaMalloc` for `d_prog`/`d_off`
+     * and `d_out` on every batch, and every copy and kernel ran on the default
+     * stream. Both allocator calls synchronise the device, so a generation
+     * could never overlap the previous one. The arena below is allocated once
+     * at the high-water mark and grown only through an explicit reserve; the
+     * steady-state batch loop performs no allocator call at all.
+     *
+     * Two program slots let the host upload batch B while batch A is still
+     * executing: each slot carries its own upload-done and kernel-done event,
+     * and a slot is only overwritten after its own completion event. The two
+     * pinned rings (`h_up`, `h_down`) are bounded by RC_PIN_BUDGET_BYTES; a
+     * copy that cannot be staged in pinned memory falls back to the blocking
+     * path with a recorded reason instead of silently becoming synchronous. */
+    unsigned int *arena_prog[2];
+    unsigned int *arena_off[2];
+    size_t arena_prog_words;   /* capacity of each slot, in u32 words */
+    size_t arena_off_words;    /* capacity of each slot, in u32 words */
+    float *arena_out;          /* persistent device output, nprog floats */
+    size_t arena_out_cap;      /* capacity in floats */
+    int arena_slot;            /* slot selected by the last rc_set_programs */
+    int arena_upload_async;    /* this batch's upload was enqueued on s_h2d */
+    /* Host staging rings. `h_up` holds one batch's packed programs plus its
+       offsets; `h_down` holds one batch's errors. The two slots alternate. */
+    unsigned char *h_up[2];
+    unsigned char *h_down[2];
+    size_t h_up_bytes;
+    size_t h_down_bytes;
+    size_t pinned_bytes;
+    cudaStream_t s_h2d;
+    cudaStream_t s_d2h;
+    cudaStream_t s_eval;
+    cudaEvent_t ev_upload[2];     /* program slot -> upload complete */
+    cudaEvent_t ev_slot_done[2];  /* program slot -> kernel complete */
+    cudaEvent_t ev_up_free[2];    /* host staging slot -> copy out complete */
+    cudaEvent_t ev_down_free[2];  /* download staging slot -> copy complete */
+    int up_next;
+    int down_next;
+    /* #285: one in-flight batch, so the compatibility `rc_eval` can be split
+       into an async submit and a collecting wait for the overlap test. */
+    struct {
+        int active;
+        int slot;
+        int nprog;
+        size_t out_bytes;
+        int down_slot;
+        int d2h_async;
+        cudaEvent_t done;
+    } pending;
+    /* #285: accounting that tells cold allocation apart from a steady-state
+       request. `warm` is set after the first successful batch; any allocator
+       call after that is a bug the tests can see. */
+    int async_copy;            /* 1 = pinned async copies, 0 = synchronous */
+    int warm;
+    unsigned long long alloc_calls;
+    unsigned long long steady_alloc_calls;
+    unsigned long long overlapped_uploads;
+    unsigned long long arena_batches;
+    char sync_reason[96];
 };
+
+/* #285: the pinned ring is capped at 64 MiB. Two upload slots plus two
+   download slots must fit inside it, so each direction can use at most half. */
+#define RC_PIN_BUDGET_BYTES (64u * 1024u * 1024u)
+
+/* #285: an allocator call is part of the ledger. Before the first batch it is
+   cold setup; afterwards it is a steady-state request and must stay zero on
+   the hot path. */
+static int rc_arena_dev_alloc(RcCtx *c, void **p, size_t bytes)
+{
+    int rc = (int)cudaMalloc(p, bytes);
+    if (rc == (int)cudaSuccess) {
+        c->alloc_calls++;
+        if (c->warm) c->steady_alloc_calls++;
+    }
+    return rc;
+}
+
+static void rc_arena_dev_free(RcCtx *c, void *p)
+{
+    if (!p) return;
+    cudaFree(p);
+    c->alloc_calls++;
+    if (c->warm) c->steady_alloc_calls++;
+}
+
+/* Reserve the device arena at the requested high-water mark. Capacity only
+   grows, and only when no batch is in flight: reallocating a slot that a
+   pending kernel still reads would be a use-after-free. */
+static int rc_arena_reserve(RcCtx *c, int nprog, size_t prog_words)
+{
+    size_t off_words = (size_t)nprog + 1;
+    size_t out_len = (size_t)nprog;
+    if (prog_words <= c->arena_prog_words && off_words <= c->arena_off_words &&
+        out_len <= c->arena_out_cap) {
+        return 0;
+    }
+    if (c->pending.active) {
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "arena growth requested while a batch is in flight");
+        return -1;
+    }
+    size_t want_prog = prog_words > c->arena_prog_words ? prog_words : c->arena_prog_words;
+    size_t want_off = off_words > c->arena_off_words ? off_words : c->arena_off_words;
+    size_t want_out = out_len > c->arena_out_cap ? out_len : c->arena_out_cap;
+    unsigned int *p0 = 0, *p1 = 0, *o0 = 0, *o1 = 0;
+    float *out = 0;
+    int ok = 1;
+    if (rc_arena_dev_alloc(c, (void **)&p0, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, (void **)&p1, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, (void **)&o0, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, (void **)&o1, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, (void **)&out, sizeof(float) * want_out) != 0) ok = 0;
+    if (!ok) {
+        if (p0) cudaFree(p0);
+        if (p1) cudaFree(p1);
+        if (o0) cudaFree(o0);
+        if (o1) cudaFree(o1);
+        if (out) cudaFree(out);
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "device arena allocation failed");
+        return -1;
+    }
+    if (c->arena_prog[0]) cudaFree(c->arena_prog[0]);
+    if (c->arena_prog[1]) cudaFree(c->arena_prog[1]);
+    if (c->arena_off[0]) cudaFree(c->arena_off[0]);
+    if (c->arena_off[1]) cudaFree(c->arena_off[1]);
+    if (c->arena_out) cudaFree(c->arena_out);
+    c->arena_prog[0] = p0;
+    c->arena_prog[1] = p1;
+    c->arena_off[0] = o0;
+    c->arena_off[1] = o1;
+    c->arena_out = out;
+    c->arena_prog_words = want_prog;
+    c->arena_off_words = want_off;
+    c->arena_out_cap = want_out;
+    return 0;
+}
+
+/* Reserve the pinned staging rings. The total is hard-capped at 64 MiB; a
+   request that does not fit is a labelled fallback to the blocking path, never
+   an over-budget pin. A failed cudaHostAlloc is handled the same way. */
+static int rc_pin_reserve(RcCtx *c, size_t up_bytes, size_t down_bytes)
+{
+    if (up_bytes <= c->h_up_bytes && down_bytes <= c->h_down_bytes) return 0;
+    size_t want_up = up_bytes > c->h_up_bytes ? up_bytes : c->h_up_bytes;
+    size_t want_down = down_bytes > c->h_down_bytes ? down_bytes : c->h_down_bytes;
+    if (2 * (want_up + want_down) > RC_PIN_BUDGET_BYTES) {
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "pinned staging request exceeds the 64 MiB ring");
+        return -1;
+    }
+    unsigned char *u0 = 0, *u1 = 0, *d0 = 0, *d1 = 0;
+    int ok = 1;
+    if (cudaHostAlloc((void **)&u0, want_up, cudaHostAllocDefault) != cudaSuccess) ok = 0;
+    if (ok && cudaHostAlloc((void **)&u1, want_up, cudaHostAllocDefault) != cudaSuccess) ok = 0;
+    if (ok && cudaHostAlloc((void **)&d0, want_down, cudaHostAllocDefault) != cudaSuccess) ok = 0;
+    if (ok && cudaHostAlloc((void **)&d1, want_down, cudaHostAllocDefault) != cudaSuccess) ok = 0;
+    if (!ok) {
+        if (u0) cudaFreeHost(u0);
+        if (u1) cudaFreeHost(u1);
+        if (d0) cudaFreeHost(d0);
+        if (d1) cudaFreeHost(d1);
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "cudaHostAlloc for the pinned staging ring failed");
+        return -1;
+    }
+    if (c->h_up[0]) cudaFreeHost(c->h_up[0]);
+    if (c->h_up[1]) cudaFreeHost(c->h_up[1]);
+    if (c->h_down[0]) cudaFreeHost(c->h_down[0]);
+    if (c->h_down[1]) cudaFreeHost(c->h_down[1]);
+    c->h_up[0] = u0;
+    c->h_up[1] = u1;
+    c->h_down[0] = d0;
+    c->h_down[1] = d1;
+    c->h_up_bytes = want_up;
+    c->h_down_bytes = want_down;
+    c->pinned_bytes = 2 * (want_up + want_down);
+    c->alloc_calls++;
+    if (c->warm) c->steady_alloc_calls++;
+    return 0;
+}
 
 __device__ __forceinline__ float logisticf(float x) { return 1.0f / (1.0f + expf(-x)); }
 
@@ -2338,6 +2534,23 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     c->v = v;
     c->nprog = 0;
     c->out_cap = 0;
+    c->async_copy = 1;
+    c->sync_reason[0] = '\0';
+#ifdef RCSR_UNIFIED
+    /* Managed pages migrate on access; an explicit pinned copy would add a
+       second transport. Keep the managed build on its proven synchronous
+       path and label it. */
+    c->async_copy = 0;
+    snprintf(c->sync_reason, sizeof(c->sync_reason),
+             "unified-memory build uses synchronous managed copies");
+#endif
+    const char *force_sync = getenv("RCSR_GPU_SYNC");
+    if (force_sync && force_sync[0] && strcmp(force_sync, "0") != 0 &&
+        strcmp(force_sync, "false") != 0 && strcmp(force_sync, "off") != 0) {
+        c->async_copy = 0;
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "RCSR_GPU_SYNC requests the synchronous copy path");
+    }
     size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
     size_t y_bytes = sizeof(float) * (size_t)n;
     if (rc_alloc((void **)&c->d_cols, col_bytes) != 0 ||
@@ -2351,6 +2564,24 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     rc_upload(c->d_y, y, y_bytes);
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
+    /* #285: copy streams and the per-slot events. A failed stream/event
+       creation is not fatal: the batch path then keeps its synchronous
+       semantics with a recorded reason. */
+    int streams_ok = 1;
+    if (cudaStreamCreateWithFlags(&c->s_h2d, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
+    if (streams_ok && cudaStreamCreateWithFlags(&c->s_d2h, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
+    if (streams_ok && cudaStreamCreateWithFlags(&c->s_eval, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
+    for (int i = 0; streams_ok && i < 2; ++i) {
+        if (cudaEventCreateWithFlags(&c->ev_upload[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
+        if (streams_ok && cudaEventCreateWithFlags(&c->ev_slot_done[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
+        if (streams_ok && cudaEventCreateWithFlags(&c->ev_up_free[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
+        if (streams_ok && cudaEventCreateWithFlags(&c->ev_down_free[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
+    }
+    if (!streams_ok) {
+        c->async_copy = 0;
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "CUDA stream/event creation failed; synchronous copy path");
+    }
     return (void *)c;
 }
 
@@ -2373,6 +2604,21 @@ void rc_destroy(void *ctx)
     if (c->d_hash) cudaFree(c->d_hash);
     if (c->d_rank_b) cudaFree(c->d_rank_b);
     if (c->d_mm) cudaFree(c->d_mm);
+    /* #285: arena, staging rings, streams and events. */
+    for (int i = 0; i < 2; ++i) {
+        if (c->arena_prog[i]) cudaFree(c->arena_prog[i]);
+        if (c->arena_off[i]) cudaFree(c->arena_off[i]);
+        if (c->h_up[i]) cudaFreeHost(c->h_up[i]);
+        if (c->h_down[i]) cudaFreeHost(c->h_down[i]);
+        if (c->ev_upload[i]) cudaEventDestroy(c->ev_upload[i]);
+        if (c->ev_slot_done[i]) cudaEventDestroy(c->ev_slot_done[i]);
+        if (c->ev_up_free[i]) cudaEventDestroy(c->ev_up_free[i]);
+        if (c->ev_down_free[i]) cudaEventDestroy(c->ev_down_free[i]);
+    }
+    if (c->arena_out) cudaFree(c->arena_out);
+    if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
+    if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
+    if (c->s_eval) cudaStreamDestroy(c->s_eval);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -2381,89 +2627,168 @@ void rc_destroy(void *ctx)
 int rc_set_programs(void *ctx, const unsigned int *prog, const unsigned int *off, int nprog)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c) return -1;
+    if (!c || !prog || !off || nprog <= 0) return -1;
     RcStats *st = &c->stats;
+    size_t prog_words = (size_t)off[nprog];
+    size_t prog_bytes = sizeof(unsigned int) * prog_words;
+    size_t off_bytes = sizeof(unsigned int) * (size_t)(nprog + 1);
     double t = rc_now_ms();
-    if (c->d_prog) { cudaFree(c->d_prog); c->d_prog = 0; }
-    if (c->d_off) { cudaFree(c->d_off); c->d_off = 0; }
-    c->nprog = nprog;
-    size_t prog_bytes = sizeof(unsigned int) * (size_t)off[nprog];
-    rc_alloc((void **)&c->d_prog, prog_bytes);
-    rc_alloc((void **)&c->d_off, sizeof(unsigned int) * (size_t)(nprog + 1));
-    if (!c->d_prog || !c->d_off) {
+    /* #285: the arena is allocated at its high-water mark, not per batch. A
+       growth is a cold event and is refused while a batch is in flight. */
+    if (rc_arena_reserve(c, nprog, prog_words) != 0) {
         st->alloc_ms += rc_now_ms() - t;
         st->failed = 1;
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
         return -1;
     }
-    if (c->out_cap < nprog) {
-        if (c->d_out) cudaFree(c->d_out);
-        if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
-            c->d_out = 0;
-            c->out_cap = 0;
-            st->alloc_ms += rc_now_ms() - t;
-            st->failed = 1;
-            st->wall_ms = rc_now_ms() - c->batch_start_ms;
-            return -1;
-        }
-        c->out_cap = nprog;
-    }
-    /* cudaMalloc/cudaFree synchronise, so this window includes the real cost
-       of (re)allocating the program and output buffers. */
     st->alloc_ms += rc_now_ms() - t;
+    /* Alternate program slots. A slot is only overwritten after the kernel
+       that last read it has completed; the other slot may still be running,
+       which is exactly what lets the next upload overlap it. */
+    t = rc_now_ms();
+    int slot = c->arena_slot ^ 1;
+    if (c->ev_slot_done[slot]) cudaEventSynchronize(c->ev_slot_done[slot]);
+    if (c->pending.active && cudaEventQuery(c->t1) == cudaErrorNotReady) {
+        c->overlapped_uploads++;
+    }
+    st->sync_ms += rc_now_ms() - t;
 
     t = rc_now_ms();
-    rc_upload(c->d_prog, prog, prog_bytes);
-    rc_upload(c->d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    int upload_async = 0;
+    if (c->async_copy) {
+        size_t pin_before = c->pinned_bytes;
+        if (rc_pin_reserve(c, prog_bytes + off_bytes,
+                           sizeof(float) * (size_t)nprog) == 0) {
+            upload_async = 1;
+        } else {
+            c->async_copy = 0;
+        }
+        if (c->pinned_bytes != pin_before) {
+            st->alloc_ms += rc_now_ms() - t;
+            t = rc_now_ms();
+        }
+    }
+    if (upload_async) {
+        int ui = c->up_next;
+        c->up_next ^= 1;
+        /* The staging slot was last read by the copy issued two uploads ago;
+           wait for that copy before overwriting it. A never-recorded event is
+           complete, so the first batch does not block. */
+        cudaEventSynchronize(c->ev_up_free[ui]);
+        memcpy(c->h_up[ui], prog, prog_bytes);
+        memcpy(c->h_up[ui] + prog_bytes, off, off_bytes);
+        cudaMemcpyAsync(c->arena_prog[slot], c->h_up[ui], prog_bytes,
+                        cudaMemcpyHostToDevice, c->s_h2d);
+        cudaMemcpyAsync(c->arena_off[slot], c->h_up[ui] + prog_bytes, off_bytes,
+                        cudaMemcpyHostToDevice, c->s_h2d);
+        cudaEventRecord(c->ev_upload[slot], c->s_h2d);
+        cudaEventRecord(c->ev_up_free[ui], c->s_h2d);
+    } else {
+        /* Blocking fallback: exact same bytes, no overlap. */
+        rc_upload(c->arena_prog[slot], prog, prog_bytes);
+        rc_upload(c->arena_off[slot], off, off_bytes);
+    }
+    c->arena_slot = slot;
+    c->arena_upload_async = upload_async;
+    c->nprog = nprog;
     st->h2d_ms += rc_now_ms() - t;
-    st->h2d_bytes += (unsigned long long)(prog_bytes + sizeof(unsigned int) * (size_t)(nprog + 1));
+    st->h2d_bytes += (unsigned long long)(prog_bytes + off_bytes);
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return 0;
 }
 
-/* Returns elapsed milliseconds; writes nprog errors into `out`. The context's
-   RcStats records the full launch+sync+download path. */
-float rc_eval(void *ctx, float *out, int loss)
+/* #285: enqueue the current batch's kernel, then its asynchronous download.
+   No host synchronisation happens here; `rc_eval_collect` owns the wait. */
+int rc_eval_submit(void *ctx, int loss)
 {
     RcCtx *c = (RcCtx *)ctx;
-    if (!c) return -1.0f;
+    if (!c || c->nprog <= 0 || c->pending.active) return -1;
+    int slot = c->arena_slot;
+    if (!c->arena_prog[slot] || !c->arena_off[slot] || !c->arena_out) return -1;
     RcStats *st = &c->stats;
-    /* One block per expression; threads spread over rows. Size the block to the
-       row count (rounded up to a power of two) so short datasets do not launch
-       mostly-idle warps. */
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    if (c->arena_upload_async) {
+        cudaStreamWaitEvent(c->s_eval, c->ev_upload[slot], 0);
+    }
     double t = rc_now_ms();
-    cudaEventRecord(c->t0, 0);
-    eval_kernel<<<c->nprog, threads>>>(c->d_cols, c->d_y, c->n, c->v,
-                                       c->d_prog, c->d_off, c->d_out, loss);
-    cudaEventRecord(c->t1, 0);
+    cudaEventRecord(c->t0, c->s_eval);
+    eval_kernel<<<c->nprog, threads, 0, c->s_eval>>>(
+        c->d_cols, c->d_y, c->n, c->v, c->arena_prog[slot], c->arena_off[slot],
+        c->arena_out, loss);
+    cudaEventRecord(c->t1, c->s_eval);
+    cudaEventRecord(c->ev_slot_done[slot], c->s_eval);
     st->launch_ms += rc_now_ms() - t;
-    /* Wait for the kernel before reading the result. In the unified build the
-       output lives in managed memory, so a plain memcpy (page migration) is the
-       download; there is no explicit device-to-host copy. */
-    t = rc_now_ms();
-    cudaEventSynchronize(c->t1);
-    st->sync_ms += rc_now_ms() - t;
-    /* A launch or execution error must be visible to the caller: the search
-       turns it into a CPU fallback instead of trusting a stale output buffer.
-       A negative time is the error marker; the benchmark treats it the same. */
     if (cudaGetLastError() != cudaSuccess) {
         st->failed = 1;
         st->wall_ms = rc_now_ms() - c->batch_start_ms;
-        return -1.0f;
+        return -1;
     }
+    size_t out_bytes = sizeof(float) * (size_t)c->nprog;
+    int down_slot = -1;
+    int d2h_async = 0;
+    if (c->async_copy && c->h_down[0] && c->h_down_bytes >= out_bytes) {
+        down_slot = c->down_next;
+        c->down_next ^= 1;
+        cudaEventSynchronize(c->ev_down_free[down_slot]);
+        cudaStreamWaitEvent(c->s_d2h, c->t1, 0);
+        cudaMemcpyAsync(c->h_down[down_slot], c->arena_out, out_bytes,
+                        cudaMemcpyDeviceToHost, c->s_d2h);
+        cudaEventRecord(c->ev_down_free[down_slot], c->s_d2h);
+        d2h_async = 1;
+    }
+    c->pending.active = 1;
+    c->pending.slot = slot;
+    c->pending.nprog = c->nprog;
+    c->pending.out_bytes = out_bytes;
+    c->pending.down_slot = down_slot;
+    c->pending.d2h_async = d2h_async;
+    c->pending.done = d2h_async ? c->ev_down_free[down_slot] : c->t1;
+    return 0;
+}
+
+/* #285: wait for the submitted batch and copy its errors into `out`. This is
+   the only place the compatibility shim blocks, and it blocks on an event, not
+   `cudaStreamSynchronize`. */
+float rc_eval_collect(void *ctx, float *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out || !c->pending.active) return -1.0f;
+    RcStats *st = &c->stats;
+    double t = rc_now_ms();
+    cudaEventSynchronize(c->pending.done);
+    st->sync_ms += rc_now_ms() - t;
     t = rc_now_ms();
-    rc_download(out, c->d_out, sizeof(float) * (size_t)c->nprog);
+    if (c->pending.d2h_async) {
+        memcpy(out, c->h_down[c->pending.down_slot], c->pending.out_bytes);
+    } else {
+        rc_download(out, c->arena_out, c->pending.out_bytes);
+    }
     st->d2h_ms += rc_now_ms() - t;
-    st->d2h_bytes += sizeof(float) * (unsigned long long)c->nprog;
+    st->d2h_bytes += (unsigned long long)c->pending.out_bytes;
+    int failed = 0;
+    if (cudaGetLastError() != cudaSuccess) failed = 1;
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
-    st->batch = c->nprog;
+    st->batch = c->pending.nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
-    return ms;
+    if (failed) st->failed = 1;
+    c->pending.active = 0;
+    c->warm = 1;
+    c->arena_batches++;
+    return failed ? -1.0f : ms;
+}
+
+/* Returns elapsed milliseconds; writes nprog errors into `out`. The context's
+   RcStats records the full launch+sync+download path. #285: this is the
+   compatibility shim over submit+collect, so existing callers keep their
+   synchronous contract while the copy/launch machinery stays asynchronous. */
+float rc_eval(void *ctx, float *out, int loss)
+{
+    if (rc_eval_submit(ctx, loss) != 0) return -1.0f;
+    return rc_eval_collect(ctx, out);
 }
 
 /* #131 fixtures: upload a packed batch and write its P x N raw predictions
@@ -2475,12 +2800,16 @@ int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nprog <= 0) return -1;
     if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1;
+    int slot = c->arena_slot;
+    /* #285: the upload may still be in flight on S_h2d. */
+    if (c->arena_upload_async) cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
     size_t total = (size_t)nprog * (size_t)c->n;
     float *d_pred = 0;
     if (cudaMalloc((void **)&d_pred, sizeof(float) * total) != 0) return -1;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
-    predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->d_prog, c->d_off, d_pred);
+    predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->arena_prog[slot],
+                                       c->arena_off[slot], d_pred);
     if (cudaGetLastError() != cudaSuccess) {
         cudaFree(d_pred);
         return -1;
@@ -2492,6 +2821,43 @@ int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
     }
     cudaFree(d_pred);
     return 0;
+}
+
+/* #285: snapshot of the arena/copy mode for tests, the benchmark and the
+   report. `reason` is the recorded cause when the synchronous path is active. */
+int rc_arena_report(void *ctx, RcArenaReport *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->async_copy = c->async_copy;
+    snprintf(out->reason, sizeof(out->reason), "%s", c->sync_reason);
+    out->pinned_bytes = (unsigned long long)c->pinned_bytes;
+    out->alloc_calls = c->alloc_calls;
+    out->steady_alloc_calls = c->steady_alloc_calls;
+    out->overlapped_uploads = c->overlapped_uploads;
+    out->batches = c->arena_batches;
+    return 0;
+}
+
+/* #285: the labelled fallback switch. `sync != 0` forces the blocking copy
+   path (used by the parity test and by a caller that knows its staging will
+   not fit); `sync == 0` re-enables async copies if the streams exist. Returns
+   the previous mode. */
+int rc_arena_force_sync(void *ctx, int sync)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    int previous = c->async_copy;
+    if (sync) {
+        c->async_copy = 0;
+        snprintf(c->sync_reason, sizeof(c->sync_reason),
+                 "caller forced the synchronous copy path");
+    } else if (c->s_h2d && c->s_d2h && c->s_eval) {
+        c->async_copy = 1;
+        c->sync_reason[0] = '\0';
+    }
+    return previous;
 }
 
 /* --- #122: persistent fixed-capacity program pool ------------------------ */

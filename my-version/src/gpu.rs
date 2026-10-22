@@ -583,6 +583,60 @@ struct RawStats {
     failed: i32,
 }
 
+/// #285: host-visible state of the persistent batch arena. Mirrors
+/// `RcArenaReport` in `src/cuda/eval.cu` field for field.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct RawArenaReport {
+    async_copy: i32,
+    reason: [std::os::raw::c_char; 96],
+    pinned_bytes: u64,
+    alloc_calls: u64,
+    steady_alloc_calls: u64,
+    overlapped_uploads: u64,
+    batches: u64,
+}
+
+/// #285: what the batch arena is doing, for a test, benchmark or report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArenaReport {
+    /// `true` when H2D/D2H run asynchronously through the pinned ring.
+    pub async_copy: bool,
+    /// The recorded cause when the synchronous fallback is active.
+    pub reason: String,
+    /// Bytes currently pinned for host staging (hard cap 64 MiB).
+    pub pinned_bytes: u64,
+    /// Total device/host allocator calls made by the arena.
+    pub alloc_calls: u64,
+    /// Allocator calls after the first successful batch: the hot-path count.
+    pub steady_alloc_calls: u64,
+    /// Uploads that were enqueued while the previous kernel was still
+    /// outstanding — the event-ordering proof of overlap.
+    pub overlapped_uploads: u64,
+    /// Batches collected through the arena.
+    pub batches: u64,
+}
+
+impl ArenaReport {
+    fn from_raw(raw: &RawArenaReport) -> Self {
+        let bytes: Vec<u8> = raw
+            .reason
+            .iter()
+            .map(|&c| c as u8)
+            .take_while(|&b| b != 0)
+            .collect();
+        ArenaReport {
+            async_copy: raw.async_copy != 0,
+            reason: String::from_utf8_lossy(&bytes).into_owned(),
+            pinned_bytes: raw.pinned_bytes,
+            alloc_calls: raw.alloc_calls,
+            steady_alloc_calls: raw.steady_alloc_calls,
+            overlapped_uploads: raw.overlapped_uploads,
+            batches: raw.batches,
+        }
+    }
+}
+
 extern "C" {
     fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32) -> *mut RawCtx;
     fn rc_destroy(ctx: *mut RawCtx);
@@ -593,6 +647,12 @@ extern "C" {
         nprog: i32,
     ) -> i32;
     fn rc_eval(ctx: *mut RawCtx, out: *mut f32, loss: i32) -> f32;
+    /* #285: split submit/collect and arena introspection. `rc_eval` is the
+       compatibility shim over these two. */
+    fn rc_eval_submit(ctx: *mut RawCtx, loss: i32) -> i32;
+    fn rc_eval_collect(ctx: *mut RawCtx, out: *mut f32) -> f32;
+    fn rc_arena_report(ctx: *mut RawCtx, out: *mut RawArenaReport) -> i32;
+    fn rc_arena_force_sync(ctx: *mut RawCtx, sync: i32) -> i32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
@@ -1088,6 +1148,101 @@ impl GpuEvaluator {
                 (out, ms)
             }
         })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        result
+    }
+
+    /// #285: the persistent arena's current state.
+    ///
+    /// `steady_alloc_calls` is the number of allocator calls made *after* the
+    /// first successful batch. With a stable batch shape it must not increase:
+    /// the arena is allocated once and reused through both program slots.
+    /// `reason` names the fallback when `async_copy` is false.
+    pub fn arena_report(&self) -> ArenaReport {
+        let mut raw = RawArenaReport {
+            async_copy: 0,
+            reason: [0; 96],
+            pinned_bytes: 0,
+            alloc_calls: 0,
+            steady_alloc_calls: 0,
+            overlapped_uploads: 0,
+            batches: 0,
+        };
+        if unsafe { rc_arena_report(self.ctx, &mut raw) } != 0 {
+            return ArenaReport::from_raw(&raw);
+        }
+        ArenaReport::from_raw(&raw)
+    }
+
+    /// #285: force the blocking copy path (`sync = true`) or re-enable the
+    /// pinned asynchronous path. Returns whether async copies were enabled
+    /// before the call. Used by the parity test and as an operational escape
+    /// hatch when a host cannot pin the staging ring.
+    pub fn force_synchronous_copy(&mut self, sync: bool) -> bool {
+        let previous = unsafe { rc_arena_force_sync(self.ctx, i32::from(sync)) };
+        previous != 0
+    }
+
+    /// #285: score two packed batches with the second upload issued while the
+    /// first kernel is still outstanding.
+    ///
+    /// This is the production double-buffer schedule made observable: batch A
+    /// is uploaded and submitted on `S_eval`, batch B is then uploaded on
+    /// `S_h2d` (the `overlapped_uploads` counter records that A's kernel was
+    /// not yet complete when B's copy was enqueued), A is collected, and only
+    /// then is B submitted. Arithmetic and launch shape are identical to two
+    /// [`Self::eval_batch`] calls, so the errors are bit-for-bit equal.
+    ///
+    /// The ledger records the combined wall; this helper exists to exercise
+    /// and document the event ordering rather than to change the search.
+    #[allow(clippy::type_complexity)]
+    pub fn eval_batch_pipelined(
+        &mut self,
+        a_prog: &[u32],
+        a_off: &[u32],
+        b_prog: &[u32],
+        b_off: &[u32],
+    ) -> ((Vec<f32>, f32), (Vec<f32>, f32)) {
+        let na = a_off.len().saturating_sub(1);
+        let nb = b_off.len().saturating_sub(1);
+        if na == 0 || nb == 0 {
+            return ((Vec::new(), 0.0), (Vec::new(), 0.0));
+        }
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = unsafe {
+            rc_stats_begin(self.ctx);
+            let loss = self.loss.code();
+            if rc_set_programs(self.ctx, a_prog.as_ptr(), a_off.as_ptr(), na as i32) != 0
+                || rc_eval_submit(self.ctx, loss) != 0
+            {
+                ok = false;
+                ((Vec::new(), -1.0), (Vec::new(), -1.0))
+            } else {
+                /* B's upload is enqueued while A's kernel may still run. */
+                let b_ok =
+                    rc_set_programs(self.ctx, b_prog.as_ptr(), b_off.as_ptr(), nb as i32) == 0;
+                if !b_ok {
+                    ok = false;
+                }
+                let mut out_a = vec![0.0f32; na];
+                let ms_a = rc_eval_collect(self.ctx, out_a.as_mut_ptr());
+                if ms_a < 0.0 {
+                    ok = false;
+                }
+                if !b_ok || rc_eval_submit(self.ctx, loss) != 0 {
+                    ok = false;
+                    ((out_a, ms_a), (Vec::new(), -1.0))
+                } else {
+                    let mut out_b = vec![0.0f32; nb];
+                    let ms_b = rc_eval_collect(self.ctx, out_b.as_mut_ptr());
+                    if ms_b < 0.0 {
+                        ok = false;
+                    }
+                    ((out_a, ms_a), (out_b, ms_b))
+                }
+            }
+        };
         self.record_batch(started.elapsed().as_secs_f64(), ok);
         result
     }
