@@ -248,11 +248,12 @@ is mathematically well posed:
 | `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
-| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
+| `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights |
+| `log_loss` with `--fit-strategy gpu` (#234) | the same Fisher scoring in the batched kernel (uploaded label sign, `q(1-q)` weights, `t/q` pseudo-response, `softplus` trial objective, `ln det Ã` gate). Fit-only: the exact CPU `f64` log-loss judges every proposal, scores every candidate and refits every finalist |
 | `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
-| `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
+| `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230, signed: #231) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; `rank_correlation_signed` scores `1 − ρ` and can never accept a reflected model or an SSE/`|ρ|` proxy (#231); the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | `interquartile` with `--fit-strategy gpu` (#232) | the same squared start and the same ladder on the same sort, averaging ranks `[⌊n/4⌋, ⌊3n/4⌋)` of `|r|` (all rows below `n = 4`) — the window is by rank, so a repeated boundary value cannot change it. Every trial is scored on that window mean, never on SSE. Fit-only, `n >= 4096` rows, and the score agrees with the CPU to `1e-12` relative (a fixed tree reduction, not bit-identical like the median) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
@@ -417,6 +418,14 @@ finalist is refit by the exact CPU arm before reporting. See
 [`gpu-backend.md`](gpu-backend.md#exact-rank-correlation-fitting-issue-230) for
 the pipeline, fallback labels and the measured 4–11× polish speed-up at
 `n = 5k…154k`.
+
+For `rank_correlation_signed` (#231) the same stage scores `1 − ρ`, so the
+direction matters: a reflected model scores `2 − score(f)` instead of the same
+value, and the gate rejects it. The orientation is a single sign on the shared
+integer sums — no second kernel, no extra sort — and the proposal gate compares
+the **exact** oriented score, never SSE and never `|ρ|`. A proposal that is
+worse in SSE but better in signed ρ is accepted; a reflection is not. See
+[`gpu-backend.md`](gpu-backend.md#signed-rank-correlation-issue-231).
 
 ### 3.1 Measured results
 
@@ -958,23 +967,29 @@ were fitted, while the batched kernel is still 17–25× faster per candidate, s
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
 `non_finite`, `launch`, `rank_declined`, `median_declined`,
-`interquartile_declined`) in
+`interquartile_declined`, `single_class`, `log_loss_worse`) in
 `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
-accumulator, and `absolute` (#222) with per-row Lawson weights
-`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps. All robust
-arms are gated by a scale-free `ln det Ã` test instead of the squared arm's
-Cholesky-diagonal ratio.
-The rank, median and interquartile families are fit-only device arms (#230,
-#226, #232): the device moves the constants, the CPU scores and refits every
-finalist. The median and interquartile arms also require at least 4 096 training
-rows, the measured crossover of the batched selection; below it the exact CPU
-arm runs with a labelled reason. An explicit `gpu` with any other metric is a
-usage error (exit 2) naming `--metric squared`, `--metric log_squashed`,
-`--metric absolute`, a rank metric, `--metric median`, `--metric interquartile`
-or a CPU strategy (exact, auto, linear, varpro, stream), never a silent CPU fit
-of a different objective (#223). Every finalist is refit
+accumulator, `absolute` (#222) with per-row Lawson weights
+`1/max(|r|, 1e-6)`, true-`|r|` acceptance and Armijo half-steps, and
+`log_loss` (#234) with per-row Fisher weights `q(1-q)`, the uploaded label sign
+`t = 2[y > (min+max)/2] - 1`, the pseudo-response offset `t/q` and a
+`softplus(-t·p)` trial objective. The robust arms and `log_loss` are gated by a
+scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
+`log_loss` is fit-only, like the rank, median and interquartile families (#230,
+#226, #232): the device moves the constants, the exact CPU objective judges
+every proposal (reverted and labelled when worse), scores every candidate and
+refits every finalist. Its measured fit share is 97.5 % of a `log_loss` run's
+CPU work, which is why this arm attacks the dominant cost where the #233 AUC arm
+could not (3.0–3.5 %). The median and interquartile arms also require at least
+4 096 training rows, the measured crossover of the batched selection; below it
+the exact CPU arm runs with a labelled reason. An explicit `gpu` with any other
+metric is a usage error (exit 2) naming `--metric squared`,
+`--metric log_squashed`, `--metric absolute`, `--metric log_loss`, a rank
+metric, `--metric median`, `--metric interquartile` or a CPU strategy (exact,
+auto, linear, varpro, stream), never a silent CPU fit of a different objective
+(#223). Every finalist is refit
 exactly on all training rows in CPU f64 *for
 the configured metric* before it is scored and reported, so reported constants
 and metrics never come from f32. The arm is opt-in and saved in checkpoints;

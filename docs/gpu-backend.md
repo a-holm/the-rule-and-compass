@@ -415,6 +415,13 @@ signed scorer on the device (#236).
 | `log_squashed` | `ln(1 + r²)` | exact objective (up to `f32`), #229 |
 | `absolute` | `|r|` | exact objective (up to `f32`), #222 |
 
+The batched **fit** kernel (below) also minimises the logistic log-loss
+`ln(1 + exp(-t·p))` (#234). `log_loss` is a **fit-only** arm like the rank and
+median families: the evaluator accumulates `ρ(pred − y)` and has no label or
+logit semantics, so every fitness, every proposal decision and every finalist
+refit stays the exact CPU `log_loss`, and only the constants come from the
+device.
+
 Every other metric is scored by the CPU evaluator: the scoring kernel has no
 MAE, rank, minimax, correlation, slope or classification objective, and using
 MSE as a ranking proxy silently changes the search (`--metric slope` was observed to
@@ -1261,6 +1268,119 @@ fitted 237 on the device and sent 15 to the CPU (**6.0 %**, all
 CPU f64. The fit stage was 1.39 s (40.4 % of wall; kernel 0.28 s) and
 kernel-time duty was 81.6 %.
 
+### LogLoss on the batched kernel (issue #234)
+
+`--metric log_loss` is the mean binary cross-entropy
+`−1/n Σ [l ln q + (1−l) ln(1−q)]` with `q = σ(p)`, the model output `p` read as
+a **logit** and `l = [y > (min y + max y)/2]` (#113). Unlike `log_squashed`
+this is a *likelihood*, not a robust loss: the optimum is finite, it fixes the
+scale and the offset, and its Hessian `JᵀWJ` with `W = q(1−q) ≤ 1/4` is
+positive definite — the one classification metric the note in
+`arbeidsmappe/crypto-rcsr/gpu-metrics/classification.md` calls optimisable
+without a surrogate.
+
+**Why the arm is fit-only.** The CPU fitness of `log_loss` is one `O(n)` pass,
+while the CPU fit (`logistic_irls`) is up to 16 rounds of `tree.clone()` + two
+LM sweeps + one metric pass. Measured on the pinned cell below, the fit owns
+**97.5 %** of a `log_loss` run's CPU work — the opposite of the AUC arm, where
+the exact fitness owned 70–77 % of the wall and a fit-only arm could not pay for
+itself (#233). The device is therefore admitted for the **fit** only, and the
+fitness stays the exact CPU value, which has a second benefit: the archive of a
+fit-only run is ranked on exactly the numbers a CPU run would produce, so a
+quality delta is attributable to the constants alone. `rc_eval` has no label
+semantics, so admitting the evaluator would be the #236 silent substitution
+(`DeviceLoss::for_metric(LogLoss)` stays `None`); `fit::fit_only_loss` names the
+split once and the search's gate, its scoring path and its fit dispatch all read
+it.
+
+**The step is the CPU's step, in the same kernel.** With the label sign
+`t = 2l − 1`, the margin `u = t·p` and `q = σ(u)` clamped to
+`[1e-9, 1−1e-9]` exactly like `logistic_irls`:
+
+```
+sw  = w · q(1-q)            // Fisher weight, ≤ 0.25
+resp = −t/q                 // pseudo-response offset, |resp| ≤ 1e9
+A  += (√sw·g)(√sw·g)ᵀ ,  b += √sw·g · √sw·resp
+loss += w · [max(−u,0) + log1p(exp(−|u|))]
+```
+
+The accumulator forms `Σ (s·g)(s·resp) = Σ sw·g·resp = −Σ t(1−q)·g`, which is
+exactly the gradient of `Σ ln(1 + exp(−t·p))` that `ft_solve`'s
+`A δ = −Jᵀr` consumes, and `A` is the same `JᵀWJ` the CPU's pseudo-response
+`z = p + t/q` produces. Nothing else in the kernel changes: same layout, same
+`λ` schedule, same four-step f64 polish, same statistic ownership.
+
+* **Stability.** `q` is formed from `u` in f64 with the branch
+  `1/(1+e^{−u})` for `u ≥ 0` and `e^u/(1+e^u)` otherwise, so no step
+  overflows at `|u| = 10⁶`; the loss is the Lin–Lin–Weng form
+  `max(−u,0) + log1p(exp(−|u|))`, which never overflows and is exact for small
+  `|u|` where the naive form cancels. Both row factors are bounded by the clamp,
+  so neither an f32 product nor `--use_fast_math`'s flush-to-zero can hide a
+  row: `√sw ≤ 0.5`, `|resp| ≤ 1e9`.
+* **The label sign is uploaded once** (`rc_set_fit_sign`), because a
+  one-block-per-candidate kernel cannot reduce the target midpoint over the
+  sample. A log-loss launch **without** an uploaded sign is refused on the
+  device, so the arm can never run on another objective, and the host refuses a
+  **single-class** sample (`single_class`), whose unconstrained optimum is at
+  infinity.
+* **Class imbalance is not reweighted.** The configured metric is the
+  *unweighted* mean cross-entropy, so balancing the classes would silently
+  change the objective (the balanced logistic is only the right surrogate for
+  `auc`). Imbalance is a conditioning problem instead: at 1 % positives the
+  optimum is finite, `q(1−q)` spans decades and the scale-free `ln det Ã` gate
+  is what decides identification. `q(1−q)` never reaches zero, so a saturated
+  row keeps a (tiny) weight rather than disappearing from the Hessian.
+* **Metric-aware acceptance.** After the batch, every accepted proposal is
+  judged by the exact `f64` `log_loss` at the proposal against the exact value
+  at the starting constants (`fit::gate_proposal`). Worse → revert and label
+  `log_loss_worse`, non-finite → revert and label `non_finite`. Finalists are
+  refit by `fit_weighted_metric` in CPU `f64` and every reported error is the
+  exact CPU log-loss of the stored tree.
+
+**Fallback labels.** Beside the existing causes the arm reports
+`single_class` (one class in the fit sample) and `log_loss_worse` (the kernel's
+constants lost the exact comparison). `ill_conditioned` is the common one on
+binary data, and it is the *correct* answer: a candidate that separates the fit
+rows has no finite MLE, so the kernel's determinant gate declines it and the
+exact CPU arm keeps the candidate.
+
+**Measured (paired, RTX 3060 shared with a 10-hour production run).** `N =
+20 000` rows, 5 % positives, 15 % label noise, `pop 64`, 2 islands, 5
+generations, **640 evaluations**, `--fit-iters 8`, `--fit-strategy gpu`:
+
+| seed | CPU wall | GPU wall | speed-up | CPU best log-loss | GPU best log-loss | Δ | CPU hv | GPU hv | fallback | kernel |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 93 | 21.80 s | 9.17 s | **2.38×** | 0.099964 | 0.105188 | +5.2e-3 | 0.5496 | 0.5950 | 41 (10.9 %) | 0.34 s |
+| 94 | 24.96 s | 6.37 s | **3.92×** | 0.097171 | 0.093748 | −3.4e-3 | 0.7361 | 0.7295 | 38 (10.3 %) | 0.38 s |
+| 95 | 22.76 s | 7.24 s | **3.14×** | 0.104713 | 0.093063 | −11.7e-3 | 0.5798 | 0.5952 | 38 (10.2 %) | 0.35 s |
+
+Both walls carry the shared device and host load; the arms are paired in one
+process and each seed is deterministic (the same archive and best value on every
+repeat). Quality is a wash, if anything slightly positive: the GPU arm is better
+on two of three seeds and on the hypervolume in two of three, and at
+`--fit-iters 16` it is better by 5.4e-3 at 3.06×, at `--fit-iters 4` better by
+1.0e-3 at 2.62× — the one worse seed is a trajectory difference at equal
+evaluations, not a systematic loss.
+
+**Where the time goes** (seed 93): the CPU arm spends 40.70 s of CPU work in the
+fit (97.5 %) against 1.06 s in the fitness. The device arm's fit stage is
+6.38 s of wall for 376 admitted candidates — **17.0 ms per candidate** against
+**63.6 ms** on the CPU, of which 0.92 ms is the kernel (**61–69× on the
+kernel**) — and the rest is the exact `f64` gate (two metric passes per
+proposal), the 41 labelled CPU fallbacks and the write-back. The arm also scores
+every candidate's fitness on the CPU (0.74 s, 8.1 % of wall). That is the cost
+model: a fit-only arm can recover at most the fit share (97.5 % here) and it
+actually recovers 2.4–3.9× because the gate and the fitness remain.
+
+**Tests** (`tests/logloss_gpu.rs`): the label rule and its subset
+independence, single-class counting, the constant model against the closed form
+`ln(n₊/n₋)` on the device, parity with the CPU `logistic_irls` on the objective
+(relative ≤ 1e-6), extreme logits (±300, +5 000), determinism and batch
+independence, the single-class refusal, a 28/32/64-iteration termination guard,
+the proposal gate (worse / non-finite / kept), exact-CPU-reported errors at the
+search level, the `--no-fit` no-op, and the paired measurement as an ignored
+benchmark.
+
 ### Metric-aware verification and the signed arm (#228)
 
 `fit/gpu.rs` judges every proposal on the **configured** objective (the #229
@@ -1514,6 +1634,8 @@ substitute for either.
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
+| logistic log-loss constants on the batched kernel: Fisher weights `q(1-q)`, uploaded label sign, softplus trial objective, closed-form and parity fixtures, extreme logits, single-class refusal, proposal gate, determinism, `--no-fit`, 28/32/64-iteration termination guard (#234) | RTX 3060, `cargo test --release --features cuda --test logloss_gpu` (21 tests) and the ignored `bench_logloss_end_to_end` | **verified** on three paired seeds (2.38×/3.92×/3.14×, quality a wash) |
+| `log_loss` **native fitness** on the device (a log-loss scorer in `rc_eval`) | — | **not built**: the evaluator has no label semantics, so the fitness is exact CPU; a device fitness is only worth it once the fit stage is cheap (it is 8.1 % of wall now) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
@@ -1643,6 +1765,99 @@ roughly `n ≈ 10⁴` the CPU polish is latency-competitive for a single candida
 so the device arm pays off through batching; the threshold is not a hidden
 switch — any configuration outside the list above is labelled by
 `gpu_blocker`'s reason in the one-line note.
+
+## Signed rank correlation (issue #231)
+
+`--metric rank_correlation_signed` scores `1 − ρ`, not `1 − |ρ|`: the direction
+of the monotone relation is part of the objective. #230 landed the exact integer
+rank stage and left the orientation as one host-side flag; #231 proves and pins
+that orientation end to end. There is no second kernel: the integer sums
+`Σ A·B`, `Σ A·A`, `Σ B·B` are shared, and `signed` is applied once, after the
+single division.
+
+**The identities the arm is built on.** For any prediction `f` and its
+reflection `−f`, `A(−f) = −A(f)` exactly, so
+
+```
+Σ AB(−f) = −Σ AB(f),   Σ A² and Σ B² unchanged
+ρ(−f) = −ρ(f)
+1 − ρ(−f) = 2 − (1 − ρ(f))         1 − |ρ(−f)| = 1 − |ρ(f)|   (unsigned)
+```
+
+A reflection is therefore *penalised* by `2 − score` under the signed metric and
+*invisible* under the unsigned one. That is the only difference between the two
+arms, and it is a bit-exact statement about the integer sums, tested on the CPU
+(`reflection_penalty_is_a_score_identity`) and on the device
+(`reflection_flips_the_cross_sum_exactly_on_the_device`: the device returns
+`AB(−c) = −AB(c)` with equal `AA`, `BB`).
+
+**Where the orientation is decided.**
+
+* `coordinate_polish` and the batched `polish_rank_batch` score every trial with
+  `RankTarget::score(pred, signed)`. A coordinate step *can* cross a zero
+  constant and so reflect the model; it is accepted **only** when that improves
+  `1 − ρ` strictly. No procedural reflection is ever applied.
+* The keep/replace decision after the polish is `fit::rank::choose_rank_fit`,
+  shared by the search arm (`GpuEvaluator::rank_fit_batch`), the batched
+  verifier (`BatchedGpu`) and the unit tests: strict improvement on the exact
+  oriented score, equal keeps the start, and an unscorable **baseline** is a
+  labelled `rank_declined` fallback rather than a blind acceptance of the
+  polished constants.
+* The shared proposal gate (`fit::gpu::verify_proposal`) now judges a rank
+  proposal on the **exact integer statistic** under the metric's orientation
+  (before #231 it compared the f64 Pearson value; the ordering is identical, but
+  only the integer form is the same arithmetic the polish decides on). A
+  reflected proposal is rejected for `rank_correlation_signed` and accepted as
+  an equal for `rank_correlation`.
+* `BatchedGpu::fit_batch_metric` answers rank metrics with the device rank arm
+  (`rank_fit_batch`), so the batched verifier is rank-native; the search path
+  already used the same arm directly. Weights, multi-output and non-finite rows
+  are still declined to the exact CPU arm.
+
+**MSE can never rank.** `GpuSearch::native_metric` is `false` for the rank
+family: `evaluate_pending` compiles no program, so screening and fitness are the
+CPU rank score; the reported `backend` stays `cpu` with
+`backend_reason = "metric is not scored natively on the GPU"`. The device's
+squared LM is only the *start* of the polish. A test pins the gate direction
+(`a_signed_rank_proposal_is_accepted_even_when_it_costs_sse`): a proposal that is
+much worse in SSE but perfect in signed ρ is accepted, which an SSE (or `|ρ|`)
+gate would reject.
+
+**`--no-fit`.** `fit_iters = 0` never builds the evaluator (the arm is not
+offered), and `rank_fit_batch(…, 0, …)` returns the incoming constants without a
+sweep, for both orientations.
+
+**Measured (RTX 3060, machine shared with other builds — load average ≈ 12, so
+indicative).** Fit-stage polish, `p = 4`, up to 8 sweeps, same start, identical
+constants:
+
+| `n` | CPU exact polish | GPU polish (unsigned) | GPU polish (signed) | speed-up |
+|---|---|---|---|---|---|
+| 154 000 | 1 218.1 ms | 93.2 ms | 93.9 ms | 11.95× |
+
+The two orientations cost the same, as expected: identical sort work, one sign
+on the host. One call carrying `s` ladder segments at `n = 154 000` (mean of 3):
+5.02, 5.99, 6.28, 7.17, 6.74, 7.29, 7.97, 8.19 ms for `s = 1…8`, a least-squares
+fit of **`t = 4.97 ms + 0.41 ms × segments`**. The fixed part is
+allocation/upload/launch and amortises across live candidates; the per-segment
+part is the segmented radix sort plus the integer reduction.
+
+Paired end-to-end (`n = 20 000`, `pop = 48`, 2 generations, 1 island, 96
+evaluations, same seed and rows):
+
+| metric | CPU exact | GPU rank fit | speed-up | best error | fits on device | labelled fallbacks | fit share of wall |
+|---|---|---|---|---|---|---|---|
+| `rank_correlation` | 3.91 s | 2.00 s | 1.96× | 8.553000e-2 → 8.551545e-2 | 72 / 78 | 6 (7.7 %) | 40.1 % |
+| `rank_correlation_signed` | 3.80 s | 1.69 s | 2.25× | 1.095749e-1 (identical) | 75 / 80 | 5 (6.2 %) | 44.3 % |
+
+Fitness stays on the CPU in both rows; the speed-up is the fit stage only,
+which is why it is smaller than the 11.95× polish speed-up.
+
+**What is not claimed.** The 3.9M-row cell is not exercised (the cost model
+extrapolates from 154k); buffer reuse across rank calls is not implemented; and
+1-island versus 4-island *archives* are not asserted equal (the island RNG
+streams differ by design) — determinism is pinned as repeated identical runs at
+each island count.
 
 ## Median absolute error fitting (issue #226)
 

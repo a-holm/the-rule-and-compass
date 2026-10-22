@@ -14,6 +14,13 @@
 //!    LM unless the tree is affine/separable), on the untouched tree;
 //! 4. finalists are always refit exactly with [`refit_finalists_exact`].
 //!
+//! #234: `log_loss` is the first metric whose **fit** is native on the device
+//! and whose **fitness** is not ([`DeviceLoss::for_metric`] deliberately
+//! excludes it: the evaluator has no label semantics). The arm is fit-only —
+//! the search scores every candidate with the exact CPU log-loss and only the
+//! constants come from the kernel — and the exact objective is what decides
+//! whether a proposal replaces its starting constants.
+//!
 //! #229: the gate and the refit are **metric-aware**. A `log_squashed`
 //! proposal that improves `mean ln(1 + r²)` can be worse in SSE; judging it by
 //! SSE would silently discard exactly the fits the metric exists for (the bug
@@ -219,6 +226,12 @@ enum Verdict {
 /// cannot exist means the model cannot represent the mean; then only a strict
 /// objective improvement can justify the proposal, and otherwise the outcome is
 /// [`Verdict::NotIdentifiable`] rather than a squared answer in disguise.
+///
+/// #231: the rank family is judged on the **exact integer** statistic of
+/// [`metrics::RankTarget`], under the orientation the metric names — `1 − ρ` for
+/// `rank_correlation_signed`, `1 − |ρ|` for `rank_correlation`. The gate never
+/// sees an SSE, and a reflected model is a worse deal for the signed objective
+/// (`2 − score`) exactly as it is for the CPU arm.
 fn verify_proposal(
     tree: &mut Node,
     proposal: &[f64],
@@ -236,6 +249,26 @@ fn verify_proposal(
         if f.cslot[i] >= 0 {
             c0[f.cslot[i] as usize] = f.val[i];
         }
+    }
+    if let Some(signed) = rank_metric_signed(metric) {
+        // The rank family refuses weights and needs the same rows throughout,
+        // so anything else is declined rather than judged on a proxy.
+        let Some(target) = metrics::RankTarget::new(y) else {
+            return Verdict::Rejected;
+        };
+        if !w.is_empty() || target.len() != x.len() {
+            return Verdict::Rejected;
+        }
+        let start = score_constants(tree, &c0, x, &target, signed);
+        let candidate = score_constants(tree, proposal, x, &target, signed);
+        let (Some(start), Some(candidate)) = (start, candidate) else {
+            return Verdict::Rejected;
+        };
+        if candidate > start {
+            return Verdict::Rejected;
+        }
+        write_constants(tree, &f, proposal);
+        return Verdict::Accepted(candidate);
     }
     if metric != Metric::Squared {
         // #229: the configured loss decides, never SSE.
@@ -292,6 +325,67 @@ fn fitted_constants(tree: &Node) -> Vec<f64> {
 /// what the archive and the report consume. Like [`refit_finalists_exact`] this
 /// is the step that makes the reported number independent of the device's
 /// arithmetic.
+/// #234: the exact configured objective at a tree's current constants.
+///
+/// Same convention as [`fit_weighted_metric`](super::fit_weighted_metric)'s
+/// return value for a non-squared metric, so the search's proposal gate and the
+/// reported fitness agree by construction.
+pub fn exact_metric_score(
+    tree: &Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> f64 {
+    metric_score(tree, x, y, w, metric)
+}
+
+/// #234: the outcome of the search's device-proposal gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalGate {
+    /// The proposal is finite and no worse than the start; it is now in the tree.
+    Kept,
+    /// The proposal scored strictly worse; the starting constants were kept.
+    Worse,
+    /// The proposal or the start was not a finite objective.
+    NonFinite,
+}
+
+/// #234: apply a device proposal to a clone and keep it only when the
+/// **configured** objective, in exact `f64`, is finite and no worse than at the
+/// starting constants.
+///
+/// This is the invariant the log-loss arm is shipped on: the kernel supplies a
+/// row sweep in f32/f64, but a proposal that does not improve the loss the user
+/// asked for cannot replace the constants the candidate started with. A model
+/// whose proposal is non-finite is rejected (`NonFinite`), and the tree is left
+/// bit-identical in both rejection cases. Returns the exact objective of the
+/// constants now in the tree.
+pub fn gate_proposal<F>(
+    tree: &mut Node,
+    apply: F,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> (f64, ProposalGate)
+where
+    F: FnOnce(&mut Node),
+{
+    let start = metric_score(tree, x, y, w, metric);
+    let mut trial = tree.clone();
+    apply(&mut trial);
+    let candidate = metric_score(&trial, x, y, w, metric);
+    if !start.is_finite() || !candidate.is_finite() {
+        return (start, ProposalGate::NonFinite);
+    }
+    if candidate > start {
+        return (start, ProposalGate::Worse);
+    }
+    *tree = trial;
+    (candidate, ProposalGate::Kept)
+}
+
 pub fn signed_finalist(
     tree: &mut Node,
     x: &[Vec<f64>],
@@ -316,6 +410,12 @@ pub fn signed_finalist(
 /// **warm start** and the verifier completes it with the exact `f64` projection
 /// onto the zero-mean-residual manifold: the device supplies the row sweep, the
 /// exact objective decides what is kept. Other metrics are declined.
+///
+/// #234: for `log_loss` the batch also uploads the label sign
+/// ([`super::classification_signs`]) derived from `y`, because the kernel
+/// cannot compute the target midpoint over the sample; the proposal is then the
+/// kernel's Fisher-scoring optimum of the configured log-loss. Without both
+/// classes the batch is declined.
 #[cfg(feature = "cuda")]
 pub struct BatchedGpu<'a> {
     ev: std::cell::RefCell<&'a mut crate::gpu::GpuEvaluator>,
@@ -361,6 +461,49 @@ impl BatchedGpu<'_> {
         }
         out
     }
+
+    /// #231: the device's **exact rank** proposal for the configured
+    /// orientation.
+    ///
+    /// This is [`crate::gpu::GpuEvaluator::rank_fit_batch`] as a batched
+    /// proposal: the squared LM start, the exact integer polish under `signed`,
+    /// and the same monotone gate against the incoming constants. A declined or
+    /// non-finite candidate returns `None`, so [`fit_batch_verified`] refits it
+    /// with the exact CPU arm; an accepted candidate is still re-checked by the
+    /// host-side gate, on the exact objective.
+    fn propose_rank(
+        &self,
+        trees: &[Node],
+        iters: usize,
+        y: &[f64],
+        w: &[f64],
+        signed: bool,
+    ) -> Vec<Option<Vec<f64>>> {
+        let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
+        // The rank family refuses weights; the CPU arm owns those rows.
+        if !w.is_empty() || y.is_empty() {
+            return out;
+        }
+        let slots: Vec<(usize, GpuFitPlan)> = trees
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| gpu_fit_plan(t).map(|plan| (i, plan)))
+            .collect();
+        if slots.is_empty() {
+            return out;
+        }
+        let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
+        let (results, ms) = self.ev.borrow_mut().rank_fit_batch(&plans, iters, y, signed);
+        if ms < 0.0 || results.len() != slots.len() {
+            return out;
+        }
+        for ((i, _), res) in slots.iter().zip(results) {
+            if res.status == 0 && res.c.iter().all(|v| v.is_finite()) {
+                out[*i] = Some(res.c);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -380,13 +523,36 @@ impl BatchedFitter for BatchedGpu<'_> {
         &self,
         trees: &[Node],
         _x: &[Vec<f64>],
-        _y: &[f64],
-        _w: &[f64],
+        y: &[f64],
+        w: &[f64],
         iters: usize,
         metric: Metric,
     ) -> Vec<Option<Vec<f64>>> {
         if let Some(loss) = fit_loss(metric) {
+            // #234: the log-loss arm reads the label sign from the device, so
+            // the caller's `y` is uploaded once per batch. A single-class
+            // target has no finite log-loss optimum and is declined rather
+            // than fitted against a sign the data does not support; the caller
+            // labels it and the exact CPU arm keeps the candidate.
+            if loss == DeviceLoss::Logistic {
+                let (pos, neg) = class_counts(y);
+                if pos == 0 || neg == 0 {
+                    return vec![None; trees.len()];
+                }
+                let sign = classification_signs(y);
+                if !self.ev.borrow_mut().set_fit_sign(&sign) {
+                    return vec![None; trees.len()];
+                }
+            }
             return self.propose(trees, iters, loss);
+        }
+        // #231: the rank family has a native **fit** objective on the device,
+        // under the orientation the metric names, so the batched verifier no
+        // longer declines it. `verify_proposal` judges the proposal on the
+        // exact integer statistic, never on SSE and never on `|ρ|` for the
+        // signed metric.
+        if let Some(signed) = rank_metric_signed(metric) {
+            return self.propose_rank(trees, iters, y, w, signed);
         }
         if metric == Metric::Signed {
             // #228: warm start only; `verify_proposal` projects and judges.
@@ -1354,5 +1520,156 @@ mod tests {
         let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
         let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Absolute, 2);
         assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    // -- #231: the signed rank orientation through the batch gate ------------
+
+    /// `c0 * x + c1` with explicit constants: slot order is `(mul, add)`.
+    fn affine(c0: f64, c1: f64) -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(c0), input(0)]), constant(c1)],
+        )
+    }
+
+    fn predictions(tree: &Node, x: &[Vec<f64>]) -> Vec<f64> {
+        x.iter().map(|r| crate::expr::eval(tree, r)).collect()
+    }
+
+    /// #231: a strictly decreasing target, so the direction of rho is decided
+    /// by the sign of the slope and nothing else.
+    fn decreasing_fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![i as f64 / 10.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 5.0 - r[0]).collect();
+        (x, y)
+    }
+
+    /// #231: the gate must accept a rank proposal that is **worse in SSE** but
+    /// better on the signed objective. An SSE gate (or an `|rho|` gate) would
+    /// reject exactly the fit this metric exists for.
+    #[test]
+    fn a_signed_rank_proposal_is_accepted_even_when_it_costs_sse() {
+        let (x, y) = decreasing_fixture(40);
+        let start = affine(1.0, 0.0); // increasing: rho = -1, score 2.0
+        // The reflected slope plus a large offset: perfect rank order, terrible
+        // squared error.
+        let proposal = vec![-1.0, 105.0];
+        let sse_start = crate::metrics::score_with_constants(
+            &predictions(&start, &x),
+            &y,
+            Metric::Squared,
+            2,
+        );
+        let mut trial = start.clone();
+        crate::fit::write_constants(
+            &mut trial,
+            &flatten(&start),
+            &proposal,
+        );
+        let sse_proposal = crate::metrics::score_with_constants(
+            &predictions(&trial, &x),
+            &y,
+            Metric::Squared,
+            2,
+        );
+        assert!(
+            sse_proposal > sse_start,
+            "the fixture must make the rank proposal worse in SSE: {sse_proposal} vs {sse_start}"
+        );
+        let mut trees = vec![start];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(proposal.clone()) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better signed rho must be accepted whatever it costs in SSE"
+        );
+        assert_eq!(out.score[0], 0.0, "the reflected slope is the perfect signed fit");
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            proposal.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #231: the reflected model is rejected under `1 - rho` and accepted as an
+    /// equal under `1 - |rho|`. This is the reflection penalty at the gate.
+    #[test]
+    fn a_reflected_rank_proposal_is_judged_by_its_own_orientation() {
+        let (x, y) = decreasing_fixture(40);
+        // The start is the perfect *signed* fit: pred = y, rho = 1.
+        let start = affine(-1.0, 5.0);
+        let reflected = vec![1.0, 5.0];
+
+        let mut signed = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(reflected.clone()) },
+            &mut signed,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Worse,
+            "a reflection must never replace a signed fit"
+        );
+        // The CPU fallback keeps the start's exact signed score (0) and its
+        // constants.
+        assert_eq!(out.score[0], 0.0);
+        assert_eq!(
+            fitted(&signed[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted(&start).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut unsigned = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(reflected) },
+            &mut unsigned,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelation,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "the unsigned objective cannot tell a model from its reflection"
+        );
+        assert_eq!(out.score[0], 0.0);
+    }
+
+    /// #231: an equal proposal is not an improvement for the signed metric, and
+    /// `--no-fit` never moves a constant on it either.
+    #[test]
+    fn a_signed_rank_no_fit_is_a_true_noop() {
+        let (x, y) = decreasing_fixture(30);
+        let start = affine(-1.0, 5.0);
+        let before = fitted(&start);
+        let mut trees = vec![start];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![-1.0, 5.0]) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        assert_eq!(out.score[0], 0.0);
     }
 }

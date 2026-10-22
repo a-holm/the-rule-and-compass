@@ -24,6 +24,16 @@
 //! `arbeidsmappe/crypto-rcsr/gpu-metrics/rank-correlation.md`: the sort, not a
 //! gradient, is the cost centre, and integer partials make the device and the
 //! CPU agree bit for bit.
+//!
+//! #231 adds the **signed** orientation to the same contract. `1 − ρ` and
+//! `1 − |ρ|` share every integer sum; the direction is a single sign applied
+//! after the one division. The consequence is the one that matters for the fit:
+//! a reflected model (`−f`) scores `2 − score(f)` under `1 − ρ` and the same
+//! value as `f` under `1 − |ρ|`, so a gate that accepted reflections, compared
+//! SSE, or took `|ρ|` for the signed metric would silently optimise a different
+//! objective. [`choose_rank_fit`] and [`score_constants`] are the exact,
+//! device-free form of that gate; the device arm calls them on the returned
+//! sums.
 
 #![cfg_attr(not(feature = "cuda"), allow(dead_code))]
 
@@ -54,6 +64,82 @@ fn score_of(sums: Option<metrics::RankSums>, target: &metrics::RankTarget, signe
         ..s
     });
     metrics::score_rank_sums(sums, signed)
+}
+
+/// #231: what the batched arm does with one candidate's incoming constants.
+///
+/// The rank family is **monotone by construction**: the polish may only replace
+/// constants it improved *strictly* on the configured orientation of `1 − ρ`
+/// (or `1 − |ρ|`). The choice is made here rather than inside the device code so
+/// the same rule is unit-tested without a GPU and cannot drift between the
+/// search arm and the batched verifier.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum RankFitChoice {
+    /// The polished constants did not improve the exact score: keep the start.
+    KeepStart { score: f64 },
+    /// The polished constants improved the exact score strictly: take them.
+    TakePolished { score: f64 },
+    /// A prediction is not finite on one side. The candidate is invalid, not a
+    /// better fit (device status 2).
+    NonFinite,
+    /// The device could not score the **incoming** constants, so there is no
+    /// baseline to be monotone against. The CPU arm decides (device status 3);
+    /// the polished constants are never accepted blind.
+    Declined,
+}
+
+/// #231: the exact score of `c` (constant-slot order) under one orientation.
+///
+/// `None` when the vector has the wrong length or a prediction is not finite.
+/// The target is the caller's cached [`metrics::RankTarget`], so this never
+/// re-sorts `y`; `signed` is the **only** place the direction of `ρ` enters.
+pub(crate) fn score_constants(
+    tree: &Node,
+    c: &[f64],
+    x: &[Vec<f64>],
+    target: &metrics::RankTarget,
+    signed: bool,
+) -> Option<f64> {
+    let f = super::flatten(tree);
+    if c.len() != f.nconst || target.len() != x.len() {
+        return None;
+    }
+    let mut t = tree.clone();
+    super::write_constants(&mut t, &f, c);
+    let pred = super::predictions(&t, x);
+    let s = target.score(&pred, signed);
+    s.is_finite().then_some(s)
+}
+
+/// #231: decide a rank proposal exactly, without a device.
+///
+/// `polished` is the exact score of the polished constants; `start` is the
+/// device's integer sums for the incoming constants — `None` when that call
+/// itself failed, `Some(None)` when the incoming prediction was not finite.
+pub(crate) fn choose_rank_fit(
+    polished: f64,
+    start: Option<Option<metrics::RankSums>>,
+    target: &metrics::RankTarget,
+    signed: bool,
+) -> RankFitChoice {
+    let Some(cell) = start else {
+        return RankFitChoice::Declined;
+    };
+    let Some(sums) = cell else {
+        return RankFitChoice::NonFinite;
+    };
+    let start_score = score_of(Some(sums), target, signed);
+    if !start_score.is_finite() || !polished.is_finite() {
+        return RankFitChoice::NonFinite;
+    }
+    // Strict improvement, exactly like the CPU `fit_weighted_metric`: an equal
+    // score is not a reason to move the constants, and for the **signed**
+    // objective an inverted model is never equal.
+    if polished < start_score {
+        RankFitChoice::TakePolished { score: polished }
+    } else {
+        RankFitChoice::KeepStart { score: start_score }
+    }
 }
 
 /// The constants a batched polish settled on.
@@ -212,7 +298,7 @@ pub(crate) fn exact_rank_score(
 mod tests {
     use super::*;
     use crate::expr::{constant, input, node};
-    use crate::metrics::{centred_ranks_doubled, RankSums, RankTarget};
+    use crate::metrics::{centred_ranks_doubled, score_rank_sums, RankSums, RankTarget};
 
     /// The reference scorer: evaluates the tree with `expr::eval` and ranks the
     /// prediction with the exact CPU path. This is what the device is compared
@@ -481,5 +567,183 @@ mod tests {
         // -0.0 and +0.0 tie at rank 1.5 (A = -2), 1.0 is rank 3 (A = 1) and
         // 2.0 is rank 4 (A = 3).
         assert_eq!(a, vec![1, -2, -2, 3]);
+    }
+
+    // -- #231: the signed orientation ----------------------------------------
+
+    /// A strictly increasing target with a strictly increasing/last-reversed
+    /// prediction: the signed objective distinguishes the two directions
+    /// exactly, the unsigned one cannot.
+    #[test]
+    fn signed_direction_fixture_is_exact() {
+        let n = 33;
+        let y: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let target = RankTarget::new(&y).unwrap();
+        let up: Vec<f64> = y.clone();
+        let down: Vec<f64> = up.iter().map(|v| -v).collect();
+        // rho = 1 -> 0, rho = -1 -> 2 for the signed metric; both 0 unsigned.
+        assert_eq!(target.score(&up, true), 0.0);
+        assert_eq!(target.score(&down, true), 2.0);
+        assert_eq!(target.score(&up, false), 0.0);
+        assert_eq!(target.score(&down, false), 0.0);
+        // The f64 Pearson metric agrees on both, so the reported score and the
+        // exact stage cannot disagree about direction.
+        for (pred, signed) in [(&up, true), (&down, true), (&down, false)] {
+            let metric = if signed {
+                Metric::RankCorrelationSigned
+            } else {
+                Metric::RankCorrelation
+            };
+            let f64_score = crate::metrics::score_with_constants(pred, &y, metric, 0);
+            let exact = target.score(pred, signed);
+            assert!(
+                (f64_score - exact).abs() <= 8.0 * f64::EPSILON,
+                "f64 Pearson {f64_score} vs exact {exact}"
+            );
+        }
+    }
+
+    /// Reflection is a *penalty* under `1 - rho` and an *invariance* under
+    /// `1 - |rho|`. The integer sums make this an algebraic statement, not a
+    /// tolerance: `AB` flips sign exactly and `AA`/`BB` are unchanged.
+    #[test]
+    fn reflection_penalty_is_a_score_identity() {
+        let (x, y) = fixture(64);
+        let target = RankTarget::new(&y).unwrap();
+        let pred = super::super::predictions(&tree(), &x);
+        let reflected: Vec<f64> = pred.iter().map(|v| -v).collect();
+        let a = target.sums(&pred).unwrap();
+        let b = target.sums(&reflected).unwrap();
+        assert_eq!(b.ab, -a.ab, "the cross sum must flip exactly");
+        assert_eq!(b.aa, a.aa);
+        assert_eq!(b.bb, a.bb);
+        let rho = a.correlation();
+        let up = score_rank_sums(Some(a), true);
+        let down = score_rank_sums(Some(b), true);
+        assert_eq!(up, 1.0 - rho);
+        assert_eq!(down, 1.0 + rho);
+        assert!(
+            (up + down - 2.0).abs() <= 4.0 * f64::EPSILON * 2.0,
+            "score(f) + score(-f) must be 2: {up} + {down}"
+        );
+        // The unsigned objective cannot tell the two apart, bit for bit.
+        assert_eq!(
+            score_rank_sums(Some(a), false).to_bits(),
+            score_rank_sums(Some(b), false).to_bits()
+        );
+        // A reflected model is never an improvement under the signed metric
+        // unless the original was already reversed.
+        let start = target.sums(&pred).unwrap();
+        assert_eq!(
+            choose_rank_fit(down, Some(Some(start)), &target, true),
+            RankFitChoice::KeepStart { score: up }
+        );
+        // Under the unsigned metric the reflection is equal, so the gate keeps
+        // the start too - but because it is not an improvement, not because it
+        // is worse.
+        let unsigned = score_rank_sums(Some(a), false);
+        assert_eq!(
+            choose_rank_fit(unsigned, Some(Some(start)), &target, false),
+            RankFitChoice::KeepStart { score: unsigned }
+        );
+    }
+
+    /// Ties on both sides: the tie-corrected denominator caps `rho` below 1,
+    /// so the signed score has a positive floor even for a perfect ordering.
+    /// The exact path and the f64 Pearson path agree, and duplicate and signed
+    /// zeros are one tie block.
+    #[test]
+    fn tied_targets_are_ranked_exactly_on_both_sides() {
+        let y = vec![0.0, 0.0, 1.0, 2.0, 2.0, 2.0, -0.0, 3.0];
+        let target = RankTarget::new(&y).unwrap();
+        // `-0.0` is the same tie block as `+0.0`: B_6 = B_0.
+        assert_eq!(target.ranks()[6], target.ranks()[0]);
+        let pred = vec![-1.0, 0.5, 0.5, 1.0, 1.0, 2.0, 3.0, 4.0];
+        let sums = target.sums(&pred).unwrap();
+        let rho = sums.correlation();
+        assert!(
+            rho > 0.0 && rho < 1.0,
+            "heavy ties must keep rho strictly inside (0, 1): {rho}"
+        );
+        let exact = score_rank_sums(Some(sums), true);
+        assert!(exact > 0.0, "heavy ties must attenuate rho below 1: {exact}");
+        let f64_score = crate::metrics::score_with_constants(
+            &pred,
+            &y,
+            Metric::RankCorrelationSigned,
+            0,
+        );
+        assert!(
+            (f64_score - exact).abs() <= 8.0 * f64::EPSILON,
+            "f64 Pearson {f64_score} vs exact {exact}"
+        );
+        // Duplicated predictions are one tie block on the `A` side, so `AA`
+        // equals the value the reference rank vector gives.
+        let reference = RankSums::between(
+            &centred_ranks_doubled(&pred).unwrap(),
+            target.ranks(),
+        )
+        .unwrap();
+        assert_eq!(sums.aa, reference.aa);
+        assert_eq!(sums.ab, reference.ab);
+    }
+
+    /// The gate is a strict-improvement rule on the orientation it was given,
+    /// and an unscorable baseline is a decline rather than a blind acceptance.
+    #[test]
+    fn the_rank_gate_requires_a_strict_improvement_and_a_baseline() {
+        let (x, y) = fixture(48);
+        let target = RankTarget::new(&y).unwrap();
+        let t = tree();
+        let pred = super::super::predictions(&t, &x);
+        let sums = target.sums(&pred).unwrap();
+        let start = score_rank_sums(Some(sums), true);
+        assert_eq!(
+            choose_rank_fit(0.1, None, &target, true),
+            RankFitChoice::Declined,
+            "a failed baseline must never accept the polished constants"
+        );
+        assert_eq!(
+            choose_rank_fit(0.1, Some(None), &target, true),
+            RankFitChoice::NonFinite
+        );
+        assert_eq!(
+            choose_rank_fit(start, Some(Some(sums)), &target, true),
+            RankFitChoice::KeepStart { score: start },
+            "an equal score is not an improvement"
+        );
+        assert_eq!(
+            choose_rank_fit(start - 0.25, Some(Some(sums)), &target, true),
+            RankFitChoice::TakePolished { score: start - 0.25 }
+        );
+        assert_eq!(
+            choose_rank_fit(start + 0.25, Some(Some(sums)), &target, true),
+            RankFitChoice::KeepStart { score: start }
+        );
+        assert_eq!(
+            choose_rank_fit(f64::INFINITY, Some(Some(sums)), &target, true),
+            RankFitChoice::NonFinite
+        );
+    }
+
+    /// `score_constants` is the exact, device-free reference the gate and the
+    /// tests share; it refuses a wrong-length vector and a non-finite
+    /// prediction instead of inventing a number.
+    #[test]
+    fn score_constants_is_exact_and_refuses_bad_input() {
+        let (x, y) = fixture(40);
+        let target = RankTarget::new(&y).unwrap();
+        let t = tree();
+        let plan = plan_of(&t);
+        for signed in [false, true] {
+            let s = score_constants(&t, &plan.c0, &x, &target, signed).unwrap();
+            let pred = super::super::predictions(&t, &x);
+            assert_eq!(s.to_bits(), target.score(&pred, signed).to_bits());
+        }
+        assert!(score_constants(&t, &[0.0], &x, &target, true).is_none());
+        assert!(score_constants(&t, &plan_of(&t).c0, &x[1..], &target, true).is_none());
+        // A non-finite prediction is refused, not scored as a fit.
+        let broken = node(Op::Ln, vec![node(Op::Mul, vec![constant(-1.0), input(0)])]);
+        assert!(score_constants(&broken, &[0.0, 0.0], &x, &target, true).is_none());
     }
 }
