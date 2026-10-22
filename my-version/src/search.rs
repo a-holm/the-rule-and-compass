@@ -2030,8 +2030,8 @@ pub enum FitFallbackCause {
     TooFewRows,
     /// More than [`crate::fit::GPU_FIT_MAX_CONSTANTS`] constants (`p > 20`).
     TooManyConstants,
-    /// #229: the metric has no native device objective (only `squared` and
-    /// `log_squashed` do), so the exact CPU arm owns the fit.
+    /// #229/#222: the metric has no native device objective (only `squared`,
+    /// `log_squashed` and `absolute` do), so the exact CPU arm owns the fit.
     MetricNotNative,
     /// The kernel's conditioning gate rejected the normal equations (status 1).
     IllConditioned,
@@ -2197,8 +2197,8 @@ fn select_promoted(
 /// batched GPU LM arm. The kernel minimises one objective per launch, so only a
 /// metric with a native device objective qualifies (#229: `squared`, the
 /// information criteria via [`Metric::is_least_squares`], and `log_squashed`
-/// with its IRLS weights); every other configuration keeps the CPU fit path it
-/// had before.
+/// with its IRLS weights; #222: `absolute` with L1/IRLS weights and true-MAE
+/// acceptance); every other configuration keeps the CPU fit path it had before.
 ///
 /// #228: `signed` is deliberately not deferred — [`crate::fit::fit_loss`] is
 /// `None` for it. Its fit arm (the exact `f64` constrained-LS projection) is a
@@ -3928,9 +3928,9 @@ fn run_search(
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
             "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed or the exact rank and median objectives; --metric \
-             must be squared, log_squashed, aic, aicc, bic, rank_correlation, \
-             rank_correlation_signed or median)"
+             log-squashed, mean absolute error or the exact rank and median \
+             objectives; --metric must be squared, log_squashed, absolute, aic, \
+             aicc, bic, rank_correlation, rank_correlation_signed or median)"
         );
     }
     #[cfg(feature = "cuda")]
@@ -5303,6 +5303,11 @@ mod tests {
             ..Default::default()
         };
         assert!(defers_fit_to_gpu(&gpu_fit, true), "log_squashed is native");
+        let absolute = Config {
+            metric: Metric::Absolute,
+            ..gpu_fit.clone()
+        };
+        assert!(defers_fit_to_gpu(&absolute, true), "#222: absolute is native");
         for metric in [Metric::Squared, Metric::Aic, Metric::Aicc, Metric::Bic] {
             let cfg = Config {
                 metric,
@@ -5310,7 +5315,7 @@ mod tests {
             };
             assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
         }
-        for metric in [Metric::Absolute, Metric::Slope, Metric::Correlation] {
+        for metric in [Metric::Slope, Metric::Correlation] {
             let cfg = Config {
                 metric,
                 ..gpu_fit.clone()

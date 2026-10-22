@@ -402,7 +402,7 @@ Each generation then runs as:
 
 The GPU never produces a number a user reads. The kernel accumulates one
 **configured objective** per row; the search divides that by the row count and
-uses it as the fitness. Today the device has two native scoring objectives:
+uses it as the fitness. Today the device has three native scoring objectives:
 
 `--metric signed` is not one of them and is refused for an explicit
 `--fit-strategy gpu`: its exact arm is the host-side projection of #228
@@ -413,6 +413,7 @@ signed scorer on the device (#236).
 |---|---|---|
 | `squared` | `r²` | exact objective (up to `f32`) |
 | `log_squashed` | `ln(1 + r²)` | exact objective (up to `f32`), #229 |
+| `absolute` | `|r|` | exact objective (up to `f32`), #222 |
 
 Every other metric is scored by the CPU evaluator: the scoring kernel has no
 MAE, rank, minimax, correlation, slope or classification objective, and using
@@ -448,8 +449,8 @@ keeps the CPU arm and records that reason.
 Fallback and the flags:
 
 * With neither flag, a CUDA build with a usable device selects the GPU **for
-  `--metric squared`**. Every other metric, including the default `absolute`,
-  is scored on the CPU and prints
+  `--metric squared`, `--metric log_squashed` and `--metric absolute`**. Every
+  other metric is scored on the CPU and prints
   `# gpu: off (metric is not scored natively on the GPU)` once; the resource
   line and the `--json` `backend` both say `cpu` and `backend_reason` carries
   the same cause.
@@ -843,17 +844,19 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 `p = 17..20`.
 
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
-only for a metric with a native device objective (squared/AIC family, and
-`log_squashed` since #229), with `p <= 20`, at most 96 flattened nodes, no
-shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The device objective is also a **CLI contract** (#223, extended by
-#229): an explicit `--fit-strategy gpu` with any metric *without* a native
-device objective — that is, outside `squared`, `aic`, `aicc`, `bic` and
-`log_squashed` — is a usage error (exit code `2`) raised before any data is
-read, because the only alternative would be a silent CPU fit of a different
-objective. The message names the two objectives the kernel minimises and every
-way out (`--metric squared`, `--metric log_squashed`, or a CPU fit strategy). The device-missing fallback below is unchanged: it never
-claims the GPU arm and is recorded with its cause.
+only for a metric with a native device objective (squared/AIC family,
+`log_squashed` since #229, and `absolute` since #222), with `p <= 20`, at most
+96 flattened nodes, no shared block constants, an analytic derivative for every
+operator, and at least `32p` rows. The device objective is also a **CLI
+contract** (#223, extended by #229/#222): an explicit `--fit-strategy gpu` with
+any metric *without* a native device objective — that is, outside `squared`,
+`aic`, `aicc`, `bic`, `log_squashed` and `absolute` — is a usage error (exit
+code `2`) raised before any data is read, because the only alternative would be
+a silent CPU fit of a different objective. The message names the objectives the
+kernel minimises and every way out (`--metric squared`, `--metric
+log_squashed`, `--metric absolute`, or a CPU fit strategy). The device-missing
+fallback below is unchanged: it never claims the GPU arm and is recorded with
+its cause.
 
 The arm also screens before it fits: every unfitted offspring is
 scored once on the GPU with its seed constants, and the screened ranking decides
@@ -1160,6 +1163,101 @@ for finalists is the follow-up.
 (the fit section below), while the *ranking* would still need a native
 signed scorer on the device (#236).
 
+### Absolute (MAE) on the batched kernel (issue #222)
+
+`--metric absolute` minimises the mean absolute residual `(1/n) Σ |r|`. It is
+convex in the prediction but not in `c`, and its subgradient is set-valued at
+`r = 0`; `r = 0` is also where the classical Lawson weight `1/|r|` is infinite.
+The arm is therefore **weighted LM/IRLS with true-`|r|` acceptance**, not an
+SSE fit with an MAE report.
+
+Per row, at the constants the pass already evaluates:
+
+```
+sc = w / max(|r|, 1e-6)          // L1 majoriser; 1e-6 is the CPU floor
+A += (√sc·g)(√sc·g)ᵀ ,  b += √sc·g · √sc·r
+loss += w · |r|                  // the accepted objective, f64 sum
+```
+
+* `rounds = min(iters, 4)` outer IRLS rounds of `iters/rounds` damped sweeps
+  mirror the CPU `irls_fit` split; the weights are re-derived at the start of
+  every round and after every accepted step, so each sweep is one majorise step.
+* Every trial is scored by the configured `Σ|r|` (f32 per row, f64 reduction).
+  If a trial is not better, the step is **halved up to twice** (Armijo,
+  `ft_loss` passes only) before it is rejected; the f64 polish gets one exact
+  half-step. A lower weighted surrogate can therefore never be accepted while
+  the true MAE rises.
+* `sc` is computed in f64 from the f64 residual; the row scaling `√sc` enters
+  the existing rank-one update, so `A` stays PSD. The f64 polish re-assembles
+  the same weighted system on the exact f64 rows.
+* The conditioning gate is the scale-free `ln det Ã` test of #229, not the
+  squared arm's `hi/lo ≤ 10⁴`: L1 weights span six decades by construction.
+  A rank-deficient or zero-residual system that does fail is status `1` and is
+  refit by the exact CPU IRLS, never reported.
+* The base `--weight` vector multiplies the L1 weight exactly as in #229; a
+  weighted *run* still scores on the CPU evaluator because the evaluator has no
+  per-row weight array.
+
+**Gate.** `eval_kernel`/`eval_pool_kernel` accumulate `Σ|r|` for the new loss
+code (`DeviceLoss::Absolute = 4`), so the search ranks a `--metric absolute`
+run on MAE itself. `fit::fit_loss` and `DeviceLoss::for_metric` both name the
+objective, `defers_fit_to_gpu` admits it, and `verify_proposal` +
+`refit_finalists_exact` score and refit with `fit_weighted_metric(.., Absolute)`
+— the exact CPU L1 IRLS. A squared-only backend still declines `absolute`
+(the `BatchedFitter` default), so a device can never answer it with SSE.
+
+**Degeneracy and fallback.** Zero residual rows are legitimate but make the
+majoriser unbounded; the `1e-6` floor and the `ln det Ã` test decide between an
+exact fit and a labelled `ill_conditioned` fallback. Non-finite rows are status
+`2`; every other CPU fallback keeps its cause label from #169/#229.
+
+**Cost model.** Per accepted sweep the row cost is the forward/adjoint of the
+squared arm plus one f64 divide (`1/max(|r|,eps)`), one `sqrtf` and `p` extra
+multiplies; there is no transcendental, so the absolute arm costs the squared
+arm plus ~5 % of the statistic work, against the CPU's ~4 IRLS rounds ×
+`iters/4` sweeps plus a final `max(iters,4)`-sweep solve. On `N` rows, `p`
+constants and `P` candidates:
+
+```
+T_cpu(L1)  ≈ P · (S · n · a + (4 + S) · n · (m + p²/2) · b)      S = iters
+T_gpu(L1)  ≈ P · n · S · c / B + launch                          c ≈ 3 + (p²+p)/16
+```
+
+with `B` the derated candidate-rows/s of #169; below `n ≈ 2 000`, or `P < 2·SM`
+where one block per candidate leaves the device half empty, the CPU arm is the
+cheaper one and stays. The measured paired numbers are recorded in the table
+below and in #222.
+
+**Measured (paired, RTX 3060, this host).** Fit stage, `N = 100 000` rows with
+10 % of rows at +15 (the `bench_batched_fit_absolute` fixture), 8 iterations
+per candidate, the exact CPU L1 IRLS versus the whole GPU batch (upload +
+kernel + download):
+
+| p | P | CPU wall | GPU wall (kernel) | fit speed-up | no worse | mean endpoint MAE (CPU / GPU) |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 64 | 16.19 s | 0.499 s (0.499 s) | **32.4×** | 64/64 | 1.500500 / 1.500495 |
+| 8 | 64 | 30.33 s | 0.851 s (0.850 s) | **35.7×** | 64/64 | 1.500522 / 1.500500 |
+
+The L1 arm has no transcendental, so it is not slower than the #229 robust
+arm (34–49× on its fixture); the GPU mean is slightly *better* than the CPU
+because the outer IRLS rounds and Armijo steps land closer to the kink.
+
+End to end (`bench_end_to_end`, `RCSR_BENCH_METRIC=absolute`, `N = 20 000`,
+pop 64, 2 islands, 3 generations, 384 evaluations, seed 9, 10 % outliers, both
+arms in one process):
+
+| arm | wall | best mean `|r|` | hypervolume | TTT |
+|---|---:|---:|---:|---:|
+| `exact` CPU | 12.23 s | 6.186247e0 | 0.005127 | gen 1 / 2.6 s |
+| `gpu` + admission | **3.45 s** | **6.176220e0** | 0.005127 | gen 1 / 0.7 s |
+
+**3.55×** end to end at equal evaluations, with a 0.16 % lower best MAE and a
+3.7× earlier time-to-target. The arm screened 506 offspring, admitted 252,
+fitted 237 on the device and sent 15 to the CPU (**6.0 %**, all
+`ill_conditioned`; every other cause zero), then refit 130 finalists exactly in
+CPU f64. The fit stage was 1.39 s (40.4 % of wall; kernel 0.28 s) and
+kernel-time duty was 81.6 %.
+
 ### Metric-aware verification and the signed arm (#228)
 
 `fit/gpu.rs` judges every proposal on the **configured** objective (the #229
@@ -1415,6 +1513,8 @@ substitute for either.
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
+| `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
+| `absolute` paired fit stage and end-to-end quality | RTX 3060, `bench_batched_fit_absolute` and `bench_end_to_end` (`RCSR_BENCH_METRIC=absolute`) | **measured on one workload** — 32.4–35.7× fit stage, no-worse 64/64 at `p=4,8`, 3.55× end-to-end, 6.0 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 
 The compile gap is closed by the test and table above; it can be re-run on any
 machine with CUDA ≥ 12.9. The runtime gap needs a DGX Spark (or any `sm_121` +

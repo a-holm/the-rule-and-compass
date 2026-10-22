@@ -188,9 +188,10 @@ impl Metric {
     ///
     /// This is the family whose fitted objective is exactly weighted least
     /// squares. The batched GPU LM also honours `log_squashed` through weighted
-    /// IRLS since #229 ([`crate::fit::fit_loss`]); every other metric fits by
-    /// logistic IRLS or the coordinate polish on the CPU, which is a different
-    /// objective from the one the kernel would minimise.
+    /// IRLS since #229 and `absolute` through Lawson/L1 IRLS with true-MAE
+    /// acceptance since #222 ([`crate::fit::fit_loss`]); every other metric
+    /// fits by logistic IRLS or the coordinate polish on the CPU, which is a
+    /// different objective from the one the kernel would minimise.
     pub fn is_least_squares(self) -> bool {
         matches!(self, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic)
     }
