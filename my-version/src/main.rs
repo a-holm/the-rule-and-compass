@@ -395,8 +395,9 @@ SEARCH:
                              passes, no optimiser); correlation/correlation_signed
                              use the exact analytic rho gradient around a frozen
                              affine gauge; rank/order losses use a deterministic
-                             coordinate polish (median and interquartile on the
-                             device with --fit-strategy gpu, #226/#232)
+                             coordinate polish (median, interquartile and
+                             maximum on the device with --fit-strategy gpu,
+                             #226/#232/#227)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
@@ -435,6 +436,11 @@ SEARCH:
                              rows, the measured crossover) and for
                              interquartile the same sort averaging ranks
                              [n/4, 3n/4) of |r| (#232; fit-only, same row
+                             floor); for maximum (Chebyshev), the exact
+                             one-dimensional minimiser per constant by
+                             bisection on the error level (at most 32 rounds,
+                             no step ladder and no optimiser, #227; fit-only,
+                             from >= 512 training rows, the measured cost-model
                              floor). Without a batch backend it uses the exact
                              CPU arms (never a no-op).
                              The device refuses any other metric instead of
@@ -442,8 +448,8 @@ SEARCH:
                              `--metric squared`, `--metric log_squashed`,
                              `--metric absolute`, `--metric log_loss`, a rank
                              metric, `--metric median`, `--metric
-                             interquartile`, or a CPU strategy. `--metric
-                             signed`
+                             interquartile`, `--metric maximum`, or a CPU
+                             strategy. `--metric signed`
                              is in that group: it keeps the exact CPU
                              projection (#228) and says so, because the device
                              has no native signed scorer yet (#236)
@@ -491,8 +497,9 @@ SEARCH:
                              and prints the reason, never with a proxy loss;
                              with --fit-strategy gpu its *constants* may still
                              be fitted on the device (the rank, median,
-                             log_loss and interquartile arms; the last three are
-                             fit-only for the same reason — no native scorer).
+                             log_loss, interquartile and maximum arms; the last
+                             four are fit-only for the same reason — no native
+                             scorer).
                              Reported errors stay CPU f64. Cross-backend runs
                              are not bit-identical because f32 fitness can
                              change the trajectory. JSON

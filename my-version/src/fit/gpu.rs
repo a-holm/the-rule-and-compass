@@ -398,6 +398,32 @@ pub fn signed_finalist(
     (value, outcome)
 }
 
+/// #227: the exact `f64` finalist refit for `--metric maximum`, and the
+/// dominance guarantee over the CPU polish.
+///
+/// The device arm returns constants whose exact `max |r|` is no worse than its
+/// start. The research note (`arbeidsmappe/crypto-rcsr/gpu-metrics/minimax-bias.md`
+/// §5) makes the stronger claim testable: run the **CPU** polish on the device
+/// constants and keep whichever exact objective is lower. The comparison is a
+/// plain f64 `<` — zero tolerance — so the statement is `J_finalist ≤
+/// J_cpu_polish` by construction, whatever the device did.
+///
+/// The CPU arm starts from the incoming constants (`fit_weighted_metric` begins
+/// with `best = metric_score(tree)` and only writes improving trials), so it can
+/// never make the finalist worse either. Ties keep the device constants.
+pub fn maximum_finalist(tree: &mut Node, x: &[Vec<f64>], y: &[f64], w: &[f64], iters: usize) -> f64 {
+    note_gpu_refit();
+    let device = metric_score(tree, x, y, w, Metric::Maximum);
+    let mut cpu = tree.clone();
+    let polished = fit_weighted_metric(&mut cpu, x, y, w, iters, Metric::Maximum);
+    if polished.is_finite() && (!device.is_finite() || polished < device) {
+        *tree = cpu;
+        polished
+    } else {
+        device
+    }
+}
+
 /// #169 + #228: the CUDA LM kernel as a [`BatchedFitter`], so a whole
 /// generation can be driven through the metric-aware verifier.
 ///
@@ -585,6 +611,32 @@ impl BatchedFitter for BatchedGpu<'_> {
             }
             return out;
         }
+        // #227: `maximum` is fitted by the batched exact maximum-error polish:
+        // the same squared LM start, then the exact one-dimensional minimiser
+        // per constant by bisection on the error level. The verifier below
+        // judges the proposal on the configured maximum, never on SSE.
+        if maximum_fit_only(metric) && iters > 0 {
+            let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
+            let slots: Vec<(usize, GpuFitPlan)> = trees
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| gpu_fit_plan(t).map(|plan| (i, plan)))
+                .collect();
+            if slots.is_empty() {
+                return out;
+            }
+            let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
+            let (results, ms) = self.ev.borrow_mut().max_fit_batch(&plans, iters);
+            if ms < 0.0 || results.len() != slots.len() {
+                return out;
+            }
+            for ((i, _), res) in slots.iter().zip(results) {
+                if res.status == 0 && res.c.iter().all(|v| v.is_finite()) {
+                    out[*i] = Some(res.c);
+                }
+            }
+            return out;
+        }
         vec![None; trees.len()]
     }
 }
@@ -596,7 +648,9 @@ impl BatchedFitter for BatchedGpu<'_> {
 /// for every other metric it is [`fit_weighted_metric`], which starts from
 /// `best = metric_score(tree)` and only writes improving trials, so the refit
 /// can never make the finalist worse on the configured objective than the
-/// constants the GPU arm produced.
+/// constants the GPU arm produced. #227: `maximum` uses [`maximum_finalist`],
+/// which additionally runs the CPU polish on the device constants and keeps
+/// whichever exact objective is lower.
 pub fn refit_finalists_exact(
     trees: &mut [Node],
     x: &[Vec<f64>],
@@ -611,6 +665,8 @@ pub fn refit_finalists_exact(
             note_gpu_refit();
             if matches!(metric, Metric::Squared | Metric::Aic | Metric::Aicc | Metric::Bic) {
                 fit_lm(tree, x, y, w, iters)
+            } else if metric == Metric::Maximum {
+                maximum_finalist(tree, x, y, w, iters)
             } else {
                 fit_weighted_metric(tree, x, y, w, iters, metric)
             }
@@ -1671,5 +1727,185 @@ mod tests {
             "--no-fit must not move a constant"
         );
         assert_eq!(out.score[0], 0.0);
+    }
+    // -- #227: the maximum arm through the batch gate -----------------------
+
+    /// #227: a proposal that improves `max |r|` while making SSE much worse
+    /// must be accepted for `--metric maximum` — the exact bug an SSE gate
+    /// causes on a minimax objective. The fixture is a constant model on 21
+    /// rows where one row carries a 100-unit outlier: the squared optimum is
+    /// the mean (4.76), whose worst residual is 95.2, and the minimax optimum
+    /// is the midrange (50), whose worst residual is 50 — with a far larger
+    /// SSE.
+    #[test]
+    fn a_maximum_proposal_is_judged_by_the_maximum_not_by_sse() {
+        let x: Vec<Vec<f64>> = (0..21).map(|i| vec![i as f64]).collect();
+        let mut y = vec![0.0; 21];
+        y[20] = 100.0;
+        let start = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.0), input(0)]), constant(100.0 / 21.0)],
+        );
+        let sse_of = |c: &[f64]| sse(&flatten(&start), &x, &y, &[], c, &mut vec![0.0; 64]);
+        let max_of = |c: &[f64]| metric_score(&with_constants(&start, c), &x, &y, &[], Metric::Maximum);
+        let squared = fitted(&start);
+        let proposal = vec![0.0, 50.0];
+        assert!(
+            max_of(&proposal) < max_of(&squared),
+            "the fixture must make the minimax constant better: {} !< {}",
+            max_of(&proposal),
+            max_of(&squared)
+        );
+        assert!(
+            sse_of(&proposal) > sse_of(&squared),
+            "the fixture must make the minimax answer worse in SSE"
+        );
+        let mut gpu = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend {
+                proposal: Some(proposal.clone()),
+            },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Maximum,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better maximum proposal must not be rejected on SSE"
+        );
+        assert_eq!(out.score[0].to_bits(), max_of(&proposal).to_bits());
+        assert_eq!(
+            fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            proposal.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #227: a squared-only backend never answers a maximum request, and the
+    /// exact CPU maximum arm then produces the identical answer.
+    #[test]
+    fn a_squared_proposal_is_never_answered_for_maximum() {
+        let trees = vec![model()];
+        assert_eq!(
+            SquaredOnlyBackend(vec![2.0, 3.0]).fit_batch_metric(
+                &trees,
+                &[],
+                &[],
+                &[],
+                8,
+                Metric::Maximum
+            ),
+            vec![None],
+            "the default must decline a maximum request"
+        );
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let mut y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        y[7] += 3.0;
+        let mut gpu = vec![model()];
+        let out = fit_batch_verified(
+            &SquaredOnlyBackend(vec![2.0, 3.0]),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Maximum,
+        );
+        assert_eq!(out.status[0], BatchStatus::Unsupported);
+        let mut cpu = model();
+        let want = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Maximum);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+        assert_eq!(
+            fitted(&gpu[0])
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #227: `--no-fit` is a no-op for the maximum arm: the proposal never
+    /// runs, the constants stay bit-identical and the score is the exact
+    /// maximum at those constants.
+    #[test]
+    fn no_fit_keeps_a_maximum_run_untouched() {
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        let tree = model();
+        let before = fitted(&tree);
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &Backend {
+                proposal: Some(vec![9.0, 9.0]),
+            },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::Maximum,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
+        let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Maximum, 2);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    /// #227: the maximum finalist refit keeps the lower of the device objective
+    /// and the CPU polish (zero tolerance), is exact, never worse than its
+    /// start, and monotone from its own endpoint.
+    #[test]
+    fn a_maximum_finalist_keeps_the_lower_of_the_two_exact_objectives() {
+        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![-1.5 + 0.05 * i as f64]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 2.0 * (1.3 * r[0]).sin() + if i % 7 == 0 { 6.0 } else { 0.0 })
+            .collect();
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(1.0),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                    ],
+                ),
+                constant(0.0),
+            ],
+        );
+        let before = metric_score(&tree, &x, &y, &[], Metric::Maximum);
+        // A device endpoint that is already better than the CPU arm's start:
+        // the finalist must never be worse than it.
+        let mut polished = tree.clone();
+        super::super::coordinate_polish(&mut polished, &x, &y, &[], Metric::Maximum, 8);
+        let device = metric_score(&polished, &x, &y, &[], Metric::Maximum);
+        let mut finalist = polished.clone();
+        let value = maximum_finalist(&mut finalist, &x, &y, &[], 8);
+        assert!(value <= device, "{value} > device {device}");
+        assert!(value <= before, "{value} > start {before}");
+        assert_eq!(
+            value.to_bits(),
+            metric_score(&finalist, &x, &y, &[], Metric::Maximum).to_bits()
+        );
+        // The CPU arm from the same constants, exactly.
+        let mut cpu = polished.clone();
+        let cpu_score = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Maximum);
+        assert!(value <= cpu_score);
+        // Monotone from its own endpoint. Unlike the order-statistic arm this
+        // refit restarts the squared pre-fit, so it is not *bit*-idempotent;
+        // what it must never do is report a worse maximum.
+        let mut twice = finalist.clone();
+        let again = maximum_finalist(&mut twice, &x, &y, &[], 8);
+        assert!(again <= value, "{again} > {value}");
+        assert!(again.is_finite());
     }
 }

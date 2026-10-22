@@ -993,6 +993,7 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
             rcsr::fit::fit_loss(**m).is_none()
                 && rcsr::fit::rank_fit_only(**m).is_none()
                 && !rcsr::fit::order_stat_fit_only(**m)
+                && !rcsr::fit::maximum_fit_only(**m)
         })
         .map(|m| m.name())
         .collect();
@@ -1019,6 +1020,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     assert!(
         !refused.contains(&"log_loss"),
         "#234: log_loss has a native device fit objective and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"maximum"),
+        "maximum is fitted by the exact maximum-error polish since #227 and must not be refused"
     );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
@@ -1076,7 +1081,9 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
         "rank_correlation",
         "rank_correlation_signed",
         "median",
+        "interquartile",
         "log_loss",
+        "maximum",
     ] {
         let out = rcsr(&[
             "--data", "missing-223.csv", "--target", "y", "--vars", "x",

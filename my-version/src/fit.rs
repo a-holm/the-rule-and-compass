@@ -25,14 +25,16 @@ mod gpu;
 mod interquartile;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 mod median;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+mod minimax;
 mod rank;
 mod stream;
 mod varpro;
 
 pub use gpu::{
     backend_description, exact_metric_score, fit_batch_verified, gate_proposal, is_squared_family,
-    refit_finalists_exact, signed_finalist, BatchStatus, BatchedFitter, ProposalGate,
-    VerifiedBatch,
+    maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus, BatchedFitter,
+    ProposalGate, VerifiedBatch,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;
@@ -49,6 +51,12 @@ pub(crate) use median::{polish_median_batch, OrderStatTrialScorer};
 #[cfg(any(feature = "cuda", test))]
 #[allow(unused_imports)]
 pub(crate) use interquartile::polish_interquartile_batch;
+// #227: the maximum-error (minimax) polish tail, likewise CUDA-only in
+// production and unit-tested from a CPU reference scorer in a plain build.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) use minimax::{
+    polish_minimax_batch, LevelInterval, MaxStat, MinimaxTrialScorer,
+};
 // The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
 // the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
@@ -269,16 +277,23 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if order_stat_fit_only(metric) {
         return None;
     }
+    // #227: `maximum` is honoured by the batched exact maximum-error scan
+    // (`maximum_fit_only`), also fit-only: the device reduces the exact
+    // `max |r|` and drives the bisection on the error level, the CPU scores
+    // every candidate with the configured maximum.
+    if maximum_fit_only(metric) {
+        return None;
+    }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
-         absolute error, the logistic log-loss or the exact rank, median and \
-         interquartile objectives, but --metric {} has no device fit \
-         objective, so the GPU arms cannot fit it. Use --metric squared (aic, \
-         aicc and bic also fit by least squares), --metric log_squashed, \
+         absolute error, the logistic log-loss or the exact rank, median, \
+         interquartile and maximum objectives, but --metric {} has no device \
+         fit objective, so the GPU arms cannot fit it. Use --metric squared \
+         (aic, aicc and bic also fit by least squares), --metric log_squashed, \
          --metric absolute, --metric log_loss, --metric rank_correlation or \
-         rank_correlation_signed, --metric median, --metric interquartile, or \
-         a CPU fit strategy: --fit-strategy exact, auto, linear, varpro or \
-         stream.",
+         rank_correlation_signed, --metric median, --metric interquartile, \
+         --metric maximum, or a CPU fit strategy: --fit-strategy exact, auto, \
+         linear, varpro or stream.",
         metric.name()
     ))
 }
@@ -551,6 +566,118 @@ pub fn interquartile_fit_cost(n: usize, p: usize, sweeps: usize) -> Interquartil
 /// than the exact CPU arm for a sample of `n` rows and `p` constants.
 pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
     n >= INTERQUARTILE_GPU_MIN_ROWS && interquartile_fit_cost(n, p, sweeps).prefers_gpu()
+}
+
+/// #227: `true` when `--fit-strategy gpu` can fit `maximum` on the device
+/// through the batched exact maximum-error polish, `false` for every other
+/// metric.
+///
+/// Like [`rank_fit_only`] and [`median_fit_only`] this is a **fit-only** arm,
+/// not a [`fit_loss`]: the device reduces the exact `max |r|` (an order-free
+/// integer max over the `|r|` bit patterns) and drives the bisection on the
+/// error level, and the CPU scores every candidate with the configured
+/// maximum. The *scoring* gate remains [`DeviceLoss::for_metric`], so a
+/// `--metric maximum` run reports the `cpu` backend with that reason.
+///
+/// A **weighted** maximum is refused: `weights_supported` excludes `Maximum`
+/// (`metrics::score_weighted` returns `+inf` for it), so there is no weighted
+/// objective to fit and the device must not invent `max √wᵢ|rᵢ|`.
+pub fn maximum_fit_only(metric: Metric) -> bool {
+    metric == Metric::Maximum
+}
+
+/// #227: rows below which the device maximum-error polish is not worth its
+/// per-call latency and the exact CPU arm stays.
+///
+/// Derived from [`maximum_fit_cost`] (measured on the RTX 3060, see
+/// `docs/gpu-backend.md` §"Maximum absolute error fitting"): the bisection on
+/// the error level calls the scan once per round, so a small sample pays more
+/// in per-call latency than it saves in row work. The paired measurement with
+/// the search's minimum admitted batch (32 candidates) shows the device ahead
+/// even at 256 rows (2.6×), so 512 rows is the conservative floor: at or above
+/// it the model predicts a speed-up for **every** constant count the kernel
+/// accepts (`p = 1..=20`), not just the measured `p = 2`. The decision is a row
+/// count, never a timing measurement, so it is reproducible.
+pub const MAXIMUM_GPU_MIN_ROWS: usize = 512;
+
+/// #227: modelled wall time of **one** candidate's maximum-error fit tail, in
+/// seconds, for `sweeps` sweeps and `p` constants.
+///
+/// ```text
+/// cpu_s = START_S + sweeps·p·6·CPU_EVAL_ROW_S·n
+/// gpu_s = START_S + calls·GPU_CALL_S + sweeps·ROUNDS·p·GPU_SCAN_ROW_S·n
+/// calls = 2 + sweeps·(ROUNDS + 1)
+/// ```
+///
+/// The CPU side is `coordinate_polish`: `sweeps·p` constants × six fixed
+/// geometric probes, one full `f64` prediction sweep each. The device side is
+/// the baseline scan plus, per sweep, `ROUNDS` level scans (each a forward plus
+/// an adjoint sweep over the rows) and one batched proposal score; every
+/// coordinate of a candidate rides in **one** call, which is why the device
+/// term scales with `p` per row but not per call. `GPU_CALL_S` is the
+/// per-candidate share of one call at the search's minimum admitted batch
+/// (32 candidates).
+///
+/// The coefficients are the paired measurement in
+/// `docs/gpu-backend.md` §"Maximum absolute error fitting" (RTX 3060, p = 2,
+/// 32 candidates, `--fit-iters 8`): CPU 23.4 / 78.3 / 623.8 ms and device
+/// 9.1 / 10.4 / 74.2 ms at 256 / 1 024 / 8 192 rows. The CPU term is linear in
+/// `n` over that range; the fitted intercept is within 20 % of `START_S`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaximumFitCost {
+    /// Modelled CPU polish time, seconds.
+    pub cpu_s: f64,
+    /// Modelled device polish time, seconds.
+    pub gpu_s: f64,
+}
+
+impl MaximumFitCost {
+    /// `cpu_s / gpu_s`, the modelled speed-up of the device tail.
+    pub fn speedup(&self) -> f64 {
+        if self.gpu_s > 0.0 {
+            self.cpu_s / self.gpu_s
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Whether the model prefers the device for this shape.
+    pub fn prefers_gpu(&self) -> bool {
+        self.gpu_s < self.cpu_s
+    }
+}
+
+/// #227: fixed cost of the squared LM warm start (both sides run one), seconds.
+const MAXIMUM_START_S: f64 = 1.5e-4;
+/// #227: per-row cost of one CPU probe (`expr::eval` in `f64` plus the max
+/// fold), seconds. Measured 24.6 ns for the search's minimum batch.
+const MAXIMUM_CPU_EVAL_ROW_S: f64 = 2.46e-8;
+/// #227: per-candidate share of one device scan call (one packed upload, one
+/// launch, one event synchronisation and one download), seconds.
+const MAXIMUM_GPU_CALL_S: f64 = 8.2e-7;
+/// #227: per-row, per-coordinate cost of one device level scan (the `f64`
+/// forward plus the adjoint sweep), seconds.
+const MAXIMUM_GPU_SCAN_ROW_S: f64 = 5.0e-10;
+
+/// #227: modelled CPU-vs-device cost of the maximum-error polish tail.
+pub fn maximum_fit_cost(n: usize, p: usize, sweeps: usize) -> MaximumFitCost {
+    let nf = n.max(1) as f64;
+    let sweeps = sweeps.max(1) as f64;
+    let rounds = minimax::MINIMAX_BISECT_ROUNDS as f64;
+    let p = p.max(1) as f64;
+    let probes = sweeps * p * 6.0;
+    let calls = 2.0 + sweeps * (rounds + 1.0);
+    let scans = sweeps * rounds * p;
+    MaximumFitCost {
+        cpu_s: MAXIMUM_START_S + probes * MAXIMUM_CPU_EVAL_ROW_S * nf,
+        gpu_s: MAXIMUM_START_S + calls * MAXIMUM_GPU_CALL_S + scans * MAXIMUM_GPU_SCAN_ROW_S * nf,
+    }
+}
+
+/// #227: whether the device maximum-error polish is predicted to be faster
+/// than the CPU polish for a sample of `n` rows and `p` constants.
+pub fn maximum_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
+    n >= MAXIMUM_GPU_MIN_ROWS && maximum_fit_cost(n, p, sweeps).prefers_gpu()
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -4660,12 +4787,14 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223 + #229 + #230 + #226 + #222: an explicit GPU request is refused
-    /// for every metric without a device fit objective, and the refusal says
-    /// why and what to use instead. `squared`/`aic`/`aicc`/`bic` fit by least
-    /// squares, `log_squashed` by weighted IRLS (#229), `absolute` by L1 IRLS
-    /// (#222), the rank family by the exact integer polish (#230) and `median`
-    /// by the exact median polish (#226), so all five groups are accepted.
+    /// #223 + #229 + #230 + #226 + #222 + #227 + #232: an explicit GPU request
+    /// is refused for every metric without a device fit objective, and the
+    /// refusal says why and what to use instead. `squared`/`aic`/`aicc`/`bic`
+    /// fit by least squares, `log_squashed` by weighted IRLS (#229), `absolute`
+    /// by L1 IRLS (#222), the rank family by the exact integer polish (#230),
+    /// `median`/`interquartile` by the exact order-statistic polish
+    /// (#226/#232) and `maximum` by the exact maximum-error polish (#227), so
+    /// every metric with a device fit objective is accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
@@ -4673,6 +4802,7 @@ mod tests {
             if fit_loss(*m).is_some()
                 || rank_fit_only(*m).is_some()
                 || order_stat_fit_only(*m)
+                || maximum_fit_only(*m)
             {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
@@ -4731,6 +4861,50 @@ mod tests {
         assert!(!order_stat_fit_only(Metric::Maximum));
         assert!(!order_stat_fit_only(Metric::Slope));
         assert!(!order_stat_fit_only(Metric::Absolute));
+        // #227: `maximum` has an exact device polish (fit-only) as well.
+        assert!(gpu_fit_metric_error(Metric::Maximum).is_none());
+        assert!(maximum_fit_only(Metric::Maximum));
+        assert!(!maximum_fit_only(Metric::Median));
+        assert!(!maximum_fit_only(Metric::Absolute));
+        assert!(!maximum_fit_only(Metric::Squared));
+    }
+
+    /// #227: the maximum cost model, as a decision. Below the row floor the
+    /// CPU polish stays; at and above it the device wins for every constant
+    /// count the kernel accepts, and the model is monotone in `n`.
+    #[test]
+    fn the_maximum_cost_model_prefers_the_device_only_above_its_row_floor() {
+        assert!(!maximum_gpu_fit_worthwhile(MAXIMUM_GPU_MIN_ROWS - 1, 4, 8));
+        for p in 1..=20 {
+            assert!(
+                maximum_gpu_fit_worthwhile(MAXIMUM_GPU_MIN_ROWS, p, 8),
+                "p={p} must be admitted at the floor"
+            );
+            assert!(
+                maximum_gpu_fit_worthwhile(154_000, p, 8),
+                "p={p} must be admitted at 154k rows"
+            );
+        }
+        let small = maximum_fit_cost(5_000, 4, 8);
+        let large = maximum_fit_cost(154_000, 4, 8);
+        assert!(large.speedup() > small.speedup());
+        assert!(large.speedup() > 1.0, "the model must show a speed-up at 154k");
+        let floor = maximum_fit_cost(MAXIMUM_GPU_MIN_ROWS, 4, 8);
+        assert!(floor.prefers_gpu(), "floor cost {floor:?}");
+        assert!(floor.cpu_s > 0.0 && floor.gpu_s > 0.0);
+        // More constants make the device relatively better, because every
+        // coordinate of a candidate rides in the same batched call.
+        for n in [MAXIMUM_GPU_MIN_ROWS, 5_000, 154_000] {
+            let mut last = 0.0;
+            for p in 1..=20 {
+                let s = maximum_fit_cost(n, p, 8).speedup();
+                assert!(s > last, "n={n}: the speed-up must grow with p ({s} vs {last})");
+                last = s;
+            }
+        }
+        // `--no-fit`/one iteration still has a well-defined model, and the
+        // device never wins on zero information.
+        assert!(maximum_fit_cost(0, 1, 8).cpu_s > 0.0);
     }
 
     /// #226: the measured cost model, as a decision. Below the row floor the

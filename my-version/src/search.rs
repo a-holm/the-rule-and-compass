@@ -713,6 +713,9 @@ impl GpuSearch {
         // #226/#232: `median` and `interquartile` have no LM loss but their own
         // exact device polish on the same squared start and ladder.
         let order_stat_arm = crate::fit::order_stat_fit_only(cfg.metric);
+        // #227: `maximum` likewise — an exact maximum-error polish, no LM
+        // loss, no order statistic.
+        let maximum_arm = crate::fit::maximum_fit_only(cfg.metric);
         // #234: a single-class fit sample has no finite log-loss optimum. The
         // counts come from the same midpoint rule the CPU arm uses, so the
         // device never fits a sign the sample does not support.
@@ -726,7 +729,11 @@ impl GpuSearch {
                 continue;
             }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
-                _ if fit_loss.is_none() && rank_loss.is_none() && !order_stat_arm => {
+                _ if fit_loss.is_none()
+                    && rank_loss.is_none()
+                    && !order_stat_arm
+                    && !maximum_arm =>
+                {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
                 }
                 Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
@@ -754,7 +761,10 @@ impl GpuSearch {
             // statistic. Every other metric stays on the LM kernel of
             // #169/#229.
             let want = crate::fit::OrderStat::for_metric(cfg.metric);
-            let (out, ms) = if let Some(want) = want {
+            let (out, ms) = if maximum_arm {
+                // #227: the exact maximum-error polish on the squared start.
+                self.ev.max_fit_batch(&plans, cfg.fit_iters)
+            } else if let Some(want) = want {
                 self.ev.order_stat_fit_batch(&plans, cfg.fit_iters, want)
             } else {
                 match crate::fit::rank_metric_signed(cfg.metric) {
@@ -763,7 +773,8 @@ impl GpuSearch {
                         .rank_fit_batch(&plans, cfg.fit_iters, &train.y, signed),
                     None => {
                         let loss = fit_loss.expect(
-                            "jobs is only filled when a native, rank or order-statistic arm exists",
+                            "jobs is only filled when a native, rank, order-statistic or \
+                             maximum arm exists",
                         );
                         self.ev.fit_batch(&plans, cfg.fit_iters, loss)
                     }
@@ -819,6 +830,8 @@ impl GpuSearch {
                             FitFallbackCause::NonFinite
                         } else if let Some(want) = want {
                             order_stat_status_fallback_cause(res.status, want)
+                        } else if maximum_arm {
+                            maximum_status_fallback_cause(res.status)
                         } else {
                             status_fallback_cause(res.status)
                         };
@@ -1619,6 +1632,44 @@ fn order_stat_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static 
     None
 }
 
+/// #227: `Some(reason)` when a `--metric maximum` run with
+/// `--fit-strategy gpu` must keep the exact CPU fit arm for this run.
+///
+/// The device maximum-error polish is a **fit-only** arm (`native_metric =
+/// false`: the evaluator cannot score a maximum), so it reuses the rank and
+/// order-statistic gates and adds one measured cost-model check: below
+/// [`crate::fit::MAXIMUM_GPU_MIN_ROWS`] the per-call latency of the bisection
+/// on the error level is not repaid by a small sample, and the CPU polish
+/// stays. The reason is recorded in the backend note and the run's
+/// `backend_reason`, so this CPU fallback is labelled, never silent. `None`
+/// for a run that is not a maximum GPU-fit run at all.
+#[cfg(feature = "cuda")]
+fn maximum_fit_only_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
+    if !crate::fit::maximum_fit_only(cfg.metric)
+        || !cfg.fit_strategy.defers_to_gpu()
+        || cfg.fit_iters == 0
+    {
+        return None;
+    }
+    if train.is_multi() {
+        return Some("multi-output objective");
+    }
+    if !train.w.is_empty() {
+        return Some("weighted rows");
+    }
+    if subsampling_active(cfg, train) {
+        return Some("--predictor-samples changes the rows per generation");
+    }
+    let fit_rows = effective_fit_rows(cfg, train);
+    if fit_rows > 0 && fit_rows < train.len() {
+        return Some("--fit-samples/--fit-rows scores offspring on a screening subset");
+    }
+    if !crate::fit::maximum_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters) {
+        return Some("maximum fit arm: the sample is too small for the device polish");
+    }
+    None
+}
+
 /// The backend this configuration and sample will use in this build
 /// (issue #140).
 ///
@@ -2122,11 +2173,14 @@ pub enum FitFallbackCause {
     /// #234: the kernel's log-loss constants scored strictly worse than the
     /// starting constants in exact `f64` `log_loss`, so the start was kept.
     LogLossWorse,
+    /// #227: the device maximum-error stage declined (allocation, launch or an
+    /// inconsistent scan) and the exact CPU maximum arm took over.
+    MaximumDeclined,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 12] = [
+    pub const ALL: [FitFallbackCause; 13] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -2139,6 +2193,7 @@ impl FitFallbackCause {
         FitFallbackCause::InterquartileDeclined,
         FitFallbackCause::SingleClass,
         FitFallbackCause::LogLossWorse,
+        FitFallbackCause::MaximumDeclined,
     ];
 
     /// Stable JSON label.
@@ -2156,6 +2211,7 @@ impl FitFallbackCause {
             FitFallbackCause::InterquartileDeclined => "interquartile_declined",
             FitFallbackCause::SingleClass => "single_class",
             FitFallbackCause::LogLossWorse => "log_loss_worse",
+            FitFallbackCause::MaximumDeclined => "maximum_declined",
         }
     }
 }
@@ -2195,6 +2251,18 @@ fn order_stat_status_fallback_cause(
             crate::fit::OrderStat::Median => FitFallbackCause::MedianDeclined,
             crate::fit::OrderStat::Interquartile => FitFallbackCause::InterquartileDeclined,
         },
+        _ => FitFallbackCause::UnsupportedPlan,
+    }
+}
+
+/// #227: the maximum arm's status 3 is its own labelled cause, so a declined
+/// minimax polish is never reported as a declined rank or order-statistic one.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn maximum_status_fallback_cause(status: i32) -> FitFallbackCause {
+    match status {
+        1 => FitFallbackCause::IllConditioned,
+        2 => FitFallbackCause::NonFinite,
+        3 => FitFallbackCause::MaximumDeclined,
         _ => FitFallbackCause::UnsupportedPlan,
     }
 }
@@ -2307,7 +2375,8 @@ fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
         && cfg.fit_iters > 0
         && (crate::fit::fit_loss(cfg.metric).is_some()
             || crate::fit::rank_fit_only(cfg.metric).is_some()
-            || crate::fit::order_stat_fit_only(cfg.metric))
+            || crate::fit::order_stat_fit_only(cfg.metric)
+            || crate::fit::maximum_fit_only(cfg.metric))
 }
 
 /// #85: true when constants are fitted on fewer rows than the generation's
@@ -3909,6 +3978,9 @@ fn run_search(
         // Their measured cost-model gate can decline the arm for a small
         // sample; that refusal is recorded as the reason.
         let order_stat_blocker = order_stat_fit_only_blocker(cfg, train);
+        // #227: `--metric maximum` uses the same fit-only shape with the batched
+        // exact maximum-error polish and its own measured cost-model gate.
+        let maximum_blocker = maximum_fit_only_blocker(cfg, train);
         // `--no-fit` (or a non-gpu strategy) has nothing to fit on the device,
         // so the fit-only evaluator must not be created for it.
         let order_stat_fit = cfg.fit_strategy.defers_to_gpu()
@@ -3920,9 +3992,13 @@ fn run_search(
         let logistic_fit = cfg.fit_strategy.defers_to_gpu()
             && cfg.fit_iters > 0
             && crate::fit::fit_only_loss(cfg.metric).is_some();
+        let maximum_fit = cfg.fit_strategy.defers_to_gpu()
+            && cfg.fit_iters > 0
+            && crate::fit::maximum_fit_only(cfg.metric);
         let fit_only = rank_fit_only_arm(cfg, train).is_some()
             || (order_stat_fit && order_stat_blocker.is_none())
-            || logistic_fit;
+            || logistic_fit
+            || (maximum_fit && maximum_blocker.is_none());
         let plan: Option<(crate::fit::DeviceLoss, bool)> = if fit_only {
             backend_reason = Some(if logistic_fit {
                 format!(
@@ -4014,6 +4090,12 @@ fn run_search(
                                         "232"
                                     }
                                 );
+                            } else if crate::fit::maximum_fit_only(cfg.metric) {
+                                eprintln!(
+                                    "# gpu-fit: {} ({}; exact maximum-error polish, CPU f64 \
+                                     fitness — native maximum scoring is open, #227)",
+                                    device, scheduling
+                                );
                             } else {
                                 eprintln!(
                                     "# gpu-fit: {} ({}; exact rank polish, CPU f64 \
@@ -4055,10 +4137,10 @@ fn run_search(
     if cfg.gpu_notes && cfg.fit_strategy.defers_to_gpu() && !defers_fit_to_gpu(cfg, true) {
         eprintln!(
             "# gpu-fit: off (the batched kernel minimises squared error, \
-             log-squashed, mean absolute error or the exact rank, median and \
-             interquartile objectives; --metric must be squared, log_squashed, \
-             absolute, aic, aicc, bic, rank_correlation, rank_correlation_signed, \
-             median or interquartile)"
+             log-squashed, mean absolute error or the exact rank, median, \
+             interquartile and maximum objectives; --metric must be squared, \
+             log_squashed, absolute, aic, aicc, bic, rank_correlation, \
+             rank_correlation_signed, median, interquartile or maximum)"
         );
     }
     // #226/#232: only a run that actually asked for the device fit arm can be
@@ -4076,6 +4158,14 @@ fn run_search(
             .map(|w| w.label())
             .unwrap_or("median");
         eprintln!("# gpu-fit: off ({}); the exact CPU {} arm runs", why, stat);
+        if backend_reason.is_none() {
+            backend_reason = Some(why.to_string());
+        }
+    }
+    #[cfg(feature = "cuda")]
+    if cfg.gpu_notes && crate::fit::maximum_fit_only(cfg.metric) && gpu.is_none() {
+        let why = maximum_fit_only_blocker(cfg, train).unwrap_or("no usable device");
+        eprintln!("# gpu-fit: off ({}); the exact CPU maximum arm runs", why);
         if backend_reason.is_none() {
             backend_reason = Some(why.to_string());
         }
@@ -5384,6 +5474,7 @@ mod tests {
                 "interquartile_declined",
                 "single_class",
                 "log_loss_worse",
+                "maximum_declined",
             ]
         );
         assert_eq!(
@@ -5457,6 +5548,23 @@ mod tests {
             order_stat_status_fallback_cause(2, median),
             FitFallbackCause::NonFinite
         );
+        // #227: the maximum arm's declined polish has its own label too.
+        assert_eq!(
+            maximum_status_fallback_cause(3),
+            FitFallbackCause::MaximumDeclined
+        );
+        assert_eq!(
+            maximum_status_fallback_cause(3).label(),
+            "maximum_declined"
+        );
+        assert_eq!(
+            maximum_status_fallback_cause(1),
+            FitFallbackCause::IllConditioned
+        );
+        assert_eq!(
+            maximum_status_fallback_cause(2),
+            FitFallbackCause::NonFinite
+        );
     }
 
     /// #229: a metric without a native device objective is labelled
@@ -5502,6 +5610,15 @@ mod tests {
             ..gpu_fit.clone()
         };
         assert!(defers_fit_to_gpu(&median, true), "median has an exact device polish");
+        // #227: the maximum arm has its own exact device polish.
+        let maximum = Config {
+            metric: Metric::Maximum,
+            ..gpu_fit.clone()
+        };
+        assert!(
+            defers_fit_to_gpu(&maximum, true),
+            "maximum has an exact device polish"
+        );
         // `--no-fit` never reaches the kernel, whatever the metric.
         let no_fit = Config {
             fit_iters: 0,
