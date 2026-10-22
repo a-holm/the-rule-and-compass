@@ -653,6 +653,22 @@ fn gpu_run_reports_measured_accounting_not_occupancy() {
     );
     assert!((0.0..=1.0).contains(&a.duty_cycle()));
     assert!(a.quality_per_gpu_hour(1.0, 10.0).is_some());
+    // #284: the run ledger closes to its own wall and the run duty is the
+    // interval union, not an evaluator-window ratio.
+    let l = &g.ledger;
+    assert!(l.wall_s() > 0.0);
+    assert!(
+        l.closure_residual().value.abs() < 0.01,
+        "run ledger must close within 1%: stages {} + unaccounted {} vs wall {}",
+        l.stage_sum_s(),
+        l.unaccounted_s(),
+        l.wall_s()
+    );
+    assert!(l.device_busy_s() <= l.device_busy_sum_s() + 1e-12);
+    assert!((0.0..=1.0).contains(&l.duty_run().value));
+    assert!((0.0..=1.0).contains(&l.eval_kernel_duty().value));
+    assert!((0.0..=1.0).contains(&l.fit_kernel_duty().value));
+    assert!(!l.intervals().is_empty(), "the evaluator must record a device interval");
     // #131 must still be present alongside the accounting.
     assert!(
         !g.generations.is_empty(),

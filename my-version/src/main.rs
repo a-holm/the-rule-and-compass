@@ -502,10 +502,16 @@ SEARCH:
                              scorer).
                              Reported errors stay CPU f64. Cross-backend runs
                              are not bit-identical because f32 fitness can
-                             change the trajectory. JSON
-                             reports the measured kernel/sync/alloc/copy wall
-                             and kernel-time duty; SM occupancy is null unless
-                             measured separately with ncu
+                             change the trajectory. JSON reports the measured
+                             kernel/sync/alloc/copy wall, the evaluator-window
+                             kernel duty, and the #284 run ledger: exclusive
+                             stage seconds (vary/eval/fit/select/archive/
+                             features/pnl/io/host_other), device-busy as the
+                             union of device intervals over run wall, fit kernel
+                             and CPU-fallback seconds with causes, and
+                             numerator/denominator/units/scope for every derived
+                             ratio. SM occupancy is null unless measured
+                             separately with ncu
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -705,7 +711,94 @@ fn gpu_baseline_error(train: &rcsr::data::Sample) -> f64 {
         return f64::NAN;
     }
     let mean = train.y.iter().sum::<f64>() / n as f64;
-    train.y.iter().map(|y| (y - mean) * (y - mean)).sum()
+    // #256/#284: `gpu_best_error` is a mean (`SSE / n` for squared); the
+    // baseline must therefore be the mean too. Dividing an SSE by an MSE was
+    // the 636.9x unit bug.
+    train.y.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n as f64
+}
+
+/// #284: a derived value plus the four facts that make it auditable. `null`
+/// when the ratio is undefined, never a fabricated zero.
+fn ratio_json(r: Option<&rcsr::gpu_stats::Ratio>) -> String {
+    match r {
+        Some(r) if r.value.is_finite() => format!(
+            "{{\"value\":{},\"numerator\":{},\"denominator\":{},\"units\":{},\"scope\":{}}}",
+            jnum(r.value),
+            jnum(r.numerator),
+            jnum(r.denominator),
+            jstr(r.units),
+            jstr(r.scope)
+        ),
+        Some(r) => format!(
+            "{{\"value\":null,\"numerator\":{},\"denominator\":{},\"units\":{},\"scope\":{}}}",
+            jnum(r.numerator),
+            jnum(r.denominator),
+            jstr(r.units),
+            jstr(r.scope)
+        ),
+        None => "null".to_string(),
+    }
+}
+
+/// #284: the run-scoped ledger, with every derived field carrying its
+/// numerator, denominator, units and scope.
+fn ledger_json(
+    l: &rcsr::gpu_stats::RunLedger,
+    a: &rcsr::gpu_stats::GpuStats,
+    best_error: f64,
+    baseline_error: f64,
+    metric_is_squared: bool,
+) -> String {
+    use rcsr::gpu_stats::Stage;
+    let stages = Stage::ALL
+        .iter()
+        .map(|s| format!("{}:{}", jstr(&format!("{}_s", s.label())), jnum(l.stage_s(*s))))
+        .collect::<Vec<_>>()
+        .join(",");
+    let causes = l
+        .fallback_by_cause()
+        .iter()
+        .map(|(name, n)| format!("{}:{}", jstr(name), n))
+        .collect::<Vec<_>>()
+        .join(",");
+    let closure = l.closure_residual();
+    let quality = if metric_is_squared {
+        l.quality_per_gpu_hour(best_error, baseline_error)
+    } else {
+        rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
+    };
+    format!(
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        jnum(l.wall_s()),
+        stages,
+        jnum(l.stage_sum_s()),
+        jnum(l.unaccounted_s()),
+        ratio_json(Some(&closure)),
+        jnum(l.device_busy_s()),
+        jnum(l.device_busy_sum_s()),
+        jnum(l.device_overlap_s()),
+        l.intervals().len(),
+        jnum(a.kernel_s),
+        jnum(a.launch_s),
+        jnum(a.transfer_s()),
+        jnum(a.alloc_s),
+        jnum(l.fit_kernel_s()),
+        ratio_json(Some(&l.duty_run())),
+        ratio_json(Some(&l.eval_kernel_duty())),
+        ratio_json(Some(&l.fit_kernel_duty())),
+        jnum(l.fit_host_s()),
+        jnum(l.fit_kernel_s()),
+        jnum(l.fit_fallback_s()),
+        jnum(l.refit_s()),
+        l.refits(),
+        l.admitted(),
+        l.device_fits(),
+        l.fallback_fits(),
+        causes,
+        l.eval_fallback_programs(),
+        jnum(l.eval_fallback_s()),
+        ratio_json(Some(&quality))
+    )
 }
 
 /// #118: the GPU block shared by `--json` and the final NDJSON event. It keeps
@@ -717,15 +810,22 @@ fn gpu_json(
     best_error: f64,
     baseline_error: f64,
     fit_strategy: &str,
+    // #284: quality/GPU-hour is only unit-consistent for the squared metric
+    // (best MSE versus constant-mean MSE). Every other metric reports null
+    // rather than a mixed-unit ratio.
+    metric_is_squared: bool,
 ) -> String {
     let Some(g) = g else {
         return "null".to_string();
     };
     let a = &g.accounting;
-    let quality = a
-        .quality_per_gpu_hour(best_error, baseline_error)
-        .map(jnum)
-        .unwrap_or_else(|| "null".to_string());
+    let quality = if metric_is_squared {
+        a.quality_per_gpu_hour(best_error, baseline_error)
+            .map(jnum)
+            .unwrap_or_else(|| "null".to_string())
+    } else {
+        "null".to_string()
+    };
     let ops_json = |ops: &std::collections::BTreeMap<String, usize>| -> String {
         ops.iter()
             .map(|(name, n)| format!("{}:{}", jstr(name), n))
@@ -798,8 +898,21 @@ fn gpu_json(
         jnum(g.fit_ms / 1000.0),
         jnum(g.fit_host_ms / 1000.0)
     );
+    let run_wall = if g.ledger.wall_s() > 0.0 {
+        g.ledger.wall_s()
+    } else {
+        a.wall_s
+    };
+    let run_duty = g.ledger.duty_run();
+    let ledger = ledger_json(
+        &g.ledger,
+        &a,
+        best_error,
+        baseline_error,
+        metric_is_squared,
+    );
     format!(
-        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"kernel/wall\",\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"generations\":[{}],\"totals\":{}, {}}}",
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"batches_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"eval_kernel_s / eval_wall_s (evaluator window, not run)\",\"duty_scope\":\"evaluator_window\",\"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"quality_scope\":\"evaluator_window_like_unit_ratio\",\"quality_per_gpu_hour_run\":{},\"ledger\":{},\"generations\":[{}],\"totals\":{}, {}}}",
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.sync_s),
@@ -823,8 +936,22 @@ fn gpu_json(
         jnum(a.evals_per_s()),
         jnum(a.row_evals_per_s()),
         jnum(a.generations_per_s()),
+        jnum(if a.wall_s > 0.0 {
+            a.batches as f64 / a.wall_s
+        } else {
+            0.0
+        }),
         jnum(a.duty_cycle()),
+        jnum(run_wall),
+        jnum(g.ledger.device_busy_s()),
+        ratio_json(Some(&run_duty)),
         quality,
+        jnum(if metric_is_squared {
+            g.ledger.quality_per_gpu_hour(best_error, baseline_error).value
+        } else {
+            f64::NAN
+        }),
+        ledger,
         gens.join(","),
         totals,
         fit
@@ -1090,6 +1217,12 @@ impl DevSink {
             peak_rss_bytes: rcsr::devlog::peak_rss_bytes(),
             gpu_wall_s: gpu_wall,
             device_hours: gpu_wall.map(|w| w / 3600.0),
+            run_wall_s: outcome.gpu.as_ref().map(|g| g.ledger.wall_s()),
+            device_busy_s: outcome.gpu.as_ref().map(|g| g.ledger.device_busy_s()),
+            duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
+            unaccounted_s: outcome.gpu.as_ref().map(|g| g.ledger.unaccounted_s()),
+            fit_kernel_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_kernel_s()),
+            fit_fallback_s: outcome.gpu.as_ref().map(|g| g.ledger.fit_fallback_s()),
             events,
             bytes,
             dropped,
@@ -4677,8 +4810,9 @@ fn main() {
                 }
                 if let Some(g) = &outcome.gpu {
                     let a = &g.accounting;
+                    let ledger = &g.ledger;
                     eprintln!(
-                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | duty={:.1}% (kernel/wall, not occupancy) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
+                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | eval duty={:.1}% (eval window) | run duty={:.1}% (device-busy union / run wall {:.3}s) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
                         a.kernel_s,
                         a.sync_s,
                         a.alloc_s,
@@ -4688,13 +4822,51 @@ fn main() {
                         a.host_s,
                         a.wall_s,
                         100.0 * a.duty_cycle(),
+                        100.0 * ledger.duty_run().value,
+                        ledger.wall_s(),
                         a.evals_per_s(),
                         a.row_evals_per_s(),
-                        a.quality_per_gpu_hour(
-                            gpu_best_error(&outcome),
-                            gpu_baseline_error(&prepared.train)
-                        )
-                        .unwrap_or(f64::NAN)
+                        if cfg.metric == rcsr::metrics::Metric::Squared {
+                            ledger
+                                .quality_per_gpu_hour(
+                                    gpu_best_error(&outcome),
+                                    gpu_baseline_error(&prepared.train),
+                                )
+                                .value
+                        } else {
+                            f64::NAN
+                        }
+                    );
+                    eprintln!(
+                        "# gpu ledger: wall={:.3}s stages[vary={:.3} eval={:.3} fit={:.3} select={:.3} archive={:.3} host_other={:.3}] unaccounted={:.3}s ({:.2}%) | device_busy={:.3}s intervals={} overlap={:.3}s | fit kernel={:.3}s fallback={:.3}s refits={:.3}s | admitted={} device={} fallback={} [{}]",
+                        ledger.wall_s(),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::Vary),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::Eval),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::Fit),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::Select),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::Archive),
+                        ledger.stage_s(rcsr::gpu_stats::Stage::HostOther),
+                        ledger.unaccounted_s(),
+                        100.0 * if ledger.wall_s() > 0.0 {
+                            ledger.unaccounted_s() / ledger.wall_s()
+                        } else {
+                            0.0
+                        },
+                        ledger.device_busy_s(),
+                        ledger.intervals().len(),
+                        ledger.device_overlap_s(),
+                        ledger.fit_kernel_s(),
+                        ledger.fit_fallback_s(),
+                        ledger.refit_s(),
+                        ledger.admitted(),
+                        ledger.device_fits(),
+                        ledger.fallback_fits(),
+                        ledger
+                            .fallback_by_cause()
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", k, v))
+                            .collect::<Vec<_>>()
+                            .join(",")
                     );
                 }
                 qd_text(outcome.qd.as_ref());
@@ -5305,6 +5477,7 @@ fn main() {
                     gpu_best_error(&outcome),
                     gpu_baseline_error(&prepared.train),
                     cfg.fit_strategy.name(),
+                    cfg.metric == rcsr::metrics::Metric::Squared,
                 ),
                 checkpoint_json,
                 null_json,
@@ -5535,6 +5708,7 @@ fn main() {
                     gpu_best_error(&outcome),
                     gpu_baseline_error(&prepared.train),
                     cfg.fit_strategy.name(),
+                    cfg.metric == rcsr::metrics::Metric::Squared,
                 ),
                 outcome.archive.items.len(),
                 search_meta_ndjson
@@ -8678,12 +8852,82 @@ mod tests {
         g.fit_refits = 5;
         g.fit_ms = 250.0;
         g.fit_host_ms = 500.0;
-        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu");
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true);
         assert!(
             json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5}"),
             "{}",
             json
         );
+    }
+
+    /// #284: the JSON ledger carries stage windows, the device union (not the
+    /// sum), fit leaves and a provenance-carrying duty. A derived field without
+    /// its denominator/units/scope is a schema failure.
+    #[test]
+    fn gpu_json_reports_the_run_ledger_with_provenance() {
+        use rcsr::gpu_stats::{RunLedger, Stage};
+        let mut l = RunLedger::new();
+        l.set_wall(10.0);
+        l.record_stage(Stage::Vary, 1.0);
+        l.record_stage(Stage::Eval, 3.0);
+        l.record_stage(Stage::Fit, 2.0);
+        l.record_stage(Stage::Select, 0.5);
+        l.record_stage(Stage::Archive, 0.5);
+        l.record_stage(Stage::HostOther, 3.0);
+        l.record_fit(2.0, 1.5, 0.4);
+        l.record_fit_counters(10, 8, 2, [("non_finite".to_string(), 2)].into_iter().collect());
+        l.record_eval_fallback(3, 0.2);
+        l.record_interval(Stage::Eval, 0, 1.0, 4.0);
+        l.record_interval(Stage::Fit, 1, 3.0, 5.0);
+        let mut g = search::GpuRunStats::default();
+        g.ledger = l;
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true);
+        for key in [
+            "\"ledger\":",
+            "\"stages\":",
+            "\"device_busy_s\":4",
+            "\"device_busy_sum_s\":5",
+            "\"device_overlap_s\":1",
+            "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
+            "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",
+            "\"fallback_by_cause\":{\"non_finite\":2}",
+            "\"units\":\"fraction\"",
+            "\"scope\":\"run\"",
+            "\"quality_per_gpu_hour\":",
+            "\"units\":\"decades_per_gpu_hour\"",
+        ] {
+            assert!(json.contains(key), "gpu JSON is missing {key}: {}", json);
+        }
+        assert!(json.contains("\"duty_scope\":\"evaluator_window\""));
+        // The schema and help must name the run-scoped fields, not just the
+        // evaluator-window ones.
+        for needle in ["device_busy_s", "duty_run", "fallback_by_cause", "run_ledger"] {
+            assert!(
+                schema::json().contains(needle),
+                "schema is missing the run ledger field {needle}"
+            );
+        }
+        assert!(usage().contains("device-busy"));
+        assert!(usage().contains("numerator/denominator/units/scope"));
+    }
+
+    /// #256/#284: the baseline is a mean (MSE) because the best error is a
+    /// mean. The published 10 h cell must give 4.844205, never 3085.48.
+    #[test]
+    fn gpu_quality_baseline_is_the_same_unit_as_the_best_error() {
+        let train = rcsr::data::Sample {
+            x: vec![vec![0.0], vec![1.0]],
+            y: vec![0.0, 2.0],
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        // SSE = 2, n = 2 -> MSE = 1.
+        assert!((gpu_baseline_error(&train) - 1.0).abs() < 1e-12);
+        let mut st = rcsr::gpu_stats::RunLedger::new();
+        st.set_wall(7.467_618_67);
+        let q = st.quality_per_gpu_hour(0.103_464_003_567_670_26, 0.105_885_819_341_126_06);
+        assert!((q.value - 4.844_205).abs() < 1e-5);
+        assert!((q.value - 3085.48).abs() > 1.0);
     }
 
     /// #71: the guard and the import command must be discoverable.

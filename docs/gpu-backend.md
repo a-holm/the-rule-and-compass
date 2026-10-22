@@ -1524,9 +1524,12 @@ The `--json`/NDJSON `gpu` block contains:
 `kernel_s`, `launch_s`, `sync_s`, `alloc_s`, `h2d_s`, `d2h_s`, `transfer_s`,
 `window_s`, `host_s`, `accounted_s`, `wall_s`, `idle_s`, `residual_fraction`, `h2d_bytes`,
 `d2h_bytes`, `batches`, `failed_batches`, `programs`, `evals`, `row_evals`,
-`evals_per_s`, `row_evals_per_s`, `generations_per_s`, `duty_cycle`,
-`duty_source`, `sm_occupancy`, `occupancy_source`, `quality_per_gpu_hour`, and
-the #131 per-generation `generations` opcode/fallback report. A CPU run reports
+`evals_per_s`, `row_evals_per_s`, `batches_per_s`, `duty_cycle` (explicitly the
+**evaluator-window** kernel fraction; `duty_scope` says so), `duty_source`,
+`run_wall_s`, `device_busy_s`, `duty_run`, `ledger`, `sm_occupancy`,
+`occupancy_source`, `quality_per_gpu_hour`, `quality_per_gpu_hour_run`,
+`quality_scope`, and the #131
+per-generation `generations` opcode/fallback report. A CPU run reports
 `"gpu": null`.
 
 Definitions that matter:
@@ -1538,12 +1541,30 @@ Definitions that matter:
 * **evals/s** counts candidate evaluations (`programs / wall`); **row-evals/s**
   counts `programs × rows / wall`. A failed batch contributes wall and bytes but
   zero evaluations.
-* **duty** is `kernel_s / wall_s`, a kernel-time fraction. It is not
-  `nvidia-smi utilization.gpu` (a 1 Hz sample of "some kernel was resident") and
-  it is not SM occupancy.
+* **evaluator duty** is `kernel_s / wall_s` inside the evaluator window. It is
+  not a run-level number and it is not `nvidia-smi utilization.gpu` (a 1 Hz
+  sample of "some kernel was resident") or SM occupancy. The run-level headline
+  is `gpu.ledger.duty_run`: the **union** of all device intervals divided by the
+  run wall. Overlapping streams are merged, never added; the naive sum and the
+  double-counted overlap are both reported (`device_busy_sum_s`,
+  `device_overlap_s`).
+* **run ledger** (`gpu.ledger`, #284) has one wall clock and exclusive stage
+  seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
+  is a telemetry defect. `fit` separates raw device kernel seconds from the
+  measured exact-CPU fallback and finalist-refit seconds, with
+  `fallback_by_cause`; `eval_fallback` does the same for the evaluator's CPU
+  pool. Every derived value is
+  `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
+  present even when their stage did not run, so a reader never has to infer a
+  missing key.
 * **quality/GPU-hour** is decades of error reduction against the constant-mean
-  baseline per measured full-path GPU-hour:
-  `-log10(best_sse / mean_baseline_sse) / hours`. A throughput gain is not a
+  baseline per measured run-wall GPU-hour:
+  `-log10(best / baseline) / hours`. The two errors **must be the same unit and
+  the same rows** (both MSE or both SSE); the #256 bug was an SSE baseline
+  divided by an MSE best. It is reported only for `--metric squared`; every
+  other metric reports `null` rather than a mixed-unit ratio. The ledger form
+  carries its numerator, denominator,
+  units (`decades_per_gpu_hour`) and scope (`run`). A throughput gain is not a
   search gain: compare quality at matched cumulative evaluations and paired
   seeds.
 * **`sm_occupancy` is `null`** with `occupancy_source: "ncu (not run)"`.
