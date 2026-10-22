@@ -140,6 +140,11 @@ pub enum DeviceLoss {
     Correlation,
     /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`].
     CorrelationSigned,
+    /// #222: `Σ w·|r|`, minimised by per-row IRLS weights `1/max(|r|, 1e-6)`
+    /// with true-`|r|` acceptance. Both the evaluator and the batched fit use
+    /// this code, so a run can neither rank nor fit MAE with a squared-error
+    /// surrogate.
+    Absolute,
 }
 
 impl DeviceLoss {
@@ -150,6 +155,7 @@ impl DeviceLoss {
             DeviceLoss::LogSquashed => 1,
             DeviceLoss::Correlation => 2,
             DeviceLoss::CorrelationSigned => 3,
+            DeviceLoss::Absolute => 4,
         }
     }
 
@@ -159,6 +165,7 @@ impl DeviceLoss {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
             Metric::LogSquashed => Some(DeviceLoss::LogSquashed),
+            Metric::Absolute => Some(DeviceLoss::Absolute),
             _ => None,
         }
     }
@@ -168,7 +175,8 @@ impl DeviceLoss {
 ///
 /// The information criteria fit by least squares and add their penalty when
 /// scoring, so they share the squared objective; `log_squashed` uses the
-/// robust arm. Everything else returns `None` and keeps the exact CPU fit.
+/// robust arm; #222's `absolute` uses the L1/IRLS arm with true-`|r|`
+/// acceptance. Everything else returns `None` and keeps the exact CPU fit.
 pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
     match metric {
         Metric::Aic | Metric::Aicc | Metric::Bic => Some(DeviceLoss::Squared),
@@ -181,7 +189,8 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 ///
 /// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) minimises one
 /// configured objective per launch: weighted squared error for the
-/// least-squares family, and `log_squashed` as weighted LM/IRLS since #229.
+/// least-squares family, `log_squashed` as weighted LM/IRLS since #229, and
+/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222.
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
@@ -205,13 +214,13 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
         return None;
     }
     Some(format!(
-        "--fit-strategy gpu minimises squared error, log-squashed loss or the \
-         exact rank and median objectives, but --metric {} has no device fit \
-         objective, so the GPU arms cannot fit it. Use --metric squared (aic, \
-         aicc and bic also fit by least squares), --metric log_squashed, \
-         --metric rank_correlation or rank_correlation_signed, --metric \
-         median, or a CPU fit strategy: --fit-strategy exact, auto, linear, \
-         varpro or stream.",
+        "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
+         absolute error or the exact rank and median objectives, but --metric \
+         {} has no device fit objective, so the GPU arms cannot fit it. Use \
+         --metric squared (aic, aicc and bic also fit by least squares), \
+         --metric log_squashed, --metric absolute, --metric rank_correlation \
+         or rank_correlation_signed, --metric median, or a CPU fit strategy: \
+         --fit-strategy exact, auto, linear, varpro or stream.",
         metric.name()
     ))
 }
@@ -3814,6 +3823,73 @@ mod tests {
         assert!(loss < 1e-12, "loss={loss}, values={:?}", values(&tree));
     }
 
+    /// #222: for a scale-only model `a·x` on positive `x`, the L1 optimum is
+    /// the (base-weight × x)-weighted median of `y_i / x_i` — an exact,
+    /// independent oracle for the IRLS arm, not a comparison with another
+    /// iteration of the same code.
+    #[test]
+    fn l1_fit_matches_the_weighted_median_on_a_scale_model() {
+        let ratios = [
+            2.0, 2.1, 1.9, 2.05, 1.95, 30.0, 2.02, 1.98, -12.0, 2.03, 1.97,
+        ];
+        let xs = [0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.3, 2.5];
+        let base = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0];
+        let x: Vec<Vec<f64>> = xs.iter().map(|&v| vec![v]).collect();
+        let y: Vec<f64> = xs.iter().zip(&ratios).map(|(x, r)| x * r).collect();
+        let mut order: Vec<usize> = (0..xs.len()).collect();
+        order.sort_by(|&a, &b| ratios[a].partial_cmp(&ratios[b]).unwrap());
+        let total: f64 = order.iter().map(|&i| base[i] * xs[i]).sum();
+        let mut acc = 0.0;
+        let mut median = f64::NAN;
+        for &i in &order {
+            acc += base[i] * xs[i];
+            if acc >= 0.5 * total {
+                median = ratios[i];
+                break;
+            }
+        }
+        let mut tree = node(Op::Mul, vec![constant(1.0), input(0)]);
+        let fitted_loss = fit_weighted_metric(&mut tree, &x, &y, &base, 64, Metric::Absolute);
+        let a = fitted_constants(&tree)[0];
+        assert!(
+            (a - median).abs() <= 1e-2 * median.abs().max(1.0),
+            "IRLS {a} vs weighted median {median}"
+        );
+        // The parity claim is on the objective: the IRLS endpoint must not be
+        // worse than the exact weighted median of this scale model.
+        let pred_at = |c: f64| -> Vec<f64> { x.iter().map(|r| c * r[0]).collect() };
+        // Lawson IRLS approaches the kink asymptotically (one weight goes to
+        // infinity at the median), so the honest quality gate is that the
+        // endpoint is within 0.1 % of the exact oracle, not bit-equal to it.
+        let at_median = metrics::score_weighted(&pred_at(median), &y, &base, Metric::Absolute, 1);
+        assert!(
+            fitted_loss <= at_median * (1.0 + 1e-3),
+            "IRLS loss {fitted_loss} worse than the weighted-median oracle {at_median}"
+        );
+    }
+
+    /// #222: the arm is deterministic (bit for bit) and a non-finite row is
+    /// reported as an infinite loss without corrupting the constants.
+    #[test]
+    fn l1_fit_is_deterministic_and_rejects_non_finite_rows() {
+        let (x, y) = outlier_fixture();
+        let mut a = line(0.5, 0.0);
+        let mut b = line(0.5, 0.0);
+        let la = fit_weighted_metric(&mut a, &x, &y, &[], 8, Metric::Absolute);
+        let lb = fit_weighted_metric(&mut b, &x, &y, &[], 8, Metric::Absolute);
+        assert_eq!(la.to_bits(), lb.to_bits());
+        assert_eq!(
+            fitted_constants(&a).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted_constants(&b).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let mut bad_y = y.clone();
+        bad_y[2] = f64::NAN;
+        let mut t = line(0.5, 0.0);
+        let loss = fit_weighted_metric(&mut t, &x, &bad_y, &[], 8, Metric::Absolute);
+        assert!(!loss.is_finite(), "a non-finite metric score must not be reported as a fit: {loss}");
+        assert!(fitted_constants(&t).iter().all(|v| v.is_finite()));
+    }
+
     #[test]
     fn fit_rejects_a_length_mismatch() {
         let x = vec![vec![0.0], vec![1.0]];
@@ -4335,12 +4411,12 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223 + #229 + #230 + #226: an explicit GPU request is refused for every
-    /// metric without a device fit objective, and the refusal says why and what
-    /// to use instead. `squared`/`aic`/`aicc`/`bic` fit by least squares,
-    /// `log_squashed` by weighted IRLS (#229), the rank family by the exact
-    /// integer polish (#230) and `median` by the exact median polish (#226), so
-    /// all four groups are accepted.
+    /// #223 + #229 + #230 + #226 + #222: an explicit GPU request is refused
+    /// for every metric without a device fit objective, and the refusal says
+    /// why and what to use instead. `squared`/`aic`/`aicc`/`bic` fit by least
+    /// squares, `log_squashed` by weighted IRLS (#229), `absolute` by L1 IRLS
+    /// (#222), the rank family by the exact integer polish (#230) and `median`
+    /// by the exact median polish (#226), so all five groups are accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
@@ -4351,7 +4427,7 @@ mod tests {
             }
             let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
             assert!(
-                why.contains("minimises squared error, log-squashed loss or the"),
+                why.contains("minimises squared error, log-squashed loss, mean"),
                 "the refusal must name the device objectives: {why}"
             );
             assert!(
@@ -4366,6 +4442,10 @@ mod tests {
                 why.contains("--metric log_squashed"),
                 "the refusal must point at the robust arm: {why}"
             );
+            assert!(
+                why.contains("--metric absolute"),
+                "the refusal must point at the L1 arm: {why}"
+            );
             for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
                 assert!(
                     why.contains(strategy),
@@ -4379,10 +4459,10 @@ mod tests {
         assert!(gpu_fit_metric_error(Metric::Squared).is_none());
         assert!(gpu_fit_metric_error(Metric::RankCorrelation).is_none());
         assert!(gpu_fit_metric_error(Metric::RankCorrelationSigned).is_none());
+        assert!(gpu_fit_metric_error(Metric::Absolute).is_none());
         assert_eq!(rank_fit_only(Metric::RankCorrelation), Some(false));
         assert_eq!(rank_fit_only(Metric::RankCorrelationSigned), Some(true));
         assert_eq!(rank_fit_only(Metric::Squared), None);
-        assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
         // #226: `median` has an exact device polish (fit-only), so an explicit
         // `--fit-strategy gpu` is no longer a usage error for it.
         assert!(gpu_fit_metric_error(Metric::Median).is_none());

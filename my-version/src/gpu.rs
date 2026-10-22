@@ -4340,6 +4340,384 @@ mod fit_tests {
             cpu / gpu.max(1e-9)
         );
     }
+
+    // ---- #222: Absolute (MAE) on the batched kernel ----------------------
+
+    /// `mean |r|` at the tree's current constants, scored by the CPU f64
+    /// function the archive uses.
+    fn absolute_at(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64]) -> f64 {
+        let pred: Vec<f64> = x.iter().map(|r| eval(tree, r)).collect();
+        metrics::score_weighted(&pred, y, w, Metric::Absolute, crate::expr::count_constants(tree))
+    }
+
+    /// #222 parity: the weighted-LM/IRLS kernel must reach the CPU L1 IRLS
+    /// objective on a heavy-tailed fixture, never an SSE endpoint.
+    #[test]
+    fn gpu_absolute_fit_matches_the_cpu_irls() {
+        let n = 400;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+        let start = model(&[0.2, 1.0]);
+        let mut cpu_tree = start.clone();
+        let cpu = crate::fit::fit_weighted_metric(&mut cpu_tree, &x, &y, &[], 8, Metric::Absolute);
+        assert!(cpu.is_finite() && cpu < absolute_at(&start, &x, &y, &[]));
+
+        let plan = crate::fit::gpu_fit_plan(&start).expect("affine plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert!(ms >= 0.0, "the absolute fit kernel ran");
+        assert_eq!(out[0].status, 0, "the outlier fixture is well conditioned");
+        let mut gpu_tree = start.clone();
+        plan.apply(&mut gpu_tree, &out[0].c);
+        let gpu = absolute_at(&gpu_tree, &x, &y, &[]);
+        assert!(
+            gpu <= cpu * (1.0 + 1e-5),
+            "the GPU L1 fit is worse than the CPU IRLS: gpu={:.12e} cpu={:.12e}",
+            gpu,
+            cpu
+        );
+        let rel = (gpu - cpu).abs() / cpu.abs().max(1e-12);
+        assert!(rel <= 1e-4, "GPU/CPU MAE gap {:.3e} (gpu {:.12e}, cpu {:.12e})", rel, gpu, cpu);
+        // The fixture separates the L1 and L2 answers, so the comparison is
+        // not vacuous and the kernel is not just running squared LM.
+        let mut l2 = start.clone();
+        crate::fit::fit_weighted(&mut l2, &x, &y, &[], 8);
+        assert!(
+            absolute_at(&l2, &x, &y, &[]) > gpu + 1e-3,
+            "the fixture must separate the L1 and least-squares optima"
+        );
+    }
+
+    /// #222: the kernel's objective statistic is the configured risk too:
+    /// `Σ|r|` (up to the trial baseline), not `Σr²`.
+    #[test]
+    fn gpu_absolute_reports_the_configured_objective() {
+        let n = 200;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]));
+        let start = model(&[0.2, 1.0]);
+        let plan = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert_eq!(out[0].status, 0);
+        let mut fitted = start.clone();
+        plan.apply(&mut fitted, &out[0].c);
+        let pred: Vec<f64> = x.iter().map(|r| eval(&fitted, r)).collect();
+        let want: f64 = pred.iter().zip(&y).map(|(p, t)| (p - t).abs()).sum();
+        let rel = (out[0].sse - want).abs() / want.max(1e-12);
+        assert!(
+            rel <= 1e-4,
+            "kernel objective {:.9e} vs exact Σ|r| {:.9e} (rel {:.2e})",
+            out[0].sse,
+            want,
+            rel
+        );
+        let sse: f64 = pred.iter().zip(&y).map(|(p, t)| (p - t) * (p - t)).sum();
+        assert_ne!(out[0].sse.to_bits(), sse.to_bits(), "the two objectives must not coincide");
+    }
+
+    /// #222: deterministic, and independent of batch composition.
+    #[test]
+    fn gpu_absolute_fit_is_deterministic_and_composition_free() {
+        let n = 400;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]));
+        let start = model(&[0.2, 1.0]);
+        let plan = crate::fit::gpu_fit_plan(&start).expect("plan");
+        let (a, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        let (b, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert_eq!(a[0].c, b[0].c, "a repeated run must be bit-identical");
+        assert_eq!(a[0].sse.to_bits(), b[0].sse.to_bits());
+
+        let plans: Vec<_> = (0..4).map(|_| crate::fit::gpu_fit_plan(&start).expect("plan")).collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (batch, _) = ev.fit_batch(&refs, 8, crate::fit::DeviceLoss::Absolute);
+        for r in &batch {
+            assert_eq!(r.c, a[0].c, "batch composition changed the L1 constants");
+            assert_eq!(r.sse.to_bits(), a[0].sse.to_bits());
+        }
+    }
+
+    /// #222: rank deficiency and non-finite rows are labelled, never returned
+    /// as constants; the caller then uses the exact CPU arm with a cause.
+    #[test]
+    fn gpu_absolute_labels_ill_conditioning_and_non_finite_rows() {
+        let n = 400;
+        let (x, _y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let x0 = input(0);
+        let collinear = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(0.1), x0.clone()]),
+                node(Op::Mul, vec![constant(0.2), x0.clone()]),
+            ],
+        );
+        let plan = crate::fit::gpu_fit_plan(&collinear).expect("collinear plan");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert!(ms >= 0.0);
+        assert_eq!(out[0].status, 1, "a rank-deficient L1 system must be labelled");
+
+        let bad = node(
+            Op::Sqrt,
+            vec![node(Op::Sub, vec![constant(0.25), node(Op::Square, vec![input(0)])])],
+        );
+        let y_bad: Vec<f64> = x.iter().map(|r| eval(&bad, r)).collect();
+        let (cols, y32) = cols_from(&x, &y_bad);
+        let mut ev = GpuEvaluator::new(&cols, n, 1, &y32).expect("second evaluator");
+        let plan = crate::fit::gpu_fit_plan(&bad).expect("sqrt plan");
+        let (out, _) = ev.fit_batch(&[&plan], 4, crate::fit::DeviceLoss::Absolute);
+        assert_eq!(out[0].status, 2, "non-finite rows must be labelled");
+    }
+
+    /// #222: exact interpolation is the L1 arm's degeneracy. Every residual is
+    /// zero at the optimum, so the weights hit the `1e-6` floor; the result
+    /// must be either the exact fit or an explicit ill-conditioned status —
+    /// never a silent SSE optimum or non-finite constants.
+    #[test]
+    fn gpu_absolute_zero_residuals_are_exact_or_labelled() {
+        let n = 300;
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = (i as f64 / (n - 1) as f64) * 4.0 - 2.0;
+            x.push(vec![t]);
+            y.push(0.5 + 1.75 * t);
+        }
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]));
+        let plan = crate::fit::gpu_fit_plan(&model(&[0.2, 1.0])).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Absolute);
+        assert!(
+            out[0].status == 0 || out[0].status == 1,
+            "a zero-residual fit is exact or ill-conditioned, got {}",
+            out[0].status
+        );
+        assert!(out[0].c.iter().all(|v| v.is_finite()));
+        if out[0].status == 0 {
+            let mut tree = model(&[0.2, 1.0]);
+            plan.apply(&mut tree, &out[0].c);
+            let mae = absolute_at(&tree, &x, &y, &[]);
+            assert!(mae <= 1e-4, "an accepted zero-residual fit must be exact, MAE={mae:.3e}");
+        }
+    }
+
+    /// #222: `--no-fit` at the kernel boundary leaves every constant at its
+    /// seed value bit for bit.
+    #[test]
+    fn gpu_absolute_no_fit_does_not_move_constants() {
+        let n = 300;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let mut cols64 = vec![0.0f64; n];
+        for i in 0..n {
+            cols64[i] = x[i][0];
+        }
+        assert!(ev.set_fit_data(&cols64, &y, &[]));
+        let plan = crate::fit::gpu_fit_plan(&model(&[0.2, 1.0])).expect("plan");
+        let (out, _) = ev.fit_batch(&[&plan], 0, crate::fit::DeviceLoss::Absolute);
+        assert_eq!(out[0].status, 0);
+        assert_eq!(out[0].c, plan.c0, "--fit-iters 0 must not move a constant");
+    }
+
+    /// #222: the CUDA evaluator's native loss for `absolute` is `mean |r|`,
+    /// matching the CPU scorer to f32 rounding, and it is not the SSE.
+    #[test]
+    fn the_evaluator_scores_absolute_natively() {
+        let n = 300;
+        let (x, y, cols, y32) = robust_fixture(n);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        ev.set_loss(crate::fit::DeviceLoss::Absolute);
+        assert_eq!(ev.loss(), crate::fit::DeviceLoss::Absolute);
+        let trees = vec![model(&[0.2, 1.0]), model(&[1.0, 2.0])];
+        let mut pop = Population::new();
+        for t in &trees {
+            assert!(pop.add(t));
+        }
+        let (loss, ms) = ev.eval_population(&pop);
+        assert!(ms >= 0.0);
+        for (t, &got) in trees.iter().zip(&loss) {
+            let pred: Vec<f64> = x.iter().map(|r| eval(t, r)).collect();
+            let mean: f64 = pred.iter().zip(&y).map(|(p, q)| (p - q).abs()).sum::<f64>() / n as f64;
+            let got = got as f64 / n as f64;
+            let rel = (got - mean).abs() / mean.max(1e-12);
+            assert!(rel <= 1e-4, "device MAE {:.9e} vs CPU {:.9e} (rel {:.2e})", got, mean, rel);
+        }
+        ev.set_loss(crate::fit::DeviceLoss::Squared);
+        let (sse, _) = ev.eval_population(&pop);
+        assert_ne!(loss[0], sse[0], "the two native objectives must not coincide");
+    }
+
+    /// #222 measurement (ignored): fit-stage throughput and endpoint quality
+    /// for the absolute arm. The CPU side is the exact L1 IRLS
+    /// (`fit_weighted_metric(.., Absolute)`); the GPU side is the batched
+    /// weighted-LM/IRLS kernel. Both fit the same candidates on the same rows,
+    /// so the ratio is paired. Run with
+    /// `cargo test --release --features cuda --lib bench_batched_fit_absolute -- --ignored --nocapture`.
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore]
+    fn bench_batched_fit_absolute() {
+        let n = std::env::var("RCSR_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000usize);
+        let threads = 8usize;
+        let pmax = 20usize;
+        for (p, candidates) in [(4usize, 64usize), (8, 64)] {
+            let (x, mut y, cols, _) = bench_fixture(pmax, p, n);
+            for i in (3..n).step_by(10) {
+                y[i] += 15.0;
+            }
+            let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+            let start: Vec<f64> = (0..p).map(|k| 0.25 + 0.07 * k as f64).collect();
+            let loss_of = |c: &[f64]| -> f64 {
+                let t = linear_model(c);
+                let pred: Vec<f64> = x.iter().map(|r| eval(&t, r)).collect();
+                metrics::score_weighted(&pred, &y, &[], Metric::Absolute, p)
+            };
+
+            let t0 = std::time::Instant::now();
+            let per = candidates.div_ceil(threads);
+            let cpu_losses: Vec<Vec<f64>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|_| {
+                        let x = &x;
+                        let y = &y;
+                        let start = &start;
+                        scope.spawn(move || {
+                            let mut out = Vec::with_capacity(per);
+                            for _ in 0..per {
+                                let mut t = linear_model(start);
+                                crate::fit::fit_weighted_metric(&mut t, x, y, &[], 8, Metric::Absolute);
+                                out.push(constants(&t));
+                            }
+                            out
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().expect("cpu fit thread"))
+                    .collect()
+            });
+            let cpu = t0.elapsed().as_secs_f64();
+
+            let mut ev = match GpuEvaluator::new(&cols, n, pmax, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU benchmark: no usable device");
+                    return;
+                }
+            };
+            let mut cols64 = vec![0.0f64; n * pmax];
+            for r in 0..n {
+                for k in 0..pmax {
+                    cols64[k * n + r] = x[r][k];
+                }
+            }
+            ev.set_fit_data(&cols64, &y, &[]);
+            let plan = crate::fit::gpu_fit_plan(&linear_model(&start)).expect("plan");
+            let plans: Vec<&crate::fit::GpuFitPlan> = (0..candidates).map(|_| &plan).collect();
+            let t1 = std::time::Instant::now();
+            let (out, ms) = ev.fit_batch(&plans, 8, crate::fit::DeviceLoss::Absolute);
+            let gpu = t1.elapsed().as_secs_f64();
+            let ok = out.iter().filter(|r| r.status == 0).count();
+
+            let mut no_worse = 0usize;
+            let mut cpu_sum = 0.0;
+            let mut gpu_sum = 0.0;
+            for (c_res, c_cpu) in out.iter().zip(&cpu_losses) {
+                let g = if c_res.status == 0 { loss_of(&c_res.c) } else { f64::INFINITY };
+                let c = loss_of(c_cpu);
+                cpu_sum += c;
+                if g <= c * (1.0 + 1e-6) {
+                    no_worse += 1;
+                }
+                if g.is_finite() {
+                    gpu_sum += g;
+                }
+            }
+            let npairs = cpu_losses.len().min(out.len()).max(1);
+            eprintln!(
+                "absolute p={} N={} P={} cpu={:.3}s gpu={:.3}s (kernel {:.1}ms, status0 {}/{}) fit speedup={:.1}x mean_loss cpu={:.6e} gpu={:.6e} no_worse={}/{}",
+                p,
+                n,
+                candidates,
+                cpu,
+                gpu,
+                ms,
+                ok,
+                out.len(),
+                cpu / gpu.max(1e-9),
+                cpu_sum / npairs as f64,
+                gpu_sum / npairs as f64,
+                no_worse,
+                npairs
+            );
+        }
+    }
 }
 
 /// #230: device-side exact rank stage.

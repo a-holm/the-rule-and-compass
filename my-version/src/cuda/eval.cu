@@ -352,6 +352,16 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    correlation scorer; these codes are never passed to rc_eval/rc_pool_eval). */
 #define RC_LOSS_CORRELATION 2
 #define RC_LOSS_CORRELATION_SIGNED 3
+/* #222: mean absolute error. The evaluator, the batched fit's objective and
+   its per-row IRLS weight all derive from the same code, so a run can never
+   fit or rank |r| with a squared-error surrogate. */
+#define RC_LOSS_ABSOLUTE 4
+
+/* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
+   deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
+   finite floor keeps a single interpolated row from reaching a weight that
+   overflows the f32 product with a large adjoint. */
+#define FT_L1_EPS 1e-6
 
 __device__ __forceinline__ float rc_row_loss(float r, int loss)
 {
@@ -359,7 +369,23 @@ __device__ __forceinline__ float rc_row_loss(float r, int loss)
         const float rr = r * r;
         return isfinite(rr) ? log1pf(rr) : 2.0f * logf(fabsf(r));
     }
+    if (loss == RC_LOSS_ABSOLUTE) {
+        return fabsf(r);
+    }
     return r * r;
+}
+
+/* #222: the per-row weight of the least-squares surrogate. `base` is the
+   user's `--weight` (1.0 when unweighted). `log_squashed` uses
+   `2/(1 + r^2)`, the derivative of `ln(1 + r^2)` split over the residual;
+   `absolute` uses the Lawson/L1 majoriser `1/max(|r|, eps)`. Both are
+   computed in f64 so an L1 weight never picks up an f32 rounding step of its
+   own. For every other objective the weight is the base weight, bit for bit. */
+__device__ __forceinline__ double ft_row_weight(double base, double r, int metric)
+{
+    if (metric == RC_LOSS_LOG_SQUASHED) return base * 2.0 / (1.0 + r * r);
+    if (metric == RC_LOSS_ABSOLUTE) return base / fmax(fabs(r), FT_L1_EPS);
+    return base;
 }
 
 /* #131 register contract: 6 blocks of RC_MAX_THREADS per SM. On sm_86 the
@@ -884,23 +910,32 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                 const double r = pred - y[row];
                 bool ok = isfinite(pred) && fabs(pred) <= 1e30 && isfinite(r);
                 ft_backward_d<MAXC>(nd, m, v, adj, g, p);
-                /* #229: the MM/IRLS weight. `2/(1 + r^2)` is `rho'(r)/r`; the
-                   CPU arm uses `1/(1 + r^2)` and the constant 2 cannot move the
-                   weighted least-squares argmin. The weight scales the whole
-                   row (adjoint and residual), so J^T W J stays PSD even where
-                   the true Hessian is indefinite. */
-                double sw = wr;
-                if (metric == RC_LOSS_LOG_SQUASHED) sw = wr * 2.0 / (1.0 + r * r);
+                /* #229/#222: the MM/IRLS weight. `2/(1 + r^2)` is the
+                   log-squashed `rho'(r)/r`; `1/max(|r|, eps)` is the Lawson
+                   L1 majoriser. The constant factors a positive weight picks
+                   up cannot move the weighted least-squares argmin. The
+                   weight scales the whole row (adjoint and residual), so
+                   J^T W J stays PSD even where the true Hessian is indefinite
+                   (L1) or negative (log-squashed beyond |r| = 1). */
+                const double sw = ft_row_weight(wr, r, metric);
                 const double s = sqrt(sw);
                 for (int j = 0; j < p; ++j) {
                     if (!isfinite(g[j])) ok = false;
                     dg[tid * p + j] = ok ? s * g[j] : 0.0;
                 }
                 dr[tid] = ok ? s * r : 0.0;
-                dl[tid] = ok ? wr * (metric == RC_LOSS_LOG_SQUASHED
-                                         ? log1p(r * r)
-                                         : r * r)
-                             : 0.0;
+                /* The objective statistic is always the configured loss, in
+                   f64: `|r|` for absolute, `ln(1+r²)` for log-squashed, and
+                   the historical `r*r` for squared. */
+                double rho;
+                if (metric == RC_LOSS_SQUARED) {
+                    rho = r * r;
+                } else if (metric == RC_LOSS_ABSOLUTE) {
+                    rho = fabs(r);
+                } else {
+                    rho = log1p(r * r);
+                }
+                dl[tid] = ok ? wr * rho : 0.0;
                 if (!ok) *bad = 1;
             } else {
                 for (int j = 0; j < p; ++j) dg[tid * p + j] = 0.0;
@@ -963,8 +998,12 @@ __device__ double ft_loss_d(const unsigned int *nd,
             const double r = pred - y[row];
             if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
                 local += 1e30;
+            } else if (metric == RC_LOSS_SQUARED) {
+                local += wr * r * r;
+            } else if (metric == RC_LOSS_ABSOLUTE) {
+                local += wr * fabs(r);
             } else {
-                local += wr * (metric == RC_LOSS_LOG_SQUASHED ? log1p(r * r) : r * r);
+                local += wr * log1p(r * r);
             }
         }
     }
@@ -1033,14 +1072,11 @@ __device__ void ft_assemble(const unsigned int *nd,
             const float r = pred - y[row];
             bool ok = isfinite(pred) && fabsf(pred) <= 1e30f && isfinite(r);
             ft_backward<MAXC>(nd, m, vt, adj, g, p);
-            /* #229: `sqrt(w_i · 2/(1 + r_i^2))` scales the row's adjoint and
-               residual, so the rank-one update below is unchanged and `A`
-               stays positive semidefinite even where ρ'' < 0. */
-            double sw = wr;
-            if (metric == RC_LOSS_LOG_SQUASHED) {
-                const double rr = (double)r * (double)r;
-                sw = wr * 2.0 / (1.0 + rr);
-            }
+            /* #229/#222: `sqrt(w_i · 2/(1 + r_i^2))` (log-squashed) or
+               `sqrt(w_i / max(|r_i|, eps))` (absolute) scales the row's
+               adjoint and residual, so the rank-one update below is unchanged
+               and `A` stays positive semidefinite even where rho'' < 0. */
+            const double sw = ft_row_weight(wr, (double)r, metric);
             const float s = sqrtf((float)sw);
             for (int j = 0; j < p; ++j) {
                 if (!isfinite(g[j])) ok = false;
@@ -1109,12 +1145,14 @@ __device__ double ft_loss(const unsigned int *nd,
         const float r = pred - y[row];
         if (!isfinite(pred) || fabsf(pred) > 1e30f || !isfinite(r)) {
             local += 1e30;
-        } else if (metric == RC_LOSS_LOG_SQUASHED) {
-            local += wr * (double)rc_row_loss(r, metric);
-        } else {
+        } else if (metric == RC_LOSS_SQUARED) {
             /* Keep the historical f64 square: the f32 product would round the
                trial score differently from the assembly's own statistic. */
             local += wr * (double)r * (double)r;
+        } else {
+            /* #222: the configured objective itself (`|r|`, `ln(1+r²)`), in
+               f32 per row and f64 in the sum, exactly like the assembly. */
+            local += wr * (double)rc_row_loss(r, metric);
         }
     }
     red[tid] = local;
@@ -1135,11 +1173,11 @@ __device__ double ft_loss(const unsigned int *nd,
  * pivot floor of 1e-18 and a Cholesky diagonal ratio `hi/lo <= 1e4`.
  *
  * #229: robust IRLS weights make `A` badly *scaled* without being
- * ill-conditioned, so for `log_squashed` the gate is the scale-free
- * `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`, `Ã = D^{-1/2} A D^{-1/2}`, which is
- * invariant to units and to a global weight scale. `ln det Ã < ln 1e-12` means
- * the data no longer identifies the parameters, which is exactly when the
- * exact CPU arm must take over. */
+ * ill-conditioned, so for `log_squashed` and #222's `absolute` the gate is the
+ * scale-free `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`, `Ã = D^{-1/2} A D^{-1/2}`,
+ * which is invariant to units and to a global weight scale. `ln det Ã < ln
+ * 1e-12` means the data no longer identifies the parameters, which is exactly
+ * when the exact CPU arm must take over. */
 /* ln(1e-12), the smallest identified fraction of parameter space. */
 #define FT_LN_DET_FLOOR (-27.631021115928547)
 
@@ -1559,9 +1597,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     const int words = (int)(off[cand + 1] - off[cand]);
     const int m = words / 4;
     const unsigned int *nd = prog + off[cand];
-    /* #229: the scale-free determinant gate replaces the ratio gate for the
-       robust arm, whose normal equations are badly scaled by construction. */
-    const int scale_free = (metric == RC_LOSS_LOG_SQUASHED);
+    /* #229/#222: the scale-free determinant gate replaces the ratio gate for
+       the robust arms, whose normal equations are badly scaled by
+       construction (L1 weights span 1..1e6). */
+    const int scale_free = (metric == RC_LOSS_LOG_SQUASHED || metric == RC_LOSS_ABSOLUTE);
 
     extern __shared__ char ft_smem_raw[];
     FtSmem<MAXC, CHUNK, PCHUNK> *S =
@@ -1698,46 +1737,71 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     int assembled = 0;
     double best = 0.0;
 
+    /* #222: the L1 arm re-derives its per-row weights from the residuals of
+       the current constants. `rounds` outer IRLS rounds of `inner` damped LM
+       sweeps mirror the CPU `irls_fit` split (four weight updates, `iters/4`
+       sweeps each for the default of 8), and every trial is judged by `|r|`.
+       The squared and log-squashed arms keep one round and their historical
+       step sequence bit for bit. */
+    const int irls = (metric == RC_LOSS_ABSOLUTE);
+    const int rounds = irls ? (iters < 1 ? 1 : (iters < 4 ? iters : 4)) : 1;
+    const int inner = irls ? (iters / rounds < 1 ? 1 : iters / rounds) : iters;
+
     if (iters > 0) {
         /* First assembly also supplies the baseline objective. */
         ft_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
         assembled = 1;
         best = S->sbest;
         if (S->sbad) status = 2;
-        for (int it = 0; it < iters && status == 0; ++it) {
-            if (!assembled) {
-                ft_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
-                assembled = 1;
-                if (S->sbad) {
-                    status = 2;
+        for (int round = 0; round < rounds && status == 0 && best != 0.0; ++round) {
+            if (irls && round > 0) assembled = 0; /* new weights, new Gram */
+            for (int it = 0; it < inner && status == 0; ++it) {
+                if (!assembled) {
+                    ft_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+                    assembled = 1;
+                    if (S->sbad) {
+                        status = 2;
+                        break;
+                    }
+                }
+                if (tid == 0) {
+                    S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free) == 0);
+                }
+                __syncthreads();
+                if (!S->ssolved) {
+                    status = 1;
                     break;
                 }
+                if (tid < p) {
+                    double t = S->sc[tid] + S->sdelta[tid];
+                    S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                }
+                __syncthreads();
+                double tsse = ft_loss<CHUNK>(nd, m, cols, y, w64, n, metric, S->strial, S->sred);
+                /* #222: true-metric Armijo. The weighted surrogate can point
+                   uphill for `|r|`; halving the step twice costs two forward
+                   passes and never accepts a trial that is worse in the
+                   configured loss. Every other objective keeps the historical
+                   single-trial acceptance. */
+                for (int half = 0; half < (irls ? 2 : 0) && !(tsse < best); ++half) {
+                    if (tid < p) {
+                        S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
+                    }
+                    __syncthreads();
+                    tsse = ft_loss<CHUNK>(nd, m, cols, y, w64, n, metric, S->strial, S->sred);
+                }
+                if (tsse < best) {
+                    if (tid < p) S->sc[tid] = S->strial[tid];
+                    best = tsse;
+                    if (tid == 0) S->slambda = fmax(S->slambda / 8.0, 1e-12);
+                    assembled = 0;
+                    if (best == 0.0) break;
+                } else {
+                    if (tid == 0) S->slambda *= 6.0;
+                    if (S->slambda > 1e9) break;
+                }
+                __syncthreads();
             }
-            if (tid == 0) {
-                S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free) == 0);
-            }
-            __syncthreads();
-            if (!S->ssolved) {
-                status = 1;
-                break;
-            }
-            if (tid < p) {
-                double t = S->sc[tid] + S->sdelta[tid];
-                S->strial[tid] = fmin(1e6, fmax(-1e6, t));
-            }
-            __syncthreads();
-            double tsse = ft_loss<CHUNK>(nd, m, cols, y, w64, n, metric, S->strial, S->sred);
-            if (tsse < best) {
-                if (tid < p) S->sc[tid] = S->strial[tid];
-                best = tsse;
-                if (tid == 0) S->slambda = fmax(S->slambda / 8.0, 1e-12);
-                assembled = 0;
-                if (best == 0.0) break;
-            } else {
-                if (tid == 0) S->slambda *= 6.0;
-                if (S->slambda > 1e9) break;
-            }
-            __syncthreads();
         }
         /* Re-baseline the acceptance objective in f64: `best` so far came from
            the f32 assembly, and comparing an f64 trial against it would reject
@@ -1763,6 +1827,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             }
             __syncthreads();
             double tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, w64, n, metric, S->strial, S->sred);
+            /* #222: one exact f64 backtrack for the non-smooth objective. */
+            if (irls && !(tsse < best)) {
+                if (tid < p) {
+                    S->strial[tid] = S->sc[tid] + 0.5 * (S->strial[tid] - S->sc[tid]);
+                }
+                __syncthreads();
+                tsse = ft_loss_d<PCHUNK>(nd, m, cols64, y64, w64, n, metric, S->strial, S->sred);
+            }
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
