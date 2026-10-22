@@ -1643,7 +1643,7 @@ substitute for either.
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |
 | Maximum paired fit stage (CPU ladder vs bisection on the error level) | RTX 3060, `tests/gpu_max.rs` (`the_paired_maximum_measurement_shows_the_device_tail_is_faster`) | **measured on three sample sizes** — 5.8–9.1× at 24 candidates, 2.6–8.4× at the search's 32-candidate batch; one-candidate batches lose (0.2–0.5×) and are never used |
-| Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows, 5 generations, pop 60 | **measured on three seeds** — 1.35–3.2× end-to-end (10.87/5.09/10.34 s exact vs 3.44/3.77/5.06 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`; the fitness is still CPU, so Amdahl caps the gain |
+| Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows (`--fit-iters 8`), 5 generations, pop 60 | **measured on three seeds** — 1.75–4.0× end-to-end (9.38/3.72/8.48 s exact vs 2.36/2.12/2.89 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`, zero `maximum_declined`; the fitness is still CPU, so Amdahl caps the gain |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
@@ -2246,10 +2246,11 @@ and the measurement shows at least 3.9× at the search's batch size.
 floor, the monotonicity in `n` and in `p`, and the coefficients' signs.
 
 **Measured end-to-end (three seeds, 20 000 rows, 5 generations, `--pop 60`).**
-CPU `--fit-strategy exact` 10.87 / 5.09 / 10.34 s against the device arm
-3.44 / 3.77 / 5.06 s (1.35–3.2×), with best front error 3.90 / 3.63 / 3.42
-against 3.79 / 3.91 / 3.66 — the fit is kept monotone per candidate, but the
-search trajectory differs, so this is not a quality claim. Fallback share is
+CPU `--fit-strategy exact` 9.38 / 3.72 / 8.48 s against the device arm
+2.36 / 2.12 / 2.89 s (1.75–4.0×, the machine is shared so these are
+indicative), with best front error 3.90 / 3.63 / 3.42 against 3.79 / 3.91 /
+3.66 — the fit is kept monotone per candidate, but the search trajectory
+differs, so this is not a quality claim. Fallback share is
 8.6–10.2 %, entirely `non_finite`, `unsupported_plan` and `ill_conditioned`;
 zero `maximum_declined` after the mixed-`p` batch fix (below). Because the arm is
 **fit-only**, the fitness evaluation stays on the CPU and Amdahl caps the
