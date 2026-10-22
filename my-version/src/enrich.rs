@@ -72,6 +72,7 @@ pub const GROUPS: &[&str] = &[
     "lags",
     "xs",
     "btc",
+    "cross",
     "py15m",
     "mtf",
     "compact",
@@ -234,6 +235,69 @@ pub const PRICE_ACTION_NAMES: &[&str] = &[
     "trend96",
 ];
 
+/// Benchmark BTC context columns produced from the same timestamp-keyed series
+/// as the compact and `py15m` joins.
+pub const CROSS_BTC_NAMES: &[&str] = &[
+    "btc_r1",
+    "btc_r16",
+    "btc_r20",
+    "btc_r96",
+    "btc_r672",
+    "btc_vol20",
+    "btc_vol96",
+    "rel_btc_r1",
+    "rel_btc_r16",
+    "rel_btc_r20",
+    "rel_btc_r96",
+    "beta_btc_60",
+    "beta_btc_384",
+];
+
+/// Benchmark ETH context columns. They mirror the BTC rows and use
+/// `--eth-symbol` / `--eth-data`; a requested ETH column without that series is
+/// a hard error, never a zero column.
+pub const CROSS_ETH_NAMES: &[&str] = &[
+    "eth_r1",
+    "eth_r16",
+    "eth_r20",
+    "eth_r96",
+    "eth_r672",
+    "eth_vol20",
+    "eth_vol96",
+    "rel_eth_r1",
+    "rel_eth_r16",
+    "rel_eth_r20",
+    "rel_eth_r96",
+    "beta_eth_60",
+    "beta_eth_384",
+];
+
+/// Equal-weight market state, breadth, dispersion and ex-self relative
+/// columns. They require at least [`MIN_CROSS_MEMBERS`] valid point-in-time
+/// members at the timestamp, otherwise every value at that timestamp is `NaN`.
+pub const CROSS_MARKET_NAMES: &[&str] = &[
+    "mkt_r16",
+    "mkt_r96",
+    "mkt_vol96",
+    "breadth",
+    "dispersion",
+    "avg_corr",
+    "rel_mkt16",
+    "rel_mkt96",
+];
+
+/// Cross-sectional ranks. The scale is `[-1, 1]`, point-in-time members only.
+pub const CROSS_RANK_NAMES: &[&str] = &[
+    "xs_rank_r1",
+    "xs_rank_r16",
+    "xs_rank_r20",
+    "xs_rank_vol20",
+    "xs_rank_amihud96",
+];
+
+/// Older market-state names registered by #260/#269. They are aliases of the
+/// canonical #273 producers, not a second implementation.
+
 /// The twelve default continuous/structure columns (issue #261). `batr` is the
 /// only name shared with the compact candle subset.
 pub const DEFAULT_CANDLE_NAMES: &[&str] = &[
@@ -286,6 +350,7 @@ fn price_action_warmup(name: &str) -> usize {
 }
 
 /// Cross-sectional market-state columns (whole-panel pass).
+
 pub const MARKET_STATE_NAMES: &[&str] = &[
     "mkt_ew_ret1",
     "mkt_ew_ret16",
@@ -294,6 +359,100 @@ pub const MARKET_STATE_NAMES: &[&str] = &[
     "btc_volume_share",
     "cs_rank_r60",
 ];
+
+/// The complete #273 cross-asset inventory in stable emission order.
+pub fn cross_names() -> Vec<String> {
+    CROSS_BTC_NAMES
+        .iter()
+        .chain(CROSS_ETH_NAMES)
+        .chain(CROSS_MARKET_NAMES)
+        .chain(CROSS_RANK_NAMES)
+        .chain(MARKET_STATE_NAMES)
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Minimum point-in-time members for a cross-sectional statistic.
+pub const MIN_CROSS_MEMBERS: usize = 20;
+
+/// Source column a cross-family member is computed from.
+pub fn cross_source(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "xs_rank_r1" | "mkt_ew_ret1" | "avg_corr" => "r1",
+        "xs_rank_r16" | "mkt_r16" | "mkt_ew_ret16" | "breadth" | "dispersion"
+        | "mkt_breadth" | "mkt_dispersion" | "rel_mkt16" => "r16",
+        "xs_rank_r20" => "r20",
+        "xs_rank_vol20" => "vol20",
+        "xs_rank_amihud96" => "amihud96",
+        "mkt_r96" | "rel_mkt96" => "r96",
+        "mkt_vol96" => "vol96",
+        "cs_rank_r60" => "r60",
+        "btc_volume_share" => "volume",
+        _ => return None,
+    })
+}
+
+/// Registry formula text for a cross-family column.
+fn cross_formula(name: &str) -> &'static str {
+    match name {
+        "btc_r1" | "btc_r16" | "btc_r20" | "btc_r96" | "btc_r672" => {
+            "ln(C_BTC,t/C_BTC,t-k) at the same timestamp"
+        }
+        "eth_r1" | "eth_r16" | "eth_r20" | "eth_r96" | "eth_r672" => {
+            "ln(C_ETH,t/C_ETH,t-k) at the same timestamp"
+        }
+        "btc_vol20" | "btc_vol96" | "eth_vol20" | "eth_vol96" => {
+            "population sd of benchmark one-bar log returns over w"
+        }
+        "rel_btc_r1" | "rel_btc_r16" | "rel_btc_r20" | "rel_btc_r96" => {
+            "asset return r_k minus btc_r_k at the same timestamp"
+        }
+        "rel_eth_r1" | "rel_eth_r16" | "rel_eth_r20" | "rel_eth_r96" => {
+            "asset return r_k minus eth_r_k at the same timestamp"
+        }
+        "beta_btc_60" | "beta_btc_384" => "clip(cov(r_i,r_BTC,w)/var(r_BTC,w),-5,5)",
+        "beta_eth_60" | "beta_eth_384" => "clip(cov(r_i,r_ETH,w)/var(r_ETH,w),-5,5)",
+        "mkt_r16" | "mkt_ew_ret16" => "equal-weight mean of PIT member r16 at t",
+        "mkt_r96" => "equal-weight mean of PIT member r96 at t",
+        "mkt_vol96" => "equal-weight mean of PIT member vol96 at t",
+        "breadth" | "mkt_breadth" => "share of PIT members with r16 > 0",
+        "dispersion" | "mkt_dispersion" => "population sd of PIT member r16 at t",
+        "avg_corr" => {
+            "mean_i corr(r_i,mkt_r1,96) over PIT members; proxy for average pairwise correlation"
+        }
+        "rel_mkt16" => "r16_i - ex-self equal-weight mean of member r16",
+        "rel_mkt96" => "r96_i - ex-self equal-weight mean of member r96",
+        "mkt_ew_ret1" => "equal-weight mean of PIT member r1 at t",
+        "btc_volume_share" => "BTC volume / total PIT member volume at t",
+        "xs_rank_r1" | "xs_rank_r16" | "xs_rank_r20" | "xs_rank_vol20"
+        | "xs_rank_amihud96" | "cs_rank_r60" => {
+            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row"
+        }
+        _ => "see docs/ohlcv.md",
+    }
+}
+
+/// Nominal warm-up for a cross-family column, in 15 m base bars.
+fn cross_warmup(name: &str) -> usize {
+    match name {
+        "btc_r1" | "eth_r1" | "mkt_ew_ret1" => 1,
+        "btc_r16" | "eth_r16" | "rel_btc_r16" | "rel_eth_r16" | "mkt_r16"
+        | "mkt_ew_ret16" | "breadth" | "dispersion" | "mkt_breadth"
+        | "mkt_dispersion" | "rel_mkt16" | "xs_rank_r16" => 16,
+        "btc_r20" | "eth_r20" | "rel_btc_r20" | "rel_eth_r20" | "btc_vol20"
+        | "eth_vol20" | "xs_rank_r20" | "xs_rank_vol20" => 20,
+        "btc_r96" | "eth_r96" | "rel_btc_r96" | "rel_eth_r96" | "btc_vol96"
+        | "eth_vol96" | "mkt_r96" | "mkt_vol96" | "rel_mkt96" | "avg_corr"
+        | "xs_rank_amihud96" => 96,
+        "btc_r672" | "eth_r672" => 672,
+        "beta_btc_60" | "beta_eth_60" => 59,
+        "beta_btc_384" | "beta_eth_384" => 383,
+        "xs_rank_r1" => 1,
+        "cs_rank_r60" => 60,
+        "btc_volume_share" => 0,
+        _ => 0,
+    }
+}
 
 /// Reserved derivative columns. No funding/OI/basis/order-book snapshot exists
 /// locally, so these stay `available:false` with `source:null`.
@@ -310,12 +469,6 @@ pub const DERIVATIVE_NAMES: &[&str] = &[
 
 /// Reason a registered name cannot be computed yet, if it is unavailable.
 pub fn unavailable_reason(name: &str) -> Option<&'static str> {
-    if MARKET_STATE_NAMES.contains(&name) {
-        return Some(
-            "whole-panel cross-sectional market-state pass is not wired into rcsr enrich yet; \
-             requires all symbols at one timestamp",
-        );
-    }
     if DERIVATIVE_NAMES.contains(&name) {
         return Some(
             "no local funding, open-interest, basis, mark-price or liquidation snapshot; \
@@ -405,6 +558,7 @@ fn flow_requires(name: &str) -> &'static [&'static str] {
         "zero_ret_share96" => &[],
         "obv_z96" => &["volume"],
         "cvd_proxy" => &["volume", "taker_buy_base"],
+        "btc_volume_share" => &["volume"],
         _ => &[],
     }
 }
@@ -493,6 +647,38 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             reason: None,
         });
     }
+    // Complete cross-asset, breadth, dispersion and rank family (#273).
+    // Registered before the compact/py15m loops so the canonical market and
+    // rank definitions win for the names those legacy groups share.
+    for name in cross_names() {
+        let warmup = cross_warmup(&name);
+        let formula = cross_formula(&name).to_string();
+        push_unique(&mut out, RegistryEntry {
+            name: name.clone(),
+            family: "cross",
+            timeframe: "15m",
+            warmup,
+            available: true,
+            derived: false,
+            formula,
+            source: match cross_source(&name) {
+                Some("volume") => "raw volume + all PIT members",
+                Some("r1") | Some("r16") | Some("r20") | Some("r96") | Some("vol20")
+                | Some("vol96") | Some("r60") | Some("amihud96") => {
+                    "all PIT members at the same timestamp"
+                }
+                _ => "benchmark series by exact timestamp",
+            },
+            pit: if CROSS_BTC_NAMES.contains(&name.as_str()) {
+                "same timestamp only; a missing benchmark row is NaN, never forward-filled"
+            } else if CROSS_ETH_NAMES.contains(&name.as_str()) {
+                "same timestamp only; a missing ETH row is NaN, never forward-filled"
+            } else {
+                "rows present at t with member_asof <= t; N>=20; no forward fill; gaps are NaN"
+            },
+            reason: None,
+        });
+    }
     // Compact subset with exact formulas.
     for name in COMPACT_NAMES {
         let family = compact_family(name);
@@ -566,20 +752,6 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             pit: "close of bar t; trailing windows inclusive; any missing bucket \
                   or zero-range/zero-volume bar in the window is NaN",
             reason: None,
-        });
-    }
-    for name in MARKET_STATE_NAMES {
-        push_unique(&mut out, RegistryEntry {
-            name: name.to_string(),
-            family: "market_state",
-            timeframe: "15m",
-            warmup: 0,
-            available: false,
-            derived: false,
-            formula: "whole-panel cross-section at t".to_string(),
-            source: "all PIT members",
-            pit: "same timestamp cross-section",
-            reason: unavailable_reason(name).map(|s| s.to_string()),
         });
     }
     for name in DERIVATIVE_NAMES {
@@ -1061,6 +1233,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "lags" => lag_names(),
             "xs" => xs_names(),
             "btc" => btc_names(),
+            "cross" => cross_names(),
             "py15m" => py15m_names(),
             "mtf" => mtf_names(),
             "compact" => compact_names(),
@@ -1110,6 +1283,7 @@ pub fn is_own(name: &str) -> bool {
     if is_compact(name)
         || FLOW_NAMES.contains(&name)
         || is_mtf(name)
+        || cross_names().iter().any(|n| n == name)
         || PRICE_ACTION_NAMES.contains(&name)
     {
         return true;
@@ -1212,6 +1386,9 @@ pub fn nominal_warmup(name: &str) -> usize {
     if FLOW_NAMES.contains(&name) {
         return flow_warmup(name);
     }
+    if cross_names().iter().any(|n| n == name) {
+        return cross_warmup(name);
+    }
     if PRICE_ACTION_NAMES.contains(&name) {
         return price_action_warmup(name);
     }
@@ -1260,6 +1437,8 @@ pub struct Options {
     pub symbol_col: Option<String>,
     pub cross_symbol: String,
     pub cross_data: Option<String>,
+    pub eth_symbol: String,
+    pub eth_data: Option<String>,
     pub gpu: GpuMode,
     pub allow_lockbox: bool,
     pub dry_run: bool,
@@ -1281,6 +1460,8 @@ impl Default for Options {
             symbol_col: None,
             cross_symbol: "BTCUSDT".to_string(),
             cross_data: None,
+            eth_symbol: "ETHUSDT".to_string(),
+            eth_data: None,
             gpu: GpuMode::Auto,
             allow_lockbox: false,
             dry_run: false,
@@ -2972,21 +3153,24 @@ fn calendar_column(s: &Series, which: &str) -> Vec<f64> {
 struct Cross {
     symbol: String,
     r1: BTreeMap<i64, f64>,
-    r20: BTreeMap<i64, f64>,
-    vol20: BTreeMap<i64, f64>,
     r16: BTreeMap<i64, f64>,
+    r20: BTreeMap<i64, f64>,
     r96: BTreeMap<i64, f64>,
+    r672: BTreeMap<i64, f64>,
+    vol20: BTreeMap<i64, f64>,
     vol96: BTreeMap<i64, f64>,
+    volume: BTreeMap<i64, f64>,
 }
 
 impl Cross {
     fn from_series(s: &Series) -> Self {
         let b = Base::new(s);
         let r1 = ret_k(s, 1);
-        let r20 = ret_k(s, 20);
-        let vol20 = vol_w(s, &b, 20);
         let r16 = ret_k(s, 16);
+        let r20 = ret_k(s, 20);
         let r96 = ret_k(s, 96);
+        let r672 = ret_k(s, 672);
+        let vol20 = vol_w(s, &b, 20);
         let vol96 = vol_w(s, &b, 96);
         let map = |v: &[f64]| {
             let mut m = BTreeMap::new();
@@ -2998,11 +3182,13 @@ impl Cross {
         Cross {
             symbol: s.symbol.clone(),
             r1: map(&r1),
-            r20: map(&r20),
-            vol20: map(&vol20),
             r16: map(&r16),
+            r20: map(&r20),
             r96: map(&r96),
+            r672: map(&r672),
+            vol20: map(&vol20),
             vol96: map(&vol96),
+            volume: map(&s.volume),
         }
     }
     fn at(map: &BTreeMap<i64, f64>, t: i64) -> f64 {
@@ -3046,10 +3232,61 @@ fn beta_window(
         let cov = sxy / nf - (sx / nf) * (sy / nf);
         let var = syy / nf - (sy / nf) * (sy / nf);
         if var > 0.0 {
-            out[i] = cov / var;
+            out[i] = (cov / var).max(-5.0).min(5.0);
         }
     }
     out
+}
+
+/// Load one benchmark symbol from the base store or an optional external store.
+///
+/// The benchmark is keyed by exact timestamps; there is no forward fill. A
+/// missing row is simply absent from the map and therefore `NaN` at the join.
+fn load_benchmark(
+    store: &FileStore,
+    segs: &[Segment],
+    cols: &Cols,
+    step: i64,
+    symbol: &str,
+    external: Option<&str>,
+) -> Result<Cross, String> {
+    if let Some(seg) = segs.iter().find(|s| s.symbol == symbol) {
+        return Ok(Cross::from_series(&load_series(store, seg, cols, step)?));
+    }
+    let Some(path) = external else {
+        return Ok(Cross::default());
+    };
+    let cs = FileStore::open(path)?;
+    let cnames = cs.header().names();
+    let time = find_time_col(&cnames, None)
+        .ok_or_else(|| format!("{}: benchmark store has no time column", path))?;
+    let ccols = Cols {
+        time,
+        time_dtype: cs.header().dtypes()[time],
+        open: find_col(&cnames, &["open", "o"])
+            .ok_or_else(|| format!("{}: benchmark store has no open", path))?,
+        high: find_col(&cnames, &["high", "h"])
+            .ok_or_else(|| format!("{}: benchmark store has no high", path))?,
+        low: find_col(&cnames, &["low", "l"])
+            .ok_or_else(|| format!("{}: benchmark store has no low", path))?,
+        close: find_col(&cnames, &["close", "c"])
+            .ok_or_else(|| format!("{}: benchmark store has no close", path))?,
+        volume: find_col(&cnames, &["volume", "vol", "v"]),
+        quote_volume: find_col(&cnames, &["quote_volume", "quotevolume", "qv"]),
+        trades: find_col(&cnames, &["trades", "trade_count", "trades_count", "n"]),
+        taker_buy_base: find_col(
+            &cnames,
+            &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
+        ),
+        symbol: find_symbol_col(&cnames, None),
+    };
+    let (csegs, _) = segments(&cs, ccols.time, ccols.symbol)?;
+    let cseg = csegs
+        .iter()
+        .find(|s| s.symbol == symbol)
+        .or_else(|| csegs.first())
+        .ok_or_else(|| format!("{}: benchmark store has no rows", path))?;
+    Ok(Cross::from_series(&load_series(&cs, cseg, &ccols, step)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -4503,6 +4740,23 @@ impl TempColumn {
             row_offset: 0,
         })
     }
+    /// Discard the current contents and start the column again. Used only when
+    /// the canonical whole-panel pass replaces a legacy per-symbol preview
+    /// (the five py15m market names).
+    fn reset(&mut self) -> Result<(), String> {
+        self.flush()?;
+        self.writer.take();
+        let file = std::fs::File::create(&self.path)
+            .map_err(|e| format!("{}: {}", self.path.display(), e))?;
+        self.writer = Some(BufWriter::with_capacity(1 << 20, file));
+        self.buf.clear();
+        self.hash = Sha256Hasher::new();
+        self.nan_rows = 0;
+        self.first_finite = None;
+        self.row_offset = 0;
+        Ok(())
+    }
+
     /// Flush the staging block into the writer and the hash (same bytes, same
     /// order, so the digest is unchanged).
     fn drain_buf(&mut self) -> Result<(), String> {
@@ -4578,6 +4832,7 @@ struct Context<'a> {
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
     cross: &'a Cross,
+    eth: &'a Cross,
 }
 
 fn compute_series(
@@ -4662,21 +4917,8 @@ fn compute_series(
             }
         }
     }
-    let needs_btc = ctx
-        .own
-        .iter()
-        .any(|n| n.starts_with("btc") || n.starts_with("rel_btc") || n.starts_with("beta_btc") || n.starts_with("cross_"));
-    let btc_r1 = if needs_btc {
-        Some(
-            (0..s.len())
-                .map(|i| Cross::at(&ctx.cross.r1, s.times[i]))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        None
-    };
     for name in &ctx.own {
-        let (values, warmup) = compute_own(name, s, &base, ctx, btc_r1.as_deref())?;
+        let (values, warmup) = compute_own(name, s, &base, ctx)?;
         if let Some(t) = cols.get_mut(name) {
             debug_assert_eq!(t.warmup, warmup);
             t.write_values(&values)?;
@@ -4696,12 +4938,64 @@ fn compute_series(
     Ok(())
 }
 
+fn benchmark_return(s: &Series, b: &Base, cross: &Cross, k: usize, relative: bool) -> Vec<f64> {
+    let own = if k == 1 { b.ret1.clone() } else { ret_k(s, k) };
+    let map = match k {
+        1 => &cross.r1,
+        16 => &cross.r16,
+        20 => &cross.r20,
+        96 => &cross.r96,
+        672 => &cross.r672,
+        _ => return vec![f64::NAN; s.len()],
+    };
+    (0..s.len())
+        .map(|i| {
+            let bench = Cross::at(map, s.times[i]);
+            if relative {
+                if own[i].is_finite() && bench.is_finite() {
+                    own[i] - bench
+                } else {
+                    f64::NAN
+                }
+            } else {
+                bench
+            }
+        })
+        .collect()
+}
+
+fn benchmark_vol(s: &Series, cross: &Cross, w: usize) -> Vec<f64> {
+    let map = match w {
+        20 => &cross.vol20,
+        96 => &cross.vol96,
+        _ => return vec![f64::NAN; s.len()],
+    };
+    (0..s.len())
+        .map(|i| Cross::at(map, s.times[i]))
+        .collect()
+}
+
+fn benchmark_beta(s: &Series, b: &Base, cross: &Cross, w: usize) -> Vec<f64> {
+    if s.symbol == cross.symbol {
+        (0..s.len())
+            .map(|i| {
+                if i + 1 >= w && contig(&s.times, i, w, s.step) {
+                    1.0
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect()
+    } else {
+        beta_window(s, &b.ret1, &cross.r1, w)
+    }
+}
+
 fn compute_own(
     name: &str,
     s: &Series,
     b: &Base,
     ctx: &Context,
-    btc_r1: Option<&[f64]>,
 ) -> Result<(Vec<f64>, usize), String> {
     let n = s.len();
     let warm = nominal_warmup(name);
@@ -4746,57 +5040,40 @@ fn compute_own(
             "dow_sin" | "dow_cos" | "hour_sin" | "hour_cos" | "month_sin" | "month_cos"
             | "dom_sin" | "dom_cos" => calendar_column(s, name),
             "btc_r1" | "rel_btc_r1" | "cross_ret1" => {
-                let br = btc_r1.ok_or("BTC features need a cross series")?;
-                (0..n)
-                    .map(|i| {
-                        if name == "rel_btc_r1" {
-                            if b.ret1[i].is_finite() && br[i].is_finite() {
-                                b.ret1[i] - br[i]
-                            } else {
-                                f64::NAN
-                            }
-                        } else {
-                            br[i]
-                        }
-                    })
-                    .collect()
+                benchmark_return(s, b, ctx.cross, 1, name == "rel_btc_r1")
+            }
+            "btc_r16" | "rel_btc_r16" => {
+                benchmark_return(s, b, ctx.cross, 16, name == "rel_btc_r16")
             }
             "btc_r20" | "rel_btc_r20" => {
-                let r20 = ret_k(s, 20);
-                (0..n)
-                    .map(|i| {
-                        let m = Cross::at(&ctx.cross.r20, s.times[i]);
-                        if name == "rel_btc_r20" {
-                            if r20[i].is_finite() && m.is_finite() {
-                                r20[i] - m
-                            } else {
-                                f64::NAN
-                            }
-                        } else {
-                            m
-                        }
-                    })
-                    .collect()
+                benchmark_return(s, b, ctx.cross, 20, name == "rel_btc_r20")
             }
-            "btc_vol20" => (0..n)
-                .map(|i| Cross::at(&ctx.cross.vol20, s.times[i]))
-                .collect(),
+            "btc_r96" | "rel_btc_r96" => {
+                benchmark_return(s, b, ctx.cross, 96, name == "rel_btc_r96")
+            }
+            "btc_r672" => benchmark_return(s, b, ctx.cross, 672, false),
+            "btc_vol20" => benchmark_vol(s, ctx.cross, 20),
+            "btc_vol96" => benchmark_vol(s, ctx.cross, 96),
             "beta_btc_60" | "cross_beta20" => {
                 let w = if name == "cross_beta20" { 20 } else { 60 };
-                if s.symbol == ctx.cross.symbol {
-                    (0..n)
-                        .map(|i| {
-                            if i + 1 >= w && contig(&s.times, i, w, s.step) {
-                                1.0
-                            } else {
-                                f64::NAN
-                            }
-                        })
-                        .collect()
-                } else {
-                    beta_window(s, &b.ret1, &ctx.cross.r1, w)
-                }
+                benchmark_beta(s, b, ctx.cross, w)
             }
+            "beta_btc_384" => benchmark_beta(s, b, ctx.cross, 384),
+            "eth_r1" | "rel_eth_r1" => benchmark_return(s, b, ctx.eth, 1, name == "rel_eth_r1"),
+            "eth_r16" | "rel_eth_r16" => {
+                benchmark_return(s, b, ctx.eth, 16, name == "rel_eth_r16")
+            }
+            "eth_r20" | "rel_eth_r20" => {
+                benchmark_return(s, b, ctx.eth, 20, name == "rel_eth_r20")
+            }
+            "eth_r96" | "rel_eth_r96" => {
+                benchmark_return(s, b, ctx.eth, 96, name == "rel_eth_r96")
+            }
+            "eth_r672" => benchmark_return(s, b, ctx.eth, 672, false),
+            "eth_vol20" => benchmark_vol(s, ctx.eth, 20),
+            "eth_vol96" => benchmark_vol(s, ctx.eth, 96),
+            "beta_eth_60" => benchmark_beta(s, b, ctx.eth, 60),
+            "beta_eth_384" => benchmark_beta(s, b, ctx.eth, 384),
             other => {
                 if FLOW_NAMES.contains(&other) {
                     let mut all = flow_all(s);
@@ -4859,18 +5136,36 @@ fn read_f64_file(path: &Path, expect_rows: usize) -> Result<Vec<f64>, String> {
 
 /// Rank `src` across symbols at each timestamp.
 ///
-/// The result is `(rank - 1) / (n_finite - 1)` in `[0, 1]`, with ties broken by
-/// symbol name and then row order. A timestamp with fewer than two finite
-/// values, or a non-finite source value, is `NaN`. Ranks are exact rational
-/// values rounded once to f64, so repeats are bit-stable.
+/// The result is `2*(rank - 1)/(n_finite - 1) - 1` in `[-1, 1]`, with ties
+/// broken by symbol name and then row order. A timestamp with fewer than
+/// [`MIN_CROSS_MEMBERS`] finite values, or a non-finite source value, is `NaN`.
+/// Ranks are exact rational values rounded once to f64, so repeats are
+/// bit-stable.
 pub fn xs_rank(
     src: &[f64],
     times: &[i64],
     sym_key: &[u32],
     rows: usize,
 ) -> Result<Vec<f64>, String> {
+    rank_with_membership(src, times, sym_key, None, rows)
+}
+
+/// Point-in-time form of [`xs_rank`]. Rows with `member[r] == false` are
+/// excluded from both the rank and the member count, and their output is NaN.
+fn rank_with_membership(
+    src: &[f64],
+    times: &[i64],
+    sym_key: &[u32],
+    member: Option<&[bool]>,
+    rows: usize,
+) -> Result<Vec<f64>, String> {
     if src.len() != rows || times.len() != rows || sym_key.len() != rows {
         return Err("cross-sectional inputs have inconsistent lengths".to_string());
+    }
+    if let Some(m) = member {
+        if m.len() != rows {
+            return Err("cross-sectional membership has inconsistent length".to_string());
+        }
     }
     // Guard the one-column-at-a-time working set (source + ts + key + order +
     // output) against a hard memory ceiling.
@@ -4894,6 +5189,18 @@ pub fn xs_rank(
             .then(sym_key[a].cmp(&sym_key[b]))
             .then(a.cmp(&b))
     });
+    Ok(rank_in_order(src, times, &order, sym_key, member, rows))
+}
+
+/// Rank against an order already sorted by `(time, symbol, row)`.
+fn rank_in_order(
+    src: &[f64],
+    times: &[i64],
+    order: &[u32],
+    sym_key: &[u32],
+    member: Option<&[bool]>,
+    rows: usize,
+) -> Vec<f64> {
     let mut out = vec![f64::NAN; rows];
     let mut i = 0usize;
     while i < order.len() {
@@ -4903,7 +5210,7 @@ pub fn xs_rank(
             j += 1;
         }
         let mut group: Vec<usize> = (i..j).map(|k| order[k] as usize).collect();
-        group.retain(|&r| src[r].is_finite());
+        group.retain(|&r| src[r].is_finite() && member.map(|m| m[r]).unwrap_or(true));
         group.sort_unstable_by(|&a, &b| {
             src[a]
                 .partial_cmp(&src[b])
@@ -4912,14 +5219,432 @@ pub fn xs_rank(
                 .then(a.cmp(&b))
         });
         let m = group.len();
-        if m >= 2 {
+        if m >= MIN_CROSS_MEMBERS {
             for (rank, &r) in group.iter().enumerate() {
-                out[r] = rank as f64 / (m - 1) as f64;
+                out[r] = 2.0 * rank as f64 / (m - 1) as f64 - 1.0;
             }
         }
         i = j;
     }
-    Ok(out)
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Whole-panel PIT cross-section pass
+// ---------------------------------------------------------------------------
+
+/// Row context shared by every point-in-time cross-sectional statistic.
+struct CrossPanel {
+    times: Vec<i64>,
+    sym_key: Vec<u32>,
+    /// `member_asof <= t` when the input carries a membership column; every
+    /// row otherwise. Pre-listing/post-delisting rows never enter a statistic.
+    member: Vec<bool>,
+    /// Row order `(time, symbol, row)`, the deterministic tie order.
+    order: Vec<u32>,
+    /// Start index in `order` of each timestamp group; `starts.len() == groups+1`.
+    starts: Vec<usize>,
+}
+
+impl CrossPanel {
+    fn new(
+        store: &FileStore,
+        segs: &[Segment],
+        time_col: usize,
+        time_dtype: DType,
+        member_col: Option<(usize, DType)>,
+    ) -> Result<Self, String> {
+        let rows = store.n_rows();
+        let mut times = Vec::with_capacity(rows);
+        for seg in segs {
+            times.extend(segment_i64(store, seg, time_col, time_dtype)?);
+        }
+        let mut sym_key = vec![0u32; rows];
+        for seg in segs {
+            for r in seg.start..seg.start + seg.len {
+                sym_key[r] = seg.key;
+            }
+        }
+        let mut member = vec![true; rows];
+        if let Some((col, dtype)) = member_col {
+            let mut vals = Vec::with_capacity(rows);
+            for seg in segs {
+                if dtype == DType::I64 {
+                    vals.extend(segment_i64(store, seg, col, dtype)?.into_iter().map(|v| v as f64));
+                } else {
+                    vals.extend(segment_column(store, seg, col)?);
+                }
+            }
+            for r in 0..rows {
+                member[r] = vals[r].is_finite() && vals[r] <= times[r] as f64;
+            }
+        }
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            times[a]
+                .cmp(&times[b])
+                .then(sym_key[a].cmp(&sym_key[b]))
+                .then(a.cmp(&b))
+        });
+        let mut starts = Vec::new();
+        let mut i = 0usize;
+        while i < order.len() {
+            starts.push(i);
+            let t = times[order[i] as usize];
+            while i < order.len() && times[order[i] as usize] == t {
+                i += 1;
+            }
+        }
+        starts.push(order.len());
+        Ok(CrossPanel {
+            times,
+            sym_key,
+            member,
+            order,
+            starts,
+        })
+    }
+
+    fn groups(&self) -> impl Iterator<Item = &[u32]> {
+        self.starts
+            .windows(2)
+            .map(move |w| &self.order[w[0]..w[1]])
+    }
+}
+
+fn write_cross_output(
+    temp: &mut BTreeMap<String, TempColumn>,
+    requested: &[String],
+    names: &[&str],
+    values: &[f64],
+) -> Result<(), String> {
+    for name in names {
+        if !requested.iter().any(|n| n == name) {
+            continue;
+        }
+        let t = temp
+            .get_mut(*name)
+            .ok_or_else(|| format!("missing temporary column '{}'", name))?;
+        t.reset()?;
+        t.write_values(values)?;
+    }
+    Ok(())
+}
+
+fn source_values(
+    temp: &BTreeMap<String, TempColumn>,
+    name: &str,
+    rows: usize,
+) -> Result<Vec<f64>, String> {
+    let col = temp
+        .get(name)
+        .ok_or_else(|| format!("cross-sectional source '{}' was not produced", name))?;
+    read_f64_file(&col.path, rows)
+}
+
+/// True when the market-state pass owns any requested column.
+fn wants_market_state(requested: &[String]) -> bool {
+    requested.iter().any(|n| {
+        CROSS_MARKET_NAMES.contains(&n.as_str()) || MARKET_STATE_NAMES.contains(&n.as_str())
+    })
+}
+
+/// Compute equal-weight market state, breadth, dispersion, relative-to-market
+/// and the average-correlation proxy from the point-in-time cross-sections.
+fn market_state_pass(
+    panel: &CrossPanel,
+    temp: &mut BTreeMap<String, TempColumn>,
+    requested: &[String],
+    segs: &[Segment],
+    store: &FileStore,
+    cols: &Cols,
+    cross: &Cross,
+    step: i64,
+) -> Result<(), String> {
+    let rows = panel.times.len();
+    let wants = |n: &str| requested.iter().any(|x| x == n);
+    let wants_r16 = wants("mkt_r16")
+        || wants("mkt_ew_ret16")
+        || wants("breadth")
+        || wants("mkt_breadth")
+        || wants("dispersion")
+        || wants("mkt_dispersion")
+        || wants("rel_mkt16");
+    let wants_r96 = wants("mkt_r96") || wants("rel_mkt96");
+    let wants_vol96 = wants("mkt_vol96");
+    let wants_corr = wants("avg_corr");
+    let wants_r1 = wants("mkt_ew_ret1") || wants_corr;
+
+    if wants_r16 {
+        let src = source_values(temp, "r16", rows)?;
+        let mut mkt = vec![f64::NAN; rows];
+        let mut breadth = vec![f64::NAN; rows];
+        let mut dispersion = vec![f64::NAN; rows];
+        let mut rel = vec![f64::NAN; rows];
+        for group in panel.groups() {
+            let mut vals = Vec::new();
+            let mut sum = 0.0;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] && src[r].is_finite() {
+                    vals.push(r);
+                    sum += src[r];
+                }
+            }
+            let n = vals.len();
+            if n < MIN_CROSS_MEMBERS {
+                continue;
+            }
+            let nf = n as f64;
+            let mean = sum / nf;
+            let mut ss = 0.0;
+            let mut positive = 0usize;
+            for &r in &vals {
+                let d = src[r] - mean;
+                ss += d * d;
+                if src[r] > 0.0 {
+                    positive += 1;
+                }
+            }
+            let sd = (ss / nf).max(0.0).sqrt();
+            let br = positive as f64 / nf;
+            for &r in group {
+                let r = r as usize;
+                if !panel.member[r] {
+                    continue;
+                }
+                mkt[r] = mean;
+                breadth[r] = br;
+                dispersion[r] = sd;
+                if src[r].is_finite() && n > 1 {
+                    rel[r] = src[r] - (sum - src[r]) / (n - 1) as f64;
+                }
+            }
+        }
+        write_cross_output(temp, requested, &["mkt_r16", "mkt_ew_ret16"], &mkt)?;
+        write_cross_output(temp, requested, &["breadth", "mkt_breadth"], &breadth)?;
+        write_cross_output(temp, requested, &["dispersion", "mkt_dispersion"], &dispersion)?;
+        write_cross_output(temp, requested, &["rel_mkt16"], &rel)?;
+    }
+
+    if wants_r96 {
+        let src = source_values(temp, "r96", rows)?;
+        let mut mkt = vec![f64::NAN; rows];
+        let mut rel = vec![f64::NAN; rows];
+        for group in panel.groups() {
+            let mut vals = Vec::new();
+            let mut sum = 0.0;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] && src[r].is_finite() {
+                    vals.push(r);
+                    sum += src[r];
+                }
+            }
+            let n = vals.len();
+            if n < MIN_CROSS_MEMBERS {
+                continue;
+            }
+            let mean = sum / n as f64;
+            for &r in group {
+                let r = r as usize;
+                if !panel.member[r] {
+                    continue;
+                }
+                mkt[r] = mean;
+                if src[r].is_finite() && n > 1 {
+                    rel[r] = src[r] - (sum - src[r]) / (n - 1) as f64;
+                }
+            }
+        }
+        write_cross_output(temp, requested, &["mkt_r96"], &mkt)?;
+        write_cross_output(temp, requested, &["rel_mkt96"], &rel)?;
+    }
+
+    if wants_vol96 {
+        let src = source_values(temp, "vol96", rows)?;
+        let mut mkt = vec![f64::NAN; rows];
+        for group in panel.groups() {
+            let mut vals = Vec::new();
+            let mut sum = 0.0;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] && src[r].is_finite() {
+                    vals.push(r);
+                    sum += src[r];
+                }
+            }
+            if vals.len() < MIN_CROSS_MEMBERS {
+                continue;
+            }
+            let mean = sum / vals.len() as f64;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] {
+                    mkt[r] = mean;
+                }
+            }
+        }
+        write_cross_output(temp, requested, &["mkt_vol96"], &mkt)?;
+    }
+
+    if wants_r1 {
+        let r1 = source_values(temp, "r1", rows)?;
+        let mut mkt = vec![f64::NAN; rows];
+        let mut by_time = BTreeMap::new();
+        for group in panel.groups() {
+            let mut vals = Vec::new();
+            let mut sum = 0.0;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] && r1[r].is_finite() {
+                    vals.push(r);
+                    sum += r1[r];
+                }
+            }
+            if vals.len() < MIN_CROSS_MEMBERS {
+                continue;
+            }
+            let mean = sum / vals.len() as f64;
+            let t = panel.times[group[0] as usize];
+            by_time.insert(t, mean);
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] {
+                    mkt[r] = mean;
+                }
+            }
+        }
+        write_cross_output(temp, requested, &["mkt_ew_ret1"], &mkt)?;
+
+        if wants_corr {
+            // Average correlation proxy: mean over members of the trailing
+            // 96-bar correlation between the member's one-bar return and the
+            // equal-weight market return. O(rows) via per-symbol prefixes.
+            let mut member_corr = vec![f64::NAN; rows];
+            for seg in segs {
+                let nt = seg.len;
+                if nt < 96 {
+                    continue;
+                }
+                let mut px = vec![0.0f64; nt + 1];
+                let mut py = vec![0.0f64; nt + 1];
+                let mut pxx = vec![0.0f64; nt + 1];
+                let mut pyy = vec![0.0f64; nt + 1];
+                let mut pxy = vec![0.0f64; nt + 1];
+                let mut pc = vec![0usize; nt + 1];
+                for j in 0..nt {
+                    let g = seg.start + j;
+                    let x = r1[g];
+                    let y = if panel.member[g] {
+                        Cross::at(&by_time, panel.times[g])
+                    } else {
+                        f64::NAN
+                    };
+                    let ok = x.is_finite() && y.is_finite();
+                    px[j + 1] = px[j] + if ok { x } else { 0.0 };
+                    py[j + 1] = py[j] + if ok { y } else { 0.0 };
+                    pxx[j + 1] = pxx[j] + if ok { x * x } else { 0.0 };
+                    pyy[j + 1] = pyy[j] + if ok { y * y } else { 0.0 };
+                    pxy[j + 1] = pxy[j] + if ok { x * y } else { 0.0 };
+                    pc[j + 1] = pc[j] + if ok { 1 } else { 0 };
+                }
+                let seg_times = &panel.times[seg.start..seg.start + nt];
+                for i in 0..nt {
+                    if !contig(seg_times, i, 96, step) {
+                        continue;
+                    }
+                    let lo = i + 1 - 96;
+                    if pc[i + 1] - pc[lo] != 96 {
+                        continue;
+                    }
+                    let w = 96.0;
+                    let sx = px[i + 1] - px[lo];
+                    let sy = py[i + 1] - py[lo];
+                    let sxx = pxx[i + 1] - pxx[lo];
+                    let syy = pyy[i + 1] - pyy[lo];
+                    let sxy = pxy[i + 1] - pxy[lo];
+                    let vx = sxx - sx * sx / w;
+                    let vy = syy - sy * sy / w;
+                    if vx > 0.0 && vy > 0.0 {
+                        member_corr[seg.start + i] =
+                            ((sxy - sx * sy / w) / (vx * vy).sqrt()).max(-1.0).min(1.0);
+                    }
+                }
+            }
+            let mut avg = vec![f64::NAN; rows];
+            for group in panel.groups() {
+                let mut vals = Vec::new();
+                let mut sum = 0.0;
+                for &r in group {
+                    let r = r as usize;
+                    if panel.member[r] && member_corr[r].is_finite() {
+                        vals.push(r);
+                        sum += member_corr[r];
+                    }
+                }
+                if vals.len() < MIN_CROSS_MEMBERS {
+                    continue;
+                }
+                let mean = sum / vals.len() as f64;
+                for &r in group {
+                    let r = r as usize;
+                    if panel.member[r] {
+                        avg[r] = mean;
+                    }
+                }
+            }
+            write_cross_output(temp, requested, &["avg_corr"], &avg)?;
+        }
+    }
+
+    if wants("btc_volume_share") {
+        let vol = match cols.volume {
+            Some(col) => {
+                let mut vals = Vec::with_capacity(rows);
+                for seg in segs {
+                    vals.extend(segment_column(store, seg, col)?);
+                }
+                vals
+            }
+            None => {
+                return Err(format!(
+                    "feature 'btc_volume_share' needs the raw 'volume' column"
+                ))
+            }
+        };
+        let mut share = vec![f64::NAN; rows];
+        for group in panel.groups() {
+            let mut total = 0.0;
+            let mut count = 0usize;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] && vol[r].is_finite() {
+                    total += vol[r];
+                    count += 1;
+                }
+            }
+            if count < MIN_CROSS_MEMBERS || !(total > 0.0) {
+                continue;
+            }
+            let t = panel.times[group[0] as usize];
+            let btc = Cross::at(&cross.volume, t);
+            if !btc.is_finite() {
+                continue;
+            }
+            let v = btc / total;
+            for &r in group {
+                let r = r as usize;
+                if panel.member[r] {
+                    share[r] = v;
+                }
+            }
+        }
+        write_cross_output(temp, requested, &["btc_volume_share"], &share)?;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -5116,8 +5841,16 @@ fn enrich_inner(
             }
         } else if py15m_names().contains(n) {
             py15m_requested.push(n.clone());
-        } else if n.starts_with("xs_rank_") {
-            // Computed in the cross-sectional pass, which needs every symbol.
+        } else if n.starts_with("xs_rank_") || n == "cs_rank_r60" {
+            // Computed in the cross-sectional rank pass, which needs every
+            // symbol and point-in-time membership.
+        } else if (CROSS_MARKET_NAMES.contains(&n.as_str())
+            || MARKET_STATE_NAMES.contains(&n.as_str()))
+            && !py15m_names().contains(n)
+        {
+            // Computed in the whole-panel market-state pass. The five py15m
+            // names are still produced by `py15m_all` and overwritten by the
+            // canonical #273 pass below, so they are tracked there.
         } else if is_mtf(n) {
             // Computed by the per-symbol resample + causal join pass.
             mtf_requested.push(n.clone());
@@ -5153,6 +5886,18 @@ fn enrich_inner(
                     "{}: feature '{}' needs the raw '{}' column",
                     input_path, name, req
                 ));
+            }
+        }
+        // A cross-column source may itself need a raw field (amihud96 needs
+        // quote_volume). Fail closed with the consumer and the field named.
+        if let Some(src) = cross_source(name) {
+            for req in flow_requires(src) {
+                if !col_present(req) {
+                    return Err(format!(
+                        "{}: feature '{}' needs the raw '{}' column (source '{}')",
+                        input_path, name, req, src
+                    ));
+                }
             }
         }
     }
@@ -5191,48 +5936,30 @@ fn enrich_inner(
         labels.push((name, spec));
     }
 
-    // Cross-market context: the benchmark symbol's own series.
-    let cross_seg = segs
+    // Cross-market context: the benchmark symbols' own series, keyed by exact
+    // timestamp. ETH is loaded only when an ETH column is requested.
+    let cross = load_benchmark(
+        &store,
+        &segs,
+        &cols,
+        step,
+        &opts.cross_symbol,
+        opts.cross_data.as_deref(),
+    )?;
+    let needs_eth = requested
         .iter()
-        .find(|s| s.symbol == opts.cross_symbol)
-        .cloned()
-        .or_else(|| {
-            // An external cross store is optional; use it when the base store
-            // does not carry the benchmark.
-            None
-        });
-    let cross = match cross_seg {
-        Some(seg) => Cross::from_series(&load_series(&store, &seg, &cols, step)?),
-        None => match &opts.cross_data {
-            Some(path) => {
-                let cs = FileStore::open(path)?;
-                let cnames = cs.header().names();
-                let ccols = Cols {
-                    time: find_time_col(&cnames, None).ok_or("cross store has no time column")?,
-                    time_dtype: cs.header().dtypes()[find_time_col(&cnames, None).unwrap()],
-                    open: find_col(&cnames, &["open", "o"]).ok_or("cross store has no open")?,
-                    high: find_col(&cnames, &["high", "h"]).ok_or("cross store has no high")?,
-                    low: find_col(&cnames, &["low", "l"]).ok_or("cross store has no low")?,
-                    close: find_col(&cnames, &["close", "c"]).ok_or("cross store has no close")?,
-                    volume: find_col(&cnames, &["volume", "vol", "v"]),
-                    quote_volume: find_col(&cnames, &["quote_volume", "quotevolume", "qv"]),
-                    trades: find_col(&cnames, &["trades", "trade_count", "trades_count", "n"]),
-                    taker_buy_base: find_col(
-                        &cnames,
-                        &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
-                    ),
-                    symbol: find_symbol_col(&cnames, None),
-                };
-                let (csegs, _) = segments(&cs, ccols.time, ccols.symbol)?;
-                let cseg = csegs
-                    .iter()
-                    .find(|s| s.symbol == opts.cross_symbol)
-                    .or_else(|| csegs.first())
-                    .ok_or("cross store has no rows")?;
-                Cross::from_series(&load_series(&cs, cseg, &ccols, step)?)
-            }
-            None => Cross::default(),
-        },
+        .any(|n| n.starts_with("eth_") || n.starts_with("rel_eth") || n.starts_with("beta_eth"));
+    let eth = if needs_eth {
+        load_benchmark(
+            &store,
+            &segs,
+            &cols,
+            step,
+            &opts.eth_symbol,
+            opts.eth_data.as_deref(),
+        )?
+    } else {
+        Cross::default()
     };
 
     let needs_cross = requested.iter().any(|n| {
@@ -5240,15 +5967,21 @@ fn enrich_inner(
             || n.starts_with("rel_btc")
             || n.starts_with("beta_btc")
             || n.starts_with("cross_")
-            || n.starts_with("mkt_")
             || n == "rel_r16"
             || n == "rel_r96"
             || n == "beta384"
+            || n == "btc_volume_share"
     });
     if needs_cross && cross.symbol.is_empty() {
         return Err(format!(
             "btc/cross features need the benchmark series '{}' in --data or a --cross-data store",
             opts.cross_symbol
+        ));
+    }
+    if needs_eth && eth.symbol.is_empty() {
+        return Err(format!(
+            "eth/cross features need the ETH series '{}' in --data or an --eth-data store",
+            opts.eth_symbol
         ));
     }
 
@@ -5352,26 +6085,22 @@ fn enrich_inner(
     }
 
     // Cross-sectional source columns are computed even when the user did not
-    // ask for them, then removed if they are not part of the output.
-    let mut xs_sources: Vec<String> = Vec::new();
+    // ask for them, then removed if they are not part of the output. The same
+    // set feeds the market-state pass and the rank pass.
+    let member_col = find_col(&names, &["member_asof"]);
+    let member_dtype = member_col.map(|c| store.header().dtypes()[c]);
+    let mut cross_sources: BTreeSet<String> = BTreeSet::new();
     for n in &requested {
-        let src = if n == "xs_rank_r1" {
-            "r1"
-        } else if n == "xs_rank_r20" {
-            "r20"
-        } else if n == "xs_rank_vol20" {
-            "vol20"
-        } else {
-            continue;
-        };
-        xs_sources.push(src.to_string());
-        if !requested.contains(&src.to_string()) {
-            temp.entry(src.to_string())
-                .or_insert(TempColumn::create(work_dir, src, nominal_warmup(src), false)?);
+        if let Some(src) = cross_source(n) {
+            cross_sources.insert(src.to_string());
+            if src != "volume" && !requested.contains(&src.to_string()) {
+                temp.entry(src.to_string())
+                    .or_insert(TempColumn::create(work_dir, src, nominal_warmup(src), false)?);
+            }
         }
     }
-    for src in &xs_sources {
-        if !requested.contains(src) && !own.contains(src) {
+    for src in &cross_sources {
+        if src != "volume" && !requested.contains(src) && !own.contains(src) {
             own.push(src.clone());
         }
     }
@@ -5393,6 +6122,7 @@ fn enrich_inner(
             }
         }
     }
+    #[allow(unused_variables)]
     let gpu_labels = !labels.is_empty()
         && gpu_available
         && opts.gpu != GpuMode::Off
@@ -5402,7 +6132,9 @@ fn enrich_inner(
 
     let mut gpu_done: BTreeSet<String> = BTreeSet::new();
     let mut gpu_fallback = 0usize;
+    #[allow(unused_mut)]
     let mut gpu_kernel_seconds = 0.0;
+    #[allow(unused_mut)]
     let mut gpu_transfer_bytes = 0u64;
     #[cfg(feature = "cuda")]
     let mut gpu_ctx: Option<crate::enrich_gpu::EnrichGpu> = None;
@@ -5567,6 +6299,7 @@ fn enrich_inner(
         labels: cpu_labels,
         tf,
         cross: &cross,
+        eth: &eth,
     };
 
     // Feature pass, one symbol at a time in row order. `--chunk-rows` bounds
@@ -5602,91 +6335,124 @@ fn enrich_inner(
         t.flush()?;
     }
 
-    // Cross-sectional pass.
+    // Point-in-time cross-section pass: market state, then ranks. The two
+    // passes share one `(time, symbol, row)` order and one membership mask.
     let t_xs = Instant::now();
-    if !xs_sources.is_empty() {
-        let mut times = Vec::with_capacity(store.n_rows());
-        for seg in &segs {
-            times.extend(segment_i64(&store, seg, time_col, cols.time_dtype)?);
-        }
-        let mut sym_key = vec![0u32; store.n_rows()];
-        for seg in &segs {
-            for r in seg.start..seg.start + seg.len {
-                sym_key[r] = seg.key;
-            }
-        }
-        let xs_gpu = gpu_available
-            && opts.gpu != GpuMode::Off
-            && plans
-                .iter()
-                .any(|p| p.group == "xs" && p.backend == "gpu");
-        #[cfg(feature = "cuda")]
-        if xs_gpu && gpu_ctx.is_none() {
-            let times_all = i64_column_all(&store, time_col, cols.time_dtype)?;
-            let nan = vec![f64::NAN; store.n_rows()];
-            let volume = match cols.volume {
-                Some(c) => column_all(&store, c)?,
-                None => nan.clone(),
-            };
-            let quote_volume = match cols.quote_volume {
-                Some(c) => column_all(&store, c)?,
-                None => nan,
-            };
-            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
-            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-            gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
-                &times_all,
-                &column_all(&store, cols.open)?,
-                &column_all(&store, cols.high)?,
-                &column_all(&store, cols.low)?,
-                &column_all(&store, cols.close)?,
-                &volume,
-                &quote_volume,
-                &seg_start,
-                &seg_len,
+    if !cross_sources.is_empty() {
+        let panel = CrossPanel::new(
+            &store,
+            &segs,
+            time_col,
+            cols.time_dtype,
+            member_col.map(|c| (c, member_dtype.unwrap())),
+        )?;
+
+        if wants_market_state(&requested) {
+            market_state_pass(
+                &panel,
+                &mut temp,
+                &requested,
+                &segs,
+                &store,
+                &cols,
+                &cross,
                 step,
-            );
+            )?;
         }
-        for (rank_name, src) in requested
+
+        let rank_names: Vec<String> = requested
             .iter()
-            .filter(|n| n.starts_with("xs_rank_"))
-            .zip(xs_sources.iter())
-        {
-            let src_path = temp
-                .get(src)
-                .ok_or_else(|| format!("missing source column '{}'", src))?
-                .path
-                .clone();
-            let values = read_f64_file(&src_path, store.n_rows())?;
-            let mut ranks = None;
+            .filter(|n| n.starts_with("xs_rank_") || n.as_str() == "cs_rank_r60")
+            .cloned()
+            .collect();
+        if !rank_names.is_empty() {
             #[cfg(feature = "cuda")]
-            if xs_gpu {
-                if let Some(gpu) = gpu_ctx.as_mut() {
-                    ranks = gpu.rank(&values, &times, &sym_key);
-                    let stats = gpu.stats();
-                    gpu_kernel_seconds = stats.kernel_s;
-                    gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
-                }
+            let xs_gpu = gpu_available
+                && opts.gpu != GpuMode::Off
+                && plans
+                    .iter()
+                    .any(|p| p.group == "xs" && p.backend == "gpu");
+            #[cfg(feature = "cuda")]
+            if xs_gpu && gpu_ctx.is_none() {
+                let times_all = i64_column_all(&store, time_col, cols.time_dtype)?;
+                let nan = vec![f64::NAN; store.n_rows()];
+                let volume = match cols.volume {
+                    Some(c) => column_all(&store, c)?,
+                    None => nan.clone(),
+                };
+                let quote_volume = match cols.quote_volume {
+                    Some(c) => column_all(&store, c)?,
+                    None => nan,
+                };
+                let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+                let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+                gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
+                    &times_all,
+                    &column_all(&store, cols.open)?,
+                    &column_all(&store, cols.high)?,
+                    &column_all(&store, cols.low)?,
+                    &column_all(&store, cols.close)?,
+                    &volume,
+                    &quote_volume,
+                    &seg_start,
+                    &seg_len,
+                    step,
+                );
             }
-            let (ranks, from_gpu) = match ranks {
-                Some(r) => (r, true),
-                None => {
-                    if xs_gpu {
-                        gpu_fallback += 1;
+            for rank_name in &rank_names {
+                let src = cross_source(rank_name)
+                    .ok_or_else(|| format!("no source registered for '{}'", rank_name))?;
+                let mut values = source_values(&temp, src, store.n_rows())?;
+                #[allow(unused_mut)]
+                let mut ranks = None;
+                let gpu_eligible = rank_name.starts_with("xs_rank_")
+                    && panel.member.iter().all(|m| *m)
+                    && gpu_available
+                    && opts.gpu != GpuMode::Off
+                    && plans
+                        .iter()
+                        .any(|p| p.group == "xs" && p.backend == "gpu");
+                #[cfg(feature = "cuda")]
+                if gpu_eligible {
+                    if let Some(gpu) = gpu_ctx.as_mut() {
+                        ranks = gpu.rank(&values, &panel.times, &panel.sym_key);
+                        let stats = gpu.stats();
+                        gpu_kernel_seconds = stats.kernel_s;
+                        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
                     }
-                    (xs_rank(&values, &times, &sym_key, store.n_rows())?, false)
                 }
-            };
-            if let Some(t) = temp.get_mut(rank_name) {
-                t.write_values(&ranks)?;
-            }
-            if from_gpu {
-                gpu_done.insert(rank_name.clone());
+                let (ranks, from_gpu) = match ranks {
+                    Some(r) => (r, true),
+                    None => {
+                        if gpu_eligible {
+                            gpu_fallback += 1;
+                        }
+                        (
+                            rank_with_membership(
+                                &values,
+                                &panel.times,
+                                &panel.sym_key,
+                                Some(&panel.member),
+                                store.n_rows(),
+                            )?,
+                            false,
+                        )
+                    }
+                };
+                if let Some(t) = temp.get_mut(rank_name) {
+                    t.reset()?;
+                    t.write_values(&ranks)?;
+                }
+                if from_gpu {
+                    gpu_done.insert(rank_name.clone());
+                }
+                values.clear();
             }
         }
+
         // Remove sources that are not requested output columns.
-        for src in &xs_sources {
-            if !requested.contains(src) {
+        for src in &cross_sources {
+            if src != "volume" && !requested.contains(src) {
                 if let Some(t) = temp.remove(src) {
                     let _ = std::fs::remove_file(t.path);
                 }
@@ -5933,6 +6699,8 @@ pub fn run(args: &[String]) -> ! {
             "--symbol" => opts.symbol_col = Some(val!()),
             "--cross-symbol" => opts.cross_symbol = val!(),
             "--cross-data" => opts.cross_data = Some(val!()),
+            "--eth-symbol" => opts.eth_symbol = val!(),
+            "--eth-data" => opts.eth_data = Some(val!()),
             "--gpu" => {
                 if let Some(next) = args.get(i + 1) {
                     if matches!(next.as_str(), "auto" | "on" | "off" | "cpu" | "force") {
@@ -6022,6 +6790,8 @@ INPUT / OUTPUT:
   --symbol <col>          panel symbol column (default symbol/ticker/asset)
   --cross-symbol <name>   benchmark symbol for btc/cross features (default BTCUSDT)
   --cross-data <store>    benchmark store when --data does not contain it
+  --eth-symbol <name>     ETH benchmark symbol (default ETHUSDT)
+  --eth-data <store>      ETH benchmark store when --data does not contain it
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
@@ -6049,6 +6819,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   lags       lag_r1_1 .. lag_r1_10
   xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section)
   btc        btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60
+  cross      complete #273 family: btc/eth returns, vol and beta; equal-weight
+             market mkt_r16 mkt_r96 mkt_vol96; breadth dispersion avg_corr;
+             rel_mkt16 rel_mkt96; xs_rank_r1/r16/r20/vol20/amihud96 and the
+             legacy mkt_ew_* / cs_rank_r60 aliases. Ranks are [-1,1] and need
+             >=20 point-in-time members; a smaller cross-section is NaN.
   py15m      the 35 columns added by the Python enrich_panel_15m.py step
   mtf        the 36 multi-timeframe columns: mtf_<1h|4h|1d>_<leaf> for the
              twelve leaves ret1 ret4 ret24 ma_ratio vol atr_pct rsi close_pos
@@ -6071,7 +6846,7 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              zero-range/zero-volume bar, a missing prior bucket or a window that
              spans a gap is NaN. `batr` is materialised by the compact profile
              and completes the twelve-name default block.
-  all        every legacy group above except py15m, compact, flow, price_action
+  all        every legacy group above except cross, py15m, mtf, compact, flow and price_action
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
   cross:btc, calendar) are also accepted and are computed by `rcsr::features`.
@@ -6084,9 +6859,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   (name, family, warm-up, availability, exact formula and the canonical
   shared-name map) and `feature_registry`; a registered-but-unavailable name
   fails closed with the missing data dependency instead of being silently
-  dropped. All 36 multi-timeframe columns are `available:true`; market-state
-  columns are `available:false` until their passes land; derivative columns have
-  no local snapshot and are `available:false` with source null.
+  dropped. All 36 multi-timeframe columns are `available:true`, and the complete
+  cross-asset/breadth/rank family is `available:true`; `cross` expands it.
+  Derivative columns have no local snapshot and are `available:false` with
+  source null.
+
 
   Flow and compact flow features read the raw `volume`, `quote_volume`,
   `trades` and `taker_buy_base` (alias `taker_buy`) fields. A missing raw field

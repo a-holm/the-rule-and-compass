@@ -117,6 +117,69 @@ fn write_store_with_flow(
     write_flow_store(path, &rich, false, group_rows);
 }
 
+/// Write a symbol-major PIT panel with an explicit `member_asof` column.
+fn write_panel_store(
+    path: &str,
+    rows: &[(i64, String, f64, f64, f64, f64, f64, f64)],
+    group_rows: usize,
+) {
+    let mut text =
+        String::from("ts,symbol,open,high,low,close,volume,quote_volume,member_asof\n");
+    for (t, sym, o, h, l, c, v, asof) in rows {
+        text.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            t,
+            sym,
+            o,
+            h,
+            l,
+            c,
+            v,
+            v * c,
+            asof
+        ));
+    }
+    let t = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    store::write_store_with_time(path, &t, group_rows, Some(0)).unwrap();
+}
+
+/// 21-symbol, symbol-major panel used by the cross-asset tests. Each symbol has
+/// a distinct deterministic drift so market mean, breadth and dispersion are
+/// non-degenerate; the last symbol can be marked pre-listing.
+fn cross_panel_rows(
+    n: usize,
+    step: i64,
+    member_asof: f64,
+    pre_listing_symbol: Option<&str>,
+    pre_listing_asof: f64,
+) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for k in 0..21usize {
+        let sym = if k == 0 {
+            "BTCUSDT".to_string()
+        } else {
+            format!("ALT{:02}USDT", k)
+        };
+        let asof = if pre_listing_symbol == Some(sym.as_str()) {
+            pre_listing_asof
+        } else {
+            member_asof
+        };
+        let mu = 0.0002 * (k as f64 - 10.0);
+        let phase = k as f64 * 0.41;
+        for i in 0..n {
+            let p = 100.0 * (mu * i as f64 + 0.03 * (i as f64 * 0.23 + phase).sin()).exp();
+            let o = p * 0.999;
+            let c = p;
+            let h = p * 1.002;
+            let l = p * 0.998;
+            let v = 1000.0 + 10.0 * k as f64 + (i % 7) as f64;
+            rows.push((i as i64 * step, sym.clone(), o, h, l, c, v, asof));
+        }
+    }
+    rows
+}
+
 fn flow_rows(n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> {
     (0..n)
         .map(|i| {
@@ -156,6 +219,15 @@ fn opts(data: &str, out: &str, features: &str) -> Options {
         features: vec![features.to_string()],
         ..Default::default()
     }
+}
+
+/// The 21-symbol fixtures carry BTC but no separate ETH series; point the ETH
+/// benchmark at BTC so the complete `cross` group can be exercised. The
+/// dedicated benchmark test above covers a distinct ETH series.
+fn cross_opts(data: &str, out: &str, features: &str) -> Options {
+    let mut o = opts(data, out, features);
+    o.eth_symbol = "BTCUSDT".to_string();
+    o
 }
 
 fn column(path: &str, name: &str) -> Vec<f64> {
@@ -356,20 +428,36 @@ fn labels_enter_at_the_next_open_and_stay_out_of_features() {
 }
 
 #[test]
-fn cross_sectional_ranks_are_stable_and_break_ties_by_symbol() {
-    // t=0: AAA=1, BBB=2, CCC=2 (tie); t=1: AAA=3, BBB=2, CCC=1.
-    let src = vec![1.0, 2.0, 2.0, 3.0, 2.0, 1.0];
-    let times = vec![0i64, 0, 0, 1, 1, 1];
-    let keys = vec![0u32, 1, 2, 0, 1, 2];
-    let r = enrich::xs_rank(&src, &times, &keys, 6).unwrap();
-    assert_eq!(r[0], 0.0);
-    assert_eq!(r[1], 0.5, "tie broken by symbol order");
-    assert_eq!(r[2], 1.0);
-    assert_eq!(r[3], 1.0);
-    assert_eq!(r[4], 0.5);
-    assert_eq!(r[5], 0.0);
+fn cross_sectional_ranks_require_twenty_members_and_scale_to_minus_one_one() {
+    // 20 members at each of two timestamps. At t=0 values 1..19 and a tie at
+    // 19; at t=1 a reversed ramp. The rank scale is [-1, 1].
+    let mut src = Vec::new();
+    let mut times = Vec::new();
+    let mut keys = Vec::new();
+    for i in 0..20u32 {
+        src.push(if i >= 18 { 19.0 } else { (i + 1) as f64 });
+        times.push(0i64);
+        keys.push(i);
+    }
+    for i in 0..20u32 {
+        src.push((20 - i) as f64);
+        times.push(1i64);
+        keys.push(i);
+    }
+    let r = enrich::xs_rank(&src, &times, &keys, 40).unwrap();
+    assert_eq!(r[0], -1.0);
+    assert!((r[18] - (2.0 * 18.0 / 19.0 - 1.0)).abs() < 1e-12);
+    assert_eq!(r[19], 1.0, "tie broken by symbol order");
+    assert_eq!(r[20], 1.0);
+    assert_eq!(r[39], -1.0);
+    assert!(r.iter().all(|v| (-1.0..=1.0).contains(v)));
     // Repeating the call is bit-identical.
-    assert_eq!(r, enrich::xs_rank(&src, &times, &keys, 6).unwrap());
+    assert_eq!(r, enrich::xs_rank(&src, &times, &keys, 40).unwrap());
+
+    // A 19-member timestamp is NaN, never a rank over a partial cross-section.
+    let short = enrich::xs_rank(&src[1..], &times[1..], &keys[1..], 39).unwrap();
+    assert!(short[..19].iter().all(|v| v.is_nan()));
+    assert!(short[19..].iter().all(|v| v.is_finite()));
 }
 
 #[test]
@@ -441,6 +529,30 @@ fn py15m_matches_the_python_panel_within_tolerance() {
     let expected_path = base.join("btc_15m_py15m_expected.csv");
     let dir = tmp_dir("py15m");
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+
+    // The #273 market-state columns now require 20 point-in-time members, so
+    // exercise the fixture on a 20-member slice whose members carry the same
+    // BTC bars. The equal-weight market state is then numerically BTC, which
+    // preserves the committed Python expectation for `mkt_*` while testing the
+    // new producer. BTCUSDT is the last block so the compared tail is its rows.
+    let fixture_text = std::fs::read_to_string(&input).unwrap();
+    let mut fixture_lines = fixture_text.lines();
+    let fixture_header = fixture_lines.next().unwrap();
+    let fixture_body: Vec<&str> = fixture_lines.filter(|l| !l.trim().is_empty()).collect();
+    let mut panel = String::from(fixture_header);
+    panel.push('\n');
+    let mut symbols: Vec<String> = (0..19).map(|k| format!("X{:02}USDT", k)).collect();
+    symbols.push("BTCUSDT".to_string());
+    for sym in &symbols {
+        for line in &fixture_body {
+            let mut fields: Vec<&str> = line.split(',').collect();
+            fields[1] = sym;
+            panel.push_str(&fields.join(","));
+            panel.push('\n');
+        }
+    }
+    let input = dir.join("panel20.csv");
+    std::fs::write(&input, panel).unwrap();
 
     let text = std::fs::read_to_string(&expected_path).unwrap();
     let mut lines = text.lines();
@@ -577,19 +689,28 @@ fn default_financial_registry_is_complete_and_explicit() {
         assert_eq!(e.family, "mtf");
         assert!(matches!(e.timeframe, "1h" | "4h" | "1d"));
         assert!(e.reason.is_none());
-        assert_eq!(
-            enrich::expand(name).unwrap(),
-            vec![name.clone()],
-            "{name} must expand to itself"
-        );
+        assert_eq!(enrich::expand(name).unwrap(), vec![name.clone()]);
     }
     assert_eq!(enrich::expand("mtf").unwrap().len(), 36);
 
     // Unavailable families are explicit, never silently omitted.
     let unavailable: Vec<&enrich::RegistryEntry> = reg.iter().filter(|e| !e.available).collect();
     assert!(!unavailable.is_empty());
-    assert!(unavailable.iter().any(|e| e.family == "market_state"));
     assert!(unavailable.iter().any(|e| e.family == "derivatives"));
+    // The complete #273 cross family is available with family=cross, and every
+    // name expands to a producer.
+    for name in enrich::cross_names() {
+        let e = reg
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from registry"));
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.family, "cross", "{name} family");
+        assert_eq!(e.timeframe, "15m");
+        assert!(!e.formula.is_empty());
+        assert!(enrich::expand(&name).is_ok(), "{name} must expand");
+    }
+    assert_eq!(enrich::expand("cross").unwrap(), enrich::cross_names());
     // Issue #261: the candle/price-action family is complete and available.
     for name in enrich::DEFAULT_CANDLE_NAMES {
         let e = reg
@@ -1231,10 +1352,17 @@ fn advertised_column_set_is_exactly_what_a_real_run_appends() {
                 rcsr::manifest::sha256_hex(&bytes),
                 "{spec}: reported hash for '{name}' is not the output column digest"
             );
-            assert!(
-                f.nan_rows < real.rows,
-                "{spec}: '{name}' is NaN on every row of the fixture"
-            );
+            // Cross-sectional ranks deliberately require 20 PIT members; this
+            // three-symbol smoke fixture cannot produce one. Their dedicated
+            // 20-member tests below cover the finite path.
+            if name.starts_with("xs_rank_") || matches!(name.as_str(), "mkt_r16" | "mkt_r96" | "mkt_vol96") {
+                assert_eq!(f.nan_rows, real.rows, "{spec}: '{name}' must need 20 members");
+            } else {
+                assert!(
+                    f.nan_rows < real.rows,
+                    "{spec}: '{name}' is NaN on every row of the fixture"
+                );
+            }
         }
         assert_eq!(
             real.output_sha256,
@@ -1245,66 +1373,293 @@ fn advertised_column_set_is_exactly_what_a_real_run_appends() {
 }
 
 // ---------------------------------------------------------------------------
-// Candle and price-action family (#261)
+// Issue #273: complete cross-asset, breadth and cross-sectional family
 // ---------------------------------------------------------------------------
 
-/// Flat hand-built bars give exact, closed-form values for the continuous
-/// geometry and structure block. ATR14 is 2.0 because every true range is 2.
+fn closeish(expected: f64, got: f64, tol: f64, what: &str) {
+    assert!(
+        (expected - got).abs() <= tol,
+        "{what}: expected {expected}, got {got}, diff {}",
+        (expected - got).abs()
+    );
+}
+
+fn bench_price(symbol: &str, i: usize) -> f64 {
+    let t = i as f64;
+    match symbol {
+        "BTCUSDT" => 100.0 * (0.0007 * t + 0.010 * (t * 0.21).sin()).exp(),
+        "ETHUSDT" => 80.0 * (0.0005 * t + 0.020 * (t * 0.17).cos()).exp(),
+        _ => 50.0 * (0.0010 * t + 0.030 * (t * 0.40).sin()).exp(),
+    }
+}
+
+fn bench_rows(shift_btc: i64, btc_hole: bool) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for sym in ["BTCUSDT", "ETHUSDT", "AAA"] {
+        for i in 0..200usize {
+            if sym == "BTCUSDT" && btc_hole && i == 100 {
+                continue;
+            }
+            let p = bench_price(sym, i);
+            let shift = if sym == "BTCUSDT" { shift_btc } else { 0 };
+            rows.push((
+                i as i64 * 900 + shift,
+                sym.to_string(),
+                p * 0.999,
+                p * 1.002,
+                p * 0.998,
+                p,
+                100.0 + i as f64 + sym.len() as f64,
+            ));
+        }
+    }
+    rows
+}
+
 #[test]
-fn price_action_geometry_matches_flat_hand_bars() {
-    let dir = tmp_dir("pa_flat");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+fn btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails() {
+    let dir = tmp_dir("cross-bench");
+    let input = dir.join("in.rcsb").to_string_lossy().into_owned();
     let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
-        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+    let features = "btc_r1,btc_r16,btc_r20,btc_vol20,rel_btc_r16,beta_btc_60,eth_r16,rel_eth_r16,beta_eth_60";
+    write_store(&input, &bench_rows(0, false), 64);
+    enrich::build(&opts(&input, &out, features)).unwrap();
+
+    let n = 200usize;
+    let aaa = 2 * n + (n - 1);
+    let btc16 = (bench_price("BTCUSDT", n - 1) / bench_price("BTCUSDT", n - 17)).ln();
+    closeish(btc16, column(&out, "btc_r16")[aaa], 1e-12, "btc_r16");
+    let eth16 = (bench_price("ETHUSDT", n - 1) / bench_price("ETHUSDT", n - 17)).ln();
+    closeish(eth16, column(&out, "eth_r16")[aaa], 1e-12, "eth_r16");
+    let own16 = (bench_price("AAA", n - 1) / bench_price("AAA", n - 17)).ln();
+    closeish(own16 - btc16, column(&out, "rel_btc_r16")[aaa], 1e-12, "rel_btc_r16");
+    closeish(own16 - eth16, column(&out, "rel_eth_r16")[aaa], 1e-12, "rel_eth_r16");
+    let beta = column(&out, "beta_btc_60")[aaa];
+    assert!(beta.is_finite() && beta >= -5.0 && beta <= 5.0, "beta {beta}");
+    assert!(column(&out, "beta_eth_60")[aaa].is_finite());
+
+    // A missing benchmark bucket is NaN, never 0 or a forward fill.
+    let hole_in = dir.join("hole.rcsb").to_string_lossy().into_owned();
+    let hole_out = dir.join("hole_out.rcsb").to_string_lossy().into_owned();
+    write_store(&hole_in, &bench_rows(0, true), 64);
+    enrich::build(&opts(&hole_in, &hole_out, "btc_r1,btc_r16")).unwrap();
+    let btc_rows = n - 1;
+    let aaa_hole_start = btc_rows + n;
+    let r1 = column(&hole_out, "btc_r1");
+    let r16 = column(&hole_out, "btc_r16");
+    assert!(r1[aaa_hole_start + 100].is_nan(), "missing BTC bucket must be NaN");
+    assert!(r16[aaa_hole_start + 116].is_nan(), "a window spanning the hole must be NaN");
+
+    // One-bucket shift: the exact-timestamp join must change the value.
+    let shift_in = dir.join("shift.rcsb").to_string_lossy().into_owned();
+    let shift_out = dir.join("shift_out.rcsb").to_string_lossy().into_owned();
+    write_store(&shift_in, &bench_rows(900, false), 64);
+    enrich::build(&opts(&shift_in, &shift_out, "btc_r1,btc_r16")).unwrap();
+    let shifted = column(&shift_out, "btc_r1")[aaa];
+    let expected_shift = (bench_price("BTCUSDT", n - 2) / bench_price("BTCUSDT", n - 3)).ln();
+    closeish(expected_shift, shifted, 1e-12, "one-bucket shift");
+    assert!(
+        (shifted - column(&out, "btc_r1")[aaa]).abs() > 1e-9,
+        "a one-bucket shift must fail the benchmark parity"
+    );
+
+    // A requested ETH column without an ETH series fails closed, naming ETH.
+    let no_eth = dir.join("no_eth.rcsb").to_string_lossy().into_owned();
+    let no_eth_rows: Vec<_> = bench_rows(0, false)
+        .into_iter()
+        .filter(|r| r.1 != "ETHUSDT")
         .collect();
-    write_store(&src, &rows, 32);
-    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
-    enrich::build(&opts(&src, &out, &spec)).unwrap();
+    write_store(&no_eth, &no_eth_rows, 64);
+    let err = enrich::build(&opts(&no_eth, &out, "eth_r16")).unwrap_err();
+    assert!(err.contains("ETHUSDT"), "unexpected error: {err}");
+}
 
-    let clv16 = column(&out, "clv16");
-    let body16 = column(&out, "body16");
-    let rng_atr = column(&out, "rng_atr");
-    let prev = column(&out, "prev_range_pos");
-    let inside = column(&out, "inside_s");
-    let outside = column(&out, "outside_s");
-    let engulf = column(&out, "engulf_s");
-    let harami = column(&out, "harami_s");
-    let run8 = column(&out, "run8");
-    let nr4 = column(&out, "nr4");
-    let trend = column(&out, "trend96");
-    let batr = column(&out, "batr");
+fn panel_close(symbol: &str, i: usize) -> f64 {
+    let k = if symbol == "BTCUSDT" {
+        0
+    } else {
+        symbol.trim_start_matches("ALT").trim_end_matches("USDT").parse::<usize>().unwrap()
+    };
+    let mu = 0.0002 * (k as f64 - 10.0);
+    let phase = k as f64 * 0.41;
+    100.0 * (mu * i as f64 + 0.03 * (i as f64 * 0.23 + phase).sin()).exp()
+}
 
-    for i in 0..rows.len() {
-        assert!(rng_atr[i].is_finite(), "rng_atr warm-up at {i}");
-        assert!((rng_atr[i] - 1.0).abs() <= 1e-12, "rng_atr at {i}: {}", rng_atr[i]);
-        assert!((batr[i] - 0.25).abs() <= 1e-12, "batr at {i}: {}", batr[i]);
-        if i >= 15 {
-            assert!((clv16[i] - 0.25).abs() <= 1e-12, "clv16 at {i}: {}", clv16[i]);
-            assert!((body16[i] - 0.25).abs() <= 1e-12, "body16 at {i}: {}", body16[i]);
-        } else {
-            assert!(clv16[i].is_nan(), "clv16 warm-up at {i}");
-            assert!(body16[i].is_nan(), "body16 warm-up at {i}");
-        }
-        if i >= 1 {
-            assert!((prev[i] - 0.25).abs() <= 1e-12, "prev_range_pos at {i}: {}", prev[i]);
-            assert!((inside[i] - 1.0).abs() <= 1e-12, "inside_s at {i}: {}", inside[i]);
-            assert!((outside[i] - 1.0).abs() <= 1e-12, "outside_s at {i}: {}", outside[i]);
-            assert!(engulf[i].abs() <= 1e-12, "engulf_s at {i}: {}", engulf[i]);
-            assert!(harami[i].abs() <= 1e-12, "harami_s at {i}: {}", harami[i]);
-        }
-        if i >= 1 {
-            assert!(run8[i].abs() <= 1e-12, "run8 at {i}: {}", run8[i]);
-        }
-        if i >= 3 {
-            assert!((nr4[i] - 1.0).abs() <= 1e-12, "nr4 at {i}: {}", nr4[i]);
-        }
-        if i >= 95 {
-            assert!(trend[i].abs() <= 1e-12, "trend96 at {i}: {}", trend[i]);
+fn panel_ret(symbol: &str, i: usize, k: usize) -> f64 {
+    (panel_close(symbol, i) / panel_close(symbol, i - k)).ln()
+}
+
+fn panel_vol96(symbol: &str, i: usize) -> f64 {
+    let mut vals = Vec::new();
+    for j in i + 1 - 96..=i {
+        vals.push((panel_close(symbol, j) / panel_close(symbol, j - 1)).ln());
+    }
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    (vals.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / vals.len() as f64).sqrt()
+}
+
+fn symbol_index(k: usize, i: usize, n: usize) -> usize {
+    k * n + i
+}
+
+#[test]
+fn cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit() {
+    let dir = tmp_dir("cross-market");
+    let input = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let n = 800usize;
+    let rows = cross_panel_rows(n, 900, 0.0, Some("ALT01USDT"), 1.0e12);
+    write_panel_store(&input, &rows, 64);
+    let report = enrich::build(&cross_opts(&input, &out, "cross")).unwrap();
+    let expected = enrich::cross_names();
+    assert_eq!(report.features.len(), expected.len());
+    let store = FileStore::open(&out).unwrap();
+    let names = store.header().names();
+    let start = names.len() - expected.len();
+    assert_eq!(&names[start..], &expected[..], "cross emission order");
+    assert!(rcsr::schema::json().contains("\"family\":\"cross\""));
+    for name in &expected {
+        let vals = column(&out, name);
+        assert!(
+            vals.iter().any(|v| v.is_finite()),
+            "cross column '{name}' is NaN on every row of the 21-symbol fixture"
+        );
+    }
+
+    let i = n - 1;
+    let valid: Vec<usize> = (0..21).filter(|k| *k != 1).collect();
+    let r16: Vec<f64> = valid.iter().map(|k| panel_ret(&format!("ALT{:02}USDT", *k), i, 16)).collect();
+    let mean = r16.iter().sum::<f64>() / r16.len() as f64;
+    let breadth_expected = r16.iter().filter(|v| **v > 0.0).count() as f64 / r16.len() as f64;
+    let dispersion_expected =
+        (r16.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / r16.len() as f64).sqrt();
+
+    let mkt = column(&out, "mkt_r16");
+    let rel = column(&out, "rel_mkt16");
+    let breadth = column(&out, "breadth");
+    let dispersion = column(&out, "dispersion");
+    let rank = column(&out, "xs_rank_r16");
+    let mkt1 = column(&out, "mkt_ew_ret1");
+    let corr = column(&out, "avg_corr");
+    let share = column(&out, "btc_volume_share");
+
+    let mut total_volume = 0.0;
+    for k in &valid {
+        total_volume += 1000.0 + 10.0 * *k as f64 + (i % 7) as f64;
+    }
+    let btc_volume = 1000.0 + (i % 7) as f64;
+    let r1: Vec<f64> = valid.iter().map(|k| panel_ret(&format!("ALT{:02}USDT", *k), i, 1)).collect();
+    let mean1 = r1.iter().sum::<f64>() / r1.len() as f64;
+    let vol: Vec<f64> = valid.iter().map(|k| panel_vol96(&format!("ALT{:02}USDT", *k), i)).collect();
+    let mean_vol = vol.iter().sum::<f64>() / vol.len() as f64;
+
+    for (j, k) in valid.iter().enumerate() {
+        let idx = symbol_index(*k, i, n);
+        let sym = if *k == 0 { "BTCUSDT".to_string() } else { format!("ALT{:02}USDT", *k) };
+        closeish(mean, mkt[idx], 1e-12, "mkt_r16");
+        closeish(mean, column(&out, "mkt_ew_ret16")[idx], 1e-12, "mkt_ew_ret16 alias");
+        closeish(breadth_expected, breadth[idx], 1e-12, "breadth");
+        closeish(dispersion_expected, dispersion[idx], 1e-12, "dispersion");
+        closeish(mean1, mkt1[idx], 1e-12, "mkt_ew_ret1");
+        closeish(mean_vol, column(&out, "mkt_vol96")[idx], 1e-12, "mkt_vol96");
+        closeish(btc_volume / total_volume, share[idx], 1e-12, "btc_volume_share");
+        let ex_self = (r16.iter().sum::<f64>() - r16[j]) / (r16.len() - 1) as f64;
+        closeish(r16[j] - ex_self, rel[idx], 1e-12, "rel_mkt16 ex-self");
+        assert!(corr[idx].is_finite() && (-1.0..=1.0).contains(&corr[idx]), "avg_corr {}", corr[idx]);
+        assert!((-1.0..=1.0).contains(&rank[idx]), "rank {}", rank[idx]);
+        assert!(column(&out, "xs_rank_r1")[idx].is_finite());
+        assert!(column(&out, "xs_rank_r20")[idx].is_finite());
+        assert!(column(&out, "xs_rank_vol20")[idx].is_finite());
+        assert!(column(&out, "xs_rank_amihud96")[idx].is_finite());
+        assert!(column(&out, "cs_rank_r60")[idx].is_finite());
+        assert!(column(&out, "rel_mkt96")[idx].is_finite());
+        let _ = sym;
+    }
+
+    // The pre-listing symbol does not enter the market statistics, ranks or
+    // the relative columns; its cross-sectional outputs are NaN.
+    let pre = symbol_index(1, i, n);
+    for name in [
+        "mkt_r16",
+        "breadth",
+        "dispersion",
+        "rel_mkt16",
+        "xs_rank_r16",
+        "xs_rank_r1",
+        "avg_corr",
+        "btc_volume_share",
+        "mkt_vol96",
+    ] {
+        assert!(column(&out, name)[pre].is_nan(), "{name} used a pre-listing row");
+    }
+
+    // The rank is exactly the sorted position of r16, scaled to [-1, 1].
+    let mut sorted: Vec<(f64, usize)> = valid
+        .iter()
+        .enumerate()
+        .map(|(j, k)| (r16[j], *k))
+        .collect();
+    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.cmp(&b.1)));
+    for (pos, (_, k)) in sorted.iter().enumerate() {
+        let expected_rank = 2.0 * pos as f64 / (sorted.len() - 1) as f64 - 1.0;
+        closeish(expected_rank, rank[symbol_index(*k, i, n)], 1e-12, "xs_rank_r16");
+    }
+}
+
+#[test]
+fn a_partial_cross_section_is_nan_and_a_prefix_is_causal() {
+    let dir = tmp_dir("cross-partial");
+    let input = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let n = 240usize;
+    let mut rows = cross_panel_rows(n, 900, 0.0, None, 0.0);
+    // Drop the last row of two symbols: only 19 members remain at t_last.
+    for k in [3usize, 2] {
+        let idx = symbol_index(k, n - 1, n);
+        rows.remove(idx);
+    }
+    write_panel_store(&input, &rows, 64);
+    let features = "mkt_r16,breadth,dispersion,rel_mkt16,avg_corr,xs_rank_r16";
+    enrich::build(&cross_opts(&input, &out, features)).unwrap();
+    let last = rows.len() - 1;
+    for name in ["mkt_r16", "breadth", "dispersion", "rel_mkt16", "avg_corr", "xs_rank_r16"] {
+        assert!(column(&out, name)[last].is_nan(), "{name} must be NaN at N=19");
+    }
+
+    // Prefix causality: every earlier value is unchanged by truncating later
+    // rows, for every cross-family column.
+    let full_in = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let pre_in = dir.join("pre.rcsb").to_string_lossy().into_owned();
+    let pre_out = dir.join("pre_out.rcsb").to_string_lossy().into_owned();
+    let full_rows = cross_panel_rows(120, 900, 0.0, None, 0.0);
+    let prefix = 80usize;
+    let mut pre_rows = Vec::new();
+    for k in 0..21usize {
+        pre_rows.extend_from_slice(&full_rows[symbol_index(k, 0, 120)..symbol_index(k, prefix, 120)]);
+    }
+    write_panel_store(&full_in, &full_rows, 32);
+    write_panel_store(&pre_in, &pre_rows, 32);
+    let names = enrich::cross_names();
+    enrich::build(&cross_opts(&full_in, &full_out, "cross")).unwrap();
+    enrich::build(&cross_opts(&pre_in, &pre_out, "cross")).unwrap();
+    for name in &names {
+        let a = column(&full_out, name);
+        let b = column(&pre_out, name);
+        for k in 0..21usize {
+            for i in 0..prefix {
+                let x = a[symbol_index(k, i, 120)];
+                let y = b[symbol_index(k, i, prefix)];
+                assert_eq!(x.is_nan(), y.is_nan(), "{name} NaN mask at k={k} i={i}");
+                if x.is_finite() {
+                    closeish(x, y, 1e-12, &format!("{name} causal k={k} i={i}"));
+                }
+            }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
 // Multi-timeframe family (#272)
 // ---------------------------------------------------------------------------
 
@@ -1440,336 +1795,6 @@ fn mtf_36_columns_match_hand_built_higher_bars() {
             }
         }
     }
-}
-
-/// A rising close series produces the signed clipped streak.
-#[test]
-fn run8_tracks_the_signed_close_streak_and_clips_at_eight() {
-    let dir = tmp_dir("pa_run");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..20i64)
-        .map(|i| {
-            let c = 100.0 + i as f64;
-            (i * 900, "AAA".to_string(), c - 1.0, c + 0.5, c - 1.5, c, 10.0)
-        })
-        .collect();
-    write_store(&src, &rows, 16);
-    enrich::build(&opts(&src, &out, "run8")).unwrap();
-    let run = column(&out, "run8");
-    assert!(run[0].is_nan());
-    for i in 1..8 {
-        assert!((run[i] - i as f64 / 8.0).abs() <= 1e-12, "run8 at {i}: {}", run[i]);
-    }
-    for i in 8..20 {
-        assert!((run[i] - 1.0).abs() <= 1e-12, "run8 clipped at {i}: {}", run[i]);
-    }
-}
-
-/// Hand-built reversal shapes exercise the continuous inside/outside/engulf and
-/// harami strengths, including their sign.
-#[test]
-fn price_action_strengths_are_continuous_and_signed() {
-    let dir = tmp_dir("pa_shapes");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let bars: Vec<(f64, f64, f64, f64)> = vec![
-        (100.0, 101.0, 99.0, 99.5),
-        (99.2, 101.0, 99.0, 100.6),   // bullish engulfing
-        (101.0, 101.5, 98.9, 99.1),   // bearish engulfing
-        (99.8, 100.2, 99.4, 99.9),    // inside bar
-        (99.5, 102.0, 98.0, 100.0),   // outside bar
-        (101.0, 101.5, 98.5, 99.0),   // prior down body
-        (99.6, 99.9, 99.3, 99.7),     // bullish harami
-        (99.5, 101.0, 99.0, 100.5),   // prior up body
-        (100.2, 100.5, 99.3, 99.9),   // bearish harami
-    ];
-    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = bars
-        .iter()
-        .enumerate()
-        .map(|(i, (o, h, l, c))| (i as i64 * 900, "AAA".to_string(), *o, *h, *l, *c, 10.0))
-        .collect();
-    write_store(&src, &rows, 16);
-    enrich::build(
-        &opts(&src, &out, "inside_s,outside_s,engulf_s,harami_s"),
-    )
-    .unwrap();
-    let inside = column(&out, "inside_s");
-    let outside = column(&out, "outside_s");
-    let engulf = column(&out, "engulf_s");
-    let harami = column(&out, "harami_s");
-
-    assert!(engulf[1] > 0.0, "bullish engulfing must be positive: {}", engulf[1]);
-    assert!(engulf[2] < 0.0, "bearish engulfing must be negative: {}", engulf[2]);
-    assert!(harami[6] > 0.0, "bullish harami must be positive: {}", harami[6]);
-    assert!(harami[8] < 0.0, "bearish harami must be negative: {}", harami[8]);
-    for v in engulf.iter().chain(harami.iter()).filter(|v| v.is_finite()) {
-        assert!(v.abs() <= 1.0, "strength is not bounded: {v}");
-    }
-    assert!((inside[3] - 1.0).abs() <= 1e-12, "inside bar: {}", inside[3]);
-    assert!(outside[3] < 1.0, "inside bar is not an outside bar: {}", outside[3]);
-    assert!((outside[4] - 1.0).abs() <= 1e-12, "outside bar: {}", outside[4]);
-    assert!(inside[4] < outside[4], "outside bar must score inside lower");
-}
-
-/// The three shape identities hold on random finite-range bars.
-#[test]
-fn price_action_identities_hold_on_random_bars() {
-    let dir = tmp_dir("pa_identities");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
-    let mut seed = 0x1234_5678_9abc_def0u64;
-    let mut next = || {
-        seed ^= seed << 13;
-        seed ^= seed >> 7;
-        seed ^= seed << 17;
-        (seed as f64) / (u64::MAX as f64)
-    };
-    for i in 0..300i64 {
-        let o = 50.0 + next() * 40.0;
-        let c = 50.0 + next() * 40.0;
-        let h = o.max(c) + 0.05 + next() * 2.0;
-        let l = o.min(c) - 0.05 - next() * 2.0;
-        rows.push((i * 900, "AAA".to_string(), o, h, l, c, 10.0));
-    }
-    write_store(&src, &rows, 32);
-    enrich::build(&opts(&src, &out, "clv1,body1,wasym1")).unwrap();
-    let clv = column(&out, "clv1");
-    let body = column(&out, "body1");
-    let wasym = column(&out, "wasym1");
-    let mut checked = 0;
-    for (i, (_, _, o, h, l, c, _)) in rows.iter().enumerate() {
-        let r = h - l;
-        if !(r > 0.0) {
-            continue;
-        }
-        let u = h - o.max(*c);
-        let d = o.min(*c) - l;
-        let up = u / r;
-        let down = d / r;
-        assert!(
-            (up - (0.5 - clv[i] + body[i].min(0.0))).abs() <= 1e-12,
-            "U/R identity at {i}"
-        );
-        assert!(
-            (down - (0.5 + clv[i] - body[i].max(0.0))).abs() <= 1e-12,
-            "D/R identity at {i}"
-        );
-        assert!(
-            (wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12,
-            "wasym identity at {i}"
-        );
-        checked += 1;
-    }
-    assert!(checked > 250, "too few finite-range bars ({checked})");
-}
-
-/// A zero-range or zero-volume bar is NaN for strict geometry, never a fake 0.
-/// The compact `batr` keeps its documented compact zero on `H == L`.
-#[test]
-fn price_action_zero_range_and_zero_volume_are_nan() {
-    let dir = tmp_dir("pa_degenerate");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..220i64)
-        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
-        .collect();
-    rows[100] = (100 * 900, "AAA".to_string(), 100.0, 100.0, 100.0, 100.0, 10.0);
-    rows[120].6 = 0.0;
-    write_store(&src, &rows, 32);
-    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
-    enrich::build(&opts(&src, &out, &spec)).unwrap();
-
-    for name in ["rng_atr", "clv16", "body16", "prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s", "nr4", "trend96"] {
-        let v = column(&out, name);
-        assert!(v[100].is_nan(), "{name} must be NaN at a zero-range bar");
-        assert!(v[120].is_nan(), "{name} must be NaN at a zero-volume bar");
-    }
-    let nr4 = column(&out, "nr4");
-    assert!(nr4[101].is_nan() && nr4[102].is_nan() && nr4[103].is_nan());
-    assert!(nr4[104].is_finite(), "nr4 must recover four bars after the hole");
-    let trend = column(&out, "trend96");
-    assert!(trend[215].is_nan(), "trend96 window still contains the zero-volume bar");
-    assert!(trend[216].is_finite(), "trend96 must recover after a full window");
-    let batr = column(&out, "batr");
-    assert_eq!(batr[100], 0.0, "compact batr keeps the documented H==L zero");
-}
-
-/// Every two-bar feature is NaN across a missing bucket, and every 16/96-bar
-/// window is NaN until the hole leaves it. Nothing bridges a gap.
-#[test]
-fn price_action_two_bar_and_window_gap_masked() {
-    let dir = tmp_dir("pa_gap");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
-    for i in 0..700i64 {
-        let t = if i < 350 { i * 900 } else { (i + 3) * 900 };
-        let p = 100.0 + i as f64 * 0.01 + (i as f64 * 0.3).sin();
-        rows.push((t, "AAA".to_string(), p, p + 0.2, p - 0.2, p + 0.05, 10.0 + i as f64));
-    }
-    write_store(&src, &rows, 64);
-    let spec = enrich::PRICE_ACTION_NAMES.join(",");
-    enrich::build(&opts(&src, &out, &spec)).unwrap();
-
-    for name in ["prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s"] {
-        let v = column(&out, name);
-        assert!(v[350].is_nan(), "{name} bridged the hole at row 350");
-    }
-    for name in ["clv16", "body16"] {
-        let v = column(&out, name);
-        for i in 350..365 {
-            assert!(v[i].is_nan(), "{name} bridged the hole at row {i}");
-        }
-        assert!(v[365].is_finite(), "{name} did not recover after the hole");
-    }
-    let trend = column(&out, "trend96");
-    for i in 350..445 {
-        assert!(trend[i].is_nan(), "trend96 bridged the hole at row {i}");
-    }
-    assert!(trend[445].is_finite(), "trend96 did not recover after the hole");
-    let nr4 = column(&out, "nr4");
-    for i in 350..353 {
-        assert!(nr4[i].is_nan(), "nr4 bridged the hole at row {i}");
-    }
-    assert!(nr4[353].is_finite(), "nr4 did not recover after the hole");
-}
-
-/// Prefix causality: changing a later bar never changes an earlier row, and a
-/// truncated store recomputes the same prefix.
-#[test]
-fn price_action_is_prefix_causal_under_a_shifted_future_bar() {
-    let dir = tmp_dir("pa_causal");
-    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
-    let cut = dir.join("cut.rcsb").to_string_lossy().into_owned();
-    let shifted = dir.join("shifted.rcsb").to_string_lossy().into_owned();
-    let out_full = dir.join("full_out.rcsb").to_string_lossy().into_owned();
-    let out_cut = dir.join("cut_out.rcsb").to_string_lossy().into_owned();
-    let out_shifted = dir.join("shifted_out.rcsb").to_string_lossy().into_owned();
-    let rows = bars("AAA", 320, 0, 900);
-    let mut future = rows.clone();
-    future[250] = (
-        future[250].0,
-        future[250].1.clone(),
-        future[250].2 + 37.0,
-        future[250].3 + 40.0,
-        future[250].4 - 5.0,
-        future[250].5 + 21.0,
-        999.0,
-    );
-    write_store(&full, &rows, 31);
-    write_store(&cut, &rows[..250], 31);
-    write_store(&shifted, &future, 31);
-    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
-    enrich::build(&opts(&full, &out_full, &spec)).unwrap();
-    enrich::build(&opts(&cut, &out_cut, &spec)).unwrap();
-    enrich::build(&opts(&shifted, &out_shifted, &spec)).unwrap();
-    for name in enrich::PRICE_ACTION_NAMES.iter().chain(["batr"].iter()) {
-        let a = column(&out_full, name);
-        let b = column(&out_cut, name);
-        let c = column(&out_shifted, name);
-        for i in 0..250 {
-            assert_eq!(a[i].is_nan(), b[i].is_nan(), "{name} prefix NaN differs at {i}");
-            assert_eq!(a[i].is_nan(), c[i].is_nan(), "{name} future NaN differs at {i}");
-            if a[i].is_finite() {
-                assert!((a[i] - b[i]).abs() <= 1e-12, "{name} prefix differs at {i}");
-                assert!((a[i] - c[i]).abs() <= 1e-12, "{name} future bar changed {i}");
-            }
-        }
-    }
-}
-
-/// The ten compact candle names pass the independent Python fixture at
-/// `abs/rel <= 1e-12`; `wasym1` is recomputed from `body1` and `clv1`.
-#[test]
-fn compact_candle_subset_passes_parity_at_1e12() {
-    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
-    let input = base.join("compact_15m_ohlcv.csv");
-    let expected_path = base.join("compact_15m_expected.csv");
-    let dir = tmp_dir("candle_parity");
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let names = [
-        "clv1", "clv4", "body1", "batr", "wasym1", "lower_wick", "rng1", "volrat", "gapatr", "don96",
-    ];
-    enrich::build(&opts(&input.to_string_lossy(), &out, &names.join(","))).unwrap();
-
-    let text = std::fs::read_to_string(&expected_path).unwrap();
-    let mut lines = text.lines();
-    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
-    let start_ts = 1_680_271_200i64;
-    let rows_per_symbol = 3600usize;
-    let out_cols: Vec<Vec<f64>> = names.iter().map(|n| column(&out, n)).collect();
-    let mut compared = 0usize;
-    let mut worst = 0.0f64;
-    for line in lines {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let fields: Vec<&str> = line.split(',').collect();
-        let ts: i64 = fields[0].parse().unwrap();
-        let sym = fields[1];
-        let seg = if sym == "AAVEUSDT" { 0 } else { 1 };
-        let idx = seg * rows_per_symbol + ((ts - start_ts) / 900) as usize;
-        for (j, name) in names.iter().enumerate() {
-            let col = header.iter().position(|h| h == name).unwrap();
-            let expected = fields[col].parse::<f64>().unwrap();
-            let got = out_cols[j][idx];
-            match (got.is_nan(), expected.is_nan()) {
-                (true, true) => continue,
-                (true, false) => panic!("{name} at {sym}/{ts}: got NaN, expected {expected}"),
-                (false, true) => panic!("{name} at {sym}/{ts}: got {got}, expected NaN"),
-                (false, false) => {}
-            }
-            let a = (got - expected).abs();
-            let r = a / expected.abs().max(1e-300);
-            worst = worst.max(a.max(r));
-            assert!(
-                a <= 1e-12 || r <= 1e-12,
-                "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
-            );
-            compared += 1;
-        }
-    }
-    assert_eq!(compared, 300 * names.len());
-    let clv = column(&out, "clv1");
-    let body = column(&out, "body1");
-    let wasym = column(&out, "wasym1");
-    let mut identity = 0usize;
-    for i in 0..clv.len() {
-        if wasym[i].is_finite() && body[i].is_finite() && clv[i].is_finite() {
-            assert!((wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12);
-            identity += 1;
-        }
-    }
-    assert!(identity > 0);
-    eprintln!("candle compact parity: {compared} values, worst abs/rel {worst:e}");
-}
-
-/// The report lists warm-up, NaN count, prevalence and the first finite date
-/// for every column, in text and JSON.
-#[test]
-fn enrich_report_lists_prevalence_and_first_finite_date() {
-    let dir = tmp_dir("pa_report");
-    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
-    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
-    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
-        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
-        .collect();
-    write_store(&src, &rows, 32);
-    let report = enrich::build(&opts(&src, &out, "clv16")).unwrap();
-    let f = report.features.iter().find(|f| f.name == "clv16").unwrap();
-    assert_eq!(f.warmup, 15);
-    assert_eq!(f.nan_rows, 15);
-    assert_eq!(f.first_finite_row, Some(15));
-    assert_eq!(f.first_finite_time, Some(15 * 900));
-    assert!((f.prevalence - 105.0 / 120.0).abs() <= 1e-12);
-    let json = report.json();
-    assert!(json.contains("\"prevalence\":0.875"), "json: {json}");
-    assert!(json.contains("\"first_finite_iso\":\"1970-01-01T03:45:00Z\""), "json: {json}");
-    let text = report.text_lines().join("\n");
-    assert!(text.contains("# enrich-feature: name=clv16 warmup=15 nan_rows=15 prevalence=0.875000"));
-    assert!(text.contains("first_finite_iso=1970-01-01T03:45:00Z"));
 }
 
 #[test]
@@ -1983,6 +2008,408 @@ fn mtf_every_column_is_nan_when_its_higher_bucket_is_missing() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Candle and price-action family (#261)
+// ---------------------------------------------------------------------------
+
+/// Flat hand-built bars give exact, closed-form values for the continuous
+/// geometry and structure block. ATR14 is 2.0 because every true range is 2.
+#[test]
+fn price_action_geometry_matches_flat_hand_bars() {
+    let dir = tmp_dir("pa_flat");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    write_store(&src, &rows, 32);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    let clv16 = column(&out, "clv16");
+    let body16 = column(&out, "body16");
+    let rng_atr = column(&out, "rng_atr");
+    let prev = column(&out, "prev_range_pos");
+    let inside = column(&out, "inside_s");
+    let outside = column(&out, "outside_s");
+    let engulf = column(&out, "engulf_s");
+    let harami = column(&out, "harami_s");
+    let run8 = column(&out, "run8");
+    let nr4 = column(&out, "nr4");
+    let trend = column(&out, "trend96");
+    let batr = column(&out, "batr");
+
+    for i in 0..rows.len() {
+        assert!(rng_atr[i].is_finite(), "rng_atr warm-up at {i}");
+        assert!((rng_atr[i] - 1.0).abs() <= 1e-12, "rng_atr at {i}: {}", rng_atr[i]);
+        assert!((batr[i] - 0.25).abs() <= 1e-12, "batr at {i}: {}", batr[i]);
+        if i >= 15 {
+            assert!((clv16[i] - 0.25).abs() <= 1e-12, "clv16 at {i}: {}", clv16[i]);
+            assert!((body16[i] - 0.25).abs() <= 1e-12, "body16 at {i}: {}", body16[i]);
+        } else {
+            assert!(clv16[i].is_nan(), "clv16 warm-up at {i}");
+            assert!(body16[i].is_nan(), "body16 warm-up at {i}");
+        }
+        if i >= 1 {
+            assert!((prev[i] - 0.25).abs() <= 1e-12, "prev_range_pos at {i}: {}", prev[i]);
+            assert!((inside[i] - 1.0).abs() <= 1e-12, "inside_s at {i}: {}", inside[i]);
+            assert!((outside[i] - 1.0).abs() <= 1e-12, "outside_s at {i}: {}", outside[i]);
+            assert!(engulf[i].abs() <= 1e-12, "engulf_s at {i}: {}", engulf[i]);
+            assert!(harami[i].abs() <= 1e-12, "harami_s at {i}: {}", harami[i]);
+        }
+        if i >= 1 {
+            assert!(run8[i].abs() <= 1e-12, "run8 at {i}: {}", run8[i]);
+        }
+        if i >= 3 {
+            assert!((nr4[i] - 1.0).abs() <= 1e-12, "nr4 at {i}: {}", nr4[i]);
+        }
+        if i >= 95 {
+            assert!(trend[i].abs() <= 1e-12, "trend96 at {i}: {}", trend[i]);
+        }
+    }
+}
+
+
+/// A rising close series produces the signed clipped streak.
+#[test]
+fn run8_tracks_the_signed_close_streak_and_clips_at_eight() {
+    let dir = tmp_dir("pa_run");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..20i64)
+        .map(|i| {
+            let c = 100.0 + i as f64;
+            (i * 900, "AAA".to_string(), c - 1.0, c + 0.5, c - 1.5, c, 10.0)
+        })
+        .collect();
+    write_store(&src, &rows, 16);
+    enrich::build(&opts(&src, &out, "run8")).unwrap();
+    let run = column(&out, "run8");
+    assert!(run[0].is_nan());
+    for i in 1..8 {
+        assert!((run[i] - i as f64 / 8.0).abs() <= 1e-12, "run8 at {i}: {}", run[i]);
+    }
+    for i in 8..20 {
+        assert!((run[i] - 1.0).abs() <= 1e-12, "run8 clipped at {i}: {}", run[i]);
+    }
+}
+
+
+/// Hand-built reversal shapes exercise the continuous inside/outside/engulf and
+/// harami strengths, including their sign.
+#[test]
+fn price_action_strengths_are_continuous_and_signed() {
+    let dir = tmp_dir("pa_shapes");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let bars: Vec<(f64, f64, f64, f64)> = vec![
+        (100.0, 101.0, 99.0, 99.5),
+        (99.2, 101.0, 99.0, 100.6),   // bullish engulfing
+        (101.0, 101.5, 98.9, 99.1),   // bearish engulfing
+        (99.8, 100.2, 99.4, 99.9),    // inside bar
+        (99.5, 102.0, 98.0, 100.0),   // outside bar
+        (101.0, 101.5, 98.5, 99.0),   // prior down body
+        (99.6, 99.9, 99.3, 99.7),     // bullish harami
+        (99.5, 101.0, 99.0, 100.5),   // prior up body
+        (100.2, 100.5, 99.3, 99.9),   // bearish harami
+    ];
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = bars
+        .iter()
+        .enumerate()
+        .map(|(i, (o, h, l, c))| (i as i64 * 900, "AAA".to_string(), *o, *h, *l, *c, 10.0))
+        .collect();
+    write_store(&src, &rows, 16);
+    enrich::build(
+        &opts(&src, &out, "inside_s,outside_s,engulf_s,harami_s"),
+    )
+    .unwrap();
+    let inside = column(&out, "inside_s");
+    let outside = column(&out, "outside_s");
+    let engulf = column(&out, "engulf_s");
+    let harami = column(&out, "harami_s");
+
+    assert!(engulf[1] > 0.0, "bullish engulfing must be positive: {}", engulf[1]);
+    assert!(engulf[2] < 0.0, "bearish engulfing must be negative: {}", engulf[2]);
+    assert!(harami[6] > 0.0, "bullish harami must be positive: {}", harami[6]);
+    assert!(harami[8] < 0.0, "bearish harami must be negative: {}", harami[8]);
+    for v in engulf.iter().chain(harami.iter()).filter(|v| v.is_finite()) {
+        assert!(v.abs() <= 1.0, "strength is not bounded: {v}");
+    }
+    assert!((inside[3] - 1.0).abs() <= 1e-12, "inside bar: {}", inside[3]);
+    assert!(outside[3] < 1.0, "inside bar is not an outside bar: {}", outside[3]);
+    assert!((outside[4] - 1.0).abs() <= 1e-12, "outside bar: {}", outside[4]);
+    assert!(inside[4] < outside[4], "outside bar must score inside lower");
+}
+
+
+/// The three shape identities hold on random finite-range bars.
+#[test]
+fn price_action_identities_hold_on_random_bars() {
+    let dir = tmp_dir("pa_identities");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed as f64) / (u64::MAX as f64)
+    };
+    for i in 0..300i64 {
+        let o = 50.0 + next() * 40.0;
+        let c = 50.0 + next() * 40.0;
+        let h = o.max(c) + 0.05 + next() * 2.0;
+        let l = o.min(c) - 0.05 - next() * 2.0;
+        rows.push((i * 900, "AAA".to_string(), o, h, l, c, 10.0));
+    }
+    write_store(&src, &rows, 32);
+    enrich::build(&opts(&src, &out, "clv1,body1,wasym1")).unwrap();
+    let clv = column(&out, "clv1");
+    let body = column(&out, "body1");
+    let wasym = column(&out, "wasym1");
+    let mut checked = 0;
+    for (i, (_, _, o, h, l, c, _)) in rows.iter().enumerate() {
+        let r = h - l;
+        if !(r > 0.0) {
+            continue;
+        }
+        let u = h - o.max(*c);
+        let d = o.min(*c) - l;
+        let up = u / r;
+        let down = d / r;
+        assert!(
+            (up - (0.5 - clv[i] + body[i].min(0.0))).abs() <= 1e-12,
+            "U/R identity at {i}"
+        );
+        assert!(
+            (down - (0.5 + clv[i] - body[i].max(0.0))).abs() <= 1e-12,
+            "D/R identity at {i}"
+        );
+        assert!(
+            (wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12,
+            "wasym identity at {i}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 250, "too few finite-range bars ({checked})");
+}
+
+
+/// A zero-range or zero-volume bar is NaN for strict geometry, never a fake 0.
+/// The compact `batr` keeps its documented compact zero on `H == L`.
+#[test]
+fn price_action_zero_range_and_zero_volume_are_nan() {
+    let dir = tmp_dir("pa_degenerate");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..220i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    rows[100] = (100 * 900, "AAA".to_string(), 100.0, 100.0, 100.0, 100.0, 10.0);
+    rows[120].6 = 0.0;
+    write_store(&src, &rows, 32);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    for name in ["rng_atr", "clv16", "body16", "prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s", "nr4", "trend96"] {
+        let v = column(&out, name);
+        assert!(v[100].is_nan(), "{name} must be NaN at a zero-range bar");
+        assert!(v[120].is_nan(), "{name} must be NaN at a zero-volume bar");
+    }
+    let nr4 = column(&out, "nr4");
+    assert!(nr4[101].is_nan() && nr4[102].is_nan() && nr4[103].is_nan());
+    assert!(nr4[104].is_finite(), "nr4 must recover four bars after the hole");
+    let trend = column(&out, "trend96");
+    assert!(trend[215].is_nan(), "trend96 window still contains the zero-volume bar");
+    assert!(trend[216].is_finite(), "trend96 must recover after a full window");
+    let batr = column(&out, "batr");
+    assert_eq!(batr[100], 0.0, "compact batr keeps the documented H==L zero");
+}
+
+
+/// Every two-bar feature is NaN across a missing bucket, and every 16/96-bar
+/// window is NaN until the hole leaves it. Nothing bridges a gap.
+#[test]
+fn price_action_two_bar_and_window_gap_masked() {
+    let dir = tmp_dir("pa_gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for i in 0..700i64 {
+        let t = if i < 350 { i * 900 } else { (i + 3) * 900 };
+        let p = 100.0 + i as f64 * 0.01 + (i as f64 * 0.3).sin();
+        rows.push((t, "AAA".to_string(), p, p + 0.2, p - 0.2, p + 0.05, 10.0 + i as f64));
+    }
+    write_store(&src, &rows, 64);
+    let spec = enrich::PRICE_ACTION_NAMES.join(",");
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    for name in ["prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s"] {
+        let v = column(&out, name);
+        assert!(v[350].is_nan(), "{name} bridged the hole at row 350");
+    }
+    for name in ["clv16", "body16"] {
+        let v = column(&out, name);
+        for i in 350..365 {
+            assert!(v[i].is_nan(), "{name} bridged the hole at row {i}");
+        }
+        assert!(v[365].is_finite(), "{name} did not recover after the hole");
+    }
+    let trend = column(&out, "trend96");
+    for i in 350..445 {
+        assert!(trend[i].is_nan(), "trend96 bridged the hole at row {i}");
+    }
+    assert!(trend[445].is_finite(), "trend96 did not recover after the hole");
+    let nr4 = column(&out, "nr4");
+    for i in 350..353 {
+        assert!(nr4[i].is_nan(), "nr4 bridged the hole at row {i}");
+    }
+    assert!(nr4[353].is_finite(), "nr4 did not recover after the hole");
+}
+
+
+/// Prefix causality: changing a later bar never changes an earlier row, and a
+/// truncated store recomputes the same prefix.
+#[test]
+fn price_action_is_prefix_causal_under_a_shifted_future_bar() {
+    let dir = tmp_dir("pa_causal");
+    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let cut = dir.join("cut.rcsb").to_string_lossy().into_owned();
+    let shifted = dir.join("shifted.rcsb").to_string_lossy().into_owned();
+    let out_full = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let out_cut = dir.join("cut_out.rcsb").to_string_lossy().into_owned();
+    let out_shifted = dir.join("shifted_out.rcsb").to_string_lossy().into_owned();
+    let rows = bars("AAA", 320, 0, 900);
+    let mut future = rows.clone();
+    future[250] = (
+        future[250].0,
+        future[250].1.clone(),
+        future[250].2 + 37.0,
+        future[250].3 + 40.0,
+        future[250].4 - 5.0,
+        future[250].5 + 21.0,
+        999.0,
+    );
+    write_store(&full, &rows, 31);
+    write_store(&cut, &rows[..250], 31);
+    write_store(&shifted, &future, 31);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&full, &out_full, &spec)).unwrap();
+    enrich::build(&opts(&cut, &out_cut, &spec)).unwrap();
+    enrich::build(&opts(&shifted, &out_shifted, &spec)).unwrap();
+    for name in enrich::PRICE_ACTION_NAMES.iter().chain(["batr"].iter()) {
+        let a = column(&out_full, name);
+        let b = column(&out_cut, name);
+        let c = column(&out_shifted, name);
+        for i in 0..250 {
+            assert_eq!(a[i].is_nan(), b[i].is_nan(), "{name} prefix NaN differs at {i}");
+            assert_eq!(a[i].is_nan(), c[i].is_nan(), "{name} future NaN differs at {i}");
+            if a[i].is_finite() {
+                assert!((a[i] - b[i]).abs() <= 1e-12, "{name} prefix differs at {i}");
+                assert!((a[i] - c[i]).abs() <= 1e-12, "{name} future bar changed {i}");
+            }
+        }
+    }
+}
+
+
+/// The ten compact candle names pass the independent Python fixture at
+/// `abs/rel <= 1e-12`; `wasym1` is recomputed from `body1` and `clv1`.
+#[test]
+fn compact_candle_subset_passes_parity_at_1e12() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
+    let input = base.join("compact_15m_ohlcv.csv");
+    let expected_path = base.join("compact_15m_expected.csv");
+    let dir = tmp_dir("candle_parity");
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let names = [
+        "clv1", "clv4", "body1", "batr", "wasym1", "lower_wick", "rng1", "volrat", "gapatr", "don96",
+    ];
+    enrich::build(&opts(&input.to_string_lossy(), &out, &names.join(","))).unwrap();
+
+    let text = std::fs::read_to_string(&expected_path).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let start_ts = 1_680_271_200i64;
+    let rows_per_symbol = 3600usize;
+    let out_cols: Vec<Vec<f64>> = names.iter().map(|n| column(&out, n)).collect();
+    let mut compared = 0usize;
+    let mut worst = 0.0f64;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        let ts: i64 = fields[0].parse().unwrap();
+        let sym = fields[1];
+        let seg = if sym == "AAVEUSDT" { 0 } else { 1 };
+        let idx = seg * rows_per_symbol + ((ts - start_ts) / 900) as usize;
+        for (j, name) in names.iter().enumerate() {
+            let col = header.iter().position(|h| h == name).unwrap();
+            let expected = fields[col].parse::<f64>().unwrap();
+            let got = out_cols[j][idx];
+            match (got.is_nan(), expected.is_nan()) {
+                (true, true) => continue,
+                (true, false) => panic!("{name} at {sym}/{ts}: got NaN, expected {expected}"),
+                (false, true) => panic!("{name} at {sym}/{ts}: got {got}, expected NaN"),
+                (false, false) => {}
+            }
+            let a = (got - expected).abs();
+            let r = a / expected.abs().max(1e-300);
+            worst = worst.max(a.max(r));
+            assert!(
+                a <= 1e-12 || r <= 1e-12,
+                "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 300 * names.len());
+    let clv = column(&out, "clv1");
+    let body = column(&out, "body1");
+    let wasym = column(&out, "wasym1");
+    let mut identity = 0usize;
+    for i in 0..clv.len() {
+        if wasym[i].is_finite() && body[i].is_finite() && clv[i].is_finite() {
+            assert!((wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12);
+            identity += 1;
+        }
+    }
+    assert!(identity > 0);
+    eprintln!("candle compact parity: {compared} values, worst abs/rel {worst:e}");
+}
+
+
+/// The report lists warm-up, NaN count, prevalence and the first finite date
+/// for every column, in text and JSON.
+#[test]
+fn enrich_report_lists_prevalence_and_first_finite_date() {
+    let dir = tmp_dir("pa_report");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    write_store(&src, &rows, 32);
+    let report = enrich::build(&opts(&src, &out, "clv16")).unwrap();
+    let f = report.features.iter().find(|f| f.name == "clv16").unwrap();
+    assert_eq!(f.warmup, 15);
+    assert_eq!(f.nan_rows, 15);
+    assert_eq!(f.first_finite_row, Some(15));
+    assert_eq!(f.first_finite_time, Some(15 * 900));
+    assert!((f.prevalence - 105.0 / 120.0).abs() <= 1e-12);
+    let json = report.json();
+    assert!(json.contains("\"prevalence\":0.875"), "json: {json}");
+    assert!(json.contains("\"first_finite_iso\":\"1970-01-01T03:45:00Z\""), "json: {json}");
+    let text = report.text_lines().join("\n");
+    assert!(text.contains("# enrich-feature: name=clv16 warmup=15 nan_rows=15 prevalence=0.875000"));
+    assert!(text.contains("first_finite_iso=1970-01-01T03:45:00Z"));
+}
+
+
+
 /// The complete engine feature-bucket inventory: every name in
 /// `enrich::engine_names()` is registered `available:true` with a real family,
 /// exact formula and warm-up, and the union command emits exactly those names,
@@ -2028,7 +2455,14 @@ fn engine_inventory_is_complete_available_and_runs() {
         assert!(e.warmup <= n, "{name} warm-up {} exceeds the fixture", e.warmup);
     }
     for f in &report.features {
-        assert!(f.nan_rows < report.rows, "{} is NaN on every row", f.name);
+        if f.name.starts_with("xs_rank_") || matches!(f.name.as_str(), "mkt_r16" | "mkt_r96" | "mkt_vol96") {
+            // #273 market state and ranks require 20 point-in-time members;
+            // this two-symbol engine inventory cannot produce one. The
+            // dedicated 20-member family test covers the finite path.
+            assert_eq!(f.nan_rows, report.rows, "{} must need 20 members", f.name);
+        } else {
+            assert!(f.nan_rows < report.rows, "{} is NaN on every row", f.name);
+        }
     }
     let schema = rcsr::schema::json();
     assert!(
@@ -2217,3 +2651,4 @@ fn engine_inventory_is_causal_on_a_prefix() {
         }
     }
 }
+

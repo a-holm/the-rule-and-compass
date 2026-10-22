@@ -383,7 +383,7 @@ atomically instead of streaming it. See
   a next-open forward label with symmetric cost. See
   [`docs/ohlcv.md`](docs/ohlcv.md).
 * **Incremental feature enrichment**: `rcsr enrich --data old.rcsb --out
-  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc`
+  new.rcsb --features returns,ma,vol,atr,rsi,bollinger,vz,range,candle,donchian,calendar,lags,xs,btc,cross,mtf`
   appends pre-computed columns without rebuilding rows: existing value/code
   blocks are copied byte for byte, dtypes and dictionaries survive, a duplicate
   name needs an explicit `--replace`, and every change is chunk-size stable.
@@ -393,21 +393,26 @@ atomically instead of streaming it. See
   subset at the 15 m base, the `flow` group materialises `vwap` plus the nine
   derived OHLCV/flow columns (taker ratios, trade intensity, average trade
   size, Amihud illiquidity, zero-return share, OBV z-score, CVD proxy and VWAP
-  deviation) with the documented zero-volume/zero-trade and gap policies, and
-  the `mtf` group emits all 36 multi-timeframe columns
+  deviation) with the documented zero-volume/zero-trade and gap policies, the
+  `mtf` group emits all 36 multi-timeframe columns
   (`mtf_<1h|4h|1d>_<leaf>`), joined only after the higher bar has closed with
-  explicit `bar_age` staleness, and the `price_action` group adds the
-  continuous candle geometry and multi-bar structure of #261 (`clv16 body16
-  rng_atr prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4
-  trend96`; `batr` is shared with `compact`) with strict zero-range/zero-volume
-  and gap masks. The default financial feature set is registered in
-  `rcsr schema` (`feature_registry`): every available column has a tested
-  producer, and registered-but-unavailable market-state and
-  derivative columns fail closed with the missing dependency instead of being
-  silently dropped. The `engine_catalogue` block enumerates all 254 engine
-  names (216 in `all,py15m,ta:full,exotic:cheap,cross:btc` plus 38
-  compact-only names) with family, warm-up, availability, exact formula and the
-  explicit canonical mapping for every name shared by several groups. The CPU path is always available; a per-family cost model
+  explicit `bar_age` staleness, the `price_action` group adds the continuous
+  candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
+  prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
+  `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
+  masks, and the `cross` group adds the complete #273 BTC/ETH benchmark
+  context, equal-weight market state, breadth, dispersion, average-correlation
+  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. The
+  default financial feature set is registered in `rcsr schema`
+  (`feature_registry`): every available column has a tested producer, and
+  registered-but-unavailable derivative columns fail closed with the missing
+  dependency instead of being silently dropped. The `engine_catalogue` block
+  enumerates all 254 engine names (216 in
+  `all,py15m,ta:full,exotic:cheap,cross:btc` plus 38 compact-only names) with
+  family, warm-up, availability, exact formula and the explicit canonical
+  mapping for every name shared by several groups. The CPU path is always
+  available; a per-family cost model
+
   decides CPU vs GPU and records the reason, GPU builds upload the source
   columns once and report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the
