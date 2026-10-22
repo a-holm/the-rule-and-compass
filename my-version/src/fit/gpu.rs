@@ -456,6 +456,22 @@ mod tests {
         fn fit_batch(&self, trees: &[Node], _: &[Vec<f64>], _: &[f64], _: &[f64], _: usize) -> Vec<Option<Vec<f64>>> {
             trees.iter().map(|_| self.proposal.clone()).collect()
         }
+
+        /// #228: a backend that claims to answer a metric must answer it
+        /// explicitly. The default declines every non-squared metric (pinned by
+        /// `a_squared_proposal_is_never_accepted_for_signed_by_default`), so the
+        /// test double overrides it exactly like a real device backend does.
+        fn fit_batch_metric(
+            &self,
+            trees: &[Node],
+            _: &[Vec<f64>],
+            _: &[f64],
+            _: &[f64],
+            _: usize,
+            _: Metric,
+        ) -> Vec<Option<Vec<f64>>> {
+            trees.iter().map(|_| self.proposal.clone()).collect()
+        }
     }
 
     #[test]

@@ -404,6 +404,11 @@ The GPU never produces a number a user reads. The kernel accumulates one
 **configured objective** per row; the search divides that by the row count and
 uses it as the fitness. Today the device has two native objectives:
 
+`--metric signed` is not one of them and is refused for an explicit
+`--fit-strategy gpu`: its exact arm is the host-side projection of #228
+(the fit section below), while the *ranking* would still need a native
+signed scorer on the device (#236).
+
 | `--metric` | device objective per row | status |
 |---|---|---|
 | `squared` | `r²` | exact objective (up to `f32`) |
@@ -1132,6 +1137,70 @@ non-convex risk the note pre-registered — the GPU landing in a different basin
 from the CPU on heavy tails — is asserted only per fixture
 (`gpu ≤ cpu × (1+1e-6)`), not measured over a corpus; graduated non-convexity
 for finalists is the follow-up.
+
+`--metric signed` is not one of them and is refused for an explicit
+`--fit-strategy gpu`: its exact arm is the host-side projection of #228
+(the fit section below), while the *ranking* would still need a native
+signed scorer on the device (#236).
+
+### Metric-aware verification and the signed arm (#228)
+
+`fit/gpu.rs` judges every proposal on the **configured** objective (the #229
+change), and since #228 it also guarantees *where the proposal came from*:
+
+* `BatchedFitter::fit_batch_metric` receives the metric. Its default
+  implementation delegates for the squared family (`squared`, `aic`, `aicc`,
+  `bic`) and returns `None` for every other metric, so a backend that only knows
+  squared error can never answer `signed`, `absolute`, `median`, `maximum`,
+  `correlation`, … . `BatchedGpu` overrides it with the device loss registry
+  (`fit::fit_loss`) plus the signed warm start below.
+* `verify_proposal` completes a `signed` proposal with the exact `f64`
+  constrained-LS projection (`fit::signed_projection`) **before** comparing, and
+  accepts only when the achieved `|Σ wᵢ rᵢ| / Σ wᵢ` is finite, no worse, and
+  either certified on the manifold or strictly better. A model that cannot move
+  the mean is labelled `not_identifiable` and keeps its constants — never
+  accepted on an equal objective, which would be a squared answer in disguise.
+* Statuses stay labelled: `gpu`, `unsupported`, `non_finite`, `worse`,
+  `not_identifiable`, `no_backend`.
+
+`BatchedGpu` is the CUDA LM kernel as a `BatchedFitter`; it fits on the
+evaluator's resident `f64` rows (and the resident weights) and returns the
+kernel's status-0 proposals. For `signed` those constants are only the **warm
+start**: the host projection decides, exactly as `docs/optimisation.md` §3.0.1
+describes. That is deliberate — the projection is two passes on `p` constants
+and must be exact `f64`, so putting it on the device could only add rounding,
+not speed on the row sweep the kernel has already paid for.
+
+**The search still keeps `--metric signed` off the device.** An explicit
+`--fit-strategy gpu --metric signed` is a usage error (`gpu_fit_metric_error`),
+because `fit::fit_loss` is `None` for it: the fit could be warmed up on the
+device, but the per-generation ranking would fall back to MSE, which is exactly
+what #236's gate forbids. `tests/gpu_fit.rs::signed_arm_projects_the_device_proposal_exactly`
+exercises the device-warm-start arm directly against the real kernel; the search
+path opens when a native signed loss lands.
+
+**Cost model.** With `n` rows and `p` constants a signed CPU fit costs `iters`
+LM assemblies plus `min(iters,12)·p·6` polish evaluations (each a full row
+sweep); the projection replaces the second term with **two** assemblies (one per
+round, one round for affine trees) plus an `O(p³)` factorisation and two `O(p²)`
+substitutions:
+
+```text
+T_cpu_signed   ≈ (iters + 48·p) · n · c_sweep
+T_projected    ≈ (iters + 1)  · n · c_sweep + O(p³)
+```
+
+Measured on the shared development machine (`signed_cost_model`,
+`n = 20 000`, `--fit-iters 8`, the polish cost taken from a metric that still
+runs it on the same tree — indicative, not a quiet box): `signed`
+22.9 / 70.1 / 125.3 / 238.6 ms against the polish path's
+44.5 / 230.3 / 824.6 / 3 648.3 ms at `p = 2 / 3 / 4 / 8`
+(1.9× / 3.3× / 6.6× / 15.3×), of which the projection itself is
+4.7 / 6.4 / 11.2 / 56.8 ms. Bias `before → after` on the same fixtures:
+`5.85e-13 → 1.28e-16` (p=2), unchanged at `~1e-16` where the squared fit was
+already feasible (p=3, 4), and `4.37e-4 → 1.08e-8` (p=8, near-collinear basis,
+`not_converged` — two rounds did not certify, and the polish it replaces cost
+15× the arm and left the bias at `4.37e-4`).
 
 ## The DGX Spark path
 
