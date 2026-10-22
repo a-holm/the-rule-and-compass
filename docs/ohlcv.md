@@ -249,19 +249,44 @@ expanded panel. It is the union of:
 
 * the raw OHLCV/flow fields (`open high low close volume quote_volume trades
   taker_buy_base taker_buy_quote`) and identity/quality fields;
-* every engine column above (`all` + `py15m` + the #125 groups), currently 216
-  distinct names;
-* the compact 52-name regression subset;
+* every engine column above (`all` + `py15m` + the #125 groups + `cross:btc`),
+  currently **216** distinct names in the catalogue command
+  `--features all,py15m,ta:full,exotic:cheap,cross:btc`;
+* the compact 52-name regression subset; 38 of its names are not in that
+  catalogue command, so the complete engine inventory is **254** names
+  (`enrich::engine_names()`), emitted by the same command plus `compact`;
 * the 36 multi-timeframe columns (`--features mtf`), which are
   `available:true` with a tested causal join;
 * cross-sectional market-state/rank and reserved derivative columns, which
   remain `available:false` with an explicit dependency.
 
-`rcsr schema` prints `feature_registry`, one object per column with `name`,
-`family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
-`formula_sha256`, `source`, `pit` and, when unavailable, `reason`. Unknown names
-remain hard errors; a registered-but-unavailable name fails with its missing
-dependency, never an empty column.
+`rcsr schema` prints two machine-readable inventories. `engine_catalogue`
+contains every engine name with `family`, `warmup`, `available` and its exact
+`formula`, plus `shared_names` mapping every cross-group name to its one
+canonical producer. `feature_registry` contains one object per default-set
+column with `name`, `family`, `timeframe`, `warmup`, `available`, `derived`,
+`formula`, `formula_sha256`, `source`, `pit` and, when unavailable, `reason`.
+Unknown names remain hard errors; a registered-but-unavailable name fails with
+its missing dependency, never an empty column. Adding a compact-only engine name
+to the registry does not remove it from `engine_catalogue`; runtime projection is
+the only way a requested column is omitted.
+
+Every engine formula has one name and one definition. The cross-group names are
+registered explicitly, not left to group order:
+
+| name | canonical implementation |
+|---|---|
+| `rsi14`, `mfi14`, `cmf20`, `adx14`, `clv1`, `don96`, `macd_hist` | compact definition |
+| `vwap_dev96`, `obv_z96`, `taker_ratio96`, `taker_imb16`, `trade_intensity96` | flow (#270) quote-volume definition |
+| `bb20_bw` | `4*sd20/SMA20` (standalone and `py15m` share it) |
+| `natr14` | `100*ATR14/C` (the #125 and compact producers agree) |
+
+The #125 (`ta:*`, `exotic:cheap`, `candle:geometry`, `cross:btc`) engine names
+obey the same gap policy as the rest of the catalogue: a one-bar return across a
+hole is `NaN`, every rolling window whose span is not contiguous is `NaN`, and
+`open_gap1`/`cross_ret1`/`cross_beta20` are missing across the boundary. This is
+tested by `engine_feature_groups_are_gap_masked` and
+`engine_inventory_is_causal_on_a_prefix`.
 
 The compact profile is computed by one 15 m reference pass. Every window is
 trailing, inclusive of `t`, and gap-masked; Wilder/EMA state restarts after a

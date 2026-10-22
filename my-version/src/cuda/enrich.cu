@@ -495,7 +495,10 @@ __global__ void k_rsi_py(const long long *__restrict__ t, const double *__restri
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         double delta = 0.0;
-        if (p > 0 && isfinite(close[i]) && isfinite(close[i - 1])) {
+        if (p > 0 && t[i] - t[i - 1] != (long long)step) {
+            /* The close-to-close move spans the hole; it is missing, not zero. */
+            delta = NAN;
+        } else if (p > 0 && isfinite(close[i]) && isfinite(close[i - 1])) {
             delta = close[i] - close[i - 1];
         }
         d[i] = delta;
@@ -584,7 +587,8 @@ __global__ void k_label(const long long *__restrict__ t, const double *__restric
             for (int j = lo; j <= p; ++j) {
                 int k = start + j;
                 double r = NAN;
-                if (j > 0 && close[k] > 0.0 && close[k - 1] > 0.0) {
+                bool gap_r = j > 0 && (t[k] - t[k - 1] != (long long)step);
+                if (j > 0 && !gap_r && close[k] > 0.0 && close[k - 1] > 0.0) {
                     r = log(close[k] / close[k - 1]);
                 }
                 if (!isfinite(r)) {

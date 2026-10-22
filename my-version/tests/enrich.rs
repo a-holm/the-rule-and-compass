@@ -41,6 +41,30 @@ fn bars(symbol: &str, n: usize, start: i64, step: i64) -> Vec<(i64, String, f64,
         .collect()
 }
 
+/// A two-sided price series: a monotonic ramp would leave RSI/MFI undefined
+/// because every close-to-close move is a gain.
+fn wavy_rows(
+    symbol: &str,
+    n: usize,
+    start: i64,
+    step: i64,
+    phase: f64,
+) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    (0..n)
+        .map(|i| {
+            let t = i as f64;
+            let p = 100.0 + 5.0 * (t * 0.37 + phase).sin() + 0.02 * t;
+            let o = p + 0.4 * (t * 0.11 + phase).cos();
+            let c = p + 0.5 * (t * 0.7).sin();
+            let h = o.max(c) + 0.8 + (i % 5) as f64 * 0.03;
+            let l = o.min(c) - 0.7 - (i % 3) as f64 * 0.02;
+            let v = 10.0 + (i % 7) as f64 + 0.01 * t;
+            (start + i as i64 * step, symbol.to_string(), o, h, l, c, v)
+        })
+        .collect()
+}
+
+
 fn write_store(path: &str, rows: &[(i64, String, f64, f64, f64, f64, f64)], group_rows: usize) {
     let refs: Vec<(i64, &str, f64, f64, f64, f64, f64)> =
         rows.iter().map(|(t, s, o, h, l, c, v)| (*t, s.as_str(), *o, *h, *l, *c, *v)).collect();
@@ -2384,4 +2408,247 @@ fn enrich_report_lists_prevalence_and_first_finite_date() {
     assert!(text.contains("first_finite_iso=1970-01-01T03:45:00Z"));
 }
 
+
+
+/// The complete engine feature-bucket inventory: every name in
+/// `enrich::engine_names()` is registered `available:true` with a real family,
+/// exact formula and warm-up, and the union command emits exactly those names,
+/// once, through real producers.
+#[test]
+fn engine_inventory_is_complete_available_and_runs() {
+    let dir = tmp_dir("engine_inventory");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let n = 3200usize;
+    let mut rows = wavy_rows("AAA", n, 0, 900, 0.0);
+    rows.extend(wavy_rows("BTCUSDT", n, 0, 900, 1.3));
+    write_store_with_flow(&src, &rows, 128);
+
+    let engine = enrich::engine_names();
+    let catalogue = enrich::catalogue_names();
+    assert_eq!(catalogue.len(), 216, "the #271 catalogue command count");
+    assert_eq!(engine.len(), 254, "the full engine inventory incl. compact-only names");
+    assert!(engine.len() > catalogue.len());
+    assert_eq!(
+        enrich::expand("all,py15m,ta:full,exotic:cheap,cross:btc,compact").unwrap(),
+        engine,
+        "the advertised command must resolve to the engine inventory"
+    );
+
+    let report = enrich::build(&opts(
+        &src,
+        &out,
+        "all,py15m,ta:full,exotic:cheap,cross:btc,compact",
+    ))
+    .unwrap();
+    assert_eq!(report.features.len(), engine.len(), "emitted vs registry count");
+    let reg = enrich::default_registry();
+    for name in &engine {
+        let e = reg
+            .iter()
+            .find(|e| e.name == *name)
+            .unwrap_or_else(|| panic!("{name} has no registry entry"));
+        assert!(e.available, "{name} must be available:true");
+        assert_eq!(e.timeframe, "15m", "{name} timeframe");
+        assert_ne!(e.family, "other", "{name} has no engine family");
+        assert_ne!(e.formula, "see docs/ohlcv.md", "{name} has no exact formula");
+        assert!(e.warmup <= n, "{name} warm-up {} exceeds the fixture", e.warmup);
+    }
+    for f in &report.features {
+        if f.name.starts_with("xs_rank_") || matches!(f.name.as_str(), "mkt_r16" | "mkt_r96" | "mkt_vol96") {
+            // #273 market state and ranks require 20 point-in-time members;
+            // this two-symbol engine inventory cannot produce one. The
+            // dedicated 20-member family test covers the finite path.
+            assert_eq!(f.nan_rows, report.rows, "{} must need 20 members", f.name);
+        } else {
+            assert!(f.nan_rows < report.rows, "{} is NaN on every row", f.name);
+        }
+    }
+    let schema = rcsr::schema::json();
+    assert!(
+        schema.contains(&format!("\"engine_catalogue\":{{\"count\":{}", engine.len())),
+        "schema does not record the engine inventory count"
+    );
+    for name in &engine {
+        assert!(schema.contains(&format!("\"name\":\"{}\"", name)), "{name} absent from schema");
+    }
+
+    // Representative hand-computed formulas for every engine family. The
+    // compact/py15m parity fixtures cover the full 52/35 sets separately.
+    let close: Vec<f64> = rows.iter().take(n).map(|r| r.5).collect();
+    let high: Vec<f64> = rows.iter().take(n).map(|r| r.3).collect();
+    let low: Vec<f64> = rows.iter().take(n).map(|r| r.4).collect();
+    let vol: Vec<f64> = rows.iter().take(n).map(|r| r.6).collect();
+    let t: Vec<i64> = rows.iter().take(n).map(|r| r.0).collect();
+    let mut lr = vec![f64::NAN; n];
+    for i in 1..n {
+        lr[i] = (close[i] / close[i - 1]).ln();
+    }
+    let i = n - 1;
+    let mean = |x: &[f64]| x.iter().sum::<f64>() / x.len() as f64;
+    let std_pop = |x: &[f64]| {
+        let m = mean(x);
+        (x.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / x.len() as f64).sqrt()
+    };
+    let check = |name: &str, want: f64| {
+        let got = column(&out, name)[i];
+        let a = (got - want).abs();
+        let r = a / want.abs().max(1e-300);
+        assert!(
+            a <= 1e-10 || r <= 1e-10,
+            "{name}: got {got}, expected {want}, abs {a:e} rel {r:e}"
+        );
+    };
+    check("r1", (close[i] / close[i - 1]).ln());
+    check("r5", (close[i] / close[i - 5]).ln());
+    check("r120", (close[i] / close[i - 120]).ln());
+    check("ma20", close[i] / mean(&close[i - 19..=i]) - 1.0);
+    check("vol20", std_pop(&lr[i - 19..=i]));
+    check("bb20_z", (close[i] - mean(&close[i - 19..=i])) / std_pop(&close[i - 19..=i]));
+    check("bb20_bw", 4.0 * std_pop(&close[i - 19..=i]) / mean(&close[i - 19..=i]));
+    let logv: Vec<f64> = vol.iter().map(|v| (1.0 + v).ln()).collect();
+    check(
+        "vz96",
+        (logv[i] - mean(&logv[i - 95..=i])) / std_pop(&logv[i - 95..=i]),
+    );
+    let lo20 = low[i - 19..=i].iter().fold(f64::INFINITY, |a, b| a.min(*b));
+    let hi20 = high[i - 19..=i].iter().fold(f64::NEG_INFINITY, |a, b| a.max(*b));
+    check("don20", (close[i] - lo20) / (hi20 - lo20));
+    check("lag_r1_3", lr[i - 3]);
+    check("rmean5", mean(&lr[i - 4..=i]));
+    check("rstd5", std_pop(&lr[i - 4..=i]));
+    let m = mean(&lr[i - 19..=i]);
+    let sd = std_pop(&lr[i - 19..=i]);
+    check("skew20", lr[i - 19..=i].iter().map(|v| ((v - m) / sd).powi(3)).sum::<f64>() / 20.0);
+    check(
+        "kurt20",
+        lr[i - 19..=i].iter().map(|v| ((v - m) / sd).powi(4)).sum::<f64>() / 20.0 - 3.0,
+    );
+    check("close_pos20", (close[i] - lo20) / (hi20 - lo20));
+    check("range1", (high[i] - low[i]) / close[i]);
+    let day_frac = t[i].rem_euclid(86_400) as f64 / 86_400.0;
+    check("hour_sin", (2.0 * std::f64::consts::PI * day_frac).sin());
+    let wd = rcsr::ohlcv::weekday(t[i].div_euclid(86_400)) as f64;
+    check("dow_sin", (2.0 * std::f64::consts::PI * wd / 7.0).sin());
+}
+
+/// A name shared by several groups has exactly one canonical value, whichever
+/// specification requested it.
+#[test]
+fn engine_shared_names_have_one_canonical_value() {
+    let dir = tmp_dir("engine_aliases");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let mut rows = bars("AAA", 400, 0, 900);
+    rows.extend(bars("BTCUSDT", 400, 0, 900));
+    write_store_with_flow(&src, &rows, 64);
+
+    let pairs = [
+        ("rsi14", "compact,py15m,ta:full,rsi"),
+        ("mfi14", "compact,py15m,ta:full"),
+        ("cmf20", "compact,ta:full"),
+        ("adx14", "compact,py15m,ta:full"),
+        ("clv1", "compact,candle,all"),
+        ("don96", "compact,donchian,all"),
+        ("macd_hist", "compact,py15m"),
+        ("vwap_dev96", "flow,py15m,compact"),
+        ("obv_z96", "flow,py15m"),
+        ("taker_ratio96", "compact,flow"),
+        ("taker_imb16", "compact,flow"),
+        ("trade_intensity96", "compact,flow"),
+        ("bb20_bw", "bollinger,py15m"),
+        ("natr14", "atr,compact,ta:full"),
+    ];
+    for (name, groups) in pairs {
+        let a_out = dir.join(format!("{name}-solo.rcsb")).to_string_lossy().into_owned();
+        let b_out = dir.join(format!("{name}-group.rcsb")).to_string_lossy().into_owned();
+        enrich::build(&opts(&src, &a_out, name)).unwrap();
+        enrich::build(&opts(&src, &b_out, groups)).unwrap();
+        let a = column(&a_out, name);
+        let b = column(&b_out, name);
+        for i in 0..a.len() {
+            assert_eq!(a[i].is_nan(), b[i].is_nan(), "{name} NaN mask differs at {i}");
+            if a[i].is_finite() {
+                let d = (a[i] - b[i]).abs();
+                assert!(
+                    d <= 1e-12 || d / a[i].abs().max(1e-300) <= 1e-12,
+                    "{name} at {i}: solo {a:?} group {b:?}",
+                    a = a[i],
+                    b = b[i]
+                );
+            }
+        }
+    }
+}
+
+/// #125 engine names that are not compact also obey the same gap policy as the
+/// rest of the catalogue: a return or window spanning a hole is NaN.
+#[test]
+fn engine_feature_groups_are_gap_masked() {
+    let dir = tmp_dir("engine_gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let gap = 450i64;
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for symbol in ["AAA", "BTCUSDT"] {
+        let base = if symbol == "AAA" { 100.0 } else { 200.0 };
+        for i in 0..900i64 {
+            let t = if i < gap { i * 900 } else { (i + 5) * 900 };
+            let p = base + (i as f64 * 0.23).sin() * 2.0 + i as f64 * 0.01;
+            rows.push((t, symbol.to_string(), p, p + 0.3, p - 0.4, p + 0.1, 10.0 + i as f64));
+        }
+    }
+    write_store_with_flow(&src, &rows, 64);
+    let spec = "ret1,ret5,open_gap1,ma20_ratio,ma60_ratio,bb20_z,vol20_ratio,cmf20,mfi14,\
+                vwap20_dev,rmean5,rstd5,skew20,kurt20,close_pos20,cross_ret1,cross_beta20,\
+                atr14,rsi14,adx14,don20,lag_r1_3";
+    enrich::build(&opts(&src, &out, spec)).unwrap();
+    for segment in 0..2usize {
+        let start = segment * 900 + gap as usize;
+        let after = start + 70;
+        for name in spec.split(',') {
+            let v = column(&out, name);
+            assert!(v[start].is_nan(), "{name} bridged the gap at row {start}");
+            assert!(v[after].is_finite(), "{name} did not recover after the gap");
+        }
+    }
+}
+
+/// The whole engine inventory is causal on a prefix: truncating the store never
+/// changes an earlier row.
+#[test]
+fn engine_inventory_is_causal_on_a_prefix() {
+    let dir = tmp_dir("engine_causal");
+    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let prefix_out = dir.join("prefix_out.rcsb").to_string_lossy().into_owned();
+    let n = 3400usize;
+    let cut = 3200usize; // per-symbol prefix, long enough for the 2,880-bar window
+    let mut rows = wavy_rows("AAA", n, 0, 900, 0.0);
+    rows.extend(wavy_rows("BTCUSDT", n, 0, 900, 1.3));
+    let mut short = wavy_rows("AAA", cut, 0, 900, 0.0);
+    short.extend(wavy_rows("BTCUSDT", cut, 0, 900, 1.3));
+    write_store_with_flow(&full, &rows, 128);
+    write_store_with_flow(&prefix, &short, 128);
+    let spec = "all,py15m,ta:full,exotic:cheap,cross:btc,compact";
+    enrich::build(&opts(&full, &full_out, spec)).unwrap();
+    enrich::build(&opts(&prefix, &prefix_out, spec)).unwrap();
+    let input_names = FileStore::open(&full).unwrap().header().names();
+    let names = FileStore::open(&full_out).unwrap().header().names();
+    for name in names.iter().skip(input_names.len()) {
+        let a = column(&full_out, name);
+        let b = column(&prefix_out, name);
+        for i in 0..cut {
+            assert_eq!(a[i].is_nan(), b[i].is_nan(), "{name} NaN pattern differs at {i}");
+            if a[i].is_finite() {
+                assert!(
+                    (a[i] - b[i]).abs() <= 1e-12,
+                    "{name} at {i}: full {} prefix {}",
+                    a[i],
+                    b[i]
+                );
+            }
+        }
+    }
+}
 

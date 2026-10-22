@@ -21,6 +21,27 @@
 
 use crate::ohlcv::{label_gap_mask, window_gap_mask, Bar, Timeframe};
 
+/// True when the `bars` rows ending at `i` form one contiguous run at the
+/// timeframe spacing. A window that spans a missing bucket is never valid.
+fn contiguous(times: &[i64], i: usize, bars: usize, tf: Timeframe) -> bool {
+    if bars == 0 {
+        return true;
+    }
+    if i + 1 < bars {
+        return false;
+    }
+    times[i + 1 - bars] == times[i] - (bars as i64 - 1) * tf.seconds()
+}
+
+/// Mask every value whose lookback window is not contiguous.
+fn mask_window(v: &mut [f64], times: &[i64], tf: Timeframe, bars: usize) {
+    for (i, x) in v.iter_mut().enumerate() {
+        if !contiguous(times, i, bars, tf) {
+            *x = f64::NAN;
+        }
+    }
+}
+
 /// One computed feature column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeatureColumn {
@@ -134,10 +155,12 @@ fn known(name: &str) -> bool {
         || calendar_names().contains(&name.to_string())
 }
 
-fn returns(bars: &[Bar]) -> Vec<f64> {
-    let mut r = vec![f64::NAN; bars.len()];
-    for i in 1..bars.len() {
-        if bars[i - 1].close > 0.0 && bars[i].close > 0.0 {
+fn returns(bars: &[Bar], tf: Timeframe) -> Vec<f64> {
+    let n = bars.len();
+    let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
+    let mut r = vec![f64::NAN; n];
+    for i in 1..n {
+        if contiguous(&times, i, 2, tf) && bars[i - 1].close > 0.0 && bars[i].close > 0.0 {
             r[i] = (bars[i].close / bars[i - 1].close).ln();
         }
     }
@@ -338,7 +361,7 @@ pub fn compute_with_cross(
 ) -> Result<Vec<FeatureColumn>, String> {
     let n = bars.len();
     let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
-    let rets = returns(bars);
+    let rets = returns(bars, tf);
     let mut out = Vec::new();
     for name in specs {
         let (values, warmup) = match name.as_str() {
@@ -346,7 +369,10 @@ pub fn compute_with_cross(
             "ret5" => {
                 let mut v = vec![f64::NAN; n];
                 for i in 5..n {
-                    if bars[i - 5].close > 0.0 && bars[i].close > 0.0 {
+                    if contiguous(&times, i, 6, tf)
+                        && bars[i - 5].close > 0.0
+                        && bars[i].close > 0.0
+                    {
                         v[i] = (bars[i].close / bars[i - 5].close).ln();
                     }
                 }
@@ -361,6 +387,7 @@ pub fn compute_with_cross(
                         v[i] = bars[i].close / m - 1.0;
                     }
                 }
+                mask_window(&mut v, &times, tf, w);
                 (v, w)
             }
             "bb20_z" => {
@@ -372,6 +399,7 @@ pub fn compute_with_cross(
                         v[i] = (bars[i].close - m) / s;
                     }
                 }
+                mask_window(&mut v, &times, tf, 20);
                 (v, 20)
             }
             "atr14" | "natr14" => {
@@ -445,10 +473,19 @@ pub fn compute_with_cross(
                         v[i] = bars[i].volume / m;
                     }
                 }
+                mask_window(&mut v, &times, tf, 20);
                 (v, 20)
             }
-            "cmf20" => ((0..n).map(|i| cmf(bars, i, 20)).collect(), 20),
-            "mfi14" => ((0..n).map(|i| mfi(bars, i, 14)).collect(), 15),
+            "cmf20" => {
+                let mut v: Vec<f64> = (0..n).map(|i| cmf(bars, i, 20)).collect();
+                mask_window(&mut v, &times, tf, 20);
+                (v, 20)
+            }
+            "mfi14" => {
+                let mut v: Vec<f64> = (0..n).map(|i| mfi(bars, i, 14)).collect();
+                mask_window(&mut v, &times, tf, 15);
+                (v, 15)
+            }
             "vwap20_dev" => {
                 let mut v = vec![f64::NAN; n];
                 for i in 0..n {
@@ -464,6 +501,7 @@ pub fn compute_with_cross(
                         }
                     }
                 }
+                mask_window(&mut v, &times, tf, 20);
                 (v, 20)
             }
             "rmean5" | "rstd5" => {
@@ -516,6 +554,7 @@ pub fn compute_with_cross(
                         v[i] = (bars[i].close - lo) / (hi - lo);
                     }
                 }
+                mask_window(&mut v, &times, tf, 20);
                 (v, 20)
             }
             "body1" | "upper_wick1" | "lower_wick1" | "open_gap1" => {
@@ -531,7 +570,7 @@ pub fn compute_with_cross(
                         "upper_wick1" => (b.high - b.open.max(b.close)) / range,
                         "lower_wick1" => (b.open.min(b.close) - b.low) / range,
                         _ => {
-                            if i == 0 || bars[i - 1].close <= 0.0 {
+                            if i == 0 || bars[i - 1].close <= 0.0 || !contiguous(&times, i, 2, tf) {
                                 f64::NAN
                             } else {
                                 b.open / bars[i - 1].close - 1.0
@@ -568,7 +607,7 @@ pub fn compute_with_cross(
                         },
                     );
                     if let (Some(c), Some(p)) = (c, p) {
-                        if c > 0.0 && p > 0.0 {
+                        if c > 0.0 && p > 0.0 && contiguous(&times, i, 2, tf) {
                             ri[i] = (c / p).ln();
                         }
                     }
@@ -595,6 +634,7 @@ pub fn compute_with_cross(
                             }
                         }
                     }
+                    mask_window(&mut v, &times, tf, 21);
                 }
                 (v, 21)
             }
@@ -726,7 +766,7 @@ pub fn forward_label(bars: &[Bar], tf: Timeframe, spec: &LabelSpec) -> LabelColu
     let n = bars.len();
     let times: Vec<i64> = bars.iter().map(|b| b.time).collect();
     let gap = label_gap_mask(&times, tf, spec.horizon);
-    let rets = returns(bars);
+    let rets = returns(bars, tf);
     let cost = 2.0 * spec.cost_bps / 10_000.0;
     let mut values = vec![f64::NAN; n];
     let mut gap_rows = 0usize;
