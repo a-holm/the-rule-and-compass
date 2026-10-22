@@ -77,6 +77,7 @@ pub const GROUPS: &[&str] = &[
     "mtf",
     "compact",
     "flow",
+    "price_action",
     "all",
 ];
 
@@ -214,8 +215,12 @@ fn mtf_formula(leaf: &str) -> &'static str {
     }
 }
 
-/// Candle/price-action columns from the default set that do not yet have an
-/// enrich producer. The raw bars are available; the producer is the gap.
+/// The complete default candle/price-action block required by issue #261.
+///
+/// `batr` is materialised by the compact profile (and shares that one
+/// implementation); the other eleven are produced by [`price_action_all`] at
+/// the 15 m base. The compact candle subset is the parity/regression half:
+/// `clv1 clv4 body1 batr wasym1 lower_wick rng1 volrat gapatr don96`.
 pub const PRICE_ACTION_NAMES: &[&str] = &[
     "clv16",
     "body16",
@@ -292,6 +297,60 @@ pub const CROSS_RANK_NAMES: &[&str] = &[
 
 /// Older market-state names registered by #260/#269. They are aliases of the
 /// canonical #273 producers, not a second implementation.
+
+/// The twelve default continuous/structure columns (issue #261). `batr` is the
+/// only name shared with the compact candle subset.
+pub const DEFAULT_CANDLE_NAMES: &[&str] = &[
+    "clv16",
+    "body16",
+    "batr",
+    "rng_atr",
+    "prev_range_pos",
+    "inside_s",
+    "outside_s",
+    "engulf_s",
+    "harami_s",
+    "run8",
+    "nr4",
+    "trend96",
+];
+
+pub fn price_action_names() -> Vec<String> {
+    PRICE_ACTION_NAMES.iter().map(|s| s.to_string()).collect()
+}
+
+fn price_action_formula(name: &str) -> &'static str {
+    match name {
+        "clv16" => "mean((C-L)/(H-L) - 1/2, 16); NaN on R=0 or a gap in the window",
+        "body16" => "mean((C-O)/(H-L), 16); NaN on R=0 or a gap in the window",
+        "rng_atr" => "(H-L)/ATR14; NaN when ATR14<=0 or the bar is invalid",
+        "prev_range_pos" => "(C_t-L_{t-1})/R_{t-1} - 1/2; NaN when t-1 is missing or R_{t-1}=0",
+        "inside_s" => "relu(1-relu(H_t-H_{t-1})/A)*relu(1-relu(L_{t-1}-L_t)/A)",
+        "outside_s" => "relu(1-relu(H_{t-1}-H_t)/A)*relu(1-relu(L_t-L_{t-1})/A)",
+        "engulf_s" => "signed bullish-minus-bearish continuous engulfing with body-ratio and ATR penetration terms",
+        "harami_s" => "signed opposite-body continuous harami with body shrink and containment terms",
+        "run8" => "clip(consecutive same-sign close changes,-8,8)/8; resets at a gap",
+        "nr4" => "R_t/min(R_{t-3..t}); NaN unless four contiguous bars have R>0",
+        "trend96" => "C/SMA96 - 1; NaN unless the 96-bar window is contiguous",
+        _ => "see docs/ohlcv.md",
+    }
+}
+
+fn price_action_warmup(name: &str) -> usize {
+    match name {
+        "clv16" | "body16" => 15,
+        "rng_atr" => 14,
+        "prev_range_pos" => 1,
+        "inside_s" | "outside_s" | "engulf_s" | "harami_s" => 1,
+        "run8" => 1,
+        "nr4" => 3,
+        "trend96" => 95,
+        _ => 0,
+    }
+}
+
+/// Cross-sectional market-state columns (whole-panel pass).
+
 pub const MARKET_STATE_NAMES: &[&str] = &[
     "mkt_ew_ret1",
     "mkt_ew_ret16",
@@ -410,12 +469,6 @@ pub const DERIVATIVE_NAMES: &[&str] = &[
 
 /// Reason a registered name cannot be computed yet, if it is unavailable.
 pub fn unavailable_reason(name: &str) -> Option<&'static str> {
-    if PRICE_ACTION_NAMES.contains(&name) {
-        return Some(
-            "candle/price-action producer is registered but not implemented in rcsr enrich yet; \
-             the 15m OHLCV bars needed to build it are available",
-        );
-    }
     if DERIVATIVE_NAMES.contains(&name) {
         return Some(
             "no local funding, open-interest, basis, mark-price or liquidation snapshot; \
@@ -628,15 +681,21 @@ pub fn default_registry() -> Vec<RegistryEntry> {
     }
     // Compact subset with exact formulas.
     for name in COMPACT_NAMES {
+        let family = compact_family(name);
+        let source = if family == "candle" || *name == "batr" {
+            "ohlcv::Bar; not a target construction column"
+        } else {
+            "ohlcv::Bar"
+        };
         push_unique(&mut out, RegistryEntry {
             name: name.to_string(),
-            family: compact_family(name),
+            family,
             timeframe: "15m",
             warmup: nominal_warmup(name),
             available: true,
             derived: *name == "wasym1",
             formula: compact_formula(name).to_string(),
-            source: "ohlcv::Bar",
+            source,
             pit: "close of bar t; trailing windows inclusive; gaps are NaN",
             reason: None,
         });
@@ -706,13 +765,14 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             name: name.to_string(),
             family: "price_action",
             timeframe: "15m",
-            warmup: 0,
-            available: false,
+            warmup: price_action_warmup(name),
+            available: true,
             derived: false,
-            formula: "continuous candle/price-action block".to_string(),
-            source: "15m OHLCV bars",
-            pit: "bar t and earlier",
-            reason: unavailable_reason(name).map(|s| s.to_string()),
+            formula: price_action_formula(name).to_string(),
+            source: "15m OHLCV bars; not a target construction column",
+            pit: "close of bar t; trailing windows inclusive; any missing bucket \
+                  or zero-range/zero-volume bar in the window is NaN",
+            reason: None,
         });
     }
     for name in DERIVATIVE_NAMES {
@@ -957,6 +1017,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "mtf" => mtf_names(),
             "compact" => compact_names(),
             "flow" => flow_names(),
+            "price_action" => price_action_names(),
             "all" => {
                 let mut v = Vec::new();
                 for g in [
@@ -1002,6 +1063,7 @@ pub fn is_own(name: &str) -> bool {
         || FLOW_NAMES.contains(&name)
         || is_mtf(name)
         || cross_names().iter().any(|n| n == name)
+        || PRICE_ACTION_NAMES.contains(&name)
     {
         return true;
     }
@@ -1105,6 +1167,9 @@ pub fn nominal_warmup(name: &str) -> usize {
     }
     if cross_names().iter().any(|n| n == name) {
         return cross_warmup(name);
+    }
+    if PRICE_ACTION_NAMES.contains(&name) {
+        return price_action_warmup(name);
     }
     if let Some((_, leaf)) = mtf_parts(name) {
         return mtf_warmup(leaf);
@@ -1231,6 +1296,10 @@ pub struct FeatureReport {
     pub warmup: usize,
     pub nan_rows: usize,
     pub first_finite_row: Option<usize>,
+    /// Epoch seconds of the first finite row, or `None`.
+    pub first_finite_time: Option<i64>,
+    /// Finite rows divided by all rows (`NaN` rows are the complement).
+    pub prevalence: f64,
     pub hash: String,
     pub label: bool,
 }
@@ -1320,6 +1389,25 @@ impl Report {
                 self.peak_rss_bytes as f64 / (1024.0 * 1024.0)
             ),
         ];
+        for f in &self.features {
+            out.push(format!(
+                "# enrich-feature: name={} warmup={} nan_rows={} prevalence={:.6} first_finite_row={} first_finite_time={} first_finite_iso={} label={}",
+                f.name,
+                f.warmup,
+                f.nan_rows,
+                f.prevalence,
+                f.first_finite_row
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                f.first_finite_time
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                f.first_finite_time
+                    .map(format_utc_seconds)
+                    .unwrap_or_else(|| "none".to_string()),
+                f.label
+            ));
+        }
         for p in &self.plans {
             out.push(format!(
                 "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} backend={} reason={}",
@@ -1344,12 +1432,21 @@ impl Report {
             .iter()
             .map(|f| {
                 format!(
-                    "{{\"name\":{},\"warmup\":{},\"nan_rows\":{},\"first_finite_row\":{},\"label\":{},\"sha256\":{}}}",
+                    "{{\"name\":{},\"warmup\":{},\"nan_rows\":{},\"prevalence\":{:.12},\
+                     \"first_finite_row\":{},\"first_finite_time\":{},\"first_finite_iso\":{},\
+                     \"label\":{},\"sha256\":{}}}",
                     jstr(&f.name),
                     f.warmup,
                     f.nan_rows,
+                    f.prevalence,
                     f.first_finite_row
                         .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".to_string()),
+                    f.first_finite_time
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".to_string()),
+                    f.first_finite_time
+                        .map(|v| jstr(&format_utc_seconds(v)))
                         .unwrap_or_else(|| "null".to_string()),
                     f.label,
                     jstr(&f.hash)
@@ -1562,6 +1659,9 @@ pub fn compact_family(name: &str) -> &'static str {
 pub fn family_of(name: &str) -> &'static str {
     if FLOW_NAMES.contains(&name) {
         return "flow";
+    }
+    if PRICE_ACTION_NAMES.contains(&name) {
+        return "price_action";
     }
     if is_compact(name) {
         return compact_family(name);
@@ -2006,6 +2106,47 @@ fn segment_i64(store: &FileStore, seg: &Segment, col: usize, dtype: DType) -> Re
         }
     }
     Ok(out)
+}
+
+/// Read one row of the time column by global row index. Used only after the
+/// feature pass, to turn `first_finite_row` into a timestamp for the report.
+fn time_at_row(
+    store: &FileStore,
+    col: usize,
+    dtype: DType,
+    row: usize,
+) -> Result<i64, String> {
+    let group_rows = store.group_rows();
+    let g = row / group_rows;
+    let within = row % group_rows;
+    if dtype == DType::I64 {
+        let vals = store.read_i64(g, col)?;
+        vals.get(within)
+            .copied()
+            .ok_or_else(|| format!("time row {} is outside store group {}", row, g))
+    } else {
+        let vals = store.read_f64_group(g, col)?;
+        Ok(vals
+            .get(within)
+            .copied()
+            .ok_or_else(|| format!("time row {} is outside store group {}", row, g))?
+            as i64)
+    }
+}
+
+fn format_utc_seconds(ts: i64) -> String {
+    let days = ts.div_euclid(86_400);
+    let rem = ts.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(feature = "cuda")]
@@ -3561,6 +3702,261 @@ fn flow_all(s: &Series) -> BTreeMap<String, Vec<f64>> {
     out
 }
 
+/// A rolling mean that requires every cell of the window to be finite. This is
+/// the strict geometry rule used by `clv16`/`body16`: one zero-range or invalid
+/// bar makes the whole window `NaN` instead of being silently skipped.
+fn rmean_strict(x: &[f64], w: usize, times: &[i64], step: i64) -> Vec<f64> {
+    let n = x.len();
+    let mut out = vec![f64::NAN; n];
+    if w == 0 || n < w {
+        return out;
+    }
+    let p = Prefix::new(x);
+    for i in w - 1..n {
+        if !contig(times, i, w, step) {
+            continue;
+        }
+        let lo = i + 1 - w;
+        if p.count[i + 1] - p.count[lo] != w {
+            continue;
+        }
+        out[i] = (p.sum[i + 1] - p.sum[lo]) / w as f64;
+    }
+    out
+}
+
+fn relu(x: f64) -> f64 {
+    if x.is_finite() {
+        x.max(0.0)
+    } else {
+        f64::NAN
+    }
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x.is_finite() {
+        x.max(0.0).min(1.0)
+    } else {
+        f64::NAN
+    }
+}
+
+/// `relu(x)/(|x|+eps)`: 1 for positive, 0 for negative, 0 at zero.
+fn pos_part(x: f64) -> f64 {
+    if x.is_finite() {
+        relu(x) / (x.abs() + 1e-12)
+    } else {
+        f64::NAN
+    }
+}
+
+fn neg_part(x: f64) -> f64 {
+    if x.is_finite() {
+        relu(-x) / (x.abs() + 1e-12)
+    } else {
+        f64::NAN
+    }
+}
+
+/// Compute the complete default candle/price-action block (#261) for one
+/// symbol, at the 15 m base (or whatever spacing the store uses).
+///
+/// `clv`, `body`, `wasym`, `rng_atr`, `inside_s`, `outside_s`, `engulf_s` and
+/// `harami_s` use **strict** geometry: a bar with `H == L`, a zero-volume bar
+/// (when the store carries volume) or a missing bucket is `NaN`, never `0`.
+/// The compact `clv1`/`body1`/`batr` names keep their documented compact
+/// convention instead, because there is exactly one implementation per name.
+///
+/// Every window is trailing and inclusive of `t`; a window that spans a missing
+/// bucket is `NaN`, and no value bridges a listing, delisting, migration or
+/// outage hole.
+fn price_action_all(s: &Series, b: &Base) -> BTreeMap<String, Vec<f64>> {
+    let n = s.len();
+    let c = &s.close;
+    let o = &s.open;
+    let h = &s.high;
+    let l = &s.low;
+    let v = &s.volume;
+    let times = &s.times;
+    let step = s.step;
+    let atr = wilder_py(&b.tr, 14, &b.gap);
+    let mut out = BTreeMap::new();
+
+    // Strict single-bar geometry. Volume is only a gate when the store carries
+    // the column; an absent volume column is all-NaN here (never a zero-volume
+    // bar), so it must not poison the geometry.
+    let mut clv = vec![f64::NAN; n];
+    let mut body = vec![f64::NAN; n];
+    let mut rng = vec![f64::NAN; n];
+    let mut valid = vec![false; n];
+    for i in 0..n {
+        let volume_ok = !v[i].is_finite() || v[i] > 0.0;
+        let finite = o[i].is_finite()
+            && h[i].is_finite()
+            && l[i].is_finite()
+            && c[i].is_finite();
+        let r = h[i] - l[i];
+        if !finite || !volume_ok || r <= 0.0 {
+            continue;
+        }
+        valid[i] = true;
+        clv[i] = (c[i] - l[i]) / r - 0.5;
+        body[i] = (c[i] - o[i]) / r;
+        rng[i] = r;
+    }
+
+    out.insert("clv16".to_string(), rmean_strict(&clv, 16, times, step));
+    out.insert("body16".to_string(), rmean_strict(&body, 16, times, step));
+    out.insert(
+        "rng_atr".to_string(),
+        (0..n)
+            .map(|i| {
+                if valid[i] && atr[i] > 0.0 {
+                    rng[i] / atr[i]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    // Close inside the previous bar's range, as a centred [0,1] position.
+    let mut prev_range_pos = vec![f64::NAN; n];
+    for i in 1..n {
+        if !valid[i] || !valid[i - 1] || times[i] - times[i - 1] != step {
+            continue;
+        }
+        let r0 = h[i - 1] - l[i - 1];
+        if r0 > 0.0 {
+            prev_range_pos[i] = (c[i] - l[i - 1]) / r0 - 0.5;
+        }
+    }
+    out.insert("prev_range_pos".to_string(), prev_range_pos);
+
+    // Continuous two-bar strengths. Relu penetrations replace hard flags; a
+    // missing or degenerate previous bar is NaN.
+    let mut inside = vec![f64::NAN; n];
+    let mut outside = vec![f64::NAN; n];
+    let mut engulf = vec![f64::NAN; n];
+    let mut harami = vec![f64::NAN; n];
+    for i in 1..n {
+        if !valid[i] || !valid[i - 1] || times[i] - times[i - 1] != step {
+            continue;
+        }
+        let a = atr[i];
+        if !(a.is_finite() && a > 0.0) {
+            continue;
+        }
+        inside[i] = relu(1.0 - relu(h[i] - h[i - 1]) / a)
+            * relu(1.0 - relu(l[i - 1] - l[i]) / a);
+        outside[i] = relu(1.0 - relu(h[i - 1] - h[i]) / a)
+            * relu(1.0 - relu(l[i] - l[i - 1]) / a);
+
+        let b0 = body[i - 1];
+        let b1 = body[i];
+        let size = relu((b1.abs() - b0.abs()) / (b1.abs() + b0.abs() + 1e-12));
+        let bull = pos_part(b1)
+            * neg_part(b0)
+            * size
+            * clamp01(relu(c[i] - o[i - 1]) / a);
+        let bear = neg_part(b1)
+            * pos_part(b0)
+            * size
+            * clamp01(relu(o[i] - c[i - 1]) / a);
+        engulf[i] = bull - bear;
+
+        // Harami: opposite body colours, today's body at most half of the
+        // previous body, and today's body contained in the previous body.
+        let shrink = if b0.abs() > 1e-12 {
+            relu(1.0 - b1.abs() / (0.5 * b0.abs()))
+        } else {
+            0.0
+        };
+        let r0 = h[i - 1] - l[i - 1];
+        let (hi0, lo0) = (o[i - 1].max(c[i - 1]), o[i - 1].min(c[i - 1]));
+        let (hi1, lo1) = (o[i].max(c[i]), o[i].min(c[i]));
+        let contain = if r0 > 0.0 {
+            relu(1.0 - relu(hi1 - hi0) / r0) * relu(1.0 - relu(lo0 - lo1) / r0)
+        } else {
+            0.0
+        };
+        let opp = pos_part(b0) * neg_part(b1) + neg_part(b0) * pos_part(b1);
+        let dir = pos_part(b1) - neg_part(b1);
+        harami[i] = dir * opp * shrink * contain;
+    }
+    out.insert("inside_s".to_string(), inside);
+    out.insert("outside_s".to_string(), outside);
+    out.insert("engulf_s".to_string(), engulf);
+    out.insert("harami_s".to_string(), harami);
+
+    // Signed close-to-close streak, clipped to +/-8 and divided by 8. A gap or
+    // a non-finite close resets the streak; the reset bar is NaN because its
+    // predecessor is not comparable.
+    let mut run8 = vec![f64::NAN; n];
+    let mut streak: i32 = 0;
+    for i in 0..n {
+        if i == 0 || b.gap[i] || !c[i].is_finite() || !c[i - 1].is_finite() {
+            streak = 0;
+            continue;
+        }
+        if c[i] > c[i - 1] {
+            streak = if streak > 0 { streak + 1 } else { 1 };
+        } else if c[i] < c[i - 1] {
+            streak = if streak < 0 { streak - 1 } else { -1 };
+        } else {
+            streak = 0;
+        }
+        let clipped = streak.max(-8).min(8) as f64;
+        run8[i] = clipped / 8.0;
+    }
+    out.insert("run8".to_string(), run8);
+
+    // Four-bar compression ratio R_t / min(R_{t-3..t}); requires four
+    // contiguous, strictly positive ranges.
+    let mut nr4 = vec![f64::NAN; n];
+    for i in 3..n {
+        if !contig(times, i, 4, step) {
+            continue;
+        }
+        let mut ok = true;
+        let mut min_r = f64::INFINITY;
+        for j in i - 3..=i {
+            if !valid[j] {
+                ok = false;
+                break;
+            }
+            min_r = min_r.min(h[j] - l[j]);
+        }
+        if ok && min_r > 0.0 {
+            nr4[i] = (h[i] - l[i]) / min_r;
+        }
+    }
+    out.insert("nr4".to_string(), nr4);
+
+    // Trend context: close relative to the trailing 96-bar simple mean. The
+    // mean is taken over strict-valid closes, so a zero-range or zero-volume
+    // bar anywhere in the window makes the feature NaN instead of being
+    // silently skipped.
+    let close_strict: Vec<f64> = (0..n)
+        .map(|i| if valid[i] { c[i] } else { f64::NAN })
+        .collect();
+    let ma96 = rmean_strict(&close_strict, 96, times, step);
+    out.insert(
+        "trend96".to_string(),
+        (0..n)
+            .map(|i| {
+                if valid[i] && ma96[i] > 0.0 && c[i] > 0.0 {
+                    c[i] / ma96[i] - 1.0
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    out
+}
+
 /// Compute the 52 compact features for one symbol.
 ///
 /// The formulas are those of `pilot/build_panel_15m_100.py` at the 15 m base,
@@ -4213,6 +4609,8 @@ impl TempColumn {
             warmup: self.warmup,
             nan_rows: self.nan_rows,
             first_finite_row: self.first_finite,
+            first_finite_time: None,
+            prevalence: 0.0,
             hash,
             label: self.label,
         })
@@ -4229,6 +4627,7 @@ struct Context<'a> {
     py15m_requested: Vec<String>,
     compact: Vec<String>,
     flow: Vec<String>,
+    price_action: Vec<String>,
     mtf: Vec<String>,
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
@@ -4291,6 +4690,17 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("flow column '{}' was not produced", name))?;
+            if let Some(t) = cols.get_mut(name) {
+                t.write_values(values)?;
+            }
+        }
+    }
+    if !ctx.price_action.is_empty() {
+        let all = price_action_all(s, &base);
+        for name in &ctx.price_action {
+            let values = all
+                .get(name)
+                .ok_or_else(|| format!("price_action column '{}' was not produced", name))?;
             if let Some(t) = cols.get_mut(name) {
                 t.write_values(values)?;
             }
@@ -4478,6 +4888,14 @@ fn compute_own(
                     return Ok((
                         all.remove(other)
                             .ok_or_else(|| format!("compact column '{}' was not produced", other))?,
+                        warm,
+                    ));
+                }
+                if PRICE_ACTION_NAMES.contains(&other) {
+                    let mut all = price_action_all(s, b);
+                    return Ok((
+                        all.remove(other)
+                            .ok_or_else(|| format!("price_action column '{}' was not produced", other))?,
                         warm,
                     ));
                 }
@@ -5198,12 +5616,15 @@ fn enrich_inner(
     let mut py15m_requested = Vec::new();
     let mut compact_requested = Vec::new();
     let mut flow_requested = Vec::new();
+    let mut price_action_requested = Vec::new();
     let mut mtf_requested = Vec::new();
     for n in &requested {
         if FLOW_NAMES.contains(&n.as_str()) {
             // One canonical implementation for the flow names shared with the
             // compact and py15m groups.
             flow_requested.push(n.clone());
+        } else if PRICE_ACTION_NAMES.contains(&n.as_str()) {
+            price_action_requested.push(n.clone());
         } else if is_compact(n) && (compact_profile || needs_compact(n)) {
             compact_requested.push(n.clone());
         } else if matches!(
@@ -5652,6 +6073,11 @@ fn enrich_inner(
         .filter(|n| !gpu_done.contains(*n))
         .cloned()
         .collect();
+    let cpu_price_action: Vec<String> = price_action_requested
+        .iter()
+        .filter(|n| !gpu_done.contains(*n))
+        .cloned()
+        .collect();
     let cpu_mtf: Vec<String> = mtf_requested
         .iter()
         .filter(|n| !gpu_done.contains(*n))
@@ -5668,6 +6094,7 @@ fn enrich_inner(
         py15m_requested: cpu_py15m,
         compact: cpu_compact,
         flow: cpu_flow,
+        price_action: cpu_price_action,
         mtf: cpu_mtf,
         labels: cpu_labels,
         tf,
@@ -5682,6 +6109,7 @@ fn enrich_inner(
         || !ctx.py15m_requested.is_empty()
         || !ctx.compact.is_empty()
         || !ctx.flow.is_empty()
+        || !ctx.price_action.is_empty()
         || !ctx.mtf.is_empty()
         || !ctx.labels.is_empty();
     if has_cpu_work {
@@ -5878,6 +6306,22 @@ fn enrich_inner(
         .cloned()
         .collect();
     reports.sort_by_key(|r| order.iter().position(|n| n == &r.name).unwrap_or(usize::MAX));
+
+    // Per-column prevalence and first finite timestamp. The timestamp is read
+    // back by global row index, so the report names a date rather than only an
+    // offset into the store.
+    let rows_total = store.n_rows();
+    for r in &mut reports {
+        r.prevalence = if rows_total == 0 {
+            0.0
+        } else {
+            (rows_total.saturating_sub(r.nan_rows)) as f64 / rows_total as f64
+        };
+        r.first_finite_time = match r.first_finite_row {
+            Some(row) => Some(time_at_row(&store, time_col, cols.time_dtype, row)?),
+            None => None,
+        };
+    }
 
     if opts.dry_run {
         for e in &extras {
@@ -6196,7 +6640,13 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              zero_ret_share96, obv_z96, cvd_proxy, vwap_dev96. Trailing 15m
              windows; a gap-spanning window is NaN; zero volume/trades is NaN
              for the affected ratios and illiquidity.
-  all        every legacy group above except cross, py15m, mtf, compact and flow
+  price_action  clv16 body16 rng_atr prev_range_pos inside_s outside_s
+             engulf_s harami_s run8 nr4 trend96 (#261). Continuous geometry and
+             multi-bar structure; two-bar strengths replace hard flags. A
+             zero-range/zero-volume bar, a missing prior bucket or a window that
+             spans a gap is NaN. `batr` is materialised by the compact profile
+             and completes the twelve-name default block.
+  all        every legacy group above except cross, py15m, mtf, compact, flow and price_action
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
   cross:btc, calendar) are also accepted and are computed by `rcsr::features`.

@@ -227,7 +227,8 @@ so a multi-gigabyte store is not read a second time just to checksum it.
 | `mtf` | 36 columns | `mtf_<1h|4h|1d>_<12 leaves>`, higher-timeframe resample + causal close join |
 | `compact` | 52 columns, compact order | the exact compact-panel regression subset at the **15 m base** |
 | `flow` | `vwap` plus `taker_ratio96 taker_imb16 trade_intensity96 avg_trade_size96 amihud96 zero_ret_share96 obv_z96 cvd_proxy vwap_dev96` | the complete OHLCV/flow family (#270) |
-| `all` | every legacy group above except `cross`, `py15m`, `mtf`, `compact`, `flow` | |
+| `price_action` | `clv16 body16 rng_atr prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96` | continuous candle geometry and multi-bar structure (#261); `batr` is materialised by `compact` |
+| `all` | every legacy group above except `cross`, `py15m`, `mtf`, `compact`, `flow`, `price_action` | |
 
 The five `py15m` names `mkt_r16`, `mkt_r96`, `mkt_vol96`, `rel_r16` and
 `rel_r96` predate #273. `mkt_*` are now the canonical equal-weight market
@@ -401,6 +402,63 @@ deviation by up to about `2e-8`, so a slice-local recomputation cannot reproduce
 that artefact to `1e-12` even though the formula is identical. The fixture
 therefore pins the formula and summation order on the same slice; the residual
 against the historical full-panel CSV is recorded in issue #269.
+
+### Candle/price-action family (#261)
+
+The family has two halves. The compact candle subset is the parity/regression
+fixture, computed by the single 15 m reference pass described above:
+
+`clv1 clv4 body1 batr wasym1 lower_wick rng1 volrat gapatr don96`.
+
+`wasym1` is the only exact identity in the set and is registered `derived`;
+the other nine are materialised. The `price_action` group completes the twelve
+default continuous/structure columns required by #261 (`batr` is the shared
+compact name):
+
+| column | definition | warm-up |
+|---|---|---:|
+| `clv16` | `mean((C-L)/(H-L) - 1/2, 16)` | 15 |
+| `body16` | `mean((C-O)/(H-L), 16)` | 15 |
+| `batr` | `(C-O)/ATR14` (compact definition) | 14 |
+| `rng_atr` | `(H-L)/ATR14` | 14 |
+| `prev_range_pos` | `(C_t-L_{t-1})/R_{t-1} - 1/2` | 1 |
+| `inside_s` | `relu(1-relu(H_t-H_{t-1})/A) * relu(1-relu(L_{t-1}-L_t)/A)` | 1 |
+| `outside_s` | `relu(1-relu(H_{t-1}-H_t)/A) * relu(1-relu(L_t-L_{t-1})/A)` | 1 |
+| `engulf_s` | signed bullish minus bearish continuous engulfing | 1 |
+| `harami_s` | signed opposite-body continuous harami | 1 |
+| `run8` | `clip(consecutive same-sign close changes, -8, 8) / 8` | 1 |
+| `nr4` | `R_t / min(R_{t-3..t})` | 3 |
+| `trend96` | `C/SMA96 - 1` | 95 |
+
+`R=H-L`, `B=C-O`, `A=ATR14` (Wilder, restarted after a gap). The two-bar
+strengths use `pos(x)=relu(x)/(|x|+eps)`, `neg(x)=relu(-x)/(|x|+eps)` and relu
+penetrations in ATR units; `engulf_s` and `harami_s` are positive for the
+bullish cell and negative for the bearish mirror, and every strength is bounded
+to `[0,1]`. No named single-bar flag (`doji`, `pin`, `bullish_engulf`) enters
+the default set; those stay conditional event-study definitions behind the
+#266 ablation/placebo gate.
+
+**NaN policy.** The new geometry columns are strict: a bar with `H==L`, a
+zero-volume bar (when the store carries volume), or a missing prior bucket makes
+the feature `NaN`, never `0`. `clv16`/`body16` require all 16 cells to be finite;
+`nr4` requires four contiguous strictly positive ranges; `trend96` requires a
+contiguous 96-bar window. The compact names retain the documented compact
+convention (`clv1=-0.5`, `body1=0`, `batr=0` on `H==L`) because there is exactly
+one implementation per name; the parity test pins that choice.
+
+The identities hold on every finite-range bar:
+
+```
+U/R = 0.5 - clv + min(0, body)
+D/R = 0.5 + clv - max(0, body)
+wasym = body - 2*clv
+```
+
+`rcsr enrich` reports `warmup`, `nan_rows`, `prevalence`, `first_finite_row`,
+`first_finite_time` and `first_finite_iso` for every column in both the text
+report (`# enrich-feature: ...`) and the JSON sidecar. The candle/price-action
+registry entries record `source: "15m OHLCV bars; not a target construction
+column"`, and no candle column is used to construct a label.
 
 ### Causality, gaps and warm-up
 
