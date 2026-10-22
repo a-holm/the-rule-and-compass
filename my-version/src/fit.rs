@@ -24,7 +24,7 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, fit_batch_verified, fit_batch_verified_metric, refit_finalists_exact,
+    backend_description, fit_batch_verified, is_squared_family, refit_finalists_exact,
     signed_finalist, BatchStatus, BatchedFitter, VerifiedBatch,
 };
 #[cfg(feature = "cuda")]

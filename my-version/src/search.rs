@@ -2059,6 +2059,18 @@ fn select_promoted(
 /// information criteria via [`Metric::is_least_squares`], and `log_squashed`
 /// with its IRLS weights); every other configuration keeps the CPU fit path it
 /// had before.
+///
+/// #228: `signed` is deliberately not deferred — [`crate::fit::fit_loss`] is
+/// `None` for it. Its fit arm (the exact `f64` constrained-LS projection) is a
+/// host step over the same rows, and #236's correctness gate keeps every
+/// non-squared metric on the CPU evaluator until the device has a native,
+/// tested scorer for it. Deferring the fit while the offspring are ranked by
+/// MSE is exactly the silent substitution that gate exists to prevent; on main
+/// this configuration is already refused up front by
+/// [`crate::fit::gpu_fit_metric_error`], and `--metric signed` uses the exact
+/// CPU arm (including the projection). The device-warm-start form of the same
+/// arm (`BatchedGpu` + [`crate::fit::fit_batch_verified`]) is tested directly; it
+/// becomes reachable from the search as soon as a native signed loss lands.
 fn defers_fit_to_gpu(cfg: &Config, defer_gpu: bool) -> bool {
     defer_gpu
         && cfg.fit_strategy.defers_to_gpu()
