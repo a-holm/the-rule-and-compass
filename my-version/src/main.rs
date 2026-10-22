@@ -392,8 +392,10 @@ SEARCH:
                              logistic IRLS; signed uses the squared fit plus a
                              constrained least-squares projection onto the
                              zero-mean-residual manifold (exact to f64, two
-                             passes, no optimiser); rank/order/correlation
-                             losses use a deterministic coordinate polish
+                             passes, no optimiser); correlation/correlation_signed
+                             use the exact analytic rho gradient around a frozen
+                             affine gauge; rank/order losses use a deterministic
+                             coordinate polish
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`

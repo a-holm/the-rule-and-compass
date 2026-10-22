@@ -341,6 +341,10 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
  */
 #define RC_LOSS_SQUARED 0
 #define RC_LOSS_LOG_SQUASHED 1
+/* #224: fit-only correlation objectives (the evaluator still has no native
+   correlation scorer; these codes are never passed to rc_eval/rc_pool_eval). */
+#define RC_LOSS_CORRELATION 2
+#define RC_LOSS_CORRELATION_SIGNED 3
 
 __device__ __forceinline__ float rc_row_loss(float r, int loss)
 {
@@ -492,6 +496,11 @@ struct FtSmem {
     double sdg[PCHUNK * MAXC];
     double sdr[PCHUNK];
     double sdl64[PCHUNK];
+    /* #224: correlation moments and conditioning probes. */
+    double scorr[6 + 3 * MAXC];
+    double svar;
+    double syy;
+    double srho;
     int sbad;
     int ssolved;
     double slambda;
@@ -1212,6 +1221,311 @@ __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
     if (i < n) dst[i] = (double)src[i];
 }
 
+/* --- #224: exact correlation fit objective -------------------------------
+ *
+ * The kernel minimises exactly 1-|rho| (RC_LOSS_CORRELATION) or 1-rho
+ * (RC_LOSS_CORRELATION_SIGNED), never SSE. Moments are accumulated in f64 from
+ * the f32 forward/adjoint values with the same resident row weights the other
+ * objectives use. One owner thread accumulates each statistic in ascending row
+ * order, so the reduction is deterministic and needs no atomics.
+ *
+ * Statistic layout: triangle C_jk, sum w*g_j, sum w*g_j*f, sum w*g_j*y, then
+ * six globals (W, sum w*f, sum w*f^2, sum w*f*y, sum w*y, sum w*y^2).
+ */
+#define FT_CORR_STATS(MAXC) (((MAXC) * ((MAXC) + 1) / 2) + 4 * (MAXC) + 6)
+#define FT_CORR_OWNED(MAXC, CHUNK) \
+    (((FT_CORR_STATS(MAXC)) + (CHUNK) - 1) / (CHUNK))
+
+/* Decode correlation statistic `s`: 0 = C_ij, 1 = sum w*g_i,
+ * 2 = sum w*g_i*f, 3 = sum w*g_i*y, 4 = global moment `g`. */
+__device__ __forceinline__ int ft_corr_kind(int s, int tri, int p, int *i, int *j, int *g)
+{
+    if (s < tri) {
+        int k = 0;
+        for (int a = 0; a < p; ++a) {
+            for (int b = 0; b <= a; ++b, ++k) {
+                if (k == s) {
+                    *i = a;
+                    *j = b;
+                    return 0;
+                }
+            }
+        }
+        *i = 0;
+        *j = 0;
+        return 0;
+    }
+    if (s < tri + p) {
+        *i = s - tri;
+        return 1;
+    }
+    if (s < tri + 2 * p) {
+        *i = s - tri - p;
+        return 2;
+    }
+    if (s < tri + 3 * p) {
+        *i = s - tri - 2 * p;
+        return 3;
+    }
+    *g = s - tri - 3 * p;
+    return 4;
+}
+
+template <int MAXC, int CHUNK>
+__device__ void ft_corr_assemble(const unsigned int *nd,
+                                 int m,
+                                 const float *__restrict__ cols,
+                                 const float *__restrict__ y,
+                                 const double *__restrict__ w,
+                                 int n,
+                                 int p,
+                                 const double *c,
+                                 float *sg,
+                                 float *sr,
+                                 double *jtj,
+                                 double *jtr,
+                                 double *mom,
+                                 double *psvar,
+                                 double *psyy,
+                                 double *pscore,
+                                 double *prho,
+                                 int *bad,
+                                 int metric)
+{
+    const int tid = threadIdx.x;
+    const int tri = p * (p + 1) / 2;
+    const int total = FT_CORR_STATS(p);
+    int own[FT_CORR_OWNED(MAXC, CHUNK)];
+    int own_kind[FT_CORR_OWNED(MAXC, CHUNK)];
+    int own_i[FT_CORR_OWNED(MAXC, CHUNK)];
+    int own_j[FT_CORR_OWNED(MAXC, CHUNK)];
+    int own_g[FT_CORR_OWNED(MAXC, CHUNK)];
+    double acc[FT_CORR_OWNED(MAXC, CHUNK)];
+    int nown = 0;
+    for (int s = tid; s < total; s += CHUNK) {
+        own[nown] = s;
+        own_kind[nown] = ft_corr_kind(s, tri, p, &own_i[nown], &own_j[nown], &own_g[nown]);
+        acc[nown] = 0.0;
+        ++nown;
+    }
+    for (int base = 0; base < n; base += CHUNK) {
+        const int rows = min(CHUNK, n - base);
+        const int row = base + tid;
+        const double wr = (row < n && w) ? w[row] : 1.0;
+        if (row < n && wr > 0.0) {
+            float vt[FT_MAX_NODES];
+            float adj[FT_MAX_NODES];
+            float g[MAXC];
+            ft_forward(nd, m, cols, n, row, c, vt);
+            const float pred = vt[m - 1];
+            const float t = y[row];
+            bool ok = isfinite(pred) && fabsf(pred) <= 1e30f && isfinite(t);
+            ft_backward<MAXC>(nd, m, vt, adj, g, p);
+            for (int j = 0; j < p; ++j) {
+                if (!isfinite(g[j])) ok = false;
+                sg[tid * p + j] = ok ? g[j] : 0.0f;
+            }
+            sr[tid] = ok ? pred : 0.0f;
+            if (!ok) *bad = 1;
+        } else {
+            for (int j = 0; j < p; ++j) sg[tid * p + j] = 0.0f;
+            sr[tid] = 0.0f;
+        }
+        __syncthreads();
+        for (int o = 0; o < nown; ++o) {
+            const int kind = own_kind[o];
+            if (kind == 0) {
+                const int ei = own_i[o];
+                const int ej = own_j[o];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)(sg[k * p + ei] * sg[k * p + ej]);
+                }
+            } else if (kind == 1) {
+                const int ei = own_i[o];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei];
+                }
+            } else if (kind == 2) {
+                const int ei = own_i[o];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei] * (double)sr[k];
+                }
+            } else if (kind == 3) {
+                const int ei = own_i[o];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    acc[o] += wk * (double)sg[k * p + ei] * (double)y[base + k];
+                }
+            } else {
+                const int gi = own_g[o];
+                for (int k = 0; k < rows; ++k) {
+                    const double wk = (w) ? w[base + k] : 1.0;
+                    const double f = (double)sr[k];
+                    const double t = (double)y[base + k];
+                    if (gi == 0) acc[o] += wk;
+                    else if (gi == 1) acc[o] += wk * f;
+                    else if (gi == 2) acc[o] += wk * f * f;
+                    else if (gi == 3) acc[o] += wk * f * t;
+                    else if (gi == 4) acc[o] += wk * t;
+                    else acc[o] += wk * t * t;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    for (int o = 0; o < nown; ++o) {
+        const int kind = own_kind[o];
+        if (kind == 0) {
+            jtj[own[o]] = acc[o];
+        } else if (kind < 4) {
+            mom[(kind - 1) * p + own_i[o]] = acc[o];
+        } else {
+            mom[3 * p + own_g[o]] = acc[o];
+        }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const double W = mom[3 * p + 0];
+        const double sum_f = mom[3 * p + 1];
+        const double sum_f2 = mom[3 * p + 2];
+        const double sum_ft = mom[3 * p + 3];
+        const double sum_t = mom[3 * p + 4];
+        const double sum_t2 = mom[3 * p + 5];
+        double sff = 0.0, syy = 0.0, rho = 0.0;
+        if (W > 0.0) {
+            const double mf = sum_f / W;
+            const double mt = sum_t / W;
+            sff = sum_f2 - W * mf * mf;
+            syy = sum_t2 - W * mt * mt;
+            const double sft = sum_ft - W * mf * mt;
+            if (sff > 0.0 && syy > 0.0) rho = sft / sqrt(sff * syy);
+            /* A_j and B_j overwrite sum g and sum g*y; gbar goes into sum g*f. */
+            for (int j = 0; j < p; ++j) {
+                const double gbar = mom[j] / W;
+                const double a = mom[p + j] - W * gbar * mf;
+                const double b = mom[2 * p + j] - W * gbar * mt;
+                mom[j] = a;
+                mom[2 * p + j] = b;
+                mom[p + j] = gbar;
+            }
+            if (sff > 0.0 && syy > 0.0) {
+                const double root = sqrt(sff * syy);
+                for (int j = 0; j < p; ++j) {
+                    jtr[j] = mom[2 * p + j] / root - rho * mom[j] / sff;
+                }
+                int k = 0;
+                for (int i = 0; i < p; ++i) {
+                    for (int j = 0; j <= i; ++j, ++k) {
+                        const double centred = jtj[k] - W * mom[p + i] * mom[p + j];
+                        jtj[k] = (centred - mom[i] * mom[j] / sff) / sff;
+                    }
+                }
+            } else {
+                for (int j = 0; j < p; ++j) jtr[j] = 0.0;
+                int k = 0;
+                for (int i = 0; i < p; ++i) {
+                    for (int j = 0; j <= i; ++j, ++k) jtj[k] = (i == j) ? 1.0 : 0.0;
+                }
+            }
+        }
+        *psvar = sff;
+        *psyy = syy;
+        *prho = rho;
+        *pscore = (metric == RC_LOSS_CORRELATION_SIGNED) ? (1.0 - rho) : (1.0 - fabs(rho));
+        if (!isfinite(*pscore) || !isfinite(sff) || !isfinite(syy)) *bad = 1;
+    }
+    __syncthreads();
+}
+
+/* Value-only weighted correlation score at `c`: one row pass, f64 reduction,
+ * the same chordal objective. A non-finite row returns a large finite value so
+ * the LM rejects the trial; the host gate then labels the candidate. */
+template <int CHUNK>
+__device__ double ft_corr_score(const unsigned int *nd,
+                                int m,
+                                const float *__restrict__ cols,
+                                const float *__restrict__ y,
+                                const double *__restrict__ w,
+                                int n,
+                                const double *c,
+                                double *red,
+                                int metric)
+{
+    const int tid = threadIdx.x;
+    double sw = 0.0, sf = 0.0, sf2 = 0.0, sft = 0.0, st = 0.0, st2 = 0.0;
+    for (int row = tid; row < n; row += CHUNK) {
+        const double wr = (w) ? w[row] : 1.0;
+        if (wr <= 0.0) continue;
+        float vt[FT_MAX_NODES];
+        ft_forward(nd, m, cols, n, row, c, vt);
+        const double f = (double)vt[m - 1];
+        const double t = (double)y[row];
+        if (!isfinite(f) || fabs(f) > 1e30 || !isfinite(t)) {
+            sw = 1.0;
+            sf = 1e30;
+            sf2 = 1e60;
+            sft = 0.0;
+            st = 0.0;
+            st2 = 0.0;
+            break;
+        }
+        sw += wr;
+        sf += wr * f;
+        sf2 += wr * f * f;
+        sft += wr * f * t;
+        st += wr * t;
+        st2 += wr * t * t;
+    }
+    double vals[6] = {sw, sf, sf2, sft, st, st2};
+    for (int q = 0; q < 6; ++q) {
+        red[tid] = vals[q];
+        __syncthreads();
+        for (int s = CHUNK / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        vals[q] = red[0];
+        __syncthreads();
+    }
+    const double W = vals[0];
+    if (!(W > 0.0)) return 1e30;
+    const double mf = vals[1] / W;
+    const double mt = vals[4] / W;
+    const double sff = vals[2] - W * mf * mf;
+    const double syy = vals[5] - W * mt * mt;
+    const double sft_c = vals[3] - W * mf * mt;
+    if (!(sff > 0.0) || !(syy > 0.0)) return 1.0;
+    const double rho = sft_c / sqrt(sff * syy);
+    return (metric == RC_LOSS_CORRELATION_SIGNED) ? (1.0 - rho) : (1.0 - fabs(rho));
+}
+
+/* Mask the affine gauge slots and turn the rho gradient into the objective
+ * gradient: L = 1 - sigma*rho, so ft_solve with jtr = dL gives
+ * delta = -H^{-1} dL. A gauge slot gets a zero right-hand side and an identity
+ * row/column, so its step is exactly zero. */
+__device__ void ft_corr_mask_gauge(double *jtj, double *jtr, int p, double rho, int metric,
+                                   const int *gauge)
+{
+    const double sigma = (metric == RC_LOSS_CORRELATION_SIGNED)
+                             ? 1.0
+                             : (rho >= 0.0 ? 1.0 : -1.0);
+    for (int j = 0; j < p; ++j) jtr[j] = -sigma * jtr[j];
+    for (int i = 0; i < p; ++i) {
+        const bool gi = (gauge[0] == i) || (gauge[1] == i);
+        for (int j = 0; j <= i; ++j) {
+            const bool gj = (gauge[0] == j) || (gauge[1] == j);
+            if (gi || gj) {
+                jtj[i * (i + 1) / 2 + j] = (i == j) ? 1.0 : 0.0;
+            }
+        }
+        if (gi) jtr[i] = 0.0;
+    }
+}
+
 template <int MAXC, int CHUNK, int PCHUNK>
 __global__ void fit_kernel(const float *__restrict__ cols,
                            const float *__restrict__ y,
@@ -1225,6 +1539,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                            const int *__restrict__ pcount,
                            int kmax,
                            const double *__restrict__ c0,
+                           const int *__restrict__ gauge,
                            int iters,
                            int metric,
                            double *__restrict__ outc,
@@ -1252,6 +1567,125 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         S->sbest = 0.0;
     }
     __syncthreads();
+
+    /* #224: exact correlation LM. The affine gauge pair is renormalised once
+       to (sign(a), 0) and then frozen: its step is exactly zero, so the reduced
+       curvature has no null direction and the gate below measures only shape
+       collinearity or saturation. */
+    if (metric == RC_LOSS_CORRELATION || metric == RC_LOSS_CORRELATION_SIGNED) {
+        const int *g = gauge + 2 * cand;
+        if (tid == 0) {
+            const int gs = g[0];
+            const int go = g[1];
+            if (gs >= 0 && gs < p && isfinite(S->sc[gs]) && S->sc[gs] != 0.0) {
+                S->sc[gs] = S->sc[gs] > 0.0 ? 1.0 : -1.0;
+            }
+            if (go >= 0 && go < p) S->sc[go] = 0.0;
+        }
+        __syncthreads();
+        int status = 0;
+        double best = 1.0;
+        if (iters > 0) {
+            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                          S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                          &S->sbest, &S->srho, &S->sbad, metric);
+            if (S->sbad) {
+                status = 2;
+            } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
+                best = 1.0;
+            } else if (S->svar < 1e-24 * S->syy) {
+                status = 1;
+            } else {
+                best = S->sbest;
+                double lambda = 1e-3;
+                int assembled = 1;
+                for (int it = 0; it < iters && status == 0; ++it) {
+                    if (!assembled) {
+                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
+                                                      S->sr, S->sjtj, S->sjtr, S->scorr,
+                                                      &S->svar, &S->syy, &S->sbest, &S->srho,
+                                                      &S->sbad, metric);
+                        assembled = 1;
+                        if (S->sbad) {
+                            status = 2;
+                            break;
+                        }
+                        if (S->svar < 1e-24 * S->syy) {
+                            status = 1;
+                            break;
+                        }
+                    }
+                    ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                    if (tid == 0) {
+                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
+                                                     S->sL, 0) == 0);
+                    }
+                    __syncthreads();
+                    if (!S->ssolved) {
+                        status = 1;
+                        break;
+                    }
+                    if (tid < p) {
+                        double t = S->sc[tid] + S->sdelta[tid];
+                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                    }
+                    __syncthreads();
+                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                        S->sred, metric);
+                    if (trial < best) {
+                        if (tid < p) S->sc[tid] = S->strial[tid];
+                        best = trial;
+                        lambda = fmax(lambda / 8.0, 1e-12);
+                        assembled = 0;
+                        if (best <= 0.0) break;
+                    } else {
+                        lambda *= 6.0;
+                        if (lambda > 1e9) break;
+                    }
+                    __syncthreads();
+                }
+                for (int it = 0; it < 4 && status == 0 && best > 0.0; ++it) {
+                    ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                                  S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                                  &S->sbest, &S->srho, &S->sbad, metric);
+                    if (S->sbad) {
+                        status = 2;
+                        break;
+                    }
+                    ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                    if (tid == 0) {
+                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
+                                                     S->sL, 0) == 0);
+                    }
+                    __syncthreads();
+                    if (!S->ssolved) break;
+                    if (tid < p) {
+                        double t = S->sc[tid] + S->sdelta[tid];
+                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                    }
+                    __syncthreads();
+                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                        S->sred, metric);
+                    if (trial < best) {
+                        if (tid < p) S->sc[tid] = S->strial[tid];
+                        best = trial;
+                    } else {
+                        break;
+                    }
+                    __syncthreads();
+                }
+            }
+        } else {
+            best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
+        }
+        __syncthreads();
+        if (tid == 0) {
+            for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
+            outsse[cand] = best;
+            outstatus[cand] = status;
+        }
+        return;
+    }
 
     int status = 0;
     int assembled = 0;
@@ -1372,6 +1806,7 @@ static int ft_launch(RcCtx *c,
                      const unsigned int *d_off,
                      const int *d_p,
                      const double *d_c0,
+                     const int *d_gauge,
                      int iters,
                      int metric,
                      double *d_c,
@@ -1391,7 +1826,7 @@ static int ft_launch(RcCtx *c,
     }
     fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes>>>(
         c->d_cols, c->d_y, c->d_cols64, c->d_y64, c->d_w64, c->n, c->v, d_prog, d_off, d_p,
-        kmax, d_c0, iters, metric, d_c, d_sse, d_status);
+        kmax, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
@@ -1813,6 +2248,7 @@ float rc_fit_batch(void *ctx,
                    int nprog,
                    int kmax,
                    const double *c0,
+                   const int *gauge,
                    int iters,
                    int metric,
                    double *outc,
@@ -1826,6 +2262,7 @@ float rc_fit_batch(void *ctx,
     unsigned int *d_off = 0;
     int *d_p = 0;
     double *d_c0 = 0;
+    int *d_gauge = 0;
     double *d_c = 0;
     double *d_sse = 0;
     int *d_status = 0;
@@ -1836,6 +2273,7 @@ float rc_fit_batch(void *ctx,
     if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nprog + 1)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nprog) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_c0, cbytes) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_gauge, sizeof(int) * (size_t)nprog * 2) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_c, cbytes) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_sse, sizeof(double) * (size_t)nprog) != 0) ok = 0;
     if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nprog) != 0) ok = 0;
@@ -1865,14 +2303,15 @@ float rc_fit_batch(void *ctx,
         rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
         rc_upload(d_p, pcount, sizeof(int) * (size_t)nprog);
         rc_upload(d_c0, c0, cbytes);
+        rc_upload(d_gauge, gauge, sizeof(int) * (size_t)nprog * 2);
         cudaEventRecord(c->t0, 0);
         int launched;
         if (kmax <= FT_MAX_CONST_SMALL) {
             launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, iters, metric, d_c, d_sse, d_status);
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
         } else {
             launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, iters, metric, d_c, d_sse, d_status);
+                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
         }
         cudaEventRecord(c->t1, 0);
         cudaEventSynchronize(c->t1);
@@ -1888,6 +2327,7 @@ float rc_fit_batch(void *ctx,
     if (d_off) cudaFree(d_off);
     if (d_p) cudaFree(d_p);
     if (d_c0) cudaFree(d_c0);
+    if (d_gauge) cudaFree(d_gauge);
     if (d_c) cudaFree(d_c);
     if (d_sse) cudaFree(d_sse);
     if (d_status) cudaFree(d_status);

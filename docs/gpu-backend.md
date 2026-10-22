@@ -414,9 +414,9 @@ signed scorer on the device (#236).
 | `squared` | `r²` | exact objective (up to `f32`) |
 | `log_squashed` | `ln(1 + r²)` | exact objective (up to `f32`), #229 |
 
-Every other metric is scored by the CPU evaluator: the kernel has no MAE, rank,
-minimax, correlation, slope or classification objective, and using MSE as a
-ranking proxy silently changes the search (`--metric slope` was observed to
+Every other metric is scored by the CPU evaluator: the scoring kernel has no
+MAE, rank, minimax, correlation, slope or classification objective, and using
+MSE as a ranking proxy silently changes the search (`--metric slope` was observed to
 select a different Pareto point, #236). At the end `full_data_archive`
 re-scores the surviving trees on the full training sample with the CPU
 evaluator in `f64`, and the reported train/test errors, Pareto front and

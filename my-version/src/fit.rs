@@ -19,6 +19,7 @@ use crate::metrics::{self, Metric};
 // #116: the solver portfolio's additional arms. Each child module uses the
 // flattened tree, adjoint sweep and guarded QR from this module, so the arms
 // share one arithmetic story and one fallback contract.
+mod correlation;
 mod gpu;
 mod stream;
 mod varpro;
@@ -118,6 +119,13 @@ pub enum DeviceLoss {
     Squared,
     /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
     LogSquashed,
+    /// #224: `1 − |ρ|`. A **fit-only** objective: the evaluator still has no
+    /// native correlation scorer, so neither [`DeviceLoss::for_metric`] nor
+    /// [`fit_loss`] maps it. It is reachable through the fit kernel's direct
+    /// batch API, not through the search dispatch.
+    Correlation,
+    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`].
+    CorrelationSigned,
 }
 
 impl DeviceLoss {
@@ -126,6 +134,8 @@ impl DeviceLoss {
         match self {
             DeviceLoss::Squared => 0,
             DeviceLoss::LogSquashed => 1,
+            DeviceLoss::Correlation => 2,
+            DeviceLoss::CorrelationSigned => 3,
         }
     }
 
@@ -377,6 +387,10 @@ pub(crate) struct GpuFitPlan {
     pub(crate) words: Vec<u32>,
     pub(crate) nconst: usize,
     pub(crate) c0: Vec<f64>,
+    /// #224: the free affine pair (`scale`, `offset`) as constant slots, `-1`
+    /// when absent. The correlation kernel freezes these slots and
+    /// renormalises them; other metrics ignore the field.
+    pub(crate) gauge: [i32; 2],
     flat: Flat,
 }
 
@@ -458,10 +472,12 @@ pub(crate) fn gpu_fit_plan_reason(tree: &Node) -> Result<GpuFitPlan, GpuFitRejec
             c0[f.cslot[i] as usize] = f.val[i];
         }
     }
+    let gauge = correlation::gauge_of(&f).slots();
     Ok(GpuFitPlan {
         words,
         nconst: f.nconst,
         c0,
+        gauge,
         flat: f,
     })
 }
@@ -2319,11 +2335,15 @@ fn qr_least_squares(a: &mut [f64], m: usize, n: usize, b: &mut [f64]) -> Option<
 ///   `auc` and `hinge` share the logistic surrogate because their own
 ///   objectives are piecewise constant or non-smooth; the surrogate is convex
 ///   and the scored metric decides whether a trial is accepted.
-/// * `correlation`, `rank_correlation`, `signed`, `median`, `maximum`,
-///   `interquartile` and `slope` — a squared fit
-///   followed by a deterministic coordinate polish on the configured metric.
-///   These losses have no least-squares normal equations (rank and order
-///   statistics are not differentiable); the polish is the documented fallback.
+/// * `correlation`, `correlation_signed` — the exact analytic gradient and
+///   Gauss–Newton curvature of the Pearson correlation, with a frozen affine
+///   gauge (see [`correlation`]). No squared pre-fit is involved.
+/// * `rank_correlation`, `signed`, `median`, `maximum`, `interquartile` and
+///   `slope` — a squared fit followed by a deterministic coordinate polish on
+///   the configured metric. These losses have no least-squares normal equations
+///   (rank and order statistics are not differentiable); the polish is the
+///   documented fallback, and it now runs on a clone so it can never replace a
+///   better starting point.
 ///
 /// A trial is written back only when it improves the configured loss, so the
 /// result is never worse than the starting constants. The returned value is the
@@ -2368,12 +2388,16 @@ pub fn fit_weighted_metric(
             1.0 / (1.0 + r * r)
         }),
         Auc | LogLoss | Hinge => logistic_irls(tree, x, y, w, iters, metric),
-        // Smooth but not reducible to a weighted least-squares problem, and the
-        // non-smooth order/rank/absolute-bias losses: start from the squared
-        // fit, then polish the actual objective.
-        Correlation
-        | CorrelationSigned
-        | RankCorrelation
+        // #224: correlation has an exact objective, an analytic gradient and a
+        // structural gauge handler; it never falls back to a squared fit.
+        Correlation | CorrelationSigned => {
+            correlation::fit(tree, x, y, w, iters, metric)
+        }
+        // The remaining smooth-but-not-least-squares and non-smooth order/rank
+        // losses: start from the squared fit, then polish the actual objective.
+        // The squared pre-fit runs on a clone, so a polish that finds no
+        // improvement keeps the incoming constants (metric-monotone refit).
+        RankCorrelation
         | RankCorrelationSigned
         | Median
         | Maximum
@@ -2381,9 +2405,17 @@ pub fn fit_weighted_metric(
         | Slope
         | ImplicitResidual
         | ImplicitDerivative => {
-            fit_weighted(tree, x, y, w, iters);
-            coordinate_polish(tree, x, y, w, metric, iters.max(1));
-            metric_score(tree, x, y, w, metric)
+            let start = metric_score(tree, x, y, w, metric);
+            let mut trial = tree.clone();
+            fit_weighted(&mut trial, x, y, w, iters);
+            coordinate_polish(&mut trial, x, y, w, metric, iters.max(1));
+            let score = metric_score(&trial, x, y, w, metric);
+            if score.is_finite() && score < start {
+                *tree = trial;
+                score
+            } else {
+                start
+            }
         }
         // #228: signed bias is the one non-squared family with an exact
         // closed-form arm. The squared fit is the warm start; the arm is the
