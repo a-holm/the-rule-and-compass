@@ -28,8 +28,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, fit_batch_verified, is_squared_family, refit_finalists_exact,
-    signed_finalist, BatchStatus, BatchedFitter, VerifiedBatch,
+    backend_description, exact_metric_score, fit_batch_verified, gate_proposal, is_squared_family,
+    refit_finalists_exact, signed_finalist, BatchStatus, BatchedFitter, ProposalGate,
+    VerifiedBatch,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;
@@ -148,6 +149,13 @@ pub enum DeviceLoss {
     /// this code, so a run can neither rank nor fit MAE with a squared-error
     /// surrogate.
     Absolute,
+    /// #234: `Σ w·ln(1 + exp(-t·p))` on the binary label sign `t`, the model
+    /// output read as a logit, minimised by Fisher scoring with `q(1-q)` row
+    /// weights. A **fit-only** objective: [`DeviceLoss::for_metric`] does not
+    /// map it, because the evaluator accumulates `ρ(pred − y)` and has no label
+    /// or logit semantics. Reachable through [`fit_loss`] (fit dispatch) and
+    /// the fit kernel's direct batch API only.
+    Logistic,
 }
 
 impl DeviceLoss {
@@ -159,11 +167,25 @@ impl DeviceLoss {
             DeviceLoss::Correlation => 2,
             DeviceLoss::CorrelationSigned => 3,
             DeviceLoss::Absolute => 4,
+            DeviceLoss::Logistic => 5,
         }
     }
 
-    /// The device objective for a metric, or `None` when the kernel cannot
-    /// score it.
+    /// Whether the **evaluator** entry points (`rc_eval`, `rc_pool_eval`) can
+    /// accumulate this objective. `false` for every fit-only code.
+    pub fn scores_on_device(self) -> bool {
+        match self {
+            DeviceLoss::Squared | DeviceLoss::LogSquashed | DeviceLoss::Absolute => true,
+            DeviceLoss::Correlation | DeviceLoss::CorrelationSigned | DeviceLoss::Logistic => false,
+        }
+    }
+
+    /// The device objective for a metric the **evaluator** can rank, or `None`
+    /// when it cannot.
+    ///
+    /// #234: `Logistic` is deliberately absent — a `log_loss` run scores every
+    /// candidate on the exact CPU metric and only its constants come from the
+    /// device (see [`fit_loss`] and [`fit_only_loss`]).
     pub fn for_metric(metric: Metric) -> Option<Self> {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
@@ -183,7 +205,28 @@ impl DeviceLoss {
 pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
     match metric {
         Metric::Aic | Metric::Aicc | Metric::Bic => Some(DeviceLoss::Squared),
+        // #234: a native fit objective with no native fitness. The search
+        // admits it as a fit-only arm; every score is the exact CPU log-loss.
+        Metric::LogLoss => Some(DeviceLoss::Logistic),
         m => DeviceLoss::for_metric(m),
+    }
+}
+
+/// #234: `Some(loss)` when the device fits `metric` but the evaluator cannot
+/// score it, so every fitness value and every finalist refit stays exact CPU
+/// `f64`; `None` when the metric is scored natively on the device or has no
+/// device fit objective at all.
+///
+/// `log_loss` is the first metric in this class whose fit is the batched LM
+/// kernel's own objective (rank and median are fit-only polish arms), so the
+/// predicate names the split once and the search's gate, its scoring path and
+/// its fit dispatch all read it.
+pub fn fit_only_loss(metric: Metric) -> Option<DeviceLoss> {
+    let loss = fit_loss(metric)?;
+    if loss.scores_on_device() {
+        None
+    } else {
+        Some(loss)
     }
 }
 
@@ -192,8 +235,9 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 ///
 /// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) minimises one
 /// configured objective per launch: weighted squared error for the
-/// least-squares family, `log_squashed` as weighted LM/IRLS since #229, and
-/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222.
+/// least-squares family, `log_squashed` as weighted LM/IRLS since #229,
+/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222, and
+/// the logistic cross-entropy on the binary label since #234.
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
@@ -218,12 +262,13 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
-         absolute error or the exact rank and median objectives, but --metric \
-         {} has no device fit objective, so the GPU arms cannot fit it. Use \
-         --metric squared (aic, aicc and bic also fit by least squares), \
-         --metric log_squashed, --metric absolute, --metric rank_correlation \
-         or rank_correlation_signed, --metric median, or a CPU fit strategy: \
-         --fit-strategy exact, auto, linear, varpro or stream.",
+         absolute error, the logistic log-loss or the exact rank and median \
+         objectives, but --metric {} has no device fit objective, so the GPU \
+         arms cannot fit it. Use --metric squared (aic, aicc and bic also fit \
+         by least squares), --metric log_squashed, --metric absolute, --metric \
+         log_loss, --metric rank_correlation or rank_correlation_signed, \
+         --metric median, or a CPU fit strategy: --fit-strategy exact, auto, \
+         linear, varpro or stream.",
         metric.name()
     ))
 }
@@ -2773,6 +2818,34 @@ fn classification_labels(y: &[f64]) -> Vec<f64> {
     }
     let mid = 0.5 * (lo + hi);
     y.iter().map(|&v| if v > mid { 1.0 } else { 0.0 }).collect()
+}
+
+/// #234: the label sign `t = 2·[y > (min y + max y)/2] − 1` the log-loss fit
+/// optimises against.
+///
+/// This is exactly the rule [`logistic_irls`] uses, computed from the full
+/// sample and uploaded once to the device (`GpuEvaluator::set_fit_sign`), so
+/// the device row weights `q(1−q)` are built from the same margin the CPU arm
+/// uses. It is subset-independent for a two-valued target, and a single-valued
+/// target degenerates to all `−1` — the caller must refuse that case (see
+/// [`class_counts`]) instead of fitting a sign no data supports.
+pub fn classification_signs(y: &[f64]) -> Vec<f64> {
+    classification_labels(y)
+        .into_iter()
+        .map(|l| 2.0 * l - 1.0)
+        .collect()
+}
+
+/// #234: `(positives, negatives)` under the [`classification_signs`] rule.
+///
+/// A log-loss fit needs both classes: with one class the unconstrained
+/// likelihood has no finite minimiser and the fit only drives the logit to the
+/// clamp, which is not a calibration. The arm reports the counts so the search
+/// can label a single-class candidate set instead of scoring it.
+pub fn class_counts(y: &[f64]) -> (usize, usize) {
+    let signs = classification_signs(y);
+    let pos = signs.iter().filter(|&&t| t > 0.0).count();
+    (pos, signs.len() - pos)
 }
 
 fn sigmoid(x: f64) -> f64 {

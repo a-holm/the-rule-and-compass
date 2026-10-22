@@ -418,7 +418,11 @@ SEARCH:
                              squared/AIC least squares, log_squashed with
                              per-row IRLS weights (#229), absolute (mean |r|)
                              with per-row Lawson weights and true-MAE
-                             acceptance (#222), or — for
+                             acceptance (#222), the logistic log-loss on the
+                             binary label with per-row Fisher weights q(1-q) and
+                             a softplus trial objective (#234; fit-only — the
+                             device proposes constants and the exact CPU f64
+                             log-loss judges, scores and refits), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
                              (#230; fit-only, the fitness stays on the CPU), with
@@ -433,8 +437,9 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, a rank metric,
-                             `--metric median`, or a CPU strategy. `--metric signed`
+                             `--metric absolute`, `--metric log_loss`, a rank
+                             metric, `--metric median`, or a CPU strategy.
+                             `--metric signed`
                              is in that group: it keeps the exact CPU
                              projection (#228) and says so, because the device
                              has no native signed scorer yet (#236)
@@ -481,7 +486,9 @@ SEARCH:
                              scores. Every other metric is *scored* on the CPU
                              and prints the reason, never with a proxy loss;
                              with --fit-strategy gpu its *constants* may still
-                             be fitted on the device (rank and median arms).
+                             be fitted on the device (the rank, median and
+                             log_loss arms; log_loss is fit-only for the same
+                             reason — no native scorer).
                              Reported errors stay CPU f64. Cross-backend runs
                              are not bit-identical because f32 fitness can
                              change the trajectory. JSON
