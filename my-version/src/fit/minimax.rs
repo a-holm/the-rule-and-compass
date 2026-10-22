@@ -259,9 +259,13 @@ pub(crate) fn polish_minimax_batch<S: MinimaxTrialScorer + ?Sized>(
             if !open.iter().any(|r| r.iter().any(|&o| o)) {
                 break;
             }
+            // One level per constant the candidate actually has: the scorer's
+            // per-candidate vectors follow `plan.order`, not the batch's
+            // largest `p`, so a mixed batch of `p = 1, 3, 4` candidates keeps
+            // one level per coordinate.
             let levels: Vec<Vec<f64>> = (0..n)
                 .map(|k| {
-                    (0..maxp)
+                    (0..plans[k].nconst)
                         .map(|ci| {
                             if open[k][ci] {
                                 0.5 * (lo[k][ci] + hi[k][ci])
@@ -749,6 +753,62 @@ mod tests {
                 "the GPU arm ({}) must not lose to the CPU ladder ({cpu_score})",
                 out.scores[0]
             );
+        }
+    }
+
+    /// A batch whose candidates have **different** constant counts polishes
+    /// every candidate exactly like a batch of one: the per-coordinate level
+    /// and interval vectors follow each candidate's own `p`, never the batch's
+    /// largest. (A regression here made the device decline every mixed batch
+    /// and fall back to the CPU arm.)
+    #[test]
+    fn a_mixed_batch_of_constant_counts_matches_single_candidate_runs() {
+        let x: Vec<Vec<f64>> = (0..48).map(|i| vec![-2.0 + 0.1 * i as f64]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 1.5 * (0.8 * r[0]).sin() + if i % 10 == 0 { 4.0 } else { 0.0 })
+            .collect();
+        // p = 1, 2 and 3 in one batch.
+        let trees = vec![
+            node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)]),
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.8),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                        ],
+                    ),
+                    constant(0.0),
+                ],
+            ),
+            constant(0.25),
+        ];
+        let plans: Vec<GpuFitPlan> = trees.iter().map(plan_of).collect();
+        let refs: Vec<&GpuFitPlan> = plans.iter().collect();
+        let starts: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
+        let bits = |out: &MinimaxPolish| {
+            out.constants
+                .iter()
+                .map(|c| c.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        };
+        let mut s = scorer(&x, &y);
+        let batch = polish_minimax_batch(&mut s, &refs, &starts, 8).expect("mixed batch");
+        for k in 0..plans.len() {
+            let mut s = scorer(&x, &y);
+            let one = polish_minimax_batch(&mut s, &[&plans[k]], &[starts[k].clone()], 8)
+                .expect("single candidate");
+            assert_eq!(
+                vec![bits(&one)[0].clone()],
+                vec![bits(&batch)[k].clone()],
+                "candidate {k} (p = {}) differs from its single-candidate run",
+                plans[k].nconst
+            );
+            assert_eq!(one.scores[0].to_bits(), batch.scores[k].to_bits());
         }
     }
 

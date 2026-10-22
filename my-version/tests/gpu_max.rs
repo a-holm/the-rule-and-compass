@@ -254,6 +254,14 @@ fn the_maximum_arm_never_loses_to_the_cpu_polish_on_the_same_candidates() {
         8,
         Metric::Maximum,
     );
+    // This batch mixes `p = 1` with `p = 2` and `p = 3`; every candidate must
+    // be answered by the device, not silently by the CPU fallback (the gate
+    // would still be correct, but the test would prove nothing).
+    assert!(
+        batch.status.iter().filter(|s| s.is_gpu()).count() >= starts.len() - 1,
+        "the device must fit this batch: {:?}",
+        batch.status
+    );
     for (k, start) in starts.iter().enumerate() {
         let mut cpu = start.clone();
         let cpu_score = fit_weighted_metric(&mut cpu, &train.x, &train.y, &[], 8, Metric::Maximum);

@@ -5996,6 +5996,43 @@ mod maximum_tests {
         assert_eq!(finalist.to_bits(), cpu_max(&g, &tree_mut).to_bits());
     }
 
+    /// A batch whose candidates have different constant counts is fitted for
+    /// every candidate: the device declines nothing (`status == 0`) and the
+    /// reported objective is the exact maximum of the returned constants.
+    #[test]
+    fn a_mixed_batch_of_constant_counts_is_fitted_for_every_candidate() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let trees = vec![
+            node(Op::Add, vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)]),
+            node(
+                Op::Add,
+                vec![
+                    node(
+                        Op::Mul,
+                        vec![
+                            constant(0.8),
+                            node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                        ],
+                    ),
+                    constant(0.0),
+                ],
+            ),
+            constant(0.25),
+        ];
+        let plans: Vec<crate::fit::GpuFitPlan> = trees.iter().map(plan).collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+        let (out, ms) = ev.max_fit_batch(&refs, 8);
+        assert!(ms > 0.0);
+        assert_eq!(out.len(), trees.len());
+        for (k, res) in out.iter().enumerate() {
+            assert_eq!(res.status, 0, "candidate {k} (p = {}) was declined", plans[k].nconst);
+            assert!(res.sse.is_finite());
+            let applied = with_constants(&trees[k], &res.c);
+            assert_eq!(cpu_max(&f, &applied).to_bits(), res.sse.to_bits());
+        }
+    }
+
     /// Results do not depend on how the batch is composed or on repetition.
     #[test]
     fn the_maximum_scan_is_deterministic_across_batch_composition() {
