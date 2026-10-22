@@ -564,11 +564,30 @@ fn default_financial_registry_is_complete_and_explicit() {
     // Unavailable families are explicit, never silently omitted.
     let unavailable: Vec<&enrich::RegistryEntry> = reg.iter().filter(|e| !e.available).collect();
     assert!(!unavailable.is_empty());
-    assert!(unavailable.iter().any(|e| e.family == "price_action"));
     assert!(unavailable.iter().any(|e| e.family == "market_state"));
     assert!(unavailable.iter().any(|e| e.family == "derivatives"));
+    // Issue #261: the candle/price-action family is complete and available.
+    for name in enrich::DEFAULT_CANDLE_NAMES {
+        let e = reg
+            .iter()
+            .find(|e| e.name == *name)
+            .unwrap_or_else(|| panic!("candle {name} missing from registry"));
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.timeframe, "15m");
+        assert!(!e.derived, "{name} must be materialised");
+        if enrich::PRICE_ACTION_NAMES.contains(name) {
+            assert!(
+                e.source.contains("not a target construction column"),
+                "{name} must record that the family is not a target construction column"
+            );
+        }
+        assert!(enrich::expand(name).is_ok(), "{name} must expand");
+    }
     for name in enrich::PRICE_ACTION_NAMES {
-        assert!(enrich::expand(name).unwrap_err().contains("unavailable"));
+        let e = reg.iter().find(|e| e.name == *name).unwrap();
+        assert!(e.available, "{name} must be available");
+        assert_eq!(e.family, "price_action");
+        assert!(!e.reason.as_deref().unwrap_or("").contains("not implemented"));
     }
     for name in enrich::DERIVATIVE_NAMES {
         let e = reg.iter().find(|e| e.name == *name).unwrap();
@@ -1202,6 +1221,66 @@ fn advertised_column_set_is_exactly_what_a_real_run_appends() {
 }
 
 // ---------------------------------------------------------------------------
+// Candle and price-action family (#261)
+// ---------------------------------------------------------------------------
+
+/// Flat hand-built bars give exact, closed-form values for the continuous
+/// geometry and structure block. ATR14 is 2.0 because every true range is 2.
+#[test]
+fn price_action_geometry_matches_flat_hand_bars() {
+    let dir = tmp_dir("pa_flat");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    write_store(&src, &rows, 32);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    let clv16 = column(&out, "clv16");
+    let body16 = column(&out, "body16");
+    let rng_atr = column(&out, "rng_atr");
+    let prev = column(&out, "prev_range_pos");
+    let inside = column(&out, "inside_s");
+    let outside = column(&out, "outside_s");
+    let engulf = column(&out, "engulf_s");
+    let harami = column(&out, "harami_s");
+    let run8 = column(&out, "run8");
+    let nr4 = column(&out, "nr4");
+    let trend = column(&out, "trend96");
+    let batr = column(&out, "batr");
+
+    for i in 0..rows.len() {
+        assert!(rng_atr[i].is_finite(), "rng_atr warm-up at {i}");
+        assert!((rng_atr[i] - 1.0).abs() <= 1e-12, "rng_atr at {i}: {}", rng_atr[i]);
+        assert!((batr[i] - 0.25).abs() <= 1e-12, "batr at {i}: {}", batr[i]);
+        if i >= 15 {
+            assert!((clv16[i] - 0.25).abs() <= 1e-12, "clv16 at {i}: {}", clv16[i]);
+            assert!((body16[i] - 0.25).abs() <= 1e-12, "body16 at {i}: {}", body16[i]);
+        } else {
+            assert!(clv16[i].is_nan(), "clv16 warm-up at {i}");
+            assert!(body16[i].is_nan(), "body16 warm-up at {i}");
+        }
+        if i >= 1 {
+            assert!((prev[i] - 0.25).abs() <= 1e-12, "prev_range_pos at {i}: {}", prev[i]);
+            assert!((inside[i] - 1.0).abs() <= 1e-12, "inside_s at {i}: {}", inside[i]);
+            assert!((outside[i] - 1.0).abs() <= 1e-12, "outside_s at {i}: {}", outside[i]);
+            assert!(engulf[i].abs() <= 1e-12, "engulf_s at {i}: {}", engulf[i]);
+            assert!(harami[i].abs() <= 1e-12, "harami_s at {i}: {}", harami[i]);
+        }
+        if i >= 1 {
+            assert!(run8[i].abs() <= 1e-12, "run8 at {i}: {}", run8[i]);
+        }
+        if i >= 3 {
+            assert!((nr4[i] - 1.0).abs() <= 1e-12, "nr4 at {i}: {}", nr4[i]);
+        }
+        if i >= 95 {
+            assert!(trend[i].abs() <= 1e-12, "trend96 at {i}: {}", trend[i]);
+        }
+    }
+}
+
 // Multi-timeframe family (#272)
 // ---------------------------------------------------------------------------
 
@@ -1337,6 +1416,336 @@ fn mtf_36_columns_match_hand_built_higher_bars() {
             }
         }
     }
+}
+
+/// A rising close series produces the signed clipped streak.
+#[test]
+fn run8_tracks_the_signed_close_streak_and_clips_at_eight() {
+    let dir = tmp_dir("pa_run");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..20i64)
+        .map(|i| {
+            let c = 100.0 + i as f64;
+            (i * 900, "AAA".to_string(), c - 1.0, c + 0.5, c - 1.5, c, 10.0)
+        })
+        .collect();
+    write_store(&src, &rows, 16);
+    enrich::build(&opts(&src, &out, "run8")).unwrap();
+    let run = column(&out, "run8");
+    assert!(run[0].is_nan());
+    for i in 1..8 {
+        assert!((run[i] - i as f64 / 8.0).abs() <= 1e-12, "run8 at {i}: {}", run[i]);
+    }
+    for i in 8..20 {
+        assert!((run[i] - 1.0).abs() <= 1e-12, "run8 clipped at {i}: {}", run[i]);
+    }
+}
+
+/// Hand-built reversal shapes exercise the continuous inside/outside/engulf and
+/// harami strengths, including their sign.
+#[test]
+fn price_action_strengths_are_continuous_and_signed() {
+    let dir = tmp_dir("pa_shapes");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let bars: Vec<(f64, f64, f64, f64)> = vec![
+        (100.0, 101.0, 99.0, 99.5),
+        (99.2, 101.0, 99.0, 100.6),   // bullish engulfing
+        (101.0, 101.5, 98.9, 99.1),   // bearish engulfing
+        (99.8, 100.2, 99.4, 99.9),    // inside bar
+        (99.5, 102.0, 98.0, 100.0),   // outside bar
+        (101.0, 101.5, 98.5, 99.0),   // prior down body
+        (99.6, 99.9, 99.3, 99.7),     // bullish harami
+        (99.5, 101.0, 99.0, 100.5),   // prior up body
+        (100.2, 100.5, 99.3, 99.9),   // bearish harami
+    ];
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = bars
+        .iter()
+        .enumerate()
+        .map(|(i, (o, h, l, c))| (i as i64 * 900, "AAA".to_string(), *o, *h, *l, *c, 10.0))
+        .collect();
+    write_store(&src, &rows, 16);
+    enrich::build(
+        &opts(&src, &out, "inside_s,outside_s,engulf_s,harami_s"),
+    )
+    .unwrap();
+    let inside = column(&out, "inside_s");
+    let outside = column(&out, "outside_s");
+    let engulf = column(&out, "engulf_s");
+    let harami = column(&out, "harami_s");
+
+    assert!(engulf[1] > 0.0, "bullish engulfing must be positive: {}", engulf[1]);
+    assert!(engulf[2] < 0.0, "bearish engulfing must be negative: {}", engulf[2]);
+    assert!(harami[6] > 0.0, "bullish harami must be positive: {}", harami[6]);
+    assert!(harami[8] < 0.0, "bearish harami must be negative: {}", harami[8]);
+    for v in engulf.iter().chain(harami.iter()).filter(|v| v.is_finite()) {
+        assert!(v.abs() <= 1.0, "strength is not bounded: {v}");
+    }
+    assert!((inside[3] - 1.0).abs() <= 1e-12, "inside bar: {}", inside[3]);
+    assert!(outside[3] < 1.0, "inside bar is not an outside bar: {}", outside[3]);
+    assert!((outside[4] - 1.0).abs() <= 1e-12, "outside bar: {}", outside[4]);
+    assert!(inside[4] < outside[4], "outside bar must score inside lower");
+}
+
+/// The three shape identities hold on random finite-range bars.
+#[test]
+fn price_action_identities_hold_on_random_bars() {
+    let dir = tmp_dir("pa_identities");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    let mut seed = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed as f64) / (u64::MAX as f64)
+    };
+    for i in 0..300i64 {
+        let o = 50.0 + next() * 40.0;
+        let c = 50.0 + next() * 40.0;
+        let h = o.max(c) + 0.05 + next() * 2.0;
+        let l = o.min(c) - 0.05 - next() * 2.0;
+        rows.push((i * 900, "AAA".to_string(), o, h, l, c, 10.0));
+    }
+    write_store(&src, &rows, 32);
+    enrich::build(&opts(&src, &out, "clv1,body1,wasym1")).unwrap();
+    let clv = column(&out, "clv1");
+    let body = column(&out, "body1");
+    let wasym = column(&out, "wasym1");
+    let mut checked = 0;
+    for (i, (_, _, o, h, l, c, _)) in rows.iter().enumerate() {
+        let r = h - l;
+        if !(r > 0.0) {
+            continue;
+        }
+        let u = h - o.max(*c);
+        let d = o.min(*c) - l;
+        let up = u / r;
+        let down = d / r;
+        assert!(
+            (up - (0.5 - clv[i] + body[i].min(0.0))).abs() <= 1e-12,
+            "U/R identity at {i}"
+        );
+        assert!(
+            (down - (0.5 + clv[i] - body[i].max(0.0))).abs() <= 1e-12,
+            "D/R identity at {i}"
+        );
+        assert!(
+            (wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12,
+            "wasym identity at {i}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 250, "too few finite-range bars ({checked})");
+}
+
+/// A zero-range or zero-volume bar is NaN for strict geometry, never a fake 0.
+/// The compact `batr` keeps its documented compact zero on `H == L`.
+#[test]
+fn price_action_zero_range_and_zero_volume_are_nan() {
+    let dir = tmp_dir("pa_degenerate");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..220i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    rows[100] = (100 * 900, "AAA".to_string(), 100.0, 100.0, 100.0, 100.0, 10.0);
+    rows[120].6 = 0.0;
+    write_store(&src, &rows, 32);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    for name in ["rng_atr", "clv16", "body16", "prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s", "nr4", "trend96"] {
+        let v = column(&out, name);
+        assert!(v[100].is_nan(), "{name} must be NaN at a zero-range bar");
+        assert!(v[120].is_nan(), "{name} must be NaN at a zero-volume bar");
+    }
+    let nr4 = column(&out, "nr4");
+    assert!(nr4[101].is_nan() && nr4[102].is_nan() && nr4[103].is_nan());
+    assert!(nr4[104].is_finite(), "nr4 must recover four bars after the hole");
+    let trend = column(&out, "trend96");
+    assert!(trend[215].is_nan(), "trend96 window still contains the zero-volume bar");
+    assert!(trend[216].is_finite(), "trend96 must recover after a full window");
+    let batr = column(&out, "batr");
+    assert_eq!(batr[100], 0.0, "compact batr keeps the documented H==L zero");
+}
+
+/// Every two-bar feature is NaN across a missing bucket, and every 16/96-bar
+/// window is NaN until the hole leaves it. Nothing bridges a gap.
+#[test]
+fn price_action_two_bar_and_window_gap_masked() {
+    let dir = tmp_dir("pa_gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for i in 0..700i64 {
+        let t = if i < 350 { i * 900 } else { (i + 3) * 900 };
+        let p = 100.0 + i as f64 * 0.01 + (i as f64 * 0.3).sin();
+        rows.push((t, "AAA".to_string(), p, p + 0.2, p - 0.2, p + 0.05, 10.0 + i as f64));
+    }
+    write_store(&src, &rows, 64);
+    let spec = enrich::PRICE_ACTION_NAMES.join(",");
+    enrich::build(&opts(&src, &out, &spec)).unwrap();
+
+    for name in ["prev_range_pos", "inside_s", "outside_s", "engulf_s", "harami_s"] {
+        let v = column(&out, name);
+        assert!(v[350].is_nan(), "{name} bridged the hole at row 350");
+    }
+    for name in ["clv16", "body16"] {
+        let v = column(&out, name);
+        for i in 350..365 {
+            assert!(v[i].is_nan(), "{name} bridged the hole at row {i}");
+        }
+        assert!(v[365].is_finite(), "{name} did not recover after the hole");
+    }
+    let trend = column(&out, "trend96");
+    for i in 350..445 {
+        assert!(trend[i].is_nan(), "trend96 bridged the hole at row {i}");
+    }
+    assert!(trend[445].is_finite(), "trend96 did not recover after the hole");
+    let nr4 = column(&out, "nr4");
+    for i in 350..353 {
+        assert!(nr4[i].is_nan(), "nr4 bridged the hole at row {i}");
+    }
+    assert!(nr4[353].is_finite(), "nr4 did not recover after the hole");
+}
+
+/// Prefix causality: changing a later bar never changes an earlier row, and a
+/// truncated store recomputes the same prefix.
+#[test]
+fn price_action_is_prefix_causal_under_a_shifted_future_bar() {
+    let dir = tmp_dir("pa_causal");
+    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let cut = dir.join("cut.rcsb").to_string_lossy().into_owned();
+    let shifted = dir.join("shifted.rcsb").to_string_lossy().into_owned();
+    let out_full = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let out_cut = dir.join("cut_out.rcsb").to_string_lossy().into_owned();
+    let out_shifted = dir.join("shifted_out.rcsb").to_string_lossy().into_owned();
+    let rows = bars("AAA", 320, 0, 900);
+    let mut future = rows.clone();
+    future[250] = (
+        future[250].0,
+        future[250].1.clone(),
+        future[250].2 + 37.0,
+        future[250].3 + 40.0,
+        future[250].4 - 5.0,
+        future[250].5 + 21.0,
+        999.0,
+    );
+    write_store(&full, &rows, 31);
+    write_store(&cut, &rows[..250], 31);
+    write_store(&shifted, &future, 31);
+    let spec = format!("{},batr", enrich::PRICE_ACTION_NAMES.join(","));
+    enrich::build(&opts(&full, &out_full, &spec)).unwrap();
+    enrich::build(&opts(&cut, &out_cut, &spec)).unwrap();
+    enrich::build(&opts(&shifted, &out_shifted, &spec)).unwrap();
+    for name in enrich::PRICE_ACTION_NAMES.iter().chain(["batr"].iter()) {
+        let a = column(&out_full, name);
+        let b = column(&out_cut, name);
+        let c = column(&out_shifted, name);
+        for i in 0..250 {
+            assert_eq!(a[i].is_nan(), b[i].is_nan(), "{name} prefix NaN differs at {i}");
+            assert_eq!(a[i].is_nan(), c[i].is_nan(), "{name} future NaN differs at {i}");
+            if a[i].is_finite() {
+                assert!((a[i] - b[i]).abs() <= 1e-12, "{name} prefix differs at {i}");
+                assert!((a[i] - c[i]).abs() <= 1e-12, "{name} future bar changed {i}");
+            }
+        }
+    }
+}
+
+/// The ten compact candle names pass the independent Python fixture at
+/// `abs/rel <= 1e-12`; `wasym1` is recomputed from `body1` and `clv1`.
+#[test]
+fn compact_candle_subset_passes_parity_at_1e12() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
+    let input = base.join("compact_15m_ohlcv.csv");
+    let expected_path = base.join("compact_15m_expected.csv");
+    let dir = tmp_dir("candle_parity");
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let names = [
+        "clv1", "clv4", "body1", "batr", "wasym1", "lower_wick", "rng1", "volrat", "gapatr", "don96",
+    ];
+    enrich::build(&opts(&input.to_string_lossy(), &out, &names.join(","))).unwrap();
+
+    let text = std::fs::read_to_string(&expected_path).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let start_ts = 1_680_271_200i64;
+    let rows_per_symbol = 3600usize;
+    let out_cols: Vec<Vec<f64>> = names.iter().map(|n| column(&out, n)).collect();
+    let mut compared = 0usize;
+    let mut worst = 0.0f64;
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        let ts: i64 = fields[0].parse().unwrap();
+        let sym = fields[1];
+        let seg = if sym == "AAVEUSDT" { 0 } else { 1 };
+        let idx = seg * rows_per_symbol + ((ts - start_ts) / 900) as usize;
+        for (j, name) in names.iter().enumerate() {
+            let col = header.iter().position(|h| h == name).unwrap();
+            let expected = fields[col].parse::<f64>().unwrap();
+            let got = out_cols[j][idx];
+            match (got.is_nan(), expected.is_nan()) {
+                (true, true) => continue,
+                (true, false) => panic!("{name} at {sym}/{ts}: got NaN, expected {expected}"),
+                (false, true) => panic!("{name} at {sym}/{ts}: got {got}, expected NaN"),
+                (false, false) => {}
+            }
+            let a = (got - expected).abs();
+            let r = a / expected.abs().max(1e-300);
+            worst = worst.max(a.max(r));
+            assert!(
+                a <= 1e-12 || r <= 1e-12,
+                "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
+            );
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 300 * names.len());
+    let clv = column(&out, "clv1");
+    let body = column(&out, "body1");
+    let wasym = column(&out, "wasym1");
+    let mut identity = 0usize;
+    for i in 0..clv.len() {
+        if wasym[i].is_finite() && body[i].is_finite() && clv[i].is_finite() {
+            assert!((wasym[i] - (body[i] - 2.0 * clv[i])).abs() <= 1e-12);
+            identity += 1;
+        }
+    }
+    assert!(identity > 0);
+    eprintln!("candle compact parity: {compared} values, worst abs/rel {worst:e}");
+}
+
+/// The report lists warm-up, NaN count, prevalence and the first finite date
+/// for every column, in text and JSON.
+#[test]
+fn enrich_report_lists_prevalence_and_first_finite_date() {
+    let dir = tmp_dir("pa_report");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = (0..120i64)
+        .map(|i| (i * 900, "AAA".to_string(), 100.0, 101.0, 99.0, 100.5, 10.0))
+        .collect();
+    write_store(&src, &rows, 32);
+    let report = enrich::build(&opts(&src, &out, "clv16")).unwrap();
+    let f = report.features.iter().find(|f| f.name == "clv16").unwrap();
+    assert_eq!(f.warmup, 15);
+    assert_eq!(f.nan_rows, 15);
+    assert_eq!(f.first_finite_row, Some(15));
+    assert_eq!(f.first_finite_time, Some(15 * 900));
+    assert!((f.prevalence - 105.0 / 120.0).abs() <= 1e-12);
+    let json = report.json();
+    assert!(json.contains("\"prevalence\":0.875"), "json: {json}");
+    assert!(json.contains("\"first_finite_iso\":\"1970-01-01T03:45:00Z\""), "json: {json}");
+    let text = report.text_lines().join("\n");
+    assert!(text.contains("# enrich-feature: name=clv16 warmup=15 nan_rows=15 prevalence=0.875000"));
+    assert!(text.contains("first_finite_iso=1970-01-01T03:45:00Z"));
 }
 
 #[test]
