@@ -489,9 +489,9 @@ SEARCH:
                              has an exact device fit arm that is not dispatched
                              yet (its device tests, cost model and measured
                              numbers live in docs/gpu-backend.md). Reported
-                             errors stay CPU f64. Cross-backend runs are not
-                             bit-identical because f32 fitness can change the
-                             trajectory. JSON
+                             errors stay CPU f64. Cross-backend runs are
+                             not bit-identical because f32 fitness can change
+                             the trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
                              measured separately with ncu
