@@ -1366,6 +1366,13 @@ impl GpuEvaluator {
     /// score. A candidate whose polish cannot be scored, or whose prediction is
     /// not finite, is reported with a non-zero status so the caller refits it
     /// with the exact CPU arm and labels the fallback.
+    ///
+    /// #231: `signed` selects `1 − ρ` instead of `1 − |ρ|`; it is the only
+    /// difference between the two objectives on this stage (the integer sums
+    /// are shared). The keep/replace decision is [`crate::fit::rank::choose_rank_fit`],
+    /// so the orientation rule is the same in the search arm, the batched
+    /// verifier and the unit tests. `iters == 0` is a true no-op: no LM step, no
+    /// sweep, the incoming constants returned unchanged.
     pub(crate) fn rank_fit_batch(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
@@ -1373,10 +1380,22 @@ impl GpuEvaluator {
         y: &[f64],
         signed: bool,
     ) -> (Vec<GpuFitOutput>, f32) {
+        let incoming: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
+        if iters == 0 {
+            // `--no-fit`: nothing may move, whatever the caller did.
+            let out = incoming
+                .iter()
+                .map(|c| GpuFitOutput {
+                    c: c.clone(),
+                    sse: f64::NAN,
+                    status: 0,
+                })
+                .collect();
+            return (out, 0.0);
+        }
         // The squared LM start is the same one `fit_weighted_metric` uses for
         // the rank family; the polished constants are judged against the
         // **incoming** constants, which is that CPU arm's monotone gate.
-        let incoming: Vec<Vec<f64>> = plans.iter().map(|p| p.c0.clone()).collect();
         let (mut out, lm_ms) = self.fit_batch(plans, iters, crate::fit::DeviceLoss::Squared);
         if out.is_empty() || out.len() != plans.len() {
             return (out, -1.0);
@@ -1417,36 +1436,31 @@ impl GpuEvaluator {
                 out[k].status = 1;
                 continue;
             }
-            if !res.scores[j].is_finite() {
+            let start = match baseline.as_ref() {
+                Some(b) => b.get(j).and_then(|t| t.first()).copied(),
+                // The baseline call failed as a whole: `None`, a decline.
+                None => None,
+            };
+            use crate::fit::RankFitChoice as Choice;
+            match crate::fit::choose_rank_fit(res.scores[j], start, &target, signed) {
+                Choice::TakePolished { score } => {
+                    out[k].c = c.clone();
+                    out[k].sse = score;
+                }
+                Choice::KeepStart { score } => {
+                    // Keep the incoming constants (slot order) and its exact
+                    // score: the CPU arm would have done the same.
+                    out[k].c = incoming[k].clone();
+                    out[k].sse = score;
+                }
                 // A prediction the exact rank stage cannot score is invalid,
                 // not a better fit: label it `non_finite` and let the CPU arm
                 // decide.
-                out[k].status = 2;
-                continue;
+                Choice::NonFinite => out[k].status = 2,
+                // No baseline, so no monotonicity to prove: never accept the
+                // polished constants blind, label the decline and fall back.
+                Choice::Declined => out[k].status = 3,
             }
-            let start_score = baseline
-                .as_ref()
-                .and_then(|b| b.get(j))
-                .and_then(|t| t.first())
-                .copied()
-                .flatten()
-                .map(|s| {
-                    let s = crate::metrics::RankSums {
-                        bb: target.sum_bb(),
-                        ..s
-                    };
-                    crate::metrics::score_rank_sums(Some(s), signed)
-                })
-                .unwrap_or(f64::INFINITY);
-            if start_score.is_finite() && res.scores[j] >= start_score {
-                // Keep the incoming constants (slot order) and its exact score:
-                // the CPU arm would have done the same.
-                out[k].c = incoming[k].clone();
-                out[k].sse = start_score;
-                continue;
-            }
-            out[k].c = c.clone();
-            out[k].sse = res.scores[j];
         }
         (out, lm_ms + polish_ms)
     }
@@ -4889,6 +4903,32 @@ mod rank_tests {
                 .expect("rank call");
         }
         let single_seg_ms = single_start.elapsed().as_secs_f64() * 1000.0 / 3.0;
+        // #231: cost model. Time one call carrying `s` segments for
+        // `s = 1..=8`; a fit of `t(s) = a + b*s` separates the fixed
+        // allocation/upload/launch cost from the per-segment (sort) cost. Both
+        // orientations run the same integer stage, so one curve covers both.
+        let mut cost = Vec::new();
+        for s in 1..=8 {
+            let mut per = Vec::new();
+            for k in 0..s {
+                let mut c = p.c0.clone();
+                c[0] *= 1.0 + 0.001 * (k as f64 + 1.0);
+                per.push(c);
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..3 {
+                let _ = ev.rank_score_trials(&[&p], &[per.clone()]).expect("rank call");
+            }
+            cost.push((s, start.elapsed().as_secs_f64() * 1000.0 / 3.0));
+        }
+        // Least squares on (s, t).
+        let m = cost.len() as f64;
+        let sx: f64 = cost.iter().map(|(s, _)| *s as f64).sum();
+        let sy: f64 = cost.iter().map(|(_, t)| *t).sum();
+        let sxx: f64 = cost.iter().map(|(s, _)| (*s as f64) * (*s as f64)).sum();
+        let sxy: f64 = cost.iter().map(|(s, t)| *s as f64 * *t).sum();
+        let b = (m * sxy - sx * sy) / (m * sxx - sx * sx);
+        let a = (sy - b * sx) / m;
         // Same constants? The device path must reproduce the CPU ladder.
         let cpu_c = crate::fit::constants_slots(&cpu);
         let same = cpu_c.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
@@ -4905,6 +4945,29 @@ mod rank_tests {
             call_ms / single_seg_ms.max(1e-9),
             same
         );
+        eprintln!(
+            "  cost model: t(call) = {:.2} ms + {:.2} ms x segments  [{}]",
+            a,
+            b,
+            cost.iter()
+                .map(|(s, t)| format!("{s}segs={t:.2}ms"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        // #231: the signed arm costs exactly the unsigned one on the same
+        // start (same sort work); record both.
+        for signed in [false, true] {
+            let start = std::time::Instant::now();
+            let out = polish_rank_batch(&mut ev, &[&p], &[p.c0.clone()], &target, signed, 8)
+                .expect("device polish");
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "  signed={signed} gpu_polish={:.1}ms score={:.6} constants={:?}",
+                ms,
+                out.scores[0],
+                out.constants[0]
+            );
+        }
     }
 
     /// The cached target ranks are the CPU's `B`, row for row, on a target
@@ -4994,6 +5057,151 @@ mod rank_tests {
                 "{metric:?}: device polish must reproduce the CPU constants"
             );
             assert!(out.scores[0].is_finite());
+        }
+    }
+
+    // -- #231: the signed orientation on the device --------------------------
+
+    /// A strictly decreasing target: the incoming `linear()` slope is positive,
+    /// so its signed score is above 1 and only the fitted orientation can go
+    /// below it.
+    fn decreasing_fixture(n: usize) -> Fixture {
+        let nv = 1;
+        let mut cols32 = vec![0.0f32; n];
+        let mut cols64 = vec![0.0f64; n];
+        let mut x: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = i as f64 / 10.0;
+            // Duplicate targets every ninth row keep the average-rank path in
+            // play on the device too.
+            let v = if i % 9 == 4 && i > 0 { y[i - 1] } else { 5.0 - t };
+            x.push(vec![t]);
+            y.push(v);
+            cols32[i] = t as f32;
+            cols64[i] = t;
+        }
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        Fixture {
+            cols32,
+            cols64,
+            n,
+            nv,
+            y32,
+            y,
+            x,
+        }
+    }
+
+    fn reflected() -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(-0.8), input(0)]), constant(-0.15)],
+        )
+    }
+
+    /// #231: the device rank stage is orientation-free. Negating every constant
+    /// negates the prediction exactly, so `Sigma A B` flips and `Sigma A A`,
+    /// `Sigma B B` are untouched; the signed score of a reflection is `2 - the
+    /// original` and the unsigned score is identical bit for bit.
+    #[test]
+    fn reflection_flips_the_cross_sum_exactly_on_the_device() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let t = linear();
+        let p = plan(&t);
+        let c = p.c0.clone();
+        let negated: Vec<f64> = c.iter().map(|v| -v).collect();
+        let out = ev
+            .rank_score_trials(&[&p], &[vec![c, negated]])
+            .expect("device rank call");
+        let a = out[0][0].expect("the original is finite");
+        let b = out[0][1].expect("the reflection is finite");
+        assert_eq!(b.ab, -a.ab, "the device cross sum must flip exactly");
+        assert_eq!(b.aa, a.aa);
+        assert_eq!(b.bb, a.bb);
+        let target = RankTarget::new(&f.y).unwrap();
+        let up = score_of(Some(a), &target, true);
+        let down = score_of(Some(b), &target, true);
+        assert!(
+            (up + down - 2.0).abs() <= 4.0 * f64::EPSILON,
+            "signed(f) + signed(-f) must be 2 on the device: {up} + {down}"
+        );
+        assert_eq!(
+            score_of(Some(a), &target, false).to_bits(),
+            score_of(Some(b), &target, false).to_bits(),
+            "the unsigned score cannot see a reflection"
+        );
+    }
+
+    /// #231: the signed arm is exact, monotone from the incoming constants, and
+    /// the number it reports is the CPU's exact signed score of the constants
+    /// it returned — never an SSE and never an `|rho|`.
+    #[test]
+    fn signed_rank_fit_batch_is_exact_and_monotone() {
+        let f = decreasing_fixture(120);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        for t in [linear(), reflected(), tied()] {
+            let p = plan(&t);
+            let incoming = target.score(&cpu_pred(&f, &t), true);
+            let (out, ms) = ev.rank_fit_batch(&[&p], 6, &f.y, true);
+            assert!(ms > 0.0, "the signed rank arm ran on the device");
+            assert_eq!(out.len(), 1);
+            if out[0].status != 0 {
+                // A labelled fallback; the CPU arm owns that candidate.
+                continue;
+            }
+            assert!(out[0].sse.is_finite());
+            assert!(
+                out[0].sse <= incoming,
+                "the signed arm returned a worse score: {} > {}",
+                out[0].sse,
+                incoming
+            );
+            let mut trial = t.clone();
+            p.apply(&mut trial, &out[0].c);
+            let exact = target.score(&cpu_pred(&f, &trial), true);
+            assert_eq!(
+                out[0].sse.to_bits(),
+                exact.to_bits(),
+                "the reported number must be the exact CPU signed score"
+            );
+        }
+        // Direction: `linear()` is increasing while the target decreases, so
+        // its incoming signed score is above 1 and the fitted one must be
+        // below it.
+        let p = plan(&linear());
+        let before = target.score(&cpu_pred(&f, &linear()), true);
+        assert!(before > 1.0, "the fixture must start in the wrong direction: {before}");
+        let (out, _) = ev.rank_fit_batch(&[&p], 6, &f.y, true);
+        assert_eq!(out[0].status, 0);
+        assert!(
+            out[0].sse < 1.0,
+            "the signed arm must find the positive direction: {}",
+            out[0].sse
+        );
+    }
+
+    /// #231: `--no-fit` (`iters == 0`) never moves a constant and never starts
+    /// a device sweep, under either orientation.
+    #[test]
+    fn rank_fit_batch_with_zero_iters_is_a_noop() {
+        let f = fixture(64);
+        let Some(mut ev) = evaluator(&f) else { return };
+        for signed in [false, true] {
+            let t = linear();
+            let p = plan(&t);
+            let before = p.c0.clone();
+            let (out, ms) = ev.rank_fit_batch(&[&p], 0, &f.y, signed);
+            assert_eq!(ms, 0.0, "no device work for --no-fit");
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].status, 0);
+            assert_eq!(
+                out[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "signed={signed}: --no-fit must not move a constant"
+            );
         }
     }
 

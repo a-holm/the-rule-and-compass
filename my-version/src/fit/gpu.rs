@@ -213,6 +213,12 @@ enum Verdict {
 /// cannot exist means the model cannot represent the mean; then only a strict
 /// objective improvement can justify the proposal, and otherwise the outcome is
 /// [`Verdict::NotIdentifiable`] rather than a squared answer in disguise.
+///
+/// #231: the rank family is judged on the **exact integer** statistic of
+/// [`metrics::RankTarget`], under the orientation the metric names — `1 − ρ` for
+/// `rank_correlation_signed`, `1 − |ρ|` for `rank_correlation`. The gate never
+/// sees an SSE, and a reflected model is a worse deal for the signed objective
+/// (`2 − score`) exactly as it is for the CPU arm.
 fn verify_proposal(
     tree: &mut Node,
     proposal: &[f64],
@@ -230,6 +236,26 @@ fn verify_proposal(
         if f.cslot[i] >= 0 {
             c0[f.cslot[i] as usize] = f.val[i];
         }
+    }
+    if let Some(signed) = rank_metric_signed(metric) {
+        // The rank family refuses weights and needs the same rows throughout,
+        // so anything else is declined rather than judged on a proxy.
+        let Some(target) = metrics::RankTarget::new(y) else {
+            return Verdict::Rejected;
+        };
+        if !w.is_empty() || target.len() != x.len() {
+            return Verdict::Rejected;
+        }
+        let start = score_constants(tree, &c0, x, &target, signed);
+        let candidate = score_constants(tree, proposal, x, &target, signed);
+        let (Some(start), Some(candidate)) = (start, candidate) else {
+            return Verdict::Rejected;
+        };
+        if candidate > start {
+            return Verdict::Rejected;
+        }
+        write_constants(tree, &f, proposal);
+        return Verdict::Accepted(candidate);
     }
     if metric != Metric::Squared {
         // #229: the configured loss decides, never SSE.
@@ -355,6 +381,49 @@ impl BatchedGpu<'_> {
         }
         out
     }
+
+    /// #231: the device's **exact rank** proposal for the configured
+    /// orientation.
+    ///
+    /// This is [`crate::gpu::GpuEvaluator::rank_fit_batch`] as a batched
+    /// proposal: the squared LM start, the exact integer polish under `signed`,
+    /// and the same monotone gate against the incoming constants. A declined or
+    /// non-finite candidate returns `None`, so [`fit_batch_verified`] refits it
+    /// with the exact CPU arm; an accepted candidate is still re-checked by the
+    /// host-side gate, on the exact objective.
+    fn propose_rank(
+        &self,
+        trees: &[Node],
+        iters: usize,
+        y: &[f64],
+        w: &[f64],
+        signed: bool,
+    ) -> Vec<Option<Vec<f64>>> {
+        let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
+        // The rank family refuses weights; the CPU arm owns those rows.
+        if !w.is_empty() || y.is_empty() {
+            return out;
+        }
+        let slots: Vec<(usize, GpuFitPlan)> = trees
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| gpu_fit_plan(t).map(|plan| (i, plan)))
+            .collect();
+        if slots.is_empty() {
+            return out;
+        }
+        let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
+        let (results, ms) = self.ev.borrow_mut().rank_fit_batch(&plans, iters, y, signed);
+        if ms < 0.0 || results.len() != slots.len() {
+            return out;
+        }
+        for ((i, _), res) in slots.iter().zip(results) {
+            if res.status == 0 && res.c.iter().all(|v| v.is_finite()) {
+                out[*i] = Some(res.c);
+            }
+        }
+        out
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -374,13 +443,21 @@ impl BatchedFitter for BatchedGpu<'_> {
         &self,
         trees: &[Node],
         _x: &[Vec<f64>],
-        _y: &[f64],
-        _w: &[f64],
+        y: &[f64],
+        w: &[f64],
         iters: usize,
         metric: Metric,
     ) -> Vec<Option<Vec<f64>>> {
         if let Some(loss) = fit_loss(metric) {
             return self.propose(trees, iters, loss);
+        }
+        // #231: the rank family has a native **fit** objective on the device,
+        // under the orientation the metric names, so the batched verifier no
+        // longer declines it. `verify_proposal` judges the proposal on the
+        // exact integer statistic, never on SSE and never on `|ρ|` for the
+        // signed metric.
+        if let Some(signed) = rank_metric_signed(metric) {
+            return self.propose_rank(trees, iters, y, w, signed);
         }
         if metric == Metric::Signed {
             // #228: warm start only; `verify_proposal` projects and judges.
@@ -1143,5 +1220,156 @@ mod tests {
         let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
         let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Absolute, 2);
         assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    // -- #231: the signed rank orientation through the batch gate ------------
+
+    /// `c0 * x + c1` with explicit constants: slot order is `(mul, add)`.
+    fn affine(c0: f64, c1: f64) -> Node {
+        node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(c0), input(0)]), constant(c1)],
+        )
+    }
+
+    fn predictions(tree: &Node, x: &[Vec<f64>]) -> Vec<f64> {
+        x.iter().map(|r| crate::expr::eval(tree, r)).collect()
+    }
+
+    /// #231: a strictly decreasing target, so the direction of rho is decided
+    /// by the sign of the slope and nothing else.
+    fn decreasing_fixture(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![i as f64 / 10.0]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 5.0 - r[0]).collect();
+        (x, y)
+    }
+
+    /// #231: the gate must accept a rank proposal that is **worse in SSE** but
+    /// better on the signed objective. An SSE gate (or an `|rho|` gate) would
+    /// reject exactly the fit this metric exists for.
+    #[test]
+    fn a_signed_rank_proposal_is_accepted_even_when_it_costs_sse() {
+        let (x, y) = decreasing_fixture(40);
+        let start = affine(1.0, 0.0); // increasing: rho = -1, score 2.0
+        // The reflected slope plus a large offset: perfect rank order, terrible
+        // squared error.
+        let proposal = vec![-1.0, 105.0];
+        let sse_start = crate::metrics::score_with_constants(
+            &predictions(&start, &x),
+            &y,
+            Metric::Squared,
+            2,
+        );
+        let mut trial = start.clone();
+        crate::fit::write_constants(
+            &mut trial,
+            &flatten(&start),
+            &proposal,
+        );
+        let sse_proposal = crate::metrics::score_with_constants(
+            &predictions(&trial, &x),
+            &y,
+            Metric::Squared,
+            2,
+        );
+        assert!(
+            sse_proposal > sse_start,
+            "the fixture must make the rank proposal worse in SSE: {sse_proposal} vs {sse_start}"
+        );
+        let mut trees = vec![start];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(proposal.clone()) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better signed rho must be accepted whatever it costs in SSE"
+        );
+        assert_eq!(out.score[0], 0.0, "the reflected slope is the perfect signed fit");
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            proposal.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #231: the reflected model is rejected under `1 - rho` and accepted as an
+    /// equal under `1 - |rho|`. This is the reflection penalty at the gate.
+    #[test]
+    fn a_reflected_rank_proposal_is_judged_by_its_own_orientation() {
+        let (x, y) = decreasing_fixture(40);
+        // The start is the perfect *signed* fit: pred = y, rho = 1.
+        let start = affine(-1.0, 5.0);
+        let reflected = vec![1.0, 5.0];
+
+        let mut signed = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(reflected.clone()) },
+            &mut signed,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Worse,
+            "a reflection must never replace a signed fit"
+        );
+        // The CPU fallback keeps the start's exact signed score (0) and its
+        // constants.
+        assert_eq!(out.score[0], 0.0);
+        assert_eq!(
+            fitted(&signed[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted(&start).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut unsigned = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(reflected) },
+            &mut unsigned,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::RankCorrelation,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "the unsigned objective cannot tell a model from its reflection"
+        );
+        assert_eq!(out.score[0], 0.0);
+    }
+
+    /// #231: an equal proposal is not an improvement for the signed metric, and
+    /// `--no-fit` never moves a constant on it either.
+    #[test]
+    fn a_signed_rank_no_fit_is_a_true_noop() {
+        let (x, y) = decreasing_fixture(30);
+        let start = affine(-1.0, 5.0);
+        let before = fitted(&start);
+        let mut trees = vec![start];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![-1.0, 5.0]) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::RankCorrelationSigned,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        assert_eq!(out.score[0], 0.0);
     }
 }

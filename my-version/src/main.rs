@@ -421,7 +421,10 @@ SEARCH:
                              acceptance (#222), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
-                             (#230; fit-only, the fitness stays on the CPU);
+                             (#230; fit-only, the fitness stays on the CPU), with
+                             rank_correlation_signed scored as 1-rho so a
+                             reflected model is rejected and nothing is judged
+                             on SSE or |rho| (#231);
                              for median, the exact f64 median polish (segmented
                              sort of the residual bits, first-improver ladder,
                              #226; fit-only, and only for >= 4096 training

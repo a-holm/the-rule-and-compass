@@ -38,7 +38,9 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `--metric median` does the same with the exact `f64` median
+still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
+reflected model is rejected and a proposal is judged on the exact oriented
+score, never on SSE or `|rho|` (#231); `--metric median` does the same with the exact `f64` median
 (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
 measured crossover of the batched selection, #226). An explicit `gpu` with a
 metric that has no device fit objective is a usage error, because the kernel
@@ -915,7 +917,9 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `--metric median` does the same with the exact `f64` median
+still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
+reflected model is rejected and a proposal is judged on the exact oriented
+score, never on SSE or `|rho|` (#231); `--metric median` does the same with the exact `f64` median
 (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
 measured crossover of the batched selection, #226). An explicit `gpu` with a
 metric that has no device fit objective is a usage error, because the kernel
