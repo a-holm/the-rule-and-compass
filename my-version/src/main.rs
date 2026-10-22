@@ -395,7 +395,8 @@ SEARCH:
                              passes, no optimiser); correlation/correlation_signed
                              use the exact analytic rho gradient around a frozen
                              affine gauge; rank/order losses use a deterministic
-                             coordinate polish
+                             coordinate polish (median on the device with
+                             --fit-strategy gpu, #226)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
@@ -418,12 +419,16 @@ SEARCH:
                              per-row IRLS weights (#229), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
-                             (#230; fit-only, the fitness stays on the CPU).
-                             Without a batch backend it uses the exact CPU arms
-                             (never a no-op). The device refuses any other
-                             metric instead of substituting an objective: use
+                             (#230; fit-only, the fitness stays on the CPU);
+                             for median, the exact f64 median polish (segmented
+                             sort of the residual bits, first-improver ladder,
+                             #226; fit-only, and only for >= 4096 training
+                             rows, the measured crossover). Without a batch
+                             backend it uses the exact CPU arms (never a no-op).
+                             The device refuses any other metric instead of
+                             substituting an objective: use
                              `--metric squared`, `--metric log_squashed`, a
-                             rank metric, or a CPU strategy. `--metric signed`
+                             rank metric, `--metric median`, or a CPU strategy. `--metric signed`
                              is in that group: it keeps the exact CPU
                              projection (#228) and says so, because the device
                              has no native signed scorer yet (#236)
@@ -467,8 +472,10 @@ SEARCH:
                              the GPU automatically for --metric squared and
                              --metric log_squashed: those are the objectives
                              the kernel scores. Every other metric (including
-                             the default absolute) runs on the CPU and prints
-                             the reason, never with a proxy loss. Reported
+                             the default absolute) is *scored* on the CPU and
+                             prints the reason, never with a proxy loss; with
+                             --fit-strategy gpu its *constants* may still be
+                             fitted on the device (rank and median arms). Reported
                              errors stay CPU f64. Cross-backend runs are
                              not bit-identical because f32 fitness can change
                              the trajectory. JSON
