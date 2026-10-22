@@ -71,8 +71,400 @@ pub const GROUPS: &[&str] = &[
     "xs",
     "btc",
     "py15m",
+    "compact",
     "all",
 ];
+
+/// The 52 compact-panel feature names, in the exact compact order.
+///
+/// These are computed at the **15 m base** by [`compact_all`]. The hourly compact
+/// panel is the projection `ts % 3600 == 0` of this output; windows are never
+/// recomputed on hourly bars.
+pub const COMPACT_NAMES: &[&str] = &[
+    "r16", "r96", "r672", "ma96", "ma672", "ma_slope672", "macd_hist",
+    "natr14", "vol16", "vol96", "vol_ts", "vol_ratio", "vol_z2880",
+    "parkinson96", "rv_ratio", "rsi14", "bb96", "bb_width96", "adx14",
+    "di_diff14", "cmf20", "mfi14", "vwap_dev96", "vol_z96", "taker_ratio96",
+    "taker_imb16", "trade_intensity96", "clv1", "clv4", "body1", "batr",
+    "wasym1", "lower_wick", "rng1", "volrat", "gapatr", "ou_hl96", "acf1",
+    "vr4", "rskew96", "jump_share", "semivar_asym", "cusum_abs_z", "btc_r96",
+    "btc_vol96", "rel_btc96", "beta384", "tod_sin", "tod_cos", "dow_sin",
+    "dow_cos", "don96",
+];
+
+pub fn compact_names() -> Vec<String> {
+    COMPACT_NAMES.iter().map(|s| s.to_string()).collect()
+}
+
+/// Multi-timeframe context columns from the default financial feature set.
+///
+/// They are registered now and will be produced by the MTF join pass; until that
+/// pass lands in `rcsr enrich` they are explicitly unavailable rather than
+/// silently missing. The 15 m bars needed to build them are present.
+pub fn mtf_names() -> Vec<String> {
+    let mut out = Vec::new();
+    for tf in ["h1", "h4", "d1"] {
+        for leaf in [
+            "ret1", "ma20_ratio", "ma60_ratio", "vol20", "atr14_pct", "rsi14",
+            "bb20_z", "channel_pos96", "don_slope", "ema20_ratio", "range1", "bar_age",
+        ] {
+            out.push(format!("{}_{}", tf, leaf));
+        }
+    }
+    out
+}
+
+/// Candle/price-action columns from the default set that do not yet have an
+/// enrich producer. The raw bars are available; the producer is the gap.
+pub const PRICE_ACTION_NAMES: &[&str] = &[
+    "clv16",
+    "body16",
+    "rng_atr",
+    "prev_range_pos",
+    "inside_s",
+    "outside_s",
+    "engulf_s",
+    "harami_s",
+    "run8",
+    "nr4",
+    "trend96",
+];
+
+/// Cross-sectional market-state columns (whole-panel pass).
+pub const MARKET_STATE_NAMES: &[&str] = &[
+    "mkt_ew_ret1",
+    "mkt_ew_ret16",
+    "mkt_breadth",
+    "mkt_dispersion",
+    "btc_volume_share",
+    "cs_rank_r60",
+];
+
+/// Reserved derivative columns. No funding/OI/basis/order-book snapshot exists
+/// locally, so these stay `available:false` with `source:null`.
+pub const DERIVATIVE_NAMES: &[&str] = &[
+    "funding_rate",
+    "funding_carry_24h",
+    "basis_bps",
+    "oi",
+    "oi_chg_1h",
+    "oi_chg_24h",
+    "ls_ratio",
+    "taker_buy_sell_ratio",
+];
+
+/// Reason a registered name cannot be computed yet, if it is unavailable.
+pub fn unavailable_reason(name: &str) -> Option<&'static str> {
+    if mtf_names().iter().any(|n| n == name) {
+        return Some(
+            "multi-timeframe resample/join pass is not wired into rcsr enrich yet; \
+             the 15m source bars are available",
+        );
+    }
+    if PRICE_ACTION_NAMES.contains(&name) {
+        return Some(
+            "candle/price-action producer is registered but not implemented in rcsr enrich yet; \
+             the 15m OHLCV bars needed to build it are available",
+        );
+    }
+    if MARKET_STATE_NAMES.contains(&name) {
+        return Some(
+            "whole-panel cross-sectional market-state pass is not wired into rcsr enrich yet; \
+             requires all symbols at one timestamp",
+        );
+    }
+    if DERIVATIVE_NAMES.contains(&name) {
+        return Some(
+            "no local funding, open-interest, basis, mark-price or liquidation snapshot; \
+             intentionally not filled with zero",
+        );
+    }
+    None
+}
+
+fn compact_formula(name: &str) -> &'static str {
+    match name {
+        "r16" | "r96" | "r672" => "ln(C_t / C_{t-w})",
+        "ma96" | "ma672" => "C_t / SMA_w(t) - 1",
+        "ma_slope672" => "SMA672(t) / SMA672(t-672) - 1",
+        "macd_hist" => "EMA12/EMA26 - 1 minus its EMA9",
+        "natr14" => "100 * ATR14 / C",
+        "vol16" | "vol96" => "population sd of 15m log returns over w",
+        "vol_ts" => "vol16 / vol96",
+        "vol_ratio" => "vol96 / vol672",
+        "vol_z2880" => "(vol96 - mean2880(vol96)) / sd2880(vol96)",
+        "parkinson96" => "sqrt(mean(log(H/L)^2,96)/(4 ln 2))",
+        "rv_ratio" => "ln(rv96/rv672), rv_w=mean(lr^2,w)",
+        "rsi14" => "RSI14/50 - 1",
+        "bb96" => "clip((C-SMA96)/(2 sd96),-1,1)",
+        "bb_width96" => "4 sd96 / SMA96",
+        "adx14" => "ADX14/100",
+        "di_diff14" => "(PDI-MDI)/100",
+        "cmf20" => "mean(mfm*volume,20)/mean(volume,20)",
+        "mfi14" => "MFI14/50 - 1",
+        "vwap_dev96" => "(C-VWAP96)/VWAP96",
+        "vol_z96" => "(log1p(V)-mean96)/sd96",
+        "taker_ratio96" => "mean(taker_buy_base,96)/mean(volume,96)",
+        "taker_imb16" => "(2 mean(tb,16)-mean(V,16))/mean(V,16)",
+        "trade_intensity96" => "ln(1+mean(trades,96)/mean(volume,96))",
+        "clv1" => "(C-L)/(H-L) - 1/2",
+        "clv4" => "mean(clv1,4)",
+        "body1" => "(C-O)/(H-L)",
+        "batr" => "(C-O)/ATR14",
+        "wasym1" => "(U-D)/(H-L); equals body1 - 2*clv1 for H>L",
+        "lower_wick" => "(min(O,C)-L)/(H-L)",
+        "rng1" => "(H-L)/C",
+        "volrat" => "ATR16/ATR96",
+        "gapatr" => "(O_t-C_{t-1})/ATR14",
+        "ou_hl96" => "ln(1+clip(-ln2/ln(phi),0,1000)), phi clipped AR(1) of log(C/SMA96)",
+        "acf1" => "lag-1 autocorrelation of 15m log returns over 384",
+        "vr4" => "rstd(r4,384)^2/(4 rstd(lr,384)^2)",
+        "rskew96" => "m3/m2^1.5 of 15m log returns over 96",
+        "jump_share" => "max(rv96-bv,0)/rv96",
+        "semivar_asym" => "(downside semivar - upside semivar)/rv96",
+        "cusum_abs_z" => "|cs_t-cs_{t-96}|/sqrt(96)",
+        "btc_r96" => "BTC 96-bar return at the same timestamp",
+        "btc_vol96" => "BTC vol96 at the same timestamp",
+        "rel_btc96" => "r96 - btc_r96",
+        "beta384" => "clip(clip(cov(r_i,r_BTC,384),-0.05,0.05)/var(r_BTC,384),-5,5)",
+        "tod_sin" | "tod_cos" => "sin/cos(2*pi*bar_index_in_day/bars_per_day)",
+        "dow_sin" | "dow_cos" => "sin/cos(2*pi*weekday/7), Monday=0",
+        "don96" => "(C-min L96)/(max H96-min L96) - 1/2",
+        _ => "see docs/ohlcv.md",
+    }
+}
+
+/// One registered column in the default financial feature set.
+#[derive(Clone, Debug)]
+pub struct RegistryEntry {
+    pub name: String,
+    pub family: &'static str,
+    pub timeframe: &'static str,
+    pub warmup: usize,
+    pub available: bool,
+    pub derived: bool,
+    pub formula: String,
+    pub source: &'static str,
+    pub pit: &'static str,
+    pub reason: Option<String>,
+}
+
+/// The default financial feature registry.
+///
+/// It enumerates (a) the compact 52 regression subset with exact formulas,
+/// (b) every engine column already accepted by `rcsr enrich`, and (c) every
+/// default-set column that is registered but not yet materialised, with the
+/// missing dependency. Unknown names remain hard errors.
+pub fn default_registry() -> Vec<RegistryEntry> {
+    fn push_unique(out: &mut Vec<RegistryEntry>, e: RegistryEntry) {
+        if !out.iter().any(|x| x.name == e.name) {
+            out.push(e);
+        }
+    }
+    let mut out: Vec<RegistryEntry> = Vec::new();
+    // Raw OHLCV/flow inputs.
+    for (name, family) in [
+        ("ts", "identity"),
+        ("symbol", "identity"),
+        ("listing_id", "identity"),
+        ("member_asof", "identity"),
+        ("open", "price"),
+        ("high", "price"),
+        ("low", "price"),
+        ("close", "price"),
+        ("volume", "flow"),
+        ("quote_volume", "flow"),
+        ("trades", "flow"),
+        ("taker_buy_base", "flow"),
+        ("taker_buy_quote", "flow"),
+    ] {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family,
+            timeframe: "15m",
+            warmup: 0,
+            available: true,
+            derived: false,
+            formula: "input column".to_string(),
+            source: "input",
+            pit: "bar t",
+            reason: None,
+        });
+    }
+    // Compact subset with exact formulas.
+    for name in COMPACT_NAMES {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family: compact_family(name),
+            timeframe: "15m",
+            warmup: nominal_warmup(name),
+            available: true,
+            derived: *name == "wasym1",
+            formula: compact_formula(name).to_string(),
+            source: "ohlcv::Bar",
+            pit: "close of bar t; trailing windows inclusive; gaps are NaN",
+            reason: None,
+        });
+    }
+    // Existing engine catalogue.
+    let mut engine: Vec<String> = expand("all").unwrap_or_default();
+    for n in py15m_names() {
+        if !engine.contains(&n) {
+            engine.push(n);
+        }
+    }
+    for g in [
+        "ta:core",
+        "ta:full",
+        "exotic:cheap",
+        "candle:geometry",
+        "cross:btc",
+        "calendar",
+    ] {
+        if let Ok(v) = features::expand(g) {
+            for n in v {
+                if !engine.contains(&n) {
+                    engine.push(n);
+                }
+            }
+        }
+    }
+    for name in engine {
+        if out.iter().any(|x| x.name == name) {
+            continue;
+        }
+        push_unique(&mut out, RegistryEntry {
+            family: family_of(&name),
+            timeframe: "15m",
+            warmup: nominal_warmup(&name),
+            available: true,
+            derived: false,
+            formula: "see docs/ohlcv.md".to_string(),
+            source: "ohlcv::Bar",
+            pit: "close of bar t; gaps are NaN",
+            reason: None,
+            name,
+        });
+    }
+    // Registered but not materialised yet.
+    for name in mtf_names() {
+        let family = name.split('_').next().unwrap_or("mtf");
+        let family: &'static str = match family {
+            "h1" => "mtf_h1",
+            "h4" => "mtf_h4",
+            "d1" => "mtf_d1",
+            _ => "mtf",
+        };
+        push_unique(&mut out, RegistryEntry {
+            name: name.clone(),
+            family,
+            timeframe: family,
+            warmup: 0,
+            available: false,
+            derived: false,
+            formula: "higher-timeframe resample + causal as-of join".to_string(),
+            source: "15m base bars",
+            pit: "last closed higher-timeframe bar strictly before t",
+            reason: unavailable_reason(&name).map(|s| s.to_string()),
+        });
+    }
+    for name in PRICE_ACTION_NAMES {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family: "price_action",
+            timeframe: "15m",
+            warmup: 0,
+            available: false,
+            derived: false,
+            formula: "continuous candle/price-action block".to_string(),
+            source: "15m OHLCV bars",
+            pit: "bar t and earlier",
+            reason: unavailable_reason(name).map(|s| s.to_string()),
+        });
+    }
+    for name in MARKET_STATE_NAMES {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family: "market_state",
+            timeframe: "15m",
+            warmup: 0,
+            available: false,
+            derived: false,
+            formula: "whole-panel cross-section at t".to_string(),
+            source: "all PIT members",
+            pit: "same timestamp cross-section",
+            reason: unavailable_reason(name).map(|s| s.to_string()),
+        });
+    }
+    for name in DERIVATIVE_NAMES {
+        push_unique(&mut out, RegistryEntry {
+            name: name.to_string(),
+            family: "derivatives",
+            timeframe: "15m",
+            warmup: 0,
+            available: false,
+            derived: false,
+            formula: "reserved derivative column".to_string(),
+            source: "none",
+            pit: "not available",
+            reason: unavailable_reason(name).map(|s| s.to_string()),
+        });
+    }
+    out
+}
+
+/// JSON array for `rcsr schema` and the enrich report.
+pub fn registry_json() -> String {
+    let entries: Vec<String> = default_registry()
+        .iter()
+        .map(|e| {
+            format!(
+                "{{\"name\":{},\"family\":{},\"timeframe\":{},\"warmup\":{},\
+                 \"available\":{},\"derived\":{},\"formula\":{},\"formula_sha256\":{},\
+                 \"source\":{},\"pit\":{},\"reason\":{}}}",
+                jstr(&e.name),
+                jstr(e.family),
+                jstr(e.timeframe),
+                e.warmup,
+                e.available,
+                e.derived,
+                jstr(&e.formula),
+                jstr(&manifest::sha256_hex(e.formula.as_bytes())),
+                jstr(e.source),
+                jstr(e.pit),
+                e.reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string())
+            )
+        })
+        .collect();
+    format!("[{}]", entries.join(","))
+}
+
+pub fn is_compact(name: &str) -> bool {
+    COMPACT_NAMES.contains(&name)
+}
+
+/// True when a compact name has no exact implementation elsewhere.
+///
+/// `r16`, `r96`, `macd_hist`, `natr14`, `adx14`, `cmf20`, `vwap_dev96`,
+/// `vol_z96` and the two weekday columns already have identical standalone
+/// implementations; every other compact name (including the four collision
+/// names `clv1`, `rsi14`, `mfi14`, `don96`) is routed to the compact reference.
+pub fn needs_compact(name: &str) -> bool {
+    is_compact(name)
+        && !matches!(
+            name,
+            "r16"
+                | "r96"
+                | "macd_hist"
+                | "natr14"
+                | "adx14"
+                | "cmf20"
+                | "vwap_dev96"
+                | "vol_z96"
+                | "dow_sin"
+                | "dow_cos"
+        )
+}
 
 fn return_names() -> Vec<String> {
     (1..=120).map(|k| format!("r{}", k)).collect()
@@ -242,6 +634,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "xs" => xs_names(),
             "btc" => btc_names(),
             "py15m" => py15m_names(),
+            "compact" => compact_names(),
             "all" => {
                 let mut v = Vec::new();
                 for g in [
@@ -258,6 +651,11 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
                 } else if features::expand(other).is_ok() {
                     // #125 group or name.
                     features::expand(other)?
+                } else if let Some(reason) = unavailable_reason(other) {
+                    return Err(format!(
+                        "registered feature '{}' is unavailable: {}",
+                        other, reason
+                    ));
                 } else {
                     return Err(format!(
                         "unknown feature '{}' (groups: {}; individual names are listed in \
@@ -278,6 +676,9 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
 
 /// Names implemented by this module (as opposed to delegated to #125).
 pub fn is_own(name: &str) -> bool {
+    if is_compact(name) {
+        return true;
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
         if (1..=120).contains(&k) {
             return true;
@@ -329,7 +730,53 @@ pub fn is_own(name: &str) -> bool {
 /// Nominal warm-up in bars for one catalogue name. The report also records the
 /// observed first finite row, which is the authoritative number for a series
 /// that starts after a gap.
+/// Nominal warm-up in 15 m bars for a compact feature.
+fn compact_warmup(name: &str) -> Option<usize> {
+    Some(match name {
+        "r16" => 16,
+        "r96" => 96,
+        "r672" => 672,
+        "ma96" => 95,
+        "ma672" => 671,
+        "ma_slope672" => 671 + 672,
+        "macd_hist" => 0,
+        "natr14" => 14,
+        "vol16" => 16,
+        "vol96" => 96,
+        "vol_ts" => 96,
+        "vol_ratio" => 672,
+        "vol_z2880" => 96 + 2880 - 1,
+        "parkinson96" => 95,
+        "rv_ratio" => 672,
+        "rsi14" => 14,
+        "bb96" | "bb_width96" => 95,
+        "adx14" | "di_diff14" => 14,
+        "cmf20" => 19,
+        "mfi14" => 14,
+        "vwap_dev96" | "vol_z96" | "taker_ratio96" | "trade_intensity96" => 95,
+        "taker_imb16" => 15,
+        "clv1" | "body1" | "wasym1" | "lower_wick" | "rng1" => 0,
+        "clv4" => 3,
+        "batr" => 14,
+        "volrat" => 96,
+        "gapatr" => 1,
+        "ou_hl96" => 191,
+        "acf1" => 385,
+        "vr4" => 387,
+        "rskew96" | "jump_share" | "semivar_asym" => 96,
+        "cusum_abs_z" => 96,
+        "btc_r96" | "btc_vol96" | "rel_btc96" => 96,
+        "beta384" => 385,
+        "tod_sin" | "tod_cos" | "dow_sin" | "dow_cos" => 0,
+        "don96" => 95,
+        _ => return None,
+    })
+}
+
 pub fn nominal_warmup(name: &str) -> usize {
+    if let Some(w) = compact_warmup(name) {
+        return w;
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
         return k;
     }
@@ -752,7 +1199,31 @@ pub struct GroupPlan {
 }
 
 /// Families in the catalogue, with the operation class they are costed as.
+/// Family of a compact feature, used by the cost model and the registry.
+pub fn compact_family(name: &str) -> &'static str {
+    match name {
+        "r16" | "r96" | "r672" => "returns",
+        "ma96" | "ma672" | "ma_slope672" | "macd_hist" => "ma",
+        "vol16" | "vol96" | "vol_ts" | "vol_ratio" | "vol_z2880" | "parkinson96"
+        | "rv_ratio" | "bb96" | "bb_width96" | "vol_z96" | "volrat" => "vol",
+        "natr14" | "adx14" | "di_diff14" | "batr" | "gapatr" => "atr",
+        "rsi14" | "mfi14" => "rsi",
+        "cmf20" | "taker_ratio96" | "taker_imb16" | "trade_intensity96" => "flow",
+        "vwap_dev96" => "vwap",
+        "clv1" | "clv4" | "body1" | "wasym1" | "lower_wick" | "rng1" => "candle",
+        "ou_hl96" | "acf1" | "vr4" | "rskew96" | "jump_share" | "semivar_asym"
+        | "cusum_abs_z" => "exotic",
+        "btc_r96" | "btc_vol96" | "rel_btc96" | "beta384" => "btc",
+        "tod_sin" | "tod_cos" | "dow_sin" | "dow_cos" => "calendar",
+        "don96" => "donchian",
+        _ => "other",
+    }
+}
+
 pub fn family_of(name: &str) -> &'static str {
+    if is_compact(name) {
+        return compact_family(name);
+    }
     if name.starts_with("r") && name[1..].parse::<usize>().is_ok() {
         "returns"
     } else if name.starts_with("ma") || name.starts_with("ema") {
@@ -823,6 +1294,11 @@ pub fn family_of(name: &str) -> &'static str {
 /// every other name falls back to the CPU without changing the output.
 pub fn gpu_supports(name: &str) -> bool {
     if !cfg!(feature = "cuda") {
+        return false;
+    }
+    if is_compact(name) {
+        // The compact profile is computed by one CPU reference pass; no compact
+        // kernel is registered yet, so never claim GPU support for it.
         return false;
     }
     if name.starts_with("xs_rank_") {
@@ -986,6 +1462,8 @@ struct Series {
     close: Vec<f64>,
     volume: Vec<f64>,
     quote_volume: Vec<f64>,
+    trades: Vec<f64>,
+    taker_buy_base: Vec<f64>,
     step: i64,
 }
 
@@ -1004,8 +1482,8 @@ impl Series {
                     close: self.close[i],
                     volume: self.volume[i],
                     quote_volume: self.quote_volume[i],
-                    trades: 0.0,
-                    taker_buy_base: 0.0,
+                    trades: self.trades[i],
+                    taker_buy_base: self.taker_buy_base[i],
                     taker_buy_quote: 0.0,
                     complete: true,
                     traded: self.volume[i] > 0.0,
@@ -1232,6 +1710,14 @@ fn load_series(
         Some(c) => get(c)?,
         None => vec![f64::NAN; seg.len],
     };
+    let trades = match cols.trades {
+        Some(c) => get(c)?,
+        None => vec![f64::NAN; seg.len],
+    };
+    let taker_buy_base = match cols.taker_buy_base {
+        Some(c) => get(c)?,
+        None => vec![f64::NAN; seg.len],
+    };
     Ok(Series {
         symbol: seg.symbol.clone(),
         times,
@@ -1241,6 +1727,8 @@ fn load_series(
         close,
         volume,
         quote_volume,
+        trades,
+        taker_buy_base,
         step,
     })
 }
@@ -1254,6 +1742,8 @@ struct Cols {
     close: usize,
     volume: Option<usize>,
     quote_volume: Option<usize>,
+    trades: Option<usize>,
+    taker_buy_base: Option<usize>,
     symbol: Option<usize>,
 }
 
@@ -1339,7 +1829,10 @@ fn true_range(s: &Series) -> Vec<f64> {
         if !(s.high[i].is_finite() && s.low[i].is_finite()) {
             continue;
         }
-        tr[i] = if i == 0 || !s.close[i - 1].is_finite() {
+        tr[i] = if i == 0
+            || !s.close[i - 1].is_finite()
+            || s.times[i] - s.times[i - 1] != s.step
+        {
             s.high[i] - s.low[i]
         } else {
             let pc = s.close[i - 1];
@@ -1588,13 +2081,18 @@ fn range1(s: &Series) -> Vec<f64> {
 }
 
 fn clv1(s: &Series) -> Vec<f64> {
+    // Compact definition: (C-L)/(H-L) - 1/2, with the compact builder's
+    // degenerate H==L convention (-1/2).
     (0..s.len())
         .map(|i| {
+            if !(s.high[i].is_finite() && s.low[i].is_finite() && s.close[i].is_finite()) {
+                return f64::NAN;
+            }
             let r = s.high[i] - s.low[i];
             if r > 0.0 {
-                ((s.close[i] - s.low[i]) - (s.high[i] - s.close[i])) / r
+                (s.close[i] - s.low[i]) / r - 0.5
             } else {
-                f64::NAN
+                -0.5
             }
         })
         .collect()
@@ -2108,6 +2606,562 @@ fn py15m_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>> 
 }
 
 // ---------------------------------------------------------------------------
+// Compact 52-feature profile (15 m base, exact compact-builder formulas)
+// ---------------------------------------------------------------------------
+
+/// A lagged copy of `x` that is valid only across one contiguous bar.
+fn rlag(x: &[f64], lag: usize, times: &[i64], step: i64) -> Vec<f64> {
+    let n = x.len();
+    let mut out = vec![f64::NAN; n];
+    for i in lag..n {
+        if times[i] - times[i - lag] == lag as i64 * step {
+            out[i] = x[i - lag];
+        }
+    }
+    out
+}
+
+fn div(a: f64, b: f64) -> f64 {
+    if a.is_finite() && b.is_finite() && b != 0.0 {
+        a / b
+    } else {
+        f64::NAN
+    }
+}
+
+fn div_pos(a: f64, b: f64) -> f64 {
+    if a.is_finite() && b.is_finite() && b > 0.0 {
+        a / b
+    } else {
+        f64::NAN
+    }
+}
+
+/// Compute the 52 compact features for one symbol.
+///
+/// The formulas are those of `pilot/build_panel_15m_100.py` at the 15 m base,
+/// with the issue's gap policy: a window whose timestamps are not contiguous is
+/// `NaN`, and Wilder/EMA state restarts after a gap. The compact builder used
+/// positional NumPy windows and therefore bridged gaps; that difference is
+/// deliberate and is recorded per column in the parity report. On contiguous
+/// rows (the parity fixture) the two definitions agree to rounding.
+///
+/// Degenerate bars (`high == low`) use the compact convention:
+/// `clv1 = -0.5`, `body1 = 0`, `lower_wick = NaN`, `wasym1 = NaN`.
+fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>> {
+    let n = s.len();
+    let c = &s.close;
+    let o = &s.open;
+    let h = &s.high;
+    let l = &s.low;
+    let v = &s.volume;
+    let tb = &s.taker_buy_base;
+    let trades = &s.trades;
+    let times = &s.times;
+    let step = s.step;
+    let gap = &b.gap;
+    let mut out = BTreeMap::new();
+
+    // Returns and moving averages.
+    out.insert("r16".to_string(), ret_k(s, 16));
+    out.insert("r96".to_string(), ret_k(s, 96));
+    out.insert("r672".to_string(), ret_k(s, 672));
+    let ma96 = rmean_py(c, 96, times, step);
+    let ma672 = rmean_py(c, 672, times, step);
+    let ratio = |m: &[f64]| -> Vec<f64> {
+        (0..n).map(|i| if c[i] > 0.0 { div(c[i], m[i]) - 1.0 } else { f64::NAN }).collect()
+    };
+    out.insert("ma96".to_string(), ratio(&ma96));
+    out.insert("ma672".to_string(), ratio(&ma672));
+    let lag672 = rlag(&ma672, 672, times, step);
+    out.insert(
+        "ma_slope672".to_string(),
+        (0..n)
+            .map(|i| if ma672[i].is_finite() && lag672[i].is_finite() && lag672[i] != 0.0 {
+                ma672[i] / lag672[i] - 1.0
+            } else {
+                f64::NAN
+            })
+            .collect(),
+    );
+
+    let e12 = ema(c, 12, gap);
+    let e26 = ema(c, 26, gap);
+    let macd: Vec<f64> = (0..n)
+        .map(|i| if e12[i].is_finite() && e26[i].is_finite() && e26[i] > 0.0 {
+            e12[i] / e26[i] - 1.0
+        } else {
+            f64::NAN
+        })
+        .collect();
+    let macd_sig = ema(&macd, 9, gap);
+    out.insert(
+        "macd_hist".to_string(),
+        (0..n)
+            .map(|i| if macd[i].is_finite() && macd_sig[i].is_finite() {
+                macd[i] - macd_sig[i]
+            } else {
+                f64::NAN
+            })
+            .collect(),
+    );
+
+    // ATR family.
+    let tr = &b.tr;
+    let atr14 = wilder_py(tr, 14, gap);
+    let atr16 = wilder_py(tr, 16, gap);
+    let atr96 = wilder_py(tr, 96, gap);
+    out.insert(
+        "natr14".to_string(),
+        (0..n).map(|i| if atr14[i].is_finite() { div_pos(100.0 * atr14[i], c[i]) } else { f64::NAN }).collect(),
+    );
+
+    // Volatility.
+    let lr = ret_k(s, 1);
+    let vol16 = rstd_py(&lr, 16, times, step);
+    let vol96 = rstd_py(&lr, 96, times, step);
+    let vol672 = rstd_py(&lr, 672, times, step);
+    out.insert("vol16".to_string(), vol16.clone());
+    out.insert("vol96".to_string(), vol96.clone());
+    out.insert(
+        "vol_ts".to_string(),
+        (0..n).map(|i| div_pos(vol16[i], vol96[i])).collect(),
+    );
+    out.insert(
+        "vol_ratio".to_string(),
+        (0..n).map(|i| div_pos(vol96[i], vol672[i])).collect(),
+    );
+    let vz2880_mean = rmean_py(&vol96, 2880, times, step);
+    let vz2880_std = rstd_py(&vol96, 2880, times, step);
+    out.insert(
+        "vol_z2880".to_string(),
+        (0..n)
+            .map(|i| if vz2880_std[i] > 0.0 { div(vol96[i] - vz2880_mean[i], vz2880_std[i]) } else { f64::NAN })
+            .collect(),
+    );
+    let hl = (0..n)
+        .map(|i| if h[i] > 0.0 && l[i] > 0.0 { (h[i] / l[i].max(1e-12)).ln() } else { f64::NAN })
+        .collect::<Vec<f64>>();
+    let hl2: Vec<f64> = hl.iter().map(|x| x * x).collect();
+    let hl2m = rmean_py(&hl2, 96, times, step);
+    out.insert(
+        "parkinson96".to_string(),
+        hl2m.iter()
+            .map(|m| if m.is_finite() { (m / (4.0 * std::f64::consts::LN_2)).sqrt() } else { f64::NAN })
+            .collect(),
+    );
+    let rv = |w: usize| {
+        let x: Vec<f64> = lr.iter().map(|r| if r.is_finite() { r * r } else { f64::NAN }).collect();
+        rmean_py(&x, w, times, step)
+    };
+    let rv96 = rv(96);
+    let rv672 = rv(672);
+    out.insert(
+        "rv_ratio".to_string(),
+        (0..n)
+            .map(|i| if rv96[i] > 0.0 && rv672[i] > 0.0 { (rv96[i] / rv672[i]).ln() } else { f64::NAN })
+            .collect(),
+    );
+
+    // RSI / Bollinger / DI.
+    out.insert("rsi14".to_string(), rsi_py(c, 14, gap));
+    let sd96 = rstd_py(c, 96, times, step);
+    out.insert(
+        "bb96".to_string(),
+        (0..n)
+            .map(|i| if sd96[i] > 0.0 {
+                clip(div(c[i] - ma96[i], 2.0 * sd96[i]), -1.0, 1.0)
+            } else {
+                f64::NAN
+            })
+            .collect(),
+    );
+    out.insert(
+        "bb_width96".to_string(),
+        (0..n).map(|i| if sd96[i].is_finite() { div_pos(4.0 * sd96[i], ma96[i]) } else { f64::NAN }).collect(),
+    );
+
+    let mut pdm = vec![0.0f64; n];
+    let mut mdm = vec![0.0f64; n];
+    for i in 1..n {
+        if times[i] - times[i - 1] != step {
+            continue;
+        }
+        let up = h[i] - h[i - 1];
+        let dn = l[i - 1] - l[i];
+        if up > dn && up > 0.0 {
+            pdm[i] = up;
+        }
+        if dn > up && dn > 0.0 {
+            mdm[i] = dn;
+        }
+    }
+    let pdi_r = wilder_py(&pdm, 14, gap);
+    let mdi_r = wilder_py(&mdm, 14, gap);
+    let mut pdi = vec![f64::NAN; n];
+    let mut mdi = vec![f64::NAN; n];
+    for i in 0..n {
+        if atr14[i] > 0.0 {
+            pdi[i] = 100.0 * pdi_r[i] / atr14[i];
+            mdi[i] = 100.0 * mdi_r[i] / atr14[i];
+        }
+    }
+    let dx: Vec<f64> = (0..n)
+        .map(|i| {
+            if pdi[i].is_finite() && mdi[i].is_finite() && pdi[i] + mdi[i] > 0.0 {
+                100.0 * (pdi[i] - mdi[i]).abs() / (pdi[i] + mdi[i])
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let adx = wilder_py(&dx, 14, gap);
+    out.insert("adx14".to_string(), adx.iter().map(|x| x / 100.0).collect());
+    out.insert(
+        "di_diff14".to_string(),
+        (0..n)
+            .map(|i| if pdi[i].is_finite() && mdi[i].is_finite() { (pdi[i] - mdi[i]) / 100.0 } else { f64::NAN })
+            .collect(),
+    );
+
+    // Flow / volume-price.
+    let mfm: Vec<f64> = (0..n)
+        .map(|i| {
+            if h[i] > l[i] {
+                ((c[i] - l[i]) - (h[i] - c[i])) / (h[i] - l[i])
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    let mfv: Vec<f64> = mfm.iter().zip(v).map(|(m, x)| m * x).collect();
+    let mfv20 = rmean_py(&mfv, 20, times, step);
+    let v20 = rmean_py(v, 20, times, step);
+    out.insert("cmf20".to_string(), (0..n).map(|i| div_pos(mfv20[i], v20[i])).collect());
+
+    let tp: Vec<f64> = (0..n).map(|i| (h[i] + l[i] + c[i]) / 3.0).collect();
+    let mf: Vec<f64> = tp.iter().zip(v).map(|(p, x)| p * x).collect();
+    let mut pos = vec![0.0f64; n];
+    let mut neg = vec![0.0f64; n];
+    for i in 1..n {
+        if times[i] - times[i - 1] != step {
+            continue;
+        }
+        if tp[i] > tp[i - 1] {
+            pos[i] = mf[i];
+        } else if tp[i] < tp[i - 1] {
+            neg[i] = mf[i];
+        }
+    }
+    let wpos = wilder_py(&pos, 14, gap);
+    let wneg = wilder_py(&neg, 14, gap);
+    out.insert(
+        "mfi14".to_string(),
+        (0..n)
+            .map(|i| {
+                if wpos[i].is_finite() && wneg[i] > 0.0 {
+                    (100.0 - 100.0 / (1.0 + wpos[i] / wneg[i])) / 50.0 - 1.0
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+    let pv: Vec<f64> = tp.iter().zip(v).map(|(p, x)| p * x).collect();
+    let pvm = rmean_py(&pv, 96, times, step);
+    let v96 = rmean_py(v, 96, times, step);
+    let vwap: Vec<f64> = (0..n).map(|i| div_pos(pvm[i], v96[i])).collect();
+    out.insert(
+        "vwap_dev96".to_string(),
+        (0..n).map(|i| if vwap[i] > 0.0 { div(c[i] - vwap[i], vwap[i]) } else { f64::NAN }).collect(),
+    );
+    let logv: Vec<f64> = v.iter().map(|x| if *x >= 0.0 { (1.0 + x).ln() } else { f64::NAN }).collect();
+    let lv_m = rmean_py(&logv, 96, times, step);
+    let lv_s = rstd_py(&logv, 96, times, step);
+    out.insert(
+        "vol_z96".to_string(),
+        (0..n).map(|i| if lv_s[i] > 0.0 { div(logv[i] - lv_m[i], lv_s[i]) } else { f64::NAN }).collect(),
+    );
+    let tb96 = rmean_py(tb, 96, times, step);
+    out.insert("taker_ratio96".to_string(), (0..n).map(|i| div_pos(tb96[i], v96[i])).collect());
+    let tb16 = rmean_py(tb, 16, times, step);
+    let v16m = rmean_py(v, 16, times, step);
+    out.insert(
+        "taker_imb16".to_string(),
+        (0..n).map(|i| div_pos(2.0 * tb16[i] - v16m[i], v16m[i])).collect(),
+    );
+    let trades96 = rmean_py(trades, 96, times, step);
+    out.insert(
+        "trade_intensity96".to_string(),
+        (0..n).map(|i| if trades96[i].is_finite() && v96[i] > 0.0 {
+            (1.0 + trades96[i] / v96[i]).ln()
+        } else {
+            f64::NAN
+        }).collect(),
+    );
+
+    // Candle geometry (compact conventions).
+    let clv: Vec<f64> = (0..n)
+        .map(|i| {
+            if h[i].is_finite() && l[i].is_finite() && c[i].is_finite() {
+                if h[i] > l[i] { (c[i] - l[i]) / (h[i] - l[i]) - 0.5 } else { -0.5 }
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    out.insert("clv1".to_string(), clv.clone());
+    out.insert("clv4".to_string(), rmean_py(&clv, 4, times, step));
+    let body: Vec<f64> = (0..n)
+        .map(|i| {
+            if h[i].is_finite() && l[i].is_finite() && c[i].is_finite() && o[i].is_finite() {
+                if h[i] > l[i] { (c[i] - o[i]) / (h[i] - l[i]) } else { 0.0 }
+            } else {
+                f64::NAN
+            }
+        })
+        .collect();
+    out.insert("body1".to_string(), body.clone());
+    out.insert(
+        "batr".to_string(),
+        (0..n).map(|i| if atr14[i] > 0.0 { div(c[i] - o[i], atr14[i]) } else { f64::NAN }).collect(),
+    );
+    let upper: Vec<f64> = (0..n)
+        .map(|i| if h[i] > l[i] { (h[i] - o[i].max(c[i])) / (h[i] - l[i]) } else { f64::NAN })
+        .collect();
+    let lower: Vec<f64> = (0..n)
+        .map(|i| if h[i] > l[i] { (o[i].min(c[i]) - l[i]) / (h[i] - l[i]) } else { f64::NAN })
+        .collect();
+    out.insert(
+        "wasym1".to_string(),
+        (0..n)
+            .map(|i| if upper[i].is_finite() && lower[i].is_finite() { upper[i] - lower[i] } else { f64::NAN })
+            .collect(),
+    );
+    out.insert("lower_wick".to_string(), lower);
+    out.insert("rng1".to_string(), (0..n).map(|i| div_pos(h[i] - l[i], c[i])).collect());
+    out.insert("volrat".to_string(), (0..n).map(|i| div_pos(atr16[i], atr96[i])).collect());
+    let prev_close = rlag(c, 1, times, step);
+    out.insert(
+        "gapatr".to_string(),
+        (0..n)
+            .map(|i| if atr14[i] > 0.0 && prev_close[i].is_finite() {
+                div(o[i] - prev_close[i], atr14[i])
+            } else {
+                f64::NAN
+            })
+            .collect(),
+    );
+
+    // Exotic statistical family.
+    let x: Vec<f64> = (0..n)
+        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { c[i].ln() - ma96[i].ln() } else { f64::NAN })
+        .collect();
+    let xl = rlag(&x, 1, times, step);
+    let xxl: Vec<f64> = x.iter().zip(&xl).map(|(a, b)| a * b).collect();
+    let xl2: Vec<f64> = xl.iter().map(|a| a * a).collect();
+    let xxl96 = rmean_py(&xxl, 96, times, step);
+    let x96 = rmean_py(&x, 96, times, step);
+    let xl96 = rmean_py(&xl, 96, times, step);
+    let xl2_96 = rmean_py(&xl2, 96, times, step);
+    out.insert(
+        "ou_hl96".to_string(),
+        (0..n)
+            .map(|i| {
+                if xxl96[i].is_finite() && x96[i].is_finite() && xl96[i].is_finite() && xl2_96[i].is_finite() {
+                    let cov = xxl96[i] - x96[i] * xl96[i];
+                    let var = xl2_96[i] - xl96[i] * xl96[i];
+                    if var > 0.0 {
+                        let phi = (cov / var).max(1e-6).min(0.999999);
+                        let hl = -std::f64::consts::LN_2 / phi.ln();
+                        (1.0 + hl.max(0.0).min(1000.0)).ln()
+                    } else {
+                        f64::NAN
+                    }
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+    let lrl = rlag(&lr, 1, times, step);
+    let lr_lrl: Vec<f64> = lr.iter().zip(&lrl).map(|(a, b)| a * b).collect();
+    let num96 = rmean_py(&lr_lrl, 384, times, step);
+    let lr384 = rmean_py(&lr, 384, times, step);
+    let lrl384 = rmean_py(&lrl, 384, times, step);
+    let lr384_sd = rstd_py(&lr, 384, times, step);
+    let lrl384_sd = rstd_py(&lrl, 384, times, step);
+    out.insert(
+        "acf1".to_string(),
+        (0..n)
+            .map(|i| {
+                let den = lr384_sd[i] * lrl384_sd[i];
+                if den > 0.0 && num96[i].is_finite() {
+                    (num96[i] - lr384[i] * lrl384[i]) / den
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+    let r4 = ret_k(s, 4);
+    let r4_sd = rstd_py(&r4, 384, times, step);
+    out.insert(
+        "vr4".to_string(),
+        (0..n)
+            .map(|i| {
+                let den = 4.0 * lr384_sd[i] * lr384_sd[i];
+                if den > 0.0 { div(r4_sd[i] * r4_sd[i], den) } else { f64::NAN }
+            })
+            .collect(),
+    );
+    let lr_m = rmean_py(&lr, 96, times, step);
+    let d2: Vec<f64> = lr.iter().zip(&lr_m).map(|(r, m)| (r - m) * (r - m)).collect();
+    let d3: Vec<f64> = lr.iter().zip(&lr_m).map(|(r, m)| (r - m) * (r - m) * (r - m)).collect();
+    let m2 = rmean_py(&d2, 96, times, step);
+    let m3 = rmean_py(&d3, 96, times, step);
+    out.insert(
+        "rskew96".to_string(),
+        (0..n).map(|i| if m2[i] > 0.0 { div(m3[i], m2[i].powf(1.5)) } else { f64::NAN }).collect(),
+    );
+    let abs_lr: Vec<f64> = lr.iter().map(|r| r.abs()).collect();
+    let abs_lrl: Vec<f64> = lrl.iter().map(|r| r.abs()).collect();
+    let abs_prod: Vec<f64> = abs_lr.iter().zip(&abs_lrl).map(|(a, b)| a * b).collect();
+    let bv = rmean_py(&abs_prod, 96, times, step);
+    out.insert(
+        "jump_share".to_string(),
+        (0..n)
+            .map(|i| if rv96[i] > 0.0 {
+                ((rv96[i] - (std::f64::consts::PI / 2.0) * bv[i]).max(0.0)) / rv96[i]
+            } else {
+                f64::NAN
+            })
+            .collect(),
+    );
+    let dn2: Vec<f64> = lr
+        .iter()
+        .map(|r| if !r.is_finite() { f64::NAN } else if *r < 0.0 { r * r } else { 0.0 })
+        .collect();
+    let up2: Vec<f64> = lr
+        .iter()
+        .map(|r| if !r.is_finite() { f64::NAN } else if *r > 0.0 { r * r } else { 0.0 })
+        .collect();
+    let rsm = rmean_py(&dn2, 96, times, step);
+    let rsp = rmean_py(&up2, 96, times, step);
+    out.insert(
+        "semivar_asym".to_string(),
+        (0..n).map(|i| if rv96[i] > 0.0 { div(rsm[i] - rsp[i], rv96[i]) } else { f64::NAN }).collect(),
+    );
+    let lr_sd96 = rstd_py(&lr, 96, times, step);
+    let zr: Vec<f64> = (0..n)
+        .map(|i| if lr[i].is_finite() && lr_sd96[i] > 0.0 { (lr[i] - lr_m[i]) / lr_sd96[i] } else { f64::NAN })
+        .collect();
+    let mut cs = vec![0.0f64; n];
+    let mut acc = 0.0;
+    for i in 0..n {
+        if i > 0 && gap[i] {
+            acc = 0.0;
+        }
+        if zr[i].is_finite() {
+            acc += zr[i];
+        }
+        cs[i] = acc;
+    }
+    let mut cusum = vec![f64::NAN; n];
+    for i in 96..n {
+        if contig(times, i, 96, step) {
+            cusum[i] = (cs[i] - cs[i - 96]).abs() / (96.0f64).sqrt();
+        }
+    }
+    out.insert("cusum_abs_z".to_string(), cusum);
+
+    // Cross-asset BTC features at the same timestamp.
+    let btc_r96: Vec<f64> = (0..n).map(|i| Cross::at(&cross.r96, times[i])).collect();
+    let btc_vol96: Vec<f64> = (0..n).map(|i| Cross::at(&cross.vol96, times[i])).collect();
+    out.insert("btc_r96".to_string(), btc_r96.clone());
+    out.insert("btc_vol96".to_string(), btc_vol96);
+    let r96_self = ret_k(s, 96);
+    out.insert(
+        "rel_btc96".to_string(),
+        (0..n)
+            .map(|i| {
+                if r96_self[i].is_finite() && btc_r96[i].is_finite() {
+                    r96_self[i] - btc_r96[i]
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+    let mut beta = vec![f64::NAN; n];
+    for i in 0..n {
+        if !contig(times, i, 384, step) {
+            continue;
+        }
+        let lo = i + 1 - 384;
+        let (mut sx, mut sy, mut syy, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+        let mut ok = true;
+        for j in lo..=i {
+            let br = Cross::at(&cross.r1, times[j]);
+            if !lr[j].is_finite() || !br.is_finite() {
+                ok = false;
+                break;
+            }
+            sx += lr[j];
+            sy += br;
+            syy += br * br;
+            sxy += lr[j] * br;
+        }
+        if ok {
+            let nf = 384.0;
+            let cov = (sxy / nf - (sx / nf) * (sy / nf)).max(-0.05).min(0.05);
+            let vb = syy / nf - (sy / nf) * (sy / nf);
+            if vb > 0.0 {
+                beta[i] = (cov / vb).max(-5.0).min(5.0);
+            }
+        }
+    }
+    out.insert("beta384".to_string(), beta);
+
+    // Clock and Donchian.
+    let bars_per_day = if step > 0 { 86_400 / step } else { 1 };
+    let tod = |i: usize, want_sin: bool| {
+        let idx = if step > 0 { times[i].rem_euclid(86_400) / step } else { 0 };
+        let a = 2.0 * std::f64::consts::PI * idx as f64 / bars_per_day as f64;
+        if want_sin { a.sin() } else { a.cos() }
+    };
+    out.insert("tod_sin".to_string(), (0..n).map(|i| tod(i, true)).collect());
+    out.insert("tod_cos".to_string(), (0..n).map(|i| tod(i, false)).collect());
+    let dow = |i: usize, want_sin: bool| {
+        let ww = weekday(times[i].div_euclid(86_400)) as f64;
+        let a = 2.0 * std::f64::consts::PI * ww / 7.0;
+        if want_sin { a.sin() } else { a.cos() }
+    };
+    out.insert("dow_sin".to_string(), (0..n).map(|i| dow(i, true)).collect());
+    out.insert("dow_cos".to_string(), (0..n).map(|i| dow(i, false)).collect());
+    let lo96 = rolling_min(l, 96, times, step);
+    let hi96 = rolling_max(h, 96, times, step);
+    out.insert(
+        "don96".to_string(),
+        (0..n)
+            .map(|i| {
+                if lo96[i].is_finite() && hi96[i].is_finite() {
+                    if hi96[i] > lo96[i] {
+                        (c[i] - lo96[i]) / (hi96[i] - lo96[i]) - 0.5
+                    } else {
+                        0.0
+                    }
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect(),
+    );
+
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Temp column writer
 // ---------------------------------------------------------------------------
 
@@ -2217,6 +3271,7 @@ struct Context<'a> {
     legacy: Vec<String>,
     own: Vec<String>,
     py15m_requested: Vec<String>,
+    compact: Vec<String>,
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
     cross: &'a Cross,
@@ -2255,6 +3310,17 @@ fn compute_series(
             let values = all
                 .get(name)
                 .ok_or_else(|| format!("py15m column '{}' was not produced", name))?;
+            if let Some(t) = cols.get_mut(name) {
+                t.write_values(values)?;
+            }
+        }
+    }
+    if !ctx.compact.is_empty() {
+        let all = compact_all(s, &base, ctx.cross);
+        for name in &ctx.compact {
+            let values = all
+                .get(name)
+                .ok_or_else(|| format!("compact column '{}' was not produced", name))?;
             if let Some(t) = cols.get_mut(name) {
                 t.write_values(values)?;
             }
@@ -2316,7 +3382,29 @@ fn compute_own(
     } else {
         match name {
             "bb20_bw" => bb_width(s, 20),
-            "vz96" => vz(s, 96),
+            "vz96" | "vol_z96" => vz(s, 96),
+            "natr14" => {
+                let atr = wilder_py(&b.tr, 14, &b.gap);
+                (0..n)
+                    .map(|i| if atr[i].is_finite() { div_pos(100.0 * atr[i], s.close[i]) } else { f64::NAN })
+                    .collect()
+            }
+            "cmf20" => {
+                let mfm: Vec<f64> = (0..n)
+                    .map(|i| {
+                        if s.high[i] > s.low[i] {
+                            ((s.close[i] - s.low[i]) - (s.high[i] - s.close[i]))
+                                / (s.high[i] - s.low[i])
+                        } else {
+                            f64::NAN
+                        }
+                    })
+                    .collect();
+                let mfv: Vec<f64> = mfm.iter().zip(&s.volume).map(|(m, v)| m * v).collect();
+                let mfv20 = rmean_py(&mfv, 20, &s.times, s.step);
+                let v20 = rmean_py(&s.volume, 20, &s.times, s.step);
+                (0..n).map(|i| div_pos(mfv20[i], v20[i])).collect()
+            }
             "clv1" => clv1(s),
             "range1" => range1(s),
             "dow_sin" | "dow_cos" | "hour_sin" | "hour_cos" | "month_sin" | "month_cos"
@@ -2373,7 +3461,17 @@ fn compute_own(
                     beta_window(s, &b.ret1, &ctx.cross.r1, w)
                 }
             }
-            other => return Err(format!("unknown feature '{}'", other)),
+            other => {
+                if is_compact(other) {
+                    let mut all = compact_all(s, b, ctx.cross);
+                    return Ok((
+                        all.remove(other)
+                            .ok_or_else(|| format!("compact column '{}' was not produced", other))?,
+                        warm,
+                    ));
+                }
+                return Err(format!("unknown feature '{}'", other));
+            }
         }
     };
     Ok((v, warm))
@@ -2604,6 +3702,11 @@ fn enrich_inner(
         close: find_col(&names, &["close", "c"]).ok_or_else(|| format!("{}: no close column", input_path))?,
         volume: find_col(&names, &["volume", "vol", "v"]),
         quote_volume: find_col(&names, &["quote_volume", "quotevolume", "qv"]),
+        trades: find_col(&names, &["trades", "trade_count", "trades_count", "n"]),
+        taker_buy_base: find_col(
+            &names,
+            &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
+        ),
         symbol: symbol_col,
     };
     let (segs, inferred_step) = segments(&store, time_col, symbol_col)?;
@@ -2627,11 +3730,18 @@ fn enrich_inner(
     if requested.is_empty() && opts.labels.is_empty() {
         return Err("enrich needs --features and/or --label".to_string());
     }
+    let compact_profile = opts
+        .features
+        .iter()
+        .any(|f| f.split(',').any(|x| x.trim() == "compact"));
     let mut legacy = Vec::new();
     let mut own = Vec::new();
     let mut py15m_requested = Vec::new();
+    let mut compact_requested = Vec::new();
     for n in &requested {
-        if matches!(
+        if is_compact(n) && (compact_profile || needs_compact(n)) {
+            compact_requested.push(n.clone());
+        } else if matches!(
             n.as_str(),
             "bb20_bw" | "month_sin" | "month_cos" | "dom_sin" | "dom_cos"
         ) {
@@ -2660,6 +3770,46 @@ fn enrich_inner(
             legacy.retain(|x| x != n);
             own.push(n.to_string());
         }
+    }
+
+    // The compact/reference flow features read raw exchange fields. A missing
+    // raw column is a hard input error naming that column, never a zero column.
+    let flow_names = [
+        "cmf20",
+        "mfi14",
+        "vwap_dev96",
+        "vol_z96",
+        "taker_ratio96",
+        "taker_imb16",
+        "trade_intensity96",
+    ];
+    let wants_flow = compact_requested.iter().any(|n| flow_names.contains(&n.as_str()));
+    let wants_trades = compact_requested.iter().any(|n| n == "trade_intensity96");
+    let wants_taker = compact_requested
+        .iter()
+        .any(|n| matches!(n.as_str(), "taker_ratio96" | "taker_imb16"));
+    if wants_flow && cols.volume.is_none() {
+        return Err(format!(
+            "{}: compact features {:?} need the raw 'volume' column",
+            input_path,
+            compact_requested
+                .iter()
+                .filter(|n| flow_names.contains(&n.as_str()))
+                .collect::<Vec<_>>()
+        ));
+    }
+    if wants_trades && cols.trades.is_none() {
+        return Err(format!(
+            "{}: compact feature 'trade_intensity96' needs the raw 'trades' column",
+            input_path
+        ));
+    }
+    if wants_taker && cols.taker_buy_base.is_none() {
+        return Err(format!(
+            "{}: compact features 'taker_ratio96'/'taker_imb16' need the raw \
+             'taker_buy_base' (alias 'taker_buy') column",
+            input_path
+        ));
     }
 
     // Labels.
@@ -2707,6 +3857,11 @@ fn enrich_inner(
                     close: find_col(&cnames, &["close", "c"]).ok_or("cross store has no close")?,
                     volume: find_col(&cnames, &["volume", "vol", "v"]),
                     quote_volume: find_col(&cnames, &["quote_volume", "quotevolume", "qv"]),
+                    trades: find_col(&cnames, &["trades", "trade_count", "trades_count", "n"]),
+                    taker_buy_base: find_col(
+                        &cnames,
+                        &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
+                    ),
                     symbol: find_symbol_col(&cnames, None),
                 };
                 let (csegs, _) = segments(&cs, ccols.time, ccols.symbol)?;
@@ -2729,6 +3884,7 @@ fn enrich_inner(
             || n.starts_with("mkt_")
             || n == "rel_r16"
             || n == "rel_r96"
+            || n == "beta384"
     });
     if needs_cross && cross.symbol.is_empty() {
         return Err(format!(
@@ -3023,6 +4179,7 @@ fn enrich_inner(
         legacy: cpu_legacy,
         own: cpu_own,
         py15m_requested: cpu_py15m,
+        compact: compact_requested,
         labels: cpu_labels,
         tf,
         cross: &cross,
@@ -3033,6 +4190,7 @@ fn enrich_inner(
     let has_cpu_work = !ctx.legacy.is_empty()
         || !ctx.own.is_empty()
         || !ctx.py15m_requested.is_empty()
+        || !ctx.compact.is_empty()
         || !ctx.labels.is_empty();
     if has_cpu_work {
         let mut i = 0usize;
@@ -3472,26 +4630,41 @@ INPUT / OUTPUT:
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout
 
-FEATURE GROUPS:
+FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   returns    r1..r120, log close-to-close over exactly k contiguous bars
   ma         ma5 ma10 ma20 ma50 ma100 ma200, close / trailing mean - 1
   vol        vol5 vol20 vol60 vol120, population std of log returns
   atr        atr14 (price units), natr14 (percent)
-  rsi        rsi14 (0..100)
+  rsi        rsi14 as RSI/50 - 1 (compact definition; breaking from 0..100)
   bollinger  bb20_z, bb20_bw
   vz         vz96, z-score of log1p(volume)
   range      range1, (high - low) / close
   candle     clv1 body1 upper_wick1 lower_wick1 open_gap1
-  donchian   don20 don96, close position in the trailing high/low channel
+             (clv1 = (C-L)/(H-L) - 1/2, the compact definition)
+  donchian   don20, don96; don96 is the compact centred channel position
   calendar   dow_sin dow_cos hour_sin hour_cos month_sin month_cos dom_sin dom_cos
   lags       lag_r1_1 .. lag_r1_10
   xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section)
   btc        btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60
   py15m      the 35 columns added by the Python enrich_panel_15m.py step
-  all        every group above except py15m
+  compact    the exact 52-column compact regression subset, 15m base, compact
+             names and order (r16..don96). It is a parity/smoke subset, not the
+             production feature set.
+  all        every legacy group above except py15m and compact
 
-  #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry) are
-  also accepted and are computed by `rcsr::features`, not duplicated here.
+  #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,
+  cross:btc, calendar) are also accepted and are computed by `rcsr::features`.
+
+  The default financial feature set is the union of the groups above, the
+  compact subset, the raw OHLCV/flow fields and the registered multi-timeframe,
+  cross-sectional market-state and reserved derivative columns. `rcsr schema`
+  prints the registry; a registered-but-unavailable name fails closed with the
+  missing data dependency instead of being silently dropped. MTF/market-state
+  columns are registered `available:false` until their passes land; derivative
+  columns have no local snapshot and are `available:false` with source null.
+
+  Compact flow features read raw `volume`, `trades` and `taker_buy_base`
+  (alias `taker_buy`). A missing raw field is a hard error naming the column.
 
 GPU (CUDA builds): registered f64 kernels cover returns/lags, calendar, moving
 sums and variances, Donchian, Bollinger/VZ, EMA/Wilder scans, RSI, labels and

@@ -76,7 +76,10 @@ fn every_flag_has_a_type_default_and_description() {
     // half-written entry, not drift between two copies.
     let doc = rcsr::schema::json();
     assert!(gui::is_valid_json(&doc), "schema is not valid JSON");
-    let opts = doc
+    // Only the root search options: the feature registry and subcommand option
+    // lists also carry `name` fields but they are not root flags.
+    let root = doc.split("\"operators\"").next().expect("root options");
+    let opts = root
         .split("\"name\":\"")
         .skip(1)
         .collect::<Vec<_>>();

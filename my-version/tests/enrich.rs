@@ -389,6 +389,210 @@ fn py15m_matches_the_python_panel_within_tolerance() {
 }
 
 
+/// The compact profile is the parity/regression subset of the default financial
+/// feature set. It must emit exactly the 52 names in compact order.
+#[test]
+fn compact_profile_is_the_exact_52_name_order() {
+    let names = enrich::expand("compact").unwrap();
+    assert_eq!(names, enrich::compact_names());
+    assert_eq!(names.len(), 52);
+    assert_eq!(names[0], "r16");
+    assert_eq!(names[51], "don96");
+    assert_eq!(&names[43..47], &["btc_r96", "btc_vol96", "rel_btc96", "beta384"]);
+}
+
+/// Every compact name is registered `available:true`; `wasym1` is `derived`.
+/// Every registered but unavailable default-set column names its dependency.
+#[test]
+fn default_financial_registry_is_complete_and_explicit() {
+    let reg = enrich::default_registry();
+    let mut seen = std::collections::BTreeSet::new();
+    for e in &reg {
+        assert!(seen.insert(e.name.clone()), "duplicate registry name {}", e.name);
+        assert!(!e.formula.is_empty(), "{} has no formula", e.name);
+        assert!(!e.family.is_empty(), "{} has no family", e.name);
+        if !e.available {
+            assert!(e.reason.as_deref().map(|r| !r.is_empty()).unwrap_or(false), "{} unavailable without reason", e.name);
+        }
+    }
+    for name in enrich::COMPACT_NAMES {
+        let e = reg.iter().find(|e| e.name == *name).unwrap_or_else(|| panic!("{name} missing from registry"));
+        assert!(e.available, "{name} must be available in the compact profile");
+        assert_eq!(e.timeframe, "15m");
+        assert_eq!(e.derived, *name == "wasym1");
+    }
+    // All existing engine columns are registered available.
+    for name in enrich::expand("all").unwrap() {
+        let e = reg.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert!(e.available, "{name} must be available");
+    }
+    for name in enrich::py15m_names() {
+        let e = reg.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert!(e.available, "{name} must be available");
+    }
+    // Unavailable families are explicit, never silently omitted.
+    let unavailable: Vec<&enrich::RegistryEntry> = reg.iter().filter(|e| !e.available).collect();
+    assert!(!unavailable.is_empty());
+    assert!(unavailable.iter().any(|e| e.family.starts_with("mtf_")));
+    assert!(unavailable.iter().any(|e| e.family == "price_action"));
+    assert!(unavailable.iter().any(|e| e.family == "market_state"));
+    assert!(unavailable.iter().any(|e| e.family == "derivatives"));
+    for name in enrich::PRICE_ACTION_NAMES {
+        assert!(enrich::expand(name).unwrap_err().contains("unavailable"));
+    }
+    for name in enrich::DERIVATIVE_NAMES {
+        let e = reg.iter().find(|e| e.name == *name).unwrap();
+        assert!(!e.available);
+        assert!(e.reason.as_deref().unwrap().contains("no local"));
+    }
+    for name in enrich::mtf_names() {
+        assert!(enrich::expand(&name).unwrap_err().contains("unavailable"));
+    }
+    assert!(enrich::expand("funding_rate").unwrap_err().contains("unavailable"));
+    // The schema prints the registry.
+    assert!(rcsr::schema::json().contains("\"feature_registry\""));
+    assert!(rcsr::schema::json().contains("\"wasym1\""));
+}
+
+/// `wasym1 = body1 - 2*clv1` on every non-degenerate bar, and the registry
+/// marks it derived. The compact `H==L` convention is documented separately.
+#[test]
+fn wasym1_identity_holds_on_finite_range_bars() {
+    let dir = tmp_dir("wasym");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for i in 0..240i64 {
+        let base = 100.0 + (i as f64 * 0.37).sin() * 3.0;
+        let o = base + (i as f64 * 0.11).cos() * 0.4;
+        let c = base + (i as f64 * 0.19).sin() * 0.5;
+        let h = o.max(c) + 0.2 + (i % 5) as f64 * 0.03;
+        let l = o.min(c) - 0.25 - (i % 3) as f64 * 0.02;
+        rows.push((i * 900, "AAA".to_string(), o, h, l, c, 10.0 + i as f64));
+    }
+    write_store(&src, &rows, 32);
+    enrich::build(&opts(&src, &out, "clv1,body1,wasym1,lower_wick,don96")).unwrap();
+    let clv = column(&out, "clv1");
+    let body = column(&out, "body1");
+    let wasym = column(&out, "wasym1");
+    let mut n = 0;
+    for i in 0..rows.len() {
+        assert!(clv[i] >= -0.5 && clv[i] <= 0.5, "clv1 out of range at {i}");
+        assert!(body[i] >= -1.0 && body[i] <= 1.0, "body1 out of range at {i}");
+        if wasym[i].is_finite() && body[i].is_finite() && clv[i].is_finite() {
+            let identity = body[i] - 2.0 * clv[i];
+            assert!(
+                (wasym[i] - identity).abs() <= 1e-12,
+                "wasym1 identity at {i}: {} vs {}",
+                wasym[i],
+                identity
+            );
+            n += 1;
+        }
+    }
+    assert!(n > 200, "identity was tested on too few bars ({n})");
+}
+
+/// A compact window that spans a hole is NaN; it is never bridged.
+#[test]
+fn compact_windows_are_gap_masked() {
+    let dir = tmp_dir("compact_gap");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64)> = Vec::new();
+    for i in 0..700i64 {
+        let t = if i < 350 { i * 900 } else { (i + 3) * 900 };
+        let p = 100.0 + i as f64 * 0.01 + (i as f64 * 0.3).sin();
+        rows.push((t, "AAA".to_string(), p, p + 0.2, p - 0.2, p + 0.05, 10.0 + i as f64));
+    }
+    write_store(&src, &rows, 64);
+    enrich::build(&opts(&src, &out, "r16,vol16,ma96,don96,acf1,ou_hl96,volrat")).unwrap();
+    for name in ["r16", "vol16", "ma96", "don96", "acf1", "ou_hl96"] {
+        let v = column(&out, name);
+        for i in 350..360 {
+            assert!(v[i].is_nan(), "{name} bridged the hole at row {i}");
+        }
+    }
+}
+
+/// Raw flow fields are required for the flow features; a missing column is a
+/// hard error naming it, never a zero column.
+#[test]
+fn compact_flow_features_require_raw_trades_and_taker_columns() {
+    let dir = tmp_dir("compact_raw");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &bars("AAA", 120, 0, 900), 16);
+    let err = enrich::build(&opts(&src, &out, "trade_intensity96")).unwrap_err();
+    assert!(err.contains("trades"), "unexpected error: {err}");
+    let err = enrich::build(&opts(&src, &out, "taker_ratio96")).unwrap_err();
+    assert!(err.contains("taker_buy_base"), "unexpected error: {err}");
+}
+
+/// Parity against the independent Python compact builder on a contiguous 15 m
+/// slice. The expected file holds the compact values for the last 300 hourly
+/// rows of two symbols (AAVEUSDT and BTCUSDT). Rows before index 3000 are
+/// pre-roll, so every 672/2880-bar window lies inside the fixture.
+#[test]
+fn compact_matches_the_python_builder_on_a_contiguous_slice() {
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/enrich");
+    let input = base.join("compact_15m_ohlcv.csv");
+    let expected_path = base.join("compact_15m_expected.csv");
+    let dir = tmp_dir("compact_parity");
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let report = enrich::build(&opts(&input.to_string_lossy(), &out, "compact")).unwrap();
+    assert_eq!(report.features.len(), 52);
+
+    let text = std::fs::read_to_string(&expected_path).unwrap();
+    let mut lines = text.lines();
+    let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+    let start_ts = 1_680_271_200i64;
+    let rows_per_symbol = 3600usize;
+    let mut worst_abs = 0.0f64;
+    let mut worst_rel = 0.0f64;
+    let mut worst_name = "";
+    let mut compared = 0usize;
+    let out_cols: Vec<Vec<f64>> = header[2..].iter().map(|n| column(&out, n)).collect();
+    let out_ts: Vec<i64> = column(&out, "ts").into_iter().map(|v| v as i64).collect();
+    for line in lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split(',').collect();
+        let ts: i64 = fields[0].parse().unwrap();
+        let sym = fields[1];
+        let seg = if sym == "AAVEUSDT" { 0 } else { 1 };
+        let idx = seg * rows_per_symbol + ((ts - start_ts) / 900) as usize;
+        assert_eq!(out_ts[idx], ts, "row alignment for {sym} at {ts}");
+        for (j, name) in header.iter().enumerate().skip(2) {
+            let expected = fields[j].parse::<f64>().unwrap();
+            let got = out_cols[j - 2][idx];
+            match (got.is_nan(), expected.is_nan()) {
+                (true, true) => continue,
+                (true, false) => panic!("{name} at {sym}/{ts}: got NaN, expected {expected}"),
+                (false, true) => panic!("{name} at {sym}/{ts}: got {got}, expected NaN"),
+                (false, false) => {}
+            }
+            let a = (got - expected).abs();
+            let r = a / expected.abs().max(1e-300);
+            if a > worst_abs {
+                worst_abs = a;
+                worst_name = name;
+            }
+            worst_rel = worst_rel.max(r);
+            assert!(
+                a <= 1e-10 || r <= 1e-10,
+                "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
+            );
+            compared += 1;
+        }
+    }
+    assert!(compared > 10_000, "parity compared too few values ({compared})");
+    eprintln!(
+        "compact parity: {compared} finite values, worst abs {worst_abs:e} ({worst_name}), worst rel {worst_rel:e}"
+    );
+}
+
 #[test]
 fn every_catalogue_column_is_causal_on_a_prefix() {
     let dir = tmp_dir("causal");
