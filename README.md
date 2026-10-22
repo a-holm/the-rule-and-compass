@@ -28,7 +28,9 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229) — and labels every larger or unsupported candidate for the exact CPU
+(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), and the exact
+correlation objective with a frozen affine gauge
+(#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* remains CPU-side under the #236 gate, and the
 exact correlation device arm (#224/#225) is built and verified on the batched
 kernel but not dispatched from the search yet (see below);
@@ -38,9 +40,13 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open). An explicit `gpu` with a metric that has no device fit objective is
-a usage error, because the kernel would otherwise fit a different loss; use
-`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+still open); `--metric median` does the same with the exact `f64` median
+(`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
+measured crossover of the batched selection, #226). An explicit `gpu` with a
+metric that has no device fit objective is a usage error, because the kernel
+would otherwise fit a different loss; use `--metric squared`,
+`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
+or a CPU strategy.
 `--metric correlation`/`correlation_signed` are in that group on purpose: their
 device arm exists (`fit_batch_verified` with `BatchedGpu` drives the exact
 `1 − |ρ|`/`1 − ρ` kernel through the exact `f64` gate and the measured cost
@@ -909,7 +915,9 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229) — and labels every larger or unsupported candidate for the exact CPU
+(#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), and the exact
+correlation objective with a frozen affine gauge
+(#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* remains CPU-side under the #236 gate, and the
 exact correlation device arm (#224/#225) is built and verified on the batched
 kernel but not dispatched from the search yet (see below);
@@ -919,9 +927,13 @@ constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device (fit-only: the
 fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open). An explicit `gpu` with a metric that has no device fit objective is
-a usage error, because the kernel would otherwise fit a different loss; use
-`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+still open); `--metric median` does the same with the exact `f64` median
+(`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows — the
+measured crossover of the batched selection, #226). An explicit `gpu` with a
+metric that has no device fit objective is a usage error, because the kernel
+would otherwise fit a different loss; use `--metric squared`,
+`--metric log_squashed`, `--metric absolute`, a rank metric, `--metric median`
+or a CPU strategy.
 `--metric correlation`/`correlation_signed` are in that group on purpose: their
 device arm exists (`fit_batch_verified` with `BatchedGpu` drives the exact
 `1 − |ρ|`/`1 − ρ` kernel through the exact `f64` gate and the measured cost

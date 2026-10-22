@@ -395,7 +395,8 @@ SEARCH:
                              passes, no optimiser); correlation/correlation_signed
                              use the exact analytic rho gradient around a frozen
                              affine gauge; rank/order losses use a deterministic
-                             coordinate polish
+                             coordinate polish (median on the device with
+                             --fit-strategy gpu, #226)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
                              exact). `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
@@ -415,24 +416,31 @@ SEARCH:
                              at or above that size, then refits finalists
                              exactly. It minimises the configured objective:
                              squared/AIC least squares, log_squashed with
-                             per-row IRLS weights (#229), or — for
+                             per-row IRLS weights (#229), absolute (mean |r|)
+                             with per-row Lawson weights and true-MAE
+                             acceptance (#222), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
-                             (#230; fit-only, the fitness stays on the CPU).
-                             Without a batch backend it uses the exact CPU arms
-                             (never a no-op). The device refuses any other
-                             metric instead of substituting an objective: use
-                             `--metric squared`, `--metric log_squashed`, a
-                             rank metric, or a CPU strategy. `--metric
-                             correlation`/`correlation_signed` are in the
-                             refused group even though their exact device arm
-                             (1-|rho| / 1-rho, both gauge orientations) exists
-                             and passes its device tests: on a 15 000-row cell
-                             the deferred fit reached validation hypervolume
+                             (#230; fit-only, the fitness stays on the CPU);
+                             for median, the exact f64 median polish (segmented
+                             sort of the residual bits, first-improver ladder,
+                             #226; fit-only, and only for >= 4096 training
+                             rows, the measured crossover). Without a batch
+                             backend it uses the exact CPU arms (never a no-op).
+                             The device refuses any other metric instead of
+                             substituting an objective: use
+                             `--metric squared`, `--metric log_squashed`,
+                             `--metric absolute`, a rank metric,
+                             `--metric median`, or a CPU strategy.
+                             `correlation`/`correlation_signed` are in the
+                             refused group too, even though their exact device
+                             arm (1-|rho| / 1-rho, both gauge orientations)
+                             exists and passes its device tests: on a 15 000-row
+                             cell the deferred fit reached validation hypervolume
                              6.85 against 34.09 for the exact CPU arm, so the
-                             arm is not wired in yet. `--metric signed` keeps
-                             the exact CPU projection (#228) for the same kind
-                             of reason (#236)
+                             arm is not wired in yet. `--metric signed` keeps the
+                             exact CPU projection (#228) for the same kind of
+                             reason (#236)
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
@@ -470,19 +478,20 @@ SEARCH:
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
-                             the GPU automatically for --metric squared and
-                             --metric log_squashed: those are the objectives
-                             the kernel scores. Every other metric (including
-                             the default absolute) runs on the CPU and prints
-                             the reason, never with a proxy loss. The
-                             correlation family has an exact device fit arm
-                             that is not dispatched yet (its device tests and
-                             cost model live in docs/gpu-backend.md); the rank
-                             family fits on the device under --fit-strategy
-                             gpu with CPU f64 fitness. Reported
-                             errors stay CPU f64. Cross-backend runs are
-                             not bit-identical because f32 fitness can change
-                             the trajectory. JSON
+                             the GPU automatically for --metric squared,
+                             --metric log_squashed and --metric absolute (mean
+                             |r|): those are the objectives the kernel fits and
+                             scores. Every other metric is *scored* on the CPU
+                             and prints the reason, never with a proxy loss;
+                             with --fit-strategy gpu its *constants* may still
+                             be fitted on the device (rank and median arms).
+                             The correlation family
+                             has an exact device fit arm that is not dispatched
+                             yet (its device tests, cost model and measured
+                             numbers live in docs/gpu-backend.md). Reported
+                             errors stay CPU f64. Cross-backend runs are not
+                             bit-identical because f32 fitness can change the
+                             trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
                              measured separately with ncu
@@ -2243,10 +2252,10 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
-    // #223 + #229: an explicit `--fit-strategy gpu` asks for the batched GPU LM,
-    // which minimises squared error or log-squashed loss. Refuse a metric with
-    // no native device objective instead of silently fitting its constants on
-    // the CPU with a different objective.
+    // #223 + #229 + #222: an explicit `--fit-strategy gpu` asks for the batched
+    // GPU LM, which minimises squared error, log-squashed loss or mean absolute
+    // error. Refuse a metric with no native device objective instead of
+    // silently fitting its constants on the CPU with a different objective.
     // The check runs before any data is read, so it is a usage error.
     if fit_strategy_set && cfg.fit_strategy == fit::FitStrategy::Gpu {
         if let Some(why) = fit::gpu_fit_metric_error(cfg.metric) {

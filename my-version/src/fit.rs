@@ -21,6 +21,8 @@ use crate::metrics::{self, Metric};
 // share one arithmetic story and one fallback contract.
 pub(crate) mod correlation;
 mod gpu;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+mod median;
 mod rank;
 mod stream;
 mod varpro;
@@ -34,6 +36,10 @@ pub use gpu::BatchedGpu;
 pub use stream::{
     fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
 };
+// #226: the median polish tail is only wired into the CUDA arm; a CPU-only
+// build keeps the module (its unit tests) without re-exporting anything.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) use median::{polish_median_batch, MedianTrialScorer};
 // The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
 // the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
@@ -138,6 +144,11 @@ pub enum DeviceLoss {
     /// [`DeviceLoss::Correlation`]. #225 gives it a real orientation choice:
     /// the kernel refines both gauge signs and keeps the better `1 − ρ`.
     CorrelationSigned,
+    /// #222: `Σ w·|r|`, minimised by per-row IRLS weights `1/max(|r|, 1e-6)`
+    /// with true-`|r|` acceptance. Both the evaluator and the batched fit use
+    /// this code, so a run can neither rank nor fit MAE with a squared-error
+    /// surrogate.
+    Absolute,
 }
 
 impl DeviceLoss {
@@ -148,6 +159,7 @@ impl DeviceLoss {
             DeviceLoss::LogSquashed => 1,
             DeviceLoss::Correlation => 2,
             DeviceLoss::CorrelationSigned => 3,
+            DeviceLoss::Absolute => 4,
         }
     }
 
@@ -157,6 +169,7 @@ impl DeviceLoss {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
             Metric::LogSquashed => Some(DeviceLoss::LogSquashed),
+            Metric::Absolute => Some(DeviceLoss::Absolute),
             _ => None,
         }
     }
@@ -204,7 +217,8 @@ pub fn correlation_fit_only(metric: Metric) -> Option<bool> {
 ///
 /// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) minimises one
 /// configured objective per launch: weighted squared error for the
-/// least-squares family, and `log_squashed` as weighted LM/IRLS since #229.
+/// least-squares family, `log_squashed` as weighted LM/IRLS since #229, and
+/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222.
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
@@ -227,12 +241,12 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if rank_metric_signed(metric).is_some() {
         return None;
     }
-    // #225: the correlation family has an exact device arm on the batched
-    // kernel, but the search does not dispatch it yet: measured on a
-    // 15 000-row cell at pop 100 the deferred fit reached validation
-    // hypervolume 6.85 against 34.09 for the exact CPU arm, so wiring it
-    // without a quality gate would trade quality for speed. The refusal names
-    // the arm instead of pretending it does not exist.
+    // #226: `median` is honoured by the batched exact median polish
+    // (`median_fit_only`), also fit-only: the device sorts the residual bits,
+    // the CPU scores every candidate with the configured median.
+    if median_fit_only(metric) {
+        return None;
+    }
     let correlation_note = if correlation_fit_only(metric).is_some() {
         " The exact correlation device arm (#224/#225) exists on the batched \
          kernel (1 - |rho| / 1 - rho, frozen affine gauge, two-orientation \
@@ -243,12 +257,13 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
         ""
     };
     Some(format!(
-        "--fit-strategy gpu minimises squared error, log-squashed loss or the \
-         exact rank objectives, but --metric {} has no device fit objective the \
-         search can dispatch, so the GPU arms cannot fit it. Use --metric squared \
-         (aic, aicc and bic also fit by least squares), --metric log_squashed, \
-         --metric rank_correlation or rank_correlation_signed, or a CPU fit \
-         strategy: --fit-strategy exact, auto, linear, varpro or stream.{}",
+        "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
+         absolute error or the exact rank and median objectives, but --metric \
+         {} has no device fit objective, so the GPU arms cannot fit it. Use \
+         --metric squared (aic, aicc and bic also fit by least squares), \
+         --metric log_squashed, --metric absolute, --metric rank_correlation \
+         or rank_correlation_signed, --metric median, or a CPU fit strategy: \
+         --fit-strategy exact, auto, linear, varpro or stream.{}",
         metric.name(),
         correlation_note
     ))
@@ -265,6 +280,100 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
 /// [`DeviceLoss::for_metric`].
 pub fn rank_fit_only(metric: Metric) -> Option<bool> {
     rank_metric_signed(metric)
+}
+
+/// #226: `true` when `--fit-strategy gpu` can fit `median` on the device
+/// through the batched exact median polish, `false` for every other metric.
+///
+/// Like [`rank_fit_only`] this is a **fit-only** arm, not a [`fit_loss`]: the
+/// device selects the exact median of `|pred − y|` (a segmented sort of the
+/// residual bits) and never accumulates an SSE. The evaluator cannot score a
+/// median, so this predicate selects the fit stage only; the *scoring* gate
+/// remains [`DeviceLoss::for_metric`] and every fitness value stays CPU `f64`.
+pub fn median_fit_only(metric: Metric) -> bool {
+    metric == Metric::Median
+}
+
+/// #226: rows below which the device median polish is not worth its per-call
+/// latency and the CPU arm stays.
+///
+/// Derived from [`median_fit_cost`] (measured on the RTX 3060, see
+/// `docs/gpu-backend.md` §"Median absolute error fitting"): one call costs a
+/// fixed launch/sort setup plus a per-row term, so a small batch of small
+/// samples loses to the CPU's single sort. At and above it the modelled device
+/// polish is cheaper for every constant count the kernel accepts (`p ≤ 20`). The
+/// decision is a row count, never a timing measurement, so it is reproducible.
+pub const MEDIAN_GPU_MIN_ROWS: usize = 4_096;
+
+/// #226: modelled wall time of **one** candidate's median fit tail, in
+/// seconds, for `sweeps` ladder sweeps and `p` constants.
+///
+/// Both sides run the same ladder: `sweeps · p` calls of six trials. The CPU
+/// side pays one prediction sweep plus one `n log n` sort of `f64` residuals
+/// per trial; the device pays one prediction sweep, one segmented radix sort of
+/// `u64` keys and one pick per trial, plus a fixed per-call cost. The
+/// coefficients are the median-arm measurement recorded in
+/// `docs/gpu-backend.md`, not guesses:
+///
+/// ```text
+/// cpu_s = sweeps·p·6·CPU_ROW_S·n
+/// gpu_s = sweeps·p·(GPU_CALL_S + 6·GPU_ROW_S·n) + GPU_CALL_S
+/// ```
+///
+/// The CPU term is linear in `n` at the measured sizes: the `n log n` sort is
+/// partly paid for by the sequential pass that feeds it (the fit is a linear
+/// upper bound from 5 000 to 154 000 rows). `gpu_s` charges the baseline call
+/// once, hence the trailing `GPU_CALL_S`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MedianFitCost {
+    /// Modelled CPU polish time, seconds.
+    pub cpu_s: f64,
+    /// Modelled device polish time, seconds.
+    pub gpu_s: f64,
+}
+
+impl MedianFitCost {
+    /// `cpu_s / gpu_s`, the modelled speed-up of the device tail.
+    pub fn speedup(&self) -> f64 {
+        if self.gpu_s > 0.0 {
+            self.cpu_s / self.gpu_s
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Whether the model prefers the device for this shape.
+    pub fn prefers_gpu(&self) -> bool {
+        self.gpu_s < self.cpu_s
+    }
+}
+
+/// #226: per-row cost of one CPU trial (prediction sweep plus the `f64` sort
+/// of the residuals), seconds. Measured mean over 5 000–154 000 rows.
+const MEDIAN_CPU_ROW_S: f64 = 3.3e-8;
+/// #226: fixed cost of one device call (uploads, CUB size query, buffer
+/// allocation, launches and sync), seconds.
+const MEDIAN_GPU_CALL_S: f64 = 3.5e-4;
+/// #226: per-row cost of one device trial (f64 predict + segmented radix sort
+/// of the keys + pick), seconds.
+const MEDIAN_GPU_ROW_S: f64 = 3.95e-9;
+
+/// #226: modelled CPU-vs-device cost of the median polish tail.
+pub fn median_fit_cost(n: usize, p: usize, sweeps: usize) -> MedianFitCost {
+    let nf = n.max(1) as f64;
+    let trials = (sweeps.max(1) * p.max(1) * 6) as f64;
+    let calls = (sweeps.max(1) * p.max(1)) as f64;
+    MedianFitCost {
+        cpu_s: trials * MEDIAN_CPU_ROW_S * nf,
+        gpu_s: calls * (MEDIAN_GPU_CALL_S + 6.0 * MEDIAN_GPU_ROW_S * nf)
+            + MEDIAN_GPU_CALL_S,
+    }
+}
+
+/// #226: whether the device median polish is predicted to be faster than the
+/// CPU polish for a sample of `n` rows and `p` constants.
+pub fn median_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
+    n >= MEDIAN_GPU_MIN_ROWS && median_fit_cost(n, p, sweeps).prefers_gpu()
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -3857,6 +3966,73 @@ mod tests {
         assert!(loss < 1e-12, "loss={loss}, values={:?}", values(&tree));
     }
 
+    /// #222: for a scale-only model `a·x` on positive `x`, the L1 optimum is
+    /// the (base-weight × x)-weighted median of `y_i / x_i` — an exact,
+    /// independent oracle for the IRLS arm, not a comparison with another
+    /// iteration of the same code.
+    #[test]
+    fn l1_fit_matches_the_weighted_median_on_a_scale_model() {
+        let ratios = [
+            2.0, 2.1, 1.9, 2.05, 1.95, 30.0, 2.02, 1.98, -12.0, 2.03, 1.97,
+        ];
+        let xs = [0.5, 0.7, 0.9, 1.1, 1.3, 1.5, 1.7, 1.9, 2.1, 2.3, 2.5];
+        let base = [1.0, 1.0, 1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0];
+        let x: Vec<Vec<f64>> = xs.iter().map(|&v| vec![v]).collect();
+        let y: Vec<f64> = xs.iter().zip(&ratios).map(|(x, r)| x * r).collect();
+        let mut order: Vec<usize> = (0..xs.len()).collect();
+        order.sort_by(|&a, &b| ratios[a].partial_cmp(&ratios[b]).unwrap());
+        let total: f64 = order.iter().map(|&i| base[i] * xs[i]).sum();
+        let mut acc = 0.0;
+        let mut median = f64::NAN;
+        for &i in &order {
+            acc += base[i] * xs[i];
+            if acc >= 0.5 * total {
+                median = ratios[i];
+                break;
+            }
+        }
+        let mut tree = node(Op::Mul, vec![constant(1.0), input(0)]);
+        let fitted_loss = fit_weighted_metric(&mut tree, &x, &y, &base, 64, Metric::Absolute);
+        let a = fitted_constants(&tree)[0];
+        assert!(
+            (a - median).abs() <= 1e-2 * median.abs().max(1.0),
+            "IRLS {a} vs weighted median {median}"
+        );
+        // The parity claim is on the objective: the IRLS endpoint must not be
+        // worse than the exact weighted median of this scale model.
+        let pred_at = |c: f64| -> Vec<f64> { x.iter().map(|r| c * r[0]).collect() };
+        // Lawson IRLS approaches the kink asymptotically (one weight goes to
+        // infinity at the median), so the honest quality gate is that the
+        // endpoint is within 0.1 % of the exact oracle, not bit-equal to it.
+        let at_median = metrics::score_weighted(&pred_at(median), &y, &base, Metric::Absolute, 1);
+        assert!(
+            fitted_loss <= at_median * (1.0 + 1e-3),
+            "IRLS loss {fitted_loss} worse than the weighted-median oracle {at_median}"
+        );
+    }
+
+    /// #222: the arm is deterministic (bit for bit) and a non-finite row is
+    /// reported as an infinite loss without corrupting the constants.
+    #[test]
+    fn l1_fit_is_deterministic_and_rejects_non_finite_rows() {
+        let (x, y) = outlier_fixture();
+        let mut a = line(0.5, 0.0);
+        let mut b = line(0.5, 0.0);
+        let la = fit_weighted_metric(&mut a, &x, &y, &[], 8, Metric::Absolute);
+        let lb = fit_weighted_metric(&mut b, &x, &y, &[], 8, Metric::Absolute);
+        assert_eq!(la.to_bits(), lb.to_bits());
+        assert_eq!(
+            fitted_constants(&a).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted_constants(&b).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        let mut bad_y = y.clone();
+        bad_y[2] = f64::NAN;
+        let mut t = line(0.5, 0.0);
+        let loss = fit_weighted_metric(&mut t, &x, &bad_y, &[], 8, Metric::Absolute);
+        assert!(!loss.is_finite(), "a non-finite metric score must not be reported as a fit: {loss}");
+        assert!(fitted_constants(&t).iter().all(|v| v.is_finite()));
+    }
+
     #[test]
     fn fit_rejects_a_length_mismatch() {
         let x = vec![vec![0.0], vec![1.0]];
@@ -4378,22 +4554,23 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223 + #229 + #230: an explicit GPU request is refused for every metric
-    /// without a device fit objective, and the refusal says why and what to use
-    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares,
-    /// `log_squashed` by weighted IRLS (#229) and the rank family by the exact
-    /// integer polish (#230), so all three groups are accepted.
+    /// #223 + #229 + #230 + #226 + #222: an explicit GPU request is refused
+    /// for every metric without a device fit objective, and the refusal says
+    /// why and what to use instead. `squared`/`aic`/`aicc`/`bic` fit by least
+    /// squares, `log_squashed` by weighted IRLS (#229), `absolute` by L1 IRLS
+    /// (#222), the rank family by the exact integer polish (#230) and `median`
+    /// by the exact median polish (#226), so all five groups are accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() {
+            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() || median_fit_only(*m) {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
             let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
             assert!(
-                why.contains("minimises squared error, log-squashed loss or the"),
+                why.contains("minimises squared error, log-squashed loss, mean"),
                 "the refusal must name the device objectives: {why}"
             );
             assert!(
@@ -4408,6 +4585,10 @@ mod tests {
                 why.contains("--metric log_squashed"),
                 "the refusal must point at the robust arm: {why}"
             );
+            assert!(
+                why.contains("--metric absolute"),
+                "the refusal must point at the L1 arm: {why}"
+            );
             for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
                 assert!(
                     why.contains(strategy),
@@ -4421,6 +4602,7 @@ mod tests {
         assert!(gpu_fit_metric_error(Metric::Squared).is_none());
         assert!(gpu_fit_metric_error(Metric::RankCorrelation).is_none());
         assert!(gpu_fit_metric_error(Metric::RankCorrelationSigned).is_none());
+        assert!(gpu_fit_metric_error(Metric::Absolute).is_none());
         assert_eq!(rank_fit_only(Metric::RankCorrelation), Some(false));
         assert_eq!(rank_fit_only(Metric::RankCorrelationSigned), Some(true));
         assert_eq!(rank_fit_only(Metric::Squared), None);
@@ -4445,7 +4627,45 @@ mod tests {
         // The scoring gate stays closed: no correlation scorer on the device.
         assert_eq!(DeviceLoss::for_metric(Metric::Correlation), None);
         assert_eq!(DeviceLoss::for_metric(Metric::CorrelationSigned), None);
-        assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
+        // #226: `median` has an exact device polish (fit-only), so an explicit
+        // `--fit-strategy gpu` is no longer a usage error for it.
+        assert!(gpu_fit_metric_error(Metric::Median).is_none());
+        assert!(median_fit_only(Metric::Median));
+        assert!(!median_fit_only(Metric::Absolute));
+        assert!(!median_fit_only(Metric::RankCorrelation));
+    }
+
+    /// #226: the measured cost model, as a decision. Below the row floor the
+    /// CPU polish stays; above it the device wins for every constant count the
+    /// kernel accepts, and the model is monotone in `n` and in `p`.
+    #[test]
+    fn the_median_cost_model_prefers_the_device_only_above_its_row_floor() {
+        assert!(!median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS - 1, 4, 8));
+        for p in 1..=20 {
+            assert!(
+                median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS, p, 8),
+                "p={p} must be admitted at the floor"
+            );
+            assert!(
+                median_gpu_fit_worthwhile(154_000, p, 8),
+                "p={p} must be admitted at 154k rows"
+            );
+            assert!(
+                median_fit_cost(154_000, p, 8).speedup() > 1.0,
+                "p={p}: the model must show a speed-up at 154k rows"
+            );
+        }
+        // Monotone in the sample size for a fixed shape.
+        let small = median_fit_cost(5_000, 4, 8);
+        let large = median_fit_cost(154_000, 4, 8);
+        assert!(large.speedup() > small.speedup());
+        // At 4k rows and p=4 the modelled device tail must still beat the CPU,
+        // which is what makes the floor the *smallest* admitted count.
+        let floor = median_fit_cost(MEDIAN_GPU_MIN_ROWS, 4, 8);
+        assert!(floor.prefers_gpu(), "floor cost {floor:?}");
+        let below = median_fit_cost(MEDIAN_GPU_MIN_ROWS - 1, 4, 8);
+        assert!(!median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS - 1, 4, 8));
+        assert!(below.cpu_s > 0.0 && below.gpu_s > 0.0);
     }
 
     #[test]
