@@ -869,7 +869,9 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     let refused: Vec<&str> = Metric::all()
         .iter()
         .filter(|m| {
-            rcsr::fit::fit_loss(**m).is_none() && rcsr::fit::rank_fit_only(**m).is_none()
+            rcsr::fit::fit_loss(**m).is_none()
+                && rcsr::fit::rank_fit_only(**m).is_none()
+                && !rcsr::fit::median_fit_only(**m)
         })
         .map(|m| m.name())
         .collect();
@@ -884,6 +886,10 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     assert!(
         !refused.contains(&"rank_correlation") && !refused.contains(&"rank_correlation_signed"),
         "the rank family is fitted by the exact polish since #230 and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"median"),
+        "median is fitted by the exact median polish since #226 and must not be refused"
     );
     for metric in refused {
         // `--implicit` metrics are refused earlier (by #14) when it is missing;
@@ -924,13 +930,23 @@ fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
     }
 }
 
-/// The gate must not over-fire. The four least-squares metrics and
-/// `log_squashed` pass the usage check with `gpu`, and every metric keeps every
-/// other strategy: each reaches the data loader, so the run fails on the missing
-/// file (exit 3) rather than on the fit strategy.
+/// The gate must not over-fire. The four least-squares metrics,
+/// `log_squashed`, the rank family and `median` pass the usage check with
+/// `gpu`, and every metric keeps every other strategy: each reaches the data
+/// loader, so the run fails on the missing file (exit 3) rather than on the fit
+/// strategy.
 #[test]
 fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
-    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
+    for metric in [
+        "squared",
+        "aic",
+        "aicc",
+        "bic",
+        "log_squashed",
+        "rank_correlation",
+        "rank_correlation_signed",
+        "median",
+    ] {
         let out = rcsr(&[
             "--data", "missing-223.csv", "--target", "y", "--vars", "x",
             "--fit-strategy", "gpu", "--metric", metric,

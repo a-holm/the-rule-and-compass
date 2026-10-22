@@ -253,6 +253,7 @@ is mathematically well posed:
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
+| `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 The correlation family is no longer a squared fit plus polish (issue #224).
@@ -833,8 +834,11 @@ is never a silent no-op. A metric with no native device objective is a
 different matter: an explicit `--fit-strategy gpu` with it is refused as a usage
 error before the run (#223, #229), because the CPU arms would fit a different
 objective. The kernel's native objectives are squared/AIC (least squares) and
-`log_squashed` (weighted IRLS). `--fit-report` prints GPU accepted/fallback/refit
-counts and whether a CUDA build is present.
+`log_squashed` (weighted IRLS); `rank_correlation`, `rank_correlation_signed`
+and `median` are **fit-only** device arms (#230, #226) whose fitness is still the
+CPU objective. `--fit-report` prints GPU accepted/fallback/refit
+counts and whether a CUDA build is present; the fallback ledger names
+`median_declined` for a median call the device could not complete (#226).
 
 #### Exactness and fallbacks
 
@@ -850,7 +854,7 @@ counts and whether a CUDA build is present.
 | non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
 | streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
 | GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
-| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` is ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking |
+| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` and `log_squashed` are ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking. The rank and median arms are fit-only: the device moves constants, the CPU scores every candidate with the configured objective and refits every finalist (#230, #226) |
 
 `auto` is deterministic: it chooses by tree structure and size only, never by
 wall-clock timing, so a seed cannot change path between runs. For separable
@@ -950,15 +954,20 @@ admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
-`non_finite`, `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+`non_finite`, `launch`, `rank_declined`, `median_declined`) in
+`gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family, and
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, accepted only when the configured loss improves and gated by a
 scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
-An explicit `gpu` with any other metric is a usage error (exit 2) naming
-`--metric squared`, `--metric log_squashed` or a CPU strategy (exact, auto,
-linear, varpro, stream), never a silent CPU fit of a different objective
-(#223). Every finalist is refit exactly on all training rows in CPU f64 *for
+The rank and median families are fit-only device arms (#230, #226): the device
+moves the constants, the CPU scores and refits every finalist. The median arm
+also requires at least 4 096 training rows, the measured crossover of the
+batched selection; below it the exact CPU median arm runs with a labelled
+reason. An explicit `gpu` with any other metric is a usage error (exit 2) naming
+`--metric squared`, `--metric log_squashed`, a rank metric, `--metric median` or
+a CPU strategy (exact, auto, linear, varpro, stream), never a silent CPU fit of
+a different objective (#223). Every finalist is refit exactly on all training rows in CPU f64 *for
 the configured metric* before it is scored and reported, so reported constants
 and metrics never come from f32. The arm is opt-in and saved in checkpoints;
 `exact` remains the default, bit for bit.

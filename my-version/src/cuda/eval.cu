@@ -2863,6 +2863,233 @@ float rc_rank_score_batch(void *ctx,
     return ms;
 }
 
+/* --- #226: host side of the exact median stage ---------------------------- */
+
+/* `|r|` as a `u64`. The absolute residual is non-negative, so its IEEE-754
+ * bit pattern orders exactly like the value; sorting the patterns is sorting
+ * the residuals. `-0.0` and `+0.0` both map to `+0.0` bits, which is what the
+ * CPU's `f64::abs` produces too. */
+__device__ __forceinline__ unsigned long long md_abs_key(double r)
+{
+    double a = fabs(r);
+    unsigned long long k;
+    memcpy(&k, &a, sizeof(k));
+    return k;
+}
+
+__device__ __forceinline__ double md_key_value(unsigned long long k)
+{
+    double a;
+    memcpy(&a, &k, sizeof(a));
+    return a;
+}
+
+/* One key per row of every `(candidate, trial)` segment: the bit pattern of
+ * `|pred − y|` in exact f64. `status[seg] = 2` marks a segment with a
+ * non-finite prediction or residual, which the caller reads as `non_finite`
+ * and hands to the exact CPU arm (the landed #169 guard, never a silent 1e30). */
+__global__ void k_median_keys(const unsigned int *__restrict__ prog,
+                              const unsigned int *__restrict__ off,
+                              const double *__restrict__ c0, int kmax,
+                              const double *__restrict__ cols,
+                              const double *__restrict__ y, int n, int ns,
+                              int ntrials,
+                              unsigned long long *__restrict__ keys,
+                              int *__restrict__ status)
+{
+    const long long total = (long long)n * (long long)ns;
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += stride) {
+        const int seg = (int)(i / n);
+        const int row = (int)(i % n);
+        /* `off` has one entry per *candidate*; a candidate owns `ntrials`
+           consecutive segments (its ladder trials). */
+        const int cand = seg / ntrials;
+        const unsigned int *nd = prog + off[cand];
+        const int m = (int)((off[cand + 1] - off[cand]) / 4u);
+        const double *c = c0 + (size_t)seg * (size_t)kmax;
+        double v[FT_MAX_NODES];
+        ft_forward_d(nd, m, cols, n, row, c, v);
+        const double pred = v[m - 1];
+        const double r = pred - y[row];
+        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+            keys[i] = 0xFFFFFFFFFFFFFFFFULL;
+            status[seg] = 2; /* non-finite row: the caller falls back */
+        } else {
+            keys[i] = md_abs_key(r);
+        }
+    }
+}
+
+/* Turn one sorted segment into its median. Odd `n`: the middle value. Even
+ * `n`: `0.5 * (a + b)` of the two middle values, the same expression
+ * `metrics::median_abs` evaluates. Ties need no tie-break: the median is a
+ * function of the multiset, so equal keys cannot change it. */
+__global__ void k_median_pick(const unsigned long long *__restrict__ keys,
+                              int n, int ns, double *__restrict__ out,
+                              int *__restrict__ status)
+{
+    const int seg = blockIdx.x;
+    if (threadIdx.x != 0 || seg >= ns) return;
+    if (status[seg] != 0 || n <= 0) {
+        if (n <= 0) status[seg] = 2;
+        out[seg] = CUDART_NAN;
+        return;
+    }
+    const unsigned long long *k = keys + (size_t)seg * (size_t)n;
+    if (n & 1) {
+        out[seg] = md_key_value(k[n / 2]);
+    } else {
+        out[seg] = 0.5 * (md_key_value(k[n / 2 - 1]) + md_key_value(k[n / 2]));
+    }
+}
+
+/* Exact median absolute error of `nsets * ntrials` prediction vectors.
+ *
+ * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
+ * the same layout `rc_fit_batch`/`rc_rank_score_batch` use. `out_median`
+ * receives the exact `f64` median per segment and `out_status` the labelled
+ * status (0 ok, 2 non-finite). Returns the stage time in ms, or a negative
+ * value when nothing may be trusted (the caller then uses the exact CPU arm).
+ *
+ * The keys are predictably cheap to sort: one prediction sweep, then CUB's
+ * segmented radix sort of the `u64` patterns (four byte passes over keys
+ * already in memory), then one pick. No atomics, no float reduction, so the
+ * value is bit-identical however the batch is composed.
+ */
+float rc_median_score_batch(void *ctx,
+                            const unsigned int *prog,
+                            const unsigned int *off,
+                            const int *pcount,
+                            int nsets,
+                            int ntrials,
+                            int kmax,
+                            const double *c0,
+                            double *out_median,
+                            int *out_status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (c->n <= 0) return -1.0f;
+    if (!c->d_cols64 || !c->d_y64) {
+        /* The f64 twins are normally uploaded once by `rc_set_fit_data`; a
+           direct caller without them gets the f32-rounded inputs, exactly like
+           `rc_fit_batch`'s own fallback. */
+        size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
+        size_t yb = sizeof(double) * (size_t)c->n;
+        if (!c->d_cols64) {
+            if (rc_alloc((void **)&c->d_cols64, cb) != 0) {
+                c->d_cols64 = 0;
+                return -1.0f;
+            }
+            int threads = 256;
+            long long total = (long long)c->n * (long long)c->v;
+            long long blocks = (total + threads - 1) / threads;
+            cast_f32_to_f64_kernel<<<(int)blocks, threads>>>(c->d_cols, c->d_cols64, total);
+        }
+        if (!c->d_y64) {
+            if (rc_alloc((void **)&c->d_y64, yb) != 0) {
+                c->d_y64 = 0;
+                return -1.0f;
+            }
+            int threads = 256;
+            long long yblocks = (c->n + threads - 1) / threads;
+            cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
+        }
+        if (cudaGetLastError() != cudaSuccess) return -1.0f;
+    }
+    const int nsegs = nsets * ntrials;
+    const long long total = (long long)nsegs * (long long)c->n;
+    if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
+    unsigned int *d_prog = 0, *d_off = 0;
+    int *d_p = 0;
+    double *d_c0 = 0;
+    unsigned long long *d_keys = 0;
+    unsigned long long *d_keys_out = 0;
+    double *d_med = 0;
+    int *d_status = 0;
+    int *d_seg_off = 0;
+    void *d_temp = 0;
+    size_t temp_bytes = 0;
+    int ok = 1;
+    const size_t prog_words = (size_t)off[nsets];
+    if (rc_alloc((void **)&d_prog, sizeof(unsigned int) * prog_words) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nsets + 1)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nsets) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_c0, sizeof(double) * (size_t)nsegs * (size_t)kmax) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_keys, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_keys_out, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_med, sizeof(double) * (size_t)nsegs) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nsegs) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&d_seg_off, sizeof(int) * (size_t)(nsegs + 1)) != 0) ok = 0;
+    if (ok) {
+        rc_upload(d_prog, prog, sizeof(unsigned int) * prog_words);
+        rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+        rc_upload(d_p, pcount, sizeof(int) * (size_t)nsets);
+        rc_upload(d_c0, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
+        int *host_seg = (int *)malloc(sizeof(int) * (size_t)(nsegs + 1));
+        if (!host_seg) {
+            ok = 0;
+        } else {
+            for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
+            rc_upload(d_seg_off, host_seg, sizeof(int) * (size_t)(nsegs + 1));
+            free(host_seg);
+        }
+        cudaMemset(d_status, 0, sizeof(int) * (size_t)nsegs);
+        /* Size the CUB temporary storage once per call (it depends on the
+           segment count and length, not on the values). */
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            NULL, temp_bytes, d_keys, d_keys_out, (int)total, nsegs, d_seg_off,
+            d_seg_off + 1);
+        if (temp_bytes == 0) temp_bytes = 1;
+        if (rc_alloc(&d_temp, temp_bytes) != 0) ok = 0;
+    }
+    float ms = -1.0f;
+    if (ok) {
+        int threads = 256;
+        long long blocks = (total + threads - 1) / threads;
+        if (blocks > 65535) blocks = 65535;
+        if (blocks < 1) blocks = 1;
+        cudaEventRecord(c->t0, 0);
+        k_median_keys<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
+                                                c->d_y64, c->n, nsegs, ntrials, d_keys,
+                                                d_status);
+        ok = cudaGetLastError() == cudaSuccess;
+        if (ok) {
+            cub::DeviceSegmentedRadixSort::SortKeys(
+                d_temp, temp_bytes, d_keys, d_keys_out, (int)total, nsegs, d_seg_off,
+                d_seg_off + 1);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        if (ok) {
+            k_median_pick<<<nsegs, 1>>>(d_keys_out, c->n, nsegs, d_med, d_status);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        cudaEventRecord(c->t1, 0);
+        cudaEventSynchronize(c->t1);
+        if (ok && cudaGetLastError() != cudaSuccess) ok = 0;
+        if (ok) {
+            cudaEventElapsedTime(&ms, c->t0, c->t1);
+            rc_download(out_median, d_med, sizeof(double) * (size_t)nsegs);
+            rc_download(out_status, d_status, sizeof(int) * (size_t)nsegs);
+            if (cudaGetLastError() != cudaSuccess) ok = 0;
+        }
+    }
+    if (d_prog) cudaFree(d_prog);
+    if (d_off) cudaFree(d_off);
+    if (d_p) cudaFree(d_p);
+    if (d_c0) cudaFree(d_c0);
+    if (d_keys) cudaFree(d_keys);
+    if (d_keys_out) cudaFree(d_keys_out);
+    if (d_med) cudaFree(d_med);
+    if (d_status) cudaFree(d_status);
+    if (d_seg_off) cudaFree(d_seg_off);
+    if (d_temp) cudaFree(d_temp);
+    if (!ok) return -1.0f;
+    return ms;
+}
+
 /* #230 test hook: copy the cached target ranks to the host so a parity test
    can check the per-row `B` instead of only the sums. */
 int rc_rank_debug_b(void *ctx, long long *out)

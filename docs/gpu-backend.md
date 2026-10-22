@@ -431,15 +431,19 @@ because they need more than one prediction per row, a different objective, a
 per-row weight array the evaluator does not carry, or a different set of rows
 every generation; the reason is printed in the one-line note.
 
-The one exception is the **fit** stage of the rank family
-(`--metric rank_correlation` / `rank_correlation_signed`) with
-`--fit-strategy gpu`: those constants are moved by the exact rank stage of
-[#230](#exact-rank-correlation-fitting-issue-230) on the device, but their
-**fitness is still the CPU rank score** and the backend stays `cpu` with
+The exception is the **fit** stage: `--fit-strategy gpu` moves the constants of
+a rank (`rank_correlation` / `rank_correlation_signed`) or median run on the
+device — the exact rank stage of
+[#230](#exact-rank-correlation-fitting-issue-230) and the exact median polish of
+[#226](#median-absolute-error-fitting-issue-226) — but their **fitness is still
+the CPU objective** and the backend stays `cpu` with
 `backend_reason = "metric is not scored natively on the GPU"`. `GpuSearch`'s
-`native_metric` is false for this arm, so every candidate is scored by the CPU
+`native_metric` is false for these arms, so every candidate is scored by the CPU
 evaluator exactly as before; only the `gpu.fit` counters (and the device field)
-record the device use.
+record the device use. The median arm additionally needs at least
+[`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows, the
+measured crossover below which the CPU polish is cheaper; a smaller sample
+keeps the CPU arm and records that reason.
 
 Fallback and the flags:
 
@@ -874,9 +878,9 @@ constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
 constants), `too_few_rows`, `too_many_constants` (`p > 20`),
 `metric_not_native` (no device fit objective for the configured metric),
-`ill_conditioned`, `non_finite`, `launch`, or — for the #230 rank arm —
-`rank_declined` (the device declined a rank call and the exact CPU rank arm
-took over). `--fit-report` and the `gpu.fit` JSON object count
+`ill_conditioned`, `non_finite`, `launch`, or — for the fit-only arms — the
+`rank_declined` (#230) and `median_declined` (#226) causes (the device declined
+the call and the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
@@ -1410,6 +1414,7 @@ substitute for either.
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
+| Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 
 The compile gap is closed by the test and table above; it can be re-run on any
 machine with CUDA ≥ 12.9. The runtime gap needs a DGX Spark (or any `sm_121` +
@@ -1533,3 +1538,111 @@ roughly `n ≈ 10⁴` the CPU polish is latency-competitive for a single candida
 so the device arm pays off through batching; the threshold is not a hidden
 switch — any configuration outside the list above is labelled by
 `gpu_blocker`'s reason in the one-line note.
+
+## Median absolute error fitting (issue #226)
+
+`--metric median` scores `medianᵢ |yᵢ − f(xᵢ;c)|`. The CPU arm is a squared
+fit followed by `coordinate_polish` on that median: per constant six fixed
+ladder steps (`±10 %, ±3 %, ±1 %` of `max(|c|,1)`), the **first strict
+improver** committed, up to 12 sweeps. Every trial costs a full prediction
+sweep **and a full `n log n` sort** of the residuals, and a sweep is `6·p`
+trials — the sort is the cost centre, exactly like the rank family of #230.
+
+#226 moves that tail to the device without changing what it optimises.
+
+**Exact selection.** With `rᵢ = pred(xᵢ) − yᵢ` and `|rᵢ| ≥ 0`, the IEEE-754
+`u64` bit pattern of `|rᵢ|` orders exactly like the value. The device
+
+1. evaluates each candidate's program in **exact `f64`** (`ft_forward_d`) and
+   writes `bits(|rᵢ|)` for every row of every `(candidate, trial)` segment
+   (`k_median_keys`; a non-finite prediction or residual marks the segment,
+   never a `1e30` stand-in);
+2. sorts each segment's keys with `cub::DeviceSegmentedRadixSort::SortKeys`
+   (four byte passes over keys already in memory, no atomics, no float
+   reduction);
+3. picks the median (`k_median_pick`): the middle key for odd `n`,
+   `0.5·(a + b)` of the two middle keys for even `n` — the same expression
+   `metrics::median_abs` evaluates.
+
+`median` is a symmetric function of the multiset `{|rᵢ|}`, so **ties cannot
+change the value** and need no row-index tie-break: an all-tied residual vector
+selects the same number however the batch is composed. A test drives odd and
+even row counts, an entirely tied multiset, `n = 2..5`, a constant prediction
+and several constant vectors, and asserts the device median equals
+`metrics::score_weighted(.., median)` **bit for bit**.
+
+**Pipeline per generation step.** For the admitted candidates:
+
+1. the resident rows are fitted by the landed squared LM kernel (the same warm
+   start `fit_weighted_metric` uses, with the same `--fit-iters` count);
+2. one call scores all six ladder trials of all live candidates
+   (`rc_median_score_batch`);
+3. the host commits the first strict improver per constant, exactly like
+   `coordinate_polish`, and repeats for at most `--fit-iters` sweeps;
+4. the arm keeps the **incoming** constants unless the polished median is
+   strictly lower, so a squared start that is worse on the median cannot be
+   reported.
+
+**Trajectory compatibility.** The device runs the *same* ladder in the same
+constant order with the same first-improver rule on the same exact `f64`
+median. From the same starting constants the batched polish and
+`coordinate_polish` commit **bit-identical** constants and scores (pinned by a
+device test). From *different* warm starts (the device LM against the CPU LM)
+the two arms may reach different local optima, because the median objective is
+not convex; that is why the reported number is always the exact CPU median of
+the reported constants and why every finalist is refit by
+`refit_finalists_exact` → `fit_weighted_metric(.., median)`.
+
+**Metric-aware gate, not SSE.** The device proposal passes through
+`fit_batch_verified`/`fit_pending`, which score the **configured median** in
+exact `f64` and accept only a finite, no-worse value. A test constructs a
+proposal whose median is exactly `0` while its SSE is strictly larger than the
+least-squares optimum's and asserts that it is accepted for `median` — the SSE
+gate would have rejected the only median answer. A squared-only backend returns
+`None` for a median request and the exact CPU median arm runs instead.
+
+**Fallbacks (all labelled).** A candidate is offered only with a GPU fit plan
+(`p ≤ 20`, ≤ 96 nodes, no shared block constants, analytic operators) and at
+least `32p` rows; every other candidate, and every batch the device marks
+non-finite (`non_finite`), ill-conditioned (`ill_conditioned`), launches
+badly (`launch`) or whose median call declines (`median_declined`), is refit by
+the exact CPU median arm. The run-level decision has a reason too: the device
+arm needs `n ≥ MEDIAN_GPU_MIN_ROWS = 4 096`, and below it the exact CPU arm
+runs with `# gpu-fit: off (median fit arm: the sample is too small for the
+device polish)` and the same string in `backend_reason`. `--no-fit` never
+enters the arm: the evaluator is not created and the archive is identical to
+the exact CPU run, bit for bit.
+
+**Measured cost (RTX 3060, machine shared with other jobs, so indicative).**
+One candidate, `p = 4`, `--fit-iters 8`, sin/linear tree; best of three runs:
+
+| rows `n` | CPU arm | CPU polish tail | GPU arm | one call (6 trials) | whole-arm speed-up |
+|---|---|---|---|---|---|
+| 5 000 | 50.0 ms | 35.1 ms | 13.4 ms | 0.47 ms | 3.7× |
+| 20 000 | 151.2 ms | 91.3 ms | 22.7 ms | 1.05 ms | 6.7× |
+| 50 000 | 515.3 ms | 435.7 ms | 63.1 ms | 2.34 ms | 8.2× |
+| 154 000 | 1 503.7 ms | 756.3 ms | 254.5 ms | 4.00 ms | 5.9× |
+
+The tail cost splits into a fixed per-call part and a per-row part:
+
+```
+T_cpu_tail ≈ calls · (c_cpu · n)                    c_cpu ≈ 3.3e-8 s/row
+T_gpu_tail ≈ calls · (t_fixed + 6 · c_gpu · n)      t_fixed ≈ 0.35 ms, c_gpu ≈ 4.0e-9 s/row
+calls = 1 + sweeps · p
+```
+
+which is `MEDIAN_CPU_ROW_S`, `MEDIAN_GPU_CALL_S` and `MEDIAN_GPU_ROW_S` in
+`src/fit.rs` and gives a crossover near `n ≈ 2 000` for `p = 4`. The admission
+floor is set to **4 096 rows** — the smallest round count with a modelled margin
+of ~1.7× and inside the measured never-worse regime — and it is a row count,
+never a timing measurement, so a run is reproducible. `median_fit_cost(n, p,
+sweeps)` exposes the model and a unit test pins the floor and its monotonicity.
+
+**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
+device, single-output unweighted full-sample data, `--fit-iters > 0` and
+`n ≥ 4 096`. It is **fit-only**: the evaluator has no native median scorer, so
+every fitness value is the CPU median, the backend stays `cpu`, and the device
+use is recorded in `gpu.fit` (with `median_declined` among the labelled
+causes). Native median scoring on the device is open; the interquartile arm
+needs the weighted assembly that the `absolute` objective will land
+(`l1-quantile.md` §4.2–4.3) and stays a follow-up.

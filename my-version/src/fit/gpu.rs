@@ -381,6 +381,32 @@ impl BatchedFitter for BatchedGpu<'_> {
             // #228: warm start only; `verify_proposal` projects and judges.
             return self.propose(trees, iters, DeviceLoss::Squared);
         }
+        // #226: `median` is fitted by the batched exact median polish (squared
+        // LM start, then the same first-improver ladder on the exact `f64`
+        // median). The verifier below judges it on the configured median, so
+        // the proposal is never accepted on SSE.
+        if median_fit_only(metric) && iters > 0 {
+            let mut out: Vec<Option<Vec<f64>>> = trees.iter().map(|_| None).collect();
+            let slots: Vec<(usize, GpuFitPlan)> = trees
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| gpu_fit_plan(t).map(|plan| (i, plan)))
+                .collect();
+            if slots.is_empty() {
+                return out;
+            }
+            let plans: Vec<&GpuFitPlan> = slots.iter().map(|(_, p)| p).collect();
+            let (results, ms) = self.ev.borrow_mut().median_fit_batch(&plans, iters);
+            if ms < 0.0 || results.len() != slots.len() {
+                return out;
+            }
+            for ((i, _), res) in slots.iter().zip(results) {
+                if res.status == 0 && res.c.iter().all(|v| v.is_finite()) {
+                    out[*i] = Some(res.c);
+                }
+            }
+            return out;
+        }
         vec![None; trees.len()]
     }
 }
@@ -435,6 +461,14 @@ mod tests {
             Op::Add,
             vec![node(Op::Mul, vec![constant(0.7), input(0)]), constant(0.1)],
         )
+    }
+
+    /// The same tree with its constants replaced (plan slot order).
+    fn with_constants(tree: &Node, c: &[f64]) -> Node {
+        let f = flatten(tree);
+        let mut out = tree.clone();
+        write_constants(&mut out, &f, c);
+        out
     }
 
     fn fitted(tree: &Node) -> Vec<f64> {
@@ -655,6 +689,176 @@ mod tests {
         );
         let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
         let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::LogSquashed, 2);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+    }
+
+    /// #226: a proposal that improves the median while making SSE worse must
+    /// be accepted for `--metric median` — the exact bug an SSE gate causes.
+    ///
+    /// Fixture: `y = 0` on 20 rows and `y = 100` on the last. The least-squares
+    /// line (the starting constants) has a strictly lower SSE than the flat
+    /// line, while the flat line drives the median of `|r|` to exactly 0 (the
+    /// 11th of 21 residuals). An SSE gate would reject the only median answer.
+    #[test]
+    fn a_median_proposal_is_judged_by_the_median_not_by_sse() {
+        let x: Vec<Vec<f64>> = (0..21).map(|i| vec![i as f64]).collect();
+        let mut y = vec![0.0; 21];
+        y[20] = 100.0;
+        let mut start = model();
+        fit_weighted(&mut start, &x, &y, &[], 8);
+        let start_c = fitted(&start);
+        let proposal = vec![0.0, 0.0];
+        let sse_of = |c: &[f64]| {
+            sse(&flatten(&model()), &x, &y, &[], c, &mut vec![0.0; 64])
+        };
+        let median_of = |c: &[f64]| metric_score(&with_constants(&model(), c), &x, &y, &[], Metric::Median);
+        assert_eq!(median_of(&proposal), 0.0);
+        assert!(
+            median_of(&start_c) > 0.0,
+            "the least-squares line must have a positive median"
+        );
+        assert!(
+            sse_of(&proposal) > sse_of(&start_c),
+            "the fixture must make the median answer worse in SSE"
+        );
+
+        let mut gpu = vec![start.clone()];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(proposal.clone()) },
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Median,
+        );
+        assert_eq!(
+            out.status[0],
+            BatchStatus::Gpu,
+            "a better median proposal must not be rejected on SSE"
+        );
+        assert_eq!(out.score[0], 0.0);
+        assert_eq!(
+            fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            proposal.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        // The same proposal through the squared gate is rejected: that is the
+        // defect the metric-aware gate removes.
+        assert!(
+            sse_of(&proposal) > sse_of(&start_c),
+            "sanity: the squared gate would reject this proposal"
+        );
+    }
+
+    /// #226: a squared-only backend never answers a median request, and a
+    /// declined median request falls back to the exact CPU median arm bit for
+    /// bit (never to a squared answer in disguise).
+    #[test]
+    fn a_squared_proposal_is_never_answered_for_median() {
+        let trees = vec![model()];
+        assert_eq!(
+            SquaredOnlyBackend(vec![2.0, 3.0]).fit_batch_metric(
+                &trees,
+                &[],
+                &[],
+                &[],
+                8,
+                Metric::Median
+            ),
+            vec![None],
+            "the default must decline a median request"
+        );
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let mut y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        y[7] += 3.0;
+        let mut gpu = vec![model()];
+        let out = fit_batch_verified(
+            &SquaredOnlyBackend(vec![2.0, 3.0]),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Median,
+        );
+        assert_eq!(out.status[0], BatchStatus::Unsupported);
+        let mut cpu = model();
+        let want = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Median);
+        assert_eq!(out.score[0].to_bits(), want.to_bits());
+        assert_eq!(
+            fitted(&gpu[0])
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    /// #226: the finalist refit for a median run is the exact CPU median arm
+    /// and cannot make the reported model worse on the median.
+    #[test]
+    fn a_median_finalist_refit_is_exact_and_never_worse() {
+        let x: Vec<Vec<f64>> = (0..60).map(|i| vec![-1.5 + 0.05 * i as f64]).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| 2.0 * (1.3 * r[0]).sin() + if i % 7 == 0 { 6.0 } else { 0.0 })
+            .collect();
+        let mut tree = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(1.0), node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])])]),
+                constant(0.0),
+            ],
+        );
+        let before = metric_score(&tree, &x, &y, &[], Metric::Median);
+        let mut once = vec![tree.clone()];
+        let first = refit_finalists_exact(&mut once, &x, &y, &[], 8, Metric::Median);
+        assert!(first[0].is_finite());
+        assert!(first[0] <= before, "refit {} > start {}", first[0], before);
+        // Exactly what `fit_weighted_metric` produces for the same start...
+        let mut cpu = tree.clone();
+        let want = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Median);
+        assert_eq!(first[0].to_bits(), want.to_bits());
+        assert_eq!(
+            fitted(&once[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        // ... and idempotent from its own endpoint.
+        let mut twice = once.clone();
+        let second = refit_finalists_exact(&mut twice, &x, &y, &[], 8, Metric::Median);
+        assert_eq!(first[0].to_bits(), second[0].to_bits());
+        tree = twice[0].clone();
+        assert!(metric_score(&tree, &x, &y, &[], Metric::Median).is_finite());
+    }
+
+    /// #226: `--no-fit` is a no-op for the median arm: the proposal never
+    /// runs, the constants stay bit-identical and the score is the median at
+    /// those constants.
+    #[test]
+    fn no_fit_keeps_a_median_run_untouched() {
+        let x: Vec<Vec<f64>> = (0..30).map(|i| vec![i as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 1.0 + 0.2 * r[0]).collect();
+        let tree = model();
+        let before = fitted(&tree);
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &Backend { proposal: Some(vec![9.0, 9.0]) },
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::Median,
+        );
+        assert_eq!(
+            fitted(&trees[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&trees[0], r)).collect();
+        let want = crate::metrics::score_weighted(&pred, &y, &[], Metric::Median, 2);
         assert_eq!(out.score[0].to_bits(), want.to_bits());
     }
 

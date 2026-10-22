@@ -21,6 +21,8 @@ use crate::metrics::{self, Metric};
 // share one arithmetic story and one fallback contract.
 mod correlation;
 mod gpu;
+#[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
+mod median;
 mod rank;
 mod stream;
 mod varpro;
@@ -34,6 +36,10 @@ pub use gpu::BatchedGpu;
 pub use stream::{
     fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
 };
+// #226: the median polish tail is only wired into the CUDA arm; a CPU-only
+// build keeps the module (its unit tests) without re-exporting anything.
+#[cfg(any(feature = "cuda", test))]
+pub(crate) use median::{polish_median_batch, MedianTrialScorer};
 // The exact-rank stage is only wired into the CUDA arm; a CPU-only build keeps
 // the module (its unit tests) without re-exporting anything.
 #[cfg(any(feature = "cuda", test))]
@@ -192,13 +198,20 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if rank_metric_signed(metric).is_some() {
         return None;
     }
+    // #226: `median` is honoured by the batched exact median polish
+    // (`median_fit_only`), also fit-only: the device sorts the residual bits,
+    // the CPU scores every candidate with the configured median.
+    if median_fit_only(metric) {
+        return None;
+    }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss or the \
-         exact rank objectives, but --metric {} has no device fit objective, so \
-         the GPU arms cannot fit it. Use --metric squared (aic, aicc and bic \
-         also fit by least squares), --metric log_squashed, \
-         --metric rank_correlation or rank_correlation_signed, or a CPU fit \
-         strategy: --fit-strategy exact, auto, linear, varpro or stream.",
+         exact rank and median objectives, but --metric {} has no device fit \
+         objective, so the GPU arms cannot fit it. Use --metric squared (aic, \
+         aicc and bic also fit by least squares), --metric log_squashed, \
+         --metric rank_correlation or rank_correlation_signed, --metric \
+         median, or a CPU fit strategy: --fit-strategy exact, auto, linear, \
+         varpro or stream.",
         metric.name()
     ))
 }
@@ -214,6 +227,100 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
 /// [`DeviceLoss::for_metric`].
 pub fn rank_fit_only(metric: Metric) -> Option<bool> {
     rank_metric_signed(metric)
+}
+
+/// #226: `true` when `--fit-strategy gpu` can fit `median` on the device
+/// through the batched exact median polish, `false` for every other metric.
+///
+/// Like [`rank_fit_only`] this is a **fit-only** arm, not a [`fit_loss`]: the
+/// device selects the exact median of `|pred − y|` (a segmented sort of the
+/// residual bits) and never accumulates an SSE. The evaluator cannot score a
+/// median, so this predicate selects the fit stage only; the *scoring* gate
+/// remains [`DeviceLoss::for_metric`] and every fitness value stays CPU `f64`.
+pub fn median_fit_only(metric: Metric) -> bool {
+    metric == Metric::Median
+}
+
+/// #226: rows below which the device median polish is not worth its per-call
+/// latency and the CPU arm stays.
+///
+/// Derived from [`median_fit_cost`] (measured on the RTX 3060, see
+/// `docs/gpu-backend.md` §"Median absolute error fitting"): one call costs a
+/// fixed launch/sort setup plus a per-row term, so a small batch of small
+/// samples loses to the CPU's single sort. At and above it the modelled device
+/// polish is cheaper for every constant count the kernel accepts (`p ≤ 20`). The
+/// decision is a row count, never a timing measurement, so it is reproducible.
+pub const MEDIAN_GPU_MIN_ROWS: usize = 4_096;
+
+/// #226: modelled wall time of **one** candidate's median fit tail, in
+/// seconds, for `sweeps` ladder sweeps and `p` constants.
+///
+/// Both sides run the same ladder: `sweeps · p` calls of six trials. The CPU
+/// side pays one prediction sweep plus one `n log n` sort of `f64` residuals
+/// per trial; the device pays one prediction sweep, one segmented radix sort of
+/// `u64` keys and one pick per trial, plus a fixed per-call cost. The
+/// coefficients are the median-arm measurement recorded in
+/// `docs/gpu-backend.md`, not guesses:
+///
+/// ```text
+/// cpu_s = sweeps·p·6·CPU_ROW_S·n
+/// gpu_s = sweeps·p·(GPU_CALL_S + 6·GPU_ROW_S·n) + GPU_CALL_S
+/// ```
+///
+/// The CPU term is linear in `n` at the measured sizes: the `n log n` sort is
+/// partly paid for by the sequential pass that feeds it (the fit is a linear
+/// upper bound from 5 000 to 154 000 rows). `gpu_s` charges the baseline call
+/// once, hence the trailing `GPU_CALL_S`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MedianFitCost {
+    /// Modelled CPU polish time, seconds.
+    pub cpu_s: f64,
+    /// Modelled device polish time, seconds.
+    pub gpu_s: f64,
+}
+
+impl MedianFitCost {
+    /// `cpu_s / gpu_s`, the modelled speed-up of the device tail.
+    pub fn speedup(&self) -> f64 {
+        if self.gpu_s > 0.0 {
+            self.cpu_s / self.gpu_s
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Whether the model prefers the device for this shape.
+    pub fn prefers_gpu(&self) -> bool {
+        self.gpu_s < self.cpu_s
+    }
+}
+
+/// #226: per-row cost of one CPU trial (prediction sweep plus the `f64` sort
+/// of the residuals), seconds. Measured mean over 5 000–154 000 rows.
+const MEDIAN_CPU_ROW_S: f64 = 3.3e-8;
+/// #226: fixed cost of one device call (uploads, CUB size query, buffer
+/// allocation, launches and sync), seconds.
+const MEDIAN_GPU_CALL_S: f64 = 3.5e-4;
+/// #226: per-row cost of one device trial (f64 predict + segmented radix sort
+/// of the keys + pick), seconds.
+const MEDIAN_GPU_ROW_S: f64 = 3.95e-9;
+
+/// #226: modelled CPU-vs-device cost of the median polish tail.
+pub fn median_fit_cost(n: usize, p: usize, sweeps: usize) -> MedianFitCost {
+    let nf = n.max(1) as f64;
+    let trials = (sweeps.max(1) * p.max(1) * 6) as f64;
+    let calls = (sweeps.max(1) * p.max(1)) as f64;
+    MedianFitCost {
+        cpu_s: trials * MEDIAN_CPU_ROW_S * nf,
+        gpu_s: calls * (MEDIAN_GPU_CALL_S + 6.0 * MEDIAN_GPU_ROW_S * nf)
+            + MEDIAN_GPU_CALL_S,
+    }
+}
+
+/// #226: whether the device median polish is predicted to be faster than the
+/// CPU polish for a sample of `n` rows and `p` constants.
+pub fn median_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
+    n >= MEDIAN_GPU_MIN_ROWS && median_fit_cost(n, p, sweeps).prefers_gpu()
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -4228,16 +4335,17 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223 + #229 + #230: an explicit GPU request is refused for every metric
-    /// without a device fit objective, and the refusal says why and what to use
-    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares,
-    /// `log_squashed` by weighted IRLS (#229) and the rank family by the exact
-    /// integer polish (#230), so all three groups are accepted.
+    /// #223 + #229 + #230 + #226: an explicit GPU request is refused for every
+    /// metric without a device fit objective, and the refusal says why and what
+    /// to use instead. `squared`/`aic`/`aicc`/`bic` fit by least squares,
+    /// `log_squashed` by weighted IRLS (#229), the rank family by the exact
+    /// integer polish (#230) and `median` by the exact median polish (#226), so
+    /// all four groups are accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() {
+            if fit_loss(*m).is_some() || rank_fit_only(*m).is_some() || median_fit_only(*m) {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
@@ -4275,6 +4383,45 @@ mod tests {
         assert_eq!(rank_fit_only(Metric::RankCorrelationSigned), Some(true));
         assert_eq!(rank_fit_only(Metric::Squared), None);
         assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
+        // #226: `median` has an exact device polish (fit-only), so an explicit
+        // `--fit-strategy gpu` is no longer a usage error for it.
+        assert!(gpu_fit_metric_error(Metric::Median).is_none());
+        assert!(median_fit_only(Metric::Median));
+        assert!(!median_fit_only(Metric::Absolute));
+        assert!(!median_fit_only(Metric::RankCorrelation));
+    }
+
+    /// #226: the measured cost model, as a decision. Below the row floor the
+    /// CPU polish stays; above it the device wins for every constant count the
+    /// kernel accepts, and the model is monotone in `n` and in `p`.
+    #[test]
+    fn the_median_cost_model_prefers_the_device_only_above_its_row_floor() {
+        assert!(!median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS - 1, 4, 8));
+        for p in 1..=20 {
+            assert!(
+                median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS, p, 8),
+                "p={p} must be admitted at the floor"
+            );
+            assert!(
+                median_gpu_fit_worthwhile(154_000, p, 8),
+                "p={p} must be admitted at 154k rows"
+            );
+            assert!(
+                median_fit_cost(154_000, p, 8).speedup() > 1.0,
+                "p={p}: the model must show a speed-up at 154k rows"
+            );
+        }
+        // Monotone in the sample size for a fixed shape.
+        let small = median_fit_cost(5_000, 4, 8);
+        let large = median_fit_cost(154_000, 4, 8);
+        assert!(large.speedup() > small.speedup());
+        // At 4k rows and p=4 the modelled device tail must still beat the CPU,
+        // which is what makes the floor the *smallest* admitted count.
+        let floor = median_fit_cost(MEDIAN_GPU_MIN_ROWS, 4, 8);
+        assert!(floor.prefers_gpu(), "floor cost {floor:?}");
+        let below = median_fit_cost(MEDIAN_GPU_MIN_ROWS - 1, 4, 8);
+        assert!(!median_gpu_fit_worthwhile(MEDIAN_GPU_MIN_ROWS - 1, 4, 8));
+        assert!(below.cpu_s > 0.0 && below.gpu_s > 0.0);
     }
 
     #[test]
