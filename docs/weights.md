@@ -73,8 +73,9 @@ r_w = cov(a,b) / sqrt(cov(a,a)·cov(b,b))
   it is not the same as duplicating rows.
 * `slope` compares adjacent first differences. Row weights do not give an
   unambiguous weighted difference, and duplicating a row changes the adjacency.
-* `rank_correlation` and `auc` depend on ranks or on class counts; a weighted
-  rank/ROC needs a separate definition for ties and class prevalence.
+* `rank_correlation`, `rank_correlation_signed` and `auc` depend on ranks or on
+  class counts; a weighted rank/ROC needs a separate definition for ties and
+  class prevalence.
 * `log_loss` and `hinge` are classification metrics. A weighted mean is
   conceivable, but the class labels (midpoint threshold) and calibration are
   defined unweighted here, so the engine refuses rather than half-applying the

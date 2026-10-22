@@ -1639,6 +1639,99 @@ so the device arm pays off through batching; the threshold is not a hidden
 switch — any configuration outside the list above is labelled by
 `gpu_blocker`'s reason in the one-line note.
 
+## Signed rank correlation (issue #231)
+
+`--metric rank_correlation_signed` scores `1 − ρ`, not `1 − |ρ|`: the direction
+of the monotone relation is part of the objective. #230 landed the exact integer
+rank stage and left the orientation as one host-side flag; #231 proves and pins
+that orientation end to end. There is no second kernel: the integer sums
+`Σ A·B`, `Σ A·A`, `Σ B·B` are shared, and `signed` is applied once, after the
+single division.
+
+**The identities the arm is built on.** For any prediction `f` and its
+reflection `−f`, `A(−f) = −A(f)` exactly, so
+
+```
+Σ AB(−f) = −Σ AB(f),   Σ A² and Σ B² unchanged
+ρ(−f) = −ρ(f)
+1 − ρ(−f) = 2 − (1 − ρ(f))         1 − |ρ(−f)| = 1 − |ρ(f)|   (unsigned)
+```
+
+A reflection is therefore *penalised* by `2 − score` under the signed metric and
+*invisible* under the unsigned one. That is the only difference between the two
+arms, and it is a bit-exact statement about the integer sums, tested on the CPU
+(`reflection_penalty_is_a_score_identity`) and on the device
+(`reflection_flips_the_cross_sum_exactly_on_the_device`: the device returns
+`AB(−c) = −AB(c)` with equal `AA`, `BB`).
+
+**Where the orientation is decided.**
+
+* `coordinate_polish` and the batched `polish_rank_batch` score every trial with
+  `RankTarget::score(pred, signed)`. A coordinate step *can* cross a zero
+  constant and so reflect the model; it is accepted **only** when that improves
+  `1 − ρ` strictly. No procedural reflection is ever applied.
+* The keep/replace decision after the polish is `fit::rank::choose_rank_fit`,
+  shared by the search arm (`GpuEvaluator::rank_fit_batch`), the batched
+  verifier (`BatchedGpu`) and the unit tests: strict improvement on the exact
+  oriented score, equal keeps the start, and an unscorable **baseline** is a
+  labelled `rank_declined` fallback rather than a blind acceptance of the
+  polished constants.
+* The shared proposal gate (`fit::gpu::verify_proposal`) now judges a rank
+  proposal on the **exact integer statistic** under the metric's orientation
+  (before #231 it compared the f64 Pearson value; the ordering is identical, but
+  only the integer form is the same arithmetic the polish decides on). A
+  reflected proposal is rejected for `rank_correlation_signed` and accepted as
+  an equal for `rank_correlation`.
+* `BatchedGpu::fit_batch_metric` answers rank metrics with the device rank arm
+  (`rank_fit_batch`), so the batched verifier is rank-native; the search path
+  already used the same arm directly. Weights, multi-output and non-finite rows
+  are still declined to the exact CPU arm.
+
+**MSE can never rank.** `GpuSearch::native_metric` is `false` for the rank
+family: `evaluate_pending` compiles no program, so screening and fitness are the
+CPU rank score; the reported `backend` stays `cpu` with
+`backend_reason = "metric is not scored natively on the GPU"`. The device's
+squared LM is only the *start* of the polish. A test pins the gate direction
+(`a_signed_rank_proposal_is_accepted_even_when_it_costs_sse`): a proposal that is
+much worse in SSE but perfect in signed ρ is accepted, which an SSE (or `|ρ|`)
+gate would reject.
+
+**`--no-fit`.** `fit_iters = 0` never builds the evaluator (the arm is not
+offered), and `rank_fit_batch(…, 0, …)` returns the incoming constants without a
+sweep, for both orientations.
+
+**Measured (RTX 3060, machine shared with other builds — load average ≈ 12, so
+indicative).** Fit-stage polish, `p = 4`, up to 8 sweeps, same start, identical
+constants:
+
+| `n` | CPU exact polish | GPU polish (unsigned) | GPU polish (signed) | speed-up |
+|---|---|---|---|---|---|
+| 154 000 | 1 218.1 ms | 93.2 ms | 93.9 ms | 11.95× |
+
+The two orientations cost the same, as expected: identical sort work, one sign
+on the host. One call carrying `s` ladder segments at `n = 154 000` (mean of 3):
+5.02, 5.99, 6.28, 7.17, 6.74, 7.29, 7.97, 8.19 ms for `s = 1…8`, a least-squares
+fit of **`t = 4.97 ms + 0.41 ms × segments`**. The fixed part is
+allocation/upload/launch and amortises across live candidates; the per-segment
+part is the segmented radix sort plus the integer reduction.
+
+Paired end-to-end (`n = 20 000`, `pop = 48`, 2 generations, 1 island, 96
+evaluations, same seed and rows):
+
+| metric | CPU exact | GPU rank fit | speed-up | best error | fits on device | labelled fallbacks | fit share of wall |
+|---|---|---|---|---|---|---|---|
+| `rank_correlation` | 3.91 s | 2.00 s | 1.96× | 8.553000e-2 → 8.551545e-2 | 72 / 78 | 6 (7.7 %) | 40.1 % |
+| `rank_correlation_signed` | 3.80 s | 1.69 s | 2.25× | 1.095749e-1 (identical) | 75 / 80 | 5 (6.2 %) | 44.3 % |
+
+Fitness stays on the CPU in both rows; the speed-up is the fit stage only,
+which is why it is smaller than the 11.95× polish speed-up.
+
+**What is not claimed.** The 3.9M-row cell is not exercised (the cost model
+extrapolates from 154k); buffer reuse across rank calls is not implemented; and
+1-island versus 4-island *archives* are not asserted equal (the island RNG
+streams differ by design) — determinism is pinned as repeated identical runs at
+each island count.
+
 ## Median absolute error fitting (issue #226)
 
 `--metric median` scores `medianᵢ |yᵢ − f(xᵢ;c)|`. The CPU arm is a squared

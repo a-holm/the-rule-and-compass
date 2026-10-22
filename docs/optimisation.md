@@ -252,7 +252,7 @@ is mathematically well posed:
 | `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
-| `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
+| `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230, signed: #231) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; `rank_correlation_signed` scores `1 − ρ` and can never accept a reflected model or an SSE/`|ρ|` proxy (#231); the fitness and the finalist refit stay on the CPU |
 | `median` with `--fit-strategy gpu` (#226) | the same squared start and the same ladder on the device: a segmented radix sort of the `|r|` bit patterns selects the exact `f64` median, two middle values averaged for even `n`; every trial is scored on that median, never on SSE. Fit-only: the fitness and the finalist refit stay on the CPU. Needs `n >= 4096` rows (the measured cost-model crossover) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
@@ -416,6 +416,14 @@ finalist is refit by the exact CPU arm before reporting. See
 [`gpu-backend.md`](gpu-backend.md#exact-rank-correlation-fitting-issue-230) for
 the pipeline, fallback labels and the measured 4–11× polish speed-up at
 `n = 5k…154k`.
+
+For `rank_correlation_signed` (#231) the same stage scores `1 − ρ`, so the
+direction matters: a reflected model scores `2 − score(f)` instead of the same
+value, and the gate rejects it. The orientation is a single sign on the shared
+integer sums — no second kernel, no extra sort — and the proposal gate compares
+the **exact** oriented score, never SSE and never `|ρ|`. A proposal that is
+worse in SSE but better in signed ρ is accepted; a reflection is not. See
+[`gpu-backend.md`](gpu-backend.md#signed-rank-correlation-issue-231).
 
 ### 3.1 Measured results
 
