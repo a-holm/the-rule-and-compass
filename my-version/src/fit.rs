@@ -24,9 +24,11 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, fit_batch_verified, refit_finalists_exact, BatchStatus, BatchedFitter,
-    VerifiedBatch,
+    backend_description, fit_batch_verified, fit_batch_verified_metric, refit_finalists_exact,
+    signed_finalist, BatchStatus, BatchedFitter, VerifiedBatch,
 };
+#[cfg(feature = "cuda")]
+pub use gpu::BatchedGpu;
 pub use stream::{
     fit_stream, fit_stream_with, RowSource, SliceRows, StoreRows, StoreSpec, STREAM_BLOCK_ROWS,
 };
@@ -1223,6 +1225,486 @@ fn normal_equations(
     Some(NormalEquations { jtj, jtr })
 }
 
+// ---------------------------------------------------------------------------
+// #228: the signed-bias arm — a constrained least-squares projection.
+// ---------------------------------------------------------------------------
+
+/// #228: the exact signed-bias statistics at one set of constants.
+///
+/// With `rᵢ = f(xᵢ; c) − yᵢ`, `gᵢ = ∇_c rᵢ` and the raw per-row weights `wᵢ`:
+///
+/// ```text
+/// sum_r  = Σ wᵢ rᵢ          (the objective numerator: |sum_r| / weight)
+/// weight = Σ wᵢ
+/// grad   = Σ wᵢ gᵢ          (the gradient of sum_r, i.e. the constraint row)
+/// jtj    = Σ wᵢ gᵢ gᵢᵀ      (weighted normal matrix, sqrt(w)-folded as in
+/// jtr    = Σ wᵢ gᵢ rᵢ       `normal_equations`, so the two share one row sweep)
+/// abs_sum= Σ |wᵢ rᵢ|        (the rounding scale of sum_r)
+/// ```
+///
+/// `sum_r` is accumulated in the same row order and with the same operations as
+/// `metrics::score_weighted`, so `|sum_r| / weight` is bit-identical to the
+/// reported `signed` objective on the same rows.
+struct SignedSystem {
+    jtj: Vec<Vec<f64>>,
+    jtr: Vec<f64>,
+    grad: Vec<f64>,
+    sum_r: f64,
+    weight: f64,
+    abs_sum: f64,
+    /// `Σ wᵢ(|predᵢ| + |yᵢ|)`: the magnitudes whose rounded difference *is*
+    /// every residual. See [`Self::noise`].
+    mag_sum: f64,
+}
+
+impl SignedSystem {
+    fn objective(&self) -> f64 {
+        (self.sum_r / self.weight).abs()
+    }
+
+    /// #228: the rounding scale of the objective.
+    ///
+    /// Two independent `f64` effects set it, and neither is about the data
+    /// scale alone:
+    ///
+    /// 1. every residual is a rounded difference, `|δrᵢ| ≲ u(|predᵢ| + |yᵢ|)`,
+    ///    so the numerator inherits `u·Σ wᵢ(|predᵢ| + |yᵢ|)`;
+    /// 2. the step itself is a `f64` solve of the normal matrix, so the
+    ///    constants — and with them the reachable bias — carry a `κ(M)·u`
+    ///    factor; the caller passes the measured conditioning.
+    ///
+    /// The numerator is accumulated with Neumaier compensation
+    /// ([`Compensated`]), so the `n`-term summation bound is not part of the
+    /// floor. An objective at or below `noise` cannot be distinguished from
+    /// exact zero by a `f64` evaluation on these rows, which is why the arm
+    /// certifies zero there instead of chasing the last bits — and why "exact
+    /// zero bias" never means "bit-identical constants".
+    fn noise(&self, kappa: f64) -> f64 {
+        4.0 * kappa.clamp(1.0, SIGNED_NOISE_COND_CAP)
+            * f64::EPSILON
+            * (self.mag_sum + self.abs_sum)
+            / self.weight
+    }
+}
+
+/// Neumaier compensated summation. The signed objective *is* a sum, so its
+/// numerator must not inherit the `n·u·Σ|r|` bound of a naive `f64` sum: with
+/// `n = 10⁵` that bound would make "zero" unprovable on data where the true
+/// sum is `1e-16`. The residual rounding (`u·(|pred| + |y|)` per row) remains
+/// and is what [`SignedSystem::noise`] certifies against.
+#[derive(Clone, Copy)]
+struct Compensated {
+    sum: f64,
+    comp: f64,
+}
+
+impl Compensated {
+    fn new() -> Self {
+        Compensated { sum: 0.0, comp: 0.0 }
+    }
+
+    fn add(&mut self, v: f64) {
+        let t = self.sum + v;
+        if self.sum.abs() >= v.abs() {
+            self.comp += (self.sum - t) + v;
+        } else {
+            self.comp += (v - t) + self.sum;
+        }
+        self.sum = t;
+    }
+
+    fn value(&self) -> f64 {
+        self.sum + self.comp
+    }
+}
+
+/// Build the [#228] statistics at `c` in one row sweep. `None` means the rows
+/// and targets do not match, a weight is negative, or a prediction, residual or
+/// derivative was not finite.
+#[allow(clippy::too_many_arguments)]
+fn signed_system(
+    f: &Flat,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    c: &[f64],
+    k: usize,
+    v: &mut [f64],
+    adj: &mut [f64],
+    grad: &mut [f64],
+) -> Option<SignedSystem> {
+    if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
+        return None;
+    }
+    let mut jtj = vec![vec![0.0; k]; k];
+    let mut jtr = vec![0.0; k];
+    let mut cgrad = vec![0.0; k];
+    let (mut sum_r, mut weight, mut abs_sum) = (Compensated::new(), Compensated::new(), Compensated::new());
+    let mut mag_sum = Compensated::new();
+    for (i, (row, &t)) in x.iter().zip(y).enumerate() {
+        let sw = w.get(i).copied().unwrap_or(1.0);
+        if !sw.is_finite() || sw < 0.0 {
+            return None;
+        }
+        if sw == 0.0 {
+            continue; // a zero-weight row never influences the fit or the bias
+        }
+        eval_row(f, row, c, v);
+        let pred = v[f.root];
+        let r = pred - t;
+        if !pred.is_finite() || !r.is_finite() {
+            return None;
+        }
+        backward(f, v, adj, grad);
+        let jw = sw.sqrt();
+        sum_r.add(sw * r);
+        abs_sum.add((sw * r).abs());
+        weight.add(sw);
+        mag_sum.add(sw * (pred.abs() + t.abs()));
+        for a in 0..k {
+            let gi = grad[a];
+            if !gi.is_finite() {
+                return None;
+            }
+            cgrad[a] += sw * gi;
+            jtr[a] += jw * gi * (jw * r);
+            for j in 0..=a {
+                jtj[a][j] += jw * gi * (jw * grad[j]);
+            }
+        }
+    }
+    for i in 0..k {
+        for j in 0..i {
+            jtj[j][i] = jtj[i][j];
+        }
+    }
+    let (sum_r, weight, abs_sum, mag_sum) =
+        (sum_r.value(), weight.value(), abs_sum.value(), mag_sum.value());
+    if !(weight > 0.0) || !sum_r.is_finite() || !abs_sum.is_finite() || !mag_sum.is_finite() {
+        return None;
+    }
+    Some(SignedSystem {
+        jtj,
+        jtr,
+        grad: cgrad,
+        sum_r,
+        weight,
+        abs_sum,
+        mag_sum,
+    })
+}
+
+/// [SignedProjection::IllConditioned] threshold: the smallest Cholesky pivot
+/// relative to its own diagonal, `min Lᵢᵢ² / (JᵀWJ)ᵢᵢ`. It is scale-free (a
+/// column rescaling cannot change it) and it is the same pre-registered rank
+/// tolerance the closed-form linear arm uses (`LINEAR_RANK_TOL`). A design whose
+/// trailing pivot falls below it is rank-deficient, so the constrained step
+/// would be amplified rounding and is declined. The GPU fit kernel gates the
+/// *ratio* of the Cholesky diagonal (`1e4`) instead, because it runs in `f32`
+/// rows and needs a wider margin.
+const SIGNED_RANK_TOL: f64 = 1e-12;
+
+/// [SignedProjection::Projected] stops scaling its rounding floor with the
+/// design conditioning beyond this factor. A design whose conditioning is worse
+/// is still fitted (the step is exact in exact arithmetic), but the arm does not
+/// pretend that a bias of `1e-6` is "exact zero": the outcome is then
+/// `not_converged`.
+const SIGNED_NOISE_COND_CAP: f64 = 1e6;
+
+/// #228: why a signed-bias projection did or did not move the constants.
+///
+/// The labels are stable: they are counted by [`signed_fit_counts`], printed by
+/// `--fit-report` and documented in `docs/optimisation.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignedProjection {
+    /// The constants are on the zero-bias manifold, or were moved onto it: the
+    /// exact objective is at or below its `f64` rounding scale.
+    Projected,
+    /// The model cannot represent the weighted mean residual (`Σ w g = 0` or
+    /// `gradᵀ M⁻¹ grad = 0`): no constant moves the bias, so no projection
+    /// exists and the starting constants are kept unchanged.
+    Unidentifiable,
+    /// The rounds ran but the exact objective did not reach its rounding scale
+    /// (a nonlinear tree, or a clamp); any improvement that was proved is kept.
+    NotConverged,
+    /// The weighted normal matrix failed the conditioning gate.
+    IllConditioned,
+    /// A non-finite weight, prediction, residual or derivative, or a
+    /// length/shape mismatch between rows, targets and weights.
+    NonFinite,
+    /// The tree has no constants to fit.
+    NoConstants,
+}
+
+impl SignedProjection {
+    /// Stable label for `--fit-report` and the docs.
+    pub fn label(self) -> &'static str {
+        match self {
+            SignedProjection::Projected => "projected",
+            SignedProjection::Unidentifiable => "unidentifiable",
+            SignedProjection::NotConverged => "not_converged",
+            SignedProjection::IllConditioned => "ill_conditioned",
+            SignedProjection::NonFinite => "non_finite",
+            SignedProjection::NoConstants => "no_constants",
+        }
+    }
+
+    /// Every outcome, in reporting order.
+    pub const ALL: [SignedProjection; 6] = [
+        SignedProjection::Projected,
+        SignedProjection::Unidentifiable,
+        SignedProjection::NotConverged,
+        SignedProjection::IllConditioned,
+        SignedProjection::NonFinite,
+        SignedProjection::NoConstants,
+    ];
+
+    /// Whether the constants were proved to sit on the zero-bias manifold.
+    pub fn is_projected(self) -> bool {
+        self == SignedProjection::Projected
+    }
+}
+
+/// #228: process-wide counts of signed-bias projection outcomes, since process
+/// start. Diagnostics only; no search decision reads them.
+pub fn signed_fit_counts() -> [(&'static str, u64); 6] {
+    use std::sync::atomic::Ordering;
+    let mut out = [("", 0); 6];
+    for (slot, outcome) in out.iter_mut().zip(SignedProjection::ALL) {
+        *slot = (outcome.label(), SIGNED_COUNTS[outcome as usize].load(Ordering::Relaxed));
+    }
+    out
+}
+
+// #228: one counter per `SignedProjection` variant, indexed by its discriminant
+// order (`Projected` = 0 … `NoConstants` = 5). Diagnostics only.
+static SIGNED_COUNTS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_signed_projection(outcome: SignedProjection) {
+    SIGNED_COUNTS[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Undamped Cholesky factorisation of a symmetric positive-definite `a`
+/// (`k × k` row-major). `None` on a non-positive or non-finite pivot.
+fn chol(a: &[Vec<f64>], k: usize) -> Option<Vec<Vec<f64>>> {
+    let mut l = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        for j in 0..=i {
+            let mut s = a[i][j];
+            for p in 0..j {
+                s -= l[i][p] * l[j][p];
+            }
+            if i == j {
+                if !(s > 0.0) || !s.is_finite() {
+                    return None;
+                }
+                l[i][j] = s.sqrt();
+            } else {
+                l[i][j] = s / l[j][j];
+            }
+        }
+    }
+    Some(l)
+}
+
+/// Solve `L Lᵀ x = b` in place for a Cholesky factor `l`.
+fn chol_solve(l: &[Vec<f64>], b: &mut [f64], k: usize) {
+    for i in 0..k {
+        let mut s = b[i];
+        for p in 0..i {
+            s -= l[i][p] * b[p];
+        }
+        b[i] = s / l[i][i];
+    }
+    for i in (0..k).rev() {
+        let mut s = b[i];
+        for p in (i + 1)..k {
+            s -= l[p][i] * b[p];
+        }
+        b[i] = s / l[i][i];
+    }
+}
+
+fn dot(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// #228: move the constants onto the zero-mean-residual manifold by a
+/// **constrained least-squares** step, and report why if they cannot be.
+///
+/// For the affine residual model `r(c + δ) = r(c) + J δ` the problem is
+///
+/// ```text
+/// min_δ  || W^{1/2} (r + J δ) ||²      subject to   Σ wᵢ (rᵢ + gᵢᵀδ) = 0
+/// ```
+///
+/// whose KKT system is the augmented saddle-point problem
+///
+/// ```text
+/// [ JᵀWJ   cgrad ] [ δ ]   [ −JᵀWr ]
+/// [ cgradᵀ   0   ] [ μ ] = [ −sum_r ]
+/// ```
+///
+/// This solves it exactly as written, with two right-hand sides on the *same*
+/// SPD normal matrix (the standard constrained-LS reduction, Scott & Tůma):
+/// `δ = δ₀ − μ·M⁻¹cgrad`, `δ₀ = −M⁻¹JᵀWr`, `μ = (sum_r + cgradᵀδ₀) / cgradᵀM⁻¹cgrad`.
+/// That is one assembly pass plus one factorisation and two substitutions —
+/// two passes, no generic optimiser and no step-size search.
+///
+/// The geometry is why this, and not a descent rule, is the arm: `|mean
+/// residual|` is a norm of an affine functional of `r` whose optimal set is the
+/// codimension-1 manifold `Σ wᵢ rᵢ = 0`, all of it at value 0. A rule that
+/// accepts only strict improvement halts at the first manifold point and says
+/// nothing about where on the manifold to stop. The constrained LS says it:
+/// among zero-bias constants it returns the one closest to the squared fit in
+/// the `JᵀWJ` metric, i.e. the minimum weighted SSE point of the manifold
+/// (exact for trees affine in their constants, since the squared fit is the
+/// unconstrained minimiser; local otherwise, as the CPU polish is).
+///
+/// A trial is written back only when the exact objective `|Σ w r| / Σ w` does
+/// not increase, so the arm can never make the configured loss worse. It stops
+/// as soon as the objective is at or below its `f64` rounding scale (the
+/// reported objective is then exactly what `metrics::score_weighted` returns).
+/// `rounds` is the number of Newton rounds on the linearised constraint: one
+/// is exact for affine trees, and at most two are used.
+pub fn signed_projection(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rounds: usize,
+) -> SignedProjection {
+    let outcome = signed_projection_inner(tree, x, y, w, rounds);
+    note_signed_projection(outcome);
+    outcome
+}
+
+fn signed_projection_inner(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    rounds: usize,
+) -> SignedProjection {
+    let f = flatten(tree);
+    let k = f.nconst;
+    if k == 0 || x.is_empty() {
+        return SignedProjection::NoConstants;
+    }
+    let n = f.op.len();
+    let mut c = vec![0.0; k];
+    for i in 0..n {
+        if f.cslot[i] >= 0 {
+            c[f.cslot[i] as usize] = f.val[i];
+        }
+    }
+    let mut v = vec![0.0; n];
+    let mut adj = vec![0.0; n];
+    let mut grad = vec![0.0; k];
+    let Some(start) = signed_system(&f, x, y, w, &c, k, &mut v, &mut adj, &mut grad) else {
+        return SignedProjection::NonFinite;
+    };
+    // Already on the manifold relative to the unconditional floor.
+    let mut best = start.objective();
+    if best <= start.noise(1.0) {
+        // Already on the manifold: the squared fit is the minimum-SSE point of
+        // it, so there is nothing to project and the constants stay untouched.
+        return SignedProjection::Projected;
+    }
+    let mut system = Some(start);
+    let mut moved = false;
+    for _ in 0..rounds.max(1) {
+        let sys = match system.take() {
+            Some(sys) => sys,
+            None => match signed_system(&f, x, y, w, &c, k, &mut v, &mut adj, &mut grad) {
+                Some(sys) => sys,
+                None => return SignedProjection::NonFinite,
+            },
+        };
+        // The constraint row must be able to move the mean at all.
+        if sys.grad.iter().all(|&g| g == 0.0) {
+            return SignedProjection::Unidentifiable;
+        }
+        let Some(l) = chol(&sys.jtj, k) else {
+            return SignedProjection::IllConditioned;
+        };
+        // Scale-free rank test and conditioning estimate: the ratio of the
+        // largest to the smallest scaled Cholesky pivot is a lower bound on the
+        // condition number of the normal matrix.
+        let (mut lo_scaled, mut hi_scaled) = (f64::INFINITY, 0.0f64);
+        for i in 0..k {
+            let pivot = l[i][i] * l[i][i];
+            let diag = sys.jtj[i][i];
+            if !(pivot.is_finite()) || !(diag > 0.0) {
+                return SignedProjection::IllConditioned;
+            }
+            let scaled = pivot / diag;
+            lo_scaled = lo_scaled.min(scaled);
+            hi_scaled = hi_scaled.max(scaled);
+        }
+        if lo_scaled < SIGNED_RANK_TOL {
+            return SignedProjection::IllConditioned;
+        }
+        let kappa = (hi_scaled / lo_scaled).max(1.0);
+        let mut step = sys.jtr.iter().map(|v| -v).collect::<Vec<f64>>();
+        chol_solve(&l, &mut step, k);
+        let mut dir = sys.grad.clone();
+        chol_solve(&l, &mut dir, k);
+        // `cgradᵀ M⁻¹ cgrad` is a squared norm, so it is non-negative and zero
+        // exactly when the constraint row is outside the range of `M`.
+        let cn = dot(&sys.grad, &dir);
+        if !(cn > 0.0) || !cn.is_finite() {
+            return SignedProjection::Unidentifiable;
+        }
+        let mu = (sys.sum_r + dot(&sys.grad, &step)) / cn;
+        if !mu.is_finite() {
+            return SignedProjection::NonFinite;
+        }
+        let trial: Vec<f64> = (0..k)
+            .map(|i| (c[i] + step[i] - mu * dir[i]).clamp(-1e6, 1e6))
+            .collect();
+        let Some(trial_system) =
+            signed_system(&f, x, y, w, &trial, k, &mut v, &mut adj, &mut grad)
+        else {
+            return SignedProjection::NonFinite;
+        };
+        let trial_objective = trial_system.objective();
+        if !(trial_objective <= best) {
+            // The linearisation is no longer a descent direction (a clamp, or a
+            // nonlinear tree): keep the best point proved so far.
+            break;
+        }
+        let improved = trial_objective < best;
+        c = trial;
+        best = trial_objective;
+        moved |= improved;
+        if best <= trial_system.noise(kappa) {
+            if improved {
+                write_constants(tree, &f, &c);
+            }
+            return SignedProjection::Projected;
+        }
+        if !improved {
+            break;
+        }
+        system = Some(trial_system);
+    }
+    // Not on the manifold after the round budget. Any proved improvement is
+    // kept (it never makes the configured objective worse) and the outcome says
+    // the exact zero was not certified.
+    if moved {
+        write_constants(tree, &f, &c);
+    }
+    SignedProjection::NotConverged
+}
+
 #[cfg(test)]
 thread_local! {
     /// #135: number of LM/polish trial steps taken on this test thread.
@@ -1893,7 +2375,6 @@ pub fn fit_weighted_metric(
         | CorrelationSigned
         | RankCorrelation
         | RankCorrelationSigned
-        | Signed
         | Median
         | Maximum
         | Interquartile
@@ -1902,6 +2383,29 @@ pub fn fit_weighted_metric(
         | ImplicitDerivative => {
             fit_weighted(tree, x, y, w, iters);
             coordinate_polish(tree, x, y, w, metric, iters.max(1));
+            metric_score(tree, x, y, w, metric)
+        }
+        // #228: signed bias is the one non-squared family with an exact
+        // closed-form arm. The squared fit is the warm start; the arm is the
+        // constrained-LS projection onto the zero-mean-residual manifold
+        // (`signed_projection`), which is two passes and never a generic
+        // optimiser. When the projection declines without moving the constants
+        // (the model cannot represent the mean, a rank-deficient design, or a
+        // non-finite row) the historical coordinate polish runs, exactly as
+        // before, so no candidate loses the old behaviour. When it *did* move
+        // the constants the arm stops there: the polish's fixed geometric
+        // probes cost `48p` full row sweeps and its strict-improvement rule is
+        // exactly the rule that cannot select a point on the zero-bias
+        // manifold.
+        Signed => {
+            fit_weighted(tree, x, y, w, iters);
+            let before = metric_score(tree, x, y, w, metric);
+            let outcome = signed_projection(tree, x, y, w, 2);
+            let after = metric_score(tree, x, y, w, metric);
+            let moved = after.is_finite() && before.is_finite() && after < before;
+            if !outcome.is_projected() && !moved {
+                coordinate_polish(tree, x, y, w, metric, iters.max(1));
+            }
             metric_score(tree, x, y, w, metric)
         }
     }
