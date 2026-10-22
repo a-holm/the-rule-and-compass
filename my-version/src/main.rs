@@ -423,10 +423,16 @@ SEARCH:
                              (never a no-op). The device refuses any other
                              metric instead of substituting an objective: use
                              `--metric squared`, `--metric log_squashed`, a
-                             rank metric, or a CPU strategy. `--metric signed`
-                             is in that group: it keeps the exact CPU
-                             projection (#228) and says so, because the device
-                             has no native signed scorer yet (#236)
+                             rank metric, or a CPU strategy. `--metric
+                             correlation`/`correlation_signed` are in the
+                             refused group even though their exact device arm
+                             (1-|rho| / 1-rho, both gauge orientations) exists
+                             and passes its device tests: on a 15 000-row cell
+                             the deferred fit reached validation hypervolume
+                             6.85 against 34.09 for the exact CPU arm, so the
+                             arm is not wired in yet. `--metric signed` keeps
+                             the exact CPU projection (#228) for the same kind
+                             of reason (#236)
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
@@ -468,7 +474,12 @@ SEARCH:
                              --metric log_squashed: those are the objectives
                              the kernel scores. Every other metric (including
                              the default absolute) runs on the CPU and prints
-                             the reason, never with a proxy loss. Reported
+                             the reason, never with a proxy loss. The
+                             correlation family has an exact device fit arm
+                             that is not dispatched yet (its device tests and
+                             cost model live in docs/gpu-backend.md); the rank
+                             family fits on the device under --fit-strategy
+                             gpu with CPU f64 fitness. Reported
                              errors stay CPU f64. Cross-backend runs are
                              not bit-identical because f32 fitness can change
                              the trajectory. JSON

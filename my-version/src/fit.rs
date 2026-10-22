@@ -19,7 +19,7 @@ use crate::metrics::{self, Metric};
 // #116: the solver portfolio's additional arms. Each child module uses the
 // flattened tree, adjoint sweep and guarded QR from this module, so the arms
 // share one arithmetic story and one fallback contract.
-mod correlation;
+pub(crate) mod correlation;
 mod gpu;
 mod rank;
 mod stream;
@@ -128,11 +128,15 @@ pub enum DeviceLoss {
     /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
     LogSquashed,
     /// #224: `1 − |ρ|`. A **fit-only** objective: the evaluator still has no
-    /// native correlation scorer, so neither [`DeviceLoss::for_metric`] nor
-    /// [`fit_loss`] maps it. It is reachable through the fit kernel's direct
-    /// batch API, not through the search dispatch.
+    /// native correlation scorer, so [`DeviceLoss::for_metric`] does not map it
+    /// and every fitness value stays on the CPU. [`fit_loss`] does not map it
+    /// either (the search does not dispatch the arm yet), but
+    /// [`correlation_fit_only`] does, so the batched verifier and the kernel's
+    /// direct batch API can fit it.
     Correlation,
-    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`].
+    /// #224: `1 − ρ`. Fit-only for the same reason as
+    /// [`DeviceLoss::Correlation`]. #225 gives it a real orientation choice:
+    /// the kernel refines both gauge signs and keeps the better `1 − ρ`.
     CorrelationSigned,
 }
 
@@ -163,10 +167,35 @@ impl DeviceLoss {
 /// The information criteria fit by least squares and add their penalty when
 /// scoring, so they share the squared objective; `log_squashed` uses the
 /// robust arm. Everything else returns `None` and keeps the exact CPU fit.
+///
+/// #225: the correlation family is deliberately *not* here. The kernel
+/// minimises exactly `1 − |ρ|` / `1 − ρ` ([`DeviceLoss::Correlation`],
+/// [`DeviceLoss::CorrelationSigned`]) and the batched verifier drives it, but
+/// the search does not dispatch it: see [`correlation_fit_only`] and
+/// [`gpu_fit_metric_error`].
 pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
     match metric {
         Metric::Aic | Metric::Aicc | Metric::Bic => Some(DeviceLoss::Squared),
         m => DeviceLoss::for_metric(m),
+    }
+}
+
+/// #225: `Some(signed)` for the correlation family, `None` otherwise.
+///
+/// This names the exact device correlation objective the batched kernel
+/// implements ([`DeviceLoss::Correlation`], [`DeviceLoss::CorrelationSigned`]).
+/// [`BatchedGpu::fit_batch_metric`](crate::fit::BatchedGpu) uses it to answer a
+/// correlation request with the correlation loss instead of SSE — the device
+/// warm-start form of the arm — and
+/// [`gpu_fit_metric_error`](crate::fit::gpu_fit_metric_error) uses it to name
+/// the arm in the refusal the CLI prints. It is deliberately **not** part of
+/// [`fit_loss`], so the search does not defer correlation fits to the device
+/// yet (see [`gpu_fit_metric_error`] for the measured reason).
+pub fn correlation_fit_only(metric: Metric) -> Option<bool> {
+    match metric {
+        Metric::Correlation => Some(false),
+        Metric::CorrelationSigned => Some(true),
+        _ => None,
     }
 }
 
@@ -179,6 +208,12 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
+///
+/// #225: the correlation family is refused **even though** the kernel
+/// implements its exact objective ([`correlation_fit_only`] names it and
+/// `BatchedGpu` uses it on the batched path): the search does not dispatch the
+/// arm yet because it measured worse end to end, and the refusal says so
+/// instead of pretending the arm does not exist.
 /// The CLI and the web front end turn this into a usage error before any data
 /// is read; the search's own dispatch requires the same predicate, so the
 /// refusal and the dispatch can never disagree.
@@ -192,14 +227,30 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     if rank_metric_signed(metric).is_some() {
         return None;
     }
+    // #225: the correlation family has an exact device arm on the batched
+    // kernel, but the search does not dispatch it yet: measured on a
+    // 15 000-row cell at pop 100 the deferred fit reached validation
+    // hypervolume 6.85 against 34.09 for the exact CPU arm, so wiring it
+    // without a quality gate would trade quality for speed. The refusal names
+    // the arm instead of pretending it does not exist.
+    let correlation_note = if correlation_fit_only(metric).is_some() {
+        " The exact correlation device arm (#224/#225) exists on the batched \
+         kernel (1 - |rho| / 1 - rho, frozen affine gauge, two-orientation \
+         signed LM) and passes its device tests, but the search does not \
+         dispatch it yet: on a 15 000-row cell at pop 100 it reached validation \
+         hypervolume 6.85 against 34.09 for the exact CPU arm."
+    } else {
+        ""
+    };
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss or the \
-         exact rank objectives, but --metric {} has no device fit objective, so \
-         the GPU arms cannot fit it. Use --metric squared (aic, aicc and bic \
-         also fit by least squares), --metric log_squashed, \
+         exact rank objectives, but --metric {} has no device fit objective the \
+         search can dispatch, so the GPU arms cannot fit it. Use --metric squared \
+         (aic, aicc and bic also fit by least squares), --metric log_squashed, \
          --metric rank_correlation or rank_correlation_signed, or a CPU fit \
-         strategy: --fit-strategy exact, auto, linear, varpro or stream.",
-        metric.name()
+         strategy: --fit-strategy exact, auto, linear, varpro or stream.{}",
+        metric.name(),
+        correlation_note
     ))
 }
 
@@ -2552,12 +2603,48 @@ fn predictions(tree: &Node, x: &[Vec<f64>]) -> Vec<f64> {
 }
 
 /// The configured metric at the tree's current constants.
-fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> f64 {
+///
+/// #225: the fit dispatch uses it as the correlation family's proposal gate: a
+/// device proposal is kept only when this value does not get worse, so the gate
+/// judges the configured objective and never SSE.
+pub(crate) fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> f64 {
     if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
         return f64::INFINITY;
     }
     let pred = predictions(tree, x);
     metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
+}
+
+/// #225: the exact `f64` gate the search applies to a device correlation
+/// proposal.
+///
+/// `1 − ρ` (or `1 − |ρ|`) decides, never SSE and never the other correlation
+/// metric: a proposal is kept only when the configured objective in exact
+/// `f64` is finite and no worse than the incoming constants. Otherwise the
+/// incoming constants are restored from `incoming` and the caller refits them
+/// with the exact CPU arm and labels the cause `worse`. Returns whether the
+/// proposal was kept.
+pub(crate) fn correlation_proposal_gate(
+    tree: &mut Node,
+    proposal: &[f64],
+    incoming: &[f64],
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+) -> bool {
+    let f = flatten(tree);
+    if proposal.len() != f.nconst || !proposal.iter().all(|v| v.is_finite()) {
+        return false;
+    }
+    let start = metric_score(tree, x, y, w, metric);
+    write_constants(tree, &f, proposal);
+    let after = metric_score(tree, x, y, w, metric);
+    if after.is_finite() && start.is_finite() && after <= start {
+        return true;
+    }
+    write_constants(tree, &f, incoming);
+    false
 }
 
 /// One IRLS round: fit weighted least squares to `target` with per-row
@@ -3696,6 +3783,69 @@ mod tests {
         assert!(a < b, "correlation fit {a} vs squared fit {b}");
     }
 
+    /// #225: the search's correlation proposal gate. It keeps a proposal that
+    /// improves `1 − ρ` even when SSE gets worse, rejects the reflection under
+    /// the signed objective, and restores the incoming constants exactly.
+    #[test]
+    fn the_correlation_proposal_gate_is_metric_aware_and_restores() {
+        let (x, y) = outlier_fixture();
+        let tree = line(0.5, 0.0);
+        let incoming = fitted_constants(&tree);
+        let good = fitted_constants(&{
+            let mut t = tree.clone();
+            fit_weighted_metric(&mut t, &x, &y, &[], 12, Metric::Correlation);
+            t
+        });
+        // A better correlation: kept.
+        let mut t = tree.clone();
+        assert!(correlation_proposal_gate(
+            &mut t,
+            &good,
+            &incoming,
+            &x,
+            &y,
+            &[],
+            Metric::Correlation
+        ));
+        assert_eq!(fitted_constants(&t), good);
+        // The reflection `−f` scores exactly `2 − (1 − ρ)` under the signed
+        // objective: rejected and restored bit for bit.
+        let mut t = tree.clone();
+        let mirrored: Vec<f64> = incoming.iter().map(|v| -v).collect();
+        assert!(!correlation_proposal_gate(
+            &mut t,
+            &mirrored,
+            &incoming,
+            &x,
+            &y,
+            &[],
+            Metric::CorrelationSigned
+        ));
+        assert_eq!(fitted_constants(&t), incoming);
+        // A non-finite or wrong-length proposal is never written.
+        let mut t = tree.clone();
+        assert!(!correlation_proposal_gate(
+            &mut t,
+            &[f64::NAN, 0.0],
+            &incoming,
+            &x,
+            &y,
+            &[],
+            Metric::CorrelationSigned
+        ));
+        assert_eq!(fitted_constants(&t), incoming);
+        assert!(!correlation_proposal_gate(
+            &mut t,
+            &[1.0],
+            &incoming,
+            &x,
+            &y,
+            &[],
+            Metric::CorrelationSigned
+        ));
+        assert_eq!(fitted_constants(&t), incoming);
+    }
+
     #[test]
     fn l1_fit_recovers_a_clean_proportional_law() {
         let x: Vec<Vec<f64>> = (0..21)
@@ -4274,6 +4424,27 @@ mod tests {
         assert_eq!(rank_fit_only(Metric::RankCorrelation), Some(false));
         assert_eq!(rank_fit_only(Metric::RankCorrelationSigned), Some(true));
         assert_eq!(rank_fit_only(Metric::Squared), None);
+        // #225: the correlation family has an exact device arm, but the
+        // search does not dispatch it yet, so an explicit gpu is still
+        // refused — with a message that names the arm and the measured reason.
+        assert_eq!(correlation_fit_only(Metric::Correlation), Some(false));
+        assert_eq!(correlation_fit_only(Metric::CorrelationSigned), Some(true));
+        assert_eq!(correlation_fit_only(Metric::Squared), None);
+        for m in [Metric::Correlation, Metric::CorrelationSigned] {
+            let why = gpu_fit_metric_error(m).expect("still refused");
+            assert!(
+                why.contains("exact correlation device arm"),
+                "the refusal must name the arm: {why}"
+            );
+            assert!(
+                why.contains("validation hypervolume"),
+                "the refusal must name the measured reason: {why}"
+            );
+            assert_eq!(fit_loss(m), None, "the search must not defer it");
+        }
+        // The scoring gate stays closed: no correlation scorer on the device.
+        assert_eq!(DeviceLoss::for_metric(Metric::Correlation), None);
+        assert_eq!(DeviceLoss::for_metric(Metric::CorrelationSigned), None);
         assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
     }
 

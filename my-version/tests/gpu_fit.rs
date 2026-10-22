@@ -576,6 +576,79 @@ fn signed_arm_projects_the_device_proposal_exactly() {
     }
 }
 
+/// #225: the exact correlation device arm is not dispatched from the search
+/// yet. `--fit-strategy gpu` with a correlation metric must therefore keep
+/// every constant and every fitness value on the exact CPU arm — never a
+/// device fit and never an SSE substitute — and the reported numbers must be
+/// the exact CPU `1 − ρ`.
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_signed_fit_is_not_dispatched_to_the_device() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(240, 61);
+    let test = sample(60, 62);
+    let cfg = Config {
+        generations: 4,
+        metric: Metric::CorrelationSigned,
+        ..gpu_config(63)
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
+    assert!(
+        a.gpu.is_none(),
+        "the correlation arm must not create a device evaluator yet: {:?}",
+        a.gpu
+    );
+    let mut differs_from_sse = false;
+    for s in &a.archive.items {
+        let signed = search::eval_error(&s.tree, &train, Metric::CorrelationSigned);
+        assert_eq!(
+            s.error.to_bits(),
+            signed.to_bits(),
+            "archive row is not the exact CPU correlation_signed score: {} vs {}",
+            s.error,
+            signed
+        );
+        let sse = search::eval_error(&s.tree, &train, Metric::Squared);
+        if s.error.to_bits() != sse.to_bits() {
+            differs_from_sse = true;
+        }
+    }
+    assert!(
+        differs_from_sse,
+        "the fitted trees must be scored on 1 - rho, never on SSE"
+    );
+}
+
+/// #225: `--no-fit` never fits anything for the correlation family either: the
+/// constants stay as generated and the reported number is the exact CPU `1 − ρ`.
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_signed_gpu_no_fit_is_a_true_noop() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample(240, 71);
+    let test = sample(60, 72);
+    let cfg = Config {
+        fit_iters: 0,
+        metric: Metric::CorrelationSigned,
+        ..gpu_config(73)
+    };
+    let out = search::run(&cfg, &train, &test);
+    assert!(out.gpu.is_none(), "no device fit may run without a fit");
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::CorrelationSigned);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
+}
+
 /// #169 measurement (ignored): end-to-end wall time of a fit-heavy
 /// configuration on the CPU exact arm versus the GPU-fit arm.
 /// Run with `cargo test --release --features cuda --test gpu_fit bench_end_to_end -- --ignored --nocapture`.

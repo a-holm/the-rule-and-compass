@@ -28,9 +28,10 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229), and the exact correlation objective with a frozen affine gauge
-(#224) — and labels every larger or unsupported candidate for the exact CPU
-arm; the correlation *scorer* remains CPU-side under the #236 gate;
+(#229) — and labels every larger or unsupported candidate for the exact CPU
+arm; the correlation *scorer* remains CPU-side under the #236 gate, and the
+exact correlation device arm (#224/#225) is built and verified on the batched
+kernel but not dispatched from the search yet (see below);
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
@@ -40,6 +41,14 @@ fitness and the finalist refit stay on the CPU, because native rank scoring is
 still open). An explicit `gpu` with a metric that has no device fit objective is
 a usage error, because the kernel would otherwise fit a different loss; use
 `--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+`--metric correlation`/`correlation_signed` are in that group on purpose: their
+device arm exists (`fit_batch_verified` with `BatchedGpu` drives the exact
+`1 − |ρ|`/`1 − ρ` kernel through the exact `f64` gate and the measured cost
+model), but wiring it into the search measured *worse* end-to-end results on a
+15 000-row cell (validation hypervolume 6.85 against 34.09 for the exact CPU
+arm), so the CLI names the arm and refuses instead of trading quality for
+speed. `--fit-strategy gpu` with `--metric signed` is refused for the same kind
+of reason (#236).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
@@ -900,9 +909,10 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
-(#229), and the exact correlation objective with a frozen affine gauge
-(#224) — and labels every larger or unsupported candidate for the exact CPU
-arm; the correlation *scorer* remains CPU-side under the #236 gate;
+(#229) — and labels every larger or unsupported candidate for the exact CPU
+arm; the correlation *scorer* remains CPU-side under the #236 gate, and the
+exact correlation device arm (#224/#225) is built and verified on the batched
+kernel but not dispatched from the search yet (see below);
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
@@ -912,6 +922,14 @@ fitness and the finalist refit stay on the CPU, because native rank scoring is
 still open). An explicit `gpu` with a metric that has no device fit objective is
 a usage error, because the kernel would otherwise fit a different loss; use
 `--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+`--metric correlation`/`correlation_signed` are in that group on purpose: their
+device arm exists (`fit_batch_verified` with `BatchedGpu` drives the exact
+`1 − |ρ|`/`1 − ρ` kernel through the exact `f64` gate and the measured cost
+model), but wiring it into the search measured *worse* end-to-end results on a
+15 000-row cell (validation hypervolume 6.85 against 34.09 for the exact CPU
+arm), so the CLI names the arm and refuses instead of trading quality for
+speed. `--fit-strategy gpu` with `--metric signed` is refused for the same kind
+of reason (#236).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed

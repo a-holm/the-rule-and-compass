@@ -226,6 +226,16 @@ fn verify_proposal(
             c0[f.cslot[i] as usize] = f.val[i];
         }
     }
+    if correlation_fit_only(metric).is_some() {
+        // #225: the correlation family has one exact gate, shared with the
+        // search's device path: the configured objective in exact `f64`,
+        // restoring the incoming constants when the proposal is worse or not
+        // finite. Never SSE, never the other correlation metric.
+        if correlation_proposal_gate(tree, proposal, &c0, x, y, w, metric) {
+            return Verdict::Accepted(metric_score(tree, x, y, w, metric));
+        }
+        return Verdict::Rejected;
+    }
     if metric != Metric::Squared {
         // #229: the configured loss decides, never SSE.
         let start = metric_score(tree, x, y, w, metric);
@@ -368,13 +378,36 @@ impl BatchedFitter for BatchedGpu<'_> {
     fn fit_batch_metric(
         &self,
         trees: &[Node],
-        _x: &[Vec<f64>],
+        x: &[Vec<f64>],
         _y: &[f64],
         _w: &[f64],
         iters: usize,
         metric: Metric,
     ) -> Vec<Option<Vec<f64>>> {
         if let Some(loss) = fit_loss(metric) {
+            return self.propose(trees, iters, loss);
+        }
+        // #225: the correlation family proposes with the exact correlation
+        // loss (`1 − |ρ|` / `1 − ρ`) and never with SSE; the caller's exact
+        // `f64` gate judges the proposal on the same metric. A batch the
+        // measured cost model says a launch would lose on is declined, so the
+        // exact CPU arm takes it.
+        if let Some(signed) = correlation_fit_only(metric) {
+            let consts = trees
+                .iter()
+                .filter_map(gpu_fit_plan)
+                .map(|p| p.nconst)
+                .max()
+                .unwrap_or(1);
+            if !crate::fit::correlation::prefer_device(x.len(), trees.len(), consts, iters, signed)
+            {
+                return vec![None; trees.len()];
+            }
+            let loss = if signed {
+                DeviceLoss::CorrelationSigned
+            } else {
+                DeviceLoss::Correlation
+            };
             return self.propose(trees, iters, loss);
         }
         if metric == Metric::Signed {
@@ -793,5 +826,189 @@ mod tests {
         assert_eq!(out.status, vec![BatchStatus::NotIdentifiable]);
         // The reported objective is the exact bias of the model, not zero.
         assert!((out.score[0] - 4.0).abs() < 1e-12, "{:?}", out.score);
+    }
+
+    // -- #225: the correlation family through the batch gate ----------------
+
+    fn corr_model() -> Node {
+        node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.5),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                    ],
+                ),
+                constant(0.1),
+            ],
+        )
+    }
+
+    fn corr_rows(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![-2.0 + 4.0 * i as f64 / (n - 1) as f64]).collect();
+        let y: Vec<f64> = x.iter().map(|r| 3.0 * (0.8 * r[0]).sin() + 20.0).collect();
+        (x, y)
+    }
+
+    /// #225: a proposal with a **better correlation and a worse SSE** must be
+    /// accepted for `--metric correlation`. The fixture's target is offset by
+    /// 20, so the least-squares optimum `(3, 20)` has a worse `1 − |ρ|` than
+    /// the shape-only `(1, 0)`, while the squared metric prefers the reverse.
+    #[test]
+    fn a_correlation_proposal_is_judged_on_1_minus_rho_not_sse() {
+        let (x, y) = corr_rows(40);
+        let start = corr_model();
+        let start_sse = metric_score(&start, &x, &y, &[], Metric::Squared);
+        let start_corr = metric_score(&start, &x, &y, &[], Metric::Correlation);
+        let proposal = vec![1.0, 1.0, 0.0];
+        let mut trial = start.clone();
+        write_constants(&mut trial, &flatten(&start), &proposal);
+        let proposal_sse = metric_score(&trial, &x, &y, &[], Metric::Squared);
+        let proposal_corr = metric_score(&trial, &x, &y, &[], Metric::Correlation);
+        assert!(
+            proposal_corr < start_corr,
+            "fixture: the proposal must improve rho ({proposal_corr} vs {start_corr})"
+        );
+        assert!(
+            proposal_sse > start_sse,
+            "fixture: and must worsen SSE ({proposal_sse} vs {start_sse})"
+        );
+        let mut gpu = vec![start.clone()];
+        let out = fit_batch_verified(
+            &ProposingBackend(proposal.clone()),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Correlation,
+        );
+        assert_eq!(out.status, vec![BatchStatus::Gpu], "judged on the metric");
+        assert_eq!(out.score[0].to_bits(), proposal_corr.to_bits());
+        // ... and the same proposal is rejected when the run is squared.
+        let mut squared = vec![start];
+        let out = fit_batch_verified(
+            &ProposingBackend(proposal),
+            &mut squared,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::Squared,
+        );
+        assert_eq!(out.status, vec![BatchStatus::Worse]);
+    }
+
+    /// #225: the reflected proposal `-T` has the *same* `1 − |ρ|` as `T`, so an
+    /// unsigned gate accepts it; the signed gate must reject it because
+    /// `1 − ρ(-T) = 2 − (1 − ρ(T))`.
+    #[test]
+    fn a_reflected_proposal_is_rejected_for_signed_correlation() {
+        let (x, y) = corr_rows(40);
+        let start = corr_model();
+        // `-0.5·sin(x) + 0.1` is the reflection of the incoming shape.
+        let mirrored = vec![-0.5, 1.0, 0.1];
+        let mut trial = start.clone();
+        write_constants(&mut trial, &flatten(&start), &mirrored);
+        let start_abs = metric_score(&start, &x, &y, &[], Metric::Correlation);
+        let mirror_abs = metric_score(&trial, &x, &y, &[], Metric::Correlation);
+        assert!(
+            (mirror_abs - start_abs).abs() < 1e-12,
+            "the reflection is free under 1 - |rho|: {mirror_abs} vs {start_abs}"
+        );
+        let start_signed = metric_score(&start, &x, &y, &[], Metric::CorrelationSigned);
+        let mirror_signed = metric_score(&trial, &x, &y, &[], Metric::CorrelationSigned);
+        assert!(
+            mirror_signed > start_signed + 0.5,
+            "the reflection must be charged by 1 - rho: {mirror_signed} vs {start_signed}"
+        );
+        let mut gpu = vec![start.clone()];
+        let out = fit_batch_verified(
+            &ProposingBackend(mirrored),
+            &mut gpu,
+            &x,
+            &y,
+            &[],
+            8,
+            Metric::CorrelationSigned,
+        );
+        assert_eq!(out.status, vec![BatchStatus::Worse]);
+        // The rejected proposal is refit by the exact CPU arm from the incoming
+        // constants, so the reported number is that arm's, and it is never
+        // worse than the start.
+        let mut cpu = start.clone();
+        let reference =
+            fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::CorrelationSigned);
+        assert_eq!(out.score[0].to_bits(), reference.to_bits());
+        assert!(out.score[0] <= start_signed);
+        assert!(
+            crate::metrics::correlation(
+                &x.iter().map(|r| crate::expr::eval(&gpu[0], r)).collect::<Vec<_>>(),
+                &y
+            ) > 0.0,
+            "the CPU refit must keep the direction"
+        );
+    }
+
+    /// #225: a rejected correlation proposal is refit bit for bit by the exact
+    /// CPU arm from the incoming constants.
+    #[test]
+    fn a_rejected_correlation_proposal_falls_back_exactly() {
+        let (x, y) = corr_rows(41);
+        for proposal in [None, Some(vec![f64::NAN, 1.0, 0.0]), Some(vec![9.0, 9.0, 9.0])] {
+            let mut gpu = vec![corr_model()];
+            let out = fit_batch_verified(
+                &Backend { proposal },
+                &mut gpu,
+                &x,
+                &y,
+                &[],
+                8,
+                Metric::CorrelationSigned,
+            );
+            let mut cpu = corr_model();
+            let reference = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::CorrelationSigned);
+            assert_eq!(out.score[0].to_bits(), reference.to_bits());
+            assert_eq!(
+                fitted(&gpu[0]).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                fitted(&cpu).iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// #225: `--no-fit` never reaches the batch verifier in production
+    /// (`defers_fit_to_gpu` requires `fit_iters > 0`), so the no-op contract
+    /// lives in the exact CPU arm. This pins the layered guarantee: with
+    /// `iters == 0` the CPU arm is a bit-exact no-op, and a better proposal is
+    /// still scored on the configured metric rather than SSE.
+    #[test]
+    fn no_fit_keeps_a_correlation_run_untouched() {
+        let (x, y) = corr_rows(30);
+        let mut tree = corr_model();
+        let before = fitted(&tree);
+        let start = metric_score(&tree, &x, &y, &[], Metric::CorrelationSigned);
+        let got = fit_weighted_metric(&mut tree, &x, &y, &[], 0, Metric::CorrelationSigned);
+        assert_eq!(got.to_bits(), start.to_bits());
+        assert_eq!(
+            fitted(&tree).iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            before.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "--no-fit must not move a constant"
+        );
+        // And a proposal under `--no-fit` is judged on 1 - rho, not SSE.
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &ProposingBackend(vec![1.0, 1.0, 0.0]),
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::CorrelationSigned,
+        );
+        let exact = metric_score(&trees[0], &x, &y, &[], Metric::CorrelationSigned);
+        assert_eq!(out.score[0].to_bits(), exact.to_bits());
+        assert!(out.score[0] <= start || !out.score[0].is_finite());
     }
 }

@@ -1590,9 +1590,34 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (go >= 0 && go < p) S->sc[go] = 0.0;
         }
         __syncthreads();
+        /* #225: signed correlation has a genuine orientation, and for the
+           frozen gauge `rho(-h) = -rho(h)` the only two candidates are the
+           signs of the scale slot. Both are refined from the same entry
+           constants and the better endpoint is kept: only the sign of the
+           gauge scale moves, never a shape constant, so this is not a
+           reflection of the tree. `--no-fit` (iters == 0) never flips because
+           nothing may move. The pass order is fixed, so the result is
+           deterministic for a fixed device. */
+        const bool flip = iters > 0 && metric == RC_LOSS_CORRELATION_SIGNED && g[0] >= 0 &&
+                          g[0] < p;
+        const int passes = flip ? 2 : 1;
+        double entry[MAXC];
+        double keepc[MAXC];
+        if (tid < p) entry[tid] = S->sc[tid];
+        __syncthreads();
         int status = 0;
+        int failures = 0;
+        bool any_ok = false;
         double best = 1.0;
         if (iters > 0) {
+            double overall = 1e30;
+            for (int pass = 0; pass < passes; ++pass) {
+                if (tid < p) S->sc[tid] = entry[tid];
+                __syncthreads();
+                if (pass == 1 && tid == 0) S->sc[g[0]] = -entry[g[0]];
+                __syncthreads();
+                status = 0;
+                best = 1.0;
             ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
                                           S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
                                           &S->sbest, &S->srho, &S->sbad, metric);
@@ -1682,6 +1707,18 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     __syncthreads();
                 }
             }
+                if (status == 0) any_ok = true;
+                else failures = status;
+                if (best < overall) {
+                    overall = best;
+                    if (tid < p) keepc[tid] = S->sc[tid];
+                }
+            }
+            if (overall < 1e30) {
+                best = overall;
+                if (tid < p) S->sc[tid] = keepc[tid];
+            }
+            status = any_ok ? 0 : failures;
         } else {
             best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
         }

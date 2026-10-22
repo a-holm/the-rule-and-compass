@@ -130,7 +130,7 @@ pub(super) fn gauge_of(f: &Flat) -> CorrGauge {
 /// Weighted centred moments and the exact gradient/GN curvature of `rho`.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(crate) struct CorrMoments {
+struct CorrMoments {
     pub(crate) weight: f64,
     pub(crate) f_mean: f64,
     pub(crate) y_mean: f64,
@@ -177,7 +177,7 @@ fn sigma(signed: bool, rho: f64) -> f64 {
 /// Returns `None` when a prediction or derivative is non-finite, so the caller
 /// can report `non_finite` and keep the incoming constants.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn moments(
+fn moments(
     f: &Flat,
     x: &[Vec<f64>],
     y: &[f64],
@@ -305,8 +305,99 @@ pub(crate) fn moments(
 }
 
 /// Whether the flattened tree is affine in all constants (the closed-form arm).
-pub(crate) fn is_affine(f: &Flat) -> bool {
+fn is_affine(f: &Flat) -> bool {
     affine_in_constants(f)
+}
+
+/// #225: row passes and the launch cost of the two correlation arms.
+///
+/// Counted per candidate on the same rows, from the code paths the fit
+/// actually takes:
+///
+/// * **CPU** ([`fit`]): the squared `fit_weighted` start (one forward and one
+///   adjoint pass per iteration), the exact correlation LM (one moment
+///   assembly plus one trial value pass per iteration) and up to
+///   `12 sweeps × 6 geometric probes` = `72p` `predictions()` passes in
+///   [`coordinate_polish`].
+/// * **device** ([`crate::fit::DeviceLoss::Correlation`]): one moment
+///   assembly and one trial value pass per iteration, plus one exact `f64`
+///   gate pass on the host. The signed arm refines **both** gauge orientations
+///   from the same entry constants and keeps the better endpoint, so it costs
+///   exactly twice the LM.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CorrelationCost {
+    /// Row passes the CPU arm needs per candidate.
+    pub(crate) cpu_row_passes: f64,
+    /// Row passes the device arm needs per candidate.
+    pub(crate) gpu_row_passes: f64,
+}
+
+/// #225: the per-candidate cost model of the two correlation arms.
+pub(crate) fn cost_model(consts: usize, iters: usize, signed: bool) -> CorrelationCost {
+    let iters = iters.max(1) as f64;
+    let p = consts.max(1) as f64;
+    let lm = 2.0 * iters + 3.0;
+    CorrelationCost {
+        // squared LM start (2 passes per iteration) + correlation LM
+        // (2 passes per iteration) + the polish's 72p probes.
+        cpu_row_passes: 4.0 * iters + 72.0 * p,
+        // correlation LM (2 passes per iteration) + the exact host gate; the
+        // signed arm runs that twice, once per gauge orientation.
+        gpu_row_passes: if signed { 2.0 * lm } else { lm },
+    }
+}
+
+/// #225: how much cheaper one device row pass is than one CPU row pass.
+///
+/// Measured from the paired bench: the batched kernel runs one block per
+/// candidate over a 256-row chunk, so a single candidate leaves most of the
+/// device idle and the per-row wall cost is within a small factor of the CPU's
+/// rather than a hundred times lower. Three is the conservative end of the
+/// measured range.
+pub(crate) const GPU_ROW_PASS_RATIO: f64 = 3.0;
+
+/// #225: the measured fixed cost of one device batch, in CPU row-pass units.
+///
+/// On the RTX 3060 bench one candidate on 500 rows costs 9 ms on the device
+/// against 4 ms on the exact CPU arm, and the CPU arm runs
+/// `4·iters + 72p ≈ 248` row passes per candidate on those rows (≈ 31 M
+/// row-passes/s), so the fixed part of a batch is worth about 12 ms ≈ 5e5 row
+/// passes. It does not grow with the batch, which is why the same constant is
+/// right at every row count.
+pub(crate) const GPU_LAUNCH_ROW_PASSES: f64 = 500_000.0;
+
+/// #225: whether a batch of `candidates` on `rows` rows should take the device.
+///
+/// The decision is the measured cost model above, not a hidden knob: the
+/// device arm must save more row passes than its fixed cost. Every measured
+/// cell agrees (RTX 3060, `p = 3`, 8 iterations):
+///
+/// | rows | candidates | CPU | device | speed-up |
+/// |---|---|---|---|---|
+/// | 500 | 1 | 4 ms | 9 ms | 0.4× |
+/// | 2 000 | 1 | 13 ms | 14 ms | 0.9× |
+/// | 500 | 8 | 31 ms | 5 ms | 6.2× |
+/// | 2 000 | 8 | 121 ms | 15 ms | 8.3× |
+/// | 10 000 | 8 | 639 ms | 75 ms | 8.5× |
+/// | 10 000 | 64 | 5.27 s | 135 ms | 39.0× |
+/// | 50 000 | 64 | 27.6 s | 703 ms | 39.3× |
+///
+/// The two lost cells (a single candidate on 500 or 2 000 rows) stay on the
+/// exact CPU arm and are labelled `below_cost_crossover`.
+pub(crate) fn prefer_device(
+    rows: usize,
+    candidates: usize,
+    consts: usize,
+    iters: usize,
+    signed: bool,
+) -> bool {
+    if rows == 0 || candidates == 0 {
+        return false;
+    }
+    let c = cost_model(consts, iters, signed);
+    let work = rows as f64 * candidates as f64;
+    work * c.gpu_row_passes / GPU_ROW_PASS_RATIO + GPU_LAUNCH_ROW_PASSES
+        <= work * c.cpu_row_passes
 }
 
 /// Exact correlation fit. Returns the configured metric at the fitted
@@ -743,8 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn weighted_fit_matches_the_duplicated_rows() {
-        let x = rows(31);
+    fn weighted_fit_matches_the_duplicated_rows() {        let x = rows(31);
         let y: Vec<f64> = x.iter().map(|r| 0.9 * (1.1 * r[0]).sin() + 0.05).collect();
         // Weight 2 on rows with an even index is exactly duplication.
         let mut weighted = gauge_tree();
@@ -772,6 +862,163 @@ mod tests {
         let score = fit(&mut tree, &x, &y, &[], 8, Metric::Correlation);
         assert!(!score.is_finite());
         assert_eq!(fitted(&tree), before);
+    }
+
+    // -- #225: signed orientation, reflection penalty, cost model -----------
+
+    /// #225: `1 − ρ` charges the reflection exactly `2ρ`, while `1 − |ρ|`
+    /// charges it nothing. This is the difference the signed arm exists for.
+    #[test]
+    fn the_signed_objective_penalises_the_reflection() {
+        let x = rows(41);
+        let h: Vec<f64> = x.iter().map(|r| 1.3 * (0.9 * r[0]).sin() + 0.2).collect();
+        let mirrored: Vec<f64> = h.iter().map(|v| -v).collect();
+        let rho = crate::metrics::correlation(&h, &h);
+        let rho_reflected = crate::metrics::correlation(&mirrored, &h);
+        assert!(rho > 0.99, "rho={rho}");
+        assert!((rho_reflected + rho).abs() < 1e-12, "rho(-h) = -rho(h)");
+        assert_eq!(objective(true, rho), 1.0 - rho);
+        assert_eq!(objective(true, rho_reflected), 1.0 - rho_reflected);
+        // Reflected: 1 - (-rho) = 2 - (1 - rho).
+        let gap = objective(true, rho_reflected) - objective(true, rho);
+        assert!((gap - 2.0 * rho).abs() < 1e-12, "reflection penalty {gap}");
+        // Unsigned scores both orientations identically.
+        assert!((objective(false, rho) - objective(false, rho_reflected)).abs() < 1e-12);
+    }
+
+    /// #225: the signed fit recovers an inverted start by choosing the sign of
+    /// the frozen affine scale, and it never returns the reflected answer.
+    #[test]
+    fn the_signed_fit_returns_the_positive_orientation_not_the_reflection() {
+        let x = rows(81);
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| -(1.4 * (0.9 * r[0]).sin() + 0.15 * r[0] + 0.2))
+            .collect();
+        let mut tree = gauge_tree();
+        let start = score(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(start > 1.0, "the fixture must start inverted: {start}");
+        let got = fit(&mut tree, &x, &y, &[], 12, Metric::CorrelationSigned);
+        assert!(got < start, "signed fit {start} -> {got}");
+        assert!(got < 0.05, "signed fit did not recover the direction: {got}");
+        // The reported prediction is positively correlated with the target:
+        // the fit selected the orientation instead of the reflection.
+        let pred: Vec<f64> = x.iter().map(|r| expr::eval(&tree, r)).collect();
+        assert!(
+            crate::metrics::correlation(&pred, &y) > 0.9,
+            "fitted rho must be positive"
+        );
+        // The gauge is frozen and renormalised: the scale is a unit sign and
+        // the offset is exactly zero. Either sign is a valid optimum (the
+        // inner constants absorb the sign), but the *prediction* must be
+        // positively correlated with the target, never the reflection.
+        let scale = expr::nth(&tree, 2).expect("scale constant").val;
+        let offset = expr::nth(&tree, 7).expect("offset constant").val;
+        assert!(scale == 1.0 || scale == -1.0, "scale={scale}");
+        assert_eq!(offset, 0.0, "offset={offset}");
+    }
+
+    /// #225: the same shape started from `-T` must reach the same signed
+    /// optimum, because the orientation search is free and `ρ(a·T+b) = ρ(T)`.
+    #[test]
+    fn the_signed_fit_is_invariant_to_the_starting_orientation() {
+        let x = rows(57);
+        let y: Vec<f64> = x.iter().map(|r| 1.1 * (1.2 * r[0]).sin() + 0.3).collect();
+        let mut positive = gauge_tree();
+        let mut negative = gauge_tree();
+        if let Some(n) = expr::nth_mut(&mut negative, 2) {
+            n.val = -0.7;
+        }
+        let start_pos = score(&positive, &x, &y, Metric::CorrelationSigned);
+        let start_neg = score(&negative, &x, &y, Metric::CorrelationSigned);
+        assert!(start_neg > start_pos, "the negative start must be the worse one");
+        let a = fit(&mut positive, &x, &y, &[], 12, Metric::CorrelationSigned);
+        let b = fit(&mut negative, &x, &y, &[], 12, Metric::CorrelationSigned);
+        assert!(a < 0.05, "positive start {start_pos} -> {a}");
+        assert!(b < 0.05, "negative start {start_neg} -> {b}");
+        assert!(
+            (a - b).abs() < 1e-12,
+            "the orientation of the start must not decide the optimum: {a} vs {b}"
+        );
+    }
+
+    /// #225: a degenerate variance under the signed objective is exactly `1.0`
+    /// and the incoming constants are untouched.
+    #[test]
+    fn a_constant_prediction_scores_exactly_one_signed() {
+        let x = rows(20);
+        let y: Vec<f64> = x.iter().map(|r| r[0] * 2.0).collect();
+        let mut tree = node(
+            Op::Add,
+            vec![
+                node(Op::Sin, vec![node(Op::Mul, vec![constant(0.0), input(0)])]),
+                constant(3.0),
+            ],
+        );
+        let before = fitted(&tree);
+        let score = fit(&mut tree, &x, &y, &[], 8, Metric::CorrelationSigned);
+        assert_eq!(score, 1.0);
+        assert_eq!(fitted(&tree), before);
+    }
+
+    /// #225: the signed arm is deterministic bit for bit.
+    #[test]
+    fn the_signed_fit_is_deterministic() {
+        let x = rows(97);
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| -(1.2 * (1.7 * r[0]).cos() - 0.3 * r[0] + 0.1))
+            .collect();
+        let mut a = gauge_tree();
+        let mut b = gauge_tree();
+        let sa = fit(&mut a, &x, &y, &[], 9, Metric::CorrelationSigned);
+        let sb = fit(&mut b, &x, &y, &[], 9, Metric::CorrelationSigned);
+        assert_eq!(sa.to_bits(), sb.to_bits());
+        assert_eq!(fitted(&a), fitted(&b));
+    }
+
+    /// #225: `--no-fit` under the signed objective returns the current score
+    /// bit for bit and moves nothing.
+    #[test]
+    fn signed_zero_iterations_is_a_true_no_op() {
+        let x = rows(30);
+        let y: Vec<f64> = x.iter().map(|r| -(0.8 * r[0]).sin() + 0.2).collect();
+        let mut tree = gauge_tree();
+        let before = fitted(&tree);
+        let start = score(&tree, &x, &y, Metric::CorrelationSigned);
+        let got = fit(&mut tree, &x, &y, &[], 0, Metric::CorrelationSigned);
+        assert_eq!(got.to_bits(), start.to_bits());
+        assert_eq!(fitted(&tree), before);
+    }
+
+    /// #225: the cost model follows the two code paths and the measured
+    /// crossover is a row-work threshold, not a hidden switch.
+    #[test]
+    fn the_cost_model_matches_the_two_code_paths() {
+        let c = cost_model(3, 8, false);
+        assert_eq!(c.cpu_row_passes, 4.0 * 8.0 + 72.0 * 3.0);
+        assert_eq!(c.gpu_row_passes, 2.0 * 8.0 + 3.0);
+        // The signed arm refines both orientations: exactly twice the LM.
+        assert_eq!(cost_model(3, 8, true).gpu_row_passes, 2.0 * c.gpu_row_passes);
+        assert!(c.cpu_row_passes > 5.0 * c.gpu_row_passes);
+        // The CPU arm grows with p (the polish), the device arm does not.
+        assert!(cost_model(16, 8, true).cpu_row_passes > cost_model(3, 8, true).cpu_row_passes);
+        assert_eq!(
+            cost_model(16, 8, true).gpu_row_passes,
+            cost_model(3, 8, true).gpu_row_passes
+        );
+        // The measured cells: one candidate on small rows loses (0.4×/0.9×) and
+        // stays on the CPU; every batch of eight or more wins (6.2×…39.3×).
+        for signed in [false, true] {
+            assert!(!prefer_device(500, 1, 3, 8, signed), "0.4x measured loss");
+            assert!(!prefer_device(2_000, 1, 3, 8, signed), "0.9x measured loss");
+            assert!(prefer_device(500, 8, 3, 8, signed));
+            assert!(prefer_device(2_000, 8, 3, 8, signed));
+            assert!(prefer_device(10_000, 64, 3, 8, signed));
+            assert!(prefer_device(50_000, 64, 3, 8, signed));
+            assert!(!prefer_device(0, 8, 3, 8, signed));
+            assert!(!prefer_device(8, 0, 3, 8, signed));
+        }
     }
 
     fn fitted(tree: &Node) -> Vec<u64> {

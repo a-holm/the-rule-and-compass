@@ -439,7 +439,8 @@ The one exception is the **fit** stage of the rank family
 `backend_reason = "metric is not scored natively on the GPU"`. `GpuSearch`'s
 `native_metric` is false for this arm, so every candidate is scored by the CPU
 evaluator exactly as before; only the `gpu.fit` counters (and the device field)
-record the device use.
+record the device use. The correlation family has the same kind of arm (below)
+but is **not** dispatched from the search yet.
 
 Fallback and the flags:
 
@@ -1533,3 +1534,82 @@ roughly `n ≈ 10⁴` the CPU polish is latency-competitive for a single candida
 so the device arm pays off through batching; the threshold is not a hidden
 switch — any configuration outside the list above is labelled by
 `gpu_blocker`'s reason in the one-line note.
+
+
+## Exact correlation fitting (issues #224 and #225)
+
+`--metric correlation` (`1 − |ρ|`) and `correlation_signed` (`1 − ρ`) fit their
+constants with the exact analytic `ρ` gradient and its `y`-free Gauss–Newton
+curvature. The affine pair of an outer `a·T+b` is an exact null space, so it is
+renormalised once to `(sign(a), 0)` and frozen; an affine-in-constants tree uses
+the closed-form weighted-least-squares optimum; degenerate variance scores
+exactly `1.0`. #224 landed that arm on the CPU and in the batched kernel. #225
+gives the signed objective its orientation and drives the kernel through the
+same exact gate the rest of the engine uses.
+
+**Orientation, not reflection.** `ρ(−h) = −ρ(h)`, so for the frozen gauge the
+two orientations are exactly the signs `a = ±1`, and `1 − ρ` charges the
+reflection `2ρ` that `1 − |ρ|` does not. The CPU arm runs the LM from both
+orientations and keeps the better one. The kernel does the same for the signed
+loss code: it refines **both** gauge signs from the same entry constants in a
+fixed order and keeps the better endpoint. It never reflects the tree (no shape
+constant moves), and `--no-fit` (`--fit-iters 0`) never flips because nothing
+may move. Refining both signs rather than only the better starting one matters:
+on the paired bench it moved the per-candidate parity against the CPU arm from
+66–72 % to 75–100 % of starts (table below).
+
+**Device contract.** The kernel's loss codes 2 and 3 are the exact correlation
+objectives. `DeviceLoss::for_metric` stays `None` for both, so the evaluator
+never scores a correlation run; `fit::correlation_fit_only` names the
+fit arm and `BatchedGpu::fit_batch_metric` answers a correlation request with
+loss 2/3 — never SSE. `fit_batch_verified` then judges every proposal with
+`correlation_proposal_gate`: the configured objective in exact `f64`, with the
+incoming constants restored bit for bit when the proposal is worse or not
+finite. A batch the measured cost model says a launch would lose on is declined
+before the launch.
+
+**Not dispatched from the search yet.** `--fit-strategy gpu` with a correlation
+metric is still a usage error (exit 2), and [`fit_loss`] does not map the
+correlation family, so the search keeps the exact CPU correlation arm. The
+message names the device arm and the measured reason. On a recorded 15 000-row
+cell (one input, `y = 1.7·sin(0.9x) + 0.3x − 0.2 + N(0, 0.02)`, `pop = 100`,
+10 and 20 generations, seed 7) the deferred fit reached validation hypervolume
+**6.85** against **34.09** for the exact CPU arm, and stayed at 6.85 at 40
+generations, while being 3.7× faster in wall time; at `pop = 32` (every
+candidate fitted) the device arm *beat* the CPU arm (24.10 against 6.85). The
+end-to-end difference is therefore in how the deferred fit interacts with the
+#169 seed-constant screen and the frozen-gauge constants the search inherits,
+not in the per-candidate objective: with the same start the two arms agree to a
+median `1 − ρ` of `≤ 3e-13`. Until that interaction is understood and gated
+(issue #225 follow-up), the search refuses the combination instead of trading
+quality for speed.
+
+**Measured cost (RTX 3060, shared with a long GPU run, so indicative).** One
+candidate (`a·sin(b·x)+c`, `p = 3`, 8 iterations) per cell, historical CPU
+correlation arm versus the batched kernel on the same starts,
+`bench_correlation_fit_paired_signed`:
+
+| rows | candidates | CPU | device | speed-up | median `Δ(1−ρ)` vs CPU | device ≤ CPU |
+|---|---|---|---|---|---|---|
+| 500 | 1 | 4 ms | 9 ms | 0.4× | 6.7e-16 | 1/1 |
+| 2 000 | 1 | 13 ms | 14 ms | 0.9× | −1.0e-15 | 1/1 |
+| 500 | 8 | 31 ms | 5 ms | 6.2× | −4.4e-16 | 8/8 |
+| 2 000 | 8 | 121 ms | 15 ms | 8.3× | 2.9e-15 | 8/8 |
+| 10 000 | 8 | 639 ms | 75 ms | 8.5× | 2.0e-14 | 8/8 |
+| 10 000 | 64 | 5.27 s | 135 ms | 39.0× | 1.4e-14 | 61/64 |
+| 50 000 | 64 | 27.6 s | 703 ms | 39.3× | 2.0e-15 | 64/64 |
+
+**Cost model.** Per candidate, `p` constants and `I` iterations:
+
+```
+CPU:    4·I + 72·p       row passes   (squared LM start, correlation LM, polish)
+device: 2·(2·I + 3)      row passes   (both orientations of the signed LM, gate)
+launch: 5e5              CPU row-pass equivalents, measured (≈ 12 ms)
+ratio:  1 device row pass ≈ 1/3 of a CPU row pass in wall time, measured
+```
+
+so the device is chosen when
+`work·2(2I+3)/3 + 5e5 ≤ work·(4I+72p)` for `work = rows · candidates`. The model
+reproduces every measured cell: the two losing cells (one candidate on 500 and
+2 000 rows) keep the exact CPU arm, and every batch of eight or more takes the
+device.

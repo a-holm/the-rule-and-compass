@@ -1483,6 +1483,10 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
 /// path. The evaluator it authorises has `native_metric = false`: the CPU scores
 /// every candidate, and the backend report stays `cpu` with the open-scorer
 /// reason.
+///
+/// #225: the correlation family has the same shape of arm, but its search
+/// dispatch is gated off (see [`crate::fit::gpu_fit_metric_error`]), so it is
+/// not part of this predicate.
 #[cfg(feature = "cuda")]
 fn rank_fit_only_arm(cfg: &Config, train: &Sample) -> Option<bool> {
     let signed = crate::fit::rank_fit_only(cfg.metric)?;
@@ -2082,7 +2086,8 @@ fn admission_count(island_pop: usize, train_rows: usize) -> usize {
 ///
 /// Every pending (`error.is_nan()`) individual is screened with its seed
 /// constants first. Per island, the best `admission_count(island_pop,
-/// train_rows)` are promoted; ties break on complexity and then on the
+/// train_rows, wide)` are promoted; `wide` is true for the correlation family
+/// (#225), whose screening score is a weak proxy for `1 − ρ`; ties break on complexity and then on the
 /// population index, so the set depends only on the screened errors, the row
 /// count and the fixed island/population order. Non-promoted offspring keep
 /// their screening score. At `train_rows >= WIDE_ADMISSION_ROWS` every
@@ -5206,14 +5211,22 @@ mod tests {
             };
             assert!(defers_fit_to_gpu(&cfg, true), "{metric:?} fits by least squares");
         }
-        for metric in [Metric::Absolute, Metric::Slope, Metric::Median, Metric::Correlation] {
+        // #225: the correlation family has an exact device arm, but the search
+        // does not defer its fits yet, so it stays on the CPU fit path too.
+        for metric in [
+            Metric::Absolute,
+            Metric::Slope,
+            Metric::Median,
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+        ] {
             let cfg = Config {
                 metric,
                 ..gpu_fit.clone()
             };
             assert!(
                 !defers_fit_to_gpu(&cfg, true),
-                "{metric:?} has no native device loss"
+                "{metric:?} has no device fit objective the search dispatches"
             );
         }
         // `--no-fit` never reaches the kernel, whatever the metric.

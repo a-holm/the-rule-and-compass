@@ -253,6 +253,7 @@ is mathematically well posed:
 | `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
 | `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
+| `correlation`, `correlation_signed` on the device (#224/#225) | the batched correlation LM: exact `1 − |ρ|` / `1 − ρ`, frozen `(±1, 0)` affine gauge, both-orientation LM for the signed arm, exact `f64` metric gate and a measured cost model on the host; reachable today through `fit_batch_verified`/`BatchedGpu`, **not** yet from `--fit-strategy gpu` (measured end-to-end regression, see below) |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
 
 The correlation family is no longer a squared fit plus polish (issue #224).
@@ -266,6 +267,32 @@ constant prediction or target scores exactly the metric's worst value `1.0`,
 matching `metrics::correlation`. The remaining polish metrics are monotone too:
 the squared pre-fit runs on a clone, so a polish that finds no improvement keeps
 the incoming constants.
+
+**Signed correlation and the device arm (#225).** `correlation_signed`
+minimises `1 − ρ`, so the reflection is charged exactly `2ρ` while
+`correlation` (`1 − |ρ|`) charges it nothing. Both share the same
+`y`-free curvature and differ only in the gradient sign, so the signed arm is
+the same fit with a real orientation choice: for the frozen gauge
+`ρ(−h) = −ρ(h)`, so flipping the scale between `+1` and `−1` selects the
+orientation exactly, without reflecting the tree. The CPU arm tries both
+orientations and keeps the better one; the device arm probes both with two
+value passes at entry and keeps the orientation that lowers `1 − ρ`.
+Degenerate variance is still exactly `1.0`, and `--no-fit` moves nothing.
+
+The batched kernel runs the same fit (fit-only: the CPU scores every candidate,
+and every proposal passes an exact `f64` gate on the configured objective, never
+on SSE; a batch the measured cost model says a launch would lose on is
+declined). Measured on an RTX 3060 (`p = 3`, 8 iterations): the device fit is
+6.2× faster at 500 rows × 8 candidates and 39.3× at 50 000 × 64, while a single
+candidate on 500 or 2 000 rows is a 0.4×/0.9× loss. Against the exact CPU arm
+the median `1 − ρ` delta is `≤ 3e-13` and the device wins or ties on 48–64 of 64
+starts at 500–50 000 rows. **It is not dispatched from `--fit-strategy gpu`
+yet**: on a 15 000-row recorded cell (`pop = 100`, 20 generations) the deferred
+fit reached validation hypervolume 6.85 against 34.09 for the exact CPU arm,
+i.e. the device constants changed the search trajectory for the worse even
+though the per-candidate fit is competitive. Until that is understood and gated,
+an explicit `gpu` with a correlation metric is refused with the numbers in the
+message (issue #225).
 
 Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
 and writes a trial back only when the configured loss improves. `squared`
@@ -950,15 +977,16 @@ admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
-`non_finite`, `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+`non_finite`, `launch`, `rank_declined`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family, and
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, accepted only when the configured loss improves and gated by a
 scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
-An explicit `gpu` with any other metric is a usage error (exit 2) naming
-`--metric squared`, `--metric log_squashed` or a CPU strategy (exact, auto,
-linear, varpro, stream), never a silent CPU fit of a different objective
-(#223). Every finalist is refit exactly on all training rows in CPU f64 *for
+An explicit `gpu` with any other metric is a usage
+error (exit 2) naming `--metric squared`, `--metric log_squashed`, a rank
+metric or a CPU strategy (exact, auto, linear, varpro, stream), never a silent
+CPU fit of a different objective (#223). The correlation metrics are refused
+for a second, measured reason in the next paragraph. Every finalist is refit exactly on all training rows in CPU f64 *for
 the configured metric* before it is scored and reported, so reported constants
 and metrics never come from f32. The arm is opt-in and saved in checkpoints;
 `exact` remains the default, bit for bit.
