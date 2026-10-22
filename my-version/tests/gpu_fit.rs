@@ -45,11 +45,12 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236: the CUDA evaluator accumulates squared error. A non-squared metric
-/// must never be handed to it, or a slope/absolute/rank run is silently ranked
-/// by MSE. This test pins the correctness gate, not a performance choice.
+/// #236 / #229: the CUDA evaluator accumulates one objective. A metric whose
+/// objective the kernel does not compute must never be handed to it, or a
+/// slope/absolute/rank run is silently ranked by MSE. `squared` and
+/// `log_squashed` (native since #229) are the two exceptions.
 #[test]
-fn non_squared_metrics_never_use_the_gpu_evaluator() {
+fn non_native_metrics_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
     let metrics = [
         Metric::Absolute,
@@ -58,7 +59,6 @@ fn non_squared_metrics_never_use_the_gpu_evaluator() {
         Metric::Median,
         Metric::Maximum,
         Metric::Signed,
-        Metric::LogSquashed,
         Metric::RankCorrelation,
         Metric::RankCorrelationSigned,
         Metric::Interquartile,
@@ -81,9 +81,65 @@ fn non_squared_metrics_never_use_the_gpu_evaluator() {
         assert_eq!(
             search::effective_backend(&cfg, &s),
             Backend::Cpu,
-            "{metric:?} must not be scored by the squared-error GPU evaluator"
+            "{metric:?} must not be scored by a GPU evaluator without its objective"
+        );
+        assert_eq!(
+            rcsr::fit::DeviceLoss::for_metric(metric),
+            None,
+            "{metric:?} has no native device objective"
         );
     }
+}
+
+/// #229: `log_squashed` has a native device objective, so the fit kernel may
+/// minimise it. The evaluator gate itself is CUDA-only and tested below.
+#[test]
+fn log_squashed_has_a_native_objective() {
+    assert_eq!(
+        rcsr::fit::DeviceLoss::for_metric(Metric::LogSquashed),
+        Some(rcsr::fit::DeviceLoss::LogSquashed)
+    );
+    assert_eq!(
+        rcsr::fit::fit_loss(Metric::LogSquashed),
+        Some(rcsr::fit::DeviceLoss::LogSquashed)
+    );
+    // The information criteria fit by least squares and stay on the squared
+    // objective; they are still gated off the evaluator (parameter-aware).
+    assert_eq!(
+        rcsr::fit::fit_loss(Metric::Aic),
+        Some(rcsr::fit::DeviceLoss::Squared)
+    );
+    assert_eq!(
+        rcsr::fit::DeviceLoss::for_metric(Metric::Aic),
+        None,
+        "AIC is not a squared objective for ranking"
+    );
+    // Weighted rows keep the CPU: the kernel weighs its normal equations, but
+    // the evaluator has no per-row weight array, so a weighted run would be
+    // ranked on unweighted loss. The cause is labelled, never silent.
+    let mut weighted = sample(64, 7);
+    weighted.w = vec![1.0; weighted.len()];
+    let wcfg = Config {
+        gpu: true,
+        metric: Metric::LogSquashed,
+        ..Default::default()
+    };
+    assert_eq!(search::effective_backend(&wcfg, &weighted), Backend::Cpu);
+}
+
+/// #229: with the native `Σ ln(1+r²)` scorer in the evaluator, a
+/// `log_squashed` run is admitted to the device; before #229 it was refused
+/// because the evaluator would have ranked it by MSE.
+#[cfg(feature = "cuda")]
+#[test]
+fn log_squashed_is_admitted_to_the_gpu_evaluator() {
+    let s = sample(64, 7);
+    let cfg = Config {
+        gpu: true,
+        metric: Metric::LogSquashed,
+        ..Default::default()
+    };
+    assert_eq!(search::effective_backend(&cfg, &s), Backend::Gpu);
 }
 
 #[cfg(feature = "cuda")]
@@ -311,6 +367,215 @@ fn admission_fits_only_the_promoted_fraction() {
     assert_fit_ledger(g);
 }
 
+/// #229: rows with gross outliers, so `log_squashed` and `squared` disagree
+/// about which model is good.
+fn sample_with_outliers(n: usize, seed: u32) -> Sample {
+    let mut s = sample(n, seed);
+    for i in (4..n).step_by(10) {
+        s.y[i] += 30.0 * (1.0 + (i % 3) as f64);
+    }
+    s
+}
+
+/// #229: a `log_squashed` run uses the batched IRLS fit kernel, ranks on
+/// `mean ln(1+r²)` natively, is bit-deterministic for a fixed seed, and every
+/// reported number is the exact CPU `f64` score of the stored tree.
+#[cfg(feature = "cuda")]
+#[test]
+fn log_squashed_gpu_fit_runs_natively_and_reports_exact_f64() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample_with_outliers(240, 41);
+    let test = sample(60, 42);
+    let cfg = Config {
+        generations: 4,
+        metric: Metric::LogSquashed,
+        ..gpu_config(43)
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.test_errors, b.test_errors);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(
+        g.fit_gpu > 0,
+        "the log-squashed fit kernel must actually run: {:?}",
+        g
+    );
+    assert_fit_ledger(g);
+    // Reported train errors are the exact CPU f64 configured loss, bit for bit.
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::LogSquashed);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "archive row is not the exact CPU log_squashed score: {} vs {}",
+            s.error,
+            cpu
+        );
+        assert!(s.error.is_finite());
+    }
+    // The archive is rebuilt and res-cored on the CPU in f64; a robust run is
+    // therefore never reported from f32 kernel values.
+    assert!(a
+        .archive
+        .items
+        .iter()
+        .all(|s| s.error.is_finite() && s.cost >= 1.0));
+}
+
+/// #229: `--no-fit` (`--fit-iters 0`) must not dispatch the fit kernel at all,
+/// for a robust run exactly as for a squared one.
+#[cfg(feature = "cuda")]
+#[test]
+fn log_squashed_gpu_no_fit_is_a_true_noop() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let train = sample_with_outliers(240, 51);
+    let test = sample(60, 52);
+    let cfg = Config {
+        fit_iters: 0,
+        metric: Metric::LogSquashed,
+        ..gpu_config(53)
+    };
+    let out = search::run(&cfg, &train, &test);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert_eq!(g.fit_attempts, 0, "no fit may be attempted: {:?}", g);
+    assert_eq!(g.fit_gpu, 0);
+    assert_eq!(g.fit_screened, 0, "admission must not run without a fit: {:?}", g);
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::LogSquashed);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
+}
+
+/// #228: the CUDA LM kernel is a warm start for `--metric signed`; the exact
+/// `f64` constrained-LS projection completed on the host is what decides. The
+/// arm must reach the same constants as the CPU arm (both are on the
+/// zero-bias manifold) and must be deterministic.
+///
+/// A projection moves constants onto `Σ wᵢ rᵢ = 0` and therefore *raises* SSE,
+/// so this also proves the gate is metric-aware: a squared-SSE gate would
+/// reject the projection by construction.
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_arm_projects_the_device_proposal_exactly() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    use rcsr::fit::{fit_batch_verified, fit_weighted_metric, BatchStatus, BatchedGpu};
+    use rcsr::metrics::score_weighted;
+
+    // Two variables with an intercept: the squared LM gets close, the
+    // projection finishes the job in exact f64.
+    let s = sample(512, 5);
+    let x = s.x.clone();
+    let y = s.y.clone();
+    let n = y.len();
+    let nv = x[0].len();
+    let cols: Vec<f32> = (0..nv)
+        .flat_map(|v| x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let mut cols64 = vec![0.0f64; n * nv];
+    for (r, row) in x.iter().enumerate() {
+        for (v, &val) in row.iter().enumerate().take(nv) {
+            cols64[v * n + r] = val;
+        }
+    }
+    let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
+        Some(ev) => ev,
+        None => {
+            eprintln!("skipping GPU test: evaluator construction failed");
+            return;
+        }
+    };
+    assert!(
+        ev.set_fit_data(&cols64, &y, &[]),
+        "f64 fit rows uploaded"
+    );
+
+    let model = || {
+        rcsr::expr::node(
+            rcsr::expr::Op::Add,
+            vec![
+                rcsr::expr::node(
+                    rcsr::expr::Op::Mul,
+                    vec![rcsr::expr::constant(1.0), rcsr::expr::input(0)],
+                ),
+                rcsr::expr::constant(0.0),
+            ],
+        )
+    };
+    let objective = |t: &rcsr::expr::Node| {
+        let p: Vec<f64> = x.iter().map(|row| rcsr::expr::eval(t, row)).collect();
+        score_weighted(&p, &y, &[], Metric::Signed, rcsr::expr::count_constants(t))
+    };
+    let constants = |t: &rcsr::expr::Node| {
+        let mut out = Vec::new();
+        fn walk(n: &rcsr::expr::Node, out: &mut Vec<f64>) {
+            if n.op == rcsr::expr::Op::Const {
+                out.push(n.val);
+            }
+            for k in &n.kids {
+                walk(k, out);
+            }
+        }
+        walk(t, &mut out);
+        out
+    };
+
+    let mut batch = vec![model(), model()];
+    let backend = BatchedGpu::new(&mut ev);
+    let out = fit_batch_verified(&backend, &mut batch, &x, &y, &[], 8, Metric::Signed);
+    assert_eq!(
+        out.status,
+        vec![BatchStatus::Gpu, BatchStatus::Gpu],
+        "the device proposal must pass the signed gate"
+    );
+    // Each reported objective is the exact metric value at the final constants,
+    // at the f64 rounding scale of the bias: the intercept makes the optimum
+    // exactly 0 in exact arithmetic, not bit-identically in f64.
+    let scale = y.iter().fold(0.0f64, |m, v| m.max(v.abs())).max(1.0);
+    for (i, t) in batch.iter().enumerate() {
+        assert_eq!(out.score[i].to_bits(), objective(t).to_bits());
+        assert!(
+            out.score[i] <= 1e-14 * scale,
+            "bias {:e} must be at the rounding scale",
+            out.score[i]
+        );
+    }
+    // Determinism: a second batch over fresh trees yields identical bits.
+    let mut again = vec![model(), model()];
+    let backend = BatchedGpu::new(&mut ev);
+    let out2 = fit_batch_verified(&backend, &mut again, &x, &y, &[], 8, Metric::Signed);
+    assert_eq!(
+        out.score.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        out2.score.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(constants(&batch[0]), constants(&again[0]));
+
+    // CPU parity: the exact arm from the same start reaches the same objective
+    // (the two constant sets may differ by f32 row rounding of the warm start,
+    // which the exact projection then removes).
+    let mut cpu = model();
+    let cpu_value = fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Signed);
+    assert!(cpu_value <= 1e-14 * scale, "cpu bias {cpu_value:e}");
+    let (a, b) = (constants(&batch[0]), constants(&cpu));
+    for (ca, cb) in a.iter().zip(&b) {
+        assert!(
+            (ca - cb).abs() <= 1e-5 * (1.0 + cb.abs()),
+            "constant {ca} vs CPU {cb}"
+        );
+    }
+}
+
 /// #169 measurement (ignored): end-to-end wall time of a fit-heavy
 /// configuration on the CPU exact arm versus the GPU-fit arm.
 /// Run with `cargo test --release --features cuda --test gpu_fit bench_end_to_end -- --ignored --nocapture`.
@@ -383,7 +648,17 @@ fn bench_end_to_end() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
-    let train = sample(n, 21);
+    // #229: the same paired measurement for the robust arm. The metric decides
+    // both the objective the kernel fits and the one the evaluator ranks on.
+    let metric = match std::env::var("RCSR_BENCH_METRIC").as_deref() {
+        Ok("log_squashed") | Ok("log-squashed") | Ok("log") => Metric::LogSquashed,
+        _ => Metric::Squared,
+    };
+    let train = if metric == Metric::LogSquashed {
+        sample_with_outliers(n, 21)
+    } else {
+        sample(n, 21)
+    };
     let test = sample(1_000, 22);
     // The feasibility note's pinned cell: fit-heavy, no screening, a smooth
     // always-finite operator set so most random candidates are eligible for
@@ -396,7 +671,7 @@ fn bench_end_to_end() {
         pop,
         max_complexity: 14,
         fit_iters,
-        metric: Metric::Squared,
+        metric,
         fit_samples: 0,
         predictor_samples: None,
         ops: vec![Op::Add, Op::Sub, Op::Mul, Op::Sin, Op::Cos, Op::Tanh, Op::Gauss, Op::Square, Op::Cube, Op::Neg],
@@ -469,8 +744,9 @@ fn bench_end_to_end() {
             .map(|s| s.error)
             .fold(f64::INFINITY, f64::min);
         eprintln!(
-            "arm={} N={} evals={} wall={:.2}s best={:.6e}",
+            "arm={} metric={} N={} evals={} wall={:.2}s best={:.6e}",
             name,
+            metric.name(),
             n,
             base.generations * base.islands * base.pop,
             wall,
@@ -563,5 +839,119 @@ fn bench_end_to_end() {
             .map(|h| format!("gen {} / {:.1}s", h.0, h.2))
             .unwrap_or_else(|| "not reached".to_string());
         eprintln!("control: arm={} hypervolume={:.6} ttt={}", name, hv, ttt);
+    }
+}
+
+// ---------------------------------------------------------------- #223 ------
+//
+// The GPU LM kernel minimises weighted squared error only. An explicit
+// `--fit-strategy gpu` with any other metric must be a usage error naming the
+// cause and the two ways out, never a silent CPU fallback that optimises a
+// different objective. These tests run the real binary so the exit code and the
+// message are what a user sees.
+
+fn rcsr(args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run rcsr")
+}
+
+/// Every metric without a device fit objective is refused with exit 2 and a
+/// message that names what the GPU arms minimise and every way out. #229 admits
+/// `log_squashed` because the kernel now fits it and #230 admits the rank
+/// family through the exact rank polish (a fit-only arm), so the refused set is
+/// the complement of `fit_loss ∪ rank_fit_only`. Iterating over `Metric::all()`
+/// means a future metric cannot inherit the old silent path.
+#[test]
+fn explicit_gpu_outside_the_native_objectives_is_a_usage_error() {
+    let refused: Vec<&str> = Metric::all()
+        .iter()
+        .filter(|m| {
+            rcsr::fit::fit_loss(**m).is_none() && rcsr::fit::rank_fit_only(**m).is_none()
+        })
+        .map(|m| m.name())
+        .collect();
+    assert!(
+        refused.contains(&"absolute") && !refused.contains(&"rank_correlation"),
+        "the device-fit family changed unexpectedly: {refused:?}"
+    );
+    assert!(
+        !refused.contains(&"log_squashed"),
+        "log_squashed is fitted by the kernel since #229 and must not be refused"
+    );
+    assert!(
+        !refused.contains(&"rank_correlation") && !refused.contains(&"rank_correlation_signed"),
+        "the rank family is fitted by the exact polish since #230 and must not be refused"
+    );
+    for metric in refused {
+        // `--implicit` metrics are refused earlier (by #14) when it is missing;
+        // with it, the GPU refusal is the one that must fire.
+        let implicit = Metric::parse(metric).is_implicit();
+        let mut args = vec![
+            "--data", "-", "--target", "y", "--vars", "x", "--fit-strategy", "gpu",
+            "--metric", metric,
+        ];
+        if implicit {
+            args.push("--implicit");
+        }
+        let out = rcsr(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "--metric {metric}: {stderr}");
+        assert!(
+            stderr.contains(
+                "--fit-strategy gpu minimises squared error, log-squashed loss or the"
+            ),
+            "--metric {metric} must say what the GPU arms minimise: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("--metric {metric}")),
+            "--metric {metric} must name the metric it refused: {stderr}"
+        );
+        assert!(
+            stderr.contains("--metric squared"),
+            "--metric {metric} must offer --metric squared: {stderr}"
+        );
+        assert!(
+            stderr.contains("--fit-strategy exact, auto, linear, varpro or stream"),
+            "--metric {metric} must offer the CPU strategies: {stderr}"
+        );
+        assert!(
+            out.stdout.is_empty(),
+            "--metric {metric}: a refused run prints no solutions"
+        );
+    }
+}
+
+/// The gate must not over-fire. The four least-squares metrics and
+/// `log_squashed` pass the usage check with `gpu`, and every metric keeps every
+/// other strategy: each reaches the data loader, so the run fails on the missing
+/// file (exit 3) rather than on the fit strategy.
+#[test]
+fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
+    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
+        let out = rcsr(&[
+            "--data", "missing-223.csv", "--target", "y", "--vars", "x",
+            "--fit-strategy", "gpu", "--metric", metric,
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "--metric {metric}: {stderr}");
+        assert!(
+            !stderr.contains("minimises squared error or log-squashed loss only"),
+            "--metric {metric} is fitted by least squares and must be accepted: {stderr}"
+        );
+    }
+    for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
+        let out = rcsr(&[
+            "--data", "missing-223.csv", "--target", "y", "--vars", "x",
+            "--fit-strategy", strategy, "--metric", "absolute",
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "--fit-strategy {strategy}: {stderr}");
+        assert!(
+            !stderr.contains("minimises squared error or log-squashed loss only"),
+            "--fit-strategy {strategy} keeps metric-aware CPU fitting: {stderr}"
+        );
     }
 }

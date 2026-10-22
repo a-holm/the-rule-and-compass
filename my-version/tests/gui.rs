@@ -241,3 +241,41 @@ fn json_string(s: &str) -> String {
     out.push('"');
     out
 }
+
+/// #223: the web front end parses the same flags, so it must refuse the same
+/// contradiction. Silently fitting on the CPU would give the browser run a
+/// different objective from the one the request named. #229 makes
+/// `log_squashed` a native kernel objective, so it is accepted with `gpu`.
+#[test]
+fn the_web_front_end_refuses_explicit_gpu_outside_the_native_objectives() {
+    let args = |metric: &str| {
+        vec![
+            "--fit-strategy".to_string(),
+            "gpu".to_string(),
+            "--metric".to_string(),
+            metric.to_string(),
+        ]
+    };
+    for metric in ["squared", "aic", "aicc", "bic", "log_squashed"] {
+        assert!(
+            gui::parse_web_args_for_test(&args(metric)).is_ok(),
+            "--metric {metric} is fitted by least squares and must be accepted"
+        );
+    }
+    for metric in ["absolute", "median", "log_loss"] {
+        let err = gui::parse_web_args_for_test(&args(metric))
+            .expect_err(&format!("--metric {metric} must be refused"));
+        assert!(
+            err.contains("minimises squared error or log-squashed loss only"),
+            "--metric {metric}: {err}"
+        );
+        assert!(err.contains("--metric squared"), "--metric {metric}: {err}");
+    }
+    assert!(gui::parse_web_args_for_test(&[
+        "--fit-strategy".to_string(),
+        "exact".to_string(),
+        "--metric".to_string(),
+        "absolute".to_string(),
+    ])
+    .is_ok());
+}

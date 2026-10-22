@@ -177,6 +177,8 @@ both levels; the fields marked **full** only exist in a `full` log.
 | `version`, `commit`, `dirty` | binary version and git state (`manifest::git_info`) |
 | `binary_sha256` | SHA-256 of the running executable |
 | `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin) |
+| `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` full load, `false`/`N` explicit sample, `null` for a CSV |
+| `data.estimate_bytes` | #112: the memory estimate behind the load decision (`null` for a CSV) |
 | `data.train`, `data.test` | `rows` and the checkpoint `fingerprint` of each sample |
 | `config_hash` | FNV-1a of the canonical search configuration (#140) |
 | `config` | the full resolved configuration, key by key, from the same canonical text |

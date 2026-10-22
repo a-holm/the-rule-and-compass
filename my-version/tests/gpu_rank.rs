@@ -5,8 +5,9 @@
 //! tests pin the search contract:
 //!
 //! * `rank_correlation`/`rank_correlation_signed` may use the GPU **fit** arm
-//!   only when `--fit-strategy gpu` is requested; the fitness is still scored
-//!   by the CPU evaluator, so the population is never ranked by MSE;
+//!   only when `--fit-strategy gpu` is requested; it is a fit-only arm: the
+//!   backend stays `cpu`, the fitness is scored by the CPU evaluator, and the
+//!   population is never ranked by MSE;
 //! * reported errors are the exact CPU metric of the stored tree;
 //! * fixed seed/device is deterministic, and `--no-fit` is a true no-op;
 //! * every fallback is labelled and the ledger adds up.
@@ -80,7 +81,8 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
 }
 
 /// #230: the rank family is offered to the fit arm only when the user asked
-/// for the GPU fit strategy. Scoring stays on the CPU in every case.
+/// for the GPU fit strategy. Scoring stays on the CPU in every case, so the
+/// backend itself is reported as `cpu` even though the fit arm uses the device.
 #[test]
 fn rank_gpu_fit_is_opt_in_and_never_the_default() {
     let s = sample(96, 3);
@@ -92,7 +94,9 @@ fn rank_gpu_fit_is_opt_in_and_never_the_default() {
             ..Default::default()
         };
         assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
-        // `--fit-strategy gpu` with fitting enabled offers the arm.
+        // `--fit-strategy gpu` with fitting enabled offers the fit arm, but the
+        // evaluator has no native rank scorer yet, so the reported backend is
+        // still the CPU (native rank evaluation is open, #230).
         let cfg = Config {
             gpu: true,
             metric,
@@ -100,14 +104,7 @@ fn rank_gpu_fit_is_opt_in_and_never_the_default() {
             fit_iters: 4,
             ..Default::default()
         };
-        // `effective_backend` mirrors the capability gate (it does not probe
-        // for a device; a runtime failure falls back inside the search).
-        let expected = if cfg!(feature = "cuda") {
-            Backend::Gpu
-        } else {
-            Backend::Cpu
-        };
-        assert_eq!(search::effective_backend(&cfg, &s), expected);
+        assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
         // `--no-fit` has nothing to fit, so it stays on the CPU.
         let cfg = Config {
             gpu: true,
@@ -133,7 +130,9 @@ fn gpu_rank_run_is_deterministic_and_reports_the_exact_objective() {
         let cfg = rank_config(11, metric);
         let a = search::run(&cfg, &train, &test);
         let b = search::run(&cfg, &train, &test);
-        assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+        // Fit-only: the device moves constants, the CPU scores and reports.
+        assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
+        assert!(a.device.is_some(), "the fit arm used a device");
         assert_eq!(describe(&a), describe(&b), "{metric:?}: repeated seed differs");
         assert_eq!(a.test_errors, b.test_errors);
         let g = a.gpu.as_ref().expect("a GPU report");

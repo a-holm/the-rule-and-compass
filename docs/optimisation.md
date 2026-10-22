@@ -249,9 +249,23 @@ is mathematically well posed:
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
 | `auc`, `log_loss`, `hinge` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/`hinge` use the smooth logistic surrogate and the configured metric accepts or rejects each step |
-| `correlation`, `rank_correlation`, `signed`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
+| `signed` | squared fit, then a **constrained least-squares projection** onto the zero-mean-residual manifold in exact `f64` (see §3.0.1); the coordinate polish runs only when the projection is declined |
+| `correlation`, `correlation_signed` | exact analytic gradient and Gauss–Newton curvature of `ρ` with weighted centred moments; an affine-in-constants tree uses the closed-form weighted least-squares/rank-one GEVP optimum, and an outer `a·T+b` gauge is frozen and renormalised. Degenerate variance scores exactly `1.0` |
+| `rank_correlation`, `median`, `maximum`, `interquartile`, `slope` | squared fit, then a deterministic coordinate polish on the configured metric (no least-squares normal equations exist for rank/order statistics) |
 | `rank_correlation`, `rank_correlation_signed` with `--fit-strategy gpu` (#230) | the same squared start and the same polish on the device: segmented radix sort, exact integer rank sums, first-improver ladder; the fitness and the finalist refit stay on the CPU |
 | information criteria | least squares for the constants, with the parameter penalty applied at scoring time |
+
+The correlation family is no longer a squared fit plus polish (issue #224).
+For `ρ = S_fy / √(S_ff·S_yy)` the fit uses the exact gradient
+`∂ρ/∂c_j = B_j/√(S_ff S_yy) − ρ·A_j/S_ff` and the `y`-free Gauss–Newton matrix
+`H_jk = (C_jk − A_j A_k/S_ff)/S_ff`. A free `a·T+b` pair is an exact
+two-dimensional null space; the outer pair is frozen at `a = ±1, b = 0`, which
+removes it without losing a shape direction. A tree affine in every constant
+uses the closed-form weighted least-squares optimum (the rank-one GEVP), and a
+constant prediction or target scores exactly the metric's worst value `1.0`,
+matching `metrics::correlation`. The remaining polish metrics are monotone too:
+the squared pre-fit runs on a clone, so a polish that finds no improvement keeps
+the incoming constants.
 
 Every strategy is deterministic, uses the same adjoint/Jacobian and QR solve,
 and writes a trial back only when the configured loss improves. `squared`
@@ -260,6 +274,130 @@ SSE). The weighted normal equations now scale **both** the Jacobian and the
 residual by `sqrt(w)`; before this change the weighted fit mixed a weighted
 Jacobian with a half-weighted gradient, which is corrected as part of the same
 work.
+
+#### 3.0.1 Signed bias: a projection, not an optimiser (#228)
+
+`signed` scores `J₀(c) = |Σ wᵢ rᵢ| / Σ wᵢ`, the absolute weighted mean residual.
+It is a norm of an affine functional of the residual, and that has three
+consequences no optimiser can escape:
+
+1. **The optimal set is a manifold.** Wherever the weighted mean residual is
+   representable in the constants, `Σ wᵢ rᵢ = 0` is one equation in `p`
+   unknowns: the minimiser set is `p − 1` dimensional and every point of it is
+   a global minimum at value exactly 0.
+2. **The gradient carries no direction along it.** Away from the kink the
+   subgradient is the single vector `(σ/W)·Σ wᵢ gᵢ`; orthogonal to it the
+   objective is exactly flat, so first-order optimality certifies nothing.
+3. **Strict-improvement descent stops dead.** A polish that accepts only
+   `score < best` cannot move from 0 to 0, so it halts at the *first* manifold
+   point it reaches, and the constants it reports are an artefact of the
+   squared start.
+
+The arm therefore **constrains instead of optimising**. From the squared fit it
+solves
+
+```text
+min_δ  ‖W^{1/2}(r + Jδ)‖²      subject to   Σ wᵢ (rᵢ + gᵢᵀδ) = 0
+```
+
+through its KKT system, with two right-hand sides on the *same* SPD normal
+matrix `M = JᵀWJ` (`c = Σ wᵢ gᵢ`, `s = Σ wᵢ rᵢ`):
+
+```text
+[ M   c ] [ δ ]   [ −JᵀWr ]
+[ cᵀ  0 ] [ μ ] = [ −s    ]
+```
+
+```text
+δ = δ₀ − μ·M⁻¹c,   δ₀ = −M⁻¹JᵀWr,   μ = (s + cᵀδ₀) / (cᵀM⁻¹c)
+```
+
+That is one assembly pass, one undamped Cholesky factorisation and two
+substitutions — **two passes, no generic optimiser, no step-size search, no
+randomness**. On an affine tree (every constant enters linearly) the step is
+the exact constrained minimiser, so `|Σ wᵢ rᵢ|` lands at its `f64` rounding
+scale in one round; the second round exists only for nonlinear trees, where the
+constraint is linearised.
+
+**What "exact zero" means.** The objective is a sum, so the arm never claims
+bit-identical constants. It certifies `Projected` when the achieved objective is
+at or below `4·κ·u·(Σ wᵢ(|predᵢ|+|yᵢ|) + Σ wᵢ|rᵢ|) / Σ wᵢ`, where `u` is the
+`f64` unit roundoff and `κ` is the measured conditioning of the normal matrix
+(capped at `1e6`): every residual is a rounded difference of two `f64`
+magnitudes, and the constants themselves come from an `f64` solve. The numerator
+is accumulated with Neumaier compensation, so the `n`-term summation bound is
+not part of the floor. On the well-conditioned fixtures the certified bias is
+`~1e-16 · max|y|`; on a near-collinear design it is `κ` times larger, and if it
+cannot be certified at all the outcome is `not_converged` with the improved
+constants kept.
+
+**The degeneracy is reported, not hidden.** If no constant moves the mean —
+`Σ wᵢ gᵢ = 0`, or `c` outside the range of `M` — the projection cannot exist.
+The bias is then a property of the *shape*, and the arm declines, keeps the
+starting constants and labels the outcome `unidentifiable`; the objective it
+returns is the residual bias of the model, never a substituted loss. A singular
+normal matrix is labelled `ill_conditioned`, a non-finite weight, prediction,
+residual or derivative `non_finite`, a tree without constants `no_constants`,
+and a nonlinear tree that exhausts its rounds `not_converged`. The labels are
+counted by `--fit-report` (`# fit: signed projection [...]`) and are pinned in
+`tests/signed_gpu.rs`.
+
+**The tie-break, and why zero scores are not a bug.** Among zero-bias constant
+sets the arm returns the one closest to the squared fit in the `M` metric — for
+affine trees, exactly the least-squares optimum subject to zero bias. So the
+tie-break is *minimum SSE on the manifold*, it is closed-form, and it is
+reproducible. It is **not** a ranking signal: once several candidates sit at
+exactly 0, selection falls back to the deterministic complexity/parsimony order,
+as it always has for equal scores. Do not read a `signed` front as
+"discriminating" when the top of it is all zeros.
+
+**Weights.** The constraint is the *weighted* mean `Σ wᵢ rᵢ = 0` with the raw
+weights, matching `metrics::score_weighted`, and a zero-weight row is invisible
+to both the fit and the bias, so the weighted manifold is a different manifold
+from the unweighted one.
+
+**`--no-fit`.** `--fit-iters 0` (and `--no-fit`) returns before any arm runs:
+the constants are untouched and the reported value is the exact objective at
+the generated constants.
+
+**On the GPU.** The device's only role in this arm is the warm start: the
+batched LM kernel proposes constants, and the exact `f64` projection then
+completes them on the host and decides what is kept
+(`fit::fit_batch_verified(..., Metric::Signed)`). The gate is metric-aware — a proposal is accepted when
+the exact `|Σ wᵢ rᵢ| / Σ wᵢ` is finite and no worse than the start, never on SSE,
+because a projection onto the manifold *raises* SSE. A backend that answers a
+signed request with a squared proposal is declined by construction
+(`BatchedFitter::fit_batch_metric`), which is the difference between "the
+device cannot do this" and "the device quietly did something else".
+The search itself keeps `--metric signed` on the CPU evaluator: the CUDA
+evaluator has no native signed scorer yet (#236), and deferring only the *fit*
+to the device while offspring are ranked by MSE is precisely the silent
+substitution that gate prevents. On main this is already enforced up front:
+`--fit-strategy gpu --metric signed` is a usage error (`fit_loss(signed)` is
+`None`).
+
+**Measured (#228).** `cargo test --release --test signed_gpu signed_cost_model
+-- --ignored --nocapture`, `n = 20 000` rows, `--fit-iters 8`, on a shared
+development machine (indicative, not a quiet-box number). The old path is
+measured as a *proxy*: a metric that still runs the coordinate polish pays the
+same `min(iters,12)·p·6` full-row probes on the same tree, and `maximum` costs
+`O(n)` per probe exactly like `signed`.
+
+| p | squared fit | new signed arm | of which projection | polish proxy (old path) | arm vs old |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 17.2 ms | 22.9 ms | 4.7 ms | 44.5 ms | 1.9× |
+| 3 | 60.1 ms | 70.1 ms | 6.4 ms | 230.3 ms | 3.3× |
+| 4 | 110.1 ms | 125.3 ms | 11.2 ms | 824.6 ms | 6.6× |
+| 8 | 162.8 ms | 238.6 ms | 56.8 ms | 3 648.3 ms | 15.3× |
+
+Quality on the same fixtures: the arm never *worsens* the bias (exact
+dominance), it repaired a squared fit that left `5.85e-13` (p=2) to
+`1.28e-16`, and on the hardest fixture (p=8, near-collinear basis) it cut
+`4.37e-4` to `1.08e-8` and reported `not_converged` — two rounds were not
+enough, and the arm does not pretend otherwise. The polish proxy in that case
+cost 15× the whole arm and left the bias at `4.37e-4`.
+
+
 
 The fitted loss is reported in `--json` under `fitting` (`loss` names the
 objective, `value` is the best fitted training loss). A non-smooth metric whose
@@ -691,7 +829,11 @@ point and the exactness gate in `src/fit/gpu.rs`:
 
 `--fit-strategy gpu` without a batch backend (a direct call, a checkpoint
 resume, a non-CUDA build) uses the exact CPU arms and records the fallback; it
-is never a silent no-op. `--fit-report` prints GPU accepted/fallback/refit
+is never a silent no-op. A metric with no native device objective is a
+different matter: an explicit `--fit-strategy gpu` with it is refused as a usage
+error before the run (#223, #229), because the CPU arms would fit a different
+objective. The kernel's native objectives are squared/AIC (least squares) and
+`log_squashed` (weighted IRLS). `--fit-report` prints GPU accepted/fallback/refit
 counts and whether a CUDA build is present.
 
 #### Exactness and fallbacks
@@ -708,6 +850,7 @@ counts and whether a CUDA build is present.
 | non-finite, rank-deficient, ineligible, non-improving | exact LM, tree untouched, bit-identical |
 | streaming merge | block-size independent to `1e-9` relative; non-finite source rejects the arm |
 | GPU proposal | finite, right length, exact `f64` score no worse than the start; otherwise CPU fallback |
+| GPU scoring metric (#236) | the device sums squared error, so only `--metric squared` is ranked there; every other metric keeps the CPU evaluator, prints the label and records `backend_reason`, never a silent MSE ranking |
 
 `auto` is deterministic: it chooses by tree structure and size only, never by
 wall-clock timing, so a seed cannot change path between runs. For separable
@@ -806,11 +949,17 @@ useful proxy for the fitted ranking, so every candidate with constants is
 admitted instead: the 3.9M hourly cell lost its quality gate when only `pop/4`
 were fitted, while the batched kernel is still 17–25× faster per candidate, so
 full admission preserves both exact-arm coverage and a large speed-up. Every CPU fallback is labelled by cause (`unsupported_plan`,
-`too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
-`launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
-applies to the squared/AIC family (the kernel minimises squared error); other
-metrics keep their metric-aware CPU path. Every finalist is refit exactly on all
-training rows in CPU f64 before it is scored and reported, so reported constants
+`too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
+`non_finite`, `launch`) in `gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+applies to metrics with a native device objective: the squared/AIC family, and
+`log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
+accumulator, accepted only when the configured loss improves and gated by a
+scale-free `ln det Ã` test instead of the squared arm's Cholesky-diagonal ratio.
+An explicit `gpu` with any other metric is a usage error (exit 2) naming
+`--metric squared`, `--metric log_squashed` or a CPU strategy (exact, auto,
+linear, varpro, stream), never a silent CPU fit of a different objective
+(#223). Every finalist is refit exactly on all training rows in CPU f64 *for
+the configured metric* before it is scored and reported, so reported constants
 and metrics never come from f32. The arm is opt-in and saved in checkpoints;
 `exact` remains the default, bit for bit.
 

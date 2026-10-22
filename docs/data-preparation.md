@@ -274,6 +274,23 @@ transformation is active:
 `rows_filled` counts rows with at least one filled cell; `smoothed` counts
 cells replaced by a smoothing window.
 
+When the input is a `.rcsb` store the same object also carries the memory
+decision (issue #112): `store_memory` is the header-derived estimate with every
+term (`estimate_bytes`, `rows`, `columns`, `used_columns`, `scan_columns`,
+`storage_bytes`, `directory_bytes`, `group_buffer_bytes`, `search_bytes`,
+`fit_copy_bytes`, `fixed_bytes`, `slack_bytes`, `saturated`, `basis`),
+`full_rows` is `true` for a full load, `false` for an explicit `--sample-rows`
+sample and `null` for a CSV, and `sampled_rows` is the requested sample size.
+The text report prints the same basis:
+
+```
+# preparation: memory estimate 7826847852 B from store header: 3943856 rows x 56 columns (54 search + 2 scan used); basis: storage 1814179393 B + directory/group 30150456 B + search 3470593280 B + fit 0 B + fixed 946525440 B + slack 1565369571 B
+```
+
+A sampled run adds `# preparation: warning: full_rows=false; used an explicit
+N-row sample, not the full store`, so a sample can never be mistaken for the
+full data.
+
 ## Worked example
 
 `gap.csv` has eight rows and two gaps in `x`, one in the target. Train on the

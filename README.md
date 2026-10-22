@@ -27,15 +27,26 @@ affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
-device and labels every larger or unsupported candidate for the exact CPU arm;
+device — least squares for the squared/AIC family, IRLS for `log_squashed`
+(#229), and the exact correlation objective with a frozen affine gauge
+(#224) — and labels every larger or unsupported candidate for the exact CPU
+arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
-constants, so the seed-constant screen cannot cost quality at large `N`; for
-`rank_correlation` it also runs the exact integer rank polish on the device,
-with the fitness and the finalist refit still on the CPU) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+constants, so the seed-constant screen cannot cost quality at large `N`) can be
+forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+the same arm fits the exact integer rank polish on the device (fit-only: the
+fitness and the finalist refit stay on the CPU, because native rank scoring is
+still open). An explicit `gpu` with a metric that has no device fit objective is
+a usage error, because the kernel would otherwise fit a different loss; use
+`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+Every arm falls back to the default LM path when it cannot prove a safe result,
+and the default remains the historical LM path bit for bit. `--metric signed`
+(the absolute mean residual) is the one non-squared metric with an exact closed
+form: its constants are projected in f64 onto the zero-mean-residual manifold by
+a constrained least-squares step (two passes, no optimiser), and when no
+constant can move the mean the arm says so instead of fabricating a fit — see
+[`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
 for a plain-language walkthrough,
@@ -332,15 +343,22 @@ atomically instead of streaming it. See
   echoed in the output.
 * **Bounded time**: `--time-budget <seconds>` guarantees the process returns.
 * **stdin**: `--data -` reads the table from standard input.
-* **Bounded memory**: `--max-memory 2GB` refuses a CSV whose measured footprint
-  (rows × columns plus preparation, calibrated on 6- and 90-column runs, not a
-  multiple of the file size) would exceed the budget, with exit 3 and a fix,
-  instead of being SIGABRT/SIGKILL'ed. The estimate and its basis appear in the
-  preparation block. `rcsr import` writes a versioned `.rcsb` store (format v2: per-column
-  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time)
-  that can be scanned group by group and searched from a bounded hash sample
-  when it does not fit; v1 stores still load. See
-  [`docs/data-format.md`](docs/data-format.md).
+* **Bounded memory**: `--max-memory 2GB` refuses an input whose estimated
+  footprint would exceed the budget, with exit 3 and a fix, instead of being
+  SIGABRT/SIGKILL'ed. A CSV is estimated from its measured rows × columns plus
+  preparation (calibrated on 6- and 90-column runs, never a multiple of the file
+  size). A `.rcsb` store is estimated exactly from its header: resident dtypes
+  (values only for numeric columns, the extra `i64` copy, 4-byte codes),
+  dictionaries, row groups, the used-column projection and GPU/fit copies, plus
+  25 % slack. The full rows load whenever that fits — on the 3.9M × 56 panel the
+  estimate is 7.83 GB against a 7.26 GB measured peak, instead of the old
+  61.71 GiB that produced a 577k-row sample. A store that does not fit is
+  refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
+  `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
+  the preparation block, manifest and dev log. `rcsr
+  import` writes a versioned `.rcsb` store (format v2: per-column
+  `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
+  v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).
 * **Market data as a typed layer**: `rcsr::ohlcv` resamples OHLCV exactly
   (open=first, high=max, low=min, close=last, flows summed), keeps gaps and
   flags zero-volume/partial bars, understands crypto 24/7 and NYSE/LSE
@@ -433,7 +451,7 @@ split made visible on the grid, and a "Copy as CLI" action on every search.
 
 ```
 rcsr --data <file|-> --target <col> [--vars a,b,..]
-     [--max-memory size] [--force] [--skip-malformed]
+     [--max-memory size] [--force] [--sample-rows N] [--skip-malformed]
      [--dtype col=continuous|boolean|categorical,..] [--max-levels N]
      [--weight col]
      [--metric <name>] [--generations N] [--islands I]
@@ -877,15 +895,26 @@ affine in every constant, variable projection (Golub–Pereyra) when it is
 separable, and the historical LM path for everything else. `varpro`, `stream`
 (out-of-core f64 sufficient statistics) and `gpu` (the #169 batched kernel with
 an exact CPU verifier, which fits candidates with at most 20 constants on the
-device and labels every larger or unsupported candidate for the exact CPU arm;
+device — least squares for the squared/AIC family, IRLS for `log_squashed`
+(#229), and the exact correlation objective with a frozen affine gauge
+(#224) — and labels every larger or unsupported candidate for the exact CPU
+arm; the correlation *scorer* remains CPU-side under the #236 gate;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
-constants, so the seed-constant screen cannot cost quality at large `N`; for
-`rank_correlation` it also runs the exact integer rank polish on the device,
-with the fitness and the finalist refit still on the CPU) can be
-forced individually. Every arm falls back to the
-default LM path when it cannot prove a safe result, and the default remains the
-historical LM path bit for bit.
+constants, so the seed-constant screen cannot cost quality at large `N`) can be
+forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+the same arm fits the exact integer rank polish on the device (fit-only: the
+fitness and the finalist refit stay on the CPU, because native rank scoring is
+still open). An explicit `gpu` with a metric that has no device fit objective is
+a usage error, because the kernel would otherwise fit a different loss; use
+`--metric squared`, `--metric log_squashed`, a rank metric or a CPU strategy.
+Every arm falls back to the default LM path when it cannot prove a safe result,
+and the default remains the historical LM path bit for bit. `--metric signed`
+(the absolute mean residual) is the one non-squared metric with an exact closed
+form: its constants are projected in f64 onto the zero-mean-residual manifold by
+a constrained least-squares step (two passes, no optimiser), and when no
+constant can move the mean the arm says so instead of fabricating a fit — see
+[`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for
   `mod`/`min`/`max` and `and`/`or`/`xor`; `0` a.e. for the piecewise-constant
@@ -978,18 +1007,28 @@ numbers and the hardware plan.
 ## Backends: GPU by default when available
 
 A binary built with `--features cuda` probes the device once at startup and uses
-the GPU to guide the search whenever one is available; a build without the
-feature, or a machine with no usable device, falls back to the CPU and records
-the reason. `--gpu` asserts that a device must exist (exit 2 otherwise),
-`--no-gpu`/`--cpu` forces the CPU, and `RCSR_GPU=0` simulates a missing device.
-Non-quiet runs print one resource line with the backend, device, available
-threads and training rows/columns, and `--json` records `backend`,
-`backend_reason` and `device`.
+the GPU to guide the search whenever one is available **and the run's metric is
+scored on the device**; a build without the feature, or a machine with no usable
+device, falls back to the CPU and records the reason. `--gpu` asserts that a
+device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
+`RCSR_GPU=0` simulates a missing device. Non-quiet runs print one resource line
+with the backend, device, available threads and training rows/columns, and
+`--json` records `backend`, `backend_reason` and `device`.
+
+The kernel ranks candidates by **squared error**, so only `--metric squared` is
+scored on the device. Every other metric — including the default `absolute` —
+keeps the CPU evaluator, prints `# gpu: off (metric is not scored natively on
+the GPU)` and records that cause in `backend_reason`; a device run is never
+ranked by a substitute loss. Native device scoring for the other objectives is
+tracked in #236–#238.
 
 Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
 change the search trajectory. Reported metrics, constants and diagnostics are
 always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. A GPU run also reports a measured `gpu` block (allocation, H2D,
+reproduction. A metric may use the GPU only when the kernel computes its
+objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
+every other metric is scored on the CPU, so no run is ever ranked by a proxy
+loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
 launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See
