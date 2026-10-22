@@ -400,24 +400,31 @@ Each generation then runs as:
    generation, all islands included;
 3. selection, migration and restart decisions consume the returned fitness.
 
-The GPU never produces a number a user reads. The kernel sums squared errors;
-the search divides that by the row count and uses it as a mean-squared fitness.
-That is exact only for `--metric squared`. Every other metric is scored by the
-CPU evaluator: the kernel has no MAE, rank, minimax, correlation, slope or
-classification objective, and using MSE as a ranking proxy silently changes the
-search (`--metric slope` was observed to select a different Pareto point). At
-the end `full_data_archive` re-scores the surviving trees on the full training
-sample with the CPU evaluator in `f64`, and the reported train/test errors,
-Pareto front and convergence statistics come from that rebuild. Constants stay
-on the CPU and in `f64` throughout.
+The GPU never produces a number a user reads. The kernel accumulates one
+**configured objective** per row; the search divides that by the row count and
+uses it as the fitness. Today the device has two native objectives:
 
-The GPU path is used for single-output, unweighted, full-sample
-`--metric squared` runs. Multi-output (`--target y1,y2`), `--weight`, every
-non-squared metric (including implicit, classification, correlation, rank,
+| `--metric` | device objective per row | status |
+|---|---|---|
+| `squared` | `r²` | exact objective (up to `f32`) |
+| `log_squashed` | `ln(1 + r²)` | exact objective (up to `f32`), #229 |
+
+Every other metric is scored by the CPU evaluator: the kernel has no MAE, rank,
+minimax, correlation, slope or classification objective, and using MSE as a
+ranking proxy silently changes the search (`--metric slope` was observed to
+select a different Pareto point, #236). At the end `full_data_archive`
+re-scores the surviving trees on the full training sample with the CPU
+evaluator in `f64`, and the reported train/test errors, Pareto front and
+convergence statistics come from that rebuild. Constants stay on the CPU and in
+`f64` throughout.
+
+The GPU path is used for single-output, unweighted, full-sample runs whose
+metric is in the table above. Multi-output (`--target y1,y2`), `--weight`,
+every other metric (including implicit, classification, correlation, rank,
 slope and AIC/AICc/BIC) and `--predictor-samples` keep the CPU evaluator,
-because they need more than one prediction per row, a different objective, or a
-different set of rows every generation; the reason is printed in the one-line
-note.
+because they need more than one prediction per row, a different objective, a
+per-row weight array the evaluator does not carry, or a different set of rows
+every generation; the reason is printed in the one-line note.
 
 Fallback and the flags:
 
@@ -802,9 +809,9 @@ one CUDA block per candidate:
 
 **Two instantiations.** The kernel is compiled twice and dispatched on the
 batch's largest constant count. `p <= 16` keeps the 256-thread block and 256-row
-chunk it was measured with (about 39.7 KB of shared memory); `17 <= p <= 20`
-uses a 128-thread block and a 128-row chunk (about 38.1 KB). Both fit two blocks
-per SM on `sm_86`. The larger alternative — 20 constants with a 256-row chunk —
+chunk it was measured with (now 43 744 B of shared memory: #229 added the f64
+per-row loss buffers); `17 <= p <= 20` uses a 128-thread block and a 128-row
+chunk (41 040 B). Both fit two blocks per SM on `sm_86`. The larger alternative — 20 constants with a 256-row chunk —
 needs about 50.8 KB, past the 48 KB static ceiling and only one block per SM, so
 the shared block is dynamic (`extern __shared__`) and the opt-in limit is raised
 once with `cudaFuncSetAttribute`; it is measured below. A block narrower than
@@ -817,14 +824,16 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 `p = 17..20`.
 
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
-only for the squared/AIC family, with `p <= 20`, at most 96 flattened nodes, no
+only for a metric with a native device objective (squared/AIC family, and
+`log_squashed` since #229), with `p <= 20`, at most 96 flattened nodes, no
 shared block constants, an analytic derivative for every operator, and at least
-`32p` rows. The family is also a **CLI contract** (#223): an explicit
-`--fit-strategy gpu` with any metric outside `squared`, `aic`, `aicc` and `bic`
-is a usage error (exit code `2`) raised before any data is read, because the
-only alternative would be a silent CPU fit of a different objective. The
-message names the kernel's objective and both fixes (--metric squared, or a
-CPU fit strategy). The device-missing fallback below is unchanged: it never
+`32p` rows. The device objective is also a **CLI contract** (#223, extended by
+#229): an explicit `--fit-strategy gpu` with any metric *without* a native
+device objective — that is, outside `squared`, `aic`, `aicc`, `bic` and
+`log_squashed` — is a usage error (exit code `2`) raised before any data is
+read, because the only alternative would be a silent CPU fit of a different
+objective. The message names the two objectives the kernel minimises and every
+way out (`--metric squared`, `--metric log_squashed`, or a CPU fit strategy). The device-missing fallback below is unchanged: it never
 claims the GPU arm and is recorded with its cause.
 
 The arm also screens before it fits: every unfitted offspring is
@@ -848,8 +857,8 @@ The kernel returns a status: `0` usable, `1` ill-conditioned or rank-deficient
 trees and a failed launch are refit by the exact CPU arm, seeded with the GPU
 constants. Every CPU fallback is labelled by cause: `unsupported_plan`
 (no analytic derivative, too many nodes, shared block constants or no
-constants), `too_few_rows`, `too_many_constants` (`p > 20`), `ill_conditioned`,
-`non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
+constants), `too_few_rows`, `too_many_constants` (`p > 20`), `metric_not_native`,
+`ill_conditioned`, `non_finite` or `launch`. `--fit-report` and the `gpu.fit` JSON object count
 `screened`/`attempts`/`gpu`/`fallback`, the per-cause map, `refits`, the kernel
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
@@ -998,6 +1007,131 @@ and falls back.
 **Overlap.** The overlap pipeline (`--pipeline-depth`) is not combined with this
 arm yet: it scores a tree as soon as it is offered, before the barrier fit
 batch, so the GPU-fit path uses synchronous generation batches.
+
+### LogSquashed on the batched kernel (issue #229)
+
+`--metric log_squashed` minimises the mean `ln(1 + r²)` — the Cauchy/Lorentzian
+shape, Barron's robust loss at `α = 0`. It is non-convex and redescending: the
+true Gauss–Newton curvature `ρ″(r)JᵀJ` is indefinite once `|r| > 1`, and the
+loss has several local minima, so a fit is a *basin refinement*, not a global
+solve. The kernel therefore runs **weighted LM/IRLS** in the same block as the
+squared arm; nothing else in the scheduling changes.
+
+Per row, at the constants the pass already evaluates (`r = f(x) − y`, `w` the
+base `--weight`):
+
+```
+sc = w · 2/(1 + r²)          // MM/IRLS weight; 2 is ρ′(r)/r / (1/(1+r²))
+A += (√sc·g)(√sc·g)ᵀ ,  b += √sc·g · √sc·r
+loss += w · log1pf(r·r)      // ONE f64 add per row
+```
+
+* The weight enters only through the rank-one update, so `JᵀWJ` stays positive
+  semidefinite where the true Hessian is not. `ρ′/r = 2/(1 + r²)`; the CPU
+  `irls_fit` uses `1/(1 + r²)`, and the constant 2 cannot move the weighted
+  least-squares argmin.
+* The weight is refreshed **every sweep** (the CPU refreshes 4 times and then
+  solves once), which is closer to true majorise-minimise and costs `iters`
+  passes instead of about `2·iters`.
+* The step, damping law (`λ₀ = 1e-3`, `/8`, `×6`, `10⁹`, clamp ±1e6), and the
+  four undamped polish steps are the squared arm's, bit for bit.
+* `sw` is formed in f64 from the f32 residual, and the trial loss is an f64
+  sum in the existing single-owner, ascending-row reduction (no f64 atomics: an
+  atomic's order can flip an accept/reject, and that decision is part of the
+  trajectory). The per-row `ρ` uses the f32 `log1pf` (1 ULP); it is a
+  **comparator, never a reported number**.
+* A base `--weight` vector is uploaded with the f64 fit rows and multiplies the
+  IRLS weight. A zero-weight row is skipped before any arithmetic, so a masked
+  row cannot contribute `0 · inf = NaN`. Weighted **runs** still use the CPU
+  evaluator, because the evaluator has no per-row weight array and would rank
+  them on unweighted loss.
+
+**Gate.** The robust objective is native in both kernels: `eval_kernel` and
+`eval_pool_kernel` accumulate `Σ ln(1+r²)` and the host divides by the row
+count, so the search ranks a `log_squashed` run on exactly the configured
+objective. `gpu_blocker` admits a metric only when
+`fit::DeviceLoss::for_metric` names a native loss; `log_squashed` passes because
+of this scorer, and the #236 rule ("no proxy ranking") is unchanged.
+
+**Conditioning gate.** Robust weights make the normal equations badly *scaled*
+without making them ill-conditioned, so the squared arm's
+`hi/lo ≤ 10⁴` Cholesky-diagonal gate is replaced for `log_squashed` by the
+scale-free
+
+```
+ln det Ã = 2 Σ ln L_ii − Σ ln A_ii ,   Ã = D^{-1/2} A D^{-1/2}
+```
+
+which fails (status 1 → exact CPU refit) when the data no longer identifies the
+parameters (`ln det Ã < ln 1e-12`) and no longer uses the absolute `1e-18`
+pivot floor. Negative curvature of the true Hessian is **not** gated: `ρ″ < 0`
+at `|r| > 1` is a property of the objective, not a defect.
+
+**Verification and finalists.** `fit/gpu.rs` is metric-aware: a proposal is
+accepted only if it improves the *configured* loss (a robust proposal that
+makes SSE worse is exactly the case a squared gate would discard), and
+`refit_finalists_exact` uses `fit_weighted_metric`, which starts from
+`best = metric_score(tree)` and writes only improving trials. Reported numbers
+come from the CPU `f64` rebuild like every other metric.
+
+**Cost model.** Per accepted sweep the row cost is forward `m` nodes, adjoint
+`≈ 2.5m`, the `(p²+p)/2 + p + 1` statistic adds, plus for the robust arm one
+f64 divide (`2/(1+r²)`), one `sqrtf`, `p` extra multiplies and one f32 `log1p`
+plus one f64 add. On `sm_86` MUFU-class ops run at roughly 1/8 the FMA rate, so
+`log + rcp ≈ 12–16` FMA-equivalents: with `C(p) = 3 + (p²+p)/16` the relative
+per-row cost is ≈6× at `p = 1`, ≈3× at `p = 8`, ≈1.8× at `p = 16` and ≈1.5× at
+`p = 20`. Against the CPU the robust arm is *not* the expensive one: the CPU
+`log_squashed` fit runs ~4 IRLS rounds × 2 sweeps plus an 8-sweep final solve
+(≈16 passes plus scoring) against the squared arm's 8 + 4.
+
+**Fallback labels.** Every CPU fallback keeps a cause; the robust arm adds
+`metric_not_native` (a metric with no native loss reaching the fit path) beside
+`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`,
+`non_finite` and `launch`.
+
+**Measured (paired, RTX 3060, this host).** Fit stage, `N = 50 000` rows with a
+heavy-tailed target (10 % of rows at +15), 8 f64 iterations per candidate,
+`--fit-iters 8`, the exact CPU IRLS arm versus the whole GPU batch (upload +
+kernel + download) in one process:
+
+| p | P | CPU wall | GPU wall (kernel) | fit speed-up | no worse | endpoint mean loss |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 64 | 6.49 s | 0.189 s (0.188 s) | **34.4×** | 64/64 | 5.420539e-1 = CPU |
+| 8 | 64 | 12.14 s | 0.248 s (0.248 s) | **48.9×** | 64/64 | 5.420539e-1 = CPU |
+
+The squared arm on the same machine at the same time measured 41.8× (`p=4`),
+31.9× (`p=16`) and 31.9× (`p=20`) at `N = 100 000`, so the robust arm lands in
+the same band: the CPU pays the transcendental cost too, in ~16 IRLS/LM passes,
+against the kernel's 8 + 4. A repeat of the robust bench while the host was more
+loaded measured CPU 19.1 s / 27.7 s with the kernel unchanged at 0.191 s /
+0.221 s (96.6× / 124.9×) — device time is stable, the host arm follows host
+load. The 11 `ill_conditioned` candidates in the end-to-end run below are the
+only fallback cause observed; `metric_not_native` is 0 because the gate keeps
+such runs off the path.
+
+End to end (`bench_end_to_end` with `RCSR_BENCH_METRIC=log_squashed`,
+`N = 20 000`, `pop 64`, 2 islands, 3 generations, 384 evaluations, seed 9, both
+arms in one process):
+
+| arm | wall | best mean `ln(1+r²)` | hypervolume | TTT |
+|---|---:|---:|---:|---|
+| `exact` CPU | 8.90 s | 8.943851e-1 | 0.6353 | gen 1 / 1.7 s |
+| `gpu` + admission | **3.41 s** | **8.901082e-1** | **0.6616** | gen 1 / 0.5 s |
+
+**2.61×** end to end, with a 0.5 % lower best robust loss, a higher hypervolume
+and a 3.4× earlier time-to-target at equal evaluations. The arm screened 506
+offspring, admitted 252, fitted 241 on the device and sent 11 to the CPU
+(**4.4 %**, all `ill_conditioned`), then refit 127 finalists exactly in CPU f64.
+The fit stage was 1.02 s (30.0 % of wall; kernel 0.29 s) and kernel-time duty
+75.3 %. The device was shared with an active 10-hour production run and other
+test suites, so both walls are inflated; the arms are paired within one process.
+
+**Quality, limits.** On the convex affine fixture the GPU and CPU IRLS endpoints
+agree to all printed digits (mean loss bit-equal, 64/64 candidates). The
+non-convex risk the note pre-registered — the GPU landing in a different basin
+from the CPU on heavy tails — is asserted only per fixture
+(`gpu ≤ cpu × (1+1e-6)`), not measured over a corpus; graduated non-convexity
+for finalists is the follow-up.
 
 ## The DGX Spark path
 
@@ -1192,6 +1326,8 @@ substitute for either.
 | `sm_121` execution on a GB10 (device, driver, GPU tests, benchmark) | needs a dated session on `sm_121` hardware | **hardware-gated — not run here** |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
+| `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
+| `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 
 The compile gap is closed by the test and table above; it can be re-run on any
 machine with CUDA ≥ 12.9. The runtime gap needs a DGX Spark (or any `sm_121` +

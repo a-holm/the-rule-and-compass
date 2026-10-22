@@ -102,25 +102,76 @@ impl FitStrategy {
     }
 }
 
-/// #223: why an explicit `--fit-strategy gpu` cannot honour `metric`, or `None`
-/// when it can.
+/// #229: an objective a device kernel computes natively.
 ///
-/// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) accumulates and
-/// minimises weighted squared error only. Every metric outside
-/// [`Metric::is_least_squares`] fits on the CPU through IRLS, logistic IRLS or
+/// #236 closed the GPU evaluator to every non-squared metric because the
+/// kernel only summed squared error: a `slope`/`absolute`/`rank` run was
+/// silently ranked by MSE. A metric may use the device again only when this
+/// enum names its objective *and* the kernel accumulates exactly that
+/// objective. The discriminants are the `metric` argument of
+/// `rc_eval`/`rc_pool_eval`/`rc_fit_batch` in `src/cuda/eval.cu`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceLoss {
+    /// `Σ w·r²`.
+    Squared,
+    /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
+    LogSquashed,
+}
+
+impl DeviceLoss {
+    /// The `metric` code the CUDA entry points take.
+    pub fn code(self) -> i32 {
+        match self {
+            DeviceLoss::Squared => 0,
+            DeviceLoss::LogSquashed => 1,
+        }
+    }
+
+    /// The device objective for a metric, or `None` when the kernel cannot
+    /// score it.
+    pub fn for_metric(metric: Metric) -> Option<Self> {
+        match metric {
+            Metric::Squared => Some(DeviceLoss::Squared),
+            Metric::LogSquashed => Some(DeviceLoss::LogSquashed),
+            _ => None,
+        }
+    }
+}
+
+/// #229: the objective the **fit** kernel must minimise for a metric.
+///
+/// The information criteria fit by least squares and add their penalty when
+/// scoring, so they share the squared objective; `log_squashed` uses the
+/// robust arm. Everything else returns `None` and keeps the exact CPU fit.
+pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
+    match metric {
+        Metric::Aic | Metric::Aicc | Metric::Bic => Some(DeviceLoss::Squared),
+        m => DeviceLoss::for_metric(m),
+    }
+}
+
+/// #223 + #229: why an explicit `--fit-strategy gpu` cannot honour `metric`,
+/// or `None` when it can.
+///
+/// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) minimises one
+/// configured objective per launch: weighted squared error for the
+/// least-squares family, and `log_squashed` as weighted LM/IRLS since #229.
+/// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
 /// The CLI and the web front end turn this into a usage error before any data
-/// is read; the search's own dispatch requires the same predicate.
+/// is read; the search's own dispatch requires the same predicate, so the
+/// refusal and the dispatch can never disagree.
 pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
-    if metric.is_least_squares() {
+    if fit_loss(metric).is_some() {
         return None;
     }
     Some(format!(
-        "--fit-strategy gpu minimises squared error only, but --metric {} is not a \
-         least-squares objective, so the GPU LM cannot fit it. Use --metric squared \
-         (aic, aicc and bic also fit by least squares), or a CPU fit strategy: \
-         --fit-strategy exact, auto, linear, varpro or stream.",
+        "--fit-strategy gpu minimises squared error or log-squashed loss only, but \
+         --metric {} has no native device objective, so the GPU LM cannot fit it. \
+         Use --metric squared (aic, aicc and bic also fit by least squares) or \
+         --metric log_squashed, or a CPU fit strategy: --fit-strategy exact, auto, \
+         linear, varpro or stream.",
         metric.name()
     ))
 }
@@ -3515,21 +3566,22 @@ mod tests {
         assert!(!FitStrategy::Auto.defers_to_gpu());
     }
 
-    /// #223: an explicit GPU request is refused outside the least-squares
-    /// family, and the refusal says why and what to use instead. The
-    /// least-squares family is accepted, including `squared` and the three
-    /// information criteria.
+    /// #223 + #229: an explicit GPU request is refused for every metric without
+    /// a native device objective, and the refusal says why and what to use
+    /// instead. `squared`/`aic`/`aicc`/`bic` fit by least squares and
+    /// `log_squashed` fits by weighted IRLS on the device (#229), so both are
+    /// accepted.
     #[test]
     fn explicit_gpu_names_the_gpu_lm_and_a_way_out_for_other_metrics() {
         for m in Metric::all() {
             let why = gpu_fit_metric_error(*m);
-            if m.is_least_squares() {
+            if fit_loss(*m).is_some() {
                 assert!(why.is_none(), "{} must stay accepted", m.name());
                 continue;
             }
             let why = why.unwrap_or_else(|| panic!("{} must be refused", m.name()));
             assert!(
-                why.contains("minimises squared error only"),
+                why.contains("minimises squared error or log-squashed loss only"),
                 "the refusal must name the GPU LM's objective: {why}"
             );
             assert!(
@@ -3540,6 +3592,10 @@ mod tests {
                 why.contains("--metric squared"),
                 "the refusal must point at --metric squared: {why}"
             );
+            assert!(
+                why.contains("--metric log_squashed"),
+                "the refusal must point at the robust arm: {why}"
+            );
             for strategy in ["exact", "auto", "linear", "varpro", "stream"] {
                 assert!(
                     why.contains(strategy),
@@ -3547,6 +3603,10 @@ mod tests {
                 );
             }
         }
+        // The robust arm is native since #229: it must never be refused.
+        assert!(gpu_fit_metric_error(Metric::LogSquashed).is_none());
+        assert!(gpu_fit_metric_error(Metric::Squared).is_none());
+        assert!(gpu_fit_metric_error(Metric::Absolute).is_some());
     }
 
     #[test]

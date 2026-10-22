@@ -405,11 +405,14 @@ SEARCH:
                              best max(32,pop/4) per island below 1 048 576
                              training rows and every candidate with constants
                              at or above that size, then refits finalists
-                             exactly. Without a batch backend it uses the exact
-                             CPU arms (never a no-op). The kernel minimises
-                             squared error, so `gpu` with a metric outside
-                             squared/aic/aicc/bic is a usage error; use
-                             `--metric squared` or a CPU strategy
+                             exactly. It minimises the configured objective:
+                             squared/AIC least squares, or log_squashed with
+                             per-row IRLS weights (#229). Without a batch
+                             backend it uses the exact CPU arms (never a
+                             no-op). The kernel minimises one of those two
+                             objectives, so `gpu` with any other metric is a
+                             usage error; use `--metric squared`,
+                             `--metric log_squashed` or a CPU strategy
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit) at the
                              end of the run (diagnostics only)
@@ -446,12 +449,14 @@ SEARCH:
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
-                             the GPU automatically for --metric squared only:
-                             the kernel scores squared error, so every other
-                             metric (including the default absolute) runs on the
-                             CPU and prints the reason. Reported errors stay CPU
-                             f64, but f32 fitness can change the trajectory
-                             (cross-backend runs are not bit-identical). JSON
+                             the GPU automatically for --metric squared and
+                             --metric log_squashed: those are the objectives
+                             the kernel scores. Every other metric (including
+                             the default absolute) runs on the CPU and prints
+                             the reason, never with a proxy loss. Reported
+                             errors stay CPU f64. Cross-backend runs are
+                             not bit-identical because f32 fitness can change
+                             the trajectory. JSON
                              reports the measured kernel/sync/alloc/copy wall
                              and kernel-time duty; SM occupancy is null unless
                              measured separately with ncu
@@ -2212,9 +2217,10 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
-    // #223: an explicit `--fit-strategy gpu` asks for the batched GPU LM, which
-    // minimises squared error only. Refuse a metric from another family instead
-    // of silently fitting its constants on the CPU with a different objective.
+    // #223 + #229: an explicit `--fit-strategy gpu` asks for the batched GPU LM,
+    // which minimises squared error or log-squashed loss. Refuse a metric with
+    // no native device objective instead of silently fitting its constants on
+    // the CPU with a different objective.
     // The check runs before any data is read, so it is a usage error.
     if fit_strategy_set && cfg.fit_strategy == fit::FitStrategy::Gpu {
         if let Some(why) = fit::gpu_fit_metric_error(cfg.metric) {
