@@ -487,3 +487,11 @@ the input file is untouched. A duplicate name is refused unless `--replace` is
 explicit, in which case the numeric column keeps its schema position and its
 stale dictionary (if any) is dropped. The output is written to a temporary file
 next to `--out` and renamed into place.
+
+Every appended feature is part of the default financial feature registry printed
+by `rcsr schema` (`feature_registry`). The registry is the contract: each column
+records `family`, `timeframe`, `warmup`, `available`, `derived`, `formula`,
+`formula_sha256`, `source` and `pit`. Available columns have a tested
+implementation; unavailable columns name their missing data dependency and fail
+closed when requested. The compact 52-name profile is a regression subset of this
+registry, not a separate store format; see `docs/ohlcv.md`.

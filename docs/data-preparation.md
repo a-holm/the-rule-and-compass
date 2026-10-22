@@ -120,6 +120,14 @@ touches, so the run finishes with an empty Pareto front and `inf` baselines —
 which reads as "no structure found" when the real answer is "the data has
 gaps". Failing loudly names the problem and the fix.
 
+Feature columns produced by `rcsr enrich` follow a stricter rule than the search
+preparation fills above: a trailing window that spans a missing bucket, listing,
+delisting, migration or outage is `NaN`, and Wilder/EMA state restarts after the
+gap. Preparation `--fill` is a separate, explicit choice made later; it never
+changes the stored feature value or bridges a gap in the producer. The compact
+52-name profile follows the same rule, even where the historical compact builder
+used positional windows that bridged a hole.
+
 `--fill <method>` chooses what to do:
 
 | method | what happens | use when | do not use when |
