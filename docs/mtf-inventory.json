@@ -1,0 +1,335 @@
+{
+  "family": "mtf",
+  "timeframes": [
+    "1h",
+    "4h",
+    "1d"
+  ],
+  "count": 36,
+  "columns": [
+    {
+      "name": "mtf_1h_ret1",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 1,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-1} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/ret1]"
+    },
+    {
+      "name": "mtf_1h_ret4",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 4,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-4} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/ret4]"
+    },
+    {
+      "name": "mtf_1h_ret24",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 24,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-24} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/ret24]"
+    },
+    {
+      "name": "mtf_1h_ma_ratio",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/MA20_t - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/ma_ratio]"
+    },
+    {
+      "name": "mtf_1h_vol",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 20,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "population sd of one-bar simple returns over 20 bars",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/vol]"
+    },
+    {
+      "name": "mtf_1h_atr_pct",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "ATR14_t/C_t (Wilder)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/atr_pct]"
+    },
+    {
+      "name": "mtf_1h_rsi",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "RSI14_t/50 - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/rsi]"
+    },
+    {
+      "name": "mtf_1h_close_pos",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-L_t)/(H_t-L_t) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/close_pos]"
+    },
+    {
+      "name": "mtf_1h_donchian_pos",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-min L20)/(max H20-min L20) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/donchian_pos]"
+    },
+    {
+      "name": "mtf_1h_range_pct",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(H_t-L_t)/C_t",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/range_pct]"
+    },
+    {
+      "name": "mtf_1h_trend_slope",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 39,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "MA20_t/MA20_{t-20} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/trend_slope]"
+    },
+    {
+      "name": "mtf_1h_bar_age",
+      "family": "mtf",
+      "timeframe": "1h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "base_time - (higher.time + timeframe_seconds)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1h/bar_age]"
+    },
+    {
+      "name": "mtf_4h_ret1",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 1,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-1} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/ret1]"
+    },
+    {
+      "name": "mtf_4h_ret4",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 4,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-4} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/ret4]"
+    },
+    {
+      "name": "mtf_4h_ret24",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 24,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-24} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/ret24]"
+    },
+    {
+      "name": "mtf_4h_ma_ratio",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/MA20_t - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/ma_ratio]"
+    },
+    {
+      "name": "mtf_4h_vol",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 20,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "population sd of one-bar simple returns over 20 bars",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/vol]"
+    },
+    {
+      "name": "mtf_4h_atr_pct",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "ATR14_t/C_t (Wilder)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/atr_pct]"
+    },
+    {
+      "name": "mtf_4h_rsi",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "RSI14_t/50 - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/rsi]"
+    },
+    {
+      "name": "mtf_4h_close_pos",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-L_t)/(H_t-L_t) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/close_pos]"
+    },
+    {
+      "name": "mtf_4h_donchian_pos",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-min L20)/(max H20-min L20) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/donchian_pos]"
+    },
+    {
+      "name": "mtf_4h_range_pct",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(H_t-L_t)/C_t",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/range_pct]"
+    },
+    {
+      "name": "mtf_4h_trend_slope",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 39,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "MA20_t/MA20_{t-20} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/trend_slope]"
+    },
+    {
+      "name": "mtf_4h_bar_age",
+      "family": "mtf",
+      "timeframe": "4h",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "base_time - (higher.time + timeframe_seconds)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[4h/bar_age]"
+    },
+    {
+      "name": "mtf_1d_ret1",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 1,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-1} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/ret1]"
+    },
+    {
+      "name": "mtf_1d_ret4",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 4,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-4} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/ret4]"
+    },
+    {
+      "name": "mtf_1d_ret24",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 24,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/C_{t-24} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/ret24]"
+    },
+    {
+      "name": "mtf_1d_ma_ratio",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "C_t/MA20_t - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/ma_ratio]"
+    },
+    {
+      "name": "mtf_1d_vol",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 20,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "population sd of one-bar simple returns over 20 bars",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/vol]"
+    },
+    {
+      "name": "mtf_1d_atr_pct",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "ATR14_t/C_t (Wilder)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/atr_pct]"
+    },
+    {
+      "name": "mtf_1d_rsi",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 14,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "RSI14_t/50 - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/rsi]"
+    },
+    {
+      "name": "mtf_1d_close_pos",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-L_t)/(H_t-L_t) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/close_pos]"
+    },
+    {
+      "name": "mtf_1d_donchian_pos",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 19,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(C_t-min L20)/(max H20-min L20) - 0.5",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/donchian_pos]"
+    },
+    {
+      "name": "mtf_1d_range_pct",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "(H_t-L_t)/C_t",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/range_pct]"
+    },
+    {
+      "name": "mtf_1d_trend_slope",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 39,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "MA20_t/MA20_{t-20} - 1",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/trend_slope]"
+    },
+    {
+      "name": "mtf_1d_bar_age",
+      "family": "mtf",
+      "timeframe": "1d",
+      "warmup_bars": 0,
+      "pit": "higher.time + higher_tf.seconds() <= t; last closed higher bar only",
+      "formula": "base_time - (higher.time + timeframe_seconds)",
+      "test_id": "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars[1d/bar_age]"
+    }
+  ]
+}

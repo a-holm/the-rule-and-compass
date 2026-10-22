@@ -390,13 +390,15 @@ atomically instead of streaming it. See
   Windows are causal and gap-aware, warm-up is reported per column, and the
   `py15m` group reproduces the 35 Python enrichment columns on a committed
   parity fixture, the `compact` group emits the exact 52-column smoke/parity
-  subset at the 15 m base, and the `flow` group materialises `vwap` plus the
-  nine derived OHLCV/flow columns (taker ratios, trade intensity, average trade
+  subset at the 15 m base, the `flow` group materialises `vwap` plus the nine
+  derived OHLCV/flow columns (taker ratios, trade intensity, average trade
   size, Amihud illiquidity, zero-return share, OBV z-score, CVD proxy and VWAP
-  deviation) with the documented zero-volume/zero-trade and gap policies. The
-  default financial feature set is
-  registered in `rcsr schema` (`feature_registry`): every available column has a
-  tested producer, and registered-but-unavailable MTF, market-state and
+  deviation) with the documented zero-volume/zero-trade and gap policies, and
+  the `mtf` group emits all 36 multi-timeframe columns
+  (`mtf_<1h|4h|1d>_<leaf>`), joined only after the higher bar has closed with
+  explicit `bar_age` staleness. The default financial feature set is
+  registered in `rcsr schema` (`feature_registry`): every available column has
+  a tested producer, and registered-but-unavailable market-state and
   derivative columns fail closed with the missing dependency instead of being
   silently dropped. The CPU path is always available; a per-family cost model
   decides CPU vs GPU and records the reason, GPU builds upload the source
