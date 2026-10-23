@@ -785,6 +785,7 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
         candidates: Vec::new(),
+        band_select: false,
         pool_reset_flat: false,
         allow_lockbox: false,
     }
@@ -1091,4 +1092,330 @@ fn threshold_select_throughput_at_one_and_three_point_nine_million_rows() {
             sort_ns as f64 / exact_ns as f64
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// #308: banded finalist selection, tie-break and provenance
+// ---------------------------------------------------------------------------
+
+use rcsr::selection::{
+    exact_cmp, rescore_exact, select_band, BandCandidate, BandOptions, BandRows, ExactScore,
+};
+
+/// Deterministic synthetic panel for the 200-candidate band fixture.
+fn band_fixture(count: usize, rows: usize) -> (Vec<f64>, Vec<f64>, Vec<u64>, Vec<Vec<f64>>) {
+    let returns: Vec<f64> = (0..rows)
+        .map(|i| {
+            let x = i as f64;
+            (x * 0.37).sin() * 0.01 + if i % 7 == 0 { -0.004 } else { 0.001 }
+        })
+        .collect();
+    let times: Vec<f64> = (0..rows).map(|i| i as f64).collect();
+    let groups: Vec<u64> = vec![0; rows];
+    let scores: Vec<Vec<f64>> = (0..count)
+        .map(|c| {
+            (0..rows)
+                .map(|i| {
+                    let x = i as f64;
+                    (x * 0.013 * (c as f64 + 1.0)).sin()
+                })
+                .collect()
+        })
+        .collect();
+    (returns, times, groups, scores)
+}
+
+fn exhaustive_winner(
+    rows: &BandRows<'_>,
+    scores: &[Vec<f64>],
+    options: &BandOptions,
+) -> (usize, ExactScore) {
+    let mut best: Option<(usize, ExactScore)> = None;
+    for c in 0..scores.len() {
+        let exact = rescore_exact(rows, &scores[c], 0.0, options).unwrap();
+        let better = match &best {
+            None => true,
+            Some((bi, be)) => {
+                exact_cmp(&exact, be) == std::cmp::Ordering::Less
+                    || (exact_cmp(&exact, be) == std::cmp::Ordering::Equal && c < *bi)
+            }
+        };
+        if better {
+            best = Some((c, exact));
+        }
+    }
+    best.unwrap()
+}
+
+#[test]
+fn band_recall_is_one_on_two_hundred_candidates_and_matches_exhaustive_cpu() {
+    let (returns, times, groups, scores) = band_fixture(200, 400);
+    let rows = BandRows {
+        targets: &returns,
+        groups: &groups,
+        times: &times,
+    };
+    let options = BandOptions::default();
+    let complexity: Vec<usize> = (0..scores.len()).collect();
+    let (exact_winner, exact_best) = exhaustive_winner(&rows, &scores, &options);
+
+    // Put the exact winner just below the cut on the surrogate. A top-K would
+    // drop it; the epsilon band must admit it and the exact rescore must find it.
+    let mut candidate = Vec::with_capacity(scores.len());
+    for c in 0..scores.len() {
+        candidate.push(BandCandidate {
+            index: c,
+            surrogate: 0.5 - c as f64 * 0.0001,
+            complexity: complexity[c],
+            scores: &scores[c],
+            threshold: 0.0,
+        });
+    }
+    let mut sorted_surrogate: Vec<f64> = candidate.iter().map(|c| c.surrogate).collect();
+    sorted_surrogate.sort_by(|a, b| b.total_cmp(a));
+    let cut = sorted_surrogate[11];
+    candidate[exact_winner].surrogate = cut - 0.0005;
+
+    let selection = select_band(&rows, &candidate, &options).unwrap();
+    assert_eq!(selection.recall_band, Some(1.0));
+    assert_eq!(selection.selected_index, exact_winner);
+    assert_eq!(selection.selected_exact, exact_best);
+    assert_eq!(selection.exact_rank, 0);
+    assert_eq!(selection.scored_by, "cpu_f64");
+    assert!(selection.finalists_considered >= 12);
+    let expected_epsilon = (2e-3f64).max(0.005 * selection.cut_surrogate.abs());
+    assert_eq!(selection.epsilon.to_bits(), expected_epsilon.to_bits());
+    // A second run is bit-identical.
+    let again = select_band(&rows, &candidate, &options).unwrap();
+    assert_eq!(selection.selected_index, again.selected_index);
+    assert_eq!(
+        selection.selected_exact.net.to_bits(),
+        again.selected_exact.net.to_bits()
+    );
+    assert_eq!(
+        selection.selected_exact.turnover.to_bits(),
+        again.selected_exact.turnover.to_bits()
+    );
+}
+
+#[test]
+fn a_band_that_misses_the_exact_winner_fails_loudly() {
+    let (returns, times, groups, scores) = band_fixture(200, 400);
+    let rows = BandRows {
+        targets: &returns,
+        groups: &groups,
+        times: &times,
+    };
+    let options = BandOptions::default();
+    let (exact_winner, _) = exhaustive_winner(&rows, &scores, &options);
+
+    let mut candidate: Vec<BandCandidate<'_>> = (0..scores.len())
+        .map(|c| BandCandidate {
+            index: c,
+            surrogate: 0.5 - c as f64 * 0.0001,
+            complexity: c,
+            scores: &scores[c],
+            threshold: 0.0,
+        })
+        .collect();
+    let mut sorted_surrogate: Vec<f64> = candidate.iter().map(|c| c.surrogate).collect();
+    sorted_surrogate.sort_by(|a, b| b.total_cmp(a));
+    let cut = sorted_surrogate[11];
+    candidate[exact_winner].surrogate = cut - 0.1;
+
+    let err = select_band(&rows, &candidate, &options).unwrap_err();
+    assert!(err.contains("band recall failure"), "unexpected error: {err}");
+
+    let lenient = BandOptions {
+        fail_on_miss: false,
+        ..options
+    };
+    let selection = select_band(&rows, &candidate, &lenient).unwrap();
+    assert_eq!(selection.recall_band, Some(0.0));
+    assert_ne!(selection.selected_index, exact_winner);
+}
+
+#[test]
+fn exact_tie_break_is_total_deterministic_and_prefers_complexity_then_index() {
+    // Direct contract for non-finite placement.
+    let finite = ExactScore {
+        net: 1.0,
+        turnover: 1.0,
+    };
+    let plus_inf = ExactScore {
+        net: f64::INFINITY,
+        turnover: 1.0,
+    };
+    let nan_net = ExactScore {
+        net: f64::NAN,
+        turnover: 1.0,
+    };
+    let minus_inf = ExactScore {
+        net: f64::NEG_INFINITY,
+        turnover: 1.0,
+    };
+    assert_eq!(exact_cmp(&plus_inf, &finite), std::cmp::Ordering::Less);
+    assert_eq!(exact_cmp(&nan_net, &finite), std::cmp::Ordering::Greater);
+    assert_eq!(
+        exact_cmp(&minus_inf, &finite),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        exact_cmp(&nan_net, &minus_inf),
+        std::cmp::Ordering::Equal,
+        "both net classes are the same worst class"
+    );
+    let zero_turnover = ExactScore {
+        net: 1.0,
+        turnover: 0.0,
+    };
+    let nan_turnover = ExactScore {
+        net: 1.0,
+        turnover: f64::NAN,
+    };
+    let inf_turnover = ExactScore {
+        net: 1.0,
+        turnover: f64::INFINITY,
+    };
+    assert_eq!(
+        exact_cmp(&zero_turnover, &finite),
+        std::cmp::Ordering::Less
+    );
+    assert_eq!(
+        exact_cmp(&nan_turnover, &finite),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(
+        exact_cmp(&inf_turnover, &finite),
+        std::cmp::Ordering::Greater
+    );
+    // Transitivity on a mixed list.
+    let mixed = [
+        nan_net, finite, plus_inf, zero_turnover, minus_inf, inf_turnover,
+    ];
+    for a in &mixed {
+        for b in &mixed {
+            for c in &mixed {
+                let ab = exact_cmp(a, b);
+                let bc = exact_cmp(b, c);
+                if ab == std::cmp::Ordering::Less && bc == std::cmp::Ordering::Less {
+                    assert_eq!(exact_cmp(a, c), std::cmp::Ordering::Less);
+                }
+            }
+        }
+    }
+
+    // Equal net and turnover: lower complexity wins, then lower index.
+    let (returns, _times, groups, _scores) = band_fixture(3, 5);
+    let times: Vec<f64> = (0..5).map(|i| i as f64).collect();
+    let rows = BandRows {
+        targets: &returns[..5],
+        groups: &groups[..5],
+        times: &times,
+    };
+    let options = BandOptions::default();
+    let score_a = vec![0.5, -0.1, 0.2, -0.3, 0.4];
+    let score_b = vec![0.6, -0.5, 0.3, -0.7, 0.8];
+    let candidates = [
+        BandCandidate {
+            index: 0,
+            surrogate: 0.0,
+            complexity: 5,
+            scores: &score_a,
+            threshold: 0.0,
+        },
+        BandCandidate {
+            index: 1,
+            surrogate: 0.0,
+            complexity: 1,
+            scores: &score_b,
+            threshold: 0.0,
+        },
+        BandCandidate {
+            index: 2,
+            surrogate: 0.0,
+            complexity: 1,
+            scores: &score_b,
+            threshold: 0.0,
+        },
+    ];
+    let selection = select_band(&rows, &candidates, &options).unwrap();
+    assert_eq!(selection.selected_index, 1, "complexity then index");
+    assert_eq!(selection.exact_rank, 0);
+}
+
+#[test]
+fn select_band_uses_validation_and_ignores_a_shuffled_or_resigned_test_block() {
+    let mut base = String::from("ts,sym,x,target\n");
+    for i in 0..40 {
+        let target = ((i as f64) * 0.21).sin() * 0.01 + if i % 3 == 0 { 0.002 } else { 0.0 };
+        base.push_str(&format!("{},A,{},{}\n", i, i, target));
+    }
+    let train = data::parse_table(&base).unwrap();
+    let mut spec = spec("x", vec![window("w", 0.0, 20.0, 20.0, 40.0)]);
+    spec.validation_frac = 0.5;
+    spec.candidates = vec!["x".to_string(), "0 - x".to_string()];
+    spec.band_select = true;
+
+    let first = walkforward::run_table(&train, &spec, "test").unwrap();
+    let w0 = &first.windows[0];
+    assert_eq!(w0.band_selection.as_ref().unwrap().recall_band, Some(1.0));
+    assert_eq!(first.band_select, true);
+    assert_eq!(first.test_used_for_selection, false);
+    let chosen = w0.candidate;
+    let chosen_expr = w0.expression.clone();
+    let chosen_threshold = w0.threshold.to_bits();
+
+    // Reverse the test rows and flip the sign of every test target. Selection
+    // uses the validation fibre only, so neither the candidate nor its
+    // constants (here the threshold) may move.
+    let mut shuffled = String::from("ts,sym,x,target\n");
+    for i in (0..20).rev() {
+        let target = ((i as f64) * 0.21).sin() * 0.01 + if i % 3 == 0 { 0.002 } else { 0.0 };
+        shuffled.push_str(&format!("{},A,{},{}\n", i, i, target));
+    }
+    for i in (20..40).rev() {
+        let target = -(((i as f64) * 0.21).sin() * 0.01 + if i % 3 == 0 { 0.002 } else { 0.0 });
+        shuffled.push_str(&format!("{},A,{},{}\n", i, i, target));
+    }
+    let shuffled = data::parse_table(&shuffled).unwrap();
+    let second = walkforward::run_table(&shuffled, &spec, "test").unwrap();
+    let w1 = &second.windows[0];
+    assert_eq!(w1.candidate, chosen);
+    assert_eq!(w1.expression, chosen_expr);
+    assert_eq!(w1.threshold.to_bits(), chosen_threshold);
+    assert_eq!(w1.band_selection.as_ref().unwrap().selected_index, chosen);
+}
+
+#[test]
+fn select_band_json_carries_the_provenance_fields() {
+    let (returns, times, groups, scores) = band_fixture(20, 40);
+    let rows = BandRows {
+        targets: &returns,
+        groups: &groups,
+        times: &times,
+    };
+    let candidate: Vec<BandCandidate<'_>> = (0..scores.len())
+        .map(|c| BandCandidate {
+            index: c,
+            surrogate: 0.0,
+            complexity: c,
+            scores: &scores[c],
+            threshold: 0.0,
+        })
+        .collect();
+    let selection = select_band(&rows, &candidate, &BandOptions::default()).unwrap();
+    let json = selection.json();
+    for field in [
+        "surrogate_rank",
+        "exact_rank",
+        "band",
+        "epsilon",
+        "finalists_considered",
+        "recall_band",
+        "scored_by",
+    ] {
+        assert!(json.contains(&format!("\"{field}\"")), "missing {field}: {json}");
+    }
+    assert!(json.contains("\"scored_by\":\"cpu_f64\""));
 }

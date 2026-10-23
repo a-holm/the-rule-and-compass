@@ -7585,6 +7585,16 @@ OPTIONS:
   --target <col>             forward-return column used for P&L
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
+  --select-band              #308: select among repeated --expr candidates with
+                             the P&L band instead of validation MSE. The screen is
+                             the fused long-only reduction on validation rows; the
+                             admitted set is rescored on the full validation rows in
+                             exact CPU f64 and ranked by
+                             (net, turnover, complexity, index). Requires
+                             --validation-frac > 0 and more than one --expr; the
+                             JSON carries surrogate_rank, exact_rank, band,
+                             epsilon, finalists_considered, recall_band and
+                             scored_by=cpu_f64
   --vars <a,b,...>           feature columns (default: all numeric except target,
                              time and group)
   --time <col>               time/ordering column (numbers or YYYY-MM-DD)
@@ -7668,6 +7678,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
     let mut device_pnl = false;
+    let mut band_select = false;
     let mut json = false;
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
@@ -7803,6 +7814,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--select-band" => band_select = true,
             "--json" => json = true,
             "--out" => {
                 out = Some(need(args, i + 1, "--out"));
@@ -7882,6 +7894,22 @@ fn run_walkforward(args: &[String]) -> ! {
         );
         std::process::exit(EXIT_USAGE);
     }
+    if band_select && expressions.len() < 2 {
+        eprintln!(
+            "error: --select-band needs at least two --expr candidates; \
+             one candidate has nothing to select\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if band_select && validation_frac <= 0.0 {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0; the test block \
+             may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
     let expression = expressions[0].clone();
     let candidates = if expressions.len() > 1 {
         expressions
@@ -7957,6 +7985,7 @@ fn run_walkforward(args: &[String]) -> ! {
         validation_frac,
         periods_per_year,
         candidates,
+        band_select,
         pool_reset_flat,
         allow_lockbox,
         device_pnl,
