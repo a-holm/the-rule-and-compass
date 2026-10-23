@@ -785,6 +785,12 @@ struct FtSmem {
     double srho;
     int sbad;
     int ssolved;
+    /* #286: label-only outcomes: rank-deficient design, rows whose gradient
+       was skipped, and the number of accepted trials. */
+    int srank;
+    int sskip;
+    int simproved;
+    int sstart;
     double slambda;
     double sbest;
 };
@@ -1125,7 +1131,8 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                               double *jtj,
                               double *jtr,
                               double *ploss,
-                              int *bad)
+                              int *bad,
+                              int *skipped)
 {
     const int tid = threadIdx.x;
     const int tri = p * (p + 1) / 2;
@@ -1158,8 +1165,19 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                 ft_forward_d(nd, m, cols, n, row, c, v);
                 const double pred = v[m - 1];
                 const double r = pred - y[row];
-                bool ok = isfinite(pred) && fabs(pred) <= 1e30 && isfinite(r);
+                /* #286: `1e30` is an f32 overflow guard; the f64 assembly and
+                   loss accept any finite value (the CPU arm fits 1e31). */
+                bool ok = isfinite(pred) && isfinite(r);
                 ft_backward_d<MAXC>(nd, m, v, adj, g, p);
+                /* #286: a finite value with a non-finite derivative (e.g.
+                   `pow(x,c)` at x=0, where `x^c ln x = 0·−∞`) is a bad
+                   *gradient* row, not a bad prediction. Drop that row's Gram
+                   contribution and keep its loss so one row in 2.46M no longer
+                   aborts the candidate. */
+                bool grad_ok = true;
+                for (int j = 0; j < p; ++j) {
+                    if (!isfinite(g[j])) grad_ok = false;
+                }
                 /* #229/#222: the MM/IRLS weight. `2/(1 + r^2)` is the
                    log-squashed `rho'(r)/r`; `1/max(|r|, eps)` is the Lawson
                    L1 majoriser. The constant factors a positive weight picks
@@ -1195,13 +1213,14 @@ __device__ void ft_assemble_d(const unsigned int *nd,
                     }
                 }
                 const double s = sqrt(sw);
+                const bool use_grad = ok && grad_ok;
                 for (int j = 0; j < p; ++j) {
-                    if (!isfinite(g[j])) ok = false;
-                    dg[tid * p + j] = ok ? s * g[j] : 0.0;
+                    dg[tid * p + j] = use_grad ? s * g[j] : 0.0;
                 }
-                dr[tid] = ok ? s * resp : 0.0;
+                dr[tid] = use_grad ? s * resp : 0.0;
                 dl[tid] = ok ? wr * rho : 0.0;
                 if (!ok) *bad = 1;
+                if (ok && !grad_ok) atomicAdd(skipped, 1);
             } else {
                 for (int j = 0; j < p; ++j) dg[tid * p + j] = 0.0;
                 dr[tid] = 0.0;
@@ -1262,7 +1281,7 @@ __device__ double ft_loss_d(const unsigned int *nd,
             ft_forward_d(nd, m, cols, n, row, c, v);
             const double pred = v[m - 1];
             const double r = pred - y[row];
-            if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+            if (!isfinite(pred) || !isfinite(r)) {
                 local += 1e30;
             } else if (metric == RC_LOSS_LOGISTIC) {
                 const double tt = tsign ? tsign[row] : 0.0;
@@ -1460,18 +1479,19 @@ __device__ double ft_loss(const unsigned int *nd,
     return total;
 }
 
-/* Damped Cholesky solve in f64. Returns 0 on success, 1 on a non-positive
- * pivot or a conditioning gate.
+/* Damped Cholesky solve in f64. Returns 0 on success, 4 when the *undamped*
+ * normal equations are rank deficient but the damped step was still solved,
+ * and 1 when no finite step can be produced.
  *
- * `scale_free = 0` (the squared family) keeps the historical gate: an absolute
- * pivot floor of 1e-18 and a Cholesky diagonal ratio `hi/lo <= 1e4`.
- *
- * #229: robust IRLS weights make `A` badly *scaled* without being
- * ill-conditioned, so for `log_squashed` and #222's `absolute` the gate is the
- * scale-free `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`, `Ã = D^{-1/2} A D^{-1/2}`,
- * which is invariant to units and to a global weight scale. `ln det Ã < ln
- * 1e-12` means the data no longer identifies the parameters, which is exactly
- * when the exact CPU arm must take over. */
+ * #286: every arm uses the scale-free `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`
+ * gate on `Ã = D^{-1/2} A D^{-1/2}`, with `D = diag(JᵀJ)`. The old absolute
+ * pivot floor and `hi/lo <= 1e4` ratio compared derivative-column *units*
+ * (they rejected a perfectly orthogonal design whose constants span decades
+ * and accepted κ = 2e8). The step itself is Jacobi-equilibrated: solve
+ * `Ã δ̃ = −D^{-1/2} jᵀr`, then `δ = D^{-1/2} δ̃`. A rank-deficient direction
+ * is *reported* (status 4), not handed to a 70× more expensive CPU refit:
+ * the damping exists precisely to make it well-posed and the exact finalist
+ * refit owns every reported number. */
 /* ln(1e-12), the smallest identified fraction of parameter space. */
 #define FT_LN_DET_FLOOR (-27.631021115928547)
 
@@ -1484,49 +1504,49 @@ __device__ int ft_solve(const double *jtj,
                         double *L,
                         int scale_free)
 {
-    /* Conditioning gate on the UNDAMPED J^T J: damping deliberately hides a
-       rank-deficient direction (that is what it is for), so the gate must not
-       see it. */
-    double sum_ln_L = 0.0;
-    double sum_ln_A = 0.0;
+    (void)scale_free; /* #286: the scale-free gate is universal now. */
+    double dscale[MAXC];
     for (int i = 0; i < p; ++i) {
+        const double aii = jtj[i * (i + 1) / 2 + i];
+        if (!(aii > 0.0) || !isfinite(aii)) return 1;
+        dscale[i] = sqrt(aii);
+    }
+
+    /* Conditioning gate on the UNDAMPED, Jacobi-scaled J^T J: damping
+       deliberately hides a rank-deficient direction, so the gate must not see
+       it. A non-positive pivot or a determinant below the floor means the data
+       does not identify all p parameters; that is reported (4), not fatal. */
+    int rank_deficient = 0;
+    double sum_ln_L = 0.0;
+    int ok = 1;
+    for (int i = 0; i < p && ok; ++i) {
         for (int j = 0; j <= i; ++j) {
-            double s = jtj[i * (i + 1) / 2 + j];
-            if (scale_free && i == j) {
-                /* The absolute 1e-12 floor is meaningless once the weights span
-                   decades; only a genuinely non-positive pivot fails here. */
-                if (!(jtj[i * (i + 1) / 2 + i] > 0.0) ||
-                    !isfinite(jtj[i * (i + 1) / 2 + i])) return 1;
-                sum_ln_A += log(jtj[i * (i + 1) / 2 + i]);
-            } else if (i == j) {
-                s += 1e-12;
-            }
+            double s = jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
+            if (!isfinite(s)) return 1;
             for (int k = 0; k < j; ++k) s -= L[i * p + k] * L[j * p + k];
             if (i == j) {
-                if (scale_free ? (!(s > 0.0) || !isfinite(s)) : (!(s > 1e-18) || !isfinite(s)))
-                    return 1;
+                if (!(s > 0.0) || !isfinite(s)) {
+                    ok = 0;
+                    break;
+                }
                 L[i * p + i] = sqrt(s);
-                if (scale_free) sum_ln_L += 0.5 * log(s);
+                sum_ln_L += 0.5 * log(s);
             } else {
                 L[i * p + j] = s / L[j * p + j];
             }
         }
     }
-    if (scale_free) {
-        const double ln_det = 2.0 * sum_ln_L - sum_ln_A;
-        if (!isfinite(ln_det) || ln_det < FT_LN_DET_FLOOR) return 1;
+    if (!ok) {
+        rank_deficient = 1;
     } else {
-        double lo = L[0], hi = L[0];
-        for (int i = 1; i < p; ++i) {
-            lo = fmin(lo, L[i * p + i]);
-            hi = fmax(hi, L[i * p + i]);
-        }
-        if (!(lo > 0.0) || !isfinite(hi) || hi / lo > 1e4) return 1;
+        const double ln_det = 2.0 * sum_ln_L;
+        if (!isfinite(ln_det) || ln_det < FT_LN_DET_FLOOR) rank_deficient = 1;
     }
-    /* Damped factorisation for the step itself. */
+
+    /* Damped factorisation of the equilibrated system for the step itself. */
     for (int i = 0; i < p; ++i) {
         for (int j = 0; j <= i; ++j) {
-            double s = jtj[i * (i + 1) / 2 + j];
+            double s = jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
             if (i == j) s = s * (1.0 + lambda) + 1e-12;
             for (int k = 0; k < j; ++k) s -= L[i * p + k] * L[j * p + k];
             if (i == j) {
@@ -1538,7 +1558,7 @@ __device__ int ft_solve(const double *jtj,
         }
     }
     double rhs[MAXC];
-    for (int i = 0; i < p; ++i) rhs[i] = -jtr[i];
+    for (int i = 0; i < p; ++i) rhs[i] = -jtr[i] / dscale[i];
     for (int i = 0; i < p; ++i) {
         double s = rhs[i];
         for (int k = 0; k < i; ++k) s -= L[i * p + k] * rhs[k];
@@ -1549,7 +1569,8 @@ __device__ int ft_solve(const double *jtj,
         for (int k = i + 1; k < p; ++k) s -= L[k * p + i] * delta[k];
         delta[i] = s / L[i * p + i];
     }
-    return 0;
+    for (int i = 0; i < p; ++i) delta[i] /= dscale[i];
+    return rank_deficient ? 4 : 0;
 }
 
 __global__ void cast_f32_to_f64_kernel(const float *__restrict__ src,
@@ -1908,6 +1929,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
     if (tid < p) S->sc[tid] = c0[(size_t)cand * (size_t)kmax + (size_t)tid];
     if (tid == 0) {
         S->sbad = 0;
+        S->srank = 0;
+        S->sskip = 0;
+        S->simproved = 0;
+        S->sstart = 0;
         S->slambda = 1e-3;
         S->sbest = 0.0;
     }
@@ -1934,6 +1959,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
                                           S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
                                           &S->sbest, &S->srho, &S->sbad, metric);
+            if (tid == 0) S->sstart = S->sbad ? 0 : 1;
             if (S->sbad) {
                 status = 2;
             } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
@@ -1962,8 +1988,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
-                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
-                                                     S->sL, 0) == 0);
+                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
+                                                         S->sL, 0);
+                        S->ssolved = (solve != 1);
+                        if (solve == 4) S->srank = 1;
                     }
                     __syncthreads();
                     if (!S->ssolved) {
@@ -1982,6 +2010,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                         best = trial;
                         lambda = fmax(lambda / 8.0, 1e-12);
                         assembled = 0;
+                        if (tid == 0) S->simproved = 1;
                         if (best <= 0.0) break;
                     } else {
                         lambda *= 6.0;
@@ -1999,8 +2028,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                     ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
-                        S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
-                                                     S->sL, 0) == 0);
+                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
+                                                         S->sL, 0);
+                        S->ssolved = (solve != 1);
+                        if (solve == 4) S->srank = 1;
                     }
                     __syncthreads();
                     if (!S->ssolved) break;
@@ -2014,6 +2045,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     if (trial < best) {
                         if (tid < p) S->sc[tid] = S->strial[tid];
                         best = trial;
+                        if (tid == 0) S->simproved = 1;
                     } else {
                         break;
                     }
@@ -2025,6 +2057,14 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         }
         __syncthreads();
         if (tid == 0) {
+            /* #286: a finite correlation answer is returned, never refit for a
+               rank/gauge label the exact finalist refit already owns. */
+            if (status == 1 || status == 2) {
+                if (!S->sstart) status = 7;
+                else status = S->simproved ? 5 : 6;
+            } else if (status == 0 && S->srank) {
+                status = 4;
+            }
             for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
             outsse[cand] = best;
             outstatus[cand] = status;
@@ -2051,6 +2091,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         ft_assemble<MAXC, CHUNK>(nd, m, cols, y, tsign, w64, n, p, metric, S->sc, S->sg, S->sr, S->sdl, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
         assembled = 1;
         best = S->sbest;
+        if (tid == 0) S->sstart = S->sbad ? 0 : 1;
         if (S->sbad) status = 2;
         for (int round = 0; round < rounds && status == 0 && best != 0.0; ++round) {
             if (irls && round > 0) assembled = 0; /* new weights, new Gram */
@@ -2064,7 +2105,9 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                     }
                 }
                 if (tid == 0) {
-                    S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free) == 0);
+                    const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, S->slambda, p, S->sdelta, S->sL, scale_free);
+                    S->ssolved = (solve != 1);
+                    if (solve == 4) S->srank = 1;
                 }
                 __syncthreads();
                 if (!S->ssolved) {
@@ -2092,7 +2135,10 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                 if (tsse < best) {
                     if (tid < p) S->sc[tid] = S->strial[tid];
                     best = tsse;
-                    if (tid == 0) S->slambda = fmax(S->slambda / 8.0, 1e-12);
+                    if (tid == 0) {
+                        S->slambda = fmax(S->slambda / 8.0, 1e-12);
+                        S->simproved = 1;
+                    }
                     assembled = 0;
                     if (best == 0.0) break;
                 } else {
@@ -2121,13 +2167,17 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         }
         /* Undamped Gauss-Newton polish, exactly like the CPU path. */
         for (int it = 0; it < 4 && status == 0 && best != 0.0; ++it) {
-            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad);
+            ft_assemble_d<MAXC, PCHUNK>(nd, m, cols64, y64, tsign64, w64, n, p, metric, S->sc, S->sdg, S->sdr, S->sdl64, S->sjtj, S->sjtr, &S->sbest, &S->sbad, &S->sskip);
             assembled = 1;
             if (S->sbad) {
                 status = 2;
                 break;
             }
-            if (tid == 0) S->ssolved = (ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL, scale_free) == 0);
+            if (tid == 0) {
+                const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta, S->sL, scale_free);
+                S->ssolved = (solve != 1);
+                if (solve == 4) S->srank = 1;
+            }
             __syncthreads();
             if (!S->ssolved) break;
             if (tid < p) {
@@ -2147,6 +2197,7 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (tsse < best) {
                 if (tid < p) S->sc[tid] = S->strial[tid];
                 best = tsse;
+                if (tid == 0) S->simproved = 1;
             } else {
                 break;
             }
@@ -2154,9 +2205,25 @@ __global__ void fit_kernel(const float *__restrict__ cols,
         }
     }
 
-    (void)v;
-    __syncthreads();
+    /* #286: label a finite answer instead of discarding it.
+     *   4 rank_deficient   finite; null direction; the damping is the point
+     *   5 recovered        last accepted finite iterate after a failed trial
+     *   6 no_improvement   finite start, no trial improved it
+     *   7 start_unusable   the start itself has no finite value (log only)
+     *   8 recovered_skipped a finite answer whose bad-gradient rows were skipped
+     * Only a genuine arithmetic failure with no finite start remains status 1,
+     * and only a non-finite start with no accepted iterate is status 7; neither
+     * needs the CPU arm, which cannot move a non-finite start either. */
     if (tid == 0) {
+        if (status == 1 || status == 2) {
+            if (!S->sstart) status = 7;
+            else if (S->simproved) status = 5;
+            else status = 6;
+        } else if (status == 0) {
+            if (S->sskip > 0) status = 8;
+            else if (S->srank) status = 4;
+            else if (!S->simproved && iters > 0) status = 6;
+        }
         for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
         outsse[cand] = best;
         outstatus[cand] = status;

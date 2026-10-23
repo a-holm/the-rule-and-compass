@@ -956,9 +956,17 @@ reverse-mode Jacobian for the p constants, `JᵀJ`/`Jᵀr`/SSE accumulation, a
 damped f64 Cholesky solve with a conditioning gate, and ordered trial steps.
 The search phase uses f32 row arithmetic with f64 accumulators and the solve;
 the final undamped polish runs in f64 on an exact f64 copy of the training rows.
+The conditioning gate is the scale-free `ln det(D^{-1/2}AD^{-1/2})` test with a
+relative pivot floor, and the step is Jacobi-equilibrated (`D = diag(JᵀJ)`); the
+old absolute `1e-18` floor and `hi/lo ≤ 1e4` ratio compared derivative-column
+units. A finite rank-deficient answer, a recovered last iterate, a start that did
+not improve, and a non-finite start are returned as statuses `4`–`7` with labels
+(`rank_deficient`, `recovered`, `no_improvement`, `start_unusable`) and are **not**
+CPU fallbacks. A non-finite *gradient* row at a finite prediction is skipped, not
+fatal. The f64 assembly and loss no longer impose the f32 `1e30` bound.
 Candidates with no analytic GPU derivative, more than 20 constants, more than
-96 nodes, a non-finite row, or an undamped Cholesky diagonal ratio above `1e4`
-are refit by the exact CPU arm and counted as fallbacks. Before fitting, every
+96 nodes, or no finite step at all are refit by the exact CPU arm and counted as
+fallbacks. Before fitting, every
 unfitted offspring is screened on the GPU with its seed constants and only the
 best `max(32, pop/4)` of each island enter the fitted LM batch; the rest keep
 their screening score, so the evaluation count is unchanged while the fit
