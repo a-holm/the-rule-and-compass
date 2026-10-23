@@ -298,7 +298,9 @@ contains every engine name with `family`, `warmup`, `available` and its exact
 `formula`, plus `shared_names` mapping every cross-group name to its one
 canonical producer. `feature_registry` contains one object per default-set
 column with `name`, `family`, `timeframe`, `warmup`, `available`, `derived`,
-`formula`, `formula_sha256`, `source`, `pit` and, when unavailable, `reason`.
+`parity_tier`, `formula`, `formula_sha256`, `source`, `pit` and, when
+unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
+`reference` (CPU-only reference in this change).
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
@@ -556,6 +558,83 @@ pilot's `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
 a gap is not bridged, and the first true range is `high - low` instead of
 NumPy's `np.roll` wrap-around that reads the last close.
 
+### Fused flow and price-action device producers (#297)
+
+The `flow` registry family has **17** columns: the five raw flow inputs
+(`volume quote_volume trades taker_buy_base taker_buy_quote`), the ten
+`FLOW_NAMES`, and the two engine columns `cmf20` and `vwap20_dev`. The fused
+device producer materialises the **twelve derived** columns (the ten
+`FLOW_NAMES` plus `cmf20`/`vwap20_dev`); the five raw inputs are pass-through
+store columns. `price_action` materialises **eleven** columns. The formulas are
+exactly those in the two tables above; there is no second definition.
+
+The device split is a **base pass plus consumers**:
+
+| family | base kernels (once per run) | consumers |
+|---|---|---|
+| flow | elementwise `vwap`/per-trade/Amihud/OBV-step/CVD-net/CMF value; cumulative OBV+CVD | one per output column |
+| price_action | elementwise geometry (`clv`, `body`, range, validity, true range) + Wilder ATR14 | one per output column |
+
+The elementwise flow base reads `trades` and `taker_buy_base` **once**,
+independent of the requested column count; `EnrichGpu::base_reads()` counts the
+optional raw columns consumed by that pass and the test
+`fused_flow_reads_optional_raw_columns_once` pins it at two for a twelve-column
+request. `EnrichGpu::base_passes()` reports four base launches for the two
+families instead of one pass per column (the ~6-vs-21 pass reduction of
+`04-feature-enrich.md` §3.7).
+
+Gap and missing-column policy is the CPU policy, not a near-copy:
+
+* the device context carries a raw-column **presence bitset** and `d_run_id`;
+  an absent optional column is uploaded as `NaN` and every consumer emits
+  `NaN`, never `0`;
+* `gap(i) = i>0 && same segment && run_id differs`, so a symbol boundary and an
+  internal outage behave exactly like the per-symbol `gap_mask`; `gap[0]` is
+  false, OBV/CVD restart at a gap, and Wilder state restarts at a gap;
+* rolling consumers stage a tile of the source plane in shared memory and one
+  thread builds the running prefix in CPU order, so `rmean_py`/`rstd_py`/
+  `rmean_strict` keep their exact addition order while global accesses stay
+  coalesced; two-bar geometry runs one thread per row.
+
+Parity tiers are declared per column in `feature_registry.parity_tier`:
+
+| tier | columns |
+|---|---|
+| `bitwise` | `vwap`, `taker_ratio96`, `taker_imb16`, `zero_ret_share96`, `obv_z96`, `cvd_proxy`, `vwap_dev96`, `cmf20`, `vwap20_dev`, and all eleven `price_action` columns |
+| `1e-12` | `trade_intensity96`, `avg_trade_size96`, `amihud96` (each takes a logarithm) |
+| `reference` | every other registered column (CPU reference; no device claim in #297) |
+| `unavailable` | the reserved derivative columns |
+
+`zero_ret_share96` stays `bitwise` even though its definition mentions
+`ln(C_t/C_{t-1}) == 0`: the kernel tests the exact close ratio instead of a
+rounded logarithm, which is equivalent because a ratio that is not `1.0` cannot
+round to a zero logarithm.
+
+The parity fixture (2 symbols x 500,000 rows, 15 m, gaps, zero volume, zero
+trades and `H == L`) reports **21 of 23 columns bit-identical**, zero NaN-mask
+mismatches and max absolute difference **8.882e-16** for the two logarithmic
+columns. Repeated GPU runs and `--chunk-rows` 1/65,536 hash identically, and
+truncating the store leaves every earlier row bit-identical
+(`fused_gpu_is_prefix_causal`), so no future bar enters a value.
+
+**Measured cost model.** `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` are
+kernel-time constants measured on a 1,000,075-row, 109-symbol fixture (the
+segment-parallel consumers only fill the device at a realistic symbol count):
+
+| family | base ms/Mrow | per column ms/Mrow | total, 12/11 columns | wall incl. D2H |
+|---|---:|---:|---:|---:|
+| flow | 11.4 | 3.3 | 51.2 ms/Mrow | 99.6 ms/Mrow |
+| price_action | 8.8 | 2.5 | 36.7 ms/Mrow | 64.6 ms/Mrow |
+
+The wall figure is download-bound: per-column `cudaMemcpy` measured
+~2.1-3.8 GB/s, which is the output-path problem of #300. Kernel time is what
+`plan_groups` costs. A fused family is not dispatched by `--gpu auto` below
+**32 symbol segments** (`FUSED_MIN_SEGMENTS`); `--gpu on` still forces it, which
+is how the two-symbol parity fixture exercises every kernel. At 16 M rows and
+109 symbols the measured rate projects to ~1.4 s for the 23 columns, in line
+with the ~1.5 s candle+price-action / ~2 s flow estimate in
+`04-feature-enrich.md` §6.
+
 ### Determinism and the cost model
 
 `--chunk-rows` changes only read/compute batching; the arithmetic and output
@@ -594,7 +673,8 @@ all kernels; it does not make the cost model claim a win. `--no-gpu`/`--cpu`
 forces the reference path. A CPU-only build ignores the GPU arms entirely, and a
 CUDA build with no device falls back with the reason in every plan row.
 
-The CUDA kernels live in `src/cuda/enrich.cu`. Elementwise families use one
+The CUDA kernels live in `src/cuda/enrich.cu` (enrichment) and
+`src/cuda/features.cu` (fused flow / price-action, #297). Elementwise families use one
 thread per row; rolling sums/standard deviations, Donchian, Wilder/EMA scans and
 labels run one thread per symbol segment in the same operation order as the CPU,
 with `-fmad=false` so multiply-add association is identical. Cross-sectional

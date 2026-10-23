@@ -24,51 +24,7 @@
 
 #include <cub/cub.cuh>
 
-typedef struct RcEnrichStats {
-    double kernel_ms;
-    double launch_ms;
-    double sync_ms;
-    double alloc_ms;
-    double h2d_ms;
-    double d2h_ms;
-    double wall_ms;
-    unsigned long long h2d_bytes;
-    unsigned long long d2h_bytes;
-    int batch;
-    int failed;
-} RcEnrichStats;
-
-typedef struct RcEnrich {
-    int n;
-    int nseg;
-    int step;
-    long long *d_times;
-    double *d_open;
-    double *d_high;
-    double *d_low;
-    double *d_close;
-    double *d_volume;
-    double *d_qvolume;
-    int *d_seg_start;
-    int *d_seg_len;
-    int *d_seg_id;
-    /* Scratch arena, reused by every family. */
-    double *d_a;
-    double *d_b;
-    double *d_c;
-    double *d_d;
-    double *d_out;
-    double *d_out2;
-    double *d_out3;
-    /* #300: one output arena per family block plus its pinned host mirror.
-       The arena is capped at RC_BATCH_ARENA_BYTES; a family block that does
-       not fit falls back to the per-column staging path. */
-    double *d_batch;
-    double *h_pinned;
-    int batch_cap;
-    RcEnrichStats last;
-    double batch_start_ms;
-} RcEnrich;
+#include "enrich_common.h"
 
 /* #300: hard cap for the per-family output arena and the pinned D2H mirror. */
 #define RC_BATCH_ARENA_BYTES (64ULL * 1024ULL * 1024ULL)
@@ -835,7 +791,9 @@ extern "C" {
 
 void *rc_enrich_create(const long long *times, const double *open, const double *high,
                        const double *low, const double *close, const double *volume,
-                       const double *qvolume, int n, const int *seg_start,
+                       const double *qvolume, const double *trades,
+                       const double *taker_buy_base, const double *taker_buy_quote,
+                       unsigned int present, int n, const int *seg_start,
                        const int *seg_len, int nseg, int step)
 {
     if (n <= 0 || nseg <= 0) return NULL;
@@ -844,6 +802,7 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     c->n = n;
     c->nseg = nseg;
     c->step = step;
+    c->present = present;
     size_t rows = (size_t)n;
     double t0 = rc_now_ms();
     int ok = 1;
@@ -854,9 +813,13 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     if (ok && rc_alloc((void **)&c->d_close, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_volume, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_qvolume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_trades, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tb, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tbq, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_start, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_len, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_id, rows * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_run_id, rows * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_a, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
@@ -877,25 +840,40 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     rc_upload(c->d_close, close, rows * sizeof(double));
     rc_upload(c->d_volume, volume, rows * sizeof(double));
     rc_upload(c->d_qvolume, qvolume, rows * sizeof(double));
+    rc_upload(c->d_trades, trades, rows * sizeof(double));
+    rc_upload(c->d_tb, taker_buy_base, rows * sizeof(double));
+    rc_upload(c->d_tbq, taker_buy_quote, rows * sizeof(double));
     rc_upload(c->d_seg_start, seg_start, (size_t)nseg * sizeof(int));
     rc_upload(c->d_seg_len, seg_len, (size_t)nseg * sizeof(int));
     c->last.h2d_ms = rc_now_ms() - t0;
-    c->last.h2d_bytes = 8ULL * (unsigned long long)rows * 8ULL +
+    c->last.h2d_bytes = 8ULL * (unsigned long long)rows * 11ULL +
                         8ULL * (unsigned long long)nseg;
     /* Segment id per row, derived once on the host and uploaded with the rest
        of the resident data. It lets elementwise kernels refuse to cross a
        symbol boundary without a per-row lookup table on the device. */
     int *seg_id = (int *)malloc(rows * sizeof(int));
-    if (!seg_id) {
+    int *run_id = (int *)malloc(rows * sizeof(int));
+    if (!seg_id || !run_id) {
+        free(seg_id);
+        free(run_id);
         rc_enrich_destroy(c);
         return NULL;
     }
+    int run = 0;
     for (int s = 0; s < nseg; ++s) {
-        for (int j = 0; j < seg_len[s]; ++j) seg_id[seg_start[s] + j] = s;
+        for (int j = 0; j < seg_len[s]; ++j) {
+            int i = seg_start[s] + j;
+            seg_id[i] = s;
+            if (j > 0 && times[i] - times[i - 1] != (long long)step) run += 1;
+            run_id[i] = run;
+        }
+        run += 1;
     }
     rc_upload(c->d_seg_id, seg_id, rows * sizeof(int));
+    rc_upload(c->d_run_id, run_id, rows * sizeof(int));
     free(seg_id);
-    c->last.h2d_bytes += (unsigned long long)rows * sizeof(int);
+    free(run_id);
+    c->last.h2d_bytes += (unsigned long long)rows * sizeof(int) * 2ULL;
     stats_end(c);
     c->last.batch = 0;
     return c;
@@ -912,9 +890,13 @@ void rc_enrich_destroy(void *v)
     cudaFree(c->d_close);
     cudaFree(c->d_volume);
     cudaFree(c->d_qvolume);
+    cudaFree(c->d_trades);
+    cudaFree(c->d_tb);
+    cudaFree(c->d_tbq);
     cudaFree(c->d_seg_start);
     cudaFree(c->d_seg_len);
     cudaFree(c->d_seg_id);
+    cudaFree(c->d_run_id);
     cudaFree(c->d_a);
     cudaFree(c->d_b);
     cudaFree(c->d_c);
@@ -928,6 +910,8 @@ void rc_enrich_destroy(void *v)
 #else
     if (c->h_pinned) cudaFreeHost(c->h_pinned);
 #endif
+    cudaFree(c->d_feat);
+
     free(c);
 }
 
@@ -1723,6 +1707,9 @@ void *rc_enrich_create_arena(int n, int nseg, int step, const int *seg_start,
     if (ok && rc_alloc((void **)&c->d_close, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_volume, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_qvolume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_trades, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tb, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tbq, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_start, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_len, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_id, rows * sizeof(int)) != 0) ok = 0;
@@ -1746,6 +1733,17 @@ void *rc_enrich_create_arena(int n, int nseg, int step, const int *seg_start,
     if (nan_mask & 8u) cudaMemset(c->d_close, 0xFF, rows * sizeof(double));
     if (nan_mask & 16u) cudaMemset(c->d_volume, 0xFF, rows * sizeof(double));
     if (nan_mask & 32u) cudaMemset(c->d_qvolume, 0xFF, rows * sizeof(double));
+    if (nan_mask & 64u) cudaMemset(c->d_trades, 0xFF, rows * sizeof(double));
+    if (nan_mask & 128u) cudaMemset(c->d_tb, 0xFF, rows * sizeof(double));
+    if (nan_mask & 256u) cudaMemset(c->d_tbq, 0xFF, rows * sizeof(double));
+    /* #297: presence bits derive from the same mask; a clear bit means the
+       optional column was not projected and must stay NaN. */
+    c->present = 0;
+    if (!(nan_mask & 16u)) c->present |= RC_PRESENT_VOLUME;
+    if (!(nan_mask & 32u)) c->present |= RC_PRESENT_QUOTE_VOLUME;
+    if (!(nan_mask & 64u)) c->present |= RC_PRESENT_TRADES;
+    if (!(nan_mask & 128u)) c->present |= RC_PRESENT_TAKER_BUY;
+    if (!(nan_mask & 256u)) c->present |= RC_PRESENT_TAKER_BUY_QV;
     stats_end(c);
     c->last.batch = 0;
     return c;
@@ -1757,7 +1755,8 @@ long long *rc_enrich_times_ptr(void *v)
     return c ? c->d_times : NULL;
 }
 
-/* which: 0 open, 1 high, 2 low, 3 close, 4 volume, 5 qvolume. */
+/* which: 0 open, 1 high, 2 low, 3 close, 4 volume, 5 qvolume,
+   6 trades, 7 taker-buy base, 8 taker-buy quote. */
 double *rc_enrich_value_ptr(void *v, int which)
 {
     RcEnrich *c = (RcEnrich *)v;
@@ -1769,6 +1768,9 @@ double *rc_enrich_value_ptr(void *v, int which)
     case 3: return c->d_close;
     case 4: return c->d_volume;
     case 5: return c->d_qvolume;
+    case 6: return c->d_trades;
+    case 7: return c->d_tb;
+    case 8: return c->d_tbq;
     default: return NULL;
     }
 }

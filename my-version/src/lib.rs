@@ -22,6 +22,7 @@ pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
 pub mod features;
+pub mod features_gpu; // #297: fused flow / price-action device producers
 pub mod fit;
 pub mod genome;
 #[cfg(feature = "cuda")]
