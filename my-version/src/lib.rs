@@ -42,6 +42,7 @@ pub mod prep; // #123: raw archives -> column store
 pub mod progress_stats;
 pub mod qd; // #120: quality-diversity descriptor grid
 pub mod resample; // #92: index-based resampling with a BLB cap
+pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown, beta/alpha)
 pub mod rng;
 pub mod schema;
 pub mod search;
