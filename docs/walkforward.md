@@ -80,7 +80,9 @@ Per window and pooled:
 |---|---|
 | Sharpe | `mean / std(ddof=1) * sqrt(periods_per_year)`; `n/a` when the series is too short or has zero variance |
 | CAGR | `equity_end^(periods_per_year / periods) - 1` |
-| max drawdown | most negative `equity / running_peak - 1` (starts from equity 1) |
+| max drawdown | most negative `equity / running_peak - 1` (starts from equity 1); `-1` on ruin |
+| Sortino | `(mean - MAR) / DD * sqrt(periods_per_year)`, where `DD = sqrt(sum(min(r-MAR,0)^2)/n)` (population, `ddof=0`) and `MAR` is 0 by default |
+| log-growth | mean of `log1p(r)` per period; `-inf` when any `r <= -1` (ruin) |
 | turnover | `sum |position change| / years`, where `years = periods / periods_per_year` |
 | exposure | long rows / test rows |
 | hit rate | long rows with `target > 0` / long rows |
@@ -93,7 +95,30 @@ Per window and pooled:
 `--periods-per-year` should be given when the time unit is not epoch seconds.
 Without it, the evaluator infers the period from the median positive time step
 of the test rows (`365*86400 / dt`), which gives 365 for daily crypto bars and
-8760 for hourly bars. The report always states the value it used.
+8760 for hourly bars. The report always states the value it used and, since
+#307, also records it in `risk_model` with the annualisation mode.
+
+**Per-period versus daily.** Every risk statistic in this report is computed on
+the per-period series and annualised with `sqrt(periods_per_year)` (Sharpe,
+Sortino) or `periods_per_year` (alpha). That is a *per-period* statistic: hourly
+returns with `periods_per_year = 8760` are not the same as a daily Sharpe. For a
+daily Sharpe, compound the hourly returns into daily returns first
+(`risk::compound_blocks(&returns, 24)`) and then annualise the daily series with
+`periods_per_year = 365`. Cash (zero variance) reports `NaN` Sharpe and `NaN`
+Sortino, never `0`.
+
+## Risk monoids
+
+`rcsr::risk` exposes the exact `f64` chunk-merge carries behind these numbers
+(#307): Welford/Chan `(n, mean, M2)` for mean/variance/Sharpe, `(n,
+sum(min(r-MAR,0)^2))` for Sortino, `(n, sum(log1p(r)), ruined)` for log-growth,
+`(n,total,min,max,dd,ruined)` on log equity for drawdown, and `(n, sum x, sum y,
+sum xy, sum x^2)` for beta/alpha. Each carries a fixed canonical merge order;
+`RiskAccumulator::push_chunk` buffers a trailing partial so arbitrary chunk
+sizes give identical bits, and `merge` appends canonical shards in ascending
+order. The serial `walkforward::sharpe` and `equity_metrics` remain the
+reference; the risk module is tested to `1e-12` against them on 100 k returns.
+There is no short or borrow kernel: the input is the long-only period series.
 
 ## Fold sign test
 

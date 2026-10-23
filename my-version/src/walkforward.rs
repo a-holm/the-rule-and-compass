@@ -144,6 +144,12 @@ pub struct Metrics {
     pub cagr: f64,
     /// Most negative peak-to-trough equity drawdown (a negative number).
     pub max_drawdown: f64,
+    /// Annualised Sortino ratio (#307). `NaN` when undefined.
+    pub sortino: f64,
+    /// Per-period log-growth from `ln_1p` (#307); `-inf` on ruin.
+    pub log_growth: f64,
+    /// Minimum acceptable return used by the Sortino denominator.
+    pub sortino_mar: f64,
     /// Position changes per year (sum of |delta position| / years).
     pub turnover: f64,
     /// Fraction of test rows with a long position.
@@ -1299,6 +1305,11 @@ fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics
     let sharpe_ratio = sharpe(returns, ppy);
     let gross_sharpe = sharpe(gross, ppy);
     let (total_return, cagr, max_drawdown) = equity_metrics(returns, ppy);
+    // #307: the same period series through the chunk-mergeable risk monoids.
+    // `max_drawdown` stays on the serial reference; the risk-module parity test
+    // pins the monoid to that reference, and Sortino/log-growth are new report
+    // fields from the monoid.
+    let risk = crate::risk::risk_stats(returns, ppy, crate::risk::DEFAULT_SORTINO_MAR);
     let exposure = ratio(stats.active, stats.rows);
     let hit_rate = ratio(stats.hits, stats.active);
     let avg_cost = if stats.active == 0 {
@@ -1329,6 +1340,9 @@ fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics
         sharpe: sharpe_ratio,
         cagr,
         max_drawdown,
+        sortino: risk.sortino,
+        log_growth: risk.log_growth_per_period,
+        sortino_mar: risk.sortino_mar,
         turnover,
         exposure,
         hit_rate,
@@ -1376,7 +1390,7 @@ pub fn sharpe(returns: &[f64], periods_per_year: f64) -> f64 {
     }
 }
 
-fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
+pub(crate) fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
     if returns.is_empty() {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
@@ -1504,7 +1518,8 @@ fn md_bps(v: f64) -> String {
 impl Metrics {
     fn json(&self) -> String {
         format!(
-            "{{\"sharpe\":{},\"cagr\":{},\"max_drawdown\":{},\"turnover\":{},\
+            "{{\"sharpe\":{},\"cagr\":{},\"max_drawdown\":{},\"sortino\":{},\
+             \"sortino_mar\":{},\"log_growth\":{},\"turnover\":{},\
              \"exposure\":{},\"hit_rate\":{},\"break_even_hit_rate\":{},\
              \"trades\":{},\"entries\":{},\"rows\":{},\"active_rows\":{},\
              \"periods\":{},\"periods_per_year\":{},\"total_return\":{},\
@@ -1513,6 +1528,9 @@ impl Metrics {
             jnum(self.sharpe),
             jnum(self.cagr),
             jnum(self.max_drawdown),
+            jnum(self.sortino),
+            jnum(self.sortino_mar),
+            jnum(self.log_growth),
             jnum(self.turnover),
             jnum(self.exposure),
             jnum(self.hit_rate),
@@ -1605,6 +1623,18 @@ impl Report {
              \"threshold\":{{\"quantile\":{},\"method\":\"linear interpolation (numpy type 7)\",\
              \"source\":\"train or validation only\"}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{}}},\
+             \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":{},\
+             \"sharpe\":{{\"scale\":\"sqrt(periods_per_year)\",\"ddof\":1,\
+             \"undefined\":\"n<2, sd=0 (cash) or periods_per_year<=0\"}},\
+             \"sortino\":{{\"mar\":{},\
+             \"denominator\":\"population RMS of min(R-MAR,0) over all periods (ddof=0)\",\
+             \"scale\":\"sqrt(periods_per_year)\"}},\
+             \"log_growth\":{{\"transform\":\"log1p\",\"unit\":\"per-period\",\
+             \"ruin\":\"R<=-1 => -inf\"}},\
+             \"drawdown\":{{\"equity\":\"log\",\"unit\":\"fraction of peak\",\
+             \"sign\":\"negative or zero\",\"ruin\":\"-1\"}},\
+             \"beta_alpha\":{{\"beta\":\"dimensionless\",\"alpha\":\"per-period\",\
+             \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"test_used_for_selection\":{},\"candidate_count\":{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
@@ -1631,6 +1661,8 @@ impl Report {
             jnum(self.threshold_quantile),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
+            jnum(self.periods_per_year),
+            jnum(crate::risk::DEFAULT_SORTINO_MAR),
             self.candidates
                 .iter()
                 .map(|v| jstr(v))
@@ -1787,6 +1819,12 @@ impl Report {
             md_num(p.gross_sharpe)
         ));
         s.push_str(&format!(
+            "Sortino (MAR {}): {}; log-growth per period: {}.\n",
+            md_num(p.sortino_mar),
+            md_num(p.sortino),
+            md_num(p.log_growth)
+        ));
+        s.push_str(&format!(
             "\nPooled seam: {}; extra seam cost {} ({} trade(s)); pooled total variation {}.\n",
             if self.pool_reset_flat {
                 "flat reset at every boundary"
@@ -1854,6 +1892,10 @@ impl Report {
             p.break_even_hit_rate,
             p.trades,
             p.rows
+        ));
+        s.push_str(&format!(
+            "risk: Sortino(MAR {:.4}) {:.4}  log-growth/period {:.6}\n",
+            p.sortino_mar, p.sortino, p.log_growth
         ));
         s.push_str(&format!(
             "seam: {}  seam cost {:.4} bp  seam trades {}  pooled |delta| {:.6}",

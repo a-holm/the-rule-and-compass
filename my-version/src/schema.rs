@@ -192,7 +192,14 @@ pub fn json() -> String {
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
-{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}],\
+         \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":\"the reported annualisation value\",\
+         \"sharpe\":\"mean/sd(ddof=1)*sqrt(periods_per_year); NaN when n<2 or sd=0 (cash)\",\
+         \"sortino\":\"(mean-MAR)/(population RMS of min(R-MAR,0))*sqrt(periods_per_year); default MAR 0\",\
+         \"log_growth\":\"mean of log1p(R); -inf on R<=-1 (ruin)\",\
+         \"drawdown\":\"log-equity peak-to-trough as a negative fraction; -1 on ruin\",\
+         \"beta_alpha\":\"beta from (n,sum x,sum y,sum xy,sum x^2); alpha per period, annualised by periods_per_year\",\
+         \"daily\":\"compound blocks with risk::compound_blocks then use periods_per_year=365\"}}}},\n  \
          \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
  {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\
