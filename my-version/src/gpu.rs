@@ -18,6 +18,7 @@
 
 use crate::expr::{constant, node, Node, Op};
 use crate::gpu_stats::GpuStats;
+use crate::metrics::{ScoreObjective, ScoreStatus};
 
 /* Architecture-name parsing and toolkit requirements. The same file is
  * `include!`d by `build.rs`; declaring it here gives it unit tests. */
@@ -653,6 +654,31 @@ extern "C" {
     fn rc_eval_collect(ctx: *mut RawCtx, out: *mut f32) -> f32;
     fn rc_arena_report(ctx: *mut RawCtx, out: *mut RawArenaReport) -> i32;
     fn rc_arena_force_sync(ctx: *mut RawCtx, sync: i32) -> i32;
+    /* #287: native score objectives over the resident dataset. `kind` is an
+       RC_SCORE_* code, `pcount` holds one constant count per candidate (used
+       only by the AIC family), and every output is f64. `status` is 0 for ok
+       and 2 for a non-finite prediction; a negative return means the launch
+       failed and all outputs must be discarded. */
+    fn rc_score_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        nprog: i32,
+        kind: i32,
+        pcount: *const i32,
+        out: *mut f64,
+        status: *mut i32,
+    ) -> f32;
+    fn rc_pool_score(
+        ctx: *mut RawCtx,
+        which: i32,
+        nprog: i32,
+        width: i32,
+        kind: i32,
+        pcount: *const i32,
+        out: *mut f64,
+        status: *mut i32,
+    ) -> f32;
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
@@ -798,6 +824,33 @@ struct RawMaxOut {
     row: i32,
     /// `0` ok; `2` a row was not finite.
     status: i32,
+}
+
+/// #287: one native scoring batch: `f64` values plus a per-candidate status.
+///
+/// Unlike the legacy `Vec<f32>` SSE evaluator, a non-finite prediction is not
+/// folded into a finite sentinel: the value is `+inf` and the status says why.
+/// A negative [`Self::ms`] means the launch failed and no value may be trusted.
+#[derive(Clone, Debug)]
+pub struct ScoreBatch {
+    /// One score per candidate, exactly the configured [`ScoreObjective`].
+    pub values: Vec<f64>,
+    /// One status per candidate, in the same order.
+    pub status: Vec<ScoreStatus>,
+    /// Kernel time in milliseconds; negative on failure.
+    pub ms: f32,
+}
+
+impl ScoreBatch {
+    /// True when the launch succeeded and every candidate is usable.
+    pub fn all_ok(&self) -> bool {
+        self.ms >= 0.0 && !self.status.is_empty() && self.status.iter().all(|s| s.is_ok())
+    }
+
+    /// True when the vector shape is self-consistent.
+    pub fn is_consistent(&self) -> bool {
+        self.values.len() == self.status.len()
+    }
 }
 
 /// #169: the fit-kernel instantiation that owns a batch whose largest constant
@@ -1012,8 +1065,8 @@ pub struct GpuEvaluator {
     /// windows; this keeps the device intervals whose union is device-busy.
     ledger: crate::gpu_stats::RunLedger,
     /// #229: the objective every evaluation accumulates. Defaults to squared;
-    /// the search sets it from `--metric` only when [`DeviceLoss::for_metric`]
-    /// names a native kernel objective.
+    /// the legacy fit/eval path sets it from `--metric`; search scoring uses
+    /// [`crate::metrics::ScoreObjective`] via `score_pool` (#287).
     loss: crate::fit::DeviceLoss,
 }
 
@@ -1257,6 +1310,245 @@ impl GpuEvaluator {
         };
         self.record_batch(started.elapsed().as_secs_f64(), ok);
         result
+    }
+
+    /// #287: score a packed batch with a native [`ScoreObjective`].
+    ///
+    /// `pcount` supplies the fitted-constant count per candidate for the AIC
+    /// family; it is ignored by every other objective, but its length must
+    /// still equal `nprog` so a mis-sized batch is rejected on the host. The
+    /// returned values are `f64` and must never be divided by the row count:
+    /// the kernel already computes the configured mean/statistic, and a
+    /// non-finite row is `+inf` with [`ScoreStatus::NonFinite`].
+    pub fn score_batch(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+        objective: ScoreObjective,
+        pcount: &[i32],
+    ) -> ScoreBatch {
+        let nprog = offsets.len().saturating_sub(1);
+        if nprog == 0 {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: 0.0,
+            };
+        }
+        if pcount.len() != nprog {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: -1.0,
+            };
+        }
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            let mut values = vec![0.0f64; nprog];
+            let mut status = vec![0i32; nprog];
+            unsafe {
+                rc_stats_begin(self.ctx);
+                // `rc_score_batch` uploads the packed programs itself, so the
+                // batch ledger still covers one H2D window, not two.
+                let ms = rc_score_batch(
+                    self.ctx,
+                    prog.as_ptr(),
+                    offsets.as_ptr(),
+                    nprog as i32,
+                    objective.code(),
+                    pcount.as_ptr(),
+                    values.as_mut_ptr(),
+                    status.as_mut_ptr(),
+                );
+                if ms < 0.0 {
+                    ok = false;
+                }
+                let status: Vec<ScoreStatus> = status
+                    .into_iter()
+                    .map(|code| {
+                        if ms < 0.0 {
+                            ScoreStatus::DeviceError
+                        } else {
+                            ScoreStatus::from_code(code)
+                        }
+                    })
+                    .collect();
+                (values, status, ms)
+            }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        let (values, status, ms) = result;
+        ScoreBatch { values, status, ms }
+    }
+
+    /// #287: score a fixed-capacity [`GenomePool`] with a native objective.
+    ///
+    /// This is the search's production scoring entry point. It reuses the same
+    /// persistent arena as [`Self::eval_pool`], so a generation still does no
+    /// steady-state `cudaMalloc`/`cudaFree`.
+    pub fn score_pool(
+        &mut self,
+        pool: &crate::genome::GenomePool,
+        objective: ScoreObjective,
+        pcount: &[i32],
+    ) -> ScoreBatch {
+        let n = pool.len();
+        if n == 0 {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: 0.0,
+            };
+        }
+        if pcount.len() != n {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: -1.0,
+            };
+        }
+        let width = pool.width();
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            let mut values = vec![0.0f64; n];
+            let mut status = vec![0i32; n];
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if self.pool_cap < pool.capacity() || self.pool_width != width {
+                    if rc_pool_reserve(self.ctx, pool.capacity() as i32, width as i32) != 0 {
+                        ok = false;
+                        return (Vec::new(), Vec::new(), -1.0);
+                    }
+                    self.pool_cap = pool.capacity();
+                    self.pool_width = width;
+                }
+                let which = (self.pool_last ^ 1) as i32;
+                if rc_pool_upload(self.ctx, which, pool.active().as_ptr(), n as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), Vec::new(), -1.0);
+                }
+                let ms = rc_pool_score(
+                    self.ctx,
+                    which,
+                    n as i32,
+                    width as i32,
+                    objective.code(),
+                    pcount.as_ptr(),
+                    values.as_mut_ptr(),
+                    status.as_mut_ptr(),
+                );
+                if ms < 0.0 {
+                    ok = false;
+                }
+                self.pool_last = which as usize;
+                let status: Vec<ScoreStatus> = status
+                    .into_iter()
+                    .map(|code| {
+                        if ms < 0.0 {
+                            ScoreStatus::DeviceError
+                        } else {
+                            ScoreStatus::from_code(code)
+                        }
+                    })
+                    .collect();
+                (values, status, ms)
+            }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        let (values, status, ms) = result;
+        ScoreBatch { values, status, ms }
+    }
+
+    /// #287: score a [`Population`] by reusing [`Self::score_batch`].
+    pub fn score_population(
+        &mut self,
+        population: &Population,
+        objective: ScoreObjective,
+        pcount: &[i32],
+    ) -> ScoreBatch {
+        let (prog, offsets) = population.programs();
+        self.score_batch(prog, offsets, objective, pcount)
+    }
+
+    /// #287: score `n` fixed-width slots read directly from `arena`.
+    ///
+    /// The flat postfix path already keeps its programs slot-major and
+    /// `HALT`-padded, so this is one upload and one launch. `pcount` is not
+    /// carried by [`crate::postfix::Arena`]; the parameter-aware AIC family is
+    /// kept off this path, and every other objective ignores the count.
+    pub fn score_arena(
+        &mut self,
+        arena: &[u32],
+        n: usize,
+        width: usize,
+        objective: ScoreObjective,
+    ) -> ScoreBatch {
+        if n == 0 {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: 0.0,
+            };
+        }
+        if width < 2 || arena.len() < n * width {
+            return ScoreBatch {
+                values: Vec::new(),
+                status: Vec::new(),
+                ms: -1.0,
+            };
+        }
+        let started = std::time::Instant::now();
+        let mut ok = true;
+        let result = (|| {
+            let mut values = vec![0.0f64; n];
+            let mut status = vec![0i32; n];
+            unsafe {
+                rc_stats_begin(self.ctx);
+                if self.pool_cap < n || self.pool_width != width {
+                    if rc_pool_reserve(self.ctx, n as i32, width as i32) != 0 {
+                        ok = false;
+                        return (Vec::new(), Vec::new(), -1.0);
+                    }
+                    self.pool_cap = n;
+                    self.pool_width = width;
+                }
+                let which = (self.pool_last ^ 1) as i32;
+                if rc_pool_upload(self.ctx, which, arena.as_ptr(), n as i32) != 0 {
+                    ok = false;
+                    return (Vec::new(), Vec::new(), -1.0);
+                }
+                let ms = rc_pool_score(
+                    self.ctx,
+                    which,
+                    n as i32,
+                    width as i32,
+                    objective.code(),
+                    std::ptr::null(),
+                    values.as_mut_ptr(),
+                    status.as_mut_ptr(),
+                );
+                if ms < 0.0 {
+                    ok = false;
+                }
+                self.pool_last = which as usize;
+                let status: Vec<ScoreStatus> = status
+                    .into_iter()
+                    .map(|code| {
+                        if ms < 0.0 {
+                            ScoreStatus::DeviceError
+                        } else {
+                            ScoreStatus::from_code(code)
+                        }
+                    })
+                    .collect();
+                (values, status, ms)
+            }
+        })();
+        self.record_batch(started.elapsed().as_secs_f64(), ok);
+        let (values, status, ms) = result;
+        ScoreBatch { values, status, ms }
     }
 
     /// #122: evaluate a fixed-capacity [`GenomePool`] through the persistent
@@ -2574,6 +2866,210 @@ mod tests {
                 i,
                 batch[i],
                 single[0]
+            );
+        }
+    }
+
+    /// #287: every native score objective matches the CPU reducer on the same
+    /// prediction vector. The kernel sees f32 rows; the reference receives the
+    /// identical f32 values widened to f64, so only reduction order can differ.
+    #[test]
+    fn native_score_objectives_match_the_cpu_reducer() {
+        use crate::metrics::{score_native, Metric};
+
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+        let objectives = [
+            (Metric::Squared, ScoreObjective::Squared),
+            (Metric::Absolute, ScoreObjective::Absolute),
+            (Metric::LogSquashed, ScoreObjective::LogSquashed),
+            (Metric::Signed, ScoreObjective::Signed),
+            (Metric::Maximum, ScoreObjective::Maximum),
+            (Metric::Correlation, ScoreObjective::Correlation),
+            (Metric::CorrelationSigned, ScoreObjective::CorrelationSigned),
+            (Metric::Aic, ScoreObjective::Aic),
+            (Metric::Aicc, ScoreObjective::Aicc),
+            (Metric::Bic, ScoreObjective::Bic),
+        ];
+        let pcount = vec![2i32; trees.len()];
+        for (metric, objective) in objectives {
+            let batch = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(batch.ms >= 0.0, "{} launch", objective.name());
+            assert!(batch.is_consistent());
+            for k in 0..trees.len() {
+                let want = score_native(
+                    &preds[k * n..(k + 1) * n]
+                        .iter()
+                        .map(|&v| v as f64)
+                        .collect::<Vec<_>>(),
+                    &y64,
+                    objective,
+                    2,
+                );
+                let got = batch.values[k];
+                assert_eq!(batch.status[k], ScoreStatus::Ok, "{} slot {k}", objective.name());
+                if objective == ScoreObjective::Maximum {
+                    assert_eq!(got.to_bits(), want.value.to_bits(), "{} slot {k}", metric.name());
+                } else if want.value.is_infinite() {
+                    assert_eq!(got, want.value, "{} slot {k}", metric.name());
+                } else if objective.is_correlation() {
+                    assert!(
+                        (got - want.value).abs() <= 1e-9,
+                        "{} slot {k}: GPU {got} vs CPU {}",
+                        metric.name(),
+                        want.value
+                    );
+                } else {
+                    let tol = 1e-12 * (1.0 + want.value.abs());
+                    assert!(
+                        (got - want.value).abs() <= tol,
+                        "{} slot {k}: GPU {got} vs CPU {} (tol {tol:e})",
+                        metric.name(),
+                        want.value
+                    );
+                }
+            }
+        }
+    }
+
+    /// #287: a non-finite prediction is `+inf` with status 2 on the device, not
+    /// the old finite `1e30/n` sentinel, for every native objective.
+    #[test]
+    fn native_score_nonfinite_is_inf_with_status() {
+        let n = 16;
+        let nv = 1;
+        let cols: Vec<f32> = (0..n).map(|i| i as f32 / n as f32).collect();
+        let y = vec![0.0f32; n];
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let trees = vec![
+            constant(f64::NAN),
+            node(Op::Div, vec![constant(1.0), constant(0.0)]),
+        ];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        for objective in [
+            ScoreObjective::Squared,
+            ScoreObjective::Absolute,
+            ScoreObjective::LogSquashed,
+            ScoreObjective::Signed,
+            ScoreObjective::Maximum,
+            ScoreObjective::Correlation,
+            ScoreObjective::CorrelationSigned,
+            ScoreObjective::Aic,
+            ScoreObjective::Aicc,
+            ScoreObjective::Bic,
+        ] {
+            let pcount = vec![0i32; pop.len()];
+            let batch = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(batch.ms >= 0.0);
+            for k in 0..pop.len() {
+                assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{}", objective.name());
+                assert_eq!(batch.values[k], f64::INFINITY, "{}", objective.name());
+                assert!(batch.values[k].is_infinite());
+            }
+        }
+    }
+
+    /// #287: the same candidate alone, in a batch of 7 and through the
+    /// fixed-slot arena produces identical bits (two runs included).
+    #[test]
+    fn native_score_is_composition_free_and_repeatable() {
+        use crate::genome::{GenomeMeta, GenomePool};
+
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let mut seven = Vec::new();
+        for i in 0..7 {
+            seven.push(trees[i % trees.len()].clone());
+        }
+        let pop = Population::from_trees(seven.iter());
+        let (prog, offsets) = pop.programs();
+        let pcount = vec![1i32; seven.len()];
+        // A 447-candidate composition exercises the widest audited batch while
+        // keeping the same reduction tree for the same n.
+        let many_trees: Vec<Node> = (0..447).map(|i| trees[i % trees.len()].clone()).collect();
+        let many_pop = Population::from_trees(many_trees.iter());
+        let (many_prog, many_offsets) = many_pop.programs();
+        let many_pcount = vec![1i32; many_trees.len()];
+        for objective in [
+            ScoreObjective::Squared,
+            ScoreObjective::Absolute,
+            ScoreObjective::LogSquashed,
+            ScoreObjective::Signed,
+            ScoreObjective::Maximum,
+            ScoreObjective::Correlation,
+            ScoreObjective::CorrelationSigned,
+            ScoreObjective::Aic,
+            ScoreObjective::Aicc,
+            ScoreObjective::Bic,
+        ] {
+            let all = ev.score_batch(prog, offsets, objective, &pcount);
+            let again = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(all.all_ok(), "{}", objective.name());
+            for k in 0..seven.len() {
+                let one_start = offsets[k] as usize;
+                let one_end = offsets[k + 1] as usize;
+                let one = ev.score_batch(
+                    &prog[one_start..one_end],
+                    &[0, (one_end - one_start) as u32],
+                    objective,
+                    &[1],
+                );
+                assert_eq!(
+                    all.values[k].to_bits(),
+                    one.values[0].to_bits(),
+                    "{} slot {k} alone vs batch",
+                    objective.name()
+                );
+                assert_eq!(
+                    all.values[k].to_bits(),
+                    again.values[k].to_bits(),
+                    "{} slot {k} repeat",
+                    objective.name()
+                );
+            }
+            // The fixed-slot pool must produce the same bits as the packed
+            // batch (same n -> same reduction tree).
+            let width = 32;
+            let mut pool = GenomePool::new(seven.len(), width);
+            let mut words = Vec::new();
+            for tree in &seven {
+                words.clear();
+                assert!(compile(tree, &mut words));
+                assert!(pool.push(&words, GenomeMeta::default()));
+            }
+            let slot = ev.score_pool(&pool, objective, &pcount);
+            assert!(slot.all_ok(), "{} pool", objective.name());
+            for k in 0..seven.len() {
+                assert_eq!(
+                    slot.values[k].to_bits(),
+                    all.values[k].to_bits(),
+                    "{} slot {k} pool vs packed",
+                    objective.name()
+                );
+            }
+            // One candidate in a batch of 447 must keep the bits it had alone
+            // and in the batch of 7 (same n, same fixed reduction tree).
+            let many = ev.score_batch(many_prog, many_offsets, objective, &many_pcount);
+            assert!(many.all_ok(), "{} 447", objective.name());
+            assert_eq!(
+                many.values[0].to_bits(),
+                all.values[0].to_bits(),
+                "{} slot 0: batch of 447 vs batch of 7",
+                objective.name()
             );
         }
     }

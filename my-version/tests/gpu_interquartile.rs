@@ -147,7 +147,7 @@ fn a_small_sample_keeps_the_labelled_cpu_interquartile_arm() {
     );
     let why = out.backend_reason.unwrap_or_default();
     assert!(
-        why.contains("interquartile fit arm") || why.contains("not scored natively"),
+        why.contains("interquartile fit arm") || why.contains("interquartile needs the exact order-statistic scorer"),
         "the CPU decision must be labelled: {why:?}"
     );
 }

@@ -45,19 +45,14 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236 / #229: the CUDA evaluator accumulates one objective. A metric whose
-/// objective the kernel does not compute must never be handed to it, or a
-/// slope/absolute/rank run is silently ranked by MSE. `squared` and
-/// `log_squashed` (native since #229) are the two exceptions.
+/// #236 / #287: the CUDA evaluator scores only metrics that the dispatch
+/// table maps to a native `ScoreObjective`. A refused metric must never be
+/// handed to it, or a slope/rank run is silently ranked by MSE.
 #[test]
-fn non_native_metrics_never_use_the_gpu_evaluator() {
+fn refused_metrics_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
     let metrics = [
-        Metric::Correlation,
-        Metric::CorrelationSigned,
         Metric::Median,
-        Metric::Maximum,
-        Metric::Signed,
         Metric::RankCorrelation,
         Metric::RankCorrelationSigned,
         Metric::Interquartile,
@@ -67,9 +62,6 @@ fn non_native_metrics_never_use_the_gpu_evaluator() {
         Metric::Slope,
         Metric::ImplicitDerivative,
         Metric::ImplicitResidual,
-        Metric::Aic,
-        Metric::Aicc,
-        Metric::Bic,
     ];
     for metric in metrics {
         let cfg = Config {
@@ -82,10 +74,33 @@ fn non_native_metrics_never_use_the_gpu_evaluator() {
             Backend::Cpu,
             "{metric:?} must not be scored by a GPU evaluator without its objective"
         );
-        assert_eq!(
-            rcsr::fit::DeviceLoss::for_metric(metric),
-            None,
-            "{metric:?} has no native device objective"
+        assert!(
+            rcsr::metrics::score_refusal(metric).is_some(),
+            "{metric:?} must carry a named score refusal"
+        );
+    }
+}
+
+/// #287: every native score objective is in the table, independent of whether
+/// this build has a CUDA device. The device-side arithmetic is covered by the
+/// `src/gpu.rs` tests.
+#[test]
+fn native_score_objectives_are_table_driven() {
+    for metric in [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Maximum,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ] {
+        assert!(
+            rcsr::metrics::native_score_objective(metric).is_some(),
+            "{metric:?} must have a native score objective"
         );
     }
 }
@@ -103,7 +118,8 @@ fn log_squashed_has_a_native_objective() {
         Some(rcsr::fit::DeviceLoss::LogSquashed)
     );
     // The information criteria fit by least squares and stay on the squared
-    // objective; they are still gated off the evaluator (parameter-aware).
+    // *fit* objective; their native score is the separate AIC-family reducer
+    // (#287).
     assert_eq!(
         rcsr::fit::fit_loss(Metric::Aic),
         Some(rcsr::fit::DeviceLoss::Squared)

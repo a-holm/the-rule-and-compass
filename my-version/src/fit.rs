@@ -148,17 +148,19 @@ impl FitStrategy {
 /// objective. The discriminants are the `metric` argument of
 /// `rc_eval`/`rc_pool_eval`/`rc_fit_batch` in `src/cuda/eval.cu`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceLoss {
+pub enum FitObjective {
     /// `Σ w·r²`.
     Squared,
     /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
     LogSquashed,
-    /// #224: `1 − |ρ|`. A **fit-only** objective: the evaluator still has no
-    /// native correlation scorer, so neither [`DeviceLoss::for_metric`] nor
-    /// [`fit_loss`] maps it. It is reachable through the fit kernel's direct
-    /// batch API, not through the search dispatch.
+    /// #224: `1 − |ρ|`. A **fit-only** objective: scoring is the separate
+    /// [`crate::metrics::ScoreObjective::Correlation`] table (#287), so
+    /// [`DeviceLoss::for_metric`] and [`fit_loss`] do not map it. Reachable
+    /// through the fit kernel's direct batch API, not through the search fit
+    /// dispatch.
     Correlation,
-    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`].
+    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`];
+    /// native scoring is [`crate::metrics::ScoreObjective::CorrelationSigned`].
     CorrelationSigned,
     /// #222: `Σ w·|r|`, minimised by per-row IRLS weights `1/max(|r|, 1e-6)`
     /// with true-`|r|` acceptance. Both the evaluator and the batched fit use
@@ -174,7 +176,12 @@ pub enum DeviceLoss {
     Logistic,
 }
 
-impl DeviceLoss {
+/// Backwards-compatible name for the fit objective. New code should say
+/// [`FitObjective`]: the scoring decision lives in
+/// [`crate::metrics::ScoreObjective`] and is independent of this enum (#287).
+pub type DeviceLoss = FitObjective;
+
+impl FitObjective {
     /// The `metric` code the CUDA entry points take.
     pub fn code(self) -> i32 {
         match self {
@@ -187,8 +194,10 @@ impl DeviceLoss {
         }
     }
 
-    /// Whether the **evaluator** entry points (`rc_eval`, `rc_pool_eval`) can
-    /// accumulate this objective. `false` for every fit-only code.
+    /// Whether the legacy f32 evaluator entry points (`rc_eval`, `rc_pool_eval`)
+    /// can accumulate this objective. Scoring itself is now driven by
+    /// [`crate::metrics::ScoreObjective`] (#287); this flag only labels the
+    /// fit-only arms.
     pub fn scores_on_device(self) -> bool {
         match self {
             DeviceLoss::Squared | DeviceLoss::LogSquashed | DeviceLoss::Absolute => true,
@@ -196,12 +205,13 @@ impl DeviceLoss {
         }
     }
 
-    /// The device objective for a metric the **evaluator** can rank, or `None`
-    /// when it cannot.
+    /// The fit objective for a metric that shares the squared/log/absolute
+    /// family, or `None` otherwise.
     ///
-    /// #234: `Logistic` is deliberately absent — a `log_loss` run scores every
-    /// candidate on the exact CPU metric and only its constants come from the
-    /// device (see [`fit_loss`] and [`fit_only_loss`]).
+    /// #234/#287: `Logistic` is deliberately absent — a `log_loss` run scores
+    /// every candidate on the exact CPU metric and only its constants come from
+    /// the device. Scoring is decided separately by
+    /// [`crate::metrics::score_dispatch`].
     pub fn for_metric(metric: Metric) -> Option<Self> {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
@@ -303,10 +313,10 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
 ///
 /// This is deliberately **not** [`fit_loss`]: the batched LM kernel does not
 /// minimise Spearman's rho, the rank stage does. It is also not
-/// [`DeviceLoss::for_metric`]: the evaluator cannot score rho yet, so a run
+/// [`DeviceLoss::for_metric`]: the fit dispatch has no rho LM objective, so a run
 /// using this arm keeps every fitness value on the CPU. Callers use this
 /// predicate for the fit dispatch; the *scoring* gate remains
-/// [`DeviceLoss::for_metric`].
+/// [`crate::metrics::ScoreObjective`] instead.
 pub fn rank_fit_only(metric: Metric) -> Option<bool> {
     rank_metric_signed(metric)
 }
@@ -373,7 +383,7 @@ impl OrderStat {
 /// device selects the exact median of `|pred − y|` (a segmented sort of the
 /// residual bits) and never accumulates an SSE. The evaluator cannot score a
 /// median, so this predicate selects the fit stage only; the *scoring* gate
-/// remains [`DeviceLoss::for_metric`] and every fitness value stays CPU `f64`.
+/// remains [`crate::metrics::score_dispatch`] and every fitness value stays CPU `f64`.
 pub fn median_fit_only(metric: Metric) -> bool {
     metric == Metric::Median
 }
@@ -576,7 +586,7 @@ pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bo
 /// not a [`fit_loss`]: the device reduces the exact `max |r|` (an order-free
 /// integer max over the `|r|` bit patterns) and drives the bisection on the
 /// error level, and the CPU scores every candidate with the configured
-/// maximum. The *scoring* gate remains [`DeviceLoss::for_metric`], so a
+/// maximum. The *scoring* gate is [`crate::metrics::score_dispatch`] (#287), so a
 /// `--metric maximum` run reports the `cpu` backend with that reason.
 ///
 /// A **weighted** maximum is refused: `weights_supported` excludes `Maximum`

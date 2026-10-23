@@ -150,6 +150,16 @@ struct RcCtx {
     unsigned int *d_prog;
     unsigned int *d_off;
     float *d_out;
+    /* #287: native-score readback buffers. `d_score_out` is f64 and
+       `d_score_status` carries 0 (ok) or 2 (non-finite); they are separate from
+       `d_out` so the legacy f32 SSE evaluator keeps its exact ABI. */
+    double *d_score_out;
+    int *d_score_status;
+    int score_cap;
+    /* #287: cached target moments for the two-pass correlation scorer. They are
+       computed once from the resident f32 target at rc_create time. */
+    double ybar;
+    double syy;
     /* #122: fixed-capacity, double-buffered genome arena. */
     unsigned int *d_pool[2];
     unsigned long long *d_hash;
@@ -574,6 +584,21 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
    and the response is `t/q`, which reproduce `logistic_irls`'s Newton step. */
 #define RC_LOSS_LOGISTIC 5
 
+/* #287: native score-objective codes (`ScoreObjective::code` in metrics.rs).
+   These are deliberately separate from the fit `RC_LOSS_*` codes: fitting and
+   scoring are different decisions, and `log_loss` remains fit-only. */
+#define RC_SCORE_SQUARED 0
+#define RC_SCORE_ABSOLUTE 1
+#define RC_SCORE_LOG_SQUASHED 2
+#define RC_SCORE_SIGNED 3
+#define RC_SCORE_MAXIMUM 4
+#define RC_SCORE_CORRELATION 5
+#define RC_SCORE_CORRELATION_SIGNED 6
+#define RC_SCORE_AIC 7
+#define RC_SCORE_AICC 8
+#define RC_SCORE_BIC 9
+#define RC_SCORE_NONFINITE 2
+
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
    finite floor keeps a single interpolated row from reaching a weight that
@@ -710,6 +735,209 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) eval_pool_kernel(const floa
         __syncthreads();
     }
     if (threadIdx.x == 0) out[p] = sh[0];
+}
+
+/* --- #287: native score-objective kernels -------------------------------
+ *
+ * One block per candidate, threads stride rows. The reduction tree is fixed
+ * (256 slots) and every thread visits rows in ascending order, so the result
+ * depends only on `(program, n)` and never on batch composition, grid size or
+ * which block a candidate happened to land in. No floating-point atomics are
+ * used; the only atomic is the integer "a row was non-finite" flag.
+ *
+ * MODE is a compile-time RC_SCORE_* code: the statistic is selected by the
+ * template, not by a runtime switch inside the row loop. Correlation needs two
+ * passes (sum p, then centred moments); every other objective is one pass.
+ *
+ * A non-finite prediction (or one above the same 1e30 hard-magnitude limit the
+ * old f32 evaluator used) writes `+inf` and status 2. It never writes a finite
+ * sentinel that the host could divide by n.
+ */
+template <int MODE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
+    const float *__restrict__ cols,
+    const float *__restrict__ y,
+    int n,
+    int v,
+    const unsigned int *__restrict__ prog,
+    const unsigned int *__restrict__ off,
+    int width,
+    int pooled,
+    double *__restrict__ out,
+    int *__restrict__ status,
+    double ybar,
+    double syy)
+{
+    const int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    const unsigned int *code = pooled
+        ? prog + (size_t)p * (size_t)width
+        : prog + off[p];
+    __shared__ double sh1[RC_MAX_THREADS];
+    __shared__ double sh2[RC_MAX_THREADS];
+    __shared__ unsigned long long shk[RC_MAX_THREADS];
+    __shared__ int shi[RC_MAX_THREADS];
+    __shared__ int sbad;
+
+    int bad = 0;
+    double a = 0.0;
+    double b = 0.0;
+    unsigned long long best_key = 0;
+    int best_row = 0;
+
+    if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        /* Pass 1: mean prediction. */
+        for (int i = tid; i < n; i += blockDim.x) {
+            const float pred = rc_exec_row(code, cols, n, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                bad = 1;
+            } else {
+                a += (double)pred;
+            }
+        }
+        if (tid == 0) sbad = 0;
+        sh1[tid] = a;
+        __syncthreads();
+        if (bad) atomicOr(&sbad, 1);
+        __syncthreads();
+        if (sbad) {
+            if (tid == 0) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_NONFINITE;
+            }
+            return;
+        }
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            __syncthreads();
+        }
+        const double pbar = sh1[0] / (double)n;
+
+        /* Pass 2: centred sums. ybar/syy were cached per fit sample. */
+        bad = 0;
+        a = 0.0;
+        b = 0.0;
+        for (int i = tid; i < n; i += blockDim.x) {
+            const float pred = rc_exec_row(code, cols, n, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                bad = 1;
+                continue;
+            }
+            const double dp = (double)pred - pbar;
+            const double dy = (double)y[i] - ybar;
+            a += dp * dp;
+            b += dp * dy;
+        }
+        if (tid == 0) sbad = 0;
+        sh1[tid] = a;
+        sh2[tid] = b;
+        __syncthreads();
+        if (bad) atomicOr(&sbad, 1);
+        __syncthreads();
+        if (sbad) {
+            if (tid == 0) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_NONFINITE;
+            }
+            return;
+        }
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                sh2[tid] += sh2[tid + st];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const double spp = sh1[0];
+            const double spy = sh2[0];
+            /* The CPU rule: zero variance on either side is rho = 0. */
+            const double rho = (spp <= 0.0 || syy <= 0.0)
+                ? 0.0
+                : spy / (sqrt(spp) * sqrt(syy));
+            out[p] = (MODE == RC_SCORE_CORRELATION_SIGNED)
+                ? 1.0 - rho
+                : 1.0 - fabs(rho);
+            status[p] = 0;
+        }
+        return;
+    }
+
+    /* One-pass reductions. Modes 7/8/9 accumulate RSS; the host applies the
+       AIC family's `k` penalty, which differs per candidate. */
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float pred = rc_exec_row(code, cols, n, i);
+        if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            bad = 1;
+            continue;
+        }
+        const double r = (double)pred - (double)y[i];
+        if (MODE == RC_SCORE_SQUARED || MODE == RC_SCORE_AIC ||
+            MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+            a += r * r;
+        } else if (MODE == RC_SCORE_ABSOLUTE) {
+            a += fabs(r);
+        } else if (MODE == RC_SCORE_LOG_SQUASHED) {
+            const double rr = r * r;
+            a += isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(r));
+        } else if (MODE == RC_SCORE_SIGNED) {
+            a += r;
+        } else if (MODE == RC_SCORE_MAXIMUM) {
+            const double ar = fabs(r);
+            const unsigned long long key = (unsigned long long)__double_as_longlong(ar);
+            if (key > best_key) {
+                best_key = key;
+                best_row = i;
+            }
+        }
+    }
+    if (tid == 0) sbad = 0;
+    sh1[tid] = a;
+    shk[tid] = best_key;
+    shi[tid] = best_row;
+    __syncthreads();
+    if (bad) atomicOr(&sbad, 1);
+    __syncthreads();
+    if (sbad) {
+        if (tid == 0) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_NONFINITE;
+        }
+        return;
+    }
+    if (MODE == RC_SCORE_MAXIMUM) {
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) {
+                const unsigned long long rk = shk[tid + st];
+                const int rr = shi[tid + st];
+                if (rk > shk[tid] || (rk == shk[tid] && rr < shi[tid])) {
+                    shk[tid] = rk;
+                    shi[tid] = rr;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[p] = __longlong_as_double((long long)shk[0]);
+            status[p] = 0;
+        }
+    } else {
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            const double sum = sh1[0];
+            if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+                out[p] = sum; /* RSS; host applies the penalty. */
+            } else if (MODE == RC_SCORE_SIGNED) {
+                out[p] = fabs(sum) / (double)n;
+            } else {
+                out[p] = sum / (double)n;
+            }
+            status[p] = 0;
+        }
+    }
 }
 
 /* #131 fixtures: raw per-row predictions of a packed batch, P x N row-major.
@@ -2629,6 +2857,22 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     }
     rc_upload(c->d_cols, cols, col_bytes);
     rc_upload(c->d_y, y, y_bytes);
+    /* #287: cache the target mean and centred sum of squares. The device
+       correlator re-executes predictions for its second pass but never pays to
+       recompute the target side. */
+    c->ybar = 0.0;
+    c->syy = 0.0;
+    if (n > 0) {
+        double s = 0.0;
+        for (int i = 0; i < n; ++i) s += (double)y[i];
+        c->ybar = s / (double)n;
+        double ss = 0.0;
+        for (int i = 0; i < n; ++i) {
+            const double d = (double)y[i] - c->ybar;
+            ss += d * d;
+        }
+        c->syy = ss;
+    }
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
     /* #285: copy streams and the per-slot events. A failed stream/event
@@ -2666,6 +2910,8 @@ void rc_destroy(void *ctx)
     if (c->d_prog) cudaFree(c->d_prog);
     if (c->d_off) cudaFree(c->d_off);
     if (c->d_out) cudaFree(c->d_out);
+    if (c->d_score_out) cudaFree(c->d_score_out);
+    if (c->d_score_status) cudaFree(c->d_score_status);
     if (c->d_pool[0]) cudaFree(c->d_pool[0]);
     if (c->d_pool[1]) cudaFree(c->d_pool[1]);
     if (c->d_hash) cudaFree(c->d_hash);
@@ -3027,6 +3273,180 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
+}
+
+/* #287: grow the f64 score readback buffers. They are separate from the
+   legacy f32 `d_out`, so the SSE ABI is unchanged. Returns 0 on success. */
+static int rc_score_reserve(RcCtx *c, int nprog)
+{
+    if (c->score_cap >= nprog) return 0;
+    if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
+    if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
+    if (rc_alloc((void **)&c->d_score_out, sizeof(double) * (size_t)nprog) != 0 ||
+        rc_alloc((void **)&c->d_score_status, sizeof(int) * (size_t)nprog) != 0) {
+        if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
+        if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
+        c->score_cap = 0;
+        return -1;
+    }
+    c->score_cap = nprog;
+    return 0;
+}
+
+/* #287: AIC-family post-processing, kept on the host so `k` can differ per
+   candidate without a device upload. The formula mirrors `metrics.rs`. */
+static double rc_aic_value(int kind, double rss, int n, int k)
+{
+    const double dn = (double)n;
+    const double dk = (double)k;
+    const double base = (rss <= 0.0) ? -INFINITY : dn * log(rss / dn);
+    if (kind == RC_SCORE_AIC) return base + 2.0 * dk;
+    if (kind == RC_SCORE_BIC) return base + dk * log(dn);
+    /* AICc */
+    if (!isfinite(base)) return base;
+    const double denom = dn - dk - 1.0;
+    if (denom <= 0.0) return INFINITY;
+    return base + 2.0 * dk + 2.0 * dk * (dk + 1.0) / denom;
+}
+
+/* Shared launcher for the packed and fixed-slot pool entry points. */
+static float rc_score_launch(RcCtx *c, const unsigned int *prog,
+                             const unsigned int *off, int width, int pooled,
+                             int nprog, int kind, const int *pcount,
+                             double *out, int *status)
+{
+    RcStats *st = &c->stats;
+    double t = rc_now_ms();
+    if (rc_score_reserve(c, nprog) != 0) {
+        st->failed = 1;
+        st->alloc_ms += rc_now_ms() - t;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
+    st->alloc_ms += rc_now_ms() - t;
+    int threads = RC_MIN_THREADS;
+    while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+
+    t = rc_now_ms();
+    cudaEventRecord(c->t0, 0);
+    switch (kind) {
+        case RC_SCORE_SQUARED:
+            score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_ABSOLUTE:
+            score_kernel<RC_SCORE_ABSOLUTE><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_LOG_SQUASHED:
+            score_kernel<RC_SCORE_LOG_SQUASHED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_SIGNED:
+            score_kernel<RC_SCORE_SIGNED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_MAXIMUM:
+            score_kernel<RC_SCORE_MAXIMUM><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_CORRELATION:
+            score_kernel<RC_SCORE_CORRELATION><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_CORRELATION_SIGNED:
+            score_kernel<RC_SCORE_CORRELATION_SIGNED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_AIC:
+            score_kernel<RC_SCORE_AIC><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_AICC:
+            score_kernel<RC_SCORE_AICC><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_BIC:
+            score_kernel<RC_SCORE_BIC><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        default:
+            st->failed = 1;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
+            return -1.0f;
+    }
+    cudaEventRecord(c->t1, 0);
+    st->launch_ms += rc_now_ms() - t;
+    t = rc_now_ms();
+    cudaEventSynchronize(c->t1);
+    st->sync_ms += rc_now_ms() - t;
+    if (cudaGetLastError() != cudaSuccess) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
+    t = rc_now_ms();
+    rc_download(out, c->d_score_out, sizeof(double) * (size_t)nprog);
+    rc_download(status, c->d_score_status, sizeof(int) * (size_t)nprog);
+    st->d2h_ms += rc_now_ms() - t;
+    st->d2h_bytes += sizeof(double) * (unsigned long long)nprog
+                   + sizeof(int) * (unsigned long long)nprog;
+    /* AIC family: convert the device RSS to the configured penalty here. */
+    if (kind == RC_SCORE_AIC || kind == RC_SCORE_AICC || kind == RC_SCORE_BIC) {
+        for (int i = 0; i < nprog; ++i) {
+            if (status[i] == 0) {
+                const int k = pcount ? pcount[i] : 0;
+                out[i] = rc_aic_value(kind, out[i], c->n, k);
+            }
+        }
+    }
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
+    st->kernel_ms = (double)ms;
+    st->batch = nprog;
+    st->wall_ms = rc_now_ms() - c->batch_start_ms;
+    return ms;
+}
+
+/* #287: score a packed batch. Returns milliseconds, negative on failure. */
+float rc_score_batch(void *ctx, const unsigned int *prog,
+                     const unsigned int *off, int nprog, int kind,
+                     const int *pcount, double *out, int *status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nprog <= 0 || !out || !status) return -1.0f;
+    if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1.0f;
+    /* #285 moved the packed upload into the persistent arena. The legacy
+       `d_prog`/`d_off` pointers are no longer filled, so score the arena slot
+       `rc_set_programs` just wrote. Wait for its H2D copy before launching. */
+    const int slot = c->arena_slot;
+    if (!c->arena_prog[slot] || !c->arena_off[slot]) return -1.0f;
+    if (c->arena_upload_async) {
+        cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
+    }
+    return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
+                           nprog, kind, pcount, out, status);
+}
+
+/* #287: score the fixed-slot programs already uploaded to `which`. */
+float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
+                    const int *pcount, double *out, int *status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !c->d_pool[which & 1] || nprog <= 0 || !out || !status)
+        return -1.0f;
+    return rc_score_launch(c, c->d_pool[which & 1], 0, width, 1, nprog, kind,
+                           pcount, out, status);
 }
 
 /* #118: start a fresh batch ledger. The Rust evaluator calls this once before
