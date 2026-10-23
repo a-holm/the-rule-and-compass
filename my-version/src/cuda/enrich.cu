@@ -646,7 +646,8 @@ __global__ void k_atr_py(const long long *__restrict__ t, const double *__restri
         int i = start + p;
         double v = NAN;
         if (isfinite(high[i]) && isfinite(low[i])) {
-            if (p == 0 || !isfinite(close[i - 1])) {
+            if (p == 0 || !isfinite(close[i - 1]) ||
+                t[i] - t[i - 1] != (long long)step) {
                 v = high[i] - low[i];
             } else {
                 double pc = close[i - 1];
@@ -786,6 +787,47 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
 static RcEnrichStats g_rank_last;
 
 extern "C" void rc_enrich_destroy(void *v);
+
+/* #298 engine-tail entry points live in `tail.cu`; they take raw device
+   pointers so that translation unit does not need the RcEnrich layout. */
+extern "C" {
+int rc_tail_donchian(const long long *t, const double *high, const double *low,
+                     const double *close, const int *seg_id, const int *ss,
+                     const int *sl, int nseg, int n, int step, int w, int centred,
+                     double *out);
+int rc_tail_stoch(const long long *t, const double *high, const double *low,
+                  const double *close, const int *seg_id, const int *ss,
+                  const int *sl, int nseg, int n, int step, int w, int mean_w,
+                  int which, double *out, double *scratch);
+int rc_tail_atr(const long long *t, const double *high, const double *low,
+                const double *close, const int *ss, const int *sl, int nseg,
+                int n, int step, int period, int which, double *out);
+int rc_tail_batr(const long long *t, const double *open, const double *high,
+                 const double *low, const double *close, const int *ss,
+                 const int *sl, int nseg, int n, int step, int period,
+                 double *out);
+int rc_tail_gapatr(const long long *t, const double *open, const double *high,
+                   const double *low, const double *close, const int *ss,
+                   const int *sl, int nseg, int n, int step, int period,
+                   double *out);
+int rc_tail_volrat(const long long *t, const double *high, const double *low,
+                   const double *close, const int *ss, const int *sl, int nseg,
+                   int n, int step, int p1, int p2, double *out);
+int rc_tail_adx(const long long *t, const double *high, const double *low,
+                const double *close, const int *ss, const int *sl, int nseg,
+                int n, int step, int period, int which, double *out);
+int rc_tail_bb_z(const long long *t, const double *close, const int *ss,
+                 const int *sl, int nseg, int n, int step, int w, int mode,
+                 double *out);
+int rc_tail_ma_slope(const long long *t, const double *close, const int *ss,
+                     const int *sl, int nseg, int n, int step, int w, int lag,
+                     double *out);
+int rc_tail_tod(const long long *t, int n, int step, int want_sin, double *out);
+int rc_tail_exotic(const long long *t, const double *high, const double *low,
+                   const double *close, const int *seg_id, const int *ss,
+                   const int *sl, int nseg, int n, int step, int which,
+                   double *out);
+}
 
 extern "C" {
 
@@ -953,6 +995,38 @@ void rc_enrich_last_stats(void *v, RcEnrichStats *out)
         c->last.d2h_bytes += (unsigned long long)c->n * sizeof(double);       \
     } while (0)
 
+/* Tail entries own their kernels and synchronise internally; this wrapper keeps
+   the same ledger windows as the in-file kernels. */
+#define RC_TAIL(c, call, out)                                                 \
+    do {                                                                      \
+        stats_begin(c);                                                       \
+        cudaEvent_t _e0, _e1;                                                 \
+        cudaEventCreate(&_e0);                                                \
+        cudaEventCreate(&_e1);                                                \
+        cudaEventRecord(_e0, 0);                                              \
+        double _l = rc_now_ms();                                              \
+        int _rc = (call);                                                     \
+        c->last.launch_ms += rc_now_ms() - _l;                                \
+        double _s = rc_now_ms();                                              \
+        cudaEventRecord(_e1, 0);                                              \
+        cudaEventSynchronize(_e1);                                            \
+        c->last.sync_ms += rc_now_ms() - _s;                                  \
+        float _ms = 0.0f;                                                     \
+        cudaEventElapsedTime(&_ms, _e0, _e1);                                 \
+        c->last.kernel_ms += _ms;                                             \
+        cudaEventDestroy(_e0);                                                \
+        cudaEventDestroy(_e1);                                                \
+        if (_rc != 0) {                                                       \
+            c->last.failed = 1;                                               \
+            stats_end(c);                                                     \
+            return -1;                                                        \
+        }                                                                     \
+        RC_DOWNLOAD(c, out, c->d_out);                                        \
+        c->last.failed = (cudaGetLastError() != cudaSuccess) ? 1 : 0;         \
+        stats_end(c);                                                         \
+        return c->last.failed ? -1 : 0;                                       \
+    } while (0)
+
 #define RC_END(c)                                                             \
     do {                                                                      \
         stats_end(c);                                                         \
@@ -1069,14 +1143,140 @@ int rc_enrich_vz(void *v, int w, double *out)
 int rc_enrich_donchian(void *v, int w, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
-    RC_ELEM_BEGIN(c, 0, 0);
-    int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_donchian<<<blocks, threads>>>(c->d_times, c->d_high, c->d_low,
-                                                       c->d_close, c->d_seg_start,
-                                                       c->d_seg_len, c->nseg, c->step, w,
-                                                       c->d_out)));
+    RC_TAIL(c, (rc_tail_donchian(c->d_times, c->d_high, c->d_low, c->d_close,
+                                c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                                c->nseg, c->n, c->step, w, 0, c->d_out)),
+            out);
+}
+
+int rc_enrich_donchian_centred(void *v, int w, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_donchian(c->d_times, c->d_high, c->d_low, c->d_close,
+                                c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                                c->nseg, c->n, c->step, w, 1, c->d_out)),
+            out);
+}
+
+int rc_enrich_stoch(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    /* The mean3 prefix needs (n + nseg + 1) doubles for sum and count each. */
+    double *scratch = NULL;
+    if (which == 1) {
+        size_t nb = (size_t)c->n + (size_t)c->nseg + 1;
+        if (cudaMalloc((void **)&scratch, 2 * nb * sizeof(double)) != cudaSuccess) {
+            return -1;
+        }
+    }
+    stats_begin(c);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventRecord(e0, 0);
+    double l = rc_now_ms();
+    int rc = rc_tail_stoch(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_id, c->d_seg_start, c->d_seg_len, c->nseg,
+                           c->n, c->step, 14, 3, which, c->d_out, scratch);
+    c->last.launch_ms += rc_now_ms() - l;
+    double s = rc_now_ms();
+    cudaEventRecord(e1, 0);
+    cudaEventSynchronize(e1);
+    c->last.sync_ms += rc_now_ms() - s;
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    c->last.kernel_ms += ms;
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    if (scratch) cudaFree(scratch);
+    if (rc != 0) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     RC_DOWNLOAD(c, out, c->d_out);
-    RC_END(c);
+    c->last.failed = (cudaGetLastError() != cudaSuccess) ? 1 : 0;
+    stats_end(c);
+    return c->last.failed ? -1 : 0;
+}
+
+int rc_enrich_atr(void *v, int period, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_atr(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                           c->step, period, which, c->d_out)),
+            out);
+}
+
+int rc_enrich_batr(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_batr(c->d_times, c->d_open, c->d_high, c->d_low,
+                            c->d_close, c->d_seg_start, c->d_seg_len, c->nseg,
+                            c->n, c->step, 14, c->d_out)),
+            out);
+}
+
+int rc_enrich_gapatr(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_gapatr(c->d_times, c->d_open, c->d_high, c->d_low,
+                              c->d_close, c->d_seg_start, c->d_seg_len, c->nseg,
+                              c->n, c->step, 14, c->d_out)),
+            out);
+}
+
+int rc_enrich_volrat(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_volrat(c->d_times, c->d_high, c->d_low, c->d_close,
+                              c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                              c->step, 16, 96, c->d_out)),
+            out);
+}
+
+int rc_enrich_adx(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_adx(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                           c->step, 14, which, c->d_out)),
+            out);
+}
+
+int rc_enrich_bb_z(void *v, int w, int mode, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_bb_z(c->d_times, c->d_close, c->d_seg_start,
+                            c->d_seg_len, c->nseg, c->n, c->step, w, mode,
+                            c->d_out)),
+            out);
+}
+
+int rc_enrich_ma_slope(void *v, int w, int lag, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_ma_slope(c->d_times, c->d_close, c->d_seg_start,
+                                c->d_seg_len, c->nseg, c->n, c->step, w, lag,
+                                c->d_out)),
+            out);
+}
+
+int rc_enrich_tod(void *v, int want_sin, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_tod(c->d_times, c->n, c->step, want_sin, c->d_out)),
+            out);
+}
+
+int rc_enrich_exotic(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_exotic(c->d_times, c->d_high, c->d_low, c->d_close,
+                              c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                              c->nseg, c->n, c->step, which, c->d_out)),
+            out);
 }
 
 int rc_enrich_ema(void *v, int span, double *out)
