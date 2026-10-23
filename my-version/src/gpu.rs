@@ -2998,6 +2998,12 @@ mod tests {
         let pop = Population::from_trees(seven.iter());
         let (prog, offsets) = pop.programs();
         let pcount = vec![1i32; seven.len()];
+        // A 447-candidate composition exercises the widest audited batch while
+        // keeping the same reduction tree for the same n.
+        let many_trees: Vec<Node> = (0..447).map(|i| trees[i % trees.len()].clone()).collect();
+        let many_pop = Population::from_trees(many_trees.iter());
+        let (many_prog, many_offsets) = many_pop.programs();
+        let many_pcount = vec![1i32; many_trees.len()];
         for objective in [
             ScoreObjective::Squared,
             ScoreObjective::Absolute,
@@ -3055,6 +3061,16 @@ mod tests {
                     objective.name()
                 );
             }
+            // One candidate in a batch of 447 must keep the bits it had alone
+            // and in the batch of 7 (same n, same fixed reduction tree).
+            let many = ev.score_batch(many_prog, many_offsets, objective, &many_pcount);
+            assert!(many.all_ok(), "{} 447", objective.name());
+            assert_eq!(
+                many.values[0].to_bits(),
+                all.values[0].to_bits(),
+                "{} slot 0: batch of 447 vs batch of 7",
+                objective.name()
+            );
         }
     }
 
