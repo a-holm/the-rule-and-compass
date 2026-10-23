@@ -422,6 +422,11 @@ squared error:
 | `correlation` | `1 − |ρ|` | two-pass centred moment, cached `ȳ, S_yy` |
 | `correlation_signed` | `1 − ρ` | same moment, signed |
 | `aic`, `aicc`, `bic` | RSS + penalty | one pass; `k` per candidate |
+| `log_loss` | mean `max(−u,0)+log1p(exp(−|u|))` | stable softplus, `u=t·p` (#289) |
+| `brier` | mean `(σ(p) − l)²` | proper Brier on the probability (#289) |
+| `hinge` | mean `1 − t·(2σ(p) − 1)` | the bounded sigmoid **surrogate** (#289) |
+| `hinge_ordinary` | mean `max(0, 1 − u)` | the SVM hinge (#289) |
+| `hinge_squared` | mean `max(0, 1 − u)²` | squared SVM hinge (#289) |
 
 The device kernel uses a fixed reduction tree, ascending row order and no
 floating-point atomics, so the same candidate scores identical bits alone or in
@@ -433,18 +438,23 @@ plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
 
 `median`, `interquartile`, `rank_correlation` and
-`rank_correlation_signed` are named refusals until #288; `auc`, `log_loss` and
-`hinge` until #289; `slope` and the implicit metrics remain CPU. Their named
-reason is printed and recorded in `backend_reason`. In particular `log_loss` is
-still a **fit-only** arm: the device moves its constants, but every fitness and
-finalist is the exact CPU log-loss.
+`rank_correlation_signed` are named refusals until #288; `auc` likewise needs
+the exact rank scorer with labels (#288); `slope` and the implicit metrics
+remain CPU. Their named reason is printed and recorded in `backend_reason`.
+`log_loss`, `brier` and the three hinge forms are native since #289 — see
+[Classification fitness](#classification-fitness-issue-289) below. Their
+fitness, the label sign and (for the classification family) the per-row
+weights live on the device; every reported number is still the exact CPU
+rebuild.
 
-The GPU path is used for single-output, unweighted, full-sample runs whose
-metric has a native score objective. Multi-output (`--target y1,y2`),
-`--weight`, a refused metric, and `--predictor-samples` keep the CPU evaluator,
-because they need more than one prediction per row, a different objective, a
-per-row weight array the evaluator does not carry, or a different set of rows
-every generation; the reason is printed in the one-line note.
+The GPU path is used for single-output, full-sample runs whose metric has a
+native score objective. Multi-output (`--target y1,y2`), a refused metric and
+`--predictor-samples` keep the CPU evaluator, because they need more than one
+prediction per row, a different objective, or a different set of rows every
+generation. `--weight` is admitted for the classification objectives (the
+device carries the weight vector, #289) and still refused for the regression
+objectives, whose weighted parity is a separate change; the reason is printed in
+the one-line note.
 
 The exception is the **fit** stage: `--fit-strategy gpu` moves the constants of
 a rank (`rank_correlation` / `rank_correlation_signed`), median or interquartile
@@ -1353,19 +1363,20 @@ positive definite — the one classification metric the note in
 `arbeidsmappe/crypto-rcsr/gpu-metrics/classification.md` calls optimisable
 without a surrogate.
 
-**Why the arm is fit-only.** The CPU fitness of `log_loss` is one `O(n)` pass,
-while the CPU fit (`logistic_irls`) is up to 16 rounds of `tree.clone()` + two
-LM sweeps + one metric pass. Measured on the pinned cell below, the fit owns
-**97.5 %** of a `log_loss` run's CPU work — the opposite of the AUC arm, where
-the exact fitness owned 70–77 % of the wall and a fit-only arm could not pay for
-itself (#233). The device is therefore admitted for the **fit** only, and the
-fitness stays the exact CPU value, which has a second benefit: the archive of a
-fit-only run is ranked on exactly the numbers a CPU run would produce, so a
-quality delta is attributable to the constants alone. `rc_eval` has no label
-semantics, so admitting the evaluator would be the #236 silent substitution
-(`DeviceLoss::for_metric(LogLoss)` stays `None`); `fit::fit_only_loss` names the
-split once and the search's gate, its scoring path and its fit dispatch all read
-it.
+**Why the arm was fit-only, and what #289 changed.** The CPU fitness of
+`log_loss` is one `O(n)` pass, while the CPU fit (`logistic_irls`) is up to 16
+rounds of `tree.clone()` + two LM sweeps + one metric pass. Measured on the
+pinned cell below, the fit owned **97.5 %** of a `log_loss` run's CPU work — the
+opposite of the AUC arm, where the exact fitness owned 70–77 % of the wall and a
+fit-only arm could not pay for itself (#233). The original #234 arm was therefore
+admitted for the **fit** only. #289 closes the remaining gap with a label-aware
+per-row scorer (`ScoreObjective::LogLoss`, [Classification
+fitness](#classification-fitness-issue-289)): the search now ranks
+log-loss/Brier/hinge on the device, and only the reported numbers stay the exact
+CPU rebuild. `DeviceLoss::for_metric(LogLoss)` is still `None` — the regression
+row loss has no label semantics — so the score objective is a separate
+`ScoreObjective` in the #287 table with disjoint launch codes; a fit launch can
+never be mistaken for a score launch.
 
 **The step is the CPU's step, in the same kernel.** With the label sign
 `t = 2l − 1`, the margin `u = t·p` and `q = σ(u)` clamped to
@@ -1441,10 +1452,10 @@ fit (97.5 %) against 1.06 s in the fitness. The device arm's fit stage is
 6.38 s of wall for 376 admitted candidates — **17.0 ms per candidate** against
 **63.6 ms** on the CPU, of which 0.92 ms is the kernel (**61–69× on the
 kernel**) — and the rest is the exact `f64` gate (two metric passes per
-proposal), the 41 labelled CPU fallbacks and the write-back. The arm also scores
-every candidate's fitness on the CPU (0.74 s, 8.1 % of wall). That is the cost
-model: a fit-only arm can recover at most the fit share (97.5 % here) and it
-actually recovers 2.4–3.9× because the gate and the fitness remain.
+proposal), the 41 labelled CPU fallbacks and the write-back. In the #234 measurement the arm also
+scored every candidate's fitness on the CPU (0.74 s, 8.1 % of wall); #289 now
+removes that term by scoring classification natively on the device, so the same
+fit-stage gain is no longer capped by CPU fitness.
 
 **Tests** (`tests/logloss_gpu.rs`): the label rule and its subset
 independence, single-class counting, the constant model against the closed form
@@ -1454,6 +1465,88 @@ independence, the single-class refusal, a 28/32/64-iteration termination guard,
 the proposal gate (worse / non-finite / kept), exact-CPU-reported errors at the
 search level, the `--no-fit` no-op, and the paired measurement as an ignored
 benchmark.
+
+### Classification fitness (#289)
+
+The #287 score table now has a label-aware block for long-only binary
+classification. The objective is the **configured metric**, never squared error
+and never a bounded surrogate with a different name:
+
+```text
+log_loss        w · [ max(−u, 0) + log1p(exp(−|u|)) ]      u = t·p
+brier           w · (σ(p) − l)²
+hinge           w · (1 − t·(2σ(p) − 1))                    bounded sigmoid
+hinge_ordinary  w · max(0, 1 − u)
+hinge_squared   w · max(0, 1 − u)²
+```
+
+`hinge` keeps its historical name and formula and the docs now say explicitly
+that it is a **bounded sigmoid surrogate**, not the SVM hinge; `hinge_ordinary`
+and `hinge_squared` are the separate SVM forms. A constant model has
+`b* = ln(n₊/n₋)` under log-loss and `σ(b*) = n₊/n` under Brier, and the tests
+pin both optima.
+
+**Codes and dispatch.** The classification objectives occupy the score codes
+10–14, after the regression block 0–9 (#287); the fit `RC_LOSS_*` codes remain
+0–5. `metrics::score_dispatch` maps every classification metric to one of them,
+so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
+labels (#288)`) rather than the old generic "classification metric" gate. The
+CPU reference is `metrics::score_native_weighted`, which the kernel mirrors.
+
+**Numerics.** `log_loss` is the Lin–Lin–Weng softplus, which never overflows and
+is exact for small `|u|`; the CPU `metrics::log_loss` uses the same form, so an
+extreme logit (`|p| = 10⁶`) is the analytic value on both sides rather than an
+arbitrary `1e-12` probability clamp. `σ` is the branch form
+`1/(1+e^{−x})` / `e^x/(1+e^x)`. Per-row arithmetic is `f32` (this evaluator's
+contract); the accumulator is a **fixed-order `f64` shared-memory tree**, never
+an atomic and never a `f32` sum. The per-row weight product and `Σw` are `f64`.
+
+**Weights and labels.** The host uploads the per-row weight vector and the label
+sign once per sample (`rc_set_score_weights`, `rc_set_fit_sign`; the same sign
+vector serves the log-loss fit). The weighted midpoint and class counts are
+taken over positive-weight rows, so a masked row cannot relabel a row that
+counts. A row with `w = 0` is skipped **before** `rc_exec_row`, so an undefined
+branch in it contributes nothing; a positive-weight non-finite prediction
+yields `+inf` with status 2, and an all-zero weight vector is status 4
+(`AllZeroWeight`). The kernel divides its weighted sum by `Σw` in `f64`, exactly
+`metrics::score_weighted`. A classification launch without an uploaded sign is
+refused (negative time), so the search takes the exact CPU scorer rather than
+silently ranking by MSE.
+
+**Determinism.** One owner block per candidate, fixed row stride, fixed thread
+count from `N`, and a fixed reduction tree: a candidate's score is bit-identical
+alone, inside a 512-candidate batch, and on a repeated call. The integer paths
+are unaffected; `f32` device scores are not claimed to be bit-identical across
+devices or toolkits, and every reported number is the exact CPU `f64` rebuild.
+
+**Tests** (`tests/classification_gpu.rs`): the objective map and disjoint
+launch codes, weighted duplicate-row parity and `Σw` scaling, masked
+target/prediction invisibility, constant-model optima, the metric-aware proposal
+gate (a proposal that lowers log-loss but raises Brier is rejected under
+`--metric brier`; a proposal that lowers log-loss but lowers AUC is rejected
+under `--metric auc`), the labelled `auc` refusal, device-vs-CPU parity on the
+same `f32` rows (relative ≤ 1e-6) and against the `f64` model (≤ 1e-5), no rank
+inversion, weighted `Σw` and batch determinism, the zero-weight `ln(-1)` skip,
+and a native-Brier search whose archive is the exact CPU rebuild. The paired
+native-fitness vs CPU scorer benchmark is an ignored test.
+
+**Measured cost** (`bench_classification_fitness`, RTX 3060 shared host,
+`P = 32` models, 5 repeats; both arms score the same rows, the device uploads
+them once and the CPU arm pays the per-candidate prediction walk plus the metric
+pass, which is exactly the cost the search paid before #289):
+
+| `N` | objective | weights | CPU | device | kernel | speed-up | CPU row-evals/s | device row-evals/s |
+|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 154 000 | `log_loss` | no | 1.889 s | 0.0085 s | 0.0069 s | **222×** | 1.304e7 | 2.895e9 |
+| 154 000 | `brier` | no | 1.513 s | 0.0092 s | 0.0069 s | **165×** | 1.628e7 | 2.691e9 |
+| 154 000 | `log_loss` | yes | 2.214 s | 0.0112 s | 0.0085 s | **197×** | 1.113e7 | 2.197e9 |
+| 2 456 306 | `log_loss` | no | 30.30 s | 0.0809 s | 0.0771 s | **374×** | 1.297e7 | 4.856e9 |
+| 2 456 306 | `brier` | yes | 27.11 s | 0.0930 s | 0.0904 s | **292×** | 1.449e7 | 4.227e9 |
+
+This is the scorer stage only, not an end-to-end search claim; the best value
+agreed within 1e-5 relative to the CPU arm (f32 rows). The device threshold is
+clearly above the measured CPU path at both sizes, so the 8.1 % fitness share
+from the #234 cell is removed rather than moved.
 
 ### Metric-aware verification and the signed arm (#228)
 
@@ -1796,7 +1889,7 @@ substitute for either.
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
 | logistic log-loss constants on the batched kernel: Fisher weights `q(1-q)`, uploaded label sign, softplus trial objective, closed-form and parity fixtures, extreme logits, single-class refusal, proposal gate, determinism, `--no-fit`, 28/32/64-iteration termination guard (#234) | RTX 3060, `cargo test --release --features cuda --test logloss_gpu` (21 tests) and the ignored `bench_logloss_end_to_end` | **verified** on three paired seeds (2.38×/3.92×/3.14×, quality a wash) |
-| `log_loss` **native fitness** on the device (a log-loss scorer in `rc_eval`) | — | **not built**: the evaluator has no label semantics, so the fitness is exact CPU; a device fitness is only worth it once the fit stage is cheap (it is 8.1 % of wall now) |
+| **Native classification fitness**: `log_loss`, `brier`, `hinge`, `hinge_ordinary`, `hinge_squared` in the label-aware score kernel; stable softplus/sigmoid; uploaded sign and weights; zero-weight skip; `f64` fixed reduction; exact CPU-finalist rebuild; metric-aware gate (#289) | RTX 3060, `cargo test --release --features cuda --test classification_gpu` and the ignored paired benchmark | **verified** (device/CPU ≤1e-6 on the same f32 rows, ≤1e-5 vs f64; weighted parity; no rank inversion; masked-row skip; deterministic; native-Brier search reports exact CPU values). The large-`N` paired cost is the table in [Classification fitness](#classification-fitness-issue-289) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |

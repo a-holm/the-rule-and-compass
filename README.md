@@ -29,9 +29,11 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
 (#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
-on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
-constants and the exact CPU `f64` log-loss judges the proposal, scores every
-candidate and refits every finalist), and the exact correlation objective with
+on the binary label for `log_loss` (#234; the device proposes the constants
+and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
+and since #289 the search also scores log-loss, Brier and the three hinge forms
+with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
+surrogate, not the SVM hinge), and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;
@@ -715,9 +717,10 @@ influence on the fit or the error.
 rcsr --data d.csv --target y --vars x --weight w --metric squared
 ```
 
-`absolute`, `squared`, `signed`, `log_squashed`, `correlation` and
-`correlation_signed` become weighted means (weighted Pearson for the
-correlations); `aic`, `aicc` and `bic`
+`absolute`, `squared`, `signed`, `log_squashed`, `log_loss`, `brier`, the
+three hinge forms, `correlation` and `correlation_signed` become weighted means
+(weighted Pearson for the correlations; the weighted classification midpoint
+and class counts use positive-weight rows only); `aic`, `aicc` and `bic`
 use the weighted RSS and the number of positive-weight rows as `n`. A weight of
 2 is exactly a duplicated row because the normalisation is `Σwᵢ·lossᵢ / Σwᵢ`,
 not division by the row count. The fitter solves the weighted least-squares
@@ -725,7 +728,7 @@ problem (`sqrt(w)` on every residual), and the standard errors use the weighted
 `JᵀWJ` with `dof = #positive weights − k`.
 
 Metrics with no standard weighted form (`median`, `maximum`, `interquartile`,
-`slope`, `rank_correlation`, `auc`, `log_loss`, `hinge`) **refuse** `--weight`
+`slope`, `rank_correlation`, `auc`) **refuse** `--weight`
 with a usage error that lists the supported ones: weights are never silently
 ignored. The text report says
 
@@ -944,9 +947,11 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
 (#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
-on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
-constants and the exact CPU `f64` log-loss judges the proposal, scores every
-candidate and refits every finalist), and the exact correlation objective with
+on the binary label for `log_loss` (#234; the device proposes the constants
+and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
+and since #289 the search also scores log-loss, Brier and the three hinge forms
+with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
+surrogate, not the SVM hinge), and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;

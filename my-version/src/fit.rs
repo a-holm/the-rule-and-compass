@@ -243,13 +243,17 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 /// `f64`; `None` when the metric is scored natively on the device or has no
 /// device fit objective at all.
 ///
-/// `log_loss` is the first metric in this class whose fit is the batched LM
-/// kernel's own objective (rank and median are fit-only polish arms), so the
-/// predicate names the split once and the search's gate, its scoring path and
-/// its fit dispatch all read it.
+/// `log_loss` was the first metric in this class whose fit is the batched LM
+/// kernel's own objective. #289 gives it (and Brier/hinge) a native scorer, so
+/// the predicate now returns `None` for it; the split still names itself once
+/// and the search's gate, scoring path and fit dispatch all read it.
 pub fn fit_only_loss(metric: Metric) -> Option<DeviceLoss> {
     let loss = fit_loss(metric)?;
-    if loss.scores_on_device() {
+    // #289: a metric is fit-only only when the evaluator has no native
+    // **score** objective either. `log_loss` used to be the example; it now
+    // has a native per-row scorer (`ScoreObjective::LogLoss`), so it is no
+    // longer fit-only and the split stays a single predicate.
+    if loss.scores_on_device() || crate::metrics::ScoreObjective::for_metric(metric).is_some() {
         None
     } else {
         Some(loss)
@@ -2968,7 +2972,17 @@ pub fn fit_weighted_metric(
         LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / (1.0 + r * r)
         }),
-        Auc | LogLoss | Hinge => logistic_irls(tree, x, y, w, iters, metric),
+        // #289: Brier and the SVM hinge forms have exact **scores** but no
+        // exact least-squares/IRLS weight on the CPU. The logistic IRLS step is
+        // a warm start and the configured metric decides whether it is kept, so
+        // the arm never claims to minimise a different objective: the returned
+        // value is always `metric_score` of the configured metric.
+        Auc
+        | LogLoss
+        | Brier
+        | Hinge
+        | HingeOrdinary
+        | HingeSquared => logistic_irls(tree, x, y, w, iters, metric),
         // #224: correlation has an exact objective, an analytic gradient and a
         // structural gauge handler; it never falls back to a squared fit.
         Correlation | CorrelationSigned => {
@@ -3180,6 +3194,66 @@ pub fn classification_signs(y: &[f64]) -> Vec<f64> {
         .into_iter()
         .map(|l| 2.0 * l - 1.0)
         .collect()
+}
+
+/// #289: the label sign under the **weighted** midpoint rule.
+///
+/// The midpoint is taken over rows with `w > 0` only, matching
+/// [`crate::metrics::score_weighted`]'s weighted classification branch: a
+/// zero-weight row is invisible, so a wild or masked target in it cannot move
+/// the label of a row that counts. Masked rows get `-1`, which no scorer or
+/// fitter reads because it skips `w = 0` before the row.
+pub fn classification_signs_weighted(y: &[f64], w: &[f64]) -> Vec<f64> {
+    if w.is_empty() {
+        return classification_signs(y);
+    }
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (&v, &wi) in y.iter().zip(w) {
+        if wi > 0.0 {
+            if !v.is_finite() {
+                // A positive-weight non-finite target is invalid, not a label.
+                // NaN signs make the device reject the row instead of silently
+                // assigning it to a class the CPU scorer refuses.
+                return vec![f64::NAN; y.len()];
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    let mid = 0.5 * (lo + hi);
+    y.iter()
+        .zip(w)
+        .map(|(&v, &wi)| if wi > 0.0 && v > mid { 1.0 } else { -1.0 })
+        .collect()
+}
+
+/// #289: `(positives, negatives)` among rows with `w > 0`.
+pub fn class_counts_weighted(y: &[f64], w: &[f64]) -> (usize, usize) {
+    if !w.is_empty()
+        && y.iter()
+            .zip(w)
+            .any(|(&v, &wi)| wi > 0.0 && !v.is_finite())
+    {
+        // No valid labels: the caller labels this sample `single_class` and
+        // keeps the exact CPU arm rather than fitting a NaN sign.
+        return (0, 0);
+    }
+    let signs = classification_signs_weighted(y, w);
+    let pos = if w.is_empty() {
+        signs.iter().filter(|&&t| t > 0.0).count()
+    } else {
+        signs
+            .iter()
+            .zip(w)
+            .filter(|(&t, &wi)| wi > 0.0 && t > 0.0)
+            .count()
+    };
+    let total = if w.is_empty() {
+        y.len()
+    } else {
+        w.iter().filter(|&&v| v > 0.0).count()
+    };
+    (pos, total - pos)
 }
 
 /// #234: `(positives, negatives)` under the [`classification_signs`] rule.
