@@ -33,6 +33,36 @@ set; the test block is never consulted. Quantiles use linear interpolation
 (numpy's default, type 7), so a reference run that uses `np.quantile(x, q)`
 gets the same threshold bit for bit.
 
+### Exact threshold (#305)
+
+The threshold is a **discrete input**: a one-ulp difference flips every row
+whose score sits on the boundary. `rcsr` therefore selects the type-7 quantile
+exactly instead of sorting or sketching:
+
+* each finite score is mapped to an order-preserving unsigned key; negative
+  zero is canonicalised to positive zero and NaN/`±inf` are excluded, exactly
+  as the reference `quantile` filters them;
+* the two ranks bracketing `h = (n - 1) * q` are selected by a 256-bin radix
+  count, and the interpolation `lo + (h - lo) * (hi - lo)` is evaluated in
+  `f64` with the same expression as numpy's type 7;
+* the radix count is integer-only, so chunk boundaries, batch composition and
+  thread count cannot change `theta`.
+
+`--threshold-fixed <theta>` supplies a pre-registered constant instead. The
+window report names the provenance in `threshold_source`:
+`train_type7`, `validation_type7` or `fixed`. An approximate/sketch threshold
+may be used to screen candidates, but it is labelled screening-only and cannot
+place a reported position.
+
+### Shared valid-row mask (#305)
+
+A row enters the P&L denominator only when **both** its score and its target
+are finite (`trading_gpu::ValidMask`). This is deliberately stricter than
+`position_for`, which only checks the score: in the pinned cell six rows have a
+finite score and a `NaN` target, and keeping them would change exposure, hit
+rate and every pooled return. `position = 1` iff the mask says the row is valid
+and `score > theta`; `score == theta` is flat.
+
 There is intentionally no arbitrary test-block selector: the test block is
 defined by the window's time bounds.
 
@@ -49,9 +79,11 @@ selection on test. A single `--expr` keeps the original behaviour.
 
 ## Position rule, costs and aggregation
 
-* `position = 1` if `score > threshold` and the score is finite, otherwise `0`.
-  There is no short leg and no leverage; `rcsr::walkforward::position_for`
-  exposes the rule.
+* `position = 1` if `score > threshold`, the score is finite and the shared
+  valid-row mask keeps the row (target finite too), otherwise `0`. There is no
+  short leg and no leverage; `rcsr::walkforward::position_for` exposes the
+  score-only comparison and `rcsr::trading_gpu::long_positions` the masked
+  vector.
 * `--cost-bps` is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every

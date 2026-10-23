@@ -48,6 +48,7 @@ pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
+pub mod trading_gpu; // #305: exact type-7 threshold and shared valid-row mask
 pub mod units;
 pub mod walkforward;
 pub mod zip; // #123: minimal stored/deflate ZIP reader

@@ -7598,7 +7598,11 @@ OPTIONS:
   --embargo <seconds>        extra gap between train_end and test_start
                              (default: the horizon)
   --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
-  --threshold-quantile <q>   training/validation score quantile (default {DEFAULT_QUANTILE})
+  --threshold-quantile <q>   exact type-7 training/validation score quantile
+                             (default {DEFAULT_QUANTILE}); selected by order-preserving
+                             radix count, so theta is bit-identical to numpy
+  --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
+                             reported with threshold_source = fixed
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -7641,6 +7645,8 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut embargo: Option<f64> = None;
     let mut cost_bps = walkforward::DEFAULT_COST_BPS;
     let mut quantile = walkforward::DEFAULT_QUANTILE;
+    let mut quantile_set = false;
+    let mut threshold_fixed: Option<f64> = None;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -7727,6 +7733,14 @@ fn run_walkforward(args: &[String]) -> ! {
                     need(args, i + 1, "--threshold-quantile"),
                     "--threshold-quantile",
                 );
+                quantile_set = true;
+                i += 1;
+            }
+            "--threshold-fixed" => {
+                threshold_fixed = Some(number(
+                    need(args, i + 1, "--threshold-fixed"),
+                    "--threshold-fixed",
+                ));
                 i += 1;
             }
             "--validation-frac" => {
@@ -7781,6 +7795,14 @@ fn run_walkforward(args: &[String]) -> ! {
     });
     if expressions.is_empty() {
         eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    }
+    if threshold_fixed.is_some() && quantile_set {
+        eprintln!(
+            "error: --threshold-fixed and --threshold-quantile are alternatives; \
+             pass one of them\n\n{}",
+            walkforward_usage()
+        );
         std::process::exit(EXIT_USAGE);
     }
     let expression = expressions[0].clone();
@@ -7854,6 +7876,7 @@ fn run_walkforward(args: &[String]) -> ! {
         embargo,
         cost_bps,
         threshold_quantile: quantile,
+        threshold_fixed,
         validation_frac,
         periods_per_year,
         candidates,

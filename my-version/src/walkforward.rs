@@ -12,10 +12,14 @@
 //!   `[train_start, train_end)` and test range `[test_start, test_end)`.
 //! * The gap `test_start - train_end` must be at least the label horizon
 //!   (`--horizon`) and the requested embargo. Rows in the gap are purged.
-//! * The threshold is a quantile of the expression score over the training
-//!   rows, or over an optional trailing validation slice of those rows. The
-//!   test block is never consulted. The quantile uses the linear interpolation
-//!   rule (numpy's default, type 7).
+//! * The threshold is an exact type-7 quantile (numpy's default) of the
+//!   expression score over the training rows, or over an optional trailing
+//!   validation slice of those rows. The test block is never consulted. #305
+//!   selects the two ranks around `h = (n - 1) q` by order-preserving radix
+//!   count and interpolates in `f64`; a pre-registered `--threshold-fixed`
+//!   value is reported with `threshold_source = "fixed"`.
+//! * A row enters the P&L denominator only when both score and target are
+//!   finite, through the shared `trading_gpu::ValidMask`.
 //! * `position = 1` when the score is strictly greater than the threshold and
 //!   the score is finite, otherwise `0`. There is no short leg and no leverage.
 //! * Costs are `cost_bps` per side on `|position - previous position|` inside
@@ -36,6 +40,7 @@ use crate::column::GroupBuf;
 use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
+use crate::trading_gpu::{self, Threshold, ThresholdSource, ValidMask};
 use std::collections::HashMap;
 
 /// Default per-side cost in basis points (10 bp, as in the pilot).
@@ -109,6 +114,9 @@ pub struct EvalSpec {
     pub cost_bps: f64,
     /// Quantile of the training/validation score used as the long threshold.
     pub threshold_quantile: f64,
+    /// Pre-registered fixed threshold. When set, it overrides the quantile and
+    /// the report says `threshold_source = "fixed"`.
+    pub threshold_fixed: Option<f64>,
     /// Optional trailing fraction of the training time range kept as validation.
     pub validation_frac: f64,
     /// Override the inferred annualisation (e.g. 365 for calendar days,
@@ -215,6 +223,8 @@ pub struct Report {
     pub pooled: Metrics,
     pub cost_bps: f64,
     pub threshold_quantile: f64,
+    /// The pre-registered fixed threshold, when one was supplied.
+    pub threshold_fixed: Option<f64>,
     pub validation_frac: f64,
     pub horizon: f64,
     pub embargo: f64,
@@ -475,6 +485,11 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
     if !(0.0..=1.0).contains(&spec.threshold_quantile) {
         return Err("--threshold-quantile must be in [0, 1]".to_string());
     }
+    if let Some(theta) = spec.threshold_fixed {
+        if !theta.is_finite() {
+            return Err("--threshold-fixed must be finite".to_string());
+        }
+    }
     if !(0.0..1.0).contains(&spec.validation_frac) {
         return Err("--validation-frac must be in [0, 1)".to_string());
     }
@@ -706,7 +721,7 @@ impl Accum {
                 } else {
                     scores
                 };
-                if source_scores.is_empty() {
+                if source_scores.is_empty() && spec.threshold_fixed.is_none() {
                     return Err(format!(
                         "window '{}': no finite {} scores for candidate {} to set the threshold",
                         d.window.label,
@@ -719,7 +734,13 @@ impl Accum {
                 } else {
                     0.0
                 };
-                let threshold = quantile(source_scores, spec.threshold_quantile);
+                let threshold = if let Some(theta) = spec.threshold_fixed {
+                    Threshold::fixed(theta)?.value()
+                } else if has_validation {
+                    Threshold::validation_type7(source_scores, spec.threshold_quantile).value()
+                } else {
+                    Threshold::train_type7(source_scores, spec.threshold_quantile).value()
+                };
                 match best {
                     Some((_, best_err, _)) if best_err <= err => {}
                     _ => best = Some((c, err, threshold)),
@@ -732,7 +753,13 @@ impl Accum {
             } else {
                 None
             };
-            let source_name = if has_validation { "validation" } else { "train" };
+            let source_name = if spec.threshold_fixed.is_some() {
+                ThresholdSource::Fixed
+            } else if has_validation {
+                ThresholdSource::ValidationType7
+            } else {
+                ThresholdSource::TrainType7
+            };
             let (ppy, inferred_dt) = match spec.periods_per_year {
                 Some(v) => (v, None),
                 None => infer_frequency(&d.test_rows),
@@ -793,7 +820,7 @@ impl Accum {
                 candidate,
                 validation_error,
                 threshold,
-                threshold_source: source_name.to_string(),
+                threshold_source: source_name.as_str().to_string(),
                 train_rows,
                 validation_rows: d.validation_scores[candidate].len(),
                 test_rows: ev.stats.rows,
@@ -834,6 +861,7 @@ impl Accum {
             pooled,
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
+            threshold_fixed: spec.threshold_fixed,
             validation_frac: spec.validation_frac,
             horizon: spec.horizon,
             embargo: spec.embargo_seconds(),
@@ -1159,12 +1187,12 @@ impl CrossSection {
 }
 
 /// The position rule, exposed so a test can pin the "never short" property.
+///
+/// It is the score-only rule; reported P&L applies the stricter shared mask
+/// (score **and** target finite) first. The comparison is strict, so
+/// `score == threshold` is flat.
 pub fn position_for(score: f64, threshold: f64) -> f64 {
-    if score.is_finite() && score > threshold {
-        1.0
-    } else {
-        0.0
-    }
+    trading_gpu::long_position(score, threshold) as f64
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -1178,10 +1206,14 @@ fn evaluate_window(
     previous: &mut HashMap<u64, f64>,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
-    // Non-finite score/target rows are dropped, exactly as before.
-    let valid: Vec<usize> = (0..rows.len())
-        .filter(|&i| scores[i].is_finite() && rows[i].target.is_finite())
-        .collect();
+    // #305: one shared mask, score and target both finite. `position_for`
+    // alone would keep a finite score with a NaN target; that is the six-row
+    // difference documented in docs/walkforward.md.
+    let mut mask = ValidMask::new(rows.len());
+    for i in 0..rows.len() {
+        mask.set(i, scores[i].is_finite() && rows[i].target.is_finite());
+    }
+    let valid: Vec<usize> = mask.indices().collect();
     let n = valid.len();
     let mut positions = vec![0.0f64; n];
     let mut costs = vec![0.0f64; n];
@@ -1205,7 +1237,7 @@ fn evaluate_window(
     });
     for &i in &order {
         let row = &rows[valid[i]];
-        let pos = position_for(scores[valid[i]], threshold);
+        let pos = trading_gpu::long_position(scores[valid[i]], threshold) as f64;
         let prev = previous.get(&row.group).copied().unwrap_or(0.0);
         let delta = pos - prev;
         let cost = cost_side * delta.abs();
@@ -1407,24 +1439,14 @@ fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
 // ---------------------------------------------------------------------------
 
 /// Linear-interpolation quantile (numpy's default, Hyndman-Fan type 7).
+///
+/// #305: this delegates to the exact order-preserving radix selection in
+/// [`crate::trading_gpu`]. The result is bit-identical to the former sort
+/// implementation (pinned by `tests/walkforward.rs` and `tests/pnl_gpu.rs`),
+/// but selection is `O(4n)` counts and cannot depend on a comparison-sort
+/// tie order. Non-finite values are filtered exactly as before.
 pub fn quantile(values: &[f64], q: f64) -> f64 {
-    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
-    if v.is_empty() {
-        return f64::NAN;
-    }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if v.len() == 1 {
-        return v[0];
-    }
-    let q = q.clamp(0.0, 1.0);
-    let h = (v.len() - 1) as f64 * q;
-    let lo = h.floor() as usize;
-    let hi = h.ceil() as usize;
-    if lo == hi {
-        v[lo]
-    } else {
-        v[lo] + (h - lo as f64) * (v[hi] - v[lo])
-    }
+    trading_gpu::type7_quantile_f64(values, q).theta
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -1602,8 +1624,10 @@ impl Report {
              \"cost_model\":{{\"per_side_bps\":{},\"round_trip_bps\":{},\
              \"charged_on\":\"|position change| per group; per-window metrics start flat, pooled carries the boundary\"}},\
              \"position_rule\":\"long/flat: 1 if score > threshold else 0; never short; no leverage\",\
-             \"threshold\":{{\"quantile\":{},\"method\":\"linear interpolation (numpy type 7)\",\
-             \"source\":\"train or validation only\"}},\
+             \"threshold\":{{\"quantile\":{},\"fixed\":{},\
+             \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
+             \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
+             \"screening_only\":false,\"source\":{}}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
              \"test_used_for_selection\":{},\"candidate_count\":{}}},\
@@ -1629,6 +1653,12 @@ impl Report {
             jnum(self.cost_bps),
             jnum(self.cost_bps * 2.0),
             jnum(self.threshold_quantile),
+            self.threshold_fixed.map_or("null".to_string(), jnum),
+            jstr(self
+                .windows
+                .first()
+                .map(|w| w.threshold_source.as_str())
+                .unwrap_or("none")),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
             self.candidates
@@ -1688,9 +1718,30 @@ impl Report {
             self.group_by.as_deref().unwrap_or("(none: one series)")
         ));
         s.push_str("## Rules\n\n");
+        let threshold_rule = if let Some(theta) = self.threshold_fixed {
+            format!(
+                "pre-registered fixed theta = {} (no data fitting; source `fixed`)",
+                theta
+            )
+        } else {
+            format!(
+                "q{:.4} of the {} scores, exact type-7 order-statistic selection \
+                 (order-preserving radix select, f64 interpolation; source `{}`)",
+                self.threshold_quantile,
+                if self.validation_frac > 0.0 {
+                    "training/validation split"
+                } else {
+                    "training"
+                },
+                self.windows
+                    .first()
+                    .map(|w| w.threshold_source.as_str())
+                    .unwrap_or("none")
+            )
+        };
         s.push_str(&format!(
             "- Long/flat only: `position = 1` when `score > threshold`, else `0`; never short, no leverage.\n\
-             - Threshold: q{:.4} of the {} scores, linear interpolation (numpy type 7).\n\
+             - Threshold: {}.\n\
              - Cost: {:.4} bp per side on `|position change|`, so {:.4} bp per round trip.\n\
              - Per-window metrics start every group flat; the pooled path {} and its total\n\
                variation includes the seam term `|p_end - q_start|`.\n\
@@ -1698,12 +1749,7 @@ impl Report {
              - Purge: horizon {:.1}s, embargo {:.1}s.\n\
              - Annualisation: {} ({:.6} periods/year).\n\
              - Source: {}.\n\n",
-            self.threshold_quantile,
-            if self.validation_frac > 0.0 {
-                "training/validation split"
-            } else {
-                "training"
-            },
+            threshold_rule,
             self.cost_bps,
             self.cost_bps * 2.0,
             if self.pool_reset_flat {
