@@ -45,6 +45,10 @@ extern "C" {
         close: *const f64,
         volume: *const f64,
         qvolume: *const f64,
+        trades: *const f64,
+        taker_buy_base: *const f64,
+        taker_buy_quote: *const f64,
+        present: u32,
         n: c_int,
         seg_start: *const c_int,
         seg_len: *const c_int,
@@ -115,7 +119,8 @@ extern "C" {
 pub enum DeviceColumn {
     /// The exact `i64` time block.
     Time,
-    /// `0` open, `1` high, `2` low, `3` close, `4` volume, `5` quote volume.
+    /// `0` open, `1` high, `2` low, `3` close, `4` volume, `5` quote volume,
+    /// `6` trades, `7` taker-buy base, `8` taker-buy quote.
     Value(i32),
 }
 
@@ -240,6 +245,9 @@ impl BatchBlock<'_> {
 
 impl EnrichGpu {
     /// Upload the resident source columns and segment table once.
+    ///
+    /// This is the whole-column path with no optional flow columns; the fused
+    /// flow/price-action producer uses [`EnrichGpu::new_with_flow`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         times: &[i64],
@@ -249,6 +257,46 @@ impl EnrichGpu {
         close: &[f64],
         volume: &[f64],
         quote_volume: &[f64],
+        seg_start: &[u32],
+        seg_len: &[u32],
+        step: i64,
+    ) -> Option<Self> {
+        let nan = vec![f64::NAN; times.len()];
+        Self::new_with_flow(
+            times,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            quote_volume,
+            &nan,
+            &nan,
+            &nan,
+            crate::features_gpu::PRESENT_VOLUME | crate::features_gpu::PRESENT_QUOTE_VOLUME,
+            seg_start,
+            seg_len,
+            step,
+        )
+    }
+
+    /// Whole-column upload including the optional flow columns (#297).
+    ///
+    /// An absent optional column is passed as an all-NaN slice and must have
+    /// its presence bit clear; consumers then emit `NaN`, never `0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_flow(
+        times: &[i64],
+        open: &[f64],
+        high: &[f64],
+        low: &[f64],
+        close: &[f64],
+        volume: &[f64],
+        quote_volume: &[f64],
+        trades: &[f64],
+        taker_buy_base: &[f64],
+        taker_buy_quote: &[f64],
+        present: u32,
         seg_start: &[u32],
         seg_len: &[u32],
         step: i64,
@@ -267,6 +315,10 @@ impl EnrichGpu {
                 close.as_ptr(),
                 volume.as_ptr(),
                 quote_volume.as_ptr(),
+                trades.as_ptr(),
+                taker_buy_base.as_ptr(),
+                taker_buy_quote.as_ptr(),
+                present,
                 times.len() as c_int,
                 starts.as_ptr(),
                 lens.as_ptr(),
@@ -329,7 +381,17 @@ impl EnrichGpu {
         // The context owns all six value arrays; arrays the projection does not
         // provide start as NaN, never as zero.
         let mut nan_mask = 0u32;
-        for (bit, which) in [(0u32, 0i32), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
+        for (bit, which) in [
+            (0u32, 0i32),
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (6, 6),
+            (7, 7),
+            (8, 8),
+        ] {
             if !sources
                 .iter()
                 .any(|s| s.destination == DeviceColumn::Value(which))
@@ -806,6 +868,23 @@ impl EnrichGpu {
             count: slots,
             rows,
         })
+    }
+
+    /// Opaque device context for the fused feature module (#297).
+    pub(crate) fn raw(&self) -> *mut std::ffi::c_void {
+        self.ctx as *mut std::ffi::c_void
+    }
+
+    /// A zeroed output buffer for one column.
+    pub(crate) fn blank(&self) -> Vec<f64> {
+        self.out()
+    }
+
+    /// Record one fused-family call in the same statistics ledger as the
+    /// single-column kernels.
+    pub(crate) fn record_fused(&mut self, started: std::time::Instant, ok: bool) {
+        self.record(started, ok);
+
     }
 
     pub fn stats(&self) -> GpuStats {
