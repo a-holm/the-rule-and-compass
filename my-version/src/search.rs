@@ -1186,7 +1186,19 @@ impl GpuSearch {
         let cpu_view = if on_cpu.is_empty() {
             None
         } else {
-            Some(EvalSample::new(train, cfg))
+            // #290: a whole batch routed to the CPU by the cost model does not
+            // need another SoA transpose. The scalar view scores exactly the
+            // same rows without paying (or counting) a full-train transpose;
+            // the SoA view is kept for the mixed supported/unsupported case
+            // that already needed one before this routing existed.
+            if force_cpu && slots.is_empty() {
+                Some(EvalSample {
+                    sample: train,
+                    cols: None,
+                })
+            } else {
+                Some(EvalSample::new(train, cfg))
+            }
         };
         let ticket = cpu_view.as_ref().map(|view| {
             let jobs: Vec<(usize, Node)> = on_cpu
@@ -1698,7 +1710,9 @@ fn score_generation(
             // `fit_only_device` and the `gpu.fit` counters instead. #290: a
             // native run claims the GPU only when a batch actually ran there;
             // the cost model may have kept every small batch on the CPU.
-            *used = g.native_metric && (g.device_eval_used || g.device_fit_used);
+            // Preserve a `used` already set by the overlap pipeline: this call
+            // only scores the leftovers and must not clear a prior device use.
+            *used = *used || (g.native_metric && (g.device_eval_used || g.device_fit_used));
             true
         }
         Err(e) => {
@@ -1812,6 +1826,11 @@ fn score_pipeline_batch(
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
     let (kept, errs) = eval_pipeline_jobs(g, &jobs, generation)?;
+    if !kept.is_empty() {
+        // #290: the overlap pipeline is a real device batch too; record it so
+        // the route ledger and the backend claim come from what ran.
+        g.device_eval_used = true;
+    }
     for (&k, &e) in kept.iter().zip(&errs) {
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
