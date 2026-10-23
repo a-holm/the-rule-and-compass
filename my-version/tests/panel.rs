@@ -237,6 +237,9 @@ fn eval_spec(windows: Vec<Window>) -> EvalSpec {
         pool_reset_flat: false,
         allow_lockbox: false,
         device_pnl: false,
+        policy: rcsr::walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
     }
 }
 

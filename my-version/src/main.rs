@@ -7599,6 +7599,15 @@ OPTIONS:
                              (default: the horizon)
   --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
   --threshold-quantile <q>   training/validation score quantile (default {DEFAULT_QUANTILE})
+  --policy <p>               threshold | band | dp (default threshold). band is a
+                             long-only no-trade band; dp keeps the threshold book
+                             and reports the exact hindsight DP as a bound, never
+                             as the strategy's P&L
+  --band <f>                 half-width beta of the no-trade band in score units
+                             (default 0; with --policy band, beta=0 reproduces
+                             the threshold rule bit for bit)
+  --min-hold <n>             minimum consecutive long rows before a band exit
+                             (default 1; requires --policy band)
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -7646,6 +7655,9 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut embargo: Option<f64> = None;
     let mut cost_bps = walkforward::DEFAULT_COST_BPS;
     let mut quantile = walkforward::DEFAULT_QUANTILE;
+    let mut policy = walkforward::Policy::Threshold;
+    let mut band_width = 0.0f64;
+    let mut min_hold = 1usize;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -7735,6 +7747,32 @@ fn run_walkforward(args: &[String]) -> ! {
                 );
                 i += 1;
             }
+            "--policy" => {
+                let src = need(args, i + 1, "--policy");
+                policy = match walkforward::Policy::parse(&src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                i += 1;
+            }
+            "--band" | "--band-width" => {
+                band_width = number(need(args, i + 1, "--band"), "--band");
+                i += 1;
+            }
+            "--min-hold" => {
+                let src = need(args, i + 1, "--min-hold");
+                min_hold = match src.parse::<usize>() {
+                    Ok(v) if v >= 1 => v,
+                    _ => {
+                        eprintln!("error: --min-hold needs an integer >= 1, got '{}'", src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                i += 1;
+            }
             "--validation-frac" => {
                 validation_frac = number(
                     need(args, i + 1, "--validation-frac"),
@@ -7762,6 +7800,38 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--quiet" => quiet = true,
             "--allow-lockbox" => allow_lockbox = true,
+            other if other.starts_with("--policy=") => {
+                let src = &other["--policy=".len()..];
+                policy = match walkforward::Policy::parse(src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+            }
+            other if other.starts_with("--band=") => {
+                band_width = number(
+                    other["--band=".len()..].to_string(),
+                    "--band",
+                );
+            }
+            other if other.starts_with("--band-width=") => {
+                band_width = number(
+                    other["--band-width=".len()..].to_string(),
+                    "--band-width",
+                );
+            }
+            other if other.starts_with("--min-hold=") => {
+                let src = &other["--min-hold=".len()..];
+                min_hold = match src.parse::<usize>() {
+                    Ok(v) if v >= 1 => v,
+                    _ => {
+                        eprintln!("error: --min-hold needs an integer >= 1, got '{}'", src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+            }
             other if other.starts_with('-') => {
                 eprintln!(
                     "error: unknown walkforward option '{}'\n\n{}",
@@ -7867,6 +7937,9 @@ fn run_walkforward(args: &[String]) -> ! {
         pool_reset_flat,
         allow_lockbox,
         device_pnl,
+        policy,
+        band_width,
+        min_hold,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
