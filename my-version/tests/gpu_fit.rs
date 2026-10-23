@@ -45,12 +45,12 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236 / #229: the CUDA evaluator accumulates one objective. A metric whose
-/// objective the kernel does not compute must never be handed to it, or a
-/// slope/absolute/rank run is silently ranked by MSE. `squared` and
-/// `log_squashed` (native since #229) are the two exceptions.
+/// #236 / #229: a 64-row sample is below every measured native scoring floor
+/// (#288), so these metrics keep the CPU here. A metric the device has no
+/// statistic for is refused regardless of sample size; the exact order/rank
+/// family is admitted only above its floor (see the `gpu_*` metric suites).
 #[test]
-fn non_native_metrics_never_use_the_gpu_evaluator() {
+fn metrics_without_an_admitted_scorer_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
     let metrics = [
         Metric::Correlation,

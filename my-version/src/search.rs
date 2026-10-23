@@ -591,11 +591,14 @@ struct GpuSearch {
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
     /// #230: true only when the CUDA evaluator scores this run's metric
-    /// itself. The rank family is *fitted* on the device (squared LM start +
-    /// exact rank polish) but still *scored* by the CPU, because the evaluator
-    /// kernel accumulates squared error; scoring it there would silently rank
-    /// the population by MSE (the #236 bug).
+    /// itself through the objective kernel. False for an exact order/rank run,
+    /// which is scored through [`crate::gpu::GpuEvaluator::score_batch`]
+    /// instead (#288); either way the population is never ranked by a proxy.
     native_metric: bool,
+    /// #288: the exact order-statistic/rank statistic this run is scored on,
+    /// or `None` when the run uses the objective kernel (`native_metric`) or
+    /// is fit-only. Set by the `gpu_blocker` dispatch gate.
+    native_score: Option<crate::gpu::ScoreStat>,
 }
 
 #[cfg(feature = "cuda")]
@@ -605,6 +608,8 @@ impl GpuSearch {
         fit_data: bool,
         loss: crate::fit::DeviceLoss,
         native_metric: bool,
+        // #288: the exact order-statistic/rank statistic this run is scored on.
+        native_score: Option<crate::gpu::ScoreStat>,
         // #234: the device fit needs the label sign for a log-loss run.
         logistic_fit: bool,
     ) -> Result<Self, String> {
@@ -670,6 +675,7 @@ impl GpuSearch {
                     fit_ms: 0.0,
                     fit_host_ms: 0.0,
                     native_metric,
+                    native_score,
                 })
             }
             None => Err(format!(
@@ -677,6 +683,13 @@ impl GpuSearch {
                 crate::gpu::GpuEvaluator::device_name()
             )),
         }
+    }
+
+    /// #288: whether the run's fitness comes from this evaluator, so the
+    /// backend may report `gpu`. True for both scoring shapes: the objective
+    /// kernel (`native_metric`) and the exact order/rank batch scorer.
+    fn claims_device(&self) -> bool {
+        self.native_metric || self.native_score.is_some()
     }
 
     /// #169: move the constants of the **admitted** pending candidates with
@@ -907,6 +920,10 @@ impl GpuSearch {
             return Ok(());
         }
 
+        // #288: an exact order-statistic/rank run is scored by the batch
+        // scorer over flattened plans, not by the objective (SSE/absolute/
+        // log-squashed) kernel. Routing it through `eval_pool` would rank the
+        // population by a proxy the metric is not defined on — the #236 bug.
         if defers_fit_to_gpu(cfg, true) {
             // #169 admission: screen every unfitted offspring with its seed
             // constants first, then fit only the best fraction of each island.
@@ -915,17 +932,135 @@ impl GpuSearch {
             // second time after the fit.
             self.fit_screened += pending.len();
             self.stats.entry(generation).or_default().fit_screened += pending.len();
-            self.evaluate_pending(islands, &pending, train, cfg, generation)?;
+            self.evaluate_the_batch(islands, &pending, train, cfg, generation)?;
             let admitted = select_promoted(islands, &pending, train.len());
             let fit_start = std::time::Instant::now();
             self.fit_pending(islands, &admitted, train, cfg, generation);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
             // Re-score the survivors so selection sees their fitted constants.
-            self.evaluate_pending(islands, &admitted, train, cfg, generation)?;
+            self.evaluate_the_batch(islands, &admitted, train, cfg, generation)?;
             return Ok(());
         }
 
-        self.evaluate_pending(islands, &pending, train, cfg, generation)
+        self.evaluate_the_batch(islands, &pending, train, cfg, generation)
+    }
+
+    /// #288: dispatch one batch to the scorer that can rank this run's metric.
+    ///
+    /// Both arms return the same value contract: the configured objective's
+    /// mean/statistic, and `+inf` for a candidate with a non-finite prediction.
+    /// A device decline is an `Err`, which turns the whole generation back to
+    /// the exact CPU scorer rather than leaving a proxy or a missing value.
+    fn evaluate_the_batch(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        pending: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+        generation: usize,
+    ) -> Result<(), String> {
+        if self.native_score.is_some() {
+            self.evaluate_pending_stat(islands, pending, train, cfg, generation)
+        } else {
+            self.evaluate_pending(islands, pending, train, cfg, generation)
+        }
+    }
+
+    /// #288: score one explicit set of pending candidates through the exact
+    /// order-statistic/rank batch entry point.
+    ///
+    /// Each candidate is flattened to a [`crate::fit::GpuFitPlan`] with its
+    /// current constants. A tree the flattening cannot represent is scored by
+    /// the bounded CPU pool, so it never loses fitness; its cause is the same
+    /// conservative `unsupported_plan` family the fit arm uses. The GPU and
+    /// the CPU fallback overlap exactly as in [`Self::evaluate_pending`].
+    fn evaluate_pending_stat(
+        &mut self,
+        islands: &mut [Vec<Ind>],
+        pending: &[(usize, usize)],
+        train: &Sample,
+        cfg: &Config,
+        generation: usize,
+    ) -> Result<(), String> {
+        let stat = self
+            .native_score
+            .expect("evaluate_pending_stat is only called for a native score stat");
+        let mut plans: Vec<crate::fit::GpuFitPlan> = Vec::with_capacity(pending.len());
+        let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
+        let mut on_cpu: Vec<(usize, usize)> = Vec::new();
+        let stats = self.stats.entry(generation).or_default();
+        stats.generation = generation;
+        for &(i, j) in pending {
+            match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
+                Ok(plan) => {
+                    plans.push(plan);
+                    slots.push((i, j));
+                }
+                Err(_) => on_cpu.push((i, j)),
+            }
+        }
+        stats.programs += plans.len();
+        stats.native += plans.len();
+        stats.fallbacks += on_cpu.len();
+        stats.unsupported_programs += on_cpu.len();
+        stats.fallback_workers = self
+            .fallback
+            .as_ref()
+            .expect("a GPU search owns its fallback pool")
+            .workers();
+
+        let cpu_view = if on_cpu.is_empty() {
+            None
+        } else {
+            Some(EvalSample::new(train, cfg))
+        };
+        let ticket = cpu_view.as_ref().map(|view| {
+            let jobs: Vec<(usize, Node)> = on_cpu
+                .iter()
+                .map(|&(i, j)| (0, islands[i][j].tree.clone()))
+                .collect();
+            self.fallback
+                .as_ref()
+                .expect("a GPU search owns its fallback pool")
+                .submit(jobs, view, cfg)
+        });
+
+        let mut gpu_error: Option<String> = None;
+        if !plans.is_empty() {
+            let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+            let constants: Vec<Vec<f64>> = refs.iter().map(|p| p.c0.clone()).collect();
+            match self.ev.score_batch(&refs, &constants, stat) {
+                Some(values) if values.len() == refs.len() => {
+                    for (&(i, j), value) in slots.iter().zip(values) {
+                        islands[i][j].error = value.unwrap_or(f64::INFINITY);
+                    }
+                }
+                _ => {
+                    gpu_error = Some(format!(
+                        "CUDA {} batch scoring failed",
+                        stat.name()
+                    ));
+                }
+            }
+        }
+        if let Some(ticket) = ticket {
+            let (errors, seconds) = self
+                .fallback
+                .as_ref()
+                .expect("a GPU search owns its fallback pool")
+                .finish(ticket);
+            if gpu_error.is_none() {
+                for (&(i, j), e) in on_cpu.iter().zip(errors.iter()) {
+                    islands[i][j].error = *e;
+                }
+            }
+            let stats = self.stats.entry(generation).or_default();
+            stats.fallback_seconds += seconds;
+        }
+        if let Some(e) = gpu_error {
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// #169: compile and score one explicit set of pending candidates in a
@@ -1405,8 +1540,10 @@ fn score_generation(
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
             // the run claim `backend = gpu`. The device use is reported through
-            // `fit_only_device` and the `gpu.fit` counters instead.
-            *used = g.native_metric;
+            // `fit_only_device` and the `gpu.fit` counters instead. #288: an
+            // exact order/rank run *is* scored on the device, so it claims the
+            // backend like the objective kernel does.
+            *used = g.claims_device();
             true
         }
         Err(e) => {
@@ -1527,19 +1664,38 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if cfg.metric.is_implicit() {
         return Some("implicit objective");
     }
-    if cfg.metric.is_classification() {
+    // #288: AUC has a native exact rank scorer, so it is the one
+    // classification metric that may reach the device. The label rule is the
+    // same midpoint rule as the CPU; a target with more than two distinct
+    // values is refused rather than collapsed. log_loss and hinge stay CPU.
+    if cfg.metric.is_classification()
+        && (cfg.metric != crate::metrics::Metric::Auc
+            || crate::metrics::classification_target_error(&train.y).is_some())
+    {
         return Some("classification metric");
     }
     if cfg.metric.is_parameter_aware() {
         return Some("parameter-aware metric");
     }
     // #236: the CUDA evaluator accumulates squared error; #229 adds one more
-    // native objective. A metric may use the device only when the kernel
-    // computes that objective itself, or a slope/absolute/rank run is silently
-    // ranked by MSE (observed: a different Pareto point for `--metric slope`).
-    // This is a correctness gate, not a performance preference.
-    if crate::fit::DeviceLoss::for_metric(cfg.metric).is_none() {
+    // native objective; #288 adds the exact order-statistic/rank batch scorer.
+    // A metric may use the device only when a kernel computes that statistic
+    // itself, or a slope/absolute/rank run is silently ranked by MSE
+    // (observed: a different Pareto point for `--metric slope`). This is a
+    // correctness gate, not a performance preference.
+    if crate::gpu::ScoreStat::for_metric(cfg.metric).is_none()
+        && crate::fit::DeviceLoss::for_metric(cfg.metric).is_none()
+    {
         return Some("metric is not scored natively on the GPU");
+    }
+    // #288: below the measured crossover the exact CPU statistic is cheaper
+    // than the device launch and sort. The run keeps the CPU scorer (and may
+    // still fit constants on the device through the fit-only arm); the reason
+    // is named, never silent.
+    if let Some(stat) = crate::gpu::ScoreStat::for_metric(cfg.metric) {
+        if train.len() < stat.min_rows() {
+            return Some(stat.small_sample_reason());
+        }
     }
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
@@ -3275,6 +3431,13 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     if cfg.fit_iters != 0 {
         return Err("constant fitting is enabled".to_string());
     }
+    // #288: the flat arena is scored by the objective kernel through
+    // `eval_pool`; an exact order-statistic/rank run must use the tree scorer
+    // over flattened plans, so it stays on the owned-tree loop rather than
+    // being ranked by an SSE proxy.
+    if crate::gpu::ScoreStat::for_metric(cfg.metric).is_some() {
+        return Err("exact order/rank scoring uses the tree scorer".to_string());
+    }
     if cfg.islands.max(1) * cfg.pop < 4096 {
         return Err(format!(
             "population {} is below the 4096-genome gate",
@@ -3995,12 +4158,33 @@ fn run_search(
         let maximum_fit = cfg.fit_strategy.defers_to_gpu()
             && cfg.fit_iters > 0
             && crate::fit::maximum_fit_only(cfg.metric);
-        let fit_only = rank_fit_only_arm(cfg, train).is_some()
-            || (order_stat_fit && order_stat_blocker.is_none())
-            || logistic_fit
-            || (maximum_fit && maximum_blocker.is_none());
-        let plan: Option<(crate::fit::DeviceLoss, bool)> = if fit_only {
-            backend_reason = Some(if logistic_fit {
+        // #288: an exact order-statistic/rank metric has a native *scoring*
+        // entry point, so it is admitted through the same gate as the
+        // objective kernel — no longer fit-only. `score_admitted` is the one
+        // decision the scorer, the gate and the status line share.
+        let score_stat = crate::gpu::ScoreStat::for_metric(cfg.metric);
+        let score_admitted = score_stat.is_some() && gpu_blocker(cfg, train).is_none();
+        let fit_only = !score_admitted
+            && (rank_fit_only_arm(cfg, train).is_some()
+                || (order_stat_fit && order_stat_blocker.is_none())
+                || logistic_fit
+                || (maximum_fit && maximum_blocker.is_none()));
+        let plan: Option<(
+            crate::fit::DeviceLoss,
+            bool,
+            Option<crate::gpu::ScoreStat>,
+        )> = if score_admitted {
+            Some((crate::fit::DeviceLoss::Squared, false, score_stat))
+        } else if fit_only {
+            // #288: a fit-only evaluator for an order/rank metric exists
+            // because the *scoring* floor (or another named gate) refused the
+            // native scorer; record that reason rather than the generic one.
+            let floor_reason = score_stat
+                .filter(|s| train.len() < s.min_rows())
+                .map(|s| s.small_sample_reason().to_string());
+            backend_reason = Some(if let Some(reason) = floor_reason {
+                reason
+            } else if logistic_fit {
                 format!(
                     "{} is scored exactly on the CPU; the device fits constants only",
                     cfg.metric.name()
@@ -4008,7 +4192,7 @@ fn run_search(
             } else {
                 "metric is not scored natively on the GPU".to_string()
             });
-            Some((crate::fit::DeviceLoss::Squared, false))
+            Some((crate::fit::DeviceLoss::Squared, false, None))
         } else {
             match gpu_blocker(cfg, train) {
                 Some(reason) => {
@@ -4019,24 +4203,25 @@ fn run_search(
                     None
                 }
                 None => {
-                    // #229: the gate above admits only metrics the kernel
-                    // scores natively, so this is always `Some`. It panics
-                    // rather than defaulting to squared error, because a silent
-                    // MSE ranking is exactly the #236 defect.
+                    // #229: the gate above admits only metrics a kernel scores
+                    // natively, so this is always `Some`. It panics rather than
+                    // defaulting to squared error, because a silent MSE ranking
+                    // is exactly the #236 defect.
                     let loss = crate::fit::DeviceLoss::for_metric(cfg.metric)
                         .expect("gpu_blocker admits only native device losses");
-                    Some((loss, true))
+                    Some((loss, true, None))
                 }
             }
         };
         match plan {
             None => None,
-            Some((loss, native)) => {
+            Some((loss, native, stat)) => {
                 match GpuSearch::new(
                     train,
-                    cfg.fit_strategy.defers_to_gpu(),
+                    cfg.fit_strategy.defers_to_gpu() || stat.is_some(),
                     loss,
                     native,
+                    stat,
                     logistic_fit,
                 ) {
                     Ok(g) => {
@@ -4044,7 +4229,9 @@ fn run_search(
                         if cfg.gpu_notes {
                             // #169: the GPU-fit arm runs at the generation
                             // barrier, so the overlap pipeline is off for it.
-                            let scheduling = if cfg.fit_strategy.defers_to_gpu()
+                            let scheduling = if stat.is_some() {
+                                "synchronous exact plan batches (#288)".to_string()
+                            } else if cfg.fit_strategy.defers_to_gpu()
                                 && defers_fit_to_gpu(cfg, true)
                             {
                                 "GPU-fit batches (synchronous)".to_string()
@@ -4068,6 +4255,14 @@ fn run_search(
                                     "native device loss, f32 fitness"
                                 };
                                 eprintln!("# gpu: {} ({}; {})", device, scheduling, fitness);
+                            } else if let Some(stat) = stat {
+                                eprintln!(
+                                    "# gpu: {} ({}; exact {} device statistic, f64 fitness \
+                                     and finalists, #288)",
+                                    device,
+                                    scheduling,
+                                    stat.name()
+                                );
                             } else if logistic_fit {
                                 eprintln!(
                                     "# gpu-fit: {} ({}; exact log-loss fit, CPU f64 fitness and \
@@ -4104,7 +4299,7 @@ fn run_search(
                                 );
                             }
                         }
-                        if !native {
+                        if !native && stat.is_none() {
                             fit_only_device = true;
                         }
                         backend_device = Some(device);
@@ -4596,7 +4791,11 @@ fn run_search(
             let pipeline_active = !screened
                 && defer_gpu
                 && cfg.pipeline_depth > 0
-                && !defers_fit_to_gpu(cfg, defer_gpu);
+                && !defers_fit_to_gpu(cfg, defer_gpu)
+                // #288: the overlap batches score compiled programs through the
+                // objective kernel; an exact order/rank run must use the plan
+                // scorer, so it takes the synchronous (tree) batch instead.
+                && crate::gpu::ScoreStat::for_metric(cfg.metric).is_none();
             #[cfg(not(feature = "cuda"))]
             let pipeline_active = false;
             // One batch is `pop / depth` candidates, so `depth` batches queue
@@ -5292,6 +5491,82 @@ mod tests {
             y.push(a);
         }
         Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    /// `n` rows of a smooth one-variable target, for the large-sample gates.
+    #[cfg(feature = "cuda")]
+    fn sample_rows(n: usize) -> Sample {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let a = -1.0 + 2.0 * i as f64 / (n - 1) as f64;
+            x.push(vec![a, 0.5 * a + 1.0]);
+            y.push(a);
+        }
+        Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    }
+
+    /// #288: the dispatch gate admits exactly the metrics with an exact
+    /// order/rank scorer and names every refusal.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn order_and_rank_metrics_pass_the_native_score_gate() {
+        use crate::metrics::Metric;
+        let mut s = sample_rows(crate::fit::MEDIAN_GPU_MIN_ROWS);
+        for metric in [
+            Metric::Median,
+            Metric::Interquartile,
+            Metric::Maximum,
+            Metric::RankCorrelation,
+            Metric::RankCorrelationSigned,
+        ] {
+            let cfg = Config { metric, ..Config::default() };
+            assert_eq!(
+                gpu_blocker(&cfg, &s),
+                None,
+                "{} must be admitted",
+                metric.name()
+            );
+        }
+        // AUC is the one classification metric with a native exact scorer; the
+        // midpoint rule needs a two-valued target.
+        for (i, y) in s.y.iter_mut().enumerate() {
+            *y = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let cfg = Config { metric: Metric::Auc, ..Config::default() };
+        assert_eq!(gpu_blocker(&cfg, &s), None);
+        s.y[0] = 2.0;
+        s.y[1] = -2.0;
+        assert_eq!(gpu_blocker(&cfg, &s), Some("classification metric"));
+        // A metric outside the table keeps its named refusal, never MSE.
+        let cfg = Config { metric: Metric::Slope, ..Config::default() };
+        assert_eq!(
+            gpu_blocker(&cfg, &s),
+            Some("metric is not scored natively on the GPU")
+        );
+    }
+
+    /// #288: below the measured crossover the exact CPU statistic stays, and
+    /// the reason says so; the fit-only arm may still move constants.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn order_and_rank_scoring_refuses_below_the_row_floor() {
+        use crate::metrics::Metric;
+        for (metric, stat) in [
+            (Metric::Median, crate::gpu::ScoreStat::Median),
+            (Metric::Interquartile, crate::gpu::ScoreStat::Interquartile),
+            (Metric::RankCorrelation, crate::gpu::ScoreStat::RankCorrelation),
+            (Metric::Maximum, crate::gpu::ScoreStat::Maximum),
+        ] {
+            let cfg = Config { metric, ..Config::default() };
+            let n = if stat == crate::gpu::ScoreStat::Maximum {
+                crate::fit::MAXIMUM_GPU_MIN_ROWS - 1
+            } else {
+                crate::fit::MEDIAN_GPU_MIN_ROWS - 1
+            };
+            let small = sample_rows(n);
+            assert_eq!(gpu_blocker(&cfg, &small), Some(stat.small_sample_reason()));
+        }
     }
 
     fn pending_ind(error: f64, complexity: f64) -> Ind {

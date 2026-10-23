@@ -4,10 +4,12 @@
 //! crate-private fit plans and the raw median stage). These integration tests
 //! pin the search contract:
 //!
-//! * `--metric median` may use the GPU **fit** arm only when
-//!   `--fit-strategy gpu` is requested; it is a fit-only arm: the backend stays
-//!   `cpu`, the fitness is scored by the CPU evaluator with the exact median,
-//!   and the population is never ranked by MSE;
+//! * from `MEDIAN_GPU_MIN_ROWS` (#288) `--metric median` is **scored** on the
+//!   device by the exact `f64` order statistic, so the backend is `gpu`; below
+//!   the floor (or with `--fit-strategy exact` on a small sample) the CPU scores
+//!   exactly and the reason is named. The population is never ranked by MSE;
+//! * `--fit-strategy gpu` additionally moves constants through the exact median
+//!   polish (fit-only below the scoring floor);
 //! * reported errors are the exact CPU median of the stored tree;
 //! * fixed seed/device is deterministic, and `--no-fit` is a true no-op;
 //! * every fallback is labelled and the ledger adds up;
@@ -81,17 +83,18 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
-/// #226: the median fit arm is opt-in, fit-only, and never the default. The
-/// scoring objective is the metric, so the reported backend is always `cpu`.
+/// #288: below the measured scoring floor the exact CPU median runs; at or
+/// above it the exact device order statistic scores the population even with
+/// the default `exact` fit strategy.
 #[test]
-fn median_gpu_fit_is_opt_in_and_never_the_default() {
-    let s = sample(96, 3);
+fn median_gpu_scoring_respects_the_measured_row_floor() {
+    let small = sample(96, 3);
     let cfg = Config {
         gpu: true,
         metric: Metric::Median,
         ..Default::default()
     };
-    assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    assert_eq!(search::effective_backend(&cfg, &small), Backend::Cpu);
     let cfg = Config {
         gpu: true,
         metric: Metric::Median,
@@ -99,12 +102,19 @@ fn median_gpu_fit_is_opt_in_and_never_the_default() {
         fit_iters: 4,
         ..Default::default()
     };
-    assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    assert_eq!(search::effective_backend(&cfg, &small), Backend::Cpu);
     let cfg = Config {
         fit_iters: 0,
         ..cfg
     };
-    assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    assert_eq!(search::effective_backend(&cfg, &small), Backend::Cpu);
+    let big = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS + 32, 3);
+    let cfg = Config {
+        gpu: true,
+        metric: Metric::Median,
+        ..Default::default()
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), Backend::Gpu);
 }
 
 /// #226: the cost model keeps a small sample on the exact CPU median arm and
@@ -126,7 +136,9 @@ fn a_small_sample_keeps_the_labelled_cpu_median_arm() {
     );
     let why = out.backend_reason.unwrap_or_default();
     assert!(
-        why.contains("median fit arm") || why.contains("not scored natively"),
+        why.contains("median fit arm")
+            || why.contains("not scored natively")
+            || why.contains("4096-row device floor"),
         "the CPU decision must be labelled: {why:?}"
     );
 }
@@ -143,9 +155,10 @@ fn gpu_median_run_is_deterministic_and_reports_the_exact_objective() {
     let test = sample(300, 6);
     let a = search::run(&median_config(11), &train, &test);
     let b = search::run(&median_config(11), &train, &test);
-    // Fit-only: the device moves constants, the CPU scores and reports.
-    assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
-    assert!(a.device.is_some(), "the fit arm used a device");
+    // #288: the device moves constants *and* scores the exact median, so the
+    // backend is `gpu`; the archive is still rebuilt in CPU f64.
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    assert!(a.device.is_some(), "the device scored the population");
     assert_eq!(describe(&a), describe(&b), "repeated seed differs");
     assert_eq!(a.test_errors, b.test_errors);
     let g = a.gpu.as_ref().expect("a GPU report");
@@ -185,7 +198,9 @@ fn no_fit_is_a_true_noop_for_the_median_gpu_arm() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let train = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS + 32, 7);
+    // Below the #288 scoring floor: with `--no-fit` there is neither a fit arm
+    // nor a native scorer, so the exact CPU median is the only arm.
+    let train = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS - 32, 7);
     let test = sample(200, 8);
     let base = Config {
         fit_iters: 0,

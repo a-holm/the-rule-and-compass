@@ -39,17 +39,18 @@ below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
-the same arm fits the exact integer rank polish on the device (fit-only: the
-fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
-reflected model is rejected and a proposal is judged on the exact oriented
-score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
-exact `f64` median and `--metric interquartile` with the middle-50 % window mean
-of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232), and
-`--metric maximum` fits the Chebyshev objective by **exact bisection on the
-error level** per constant (fit-only, from 512 training rows — the measured
-cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+the same arm fits the exact integer rank polish on the device; the same exact
+integer sums also **score** every candidate on the device from 4 096 training
+rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
+is the same stage under `1 - rho`, so a reflected model is rejected and a
+proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
+`--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
+native scoring from 4 096 training rows — the measured crossover of the batched
+selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
+objective by **exact bisection on the error level** per constant and scores the
+exact `max |r|` natively from 512 training rows — the measured cost-model floor
+(#227, #288). An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
 `--metric log_loss`, a rank metric, `--metric median`, `--metric
@@ -948,17 +949,18 @@ below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
-the same arm fits the exact integer rank polish on the device (fit-only: the
-fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
-reflected model is rejected and a proposal is judged on the exact oriented
-score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
-exact `f64` median and `--metric interquartile` with the middle-50 % window mean
-of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232), and
-`--metric maximum` fits the Chebyshev objective by **exact bisection on the
-error level** per constant (fit-only, from 512 training rows — the measured
-cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+the same arm fits the exact integer rank polish on the device; the same exact
+integer sums also **score** every candidate on the device from 4 096 training
+rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
+is the same stage under `1 - rho`, so a reflected model is rejected and a
+proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
+`--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
+native scoring from 4 096 training rows — the measured crossover of the batched
+selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
+objective by **exact bisection on the error level** per constant and scores the
+exact `max |r|` natively from 512 training rows — the measured cost-model floor
+(#227, #288). An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
 `--metric log_loss`, a rank metric, `--metric median`, `--metric
@@ -1070,20 +1072,26 @@ device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 
-The kernel ranks candidates by **squared error**, so only `--metric squared` is
-scored on the device. Every other metric — including the default `absolute` —
-keeps the CPU evaluator, prints `# gpu: off (metric is not scored natively on
-the GPU)` and records that cause in `backend_reason`; a device run is never
-ranked by a substitute loss. Native device scoring for the other objectives is
-tracked in #236–#238.
+The device scores `squared`, `log_squashed`, `absolute`, and — through the exact
+`f64` order-statistic/rank batch entry point (#288) — `median`,
+`interquartile`, `maximum`, `rank_correlation`, `rank_correlation_signed` and
+`auc`, from the measured row floors (4 096 rows for the sort-based statistics,
+512 for maximum). Every other metric — including the default `absolute` below
+the floor — keeps the CPU evaluator, prints `# gpu: off (<reason>)` and records
+that cause in `backend_reason`; a device run is never ranked by a substitute
+loss. Native device scoring for the other objectives is tracked in #236–#238
+and #289.
 
-Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
-change the search trajectory. Reported metrics, constants and diagnostics are
-always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. A metric may use the GPU only when the kernel computes its
-objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
-every other metric is scored on the CPU, so no run is ever ranked by a proxy
-loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
+Cross-backend runs are **not bit-identical**: the objective-kernel fitness is
+`f32`, so it can change the search trajectory. The #288 statistics are exact
+`f64` and match the CPU bit for bit for the same prediction vector, but the
+prediction itself may round differently on the two devices. Reported metrics,
+constants and diagnostics are always rebuilt on the CPU in exact `f64`; use
+`--cpu` for a byte-identical reproduction. A metric may use the GPU only when a
+kernel computes its statistic itself: the objective kernel does for `squared`,
+`log_squashed` and `absolute` (#229, #222), and the exact batch scorer does for
+the order/rank family (#288); every other metric is scored on the CPU, so no
+run is ever ranked by a proxy loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
 launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See

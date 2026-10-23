@@ -4,10 +4,11 @@
 //! maximum, its lowest maximiser, the exact level interval, the polish itself).
 //! These integration tests pin the search contract:
 //!
-//! * `--metric maximum` may use the GPU **fit** arm only when
-//!   `--fit-strategy gpu` is requested; it is a fit-only arm: the backend stays
-//!   `cpu`, every fitness value is the CPU `f64` maximum, and the population is
-//!   never ranked by MSE;
+//! * the exact `max |r|` also **scores** the population on the device from
+//!   `MAXIMUM_GPU_MIN_ROWS` (#288), so the backend is `gpu` at or above the
+//!   floor; below it the CPU `f64` maximum runs with a named reason;
+//! * `--fit-strategy gpu` additionally moves constants through the exact
+//!   minimax polish; the population is never ranked by MSE;
 //! * reported errors are the exact CPU `max |r|` of the stored tree;
 //! * the arm never loses to the exact CPU polish on the same candidates — the
 //!   zero-tolerance dominance claim of the research note;
@@ -89,10 +90,11 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
-/// #227: the maximum fit arm is opt-in, fit-only, and never the default. The
-/// scoring objective is the metric, so the reported backend is always `cpu`.
+/// #288: below the measured floor the exact CPU maximum runs; above it the
+/// exact device maximum scores the population even with the default `exact`
+/// fit strategy.
 #[test]
-fn maximum_gpu_fit_is_opt_in_and_never_the_default() {
+fn maximum_gpu_scoring_respects_the_measured_row_floor() {
     let s = sample(96, 3);
     let cfg = Config {
         gpu: true,
@@ -113,6 +115,18 @@ fn maximum_gpu_fit_is_opt_in_and_never_the_default() {
         ..cfg
     };
     assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    let big = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS + 32, 3);
+    assert_eq!(
+        search::effective_backend(
+            &Config {
+                gpu: true,
+                metric: Metric::Maximum,
+                ..Default::default()
+            },
+            &big
+        ),
+        Backend::Gpu
+    );
 }
 
 /// #227: the cost model keeps a small sample on the exact CPU maximum arm and
@@ -134,7 +148,9 @@ fn a_small_sample_keeps_the_labelled_cpu_maximum_arm() {
     );
     let why = out.backend_reason.unwrap_or_default();
     assert!(
-        why.contains("maximum fit arm") || why.contains("not scored natively"),
+        why.contains("maximum fit arm")
+            || why.contains("not scored natively")
+            || why.contains("512-row device floor"),
         "the CPU decision must be labelled: {why:?}"
     );
 }
@@ -151,9 +167,10 @@ fn gpu_maximum_run_is_deterministic_and_reports_the_exact_objective() {
     let test = sample(300, 6);
     let a = search::run(&maximum_config(11), &train, &test);
     let b = search::run(&maximum_config(11), &train, &test);
-    // Fit-only: the device moves constants, the CPU scores and reports.
-    assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
-    assert!(a.device.is_some(), "the fit arm used a device");
+    // #288: the device moves constants *and* scores the exact maximum, so the
+    // backend is `gpu`; the archive is still rebuilt in CPU f64.
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    assert!(a.device.is_some(), "the device scored the population");
     assert_eq!(describe(&a), describe(&b), "repeated seed differs");
     assert_eq!(a.test_errors, b.test_errors);
     let g = a.gpu.as_ref().expect("a GPU report");
@@ -295,7 +312,9 @@ fn no_fit_is_a_true_noop_for_the_maximum_gpu_arm() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let train = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS + 32, 7);
+    // Below the #288 scoring floor: `--no-fit` leaves neither a fit arm nor a
+    // native scorer, so the exact CPU maximum is the only arm.
+    let train = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS - 32, 7);
     let test = sample(200, 8);
     let base = Config {
         fit_iters: 0,
