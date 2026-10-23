@@ -36,7 +36,7 @@ RCSR_CUDA_ARCH=sm_86 cargo build --release --features cuda
 
 # benchmark GPU vs the reference CPU evaluator
 ./target/release/rcsr-gpu-bench --data examples/sine.csv --target y --vars x \
-    --batch 8000 --depth 5 --seed 5
+    --batch 8000 --depth 5 --seed 5 --reps 25
 
 # opt in to GPU-guided search when a device is present (--gpu is required)
 # no flag: a CUDA build with a device uses the GPU automatically
@@ -77,6 +77,7 @@ Environment overrides for the build:
 | `RCSR_CUDA_ARCH` | target architecture passed to `nvcc` as `-arch=` | `sm_86` (Ampere) |
 | `RCSR_NVCC` | `nvcc` binary to use | `nvcc` |
 | `RCSR_GPU_UNIFIED` | `1`/`true`/`yes`/`on` selects `cudaMallocManaged` for every buffer; `0`/`false`/anything else selects plain device memory | `1` for `sm_121`, `0` otherwise |
+| `RCSR_GPU_SYNC` | `1`/`true`/`yes`/`on` forces the blocking copy path for the batch arena (the labelled fallback, #285) | unset (pinned asynchronous path) |
 
 Minimum toolkit per target, as used by the build-script check:
 
@@ -899,6 +900,52 @@ the exact CPU arm took over). `--fit-report` and the `gpu.fit` JSON object count
 `seconds` and the whole fit stage's `host_seconds`; the run manifest records the
 same accepted/fallback/refit totals.
 
+**Parallel fallback batch and its bound (#255).** The exact CPU refits are
+independent per candidate and are therefore split across scoped workers with
+the same fixed-order pattern as the finalist refits in `full_data_archive`:
+`ceil(n / workers)` contiguous jobs per worker, one thread-local block registry
+per worker, and the fitted trees written back by their original island/slot in
+admission order. The result is bit-identical to the old serial `for` loop for
+any worker count; `search::tests::fit_fallback_is_identical_for_one_and_many_workers`
+pins one versus eight workers and compares every tree bit with the serial arm.
+The worker count is the same bounded pool setting as the evaluator fallback
+(`RCSR_CPU_FALLBACK_THREADS`, default `min(cores, 8)`, maximum 64).
+
+`--fit-fallback-max N` is a hard per-generation cap on those refits (default
+`4096`, `0` = unbounded). The first `N` fallbacks in deterministic admission
+order are refit; any remainder keeps the finite constants the device produced.
+That case is **reported, never silent**: `gpu.fit.fallback_bounded` and each
+generation's `fit_fallback_bounded` count it, and `fallback_max` records the
+configured bound. The default is above every generation of the recorded cell
+(at most 540 admitted), so normal runs are unchanged; the cap exists so one
+pathological generation cannot spend minutes in an unbounded CPU tail.
+`gpu.fit.fallback_seconds` reports the measured fallback subset, and each
+generation carries `fit_fallback_seconds`, `fit_fallback_bounded` and
+`fit_fallback_workers`. `fallback_seconds` is a **subset** of `host_seconds`
+(kernel + launch + fallback + write-back), so the phase ledger still closes
+without double counting.
+
+Measured on the fit-heavy pinned cell (`tests/gpu_fit.rs::bench_end_to_end`:
+154 000 rows, 21 variables, 4 islands × pop 256, 5 generations, `--fit-iters 8`,
+seed 9, `--metric squared`) on an RTX 3060 with an Intel i7-3770K (4 cores / 8
+logical CPUs), same binary and seed, only `RCSR_CPU_FALLBACK_THREADS` changed:
+
+| fallback workers | fit host | fallback subset | wall | best error | archive hash |
+|---:|---:|---:|---:|---:|---|
+| 1 (serial reference) | 35.00 s | 30.13 s | 93.54 s | 1.086148e-2 | `c257d304ee910746` |
+| **8** | **11.49 s** | **6.93 s** | **63.10 s** | **1.086148e-2** | **`c257d304ee910746`** |
+
+The exact fallback loop is **4.35×** faster, the fit stage **3.05×** and the
+end-to-end run **1.48×**, with the same per-generation trajectory, archive best,
+archive hash and 996 finalist refits. The untouched serial binary recorded 23.33 s
+fit host at 67.02 s wall on the same cell in a separate run, so the change does
+not borrow time from another phase; run-to-run host load moves the absolute
+numbers, which is why the worker pair above is the controlled comparison. The
+recorded 10 h cell is fallback-dominated (95.40 % of process wall in 5 835
+refits), so at this measured ratio its fallback residue projects from 36 362 s
+to about 8 400 s; that projection is not a run on that cell and is labelled as
+such.
+
 **Exactness.** Search fitness is still f32 and only guides selection. Every
 finalist is refit by the exact CPU f64 LM on all training rows before the final
 archive is rebuilt, and the archive is then scored by the CPU in f64. Reported
@@ -1504,6 +1551,69 @@ evaluation is **10–40×** (reported figures for this style of workload range f
 ~18× to ~40×; the 201–1 678× measured above is against a much slower
 single-threaded reference), rising further with row tiling and CUDA graphs.
 
+## Persistent batch arena and asynchronous copies (issue #285)
+
+The packed batch path (`rc_create` → `rc_set_programs` → `rc_eval`) used to call
+`cudaFree`/`cudaMalloc` for `d_prog`, `d_off` and the output on **every batch**,
+then launch on the default stream, `cudaEventSynchronize`, and block in
+`cudaMemcpy`. Both allocator calls synchronise the device, so that schedule could
+never overlap a generation with the previous one. `rc_set_programs` now owns no
+allocator call in steady state.
+
+* **One device arena.** `arena_prog[2]`, `arena_off[2]` and `arena_out` are
+  allocated once at the high-water mark of the batch shape. `arena_prog` is
+  double-buffered: a batch is uploaded into the back slot while the front slot's
+  kernel runs. A slot is only overwritten after its own `ev_slot_done` event.
+  Capacity growth is explicit (`rc_arena_reserve`) and refused while a batch is
+  in flight; it never happens inside a stable generation loop.
+* **Pinned host staging.** Two upload slots and two download slots are pinned
+  with `cudaHostAlloc` and copied with `cudaMemcpyAsync` on `s_h2d`/`s_d2h`. The
+  rings are hard-capped at **64 MiB total**; a request that does not fit, a
+  failed `cudaHostAlloc`, a failed stream/event creation, a unified-memory build
+  or `RCSR_GPU_SYNC=1` switches to the blocking path and records the reason in
+  `rc_arena_report`. The 8 000-program batch above needs 804 392 B of pinned
+  staging — well inside the cap — and that number is constant across 100
+  generations.
+* **Events, not stream synchronisation.** `rc_eval_submit` records the launch
+  and D2H events and returns; `rc_eval_collect` waits on the download event and
+  copies the pinned errors. `rc_eval` is the compatibility shim that calls the
+  two in sequence, so every existing caller keeps its synchronous contract.
+  There is no `cudaStreamSynchronize` in the batch path.
+* **Event-ordering test.** `tests/gpu_arena.rs` runs 100 generations and asserts
+  `alloc_s` stays at zero after warm-up and the pinned ring never grows. It also
+  compares the asynchronous path against the forced synchronous path **bit for
+  bit**, and uses `eval_batch_pipelined` to enqueue batch B's upload while batch
+  A's kernel is still outstanding; `overlapped_uploads` must increase and both
+  batches must equal the sequential result. Arithmetic is unchanged: the same
+  kernel, launch shape and accumulation order execute; only the stream and
+  buffer lifetime differ.
+* **Telemetry.** `GpuEvaluator::arena_report()` exposes `async_copy`, `reason`,
+  `pinned_bytes`, `alloc_calls`, `steady_alloc_calls`, `overlapped_uploads` and
+  `batches`. `alloc_calls` counts cold arena/staging setup; any increase in
+  `steady_alloc_calls` after the first batch is a hot-path allocation bug.
+  `rcsr-gpu-bench --reps N` prints the arena line next to the #118 ledger.
+
+Measured on the RTX 3060 cell used above (200 000 rows × 2 variables, 8 000
+programs, depth 5, CUDA 12.0, plain device memory). The pre-#285 binary reported
+25 repetitions; the post-#285 binary reports 100. Per-batch host windows:
+
+| window | before #285 | after #285 |
+|---|---:|---:|
+| `alloc_s` | 53.0 µs | **0.2 µs** (steady allocator calls: 0) |
+| `h2d_s` | 148.1 µs | **97.2 µs** |
+| `d2h_s` | 58.3 µs | **5.0 µs** |
+| `launch_s` | 41.7 µs | 37.4 µs |
+| host windows + sync | ~137.5 ms | ~128.8 ms |
+| kernel | ~137.0 ms | ~128.6 ms |
+
+The honest conclusion is the one in the issue: this is a
+**correctness-of-schedule** change, not a 10-hour throughput lever. The measured
+host overhead falls by roughly 160 µs per batch (less than 0.2 % of the
+kernel-dominated wall), but the batch loop no longer allocates, no longer
+synchronises through the allocator, and can overlap the next upload with the
+current kernel. That is the prerequisite for #286/#291/#292, not a stand-alone
+speed-up.
+
 ## Measuring the full GPU path (issue #118)
 
 The older benchmark placed an event pair immediately after the launch, so
@@ -1648,6 +1758,7 @@ substitute for either.
 | ≥1.1× end-to-end with the default fitter at pop 400, N ≥ 5 000 | RTX 3060, `d5k.csv`, shared host | **not met** — 1.02–1.06×; GPU phase is only 2–3 % of wall |
 | Reported law/train/test errors agree with the CPU backend | RTX 3060, `tests/gpu_loop.rs` | **verified** (law predictions within 1e-12; errors within 1e-9, observed 0) |
 | Full-path ledger (alloc/H2D/launch/sync/D2H) and duty | RTX 3060, `src/gpu_stats.rs` tests + `tests/gpu_loop.rs` + `rcsr-gpu-bench` | **verified** (host windows close to wall; kernel-time duty, not occupancy) |
+| Persistent batch arena, pinned <=64 MiB ring, zero steady-state allocator calls, async-vs-sync bit equality, upload-behind-kernel event ordering (#285) | RTX 3060, `tests/gpu_arena.rs` (3 tests) and `rcsr-gpu-bench --reps 100` | **verified** (steady allocator calls 0; 804 392 B pinned ring constant; identical `f32` bits) |
 | Speed-up against the SoA/AVX path (not the interpreted walk) | RTX 3060, `rcsr-gpu-bench` | **measured** (see the PR/issue; the benchmark prints both baselines) |
 | Failed batch is timed but adds no evaluations | RTX 3060, `tests/gpu_loop.rs` | **verified** |
 | SM occupancy / achieved SM throughput | needs `ncu` with counter permission | **unverified here** — reported as `null`, never invented |

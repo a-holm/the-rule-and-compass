@@ -512,7 +512,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--variation auto|node|postfix]
      [--no-front-parents]
@@ -1090,7 +1090,11 @@ the **union** of device intervals over run wall (never their sum), fit/eval/
 fallback seconds with labelled causes, fit kernel versus CPU-fallback time, and
 numerator/denominator/units/scope on every derived ratio. `Σ stage_s +
 unaccounted_s = wall_s` within 1 %; `gpu.duty_cycle` is explicitly the evaluator
-window, while `gpu.ledger.duty_run` is the run-level headline. See
+window, while `gpu.ledger.duty_run` is the run-level headline. The packed batch
+path allocates a persistent device arena once, stages host bytes in a <=64 MiB
+pinned ring and copies on `S_h2d`/`S_d2h` with event dependencies, so `alloc_s`
+is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the labelled blocking fallback
+(#285). See
 [`docs/gpu-backend.md`](docs/gpu-backend.md#measuring-the-full-gpu-path-issue-118).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See
