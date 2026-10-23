@@ -52,6 +52,20 @@ selection on test. A single `--expr` keeps the original behaviour.
 * `position = 1` if `score > threshold` and the score is finite, otherwise `0`.
   There is no short leg and no leverage; `rcsr::walkforward::position_for`
   exposes the rule.
+* `--policy threshold` (default) is the rule above.
+* `--policy band` is a long-only no-trade band. With threshold `θ` and
+  half-width `β = --band`, an entry needs `score > θ + β`; a long book stays
+  long while `score > θ − β` and exits when the score is non-finite or at/below
+  `θ − β`. `--min-hold K` (default 1) delays an exit until the book has been
+  long for `K` consecutive rows, counting the entry row. `β = 0` with
+  `--min-hold 1` reproduces the threshold rule **bit for bit**. The band is a
+  deterministic `{0,+1}` finite-state automaton; it never opens a short.
+* `--policy dp` keeps the reported book on the threshold rule and adds the
+  exact hindsight-optimal DP as a diagnostic `hindsight_bound`. The DP is the
+  best path with hindsight, so it always flatters the strategy and is **never**
+  reported as the strategy's P&L. The report labels it `"label":
+  "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
+  net, the gap and `rule_le_bound`.
 * `--cost-bps` is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
@@ -71,6 +85,38 @@ selection on test. A single `--expr` keeps the original behaviour.
 * Costs and positions are per group. Counting position changes on a flattened
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
+
+## Associative carries and chunk invariance
+
+The band and the hindsight DP are implemented as associative carries in
+`rcsr::trading_gpu`, with the serial CPU reference kept as the authority.
+
+* **Band (`Carry2`).** A row block induces, for each start state
+  `s ∈ {0, 1}`, an end state `e(s)` and a reward `w(s)`. The carry is
+  `(e0, e1, w0, w1)`, identity `(0, 1, 0, 0)`, and blocks compose
+  left-then-right:
+  `e(s) = right.e(left.e(s))`, `w(s) = left.w(s) + right.w(left.e(s))`.
+  The final exit is charged on the last row of each group; the group seam resets
+  the carry. `--min-hold K > 1` uses the `K+1`-state `CooldownCarry` variant.
+* **Hindsight DP (`DpCarry`).** `M_t = [[0, −s], [r_t − s, r_t]]` (destination
+  rows, source columns) is combined with the associative `(max, +)` product;
+  identity `[[0, −∞], [−∞, 0]]`. The answer is
+  `max(V_T(0), V_T(1) − s)`, four max-adds per row, `O(2n)` for the whole
+  scan. Ties use a fixed destination/source order, so the result is
+  deterministic. The DP resets at every group seam and its per-group bounds add.
+* Chunks are merged in ascending order. A chunk that ends inside a group
+  continues the same carry, so **alone, 1-row, 4 k and 64 k chunks produce
+  identical carry bits and bounds**. Nothing in these scans depends on the
+  thread count (the serial reference is used for the reported book) or on a
+  `P×N` allocation.
+
+```sh
+# no-trade band, beta 0.1, minimum hold 3 rows
+rcsr walkforward ... --policy band --band 0.1 --min-hold 3
+
+# threshold strategy plus the exact hindsight bound (never a strategy)
+rcsr walkforward ... --policy dp
+```
 
 ## Fused long-only P&L (`--device-pnl`)
 

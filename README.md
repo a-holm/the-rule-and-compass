@@ -155,11 +155,15 @@ input. The fold sign test is reported as not applicable for expanding folds
 because `test_k` lies inside `train_{k+1}`. Pass `--device-pnl` to recompute
 each test block through the fused f64 long-only reduction (`src/trading_gpu.rs`
 plus the CUDA kernel `src/cuda/pnl.cu`) and report it with cash and
-buy-and-hold benchmarks; the scalar evaluator stays the reported authority. See
-[`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
-definitions and the reference-agreement check against the Python evaluator, and
-[`docs/eval-benchmark.md`](docs/eval-benchmark.md) for the pinned 4M-row
-Python-vs-Rust benchmark protocol and the measured 10x evidence.
+buy-and-hold benchmarks; the scalar evaluator stays the reported authority.
+`--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
+associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
+adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
+strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
+semantics, metric definitions and the reference-agreement check against the
+Python evaluator, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
+the pinned 4M-row Python-vs-Rust benchmark protocol and the measured 10x
+evidence.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),

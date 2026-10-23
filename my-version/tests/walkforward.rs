@@ -53,6 +53,9 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         pool_reset_flat: false,
         allow_lockbox: false,
         device_pnl: false,
+        policy: walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
     }
 }
 
@@ -88,6 +91,70 @@ fn device_pnl_check_matches_the_scalar_book() {
     assert!(summary.max_abs_net_delta <= 1e-12);
     assert!(r.json().contains("\"device_pnl\""));
     assert!(r.json().contains("\"buy_and_hold\""));
+}
+
+#[test]
+fn band_and_dp_policies_are_reported_and_dp_is_only_a_bound() {
+    // Training x = 0..3 => q50 threshold 1.5. Test scores 1.8 are above the
+    // threshold but below threshold+beta, so the band stays flat while the
+    // threshold rule is long.
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 1.8, 0.01),
+        (5.0, 0.0, -0.02),
+        (6.0, 1.8, 0.03),
+        (7.0, 0.0, -0.01),
+    ]);
+
+    let mut threshold = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    threshold.threshold_quantile = 0.5;
+    let tr = walkforward::run_table(&t, &threshold, "test").unwrap();
+    assert_eq!(tr.windows[0].metrics.active_rows, 2);
+
+    let mut band_zero = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    band_zero.threshold_quantile = 0.5;
+    band_zero.policy = walkforward::Policy::Band;
+    band_zero.band_width = 0.0;
+    let bz = walkforward::run_table(&t, &band_zero, "test").unwrap();
+    // beta=0 reproduces the threshold book bit for bit.
+    assert_eq!(bz.windows[0].metrics.active_rows, 2);
+    assert_eq!(bz.windows[0].metrics.trades, tr.windows[0].metrics.trades);
+    assert_eq!(
+        bz.windows[0].metrics.total_abs_delta.to_bits(),
+        tr.windows[0].metrics.total_abs_delta.to_bits()
+    );
+    assert!(bz.json().contains("\"policy\":{\"name\":\"band\""));
+
+    let mut band = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    band.threshold_quantile = 0.5;
+    band.policy = walkforward::Policy::Band;
+    band.band_width = 0.6;
+    let br = walkforward::run_table(&t, &band, "test").unwrap();
+    assert_eq!(br.windows[0].metrics.active_rows, 0);
+    let bc = br.windows[0].band.as_ref().expect("band carry check");
+    assert_eq!(bc.carry, "carry2");
+    assert_eq!(bc.groups, 1);
+
+    let mut dp = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    dp.threshold_quantile = 0.5;
+    dp.policy = walkforward::Policy::Dp;
+    let dr = walkforward::run_table(&t, &dp, "test").unwrap();
+    let h = dr.windows[0]
+        .hindsight_bound
+        .as_ref()
+        .expect("hindsight bound");
+    assert_eq!(h.label, "hindsight_bound");
+    assert!(h.rule_le_bound);
+    assert!(h.net + 1e-12 >= h.rule_net);
+    // The reported book is still the threshold strategy, not the DP path.
+    assert_eq!(dr.windows[0].metrics.active_rows, 2);
+    let json = dr.json();
+    assert!(json.contains("\"hindsight_bound\":{\"label\":\"hindsight_bound\""));
+    assert!(json.contains("\"is_strategy\":false"));
+    assert!(json.contains("\"policy\":{\"name\":\"dp\",\"hindsight_bound\":true"));
 }
 
 #[test]

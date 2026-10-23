@@ -238,6 +238,638 @@ pub fn check_group_contiguous(groups: &[u64]) -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// #306: finite-state no-trade band / cooldown and hindsight DP
+// ---------------------------------------------------------------------------
+
+/// A long-only band/cooldown rule. The transition is deterministic:
+///
+/// ```text
+/// flat  -> long iff score is finite and score > threshold + band
+/// long  -> flat iff score is non-finite or score <= threshold - band
+///                 and the minimum holding count has been reached
+/// ```
+///
+/// With `band == 0` and `min_hold == 1` this is exactly the plain rule
+/// `long iff score is finite and score > threshold`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BandParams {
+    pub threshold: f64,
+    /// Half-width of the no-trade band (`beta`), in score units.
+    pub band: f64,
+    /// Minimum consecutive long rows before an exit is allowed (>= 1).
+    pub min_hold: usize,
+}
+
+impl Default for BandParams {
+    fn default() -> Self {
+        BandParams {
+            threshold: 0.0,
+            band: 0.0,
+            min_hold: 1,
+        }
+    }
+}
+
+impl BandParams {
+    pub fn new(threshold: f64, band: f64, min_hold: usize) -> Result<Self, String> {
+        let p = BandParams {
+            threshold,
+            band,
+            min_hold,
+        };
+        p.validate()?;
+        Ok(p)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if !self.threshold.is_finite() {
+            return Err(format!("threshold must be finite, got {}", self.threshold));
+        }
+        if !self.band.is_finite() || self.band < 0.0 {
+            return Err(format!(
+                "band width must be finite and non-negative, got {}",
+                self.band
+            ));
+        }
+        if self.min_hold == 0 {
+            return Err("min_hold must be at least 1".to_string());
+        }
+        Ok(())
+    }
+
+    /// One deterministic state transition. `held` counts the entry row.
+    #[inline]
+    pub fn next(&self, state: BandState, score: f64) -> BandState {
+        if state.long {
+            let exit = !score.is_finite() || score <= self.threshold - self.band;
+            if exit && state.held >= self.min_hold {
+                BandState {
+                    long: false,
+                    held: 0,
+                }
+            } else {
+                BandState {
+                    long: true,
+                    held: state.held.saturating_add(1),
+                }
+            }
+        } else if score.is_finite() && score > self.threshold + self.band {
+            BandState {
+                long: true,
+                held: 1,
+            }
+        } else {
+            BandState {
+                long: false,
+                held: 0,
+            }
+        }
+    }
+}
+
+/// The two-state long-only band state. `held` is only meaningful while long.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BandState {
+    pub long: bool,
+    pub held: usize,
+}
+
+impl BandState {
+    pub fn position(self) -> f64 {
+        if self.long {
+            1.0
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Plain threshold positions, exposed so a test can pin `band(beta=0)` against
+/// it bit for bit.
+pub fn threshold_positions(scores: &[f64], threshold: f64) -> Vec<f64> {
+    scores
+        .iter()
+        .map(|&z| position_for(z, threshold))
+        .collect()
+}
+
+/// Serial band/cooldown reference. Groups must be contiguous; every group
+/// starts flat and its state is reset at the seam.
+pub fn band_positions(
+    scores: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+) -> Result<Vec<f64>, String> {
+    if scores.len() != groups.len() {
+        return Err(format!(
+            "length mismatch: scores {}, groups {}",
+            scores.len(),
+            groups.len()
+        ));
+    }
+    params.validate()?;
+    check_group_contiguous(groups)?;
+    let mut out = Vec::with_capacity(scores.len());
+    let mut state = BandState::default();
+    let mut current: Option<u64> = None;
+    for (&score, &group) in scores.iter().zip(groups) {
+        if current != Some(group) {
+            state = BandState::default();
+            current = Some(group);
+        }
+        state = params.next(state, score);
+        out.push(state.position());
+    }
+    Ok(out)
+}
+
+/// The 2-state carry of issue #306. For each start state `s` it stores the end
+/// state `e_s` and the reward `w_s` of the row block.
+///
+/// Composition is left-then-right and associative:
+///
+/// ```text
+/// e(s) = right.e(left.e(s))
+/// w(s) = left.w(s) + right.w(left.e(s))
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Carry2 {
+    pub e0: usize,
+    pub e1: usize,
+    pub w0: f64,
+    pub w1: f64,
+}
+
+impl Carry2 {
+    /// The identity block: both start states end in themselves with zero
+    /// reward. `e0 = 0`, `e1 = 1`, `w0 = w1 = 0`.
+    pub const IDENTITY: Carry2 = Carry2 {
+        e0: 0,
+        e1: 1,
+        w0: 0.0,
+        w1: 0.0,
+    };
+
+    /// Build a block from its per-start-state end state and reward.
+    pub fn from_row(end: [usize; 2], reward: [f64; 2]) -> Carry2 {
+        Carry2 {
+            e0: end[0],
+            e1: end[1],
+            w0: reward[0],
+            w1: reward[1],
+        }
+    }
+
+    #[inline]
+    pub fn end(&self, start: usize) -> usize {
+        if start == 0 {
+            self.e0
+        } else {
+            self.e1
+        }
+    }
+
+    #[inline]
+    pub fn reward(&self, start: usize) -> f64 {
+        if start == 0 {
+            self.w0
+        } else {
+            self.w1
+        }
+    }
+
+    /// Compose `self` (earlier rows) with `right` (later rows).
+    pub fn then(&self, right: &Carry2) -> Carry2 {
+        Carry2 {
+            e0: right.end(self.e0),
+            e1: right.end(self.e1),
+            w0: self.w0 + right.reward(self.e0),
+            w1: self.w1 + right.reward(self.e1),
+        }
+    }
+
+    /// End state and reward for a starting state, as a tuple.
+    pub fn apply(&self, start: usize) -> (usize, f64) {
+        (self.end(start), self.reward(start))
+    }
+
+    /// Stable bit fingerprint for chunk-invariance tests.
+    pub fn bits(&self) -> [u64; 4] {
+        [self.e0 as u64, self.e1 as u64, self.w0.to_bits(), self.w1.to_bits()]
+    }
+}
+
+/// A K+1-state carry for the minimum-holding/cooldown band. State 0 is flat;
+/// state `h` is long with `held == h` (clamped to `K`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CooldownCarry {
+    pub end: Vec<usize>,
+    pub reward: Vec<f64>,
+}
+
+impl CooldownCarry {
+    pub fn identity(states: usize) -> CooldownCarry {
+        CooldownCarry {
+            end: (0..states).collect(),
+            reward: vec![0.0; states],
+        }
+    }
+
+    pub fn then(&self, right: &CooldownCarry) -> CooldownCarry {
+        assert_eq!(self.end.len(), right.end.len());
+        let mut end = Vec::with_capacity(self.end.len());
+        let mut reward = Vec::with_capacity(self.end.len());
+        for s in 0..self.end.len() {
+            let mid = self.end[s];
+            end.push(right.end[mid]);
+            reward.push(self.reward[s] + right.reward[mid]);
+        }
+        CooldownCarry { end, reward }
+    }
+
+    pub fn bits(&self) -> Vec<u64> {
+        let mut out = Vec::with_capacity(self.end.len() * 2);
+        out.extend(self.end.iter().map(|&s| s as u64));
+        out.extend(self.reward.iter().map(|v| v.to_bits()));
+        out
+    }
+}
+
+#[inline]
+fn carry_start_state(state: usize, min_hold: usize) -> BandState {
+    if state == 0 {
+        BandState::default()
+    } else {
+        BandState {
+            long: true,
+            held: state.min(min_hold),
+        }
+    }
+}
+
+#[inline]
+fn carry_state_index(state: BandState, min_hold: usize) -> usize {
+    if state.long {
+        state.held.max(1).min(min_hold)
+    } else {
+        0
+    }
+}
+
+fn band_row_carry(
+    params: &BandParams,
+    score: f64,
+    ret: f64,
+    side: f64,
+    final_exit: bool,
+) -> Carry2 {
+    let starts = [0usize, 1usize];
+    let mut end = [0usize; 2];
+    let mut reward = [0.0f64; 2];
+    for (k, &start) in starts.iter().enumerate() {
+        let before = carry_start_state(start, 1);
+        let after = params.next(before, score);
+        let p0 = before.position();
+        let p1 = after.position();
+        let mut w = p1 * ret - side * (p1 - p0).abs();
+        if final_exit && p1 != 0.0 {
+            w -= side;
+        }
+        end[k] = if after.long { 1 } else { 0 };
+        reward[k] = w;
+    }
+    Carry2::from_row(end, reward)
+}
+
+fn cooldown_row_carry(
+    params: &BandParams,
+    score: f64,
+    ret: f64,
+    side: f64,
+    final_exit: bool,
+) -> CooldownCarry {
+    let states = params.min_hold + 1;
+    let mut end = Vec::with_capacity(states);
+    let mut reward = Vec::with_capacity(states);
+    for s in 0..states {
+        let before = carry_start_state(s, params.min_hold);
+        let after = params.next(before, score);
+        let p0 = before.position();
+        let p1 = after.position();
+        let mut w = p1 * ret - side * (p1 - p0).abs();
+        if final_exit && p1 != 0.0 {
+            w -= side;
+        }
+        end.push(carry_state_index(after, params.min_hold));
+        reward.push(w);
+    }
+    CooldownCarry { end, reward }
+}
+
+/// A band scan's positions and one composed carry per group (ascending).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandScan {
+    pub positions: Vec<f64>,
+    pub carries: Vec<Carry2>,
+}
+
+impl BandScan {
+    /// Additive net including the final exit of every group. Group carries are
+    /// added in ascending order.
+    pub fn net(&self) -> f64 {
+        let mut total = 0.0f64;
+        for carry in &self.carries {
+            total += carry.w0;
+        }
+        total
+    }
+}
+
+/// A cooldown scan's positions and one composed K+1-state carry per group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CooldownScan {
+    pub positions: Vec<f64>,
+    pub carries: Vec<CooldownCarry>,
+}
+
+impl CooldownScan {
+    pub fn net(&self) -> f64 {
+        let mut total = 0.0f64;
+        for carry in &self.carries {
+            total += carry.reward[0];
+        }
+        total
+    }
+}
+
+fn validate_scan(
+    scores: &[f64],
+    returns: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+    side: f64,
+    chunk_rows: usize,
+) -> Result<(), String> {
+    if scores.len() != returns.len() || groups.len() != returns.len() {
+        return Err(format!(
+            "length mismatch: scores {}, returns {}, groups {}",
+            scores.len(),
+            returns.len(),
+            groups.len()
+        ));
+    }
+    params.validate()?;
+    if !side.is_finite() || side < 0.0 {
+        return Err(format!("side must be finite and non-negative, got {}", side));
+    }
+    if chunk_rows == 0 {
+        return Err("chunk_rows must be at least 1".to_string());
+    }
+    check_group_contiguous(groups)?;
+    for (i, &r) in returns.iter().enumerate() {
+        if !r.is_finite() {
+            return Err(format!("row {}: non-finite return {}", i, r));
+        }
+    }
+    Ok(())
+}
+
+/// Band scan with the 2-state [`Carry2`]. This is the `min_hold == 1` form;
+/// use [`cooldown_scan`] for a longer minimum hold.
+///
+/// `chunk_rows` only controls how many rows are fed at a time. A chunk that
+/// ends inside a group continues the same carry, so the group carries and the
+/// net are bit-identical for every positive chunk size.
+pub fn band_scan(
+    scores: &[f64],
+    returns: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+    side: f64,
+    chunk_rows: usize,
+) -> Result<BandScan, String> {
+    validate_scan(scores, returns, groups, params, side, chunk_rows)?;
+    if params.min_hold > 1 {
+        return Err(format!(
+            "band_scan is the 2-state carry; min_hold {} needs cooldown_scan ({} states)",
+            params.min_hold,
+            params.min_hold + 1
+        ));
+    }
+    let positions = band_positions(scores, groups, params)?;
+    let n = returns.len();
+    let mut carries = Vec::new();
+    let mut carry = Carry2::IDENTITY;
+    let mut current: Option<u64> = None;
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + chunk_rows).min(n);
+        for i in lo..hi {
+            let group = groups[i];
+            if current != Some(group) {
+                if current.is_some() {
+                    carries.push(carry);
+                }
+                carry = Carry2::IDENTITY;
+                current = Some(group);
+            }
+            let final_exit = i + 1 == n || groups[i + 1] != group;
+            let row = band_row_carry(params, scores[i], returns[i], side, final_exit);
+            carry = carry.then(&row);
+        }
+        lo = hi;
+    }
+    if current.is_some() {
+        carries.push(carry);
+    }
+    Ok(BandScan { positions, carries })
+}
+
+/// Minimum-holding/cooldown scan with the K+1-state [`CooldownCarry`].
+///
+/// The counter includes the entry row, so `min_hold == 1` is the plain band and
+/// `min_hold == 2` forbids an exit on the row after entry. Chunk invariance has
+/// the same contract as [`band_scan`].
+pub fn cooldown_scan(
+    scores: &[f64],
+    returns: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+    side: f64,
+    chunk_rows: usize,
+) -> Result<CooldownScan, String> {
+    validate_scan(scores, returns, groups, params, side, chunk_rows)?;
+    let positions = band_positions(scores, groups, params)?;
+    let n = returns.len();
+    let states = params.min_hold + 1;
+    let mut carries = Vec::new();
+    let mut carry = CooldownCarry::identity(states);
+    let mut current: Option<u64> = None;
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + chunk_rows).min(n);
+        for i in lo..hi {
+            let group = groups[i];
+            if current != Some(group) {
+                if current.is_some() {
+                    carries.push(carry);
+                }
+                carry = CooldownCarry::identity(states);
+                current = Some(group);
+            }
+            let final_exit = i + 1 == n || groups[i + 1] != group;
+            let row = cooldown_row_carry(params, scores[i], returns[i], side, final_exit);
+            carry = carry.then(&row);
+        }
+        lo = hi;
+    }
+    if current.is_some() {
+        carries.push(carry);
+    }
+    Ok(CooldownScan { positions, carries })
+}
+
+/// The exact `O(2n)` hindsight DP as a 2x2 max-plus carry.
+///
+/// `M_t = [[0, -s], [r_t - s, r_t]]` (destination rows, source columns) and the
+/// carry is the ordered max-plus product of the row matrices. The identity is
+/// `[[0, -inf], [-inf, 0]]`. Only [`DpScan::bound`] is the diagnostic best
+/// hindsight path; it is never a reported strategy P&L.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DpCarry {
+    /// `m[destination][source]`.
+    pub m: [[f64; 2]; 2],
+}
+
+impl DpCarry {
+    pub const IDENTITY: DpCarry = DpCarry {
+        m: [[0.0, f64::NEG_INFINITY], [f64::NEG_INFINITY, 0.0]],
+    };
+
+    /// The row matrix for one return and per-side cost.
+    pub fn row(ret: f64, side: f64) -> DpCarry {
+        DpCarry {
+            m: [[0.0, -side], [ret - side, ret]],
+        }
+    }
+
+    /// Max-plus product: `self` is applied first, then `right`.
+    pub fn then(&self, right: &DpCarry) -> DpCarry {
+        let mut m = [[f64::NEG_INFINITY; 2]; 2];
+        for (i, row) in m.iter_mut().enumerate() {
+            for (j, slot) in row.iter_mut().enumerate() {
+                let mut best = f64::NEG_INFINITY;
+                for k in 0..2 {
+                    let candidate = right.m[i][k] + self.m[k][j];
+                    // Fixed k order: the first maximum wins, so ties have a
+                    // deterministic representative (no NaN can reach here).
+                    if candidate > best {
+                        best = candidate;
+                    }
+                }
+                *slot = best;
+            }
+        }
+        DpCarry { m }
+    }
+
+    /// Best value from a flat start, charging one final exit if the end state is
+    /// long. `max(V_T(0), V_T(1) - s)`.
+    pub fn bound(&self, side: f64) -> f64 {
+        let flat = self.m[0][0];
+        let long = self.m[1][0] - side;
+        if long > flat {
+            long
+        } else {
+            flat
+        }
+    }
+
+    pub fn bits(&self) -> [u64; 4] {
+        [
+            self.m[0][0].to_bits(),
+            self.m[0][1].to_bits(),
+            self.m[1][0].to_bits(),
+            self.m[1][1].to_bits(),
+        ]
+    }
+}
+
+/// One composed DP carry per group and the additive hindsight bound.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DpScan {
+    pub carries: Vec<DpCarry>,
+}
+
+impl DpScan {
+    pub fn bound(&self, side: f64) -> f64 {
+        let mut total = 0.0f64;
+        for carry in &self.carries {
+            total += carry.bound(side);
+        }
+        total
+    }
+}
+
+/// Exact hindsight DP scan with group seams reset and a max-plus carry. Chunk
+/// size does not change the carry bits or the bound.
+pub fn dp_scan(
+    returns: &[f64],
+    groups: &[u64],
+    side: f64,
+    chunk_rows: usize,
+) -> Result<DpScan, String> {
+    if returns.len() != groups.len() {
+        return Err(format!(
+            "length mismatch: returns {}, groups {}",
+            returns.len(),
+            groups.len()
+        ));
+    }
+    if !side.is_finite() || side < 0.0 {
+        return Err(format!("side must be finite and non-negative, got {}", side));
+    }
+    if chunk_rows == 0 {
+        return Err("chunk_rows must be at least 1".to_string());
+    }
+    check_group_contiguous(groups)?;
+    for (i, &r) in returns.iter().enumerate() {
+        if !r.is_finite() {
+            return Err(format!("row {}: non-finite return {}", i, r));
+        }
+    }
+    let n = returns.len();
+    let mut carries = Vec::new();
+    let mut carry = DpCarry::IDENTITY;
+    let mut current: Option<u64> = None;
+    let mut lo = 0usize;
+    while lo < n {
+        let hi = (lo + chunk_rows).min(n);
+        for i in lo..hi {
+            let group = groups[i];
+            if current != Some(group) {
+                if current.is_some() {
+                    carries.push(carry);
+                }
+                carry = DpCarry::IDENTITY;
+                current = Some(group);
+            }
+            carry = carry.then(&DpCarry::row(returns[i], side));
+        }
+        lo = hi;
+    }
+    if current.is_some() {
+        carries.push(carry);
+    }
+    Ok(DpScan { carries })
+}
+
+/// Convenience scalar hindsight bound.
+pub fn dp_bound(returns: &[f64], groups: &[u64], side: f64) -> Result<f64, String> {
+    Ok(dp_scan(returns, groups, side, returns.len().max(1))?.bound(side))
+}
+
 /// Merge 32 lane partials with the fixed pairwise tree used by the device.
 pub fn merge_lanes(lanes: &[PnlTotals; PNL_LANES]) -> PnlTotals {
     let mut buf = *lanes;

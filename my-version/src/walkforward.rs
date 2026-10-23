@@ -89,6 +89,37 @@ impl Window {
     }
 }
 
+/// The position policy. `Dp` keeps the threshold strategy as the reported book
+/// and adds the exact hindsight DP as a diagnostic bound, never as a strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    Threshold,
+    Band,
+    Dp,
+}
+
+impl Policy {
+    pub fn parse(src: &str) -> Result<Policy, String> {
+        match src {
+            "threshold" => Ok(Policy::Threshold),
+            "band" => Ok(Policy::Band),
+            "dp" | "hindsight" => Ok(Policy::Dp),
+            other => Err(format!(
+                "unknown policy '{}'; expected threshold | band | dp",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Policy::Threshold => "threshold",
+            Policy::Band => "band",
+            Policy::Dp => "dp",
+        }
+    }
+}
+
 /// Everything the evaluator needs. Construct this from the CLI or directly
 /// from Rust; [`run_path`] dispatches `.rcsb` vs CSV.
 #[derive(Clone, Debug)]
@@ -124,6 +155,15 @@ pub struct EvalSpec {
     /// CPU canonical path otherwise) and report it beside the scalar evaluator.
     /// The scalar evaluator remains the reported authority.
     pub device_pnl: bool,
+    /// #306: threshold | band | dp. `dp` keeps the threshold book and adds the
+    /// hindsight bound; it is never reported as the strategy's P&L.
+    pub policy: Policy,
+    /// #306: half-width `beta` of the no-trade band, in score units. Only used
+    /// by [`Policy::Band`]; `0` reproduces the plain threshold rule.
+    pub band_width: f64,
+    /// #306: minimum consecutive long rows before a band exit is allowed
+    /// (>= 1; `1` is the plain band).
+    pub min_hold: usize,
     /// Reset every pool seam to flat (the historical behaviour). The default
     /// carries the ending position of one test block into the next, so pooled
     /// total variation includes `|p_end - q_start|`.
@@ -208,6 +248,40 @@ pub struct WindowResult {
     pub metrics: Metrics,
     /// #304: fused canonical/device long-only P&L for this test block.
     pub device_pnl: Option<DevicePnlCheck>,
+    /// #306: band/cooldown carry check when the band policy was selected.
+    pub band: Option<BandCheck>,
+    /// #306: exact hindsight DP bound when the dp policy was selected.
+    pub hindsight_bound: Option<HindsightBound>,
+}
+
+/// #306: the band/cooldown book and its associative carry.
+#[derive(Clone, Debug)]
+pub struct BandCheck {
+    pub band_width: f64,
+    pub min_hold: usize,
+    /// `carry2` for the 2-state band, `cooldown-K` for the K+1-state variant.
+    pub carry: String,
+    pub groups: usize,
+    /// Additive net from the composed carry (including every final exit).
+    pub net: f64,
+    /// Scalar evaluator's sum of per-row net returns.
+    pub scalar_net: f64,
+}
+
+/// #306: the exact hindsight DP, labelled as a bound and not a strategy.
+#[derive(Clone, Debug)]
+pub struct HindsightBound {
+    /// Always `hindsight_bound`; kept explicit in the JSON.
+    pub label: String,
+    /// Exact `O(2n)` max-plus DP value.
+    pub net: f64,
+    /// The reported threshold book's net for the same rows.
+    pub rule_net: f64,
+    /// `net - rule_net`; always non-negative up to floating-point rounding.
+    pub gap: f64,
+    pub groups: usize,
+    /// `rule_net <= net` (with a 1e-12 absolute tolerance for summation order).
+    pub rule_le_bound: bool,
 }
 
 /// #304: one test block's fused long-only reduction, plus the two benchmarks.
@@ -250,6 +324,10 @@ pub struct Report {
     pub pooled: Metrics,
     pub cost_bps: f64,
     pub threshold_quantile: f64,
+    /// #306: position policy and its band parameters.
+    pub policy: Policy,
+    pub band_width: f64,
+    pub min_hold: usize,
     pub validation_frac: f64,
     pub horizon: f64,
     pub embargo: f64,
@@ -518,6 +596,12 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
     if !spec.cost_bps.is_finite() || spec.cost_bps < 0.0 {
         return Err("--cost-bps must be finite and non-negative".to_string());
     }
+    if !spec.band_width.is_finite() || spec.band_width < 0.0 {
+        return Err("--band must be finite and non-negative".to_string());
+    }
+    if spec.min_hold == 0 {
+        return Err("--min-hold must be at least 1".to_string());
+    }
     if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 {
         return Err(
             "multiple --expr candidates need --validation-frac > 0: select on a validation \
@@ -782,6 +866,9 @@ impl Accum {
                 cost_side,
                 ppy,
                 &mut fresh_previous,
+                spec.policy,
+                spec.band_width,
+                spec.min_hold,
                 spec.device_pnl,
             );
             // Pooled path: carry each group's position across the seam unless
@@ -794,6 +881,9 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut HashMap::new(),
+                    spec.policy,
+                    spec.band_width,
+                    spec.min_hold,
                     false,
                 )
             } else {
@@ -804,6 +894,9 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut pooled_previous,
+                    spec.policy,
+                    spec.band_width,
+                    spec.min_hold,
                     false,
                 )
             };
@@ -841,6 +934,8 @@ impl Accum {
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
                 device_pnl: ev.device,
+                band: ev.band,
+                hindsight_bound: ev.hindsight_bound,
             });
         }
 
@@ -901,6 +996,9 @@ impl Accum {
             pooled,
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
+            policy: spec.policy,
+            band_width: spec.band_width,
+            min_hold: spec.min_hold,
             validation_frac: spec.validation_frac,
             horizon: spec.horizon,
             embargo: spec.embargo_seconds(),
@@ -1134,6 +1232,8 @@ struct WindowEval {
     first_positions: HashMap<u64, f64>,
     end_positions: HashMap<u64, f64>,
     device: Option<DevicePnlCheck>,
+    band: Option<BandCheck>,
+    hindsight_bound: Option<HindsightBound>,
 }
 
 /// One timestamp's `(sum, count)` cross-section.
@@ -1245,6 +1345,9 @@ fn evaluate_window(
     cost_side: f64,
     ppy: f64,
     previous: &mut HashMap<u64, f64>,
+    policy: Policy,
+    band_width: f64,
+    min_hold: usize,
     device_pnl: bool,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
@@ -1273,9 +1376,73 @@ fn evaluate_window(
             .then_with(|| ra.time.partial_cmp(&rb.time).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.cmp(&b))
     });
+
+    // Rows in the group-contiguous order used by the carry scans and by the
+    // #304 reduction. The scalar book below stays in this same order.
+    let mut ord_scores = Vec::with_capacity(n);
+    let mut ord_returns = Vec::with_capacity(n);
+    let mut ord_groups = Vec::with_capacity(n);
     for &i in &order {
         let row = &rows[valid[i]];
-        let pos = position_for(scores[valid[i]], threshold);
+        ord_scores.push(scores[valid[i]]);
+        ord_returns.push(row.target);
+        ord_groups.push(row.group);
+    }
+
+    // #306: the band/cooldown book. `positions` are aligned with `order`;
+    // `net` includes the final exit of every group. `dp` deliberately keeps
+    // the threshold book: the DP is a bound, not a strategy.
+    let band_scan: Option<(Vec<f64>, f64, usize, String)> = if policy == Policy::Band {
+        let params = crate::trading_gpu::BandParams {
+            threshold,
+            band: band_width,
+            min_hold,
+        };
+        if min_hold > 1 {
+            let scan = crate::trading_gpu::cooldown_scan(
+                &ord_scores,
+                &ord_returns,
+                &ord_groups,
+                &params,
+                cost_side,
+                65_536,
+            )
+            .unwrap_or_else(|e| panic!("cooldown scan failed: {}", e));
+            let net = scan.net();
+            Some((
+                scan.positions,
+                net,
+                scan.carries.len(),
+                format!("cooldown-{}", min_hold),
+            ))
+        } else {
+            let scan = crate::trading_gpu::band_scan(
+                &ord_scores,
+                &ord_returns,
+                &ord_groups,
+                &params,
+                cost_side,
+                65_536,
+            )
+            .unwrap_or_else(|e| panic!("band scan failed: {}", e));
+            let net = scan.net();
+            Some((
+                scan.positions,
+                net,
+                scan.carries.len(),
+                "carry2".to_string(),
+            ))
+        }
+    } else {
+        None
+    };
+
+    for (k, &i) in order.iter().enumerate() {
+        let row = &rows[valid[i]];
+        let pos = match &band_scan {
+            Some((positions, _, _, _)) => positions[k],
+            None => position_for(scores[valid[i]], threshold),
+        };
         let prev = previous.get(&row.group).copied().unwrap_or(0.0);
         let delta = pos - prev;
         let cost = cost_side * delta.abs();
@@ -1335,15 +1502,6 @@ fn evaluate_window(
     // group-contiguous order the reducer requires. The scalar evaluator above
     // stays the reported authority; this block is a device/canonical check.
     let device = if device_pnl {
-        let mut ord_scores = Vec::with_capacity(n);
-        let mut ord_returns = Vec::with_capacity(n);
-        let mut ord_groups = Vec::with_capacity(n);
-        for &i in &order {
-            let row = &rows[valid[i]];
-            ord_scores.push(scores[valid[i]]);
-            ord_returns.push(row.target);
-            ord_groups.push(row.group);
-        }
         let params = crate::trading_gpu::PnlParams {
             threshold,
             per_side_bps: cost_side * 10_000.0,
@@ -1389,6 +1547,35 @@ fn evaluate_window(
         None
     };
 
+    let scalar_net = net.iter().sum::<f64>();
+    let band = band_scan.map(|(_, band_net, groups, carry)| BandCheck {
+        band_width,
+        min_hold,
+        carry,
+        groups,
+        net: band_net,
+        scalar_net,
+    });
+
+    // #306: exact hindsight DP for the same rows and costs. It is reported as
+    // a bound only; the threshold (or band) book above remains the strategy.
+    let hindsight_bound = if policy == Policy::Dp {
+        let scan = crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536)
+            .unwrap_or_else(|e| panic!("hindsight DP scan failed: {}", e));
+        let bound = scan.bound(cost_side);
+        Some(HindsightBound {
+            label: "hindsight_bound".to_string(),
+            net: bound,
+            rule_net: scalar_net,
+            gap: bound - scalar_net,
+            groups: scan.carries.len(),
+            rule_le_bound: scalar_net <= bound + 1e-12,
+        })
+    } else {
+        None
+    };
+
+
     // Equal-weight the groups present at each timestamp. Times are sorted so the
     // return series has the same order as the Python reference.
     let mut time_order = order;
@@ -1416,6 +1603,8 @@ fn evaluate_window(
         first_positions,
         end_positions,
         device,
+        band,
+        hindsight_bound,
     }
 }
 
@@ -1653,6 +1842,33 @@ fn device_pnl_json(d: &DevicePnlCheck) -> String {
     )
 }
 
+fn band_check_json(b: &BandCheck) -> String {
+    format!(
+        "{{\"band_width\":{},\"min_hold\":{},\"carry\":{},\"groups\":{},\
+         \"net\":{},\"scalar_net\":{},\"net_delta\":{}}}",
+        jnum(b.band_width),
+        b.min_hold,
+        jstr(&b.carry),
+        b.groups,
+        jnum(b.net),
+        jnum(b.scalar_net),
+        jnum(b.net - b.scalar_net)
+    )
+}
+
+fn hindsight_bound_json(h: &HindsightBound) -> String {
+    format!(
+        "{{\"label\":{},\"is_strategy\":false,\"net\":{},\"rule_net\":{},\
+         \"gap\":{},\"groups\":{},\"rule_le_bound\":{}}}",
+        jstr(&h.label),
+        jnum(h.net),
+        jnum(h.rule_net),
+        jnum(h.gap),
+        h.groups,
+        h.rule_le_bound
+    )
+}
+
 fn md_num(v: f64) -> String {
     if v.is_finite() {
         format!("{:.6}", v)
@@ -1709,7 +1925,7 @@ impl WindowResult {
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
-             \"metrics\":{},\"device_pnl\":{}}}",
+             \"metrics\":{},\"device_pnl\":{},\"band\":{},\"hindsight_bound\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
             jnum(self.window.train_end),
@@ -1729,7 +1945,13 @@ impl WindowResult {
             self.metrics.json(),
             self.device_pnl
                 .as_ref()
-                .map_or("null".to_string(), device_pnl_json)
+                .map_or("null".to_string(), device_pnl_json),
+            self.band
+                .as_ref()
+                .map_or("null".to_string(), band_check_json),
+            self.hindsight_bound
+                .as_ref()
+                .map_or("null".to_string(), hindsight_bound_json)
         )
     }
 }
@@ -1764,6 +1986,19 @@ impl Report {
             self.allow_lockbox,
             overlap.join(",")
         );
+        let position_rule = match self.policy {
+            Policy::Threshold => {
+                "long/flat: 1 if score > threshold else 0; never short; no leverage"
+            }
+            Policy::Band => {
+                "long/flat no-trade band: enter when score > threshold+band, exit when \
+                 score <= threshold-band after the minimum hold; never short; no leverage"
+            }
+            Policy::Dp => {
+                "reported book is the threshold rule; the DP value is a hindsight_bound, \
+                 not a strategy; never short; no leverage"
+            }
+        };
         format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"walkforward\",\
              \"expression\":{},\"target\":{},\"variables\":[{}],\"time\":{},\
@@ -1772,7 +2007,9 @@ impl Report {
              \"purge\":{{\"horizon_seconds\":{},\"embargo_seconds\":{}}},\
              \"cost_model\":{{\"per_side_bps\":{},\"round_trip_bps\":{},\
              \"charged_on\":\"|position change| per group; per-window metrics start flat, pooled carries the boundary\"}},\
-             \"position_rule\":\"long/flat: 1 if score > threshold else 0; never short; no leverage\",\
+             \"position_rule\":{},\
+             \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
+             \"min_hold\":{},\"short\":false}},\
              \"threshold\":{{\"quantile\":{},\"method\":\"linear interpolation (numpy type 7)\",\
              \"source\":\"train or validation only\"}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{}}},\
@@ -1799,6 +2036,11 @@ impl Report {
             jnum(self.embargo),
             jnum(self.cost_bps),
             jnum(self.cost_bps * 2.0),
+            jstr(position_rule),
+            jstr(self.policy.as_str()),
+            self.policy == Policy::Dp,
+            jnum(self.band_width),
+            self.min_hold,
             jnum(self.threshold_quantile),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
@@ -1871,9 +2113,21 @@ impl Report {
             self.group_by.as_deref().unwrap_or("(none: one series)")
         ));
         s.push_str("## Rules\n\n");
+        let policy_line = match self.policy {
+            Policy::Threshold => {
+                "- Long/flat only: `position = 1` when `score > threshold`, else `0`; never short, no leverage.\n".to_string()
+            }
+            Policy::Band => format!(
+                "- Long/flat no-trade band (`beta = {}`, minimum hold {}): enter when `score > threshold + beta`, exit when `score <= threshold - beta` after the hold; never short, no leverage.\n",
+                md_num(self.band_width),
+                self.min_hold
+            ),
+            Policy::Dp => {
+                "- Reported book: the plain threshold rule. The DP value is a **hindsight bound**, not a strategy; never short, no leverage.\n".to_string()
+            }
+        };
         s.push_str(&format!(
-            "- Long/flat only: `position = 1` when `score > threshold`, else `0`; never short, no leverage.\n\
-             - Threshold: q{:.4} of the {} scores, linear interpolation (numpy type 7).\n\
+            "{}- Threshold: q{:.4} of the {} scores, linear interpolation (numpy type 7).\n\
              - Cost: {:.4} bp per side on `|position change|`, so {:.4} bp per round trip.\n\
              - Per-window metrics start every group flat; the pooled path {} and its total\n\
                variation includes the seam term `|p_end - q_start|`.\n\
@@ -1881,6 +2135,7 @@ impl Report {
              - Purge: horizon {:.1}s, embargo {:.1}s.\n\
              - Annualisation: {} ({:.6} periods/year).\n\
              - Source: {}.\n\n",
+            policy_line,
             self.threshold_quantile,
             if self.validation_frac > 0.0 {
                 "training/validation split"
