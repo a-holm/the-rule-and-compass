@@ -67,6 +67,17 @@ extern "C" {
     fn rc_enrich_bb_width(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_vz(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_donchian(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_donchian_centred(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_stoch(ctx: *mut Raw, which: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_atr(ctx: *mut Raw, period: c_int, which: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_batr(ctx: *mut Raw, out: *mut f64) -> c_int;
+    fn rc_enrich_gapatr(ctx: *mut Raw, out: *mut f64) -> c_int;
+    fn rc_enrich_volrat(ctx: *mut Raw, out: *mut f64) -> c_int;
+    fn rc_enrich_adx(ctx: *mut Raw, which: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_bb_z(ctx: *mut Raw, w: c_int, mode: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_ma_slope(ctx: *mut Raw, w: c_int, lag: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_tod(ctx: *mut Raw, want_sin: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_exotic(ctx: *mut Raw, which: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_ema(ctx: *mut Raw, span: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_macd(
         ctx: *mut Raw,
@@ -700,6 +711,68 @@ impl EnrichGpu {
     pub fn donchian(&mut self, w: usize) -> Option<Vec<f64>> {
         let ctx = self.ctx;
         self.one(|p| unsafe { rc_enrich_donchian(ctx, w as c_int, p) })
+    }
+
+    /// Compact `don96`: the same blocked extrema, centred on zero.
+    pub fn donchian_centred(&mut self, w: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_donchian_centred(ctx, w as c_int, p) })
+    }
+
+    /// Stochastic `%K` (`which = 0`) or its 3-bar mean `%D` (`which = 1`).
+    pub fn stoch(&mut self, which: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_stoch(ctx, which as c_int, p) })
+    }
+
+    /// Parameterised ATR. `which`: 0 price, 1 NATR, 2 fraction, 3 legacy #125.
+    pub fn atr(&mut self, period: usize, which: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_atr(ctx, period as c_int, which as c_int, p) })
+    }
+
+    pub fn batr(&mut self) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_batr(ctx, p) })
+    }
+
+    pub fn gapatr(&mut self) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_gapatr(ctx, p) })
+    }
+
+    pub fn volrat(&mut self) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_volrat(ctx, p) })
+    }
+
+    /// ADX/DI selector: 0 ADX, 1 +DI, 2 -DI, 3 DI difference.
+    pub fn adx(&mut self, which: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_adx(ctx, which as c_int, p) })
+    }
+
+    /// Bollinger z-score (mode 0) or two-sigma clip (mode 1).
+    pub fn bb_z(&mut self, w: usize, mode: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_bb_z(ctx, w as c_int, mode as c_int, p) })
+    }
+
+    pub fn ma_slope(&mut self, w: usize, lag: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_ma_slope(ctx, w as c_int, lag as c_int, p) })
+    }
+
+    pub fn tod(&mut self, want_sin: bool) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_tod(ctx, want_sin as c_int, p) })
+    }
+
+    /// Exotic selector: 0 rmean5, 1 rstd5, 2 close_pos20, 3 ou_hl96, 4 acf1,
+    /// 5 vr4, 6 rskew96, 7 jump_share, 8 semivar_asym, 9 cusum_abs_z.
+    pub fn exotic(&mut self, which: usize) -> Option<Vec<f64>> {
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_exotic(ctx, which as c_int, p) })
     }
 
     pub fn ema(&mut self, span: usize) -> Option<Vec<f64>> {

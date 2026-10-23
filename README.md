@@ -402,7 +402,11 @@ atomically instead of streaming it. See
   `mtf` group emits all 36 multi-timeframe columns
   (`mtf_<1h|4h|1d>_<leaf>`), joined only after the higher bar has closed with
   explicit `bar_age` staleness (the same resample and causal join dispatch to
-  the device under `--features cuda` and `--gpu on`), the `price_action` group adds the continuous
+  the device under `--features cuda` and `--gpu on`), the engine-tail kernels
+  cover return/MA parameters, `don20`/`don96`, stochastic, ATR/ADX/DI,
+  Bollinger and the registered exotic statistics with `O(n)` blocked extrema
+  and one shared gap policy (`r16`, `r96` and `don96` no longer fall through
+  the compact guard), the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
