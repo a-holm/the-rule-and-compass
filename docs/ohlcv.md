@@ -113,6 +113,39 @@ The registry (`rcsr schema`) marks all 36 `available:true` with
 test id; `tests/enrich.rs` pins hand-built higher-bar values, NaN/gap behaviour,
 the future-shift failure and prefix replay.
 
+### Device MTF resample and causal join (`--features cuda`)
+
+`src/mtf_gpu.rs` and `src/cuda/mtf.cu` move the same contract to the device.
+Base rows are bucketised with `floor(t/tf)` per symbol; a deterministic
+exclusive scan of the new-bucket flags gives one thread per bucket, which folds
+its contiguous input rows in order (`open=first`, `high=max`, `low=min`,
+`close=last`). No empty bucket is emitted: a missing hour simply leaves a hole
+in the higher series, exactly like the CPU.
+
+The eleven value leaves are evaluated on the smaller higher series with the
+CPU's sequential arithmetic and the same prefix-subtraction order, including
+the Wilder ATR/RSI seeds and gap resets. One monotone cursor per symbol then
+produces the last-closed join index once per timeframe; each requested leaf is
+a one-thread-per-base-row gather over that index. The CPU guard
+`higher.time == bucket_start(base.time) - tf` is preserved, so a stale bucket
+is `NaN` for every value leaf while `bar_age` stays finite and exact. A partial
+or current higher bucket is never visible.
+
+`tests/mtf_gpu.rs` pins the complete 36-column CPU/GPU parity (bitwise for every
+leaf except `vol`, whose `sqrt` is within `1e-12`), a missing bucket for
+`1h`/`4h`/`1d`, a partial trailing bucket, prefix replay at ~20 cuts and symbol
+batch/chunk-size invariance. `rcsr schema` reports the family under
+`gpu_feature_parity`; `rcsr enrich --help` documents the device path.
+
+**Dispatch guard.** On the paired 1.05M-row, two-symbol 15m fixture the MTF
+phase was CPU 5.08 s vs device 6.45 s (kernel 3.55 s, transfer 357 MB), so the
+device path is **opt-in** with `--gpu on` until a paired 16M-row run establishes
+the crossover. `--gpu auto` keeps the CPU reference for MTF and reports the
+reason in the plan; the cost model for the other families is unchanged. This is
+a measured guard, not a speed-up claim: the 16M paired measurement is still
+missing, and the 1.05M fixture has only two symbol segments, so the
+one-thread-per-segment leaf/join passes underutilise the device.
+
 ## Corporate actions
 
 `adjust(actions, bars)` returns an `AdjustedSeries` with three parallel views:
