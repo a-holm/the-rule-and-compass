@@ -236,6 +236,7 @@ fn eval_spec(windows: Vec<Window>) -> EvalSpec {
         candidates: Vec::new(),
         pool_reset_flat: false,
         allow_lockbox: false,
+        device_pnl: false,
     }
 }
 

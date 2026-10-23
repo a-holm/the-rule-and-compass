@@ -7607,6 +7607,11 @@ OPTIONS:
                              position, so total variation includes |p_end-q_start|
   --periods-per-year <f>     annualisation override (default: infer from the
                              median test time step; 365 for daily crypto bars)
+  --device-pnl               recompute each test block through the fused
+                             long-only reduction (f64 canonical segments; the
+                             CUDA kernel when built with --features cuda) and
+                             report it with cash and buy-and-hold benchmarks.
+                             The scalar evaluator remains the reported authority
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
@@ -7644,6 +7649,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
+    let mut device_pnl = false;
     let mut json = false;
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
@@ -7744,6 +7750,7 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--pool-reset-flat" => pool_reset_flat = true,
+            "--device-pnl" => device_pnl = true,
             "--json" => json = true,
             "--out" => {
                 out = Some(need(args, i + 1, "--out"));
@@ -7859,6 +7866,7 @@ fn run_walkforward(args: &[String]) -> ! {
         candidates,
         pool_reset_flat,
         allow_lockbox,
+        device_pnl,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,

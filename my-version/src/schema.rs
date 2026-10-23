@@ -190,6 +190,7 @@ pub fn json() -> String {
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
 {{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
+{{\"name\":\"--device-pnl\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"recompute each test block through the fused f64 long-only reduction (CUDA kernel when available, identical canonical CPU segments otherwise) and report it with cash and buy-and-hold benchmarks; the scalar evaluator remains the authority\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \

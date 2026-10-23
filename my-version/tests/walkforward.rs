@@ -52,7 +52,42 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         candidates: Vec::new(),
         pool_reset_flat: false,
         allow_lockbox: false,
+        device_pnl: false,
     }
+}
+
+#[test]
+fn device_pnl_check_matches_the_scalar_book() {
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, -0.02),
+        (6.0, 6.0, 0.03),
+        (7.0, 7.0, -0.01),
+    ]);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    s.cost_bps = 100.0;
+    s.threshold_quantile = 0.5;
+    s.device_pnl = true;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let d = r.windows[0].device_pnl.as_ref().expect("device P&L block");
+    let m = &r.windows[0].metrics;
+    assert_eq!(d.strategy.rows, m.rows as u64);
+    assert_eq!(d.strategy.entries, m.entries as u64);
+    assert_eq!(d.strategy.trades, m.trades as u64);
+    assert!((d.strategy.net - d.cpu_net).abs() <= 1e-12);
+    assert!((d.strategy.turnover - m.total_abs_delta).abs() <= 1e-12);
+    assert_eq!(d.cash.net, 0.0);
+    assert_eq!(d.cash.cost, 0.0);
+    let summary = r.device_pnl.as_ref().expect("report summary");
+    assert_eq!(summary.windows, 1);
+    assert_eq!(summary.rows, m.rows as u64);
+    assert!(summary.max_abs_net_delta <= 1e-12);
+    assert!(r.json().contains("\"device_pnl\""));
+    assert!(r.json().contains("\"buy_and_hold\""));
 }
 
 #[test]
