@@ -1084,11 +1084,18 @@ reproduction. A metric may use the GPU only when the kernel computes its
 objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
 every other metric is scored on the CPU, so no run is ever ranked by a proxy
 loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
-launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
-The packed batch path allocates a persistent device arena once, stages host
-bytes in a <=64 MiB pinned ring and copies on `S_h2d`/`S_d2h` with event
-dependencies, so `alloc_s` is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the
-labelled blocking fallback (#285).
+launch, sync, D2H, wall, throughput, evaluator-window kernel duty, quality per
+GPU-hour) and a run-scoped `gpu.ledger`: exclusive stage seconds, device-busy as
+the **union** of device intervals over run wall (never their sum), fit/eval/
+fallback seconds with labelled causes, fit kernel versus CPU-fallback time, and
+numerator/denominator/units/scope on every derived ratio. `Σ stage_s +
+unaccounted_s = wall_s` within 1 %; `gpu.duty_cycle` is explicitly the evaluator
+window, while `gpu.ledger.duty_run` is the run-level headline. The packed batch
+path allocates a persistent device arena once, stages host bytes in a <=64 MiB
+pinned ring and copies on `S_h2d`/`S_d2h` with event dependencies, so `alloc_s`
+is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the labelled blocking fallback
+(#285). See
+[`docs/gpu-backend.md`](docs/gpu-backend.md#measuring-the-full-gpu-path-issue-118).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See
 [`docs/gpu-backend.md`](docs/gpu-backend.md).

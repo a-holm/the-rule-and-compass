@@ -1001,6 +1001,11 @@ pub struct GpuEvaluator {
     n_rows: u64,
     /// #118: accumulated host-time ledger for every batch scored here.
     stats: GpuStats,
+    /// #284: run clock for evaluator device intervals.
+    run_start: std::time::Instant,
+    /// #284: evaluator side of the run ledger. `GpuStats` keeps the additive C
+    /// windows; this keeps the device intervals whose union is device-busy.
+    ledger: crate::gpu_stats::RunLedger,
     /// #229: the objective every evaluation accumulates. Defaults to squared;
     /// the search sets it from `--metric` only when [`DeviceLoss::for_metric`]
     /// names a native kernel objective.
@@ -1021,6 +1026,8 @@ impl GpuEvaluator {
                 pool_width: 0,
                 pool_last: 0,
                 stats: GpuStats::default(),
+                run_start: std::time::Instant::now(),
+                ledger: crate::gpu_stats::RunLedger::new(),
                 loss: crate::fit::DeviceLoss::Squared,
             })
         }
@@ -1319,12 +1326,29 @@ impl GpuEvaluator {
                 self.n_rows,
                 failed,
             );
+            // #284: the evaluator's device interval is the raw kernel window,
+            // not the host envelope. Place it on the run clock using the
+            // measured outer wall; a failed batch keeps its interval too.
+            let end_s = self.run_start.elapsed().as_secs_f64();
+            let start_s = (end_s - wall_s).max(0.0);
+            self.ledger
+                .record_eval_kernel(0, start_s, raw.kernel_ms.max(0.0) / 1e3);
         }
+    }
+
+    /// #284: place this evaluator's device intervals on the caller's run clock.
+    pub(crate) fn set_run_start(&mut self, run_start: std::time::Instant) {
+        self.run_start = run_start;
     }
 
     /// Accumulated accounting for every batch scored through this evaluator.
     pub fn stats(&self) -> GpuStats {
         self.stats
+    }
+
+    /// #284: device intervals recorded by this evaluator.
+    pub fn ledger(&self) -> &crate::gpu_stats::RunLedger {
+        &self.ledger
     }
 
     /// #122: evaluate `n` fixed-width slots read directly from `arena`.

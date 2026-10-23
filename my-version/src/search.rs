@@ -605,7 +605,7 @@ struct GpuSearch {
     /// #169: wall time spent in the whole fit stage (kernel, launch, CPU
     /// fallback and write-back), milliseconds.
     fit_host_ms: f64,
-    /// #255: wall time spent in the exact CPU fallback fits, milliseconds.
+    /// #284/#255: exact CPU fallback seconds inside the fit stage, milliseconds.
     /// This is a subset of `fit_host_ms`, never added to it twice.
     fit_fallback_ms: f64,
     /// #255: candidates left at their finite device constants because the
@@ -613,6 +613,11 @@ struct GpuSearch {
     fit_fallback_bounded: usize,
     /// #255: largest number of scoped workers the fallback batch used.
     fit_fallback_workers: usize,
+    /// #284: run clock for device intervals.
+    ledger_origin: std::time::Instant,
+    /// #284: device intervals and fit sub-ledger. The search adds the exclusive
+    /// main-thread stages; this ledger owns what only the evaluator/fitter sees.
+    ledger: crate::gpu_stats::RunLedger,
     /// #230: true only when the CUDA evaluator scores this run's metric
     /// itself. The rank family is *fitted* on the device (squared LM start +
     /// exact rank polish) but still *scored* by the CPU, because the evaluator
@@ -630,6 +635,8 @@ impl GpuSearch {
         native_metric: bool,
         // #234: the device fit needs the label sign for a log-loss run.
         logistic_fit: bool,
+        // #284: the run clock every device interval is placed on.
+        run_start: std::time::Instant,
     ) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
@@ -655,6 +662,8 @@ impl GpuSearch {
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
         match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
             Some(mut ev) => {
+                // #284: one clock for evaluator and fit intervals.
+                ev.set_run_start(run_start);
                 // #229: the evaluator must accumulate the objective the run
                 // ranks on. `gpu_blocker` has already refused any metric without
                 // a native kernel loss, so this is the configured objective.
@@ -695,6 +704,8 @@ impl GpuSearch {
                     fit_fallback_ms: 0.0,
                     fit_fallback_bounded: 0,
                     fit_fallback_workers: 0,
+                    ledger_origin: run_start,
+                    ledger: crate::gpu_stats::RunLedger::new(),
                     native_metric,
                 })
             }
@@ -703,6 +714,11 @@ impl GpuSearch {
                 crate::gpu::GpuEvaluator::device_name()
             )),
         }
+    }
+
+    /// #284: current position on the run clock, for device intervals.
+    fn ledger_offset_s(&self) -> f64 {
+        self.ledger_origin.elapsed().as_secs_f64()
     }
 
     /// #169: move the constants of the **admitted** pending candidates with
@@ -787,6 +803,7 @@ impl GpuSearch {
             // statistic. Every other metric stays on the LM kernel of
             // #169/#229.
             let want = crate::fit::OrderStat::for_metric(cfg.metric);
+            let fit_device_start = self.ledger_offset_s();
             let (out, ms) = if maximum_arm {
                 // #227: the exact maximum-error polish on the squared start.
                 self.ev.max_fit_batch(&plans, cfg.fit_iters)
@@ -808,6 +825,10 @@ impl GpuSearch {
             };
             if ms > 0.0 {
                 self.fit_ms += ms as f64;
+                // #284: the fit kernel is one device interval on the run clock;
+                // its duration is the raw event time, not the host envelope.
+                self.ledger
+                    .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0);
             }
             if out.len() == jobs.len() {
                 // #234: the log-loss arm judges the proposal by the configured
@@ -911,6 +932,8 @@ impl GpuSearch {
                 islands[job.island][job.slot].tree = job.tree;
             }
         }
+        // #284: fallback seconds are measured around the CPU arm itself, not
+        // inferred from a count. This is a leaf of the fit host window.
         let fallback_seconds = fallback_start.elapsed().as_secs_f64();
         self.fit_fallback_ms += fallback_seconds * 1000.0;
         self.fit_fallback_workers = self.fit_fallback_workers.max(workers_used);
@@ -1121,6 +1144,10 @@ impl GpuSearch {
             }
             let stats = self.stats.entry(generation).or_default();
             stats.fallback_seconds += seconds;
+            // #284: evaluator fallback is a separate measured leaf; its programs
+            // are already counted in `stats.fallbacks`.
+            self.ledger
+                .record_eval_fallback(on_cpu.len() as u64, seconds);
         }
         if let Some(e) = gpu_error {
             return Err(e);
@@ -1131,6 +1158,23 @@ impl GpuSearch {
     /// #131: the per-generation report, in generation order. #118 adds the
     /// accumulated full-path accounting from the same evaluator.
     fn run_stats(&self) -> GpuRunStats {
+        // #284: the evaluator/fitter side of the run ledger. The exclusive
+        // main-thread stages are added by the caller; this half owns the device
+        // intervals and the fit leaves.
+        let mut ledger = self.ev.ledger().clone();
+        ledger.set_eval_window(self.ev.stats().wall_s);
+        ledger.absorb(&self.ledger);
+        ledger.record_fit(
+            self.fit_host_ms / 1000.0,
+            self.fit_ms / 1000.0,
+            self.fit_fallback_ms / 1000.0,
+        );
+        ledger.record_fit_counters(
+            self.fit_attempts as u64,
+            self.fit_gpu as u64,
+            self.fit_fallback as u64,
+            self.fit_fallback_by_cause.clone(),
+        );
         GpuRunStats {
             generations: self
                 .stats
@@ -1147,9 +1191,10 @@ impl GpuSearch {
             fit_ms: self.fit_ms,
             fit_host_ms: self.fit_host_ms,
             fit_fallback_ms: self.fit_fallback_ms,
-            fit_fallback_bounded: self.fit_fallback_bounded,
+fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
+            ledger,
         }
     }
 
@@ -2603,7 +2648,7 @@ fn full_data_archive(
     // #169: refit every finalist with the exact CPU f64 arm because the search
     // used the batched GPU constants.
     refit_gpu_fit: bool,
-) -> (Archive, usize) {
+) -> (Archive, usize, f64) {
     let trees: Vec<&Node> = archive
         .items
         .iter()
@@ -2618,6 +2663,8 @@ fn full_data_archive(
         }
     }
     let mut refits = 0usize;
+    let mut refit_s = 0.0;
+    let refit_start = std::time::Instant::now();
     // #169: reported constants must come from the exact CPU f64 arm, not from
     // the f32 row arithmetic of the batched kernel. This is a warm start from
     // the GPU constants on the full training sample. Trees are independent, so
@@ -2668,6 +2715,10 @@ fn full_data_archive(
         }
         refits = unique.len();
     }
+    // #284: only the exact CPU refit window, not the whole archive rebuild.
+    if refits > 0 {
+        refit_s = refit_start.elapsed().as_secs_f64();
+    }
     let mut out = Archive::new(archive.cap);
     for tree in unique {
         // #15: combined error on a multi-output sample; #25: a rejected
@@ -2684,7 +2735,7 @@ fn full_data_archive(
             error,
         });
     }
-    (out, refits)
+    (out, refits, refit_s)
 }
 
 /// Lexicographic parsimony pressure: better error wins; if the errors are equal
@@ -3081,7 +3132,7 @@ pub struct GpuRunStats {
     pub fit_ms: f64,
     /// #169: wall time spent in the whole fit stage, milliseconds.
     pub fit_host_ms: f64,
-    /// #255: wall time spent in the exact CPU fallback fits, milliseconds.
+/// #284/#255: wall time spent in the exact CPU fallback fits, milliseconds.
     /// Already included in `fit_host_ms`; report it, never add it again.
     pub fit_fallback_ms: f64,
     /// #255: fallbacks held at their finite device constants by the
@@ -3091,6 +3142,9 @@ pub struct GpuRunStats {
     pub fit_fallback_workers: usize,
     /// #255: configured per-generation fallback cap (`0` = unbounded).
     pub fit_fallback_max: usize,
+    /// #284: run-scoped stage/device ledger. `Default` is an empty ledger, so
+    /// every existing fixture that builds `GpuRunStats` still compiles.
+    pub ledger: crate::gpu_stats::RunLedger,
 }
 
 pub struct Outcome {
@@ -3503,6 +3557,14 @@ impl GpuSnapshot {
     }
 }
 
+/// #284: read the always-on stage clock and reset the mark.
+fn stage_lap(mark: &mut std::time::Instant) -> f64 {
+    let now = std::time::Instant::now();
+    let d = now.duration_since(*mark).as_secs_f64();
+    *mark = now;
+    d
+}
+
 /// #211: read the clock and reset the mark. A no-op (0.0) with no log attached.
 fn dev_lap(mark: &mut Option<std::time::Instant>) -> f64 {
     match mark.as_mut() {
@@ -3693,6 +3755,13 @@ fn run_postfix_search(
     let mut gpu_stats: Vec<GpuGenStats> = Vec::new();
     let mut restart_flags = vec![false; n_islands];
     let t0 = std::time::Instant::now();
+    // #284: run clock and ledger for the flat path.
+    let mut run_ledger = crate::gpu_stats::RunLedger::new();
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        t0.elapsed().as_secs_f64(),
+    );
+    let mut eval_stage_total = 0.0f64;
     // #211: why the loop ends, for the development log's run_end event.
     let mut stop_reason: &'static str = if converged_early {
         "already_stopped"
@@ -3710,6 +3779,7 @@ fn run_postfix_search(
         // #211: development-log clock and counters. `None` without --dev-log, so
         // this loop is the one it always was.
         let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
+        let mut stage_mark = std::time::Instant::now();
         let mut dev_offers = 0usize;
         let mut dev_admissions = 0usize;
         let dev_gpu_before = if dev_mark.is_some() {
@@ -3739,8 +3809,10 @@ fn run_postfix_search(
             front_p,
         );
         let dev_generate = dev_lap(&mut dev_mark); // #211
+        let stage_generate = stage_lap(&mut stage_mark); // #284
         next.evaluate(&mut gpu.ev, train.len())?;
         let dev_eval = dev_lap(&mut dev_mark); // #211
+        let stage_eval = stage_lap(&mut stage_mark); // #284
         restart_flags = vec![false; n_islands];
 
         // Archive: test `(error, cost)` first and rebuild a tree only for a
@@ -3768,6 +3840,10 @@ fn run_postfix_search(
             }
         }
         let dev_archive = dev_lap(&mut dev_mark); // #211
+        let stage_archive = stage_lap(&mut stage_mark); // #284
+        run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_generate);
+        run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
+        eval_stage_total += stage_eval;
         gpu_stats.push(GpuGenStats {
             generation: gen,
             opcodes: Default::default(),
@@ -3963,6 +4039,20 @@ fn run_postfix_search(
         }
     }
 
+    // #284: close measured generation stages to the run clock. The evaluator
+    // window joins the ledger first so the fit reclassification can subtract
+    // from it rather than add a second stage.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
+    let tail_start = std::time::Instant::now();
+    let pre_tail_elapsed = tail_start.duration_since(t0).as_secs_f64();
+    let accounted_before_tail = run_ledger.stage_sum_s();
+    if pre_tail_elapsed > accounted_before_tail {
+        run_ledger.record_stage(
+            crate::gpu_stats::Stage::HostOther,
+            pre_tail_elapsed - accounted_before_tail,
+        );
+    }
+
     if on_checkpoint.is_some() {
         let trees = pool
             .to_trees()
@@ -4035,6 +4125,22 @@ fn run_postfix_search(
         .fold(f64::INFINITY, f64::min);
     let convergence = progress_stats.observe(gens_done, best, &final_archive);
 
+    // #284: the remaining tail is one measured host window (final f64 rebuild,
+    // test scoring and archive canonicalisation).
+    let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, tail_total);
+    run_ledger.set_wall(t0.elapsed().as_secs_f64());
+
+    let mut stats = gpu.run_stats();
+    let mut ledger = run_ledger;
+    ledger.absorb(&stats.ledger);
+    // The flat path is fit-free (no per-candidate constants), but keep the
+    // same reclassification rule for a future fit arm.
+    ledger.reclassify_eval_to_fit(stats.fit_host_ms / 1000.0);
+    ledger.set_wall(t0.elapsed().as_secs_f64());
+    stats.ledger = ledger;
+    stats.fit_fallback_max = cfg.fit_fallback_max;
+
     Ok(Outcome {
         archive: final_archive,
         test_errors,
@@ -4049,24 +4155,7 @@ fn run_postfix_search(
         backend: crate::backend::Kind::Gpu,
         backend_reason,
         device,
-        gpu: Some(GpuRunStats {
-            generations: gpu_stats,
-            // #118: the flat path goes through `GpuEvaluator::eval_arena`,
-            // which records the same full-path ledger as the packed batch.
-            accounting: gpu.ev.stats(),
-            fit_attempts: gpu.fit_attempts,
-            fit_gpu: gpu.fit_gpu,
-            fit_fallback: gpu.fit_fallback,
-            fit_screened: gpu.fit_screened,
-            fit_fallback_by_cause: gpu.fit_fallback_by_cause.clone(),
-            fit_refits: 0,
-            fit_ms: gpu.fit_ms,
-            fit_host_ms: gpu.fit_host_ms,
-            fit_fallback_ms: gpu.fit_fallback_ms,
-            fit_fallback_bounded: gpu.fit_fallback_bounded,
-            fit_fallback_workers: gpu.fit_fallback_workers,
-            fit_fallback_max: cfg.fit_fallback_max,
-        }),
+        gpu: Some(stats),
         qd: None,
         stop_reason,
     })
@@ -4092,6 +4181,10 @@ fn run_search(
     // what the dataset's statistics are.
     let aggs = AggTable::from_sample(train);
     let t0 = std::time::Instant::now();
+    // #284: one run clock and one ledger for the search phase. The ledger is
+    // filled by the exclusive main-thread windows below; the device intervals
+    // and fit leaves are absorbed from `GpuSearch` at the end.
+    let mut run_ledger = crate::gpu_stats::RunLedger::new();
     // #10: user-defined blocks are thread-local. Snapshot the registry here so
     // every island thread (and the initial population below) sees the same
     // definitions; the list is empty unless --function was supplied.
@@ -4190,6 +4283,7 @@ fn run_search(
                     loss,
                     native,
                     logistic_fit,
+                    t0,
                 ) {
                     Ok(g) => {
                         let device = crate::gpu::GpuEvaluator::device_name();
@@ -4635,6 +4729,22 @@ fn run_search(
         "generations"
     };
 
+    // #284: everything before the first generation is an exclusive host window:
+    // evaluator construction, initial population, seeded solutions and the
+    // generation-0 screening/fit. Any fit inside it is moved from host_other to
+    // the fit stage, never counted twice.
+    let setup_s = t0.elapsed().as_secs_f64();
+    #[cfg(feature = "cuda")]
+    let setup_fit_s = gpu.as_ref().map(|g| g.fit_host_ms / 1000.0).unwrap_or(0.0);
+    #[cfg(not(feature = "cuda"))]
+    let setup_fit_s = 0.0;
+    run_ledger.record_stage(crate::gpu_stats::Stage::Fit, setup_fit_s);
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        (setup_s - setup_fit_s).max(0.0),
+    );
+    #[cfg_attr(not(feature = "cuda"), allow(unused_variables, unused_assignments))]
+    let mut eval_stage_total = 0.0f64;
     if !converged_early {
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
@@ -4644,6 +4754,7 @@ fn run_search(
             // returns 0.0 without reading a clock, so the generation is the one
             // it always was.
             let mut dev_mark = cfg.dev_log.is_some().then(std::time::Instant::now);
+            let mut stage_mark = std::time::Instant::now();
             let dev_counters = cfg.dev_log.is_some().then(GenCounters::default);
             // The island threads take `Option<&GenCounters>`, which is `Copy`;
             // the owning `Option` stays here for the readout below.
@@ -4720,6 +4831,7 @@ fn run_search(
                 None
             };
             let dev_prep = dev_lap(&mut dev_mark); // #211
+            let stage_prep = stage_lap(&mut stage_mark); // #284
 
             // ---- parallel generation across islands ---------------------
             let aggs_ref = &aggs;
@@ -4834,6 +4946,7 @@ fn run_search(
                 }
             });
             let dev_search = dev_lap(&mut dev_mark); // #211: island scope
+            let stage_search = stage_lap(&mut stage_mark); // #284: see note below
 
             #[cfg(feature = "cuda")]
             {
@@ -4885,6 +4998,7 @@ fn run_search(
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
+            let stage_eval = stage_lap(&mut stage_mark); // #284
 
             // #85: successive halving phase two. Promote the top fraction of
             // the screening offspring, refit and re-score them on every
@@ -4917,6 +5031,7 @@ fn run_search(
                 }
             }
             let dev_select = dev_lap(&mut dev_mark); // #211
+            let stage_select = stage_lap(&mut stage_mark); // #284
 
             // ---- archive + convergence bookkeeping ----------------------
             let mut gen_best = f64::INFINITY;
@@ -4943,6 +5058,18 @@ fn run_search(
                 }
             }
             let dev_archive = dev_lap(&mut dev_mark); // #211
+            let stage_archive = stage_lap(&mut stage_mark); // #284
+
+            // #284: exclusive main-thread stages. `prep` is the generation
+            // setup/carried refit window, which has no dedicated name in the
+            // stage enum, so it is `host_other`. The evaluator window is
+            // accumulated and partitioned with the nested fit window after the
+            // loop, so fit is never counted twice.
+            run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, stage_prep);
+            run_ledger.record_stage(crate::gpu_stats::Stage::Vary, stage_search);
+            run_ledger.record_stage(crate::gpu_stats::Stage::Select, stage_select);
+            run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
+            eval_stage_total += stage_eval;
 
             if let Some(budget) = cfg.time_budget {
                 if t0.elapsed().as_secs_f64() >= budget {
@@ -5272,6 +5399,26 @@ fn run_search(
         }
     }
 
+    // #284: in a non-CUDA build the evaluator window is not emitted (there is
+    // no GPU report), but the stage clock still runs so the code is identical.
+    #[cfg(not(feature = "cuda"))]
+    let _ = eval_stage_total;
+    // The measured evaluator windows join the ledger before the closure check;
+    // the fit part is reclassified below after the gadget's totals are known.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
+
+    // #284: close the generation loop's measured stages to the run clock. Any
+    // gap between the last stage boundary and this mark is still host time.
+    let tail_start = std::time::Instant::now();
+    let pre_tail_elapsed = tail_start.duration_since(t0).as_secs_f64();
+    let accounted_before_tail = run_ledger.stage_sum_s();
+    if pre_tail_elapsed > accounted_before_tail {
+        run_ledger.record_stage(
+            crate::gpu_stats::Stage::HostOther,
+            pre_tail_elapsed - accounted_before_tail,
+        );
+    }
+
     // #120: promoted cell elites are rebuilt exactly on every training row in
     // f64 before they are reported. Screening and row subsets may guide the
     // search, but the QD report is never a subset estimate.
@@ -5316,6 +5463,7 @@ fn run_search(
     let gpu_fit_used =
         cfg.fit_strategy.defers_to_gpu() && (gpu_used || fit_only_device);
     let mut gpu_fit_refits = 0usize;
+    let mut refit_tail_s = 0.0;
     if subsampling_active(cfg, train) || gpu_used || fit_only_device || resumed || fit_screened {
         // Generation fitness was estimated on subsets, or on the GPU in f32, so
         // the front is rebuilt from the surviving trees and scored on every
@@ -5324,6 +5472,7 @@ fn run_search(
         let rebuilt = full_data_archive(&archive, &islands, &train_data, cfg, gpu_fit_used);
         archive = rebuilt.0;
         gpu_fit_refits = rebuilt.1;
+        refit_tail_s = rebuilt.2;
     } else {
         for pop in &islands {
             for ind in pop {
@@ -5370,6 +5519,17 @@ fn run_search(
         convergence = progress_stats.observe(gens_done, best, &final_archive);
     }
 
+    // #284: the exact finalist refit is a fit-stage leaf, and the remaining tail
+    // (test scoring, report bookkeeping) is a measured host window.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
+    run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
+    let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        (tail_total - refit_tail_s).max(0.0),
+    );
+    run_ledger.set_wall(t0.elapsed().as_secs_f64());
+
     // #131: the GPU report is emitted only for a run that actually used the
     // device, so a CPU run's JSON is byte-identical to before.
     #[cfg(feature = "cuda")]
@@ -5377,6 +5537,18 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+// #284: absorb the device intervals and fit leaves, then add the
+            // exclusive main-thread stages. Fit is a sub-window of the measured
+            // eval window, so it is partitioned out exactly once.
+            let mut ledger = run_ledger.clone();
+            ledger.absorb(&s.ledger);
+            // Fit is a sub-window of the measured eval window. The part before
+            // the loop (generation 0) is already booked as Fit; only the loop's
+            // share is reclassified, so the stage sum never grows.
+            let fit_loop_s = (s.fit_host_ms / 1000.0 - setup_fit_s).max(0.0);
+            ledger.reclassify_eval_to_fit(fit_loop_s);
+            ledger.set_wall(t0.elapsed().as_secs_f64());
+            s.ledger = ledger;
             s.fit_fallback_max = cfg.fit_fallback_max;
             s
         })

@@ -239,6 +239,29 @@ fn assert_fit_ledger(g: &rcsr::search::GpuRunStats) {
         "fallback causes must add up to the total: {:?}",
         g
     );
+    // #284: the same counters and the raw kernel/fallback seconds are in the
+    // run ledger, which must also close and never report duty > 1.
+    assert_eq!(g.ledger.admitted() as usize, g.fit_attempts, "{:?}", g.ledger);
+    assert_eq!(g.ledger.device_fits() as usize, g.fit_gpu, "{:?}", g.ledger);
+    assert_eq!(g.ledger.fallback_fits() as usize, g.fit_fallback, "{:?}", g.ledger);
+    assert_eq!(
+        g.ledger.fallback_by_cause(),
+        &g.fit_fallback_by_cause,
+        "the ledger must carry every labelled cause"
+    );
+    assert!(g.ledger.wall_s() > 0.0);
+    assert!(
+        g.ledger.closure_residual().value.abs() < 0.01,
+        "run ledger does not close: {:?}",
+        g.ledger
+    );
+    assert!(g.ledger.duty_run().value <= 1.0);
+    assert!(g.ledger.device_busy_s() <= g.ledger.device_busy_sum_s() + 1e-12);
+    if g.fit_gpu > 0 {
+        assert!(g.ledger.fit_kernel_s() > 0.0, "a device fit must be recorded");
+        assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
+        assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+    }
 }
 
 #[test]
@@ -906,8 +929,27 @@ fn bench_end_to_end() {
                 causes,
                 g.fit_refits
             );
+            // #284: a CUDA fit run must leave a fit record in the run ledger,
+            // with kernel seconds from raw device events and any CPU fallback
+            // seconds measured separately.
+            if g.fit_gpu > 0 {
+                assert!(
+                    g.ledger.fit_kernel_s() > 0.0,
+                    "a device fit must record fit kernel seconds: {:?}",
+                    g.ledger
+                );
+                assert_eq!(g.ledger.device_fits(), g.fit_gpu as u64);
+                assert_eq!(g.ledger.fallback_fits(), g.fit_fallback as u64);
+                assert_eq!(
+                    g.ledger.admitted() as usize,
+                    g.fit_attempts,
+                    "the ledger must count every admitted fit once"
+                );
+                assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
+                assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+            }
             eprintln!(
-                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fallback={:.2}s bounded={}/{} workers={} duty={:.1}%",
+"  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fallback={:.2}s bounded={}/{} workers={} duty={:.1}% run_duty={:.1}%",
                 g.fit_host_ms / 1000.0,
                 100.0 * (g.fit_host_ms / 1000.0) / wall,
                 g.fit_ms / 1000.0,
@@ -915,7 +957,8 @@ fn bench_end_to_end() {
                 g.fit_fallback_bounded,
                 g.fit_fallback_max,
                 g.fit_fallback_workers,
-                100.0 * g.accounting.duty_cycle()
+                100.0 * g.accounting.duty_cycle(),
+                100.0 * g.ledger.duty_run().value
             );
         }
         runs.push((name, wall, history, out));
