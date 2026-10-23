@@ -158,6 +158,13 @@ pub struct EvalSpec {
     /// the test block is only scored after that choice is fixed. Requires
     /// `validation_frac > 0`.
     pub candidates: Vec<String>,
+    /// #308: select among candidates with the band protocol instead of
+    /// validation MSE. The screening score is the fused long-only reduction on
+    /// validation rows; the admitted set is rescored on the full validation rows
+    /// in exact CPU `f64` and the winner is chosen by
+    /// `(net, turnover, complexity, index)`. Requires `validation_frac > 0` and
+    /// more than one `--expr`.
+    pub band_select: bool,
     /// #304: recompute each test block's long-only P&L through the fused
     /// canonical reduction (the device kernel when available, the identical
     /// CPU canonical path otherwise) and report it beside the scalar evaluator.
@@ -266,6 +273,8 @@ pub struct WindowResult {
     pub band: Option<BandCheck>,
     /// #306: exact hindsight DP bound when the dp policy was selected.
     pub hindsight_bound: Option<HindsightBound>,
+    /// #308: banded finalist provenance when `--select-band` was used.
+    pub band_selection: Option<crate::selection::BandSelection>,
 }
 
 /// #306: the band/cooldown book and its associative carry.
@@ -355,6 +364,8 @@ pub struct Report {
     /// Which fibre selected the candidate(s). Always validation when more than
     /// one candidate is present; `test` is never a selection input.
     pub selected_on: String,
+    /// #308: whether the band protocol selected the candidate.
+    pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
     pub test_used_for_selection: bool,
     /// Pooled seam policy and the extra cost the carried boundary charged.
@@ -842,6 +853,7 @@ impl Accum {
             // Score every candidate on the validation fibre, then freeze the
             // choice before touching the test block.
             let mut best: Option<(usize, f64, f64)> = None;
+            let mut thresholds = vec![f64::NAN; d.train_scores.len()];
             for (c, scores) in d.train_scores.iter().enumerate() {
                 let source_scores = if has_validation {
                     &d.validation_scores[c]
@@ -868,17 +880,60 @@ impl Accum {
                 } else {
                     Threshold::train_type7(source_scores, spec.threshold_quantile).value()
                 };
+                thresholds[c] = threshold;
                 match best {
                     Some((_, best_err, _)) if best_err <= err => {}
                     _ => best = Some((c, err, threshold)),
                 }
             }
-            let (candidate, validation_error, threshold) =
-                best.expect("at least one candidate");
-            let validation_error = if has_validation {
-                Some(validation_error)
+            let mut band_selection = None;
+            let (candidate, validation_error, threshold) = if spec.band_select {
+                if !has_validation {
+                    return Err(format!(
+                        "window '{}': --select-band needs --validation-frac > 0, \
+                         because the test block may not choose the candidate",
+                        d.window.label
+                    ));
+                }
+                let targets: Vec<f64> = d.validation_rows.iter().map(|r| r.target).collect();
+                let groups: Vec<u64> = d.validation_rows.iter().map(|r| r.group).collect();
+                let times: Vec<f64> = d.validation_rows.iter().map(|r| r.time).collect();
+                let rows = crate::selection::BandRows {
+                    targets: &targets,
+                    groups: &groups,
+                    times: &times,
+                };
+                let options = crate::selection::BandOptions {
+                    cost_bps: spec.cost_bps,
+                    ..crate::selection::BandOptions::default()
+                };
+                let mut candidates: Vec<crate::selection::BandCandidate<'_>> =
+                    Vec::with_capacity(d.validation_scores.len());
+                for c in 0..d.validation_scores.len() {
+                    let surrogate = crate::selection::screening_net(
+                        &rows,
+                        &d.validation_scores[c],
+                        thresholds[c],
+                        &options,
+                    )?;
+                    candidates.push(crate::selection::BandCandidate {
+                        index: c,
+                        surrogate,
+                        complexity: expr::complexity(&trees[c]),
+                        scores: &d.validation_scores[c],
+                        threshold: thresholds[c],
+                    });
+                }
+                let selection = crate::selection::select_band(&rows, &candidates, &options)
+                    .map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                let chosen = selection.selected_index;
+                let err = validation_mse(&d.validation_rows, &d.validation_scores[chosen]);
+                band_selection = Some(selection);
+                (chosen, Some(err), thresholds[chosen])
             } else {
-                None
+                let (c, err, theta) = best.expect("at least one candidate");
+                let err = if has_validation { Some(err) } else { None };
+                (c, err, theta)
             };
             let source_name = if spec.threshold_fixed.is_some() {
                 ThresholdSource::Fixed
@@ -969,6 +1024,7 @@ impl Accum {
                 device_pnl: ev.device,
                 band: ev.band,
                 hindsight_bound: ev.hindsight_bound,
+                band_selection,
             });
         }
 
@@ -1040,6 +1096,7 @@ impl Accum {
             annualization,
             candidates: expressions,
             selected_on,
+            band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
             seam_cost,
@@ -1966,7 +2023,8 @@ impl WindowResult {
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
-             \"metrics\":{},\"device_pnl\":{},\"band\":{},\"hindsight_bound\":{}}}",
+             \"metrics\":{},\"device_pnl\":{},\"band\":{},\"hindsight_bound\":{},\
+             \"band_selection\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
             jnum(self.window.train_end),
@@ -1992,7 +2050,10 @@ impl WindowResult {
                 .map_or("null".to_string(), band_check_json),
             self.hindsight_bound
                 .as_ref()
-                .map_or("null".to_string(), hindsight_bound_json)
+                .map_or("null".to_string(), hindsight_bound_json),
+            self.band_selection
+                .as_ref()
+                .map_or("null".to_string(), |s| s.json())
         )
     }
 }
@@ -2069,7 +2130,8 @@ impl Report {
              \"beta_alpha\":{{\"beta\":\"dimensionless\",\"alpha\":\"per-period\",\
              \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
-             \"test_used_for_selection\":{},\"candidate_count\":{}}},\
+             \"band_select\":{},\"test_used_for_selection\":{},\
+             \"candidate_count\":{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
@@ -2113,6 +2175,7 @@ impl Report {
                 .collect::<Vec<_>>()
                 .join(","),
             jstr(&self.selected_on),
+            self.band_select,
             self.test_used_for_selection,
             self.candidates.len(),
             self.pool_reset_flat,

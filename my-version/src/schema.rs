@@ -178,6 +178,7 @@ pub fn json() -> String {
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
 {{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
+{{\"name\":\"--select-band\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"#308 banded finalist selection: screen repeated candidates with the fused long-only validation P&L, admit K=max(8,P/16) plus an epsilon band, rescore admitted candidates on full validation rows in exact CPU f64 and rank by (net, turnover, complexity, index); JSON carries surrogate_rank, exact_rank, band, epsilon, finalists_considered, recall_band and scored_by=cpu_f64; needs --validation-frac > 0\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
 {{\"name\":\"--group-by\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel group column; costs and positions are per group\"}},\

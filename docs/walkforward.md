@@ -77,6 +77,49 @@ report records `selection.selected_on = "validation"` and
 validation slice are refused, because the only remaining alternative would be
 selection on test. A single `--expr` keeps the original behaviour.
 
+### Banded finalist selection (#308)
+
+`--select-band` replaces validation MSE as the selection statistic with the
+long-only P&L band. It is for the case where the search ranks candidates on a
+fast surrogate and the report must return the exact winner: a near tie on the
+screen must not hide a different candidate on the full rows.
+
+For each window, after the exact threshold is frozen on the validation slice:
+
+1. score every candidate on the validation rows with the fused long-only
+   reduction (`trading_gpu::reduce_device` when the CUDA feature and a device
+   are present, otherwise the identical canonical CPU segments). The value is a
+   **screening** score only; it never appears as a reported P&L;
+2. with `P` candidates set `K = min(P, max(8, P/16))` and
+   `epsilon = max(2e-3, 0.005 * |J_K|)`, where `J_K` is the screening score at
+   rank `K`;
+3. admit every candidate with a finite screening score at least
+   `J_K - epsilon`; non-finite screens are never admitted;
+4. rescore every admitted candidate on the full validation rows with the exact
+   CPU `f64` path (`selection::rescore_exact`), using the same threshold, the
+   shared valid-row mask and the canonical `(group, time, row)` order;
+5. order the admitted set by `(higher net, lower turnover, lower complexity,
+   lower index)`. The comparison is a total order: net `+inf` is best, net
+   `-inf`/`NaN` is worst, turnover `-inf` is best and turnover
+   `+inf`/`NaN` is worst, with `f64::total_cmp` inside each class.
+
+The function also rescores the out-of-band candidates as an audit and reports
+`recall_band`. If the exhaustive exact winner is outside the band the run fails
+loudly instead of reporting the wrong finalist. The JSON block carries
+`surrogate_rank`, `exact_rank`, `band` (cut rank, cut score, epsilon, lower
+bound, `finalists_considered`), `recall_band` and `scored_by: "cpu_f64"`.
+`--select-band` requires more than one `--expr` and `--validation-frac > 0`;
+the test block is never read before the candidate is frozen.
+
+`epsilon` is measured, not assumed. The 200-candidate fixture in
+`tests/pnl_gpu.rs` plants the exact CPU winner `0.0005` below the screening cut;
+with `P = 200`, `K = 12`, `J_K = 0.4989` and
+`epsilon = max(0.002, 0.005 * |J_K|) = 0.0024945`, so the admitted band starts
+at `0.4964055`. The test then requires recall 1.0 and equality of the reported
+finalist with exhaustive CPU selection. A wider band costs only exact CPU
+rescores; a narrower one fails the recall audit rather than silently dropping
+the winner.
+
 ## Position rule, costs and aggregation
 
 * `position = 1` if `score > threshold`, the score is finite and the shared
