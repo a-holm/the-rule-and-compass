@@ -401,41 +401,47 @@ Each generation then runs as:
    generation, all islands included;
 3. selection, migration and restart decisions consume the returned fitness.
 
-The GPU never produces a number a user reads. The kernel accumulates one
-**configured objective** per row; the search divides that by the row count and
-uses it as the fitness. Today the device has three native scoring objectives:
+The GPU never produces a number a user reads. The kernel computes one
+**configured score objective**; the returned value is already the metric value
+(the mean, the RSS + AIC penalty, the maximum or `1 − ρ`), so the search never
+divides a raw sum by the row count. The reported numbers are still rebuilt by
+the CPU in `f64` at the end.
 
-`--metric signed` is not one of them and is refused for an explicit
-`--fit-strategy gpu`: its exact arm is the host-side projection of #228
-(the fit section below), while the *ranking* would still need a native
-signed scorer on the device (#236).
+#287 replaced the old three-entry loss gate with a total
+`Metric -> ScoreDispatch` table (`metrics::score_dispatch`). A metric either has
+a native `ScoreObjective` or a **named refusal**; it can never fall through to
+squared error:
 
-| `--metric` | device objective per row | status |
+| `--metric` | native objective | notes |
 |---|---|---|
-| `squared` | `r²` | exact objective (up to `f32`) |
-| `log_squashed` | `ln(1 + r²)` | exact objective (up to `f32`), #229 |
-| `absolute` | `|r|` | exact objective (up to `f32`), #222 |
+| `squared` | mean `r²` | one pass |
+| `absolute` | mean `|r|` | one pass |
+| `log_squashed` | mean `ln(1 + r²)` | one pass, `log1p` |
+| `signed` | `|mean r|` | one pass |
+| `maximum` | `max |r|` | integer max on the `|r|` bits, lowest-row tie |
+| `correlation` | `1 − |ρ|` | two-pass centred moment, cached `ȳ, S_yy` |
+| `correlation_signed` | `1 − ρ` | same moment, signed |
+| `aic`, `aicc`, `bic` | RSS + penalty | one pass; `k` per candidate |
 
-The batched **fit** kernel (below) also minimises the logistic log-loss
-`ln(1 + exp(-t·p))` (#234). `log_loss` is a **fit-only** arm like the rank and
-median families: the evaluator accumulates `ρ(pred − y)` and has no label or
-logit semantics, so every fitness, every proposal decision and every finalist
-refit stays the exact CPU `log_loss`, and only the constants come from the
-device.
+The device kernel uses a fixed reduction tree, ascending row order and no
+floating-point atomics, so the same candidate scores identical bits alone or in
+a batch of 7 or 447. `maximum` compares the IEEE-754 bits of `|r|` and breaks an
+exact tie on the lowest row. A non-finite prediction (or one above the same
+`1e30` hard-magnitude limit used elsewhere) returns **`+inf` with status 2**,
+never the old finite `1e30/n`. `score_batch`/`score_pool` return `f64` values
+plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
+remains for the fit and test APIs.
 
-Every other metric is scored by the CPU evaluator: the scoring kernel has no
-MAE, rank, minimax, correlation, slope or classification objective, and using
-MSE as a ranking proxy silently changes the search (`--metric slope` was observed to
-select a different Pareto point, #236). At the end `full_data_archive`
-re-scores the surviving trees on the full training sample with the CPU
-evaluator in `f64`, and the reported train/test errors, Pareto front and
-convergence statistics come from that rebuild. Constants stay on the CPU and in
-`f64` throughout.
+`median`, `interquartile`, `rank_correlation` and
+`rank_correlation_signed` are named refusals until #288; `auc`, `log_loss` and
+`hinge` until #289; `slope` and the implicit metrics remain CPU. Their named
+reason is printed and recorded in `backend_reason`. In particular `log_loss` is
+still a **fit-only** arm: the device moves its constants, but every fitness and
+finalist is the exact CPU log-loss.
 
 The GPU path is used for single-output, unweighted, full-sample runs whose
-metric is in the table above. Multi-output (`--target y1,y2`), `--weight`,
-every other metric (including implicit, classification, correlation, rank,
-slope and AIC/AICc/BIC) and `--predictor-samples` keep the CPU evaluator,
+metric has a native score objective. Multi-output (`--target y1,y2`),
+`--weight`, a refused metric, and `--predictor-samples` keep the CPU evaluator,
 because they need more than one prediction per row, a different objective, a
 per-row weight array the evaluator does not carry, or a different set of rows
 every generation; the reason is printed in the one-line note.
@@ -447,8 +453,9 @@ run on the device — the exact rank stage of
 [#226](#median-absolute-error-fitting-issue-226) and the middle-50 % window
 polish of
 [#232](#interquartile-absolute-error-fitting-issue-232) — but their **fitness is
-still the CPU objective** and the backend stays `cpu` with
-`backend_reason = "metric is not scored natively on the GPU"`. `GpuSearch`'s
+still the CPU objective** and the backend stays `cpu` with the score table's
+named refusal (`rank_* needs the exact rank scorer (#288)`, or the median /
+interquartile order-statistic refusal). `GpuSearch`'s
 `native_metric` is false for these arms, so every candidate is scored by the CPU
 evaluator exactly as before; only the `gpu.fit` counters (and the device field)
 record the device use. The median and interquartile arms additionally need at
@@ -459,12 +466,12 @@ keeps the CPU arm and records that reason.
 
 Fallback and the flags:
 
-* With neither flag, a CUDA build with a usable device selects the GPU **for
-  `--metric squared`, `--metric log_squashed` and `--metric absolute`**. Every
-  other metric is scored on the CPU and prints
-  `# gpu: off (metric is not scored natively on the GPU)` once; the resource
-  line and the `--json` `backend` both say `cpu` and `backend_reason` carries
-  the same cause.
+* With neither flag, a CUDA build with a usable device selects the GPU when the
+  metric has a native score objective (the #287 table above). Every other metric
+  is scored on the CPU and prints the table's named refusal
+  (for example `# gpu: off (rank_correlation needs the exact rank scorer
+  (#288))`) once; the resource line and the `--json` `backend` both say `cpu`
+  and `backend_reason` carries the same cause.
 * A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
   build with no usable device prints the same line with the probe's reason.
@@ -855,8 +862,9 @@ in a padded `kmax = 20` batch are **bit-identical**, which
 `p = 17..20`.
 
 **Eligibility, admission and fallback.** A candidate is offered to the kernel
-only for a metric with a native device objective (squared/AIC family,
-`log_squashed` since #229, and `absolute` since #222), with `p <= 20`, at most
+only for a metric with a native device fit objective (squared/AIC family,
+`log_squashed` since #229, and `absolute` since #222; scoring is a separate
+#287 table), with `p <= 20`, at most
 96 flattened nodes, no shared block constants, an analytic derivative for every
 operator, and at least `32p` rows. The device objective is also a **CLI
 contract** (#223, extended by #229/#222): an explicit `--fit-strategy gpu` with
@@ -1150,8 +1158,9 @@ loss += w · log1pf(r·r)      // ONE f64 add per row
 `eval_pool_kernel` accumulate `Σ ln(1+r²)` and the host divides by the row
 count, so the search ranks a `log_squashed` run on exactly the configured
 objective. `gpu_blocker` admits a metric only when
-`fit::DeviceLoss::for_metric` names a native loss; `log_squashed` passes because
-of this scorer, and the #236 rule ("no proxy ranking") is unchanged.
+`metrics::score_dispatch` names a native `ScoreObjective` (#287);
+`log_squashed` passes because of this scorer, and the #236 rule ("no proxy
+ranking") is unchanged.
 
 **Conditioning gate.** Robust weights make the normal equations badly *scaled*
 without making them ill-conditioned, so the squared arm's
@@ -1233,10 +1242,8 @@ from the CPU on heavy tails — is asserted only per fixture
 (`gpu ≤ cpu × (1+1e-6)`), not measured over a corpus; graduated non-convexity
 for finalists is the follow-up.
 
-`--metric signed` is not one of them and is refused for an explicit
-`--fit-strategy gpu`: its exact arm is the host-side projection of #228
-(the fit section below), while the *ranking* would still need a native
-signed scorer on the device (#236).
+`--metric signed` now has a native one-pass score objective (#287); its exact
+fit arm remains the host-side projection of #228 (the fit section below).
 
 ### Absolute (MAE) on the batched kernel (issue #222)
 
@@ -1276,8 +1283,8 @@ loss += w · |r|                  // the accepted objective, f64 sum
   per-row weight array.
 
 **Gate.** `eval_kernel`/`eval_pool_kernel` accumulate `Σ|r|` for the new loss
-code (`DeviceLoss::Absolute = 4`), so the search ranks a `--metric absolute`
-run on MAE itself. `fit::fit_loss` and `DeviceLoss::for_metric` both name the
+code (`FitObjective::Absolute = 4`), so the search ranks a `--metric absolute`
+run on MAE itself. `fit::fit_loss` names the
 objective, `defers_fit_to_gpu` admits it, and `verify_proposal` +
 `refit_finalists_exact` score and refit with `fit_weighted_metric(.., Absolute)`
 — the exact CPU L1 IRLS. A squared-only backend still declines `absolute`
@@ -1973,8 +1980,8 @@ arms, and it is a bit-exact statement about the integer sums, tested on the CPU
 
 **MSE can never rank.** `GpuSearch::native_metric` is `false` for the rank
 family: `evaluate_pending` compiles no program, so screening and fitness are the
-CPU rank score; the reported `backend` stays `cpu` with
-`backend_reason = "metric is not scored natively on the GPU"`. The device's
+CPU rank score; the reported `backend` stays `cpu` with the named refusal
+`rank_* needs the exact rank scorer (#288)`. The device's
 squared LM is only the *start* of the polish. A test pins the gate direction
 (`a_signed_rank_proposal_is_accepted_even_when_it_costs_sse`): a proposal that is
 much worse in SSE but perfect in signed ρ is accepted, which an SSE (or `|ρ|`)

@@ -210,6 +210,403 @@ impl Metric {
     }
 }
 
+/// #287: the device/native scoring statistic for a metric.
+///
+/// This is deliberately **not** [`crate::fit::DeviceLoss`]: fitting and scoring
+/// are separate decisions. `log_loss` has a device *fit* objective but no
+/// native *score*; `correlation` now has both. The discriminants are the
+/// `kind` argument of `rc_score_batch`/`rc_pool_score` in
+/// `src/cuda/eval.cu` (`RC_SCORE_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreObjective {
+    /// Mean `r²`.
+    Squared,
+    /// Mean `|r|`.
+    Absolute,
+    /// Mean `ln(1 + r²)`.
+    LogSquashed,
+    /// `|mean r|`.
+    Signed,
+    /// `max |r|`, with the lowest-row tie broken on the `|r|` bit pattern.
+    Maximum,
+    /// `1 − |ρ|`, two-pass centred moments.
+    Correlation,
+    /// `1 − ρ`, two-pass centred moments.
+    CorrelationSigned,
+    /// `n·ln(RSS/n) + 2k`.
+    Aic,
+    /// Small-sample-corrected AIC.
+    Aicc,
+    /// `n·ln(RSS/n) + k·ln n`.
+    Bic,
+}
+
+impl ScoreObjective {
+    /// The `RC_SCORE_*` code the CUDA scoring entry points take.
+    pub fn code(self) -> i32 {
+        match self {
+            ScoreObjective::Squared => 0,
+            ScoreObjective::Absolute => 1,
+            ScoreObjective::LogSquashed => 2,
+            ScoreObjective::Signed => 3,
+            ScoreObjective::Maximum => 4,
+            ScoreObjective::Correlation => 5,
+            ScoreObjective::CorrelationSigned => 6,
+            ScoreObjective::Aic => 7,
+            ScoreObjective::Aicc => 8,
+            ScoreObjective::Bic => 9,
+        }
+    }
+
+    /// Inverse of [`Self::code`], used when a status report is read back.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => ScoreObjective::Squared,
+            1 => ScoreObjective::Absolute,
+            2 => ScoreObjective::LogSquashed,
+            3 => ScoreObjective::Signed,
+            4 => ScoreObjective::Maximum,
+            5 => ScoreObjective::Correlation,
+            6 => ScoreObjective::CorrelationSigned,
+            7 => ScoreObjective::Aic,
+            8 => ScoreObjective::Aicc,
+            9 => ScoreObjective::Bic,
+            _ => return None,
+        })
+    }
+
+    /// A stable name for reports and schema output.
+    pub fn name(self) -> &'static str {
+        match self {
+            ScoreObjective::Squared => "squared",
+            ScoreObjective::Absolute => "absolute",
+            ScoreObjective::LogSquashed => "log_squashed",
+            ScoreObjective::Signed => "signed",
+            ScoreObjective::Maximum => "maximum",
+            ScoreObjective::Correlation => "correlation",
+            ScoreObjective::CorrelationSigned => "correlation_signed",
+            ScoreObjective::Aic => "aic",
+            ScoreObjective::Aicc => "aicc",
+            ScoreObjective::Bic => "bic",
+        }
+    }
+
+    /// True when the objective is parameter-aware and needs `k`.
+    pub fn needs_constants(self) -> bool {
+        matches!(
+            self,
+            ScoreObjective::Aic | ScoreObjective::Aicc | ScoreObjective::Bic
+        )
+    }
+
+    /// True when the scorer accumulates a two-pass centred moment.
+    pub fn is_correlation(self) -> bool {
+        matches!(
+            self,
+            ScoreObjective::Correlation | ScoreObjective::CorrelationSigned
+        )
+    }
+}
+
+/// #287: one row of the score dispatch table.
+///
+/// Every [`Metric`] maps here exactly once. `Native` means a device kernel
+/// computes the configured statistic; `Refused` carries a named, user-facing
+/// reason instead of silently substituting squared error (the #236 defect).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreDispatch {
+    /// A native one-pass/two-pass statistic.
+    Native(ScoreObjective),
+    /// No native scorer in this issue; the name says why.
+    Refused(&'static str),
+}
+
+impl ScoreDispatch {
+    /// The native objective, or `None` when the metric is refused.
+    pub fn objective(self) -> Option<ScoreObjective> {
+        match self {
+            ScoreDispatch::Native(o) => Some(o),
+            ScoreDispatch::Refused(_) => None,
+        }
+    }
+
+    /// The refusal reason, or `None` for a native metric.
+    pub fn refusal(self) -> Option<&'static str> {
+        match self {
+            ScoreDispatch::Native(_) => None,
+            ScoreDispatch::Refused(reason) => Some(reason),
+        }
+    }
+}
+
+/// #287: the total `Metric -> ScoreDispatch` table.
+///
+/// The match is exhaustive, so adding a `Metric` without deciding how it is
+/// scored is a compile error rather than a silent fallback. The table is the
+/// only scoring gate: [`crate::search::gpu_blocker`], the CUDA entry points and
+/// this module all read it.
+pub fn score_dispatch(m: Metric) -> ScoreDispatch {
+    use Metric::*;
+    use ScoreObjective as O;
+    match m {
+        Squared => ScoreDispatch::Native(O::Squared),
+        Absolute => ScoreDispatch::Native(O::Absolute),
+        LogSquashed => ScoreDispatch::Native(O::LogSquashed),
+        Signed => ScoreDispatch::Native(O::Signed),
+        Maximum => ScoreDispatch::Native(O::Maximum),
+        Correlation => ScoreDispatch::Native(O::Correlation),
+        CorrelationSigned => ScoreDispatch::Native(O::CorrelationSigned),
+        Aic => ScoreDispatch::Native(O::Aic),
+        Aicc => ScoreDispatch::Native(O::Aicc),
+        Bic => ScoreDispatch::Native(O::Bic),
+        Median => ScoreDispatch::Refused(
+            "median needs the exact order-statistic scorer (#288)",
+        ),
+        Interquartile => ScoreDispatch::Refused(
+            "interquartile needs the exact order-statistic scorer (#288)",
+        ),
+        RankCorrelation => ScoreDispatch::Refused(
+            "rank_correlation needs the exact rank scorer (#288)",
+        ),
+        RankCorrelationSigned => ScoreDispatch::Refused(
+            "rank_correlation_signed needs the exact rank scorer (#288)",
+        ),
+        Slope => ScoreDispatch::Refused(
+            "slope needs a cross-row first-difference pass",
+        ),
+        ImplicitDerivative => ScoreDispatch::Refused(
+            "implicit needs an expression-tree gradient pass",
+        ),
+        ImplicitResidual => ScoreDispatch::Refused(
+            "implicit_residual needs implicit samples on the device",
+        ),
+        Auc => ScoreDispatch::Refused(
+            "auc needs the exact rank scorer with labels (#289)",
+        ),
+        LogLoss => ScoreDispatch::Refused(
+            "log_loss needs classification logit/label scoring (#289)",
+        ),
+        Hinge => ScoreDispatch::Refused(
+            "hinge needs classification logit/label scoring (#289)",
+        ),
+    }
+}
+
+/// #287: the native scoring objective for a metric, or `None` when refused.
+pub fn native_score_objective(m: Metric) -> Option<ScoreObjective> {
+    score_dispatch(m).objective()
+}
+
+/// #287: the named reason a metric has no native scorer, or `None`.
+pub fn score_refusal(m: Metric) -> Option<&'static str> {
+    score_dispatch(m).refusal()
+}
+
+/// #287: a per-candidate scoring status, mirrored by the CUDA ABI.
+///
+/// `Ok` is `0`; `NonFinite` is `2` (the existing order-statistic/maximum ABI);
+/// the CPU-only labels use higher values. A non-`Ok` status always carries
+/// `value = +inf`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreStatus {
+    /// A finite (or explicitly `-inf`, for a perfect AIC fit) score.
+    Ok = 0,
+    /// A prediction was not finite (or exceeded the device's hard magnitude).
+    NonFinite = 2,
+    /// Lengths disagreed or an input weight was negative/non-finite.
+    Invalid = 3,
+    /// Every row was masked by a zero weight.
+    AllZeroWeight = 4,
+    /// The device launch failed; the caller must fall back to the CPU.
+    DeviceError = 5,
+}
+
+impl ScoreStatus {
+    /// The wire code for the CUDA status array.
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    /// Decode a device status; unknown values are a device failure.
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => ScoreStatus::Ok,
+            2 => ScoreStatus::NonFinite,
+            3 => ScoreStatus::Invalid,
+            4 => ScoreStatus::AllZeroWeight,
+            _ => ScoreStatus::DeviceError,
+        }
+    }
+
+    /// True when `value` is usable.
+    pub fn is_ok(self) -> bool {
+        self == ScoreStatus::Ok
+    }
+}
+
+/// #287: the CPU reference result of a native reduction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeScore {
+    /// The metric value; `+inf` for every non-`Ok` status.
+    pub value: f64,
+    /// Why the value is unusable, if it is.
+    pub status: ScoreStatus,
+    /// Lowest maximiser row for [`ScoreObjective::Maximum`].
+    pub maximum_row: Option<usize>,
+}
+
+impl NativeScore {
+    fn ok(value: f64) -> Self {
+        NativeScore {
+            value,
+            status: ScoreStatus::Ok,
+            maximum_row: None,
+        }
+    }
+
+    fn invalid(status: ScoreStatus) -> Self {
+        NativeScore {
+            value: f64::INFINITY,
+            status,
+            maximum_row: None,
+        }
+    }
+}
+
+/// #287: CPU reference for a native score objective, without weights.
+///
+/// This is the exact `f64` reducer the CUDA kernel mirrors. It exists so the
+/// statistic can be tested independently of the general metric dispatcher and
+/// so a device readback can be compared against the same formula given the same
+/// (f32-rounded) prediction vector.
+pub fn score_native(pred: &[f64], y: &[f64], objective: ScoreObjective, k: usize) -> NativeScore {
+    score_native_weighted(pred, y, &[], objective, k)
+}
+
+/// #287: CPU reference for a native score objective with optional weights.
+///
+/// Zero-weight rows are masked **before** any prediction is read, exactly like
+/// [`score_weighted`]. A non-finite prediction in a masked row is therefore
+/// invisible. `maximum` has no weighted form and refuses weights.
+pub fn score_native_weighted(
+    pred: &[f64],
+    y: &[f64],
+    w: &[f64],
+    objective: ScoreObjective,
+    k: usize,
+) -> NativeScore {
+    let n = pred.len();
+    if n == 0 || y.len() != n || (!w.is_empty() && w.len() != n) {
+        return NativeScore::invalid(ScoreStatus::Invalid);
+    }
+    let weighted = !w.is_empty();
+    if weighted {
+        if objective == ScoreObjective::Maximum {
+            return NativeScore::invalid(ScoreStatus::Invalid);
+        }
+        let mut total = 0.0;
+        for &wi in w {
+            if !wi.is_finite() || wi < 0.0 {
+                return NativeScore::invalid(ScoreStatus::Invalid);
+            }
+            total += wi;
+        }
+        if !(total > 0.0) {
+            return NativeScore::invalid(ScoreStatus::AllZeroWeight);
+        }
+    }
+    for (i, &p) in pred.iter().enumerate() {
+        if (!weighted || w[i] > 0.0) && !p.is_finite() {
+            return NativeScore::invalid(ScoreStatus::NonFinite);
+        }
+    }
+    // Masked rows have a zero residual, so no `w * loss` product can become
+    // `0 * inf = NaN`.
+    let active = |i: usize| !weighted || w[i] > 0.0;
+    let weight = |i: usize| if weighted { w[i] } else { 1.0 };
+    let denom = if weighted {
+        w.iter().sum::<f64>()
+    } else {
+        n as f64
+    };
+
+    match objective {
+        ScoreObjective::Maximum => {
+            let mut best_bits = 0u64;
+            let mut best_row = 0usize;
+            for i in 0..n {
+                let key = (pred[i] - y[i]).abs().to_bits();
+                if key > best_bits {
+                    best_bits = key;
+                    best_row = i;
+                }
+            }
+            NativeScore {
+                value: f64::from_bits(best_bits),
+                status: ScoreStatus::Ok,
+                maximum_row: Some(best_row),
+            }
+        }
+        ScoreObjective::Correlation | ScoreObjective::CorrelationSigned => {
+            let rho = if weighted {
+                weighted_correlation(pred, y, w)
+            } else {
+                correlation(pred, y)
+            };
+            NativeScore::ok(if objective == ScoreObjective::Correlation {
+                1.0 - rho.abs()
+            } else {
+                1.0 - rho
+            })
+        }
+        ScoreObjective::Signed => {
+            let mut sum = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    sum += weight(i) * (pred[i] - y[i]);
+                }
+            }
+            NativeScore::ok((sum / denom).abs())
+        }
+        ScoreObjective::Aic | ScoreObjective::Aicc | ScoreObjective::Bic => {
+            let mut rss = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    let r = pred[i] - y[i];
+                    rss += weight(i) * r * r;
+                }
+            }
+            let rows = if weighted {
+                w.iter().filter(|&&wi| wi > 0.0).count()
+            } else {
+                n
+            };
+            NativeScore::ok(match objective {
+                ScoreObjective::Aic => aic(rows, rss, k),
+                ScoreObjective::Aicc => aicc(rows, rss, k),
+                _ => bic(rows, rss, k),
+            })
+        }
+        objective => {
+            let mut sum = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    let r = pred[i] - y[i];
+                    let loss = match objective {
+                        ScoreObjective::Squared => r * r,
+                        ScoreObjective::Absolute => r.abs(),
+                        ScoreObjective::LogSquashed => (1.0 + r * r).ln(),
+                        _ => unreachable!("maximum and correlation are handled above"),
+                    };
+                    sum += weight(i) * loss;
+                }
+            }
+            NativeScore::ok(sum / denom)
+        }
+    }
+}
+
 /// Score with the number of fitted constants set to zero. Used by callers that
 /// do not know (or do not need) the model's parameter count.
 pub fn score(pred: &[f64], y: &[f64], m: Metric) -> f64 {
@@ -1311,5 +1708,274 @@ mod tests {
             RankSums::between(&centred_ranks_doubled(&scaled).unwrap(), &rb).unwrap(),
             forward
         );
+    }
+
+    // --- #287: the score-objective table and native reductions ----------
+
+    /// Every metric appears exactly once and every refusal is named. The match
+    /// in `score_dispatch` is exhaustive, so an unhandled metric cannot compile;
+    /// this test additionally pins the coverage and the native family.
+    #[test]
+    fn score_table_covers_every_metric_and_names_every_refusal() {
+        let mut seen = std::collections::BTreeSet::new();
+        for metric in Metric::all() {
+            assert!(seen.insert(metric.name()), "duplicate table row: {}", metric.name());
+            match score_dispatch(*metric) {
+                ScoreDispatch::Native(o) => {
+                    assert_eq!(o, native_score_objective(*metric).unwrap());
+                    assert_eq!(ScoreObjective::from_code(o.code()), Some(o));
+                    assert!(score_refusal(*metric).is_none());
+                }
+                ScoreDispatch::Refused(reason) => {
+                    assert!(!reason.is_empty(), "{} has an empty refusal", metric.name());
+                    assert!(reason.contains(metric.name()) || metric.name().contains("implicit"),
+                        "{} refusal must name the metric: {reason}", metric.name());
+                    assert!(native_score_objective(*metric).is_none());
+                }
+            }
+        }
+        assert_eq!(seen.len(), Metric::all().len());
+        let native: Vec<&str> = Metric::all()
+            .iter()
+            .filter(|m| native_score_objective(**m).is_some())
+            .map(|m| m.name())
+            .collect();
+        assert_eq!(
+            native,
+            [
+                "absolute",
+                "squared",
+                "correlation",
+                "correlation_signed",
+                "maximum",
+                "signed",
+                "log_squashed",
+                "aic",
+                "aicc",
+                "bic",
+            ]
+        );
+        // An unhandled metric must be a hard failure, never an MSE fallback.
+        assert_eq!(
+            score_refusal(Metric::Slope).unwrap(),
+            "slope needs a cross-row first-difference pass"
+        );
+        assert_eq!(score_dispatch(Metric::LogLoss).objective(), None);
+    }
+
+    /// T1/T2 parity between the native reducer and the historical CPU metric,
+    /// on exactly the fixtures named by #287.
+    #[test]
+    fn native_reductions_match_the_cpu_metric() {
+        let fixtures: &[(&[f64], &[f64])] = &[
+            (&[0.0, 3.0, 0.0], &[1.0, 1.0, 3.0]), // residuals -1, 2, -3
+            (&[0.0, 0.0, 0.0, 0.0], &[3.0, 1.0, -2.0, -4.0]), // |r| 3,1,2,4
+            (&[4.0], &[4.0]),                      // n = 1
+            (&[0.0, 0.0], &[1.0, 1.0]),
+        ];
+        for (pred, y) in fixtures {
+            for m in Metric::all() {
+                let Some(o) = native_score_objective(*m) else {
+                    continue;
+                };
+                let got = score_native(pred, y, o, 2);
+                assert_eq!(got.status, ScoreStatus::Ok, "{}", o.name());
+                let want = score_with_constants(pred, y, *m, 2);
+                if o == ScoreObjective::Maximum {
+                    assert_eq!(got.value.to_bits(), want.to_bits(), "maximum must be bit-exact");
+                } else if want.is_infinite() {
+                    assert_eq!(got.value, want, "{}", o.name());
+                } else {
+                    let rel = (got.value - want).abs() / (1.0 + want.abs());
+                    assert!(
+                        rel <= 1e-12,
+                        "{} {pred:?}/{y:?}: native {} vs cpu {} (relative {rel:e})",
+                        o.name(),
+                        got.value,
+                        want
+                    );
+                }
+            }
+        }
+    }
+
+    /// #287: correlation absolute `ρ` error ≤ 1e-9, including the near-perfect
+    /// case where a relative score tolerance would be meaningless.
+    #[test]
+    fn native_correlation_matches_the_pearson_path_and_the_constant_rule() {
+        let y: Vec<f64> = (0..97).map(|i| (i as f64 * 0.37).sin() * 4.0 + 10.0).collect();
+        let near: Vec<f64> = y.iter().map(|v| v + 1e-12).collect();
+        for (signed, m) in [
+            (false, Metric::Correlation),
+            (true, Metric::CorrelationSigned),
+        ] {
+            let o = native_score_objective(m).unwrap();
+            let got = score_native(&near, &y, o, 0);
+            let want = score_with_constants(&near, &y, m, 0);
+            let want_rho = correlation(&near, &y);
+            let got_rho = 1.0 - (if signed { got.value } else { got.value });
+            assert!((got_rho - want_rho).abs() <= 1e-9,
+                "rho error on signed={signed}: got {got_rho} want {want_rho}");
+            assert!((got.value - want).abs() <= 1e-9, "score error");
+            assert!(got_rho.is_finite());
+        }
+        // Constant prediction: CPU rule is rho = 0 -> score 1.0, never NaN.
+        for pred in [vec![3.0; y.len()], vec![-0.0; y.len()]] {
+            let got = score_native(&pred, &y, ScoreObjective::Correlation, 0);
+            assert_eq!(got.status, ScoreStatus::Ok);
+            assert_eq!(got.value, 1.0);
+            let signed = score_native(&pred, &y, ScoreObjective::CorrelationSigned, 0);
+            assert_eq!(signed.value, 1.0);
+        }
+        // Zero variance target is also rho = 0.
+        let flat = vec![7.0; 40];
+        let p: Vec<f64> = (0..40).map(|i| i as f64).collect();
+        assert_eq!(score_native(&p, &flat, ScoreObjective::Correlation, 0).value, 1.0);
+    }
+
+    /// Maximum is an integer comparison on the `|r|` bit patterns; the first
+    /// (lowest-index) row wins a tie and `-0.0` canonicalises to `+0.0`.
+    #[test]
+    fn native_maximum_is_bit_exact_and_breaks_ties_on_the_lowest_row() {
+        let pred = [0.0, 3.0, -3.0, 1.0, 3.0, -0.0];
+        let y = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let got = score_native(&pred, &y, ScoreObjective::Maximum, 0);
+        assert_eq!(got.value.to_bits(), 3.0f64.to_bits());
+        assert_eq!(got.maximum_row, Some(1), "lowest row among |r| = 3");
+        // Large magnitudes compare by bits exactly like `f64::max`.
+        let huge = [1e300, -1e300, 1e-300];
+        let z = [0.0; 3];
+        let got = score_native(&huge, &z, ScoreObjective::Maximum, 0);
+        assert_eq!(got.value, 1e300);
+        assert_eq!(got.maximum_row, Some(0));
+        // Signed zeros are a tie at +0, and the lowest row wins.
+        let zeros = [-0.0, 0.0];
+        let got = score_native(&zeros, &z[..2], ScoreObjective::Maximum, 0);
+        assert_eq!(got.value.to_bits(), 0.0f64.to_bits());
+        assert_eq!(got.maximum_row, Some(0));
+    }
+
+    /// Non-finite predictions yield `+inf` with a status, never a finite
+    /// `1e30/n`-style score. Zero-weight masked rows are invisible.
+    #[test]
+    fn native_non_finite_and_zero_weight_statuses() {
+        let y = [1.0, 2.0];
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for o in [
+                ScoreObjective::Squared,
+                ScoreObjective::Absolute,
+                ScoreObjective::LogSquashed,
+                ScoreObjective::Signed,
+                ScoreObjective::Maximum,
+                ScoreObjective::Correlation,
+                ScoreObjective::CorrelationSigned,
+                ScoreObjective::Aic,
+                ScoreObjective::Aicc,
+                ScoreObjective::Bic,
+            ] {
+                let got = score_native(&[bad, 1.0], &y, o, 1);
+                assert_eq!(got.status, ScoreStatus::NonFinite, "{}", o.name());
+                assert_eq!(got.value, f64::INFINITY, "{}", o.name());
+                assert!(got.value.is_infinite(), "never a finite sentinel");
+            }
+        }
+        // The same bad row is masked away by weight 0.
+        let got = score_native_weighted(
+            &[f64::NAN, 800.0],
+            &y,
+            &[0.0, 1.0],
+            ScoreObjective::Squared,
+            0,
+        );
+        assert_eq!(got.status, ScoreStatus::Ok);
+        assert_eq!(got.value, (800.0 - 2.0) * (800.0 - 2.0));
+        // All masked is a labelled refusal, not a divide by zero.
+        let all_zero = score_native_weighted(&[1.0, 2.0], &y, &[0.0, 0.0], ScoreObjective::Squared, 0);
+        assert_eq!(all_zero.status, ScoreStatus::AllZeroWeight);
+        assert_eq!(all_zero.value, f64::INFINITY);
+        // Weighted parity with the existing weighted path.
+        let p = [0.0, 3.0, 0.0];
+        let target = [1.0, 1.0, 3.0];
+        let w = [1.0, 2.0, 1.0];
+        for m in [
+            Metric::Absolute,
+            Metric::Squared,
+            Metric::Signed,
+            Metric::LogSquashed,
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+            Metric::Aic,
+            Metric::Aicc,
+            Metric::Bic,
+        ] {
+            let o = native_score_objective(m).unwrap();
+            let got = score_native_weighted(&p, &target, &w, o, 2);
+            let want = score_weighted(&p, &target, &w, m, 2);
+            assert_eq!(got.status, ScoreStatus::Ok, "{}", m.name());
+            if want.is_infinite() {
+                assert_eq!(got.value, want, "{}", m.name());
+            } else {
+                assert!(
+                    (got.value - want).abs() <= 1e-12 * (1.0 + want.abs()),
+                    "{}: {} vs {}",
+                    m.name(),
+                    got.value,
+                    want
+                );
+            }
+        }
+    }
+
+    /// A batch is just independent reducers: the same candidate must produce
+    /// the same bits alone and in a larger composition, on repeated runs.
+    #[test]
+    fn native_reductions_are_composition_and_order_stable() {
+        let y = lcg(257, 91, 3.0);
+        let pred: Vec<f64> = y.iter().map(|v| v * 0.5 + (v * 7.0).cos()).collect();
+        for o in [
+            ScoreObjective::Squared,
+            ScoreObjective::Absolute,
+            ScoreObjective::LogSquashed,
+            ScoreObjective::Signed,
+            ScoreObjective::Maximum,
+            ScoreObjective::Correlation,
+            ScoreObjective::CorrelationSigned,
+            ScoreObjective::Aic,
+            ScoreObjective::Aicc,
+            ScoreObjective::Bic,
+        ] {
+            let alone = score_native(&pred, &y, o, 3);
+            let again = score_native(&pred, &y, o, 3);
+            assert_eq!(alone.value.to_bits(), again.value.to_bits(), "{}", o.name());
+            // Composition is a host-side concept, but ensure no hidden
+            // whole-batch state changes the reducer: run other candidates
+            // first, then this one, and compare.
+            let _ = score_native(&y, &pred, o, 3);
+            let composed = score_native(&pred, &y, o, 3);
+            assert_eq!(alone.value.to_bits(), composed.value.to_bits(), "{}", o.name());
+            assert_eq!(alone.maximum_row, composed.maximum_row, "{}", o.name());
+        }
+    }
+
+    /// `rho = 1 - 1e-12`, `1e30`, subnormals and signed zeros must not trip a
+    /// magnitude sentinel or lose the finite result.
+    #[test]
+    fn native_edge_fixtures_are_finite_and_exact_where_required() {
+        let z = [0.0; 3];
+        // 1e30 residuals are finite in f64 and must stay finite.
+        let p = [1e30, -1e30, 0.0];
+        let sq = score_native(&p, &z, ScoreObjective::Squared, 0);
+        assert!(sq.value.is_finite() && sq.value > 0.0);
+        let abs = score_native(&p, &z, ScoreObjective::Absolute, 0);
+        assert!(abs.value.is_finite());
+        // Subnormals survive the same reduction.
+        let tiny = [f64::MIN_POSITIVE / 4.0, 0.0, 0.0];
+        let got = score_native(&tiny, &z, ScoreObjective::Absolute, 0);
+        assert_eq!(got.value.to_bits(), (tiny[0] / 3.0).to_bits());
+        // Perfect correlation fixture.
+        let y = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let p: Vec<f64> = y.iter().map(|v| v * 2.0 + 3.0).collect();
+        let rho = 1.0 - score_native(&p, &y, ScoreObjective::Correlation, 0).value;
+        assert!((rho - 1.0).abs() <= 1e-9, "rho = {rho}");
     }
 }

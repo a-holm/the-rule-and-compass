@@ -320,8 +320,8 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
     );
 }
 
-/// #236: the CUDA evaluator accumulates squared error, so a non-squared metric
-/// stays on the CPU — visibly. `--metric slope --gpu` must print the labelled
+/// #236/#287: a metric with no native score objective stays on the CPU —
+/// visibly, with the score table's named refusal. `--metric slope --gpu` must print the labelled
 /// reason, must not claim the device in the resource line or JSON, and must
 /// return exactly the `--no-gpu` run: the CPU evaluator is the only one in both
 /// runs, so any difference would mean the gate is leaking somewhere else.
@@ -358,11 +358,13 @@ fn non_squared_metric_on_gpu_prints_the_reason_and_matches_the_cpu() {
     );
     assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
     assert!(
-        stdout.contains("\"backend_reason\":\"metric is not scored natively on the GPU\""),
-        "the fallback must carry its labelled cause, json: {stdout}"
+        stdout.contains(
+            "\"backend_reason\":\"slope needs a cross-row first-difference pass\""
+        ),
+        "the fallback must carry its named cause, json: {stdout}"
     );
     assert!(
-        stderr.contains("# gpu: off (metric is not scored natively on the GPU)"),
+        stderr.contains("# gpu: off (slope needs a cross-row first-difference pass)"),
         "the reason must be printed once, got: {stderr}"
     );
     assert!(

@@ -126,7 +126,7 @@ fn a_small_sample_keeps_the_labelled_cpu_median_arm() {
     );
     let why = out.backend_reason.unwrap_or_default();
     assert!(
-        why.contains("median fit arm") || why.contains("not scored natively"),
+        why.contains("median fit arm") || why.contains("median needs the exact order-statistic scorer"),
         "the CPU decision must be labelled: {why:?}"
     );
 }

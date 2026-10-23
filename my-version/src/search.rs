@@ -583,7 +583,6 @@ impl Ind {
 #[cfg(feature = "cuda")]
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
-    n_rows: usize,
     /// #122: the fixed-capacity, double-buffered postfix arena. It is allocated
     /// once (grown only if a later batch is larger) and reused every generation,
     /// so a generation never calls `cudaMalloc` for its programs.
@@ -623,11 +622,14 @@ struct GpuSearch {
     /// main-thread stages; this ledger owns what only the evaluator/fitter sees.
     ledger: crate::gpu_stats::RunLedger,
     /// #230: true only when the CUDA evaluator scores this run's metric
-    /// itself. The rank family is *fitted* on the device (squared LM start +
-    /// exact rank polish) but still *scored* by the CPU, because the evaluator
-    /// kernel accumulates squared error; scoring it there would silently rank
-    /// the population by MSE (the #236 bug).
+    /// itself. A fit-only arm (`rank`, median, log-loss) keeps this false; the
+    /// CPU then scores every candidate, and `native_metric = false` is recorded
+    /// in the backend report.
     native_metric: bool,
+    /// #287: the exact native statistic the evaluator computes. `None` for a
+    /// fit-only arm. `score_pool`/`score_population` use this, never the fit
+    /// objective, so a `correlation` run cannot be ranked by SSE.
+    score: Option<crate::metrics::ScoreObjective>,
 }
 
 #[cfg(feature = "cuda")]
@@ -637,6 +639,7 @@ impl GpuSearch {
         fit_data: bool,
         loss: crate::fit::DeviceLoss,
         native_metric: bool,
+        score: Option<crate::metrics::ScoreObjective>,
         // #234: the device fit needs the label sign for a log-loss run.
         logistic_fit: bool,
         // #284: the run clock every device interval is placed on.
@@ -694,7 +697,6 @@ impl GpuSearch {
                 }
                 Ok(GpuSearch {
                     ev,
-                    n_rows,
                     pool: None,
                     stats: BTreeMap::new(),
                     fallback: Some(FallbackPool::new(fallback_workers(), fallback_workers())),
@@ -712,6 +714,7 @@ impl GpuSearch {
                     ledger_origin: run_start,
                     ledger: crate::gpu_stats::RunLedger::new(),
                     native_metric,
+                    score,
                 })
             }
             None => Err(format!(
@@ -761,8 +764,11 @@ impl GpuSearch {
         // exact device polish on the same squared start and ladder.
         let order_stat_arm = crate::fit::order_stat_fit_only(cfg.metric);
         // #227: `maximum` likewise — an exact maximum-error polish, no LM
-        // loss, no order statistic.
-        let maximum_arm = crate::fit::maximum_fit_only(cfg.metric);
+        // loss, no order statistic. #287 scores maximum natively, but the fit
+        // arm keeps its measured cost model: below the crossover the exact CPU
+        // polish runs instead of paying a device launch.
+        let maximum_arm = crate::fit::maximum_fit_only(cfg.metric)
+            && crate::fit::maximum_gpu_fit_worthwhile(train.len(), 1, cfg.fit_iters);
         // #234: a single-class fit sample has no finite log-loss optimum. The
         // counts come from the same midpoint rule the CPU arm uses, so the
         // device never fits a sign the sample does not support.
@@ -1056,6 +1062,7 @@ impl GpuSearch {
         }
         let pool = self.pool.as_mut().expect("a pool was just allocated");
         pool.begin_generation();
+        let mut pcount: Vec<i32> = Vec::with_capacity(pending.len());
         for &(i, j) in pending {
             let meta = crate::genome::GenomeMeta {
                 island: i as u16,
@@ -1080,6 +1087,7 @@ impl GpuSearch {
                     for (name, n) in c.opcodes() {
                         *stats.opcodes.entry(name.clone()).or_default() += *n;
                     }
+                    pcount.push(crate::expr::count_constants(&islands[i][j].tree) as i32);
                     slots.push((i, j));
                 }
                 _ => on_cpu.push((i, j)),
@@ -1119,16 +1127,24 @@ impl GpuSearch {
 
         let mut gpu_error: Option<String> = None;
         if !pool.is_empty() {
-            let (sse, ms) = self.ev.eval_pool(pool);
-            if ms < 0.0 || sse.len() != pool.len() {
+            let objective = self
+                .score
+                .expect("a native GPU search owns a ScoreObjective");
+            let batch = self.ev.score_pool(pool, objective, &pcount);
+            if batch.ms < 0.0 || !batch.is_consistent() || batch.values.len() != pool.len() {
                 // Do not return before the submitted fallback batch is drained:
                 // a stale result would be read by the next call.
                 gpu_error = Some("CUDA batch evaluation failed".to_string());
             } else {
-                let n = self.n_rows as f64;
-                for (&(i, j), &s) in slots.iter().zip(sse.iter()) {
-                    islands[i][j].error = if s.is_finite() {
-                        (s as f64) / n
+                for (&(i, j), (&value, &status)) in slots
+                    .iter()
+                    .zip(batch.values.iter().zip(batch.status.iter()))
+                {
+                    // #287: a non-finite row is `+inf` with a status; an Ok
+                    // value is already the configured statistic (mean, RSS +
+                    // penalty, max, or 1-rho), never an SSE to divide by n.
+                    islands[i][j].error = if status.is_ok() {
+                        value
                     } else {
                         f64::INFINITY
                     };
@@ -1641,14 +1657,15 @@ fn score_generation(
 fn eval_pipeline_jobs(
     g: &mut GpuSearch,
     jobs: &[PipelineJob],
-    n_rows: usize,
     generation: usize,
 ) -> Result<(Vec<usize>, Vec<f64>), String> {
     let mut pop = crate::gpu::Population::new();
     let mut kept: Vec<usize> = Vec::with_capacity(jobs.len());
+    let mut pcount: Vec<i32> = Vec::with_capacity(jobs.len());
     for (k, (_, _, tree)) in jobs.iter().enumerate() {
         if pop.add(tree) {
             kept.push(k);
+            pcount.push(crate::expr::count_constants(tree) as i32);
         }
     }
     if pop.is_empty() {
@@ -1667,16 +1684,20 @@ fn eval_pipeline_jobs(
     for (name, n) in pop.opcode_usage() {
         *stats.opcodes.entry(name).or_default() += n;
     }
-    let (sse, ms) = g.ev.eval_population(&pop);
-    if ms < 0.0 || sse.len() != pop.len() {
+    let objective = g
+        .score
+        .ok_or_else(|| "pipeline scoring without a native ScoreObjective".to_string())?;
+    let batch = g.ev.score_population(&pop, objective, &pcount);
+    if batch.ms < 0.0 || !batch.is_consistent() || batch.values.len() != pop.len() {
         return Err("CUDA batch evaluation failed".to_string());
     }
-    let n = n_rows as f64;
-    let errs = sse
+    let errs = batch
+        .values
         .iter()
-        .map(|&s| {
-            if s.is_finite() {
-                (s as f64) / n
+        .zip(batch.status.iter())
+        .map(|(&value, &status)| {
+            if status.is_ok() {
+                value
             } else {
                 f64::INFINITY
             }
@@ -1697,8 +1718,7 @@ fn score_pipeline_batch(
     let Some(g) = gpu.as_mut() else {
         return Err("pipeline scoring without a GPU evaluator".to_string());
     };
-    let n_rows = train.len();
-    let (kept, errs) = eval_pipeline_jobs(g, &jobs, n_rows, generation)?;
+    let (kept, errs) = eval_pipeline_jobs(g, &jobs, generation)?;
     for (&k, &e) in kept.iter().zip(&errs) {
         let (i, j) = (jobs[k].0, jobs[k].1);
         results[i][j] = Some(PipelineResult {
@@ -1847,7 +1867,7 @@ fn score_pipeline_batch(
                 (*i, *j, tree.clone())
             })
             .collect();
-        let (kept2, errs2) = eval_pipeline_jobs(g, &refit, n_rows, generation)?;
+        let (kept2, errs2) = eval_pipeline_jobs(g, &refit, generation)?;
         for (pos, &err) in kept2.iter().zip(&errs2) {
             let (k, constants) = &fitted[*pos];
             let (i, j) = (jobs[*k].0, jobs[*k].1);
@@ -1881,22 +1901,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if !train.w.is_empty() {
         return Some("weighted rows");
     }
-    if cfg.metric.is_implicit() {
-        return Some("implicit objective");
-    }
-    if cfg.metric.is_classification() {
-        return Some("classification metric");
-    }
-    if cfg.metric.is_parameter_aware() {
-        return Some("parameter-aware metric");
-    }
-    // #236: the CUDA evaluator accumulates squared error; #229 adds one more
-    // native objective. A metric may use the device only when the kernel
-    // computes that objective itself, or a slope/absolute/rank run is silently
-    // ranked by MSE (observed: a different Pareto point for `--metric slope`).
-    // This is a correctness gate, not a performance preference.
-    if crate::fit::DeviceLoss::for_metric(cfg.metric).is_none() {
-        return Some("metric is not scored natively on the GPU");
+    // #236/#287: a metric may use the device only when the score-dispatch
+    // table names a native statistic for it; otherwise the *named* refusal is
+    // the reason, and no run can be silently ranked by MSE.
+    if let Some(reason) = crate::metrics::score_refusal(cfg.metric) {
+        return Some(reason);
     }
     if subsampling_active(cfg, train) {
         return Some("--predictor-samples changes the rows per generation");
@@ -3742,6 +3751,20 @@ fn postfix_variation_for(cfg: &Config, train: &Sample) -> Result<Variation, Stri
     if !expr::current_blocks().is_empty() {
         return Err("custom building blocks".to_string());
     }
+    // #287: the flat arena carries programs, not the per-candidate constant
+    // count the AIC family's penalty needs. Keep that family on the owned-tree
+    // path, where `count_constants(tree)` is available for every candidate.
+    if crate::metrics::native_score_objective(cfg.metric)
+        .is_some_and(|o| o.needs_constants())
+    {
+        return Err("parameter-aware metric needs per-candidate constants".to_string());
+    }
+    // The pass-through path must never score a metric without a native
+    // objective (the #236 defect). `gpu` is only built when this holds, but the
+    // gate is asserted here so a future caller cannot bypass it.
+    if crate::metrics::native_score_objective(cfg.metric).is_none() {
+        return Err("metric has no native score objective".to_string());
+    }
     let width = crate::genome::width_for(cfg.max_complexity);
     Variation::new(
         width,
@@ -4054,7 +4077,11 @@ fn run_postfix_search(
         );
         let dev_generate = dev_lap(&mut dev_mark); // #211
         let stage_generate = stage_lap(&mut stage_mark); // #284
-        next.evaluate(&mut gpu.ev, train.len())?;
+        next.evaluate(
+            &mut gpu.ev,
+            gpu.score
+                .expect("the pass-through postfix path only runs native score objectives"),
+        )?;
         let dev_eval = dev_lap(&mut dev_mark); // #211
         let stage_eval = stage_lap(&mut stage_mark); // #284
         restart_flags = vec![false; n_islands];
@@ -4235,7 +4262,11 @@ fn run_postfix_search(
                 }
             }
             if restarted {
-                next.evaluate(&mut gpu.ev, train.len())?;
+                next.evaluate(
+            &mut gpu.ev,
+            gpu.score
+                .expect("the pass-through postfix path only runs native score objectives"),
+        )?;
             }
         }
 
@@ -4484,10 +4515,16 @@ fn run_search(
         let maximum_fit = cfg.fit_strategy.defers_to_gpu()
             && cfg.fit_iters > 0
             && crate::fit::maximum_fit_only(cfg.metric);
+        // #287: maximum now has a native scorer, so it is not fit-only. Rank,
+        // order statistics and log-loss still have no native score (#288/#289)
+        // and keep the exact CPU fitness.
+        let maximum_fit_only =
+            maximum_fit && maximum_blocker.is_none()
+                && crate::metrics::native_score_objective(cfg.metric).is_none();
         let fit_only = rank_fit_only_arm(cfg, train).is_some()
             || (order_stat_fit && order_stat_blocker.is_none())
             || logistic_fit
-            || (maximum_fit && maximum_blocker.is_none());
+            || maximum_fit_only;
         let plan: Option<(crate::fit::DeviceLoss, bool)> = if fit_only {
             backend_reason = Some(if logistic_fit {
                 format!(
@@ -4508,12 +4545,18 @@ fn run_search(
                     None
                 }
                 None => {
-                    // #229: the gate above admits only metrics the kernel
-                    // scores natively, so this is always `Some`. It panics
-                    // rather than defaulting to squared error, because a silent
-                    // MSE ranking is exactly the #236 defect.
-                    let loss = crate::fit::DeviceLoss::for_metric(cfg.metric)
-                        .expect("gpu_blocker admits only native device losses");
+                    // #287: the score gate is independent of the fit objective.
+                    // The evaluator gets a `ScoreObjective`; `loss` only seeds
+                    // the legacy fit/eval field and is `Squared` when the metric
+                    // has no device LM loss (correlation, signed, maximum).
+                    // The score gate is independent of the fit objective.
+                    // `loss` only seeds the legacy fit/eval field and is
+                    // `Squared` when the metric has no device LM loss
+                    // (correlation, signed, maximum).
+                    let _objective = crate::metrics::native_score_objective(cfg.metric)
+                        .expect("gpu_blocker admits only native score objectives");
+                    let loss = crate::fit::fit_loss(cfg.metric)
+                        .unwrap_or(crate::fit::DeviceLoss::Squared);
                     Some((loss, true))
                 }
             }
@@ -4521,11 +4564,20 @@ fn run_search(
         match plan {
             None => None,
             Some((loss, native)) => {
+                let score = if native {
+                    Some(
+                        crate::metrics::native_score_objective(cfg.metric)
+                            .expect("native GPU plan owns a score objective"),
+                    )
+                } else {
+                    None
+                };
                 match GpuSearch::new(
                     train,
                     cfg.fit_strategy.defers_to_gpu(),
                     loss,
                     native,
+                    score,
                     logistic_fit,
                     t0,
                 ) {

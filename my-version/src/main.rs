@@ -449,10 +449,9 @@ SEARCH:
                              `--metric absolute`, `--metric log_loss`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
-                             strategy. `--metric signed`
-                             is in that group: it keeps the exact CPU
-                             projection (#228) and says so, because the device
-                             has no native signed scorer yet (#236)
+                             strategy. `--metric signed` keeps the exact CPU
+                             fit projection (#228), but its score is native on
+                             the device since #287
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
@@ -494,16 +493,17 @@ SEARCH:
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
-                             the GPU automatically for --metric squared,
-                             --metric log_squashed and --metric absolute (mean
-                             |r|): those are the objectives the kernel fits and
-                             scores. Every other metric is *scored* on the CPU
-                             and prints the reason, never with a proxy loss;
-                             with --fit-strategy gpu its *constants* may still
-                             be fitted on the device (the rank, median,
-                             log_loss, interquartile and maximum arms; the last
-                             four are fit-only for the same reason — no native
-                             scorer).
+                             the GPU automatically when the #287 score table
+                             names a native objective: squared, absolute,
+                             log_squashed, signed, maximum, correlation,
+                             correlation_signed and aic/aicc/bic. Every other
+                             metric is *scored* on the CPU with its named
+                             refusal, never with a proxy loss; with
+                             --fit-strategy gpu its *constants* may still be
+                             fitted on the device (the rank, median,
+                             interquartile and log_loss arms are fit-only
+                             because no native score exists yet; maximum fits
+                             and scores natively).
                              Reported errors stay CPU f64. Cross-backend runs
                              are not bit-identical because f32 fitness can
                              change the trajectory. JSON reports the measured
