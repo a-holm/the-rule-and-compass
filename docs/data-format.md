@@ -365,6 +365,17 @@ and small (≤ ~7 %, absolute cap 10⁶ rows); everything else is a `Range` or t
 pinned one-multiply `Hash` predicate. The hashed sample and the split selector
 are the same function, so row selection is reproducible across passes.
 
+### Projected reads (issue #294)
+
+`FileStore::to_table_projected` / `read_group_projected` take a resolved
+`Projection`: exact names, header-order indices, and one value block per column.
+Only those blocks are `pread`; the header directories for the other columns are
+still validated when the store is opened, but no unprojected block is read.
+`read_group_projected_raw_into` is the transport form: it copies the block bytes
+straight into a pinned slot, keeping the time column as `i64` and features as
+`f64`. A missing or dictionary-only name is an error, never a silent omission.
+The projection hash is FNV-1a 64 over `index:name:dtype;` in header order.
+
 ## Measured
 
 ### Streaming CSV (issue #126)

@@ -112,6 +112,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),
         ("--allow-backend-change", "flag", "false", "permit --resume across cpu<->gpu (recorded on stderr and in --run-manifest)"),
+        ("--no-project", "flag", "false", "load every column of a .rcsb store. The default projects a store read to --vars, targets, --weight, --time and --group-by when --vars and --time are both given; the resolved projection hash, column list and header indices are written to --run-manifest. --no-project is the A/B escape hatch and keeps the unprojected path"),
         // #140: run integrity.
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
         ("--dev-log", "string", "rcsr.dev.ndjson next to --json-out/--save, else the working directory", "write the bounded NDJSON development log to this path instead of the default. The log is ON BY DEFAULT (see --dev-log-level and --no-dev-log): run_start, generation events, checkpoint and run_end, schema `rcsr-devlog/1`, documented in docs/dev-log.md. Never changes the archive, results or config hash; no raw rows"),

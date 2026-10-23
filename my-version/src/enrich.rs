@@ -1516,6 +1516,13 @@ pub struct Report {
     /// Measured device windows for the enrichment phase (#118 ledger).
     pub gpu_kernel_seconds: f64,
     pub gpu_transfer_bytes: u64,
+    /// Measured host→device and device→host windows (#294 benchmark ledger).
+    pub gpu_h2d_seconds: f64,
+    pub gpu_d2h_seconds: f64,
+    /// #294: FNV-1a 64 of the resolved device read projection.
+    pub projection_hash: Option<String>,
+    /// #294: exact header columns the projected transport read.
+    pub projection_columns: Vec<String>,
     pub read_seconds: f64,
     pub feature_seconds: f64,
     pub xs_seconds: f64,
@@ -1569,6 +1576,13 @@ impl Report {
                 self.peak_rss_bytes as f64 / (1024.0 * 1024.0)
             ),
         ];
+        if let Some(hash) = &self.projection_hash {
+            out.push(format!(
+                "# enrich: projection_hash={} columns={}",
+                hash,
+                self.projection_columns.join(",")
+            ));
+        }
         for f in &self.features {
             out.push(format!(
                 "# enrich-feature: name={} warmup={} nan_rows={} prevalence={:.6} first_finite_row={} first_finite_time={} first_finite_iso={} label={}",
@@ -1658,7 +1672,8 @@ impl Report {
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
-             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"transfer_bytes\":{}}},\n  \
+             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"transfer_bytes\":{}}},\n  \
+             \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
@@ -1686,7 +1701,18 @@ impl Report {
             self.gpu_share,
             self.gpu_fallback,
             self.gpu_kernel_seconds,
+            self.gpu_h2d_seconds,
+            self.gpu_d2h_seconds,
             self.gpu_transfer_bytes,
+            self.projection_hash
+                .as_deref()
+                .map(jstr)
+                .unwrap_or_else(|| "null".to_string()),
+            self.projection_columns
+                .iter()
+                .map(|c| jstr(c))
+                .collect::<Vec<_>>()
+                .join(","),
             self.read_seconds,
             self.feature_seconds,
             self.xs_seconds,
@@ -6136,39 +6162,111 @@ fn enrich_inner(
     let mut gpu_kernel_seconds = 0.0;
     #[allow(unused_mut)]
     let mut gpu_transfer_bytes = 0u64;
+    #[allow(unused_mut)]
+    let mut gpu_h2d_seconds = 0.0;
+    #[allow(unused_mut)]
+    let mut gpu_d2h_seconds = 0.0;
+    // #294: the resolved device read projection, recorded in the report so the
+    // audited column list cannot drift from the bytes actually read.
+    #[allow(unused_mut)]
+    let mut device_projection: Option<(String, Vec<String>)> = None;
     #[cfg(feature = "cuda")]
     let mut gpu_ctx: Option<crate::enrich_gpu::EnrichGpu> = None;
 
     #[cfg(feature = "cuda")]
     if !gpu_names.is_empty() || gpu_labels {
-        let times = i64_column_all(&store, time_col, cols.time_dtype)?;
-        let nan = vec![f64::NAN; store.n_rows()];
-        let volume = match cols.volume {
-            Some(c) => column_all(&store, c)?,
-            None => nan.clone(),
-        };
-        let quote_volume = match cols.quote_volume {
-            Some(c) => column_all(&store, c)?,
-            None => nan,
-        };
-        let open = column_all(&store, cols.open)?;
-        let high = column_all(&store, cols.high)?;
-        let low = column_all(&store, cols.low)?;
-        let close = column_all(&store, cols.close)?;
+        // Projected transport: only the raw columns the device needs, read
+        // group by group into a bounded pinned ring. Open/high/low/close are
+        // required; volume/quote_volume are optional and start as NaN.
+        let mut wanted: Vec<(usize, crate::enrich_gpu::DeviceColumn)> = vec![
+            (time_col, crate::enrich_gpu::DeviceColumn::Time),
+            (cols.open, crate::enrich_gpu::DeviceColumn::Value(0)),
+            (cols.high, crate::enrich_gpu::DeviceColumn::Value(1)),
+            (cols.low, crate::enrich_gpu::DeviceColumn::Value(2)),
+            (cols.close, crate::enrich_gpu::DeviceColumn::Value(3)),
+        ];
+        if let Some(c) = cols.volume {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(4)));
+        }
+        if let Some(c) = cols.quote_volume {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(5)));
+        }
+        wanted.sort_by_key(|(i, _)| *i);
+        wanted.dedup_by_key(|(i, _)| *i);
+        let proj_names: Vec<String> = wanted.iter().map(|(i, _)| names[*i].clone()).collect();
         let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
         let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-        gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
-            &times,
-            &open,
-            &high,
-            &low,
-            &close,
-            &volume,
-            &quote_volume,
-            &seg_start,
-            &seg_len,
-            step,
-        );
+        let precompute: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| crate::enrich_gpu::tile_feature(n).is_some())
+            .cloned()
+            .collect();
+        if let Ok(projection) = crate::store::Projection::resolve_owned(&store, &proj_names) {
+            let sources: Vec<crate::enrich_gpu::ProjectedSource> = projection
+                .columns()
+                .iter()
+                .filter_map(|c| {
+                    wanted
+                        .iter()
+                        .find(|(i, _)| *i == c.index)
+                        .map(|(i, d)| crate::enrich_gpu::ProjectedSource {
+                            header_index: *i,
+                            destination: *d,
+                        })
+                })
+                .collect();
+            device_projection = Some((projection.hash_hex(), projection.names()));
+            // A/B escape hatch: force the historical whole-column upload.
+            let disabled = std::env::var("RCSR_NO_PROJECTED_UPLOAD")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            if disabled {
+                device_projection = None;
+            } else {
+                gpu_ctx = crate::enrich_gpu::EnrichGpu::from_projected(
+                    &store,
+                    projection,
+                    &sources,
+                    &seg_start,
+                    &seg_len,
+                    step,
+                    &precompute,
+                    3,
+                );
+            }
+        }
+        if gpu_ctx.is_none() {
+            // Fallback: the historical whole-column upload. It is the narrow
+            // path for an exotic store layout, not the default.
+            let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let nan = vec![f64::NAN; store.n_rows()];
+            let volume = match cols.volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let quote_volume = match cols.quote_volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan,
+            };
+            let open = column_all(&store, cols.open)?;
+            let high = column_all(&store, cols.high)?;
+            let low = column_all(&store, cols.low)?;
+            let close = column_all(&store, cols.close)?;
+            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+            gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
+                &times,
+                &open,
+                &high,
+                &low,
+                &close,
+                &volume,
+                &quote_volume,
+                &seg_start,
+                &seg_len,
+                step,
+            );
+        }
         if gpu_ctx.is_none() {
             // No device context: the whole planned GPU share falls back.
             gpu_fallback += gpu_names.len() + if gpu_labels { labels.len() } else { 0 };
@@ -6210,6 +6308,23 @@ fn enrich_inner(
             .cloned()
             .collect();
         for name in names {
+            // A feature computed per uploaded tile already lives on the device.
+            if let Some(vals) = gpu.take_precomputed(&name) {
+                let ok = match temp.get_mut(&name) {
+                    Some(t) => {
+                        t.write_values(&vals)?;
+                        true
+                    }
+                    None => false,
+                };
+                if ok {
+                    gpu_done.insert(name.clone());
+                } else {
+                    gpu_fallback += 1;
+                }
+                gpu_names.remove(&name);
+                continue;
+            }
             let vals = gpu_feature(&name, gpu);
             let ok = match vals {
                 Some(vals) => match temp.get_mut(&name) {
@@ -6245,6 +6360,8 @@ fn enrich_inner(
         let stats = gpu.stats();
         gpu_kernel_seconds = stats.kernel_s;
         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+        gpu_h2d_seconds = stats.h2d_s;
+        gpu_d2h_seconds = stats.d2h_s;
     }
 
     // Everything planned for the CPU (including failed GPU calls).
@@ -6419,6 +6536,8 @@ fn enrich_inner(
                         let stats = gpu.stats();
                         gpu_kernel_seconds = stats.kernel_s;
                         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                        gpu_h2d_seconds = stats.h2d_s;
+                        gpu_d2h_seconds = stats.d2h_s;
                     }
                 }
                 let (ranks, from_gpu) = match ranks {
@@ -6553,6 +6672,13 @@ fn enrich_inner(
             gpu_fallback,
             gpu_kernel_seconds,
             gpu_transfer_bytes,
+            gpu_h2d_seconds,
+            gpu_d2h_seconds,
+            projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
+            projection_columns: device_projection
+                .as_ref()
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default(),
             read_seconds,
             feature_seconds,
             xs_seconds,
@@ -6601,6 +6727,13 @@ fn enrich_inner(
         gpu_fallback,
         gpu_kernel_seconds,
         gpu_transfer_bytes,
+        gpu_h2d_seconds,
+        gpu_d2h_seconds,
+        projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
+        projection_columns: device_projection
+            .as_ref()
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default(),
         read_seconds,
         feature_seconds,
         xs_seconds,

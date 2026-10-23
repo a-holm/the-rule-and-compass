@@ -281,6 +281,128 @@ __global__ void k_calendar(const long long *__restrict__ t, int n, int which,
 }
 
 /* ------------------------------------------------------------------------- */
+/* Tiled elementwise kernels (#294 direct projected upload)                  */
+/* ------------------------------------------------------------------------- */
+
+/* The same arithmetic as k_ret/k_lag/k_range/k_clv/k_calendar, restricted to
+   [start, start+len). The transport runs one of these per uploaded group on
+   the compute stream, so the H2D copy of group g+1 overlaps the kernel of g.
+   State (close/times/seg_id) before `start` is already resident and ready. */
+
+__global__ void k_ret_tile(const long long *__restrict__ t, const double *__restrict__ c,
+                           const int *__restrict__ seg, int step, int k,
+                           int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    double v = NAN;
+    if (i >= k && seg[i] == seg[i - k] &&
+        t[i] - t[i - k] == (long long)k * step &&
+        c[i] > 0.0 && c[i - k] > 0.0) {
+        v = log(c[i] / c[i - k]);
+    }
+    out[i] = v;
+}
+
+__global__ void k_lag_tile(const long long *__restrict__ t, const double *__restrict__ c,
+                           const int *__restrict__ seg, int step, int k,
+                           int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    double v = NAN;
+    int j = i - k;
+    if (j >= 1 && seg[i] == seg[j] && t[i] - t[j] == (long long)k * step &&
+        t[j] - t[j - 1] == (long long)step) {
+        double a = c[j], b = c[j - 1];
+        if (a > 0.0 && b > 0.0) v = log(a / b);
+    }
+    out[i] = v;
+}
+
+__global__ void k_range_tile(const double *__restrict__ high, const double *__restrict__ low,
+                             const double *__restrict__ close, int start, int len,
+                             double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    out[i] = close[i] > 0.0 ? (high[i] - low[i]) / close[i] : NAN;
+}
+
+__global__ void k_clv_tile(const double *__restrict__ high, const double *__restrict__ low,
+                           const double *__restrict__ close, int start, int len,
+                           double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    if (!(isfinite(high[i]) && isfinite(low[i]) && isfinite(close[i]))) {
+        out[i] = NAN;
+        return;
+    }
+    double r = high[i] - low[i];
+    out[i] = r > 0.0 ? (close[i] - low[i]) / r - 0.5 : -0.5;
+}
+
+__global__ void k_calendar_tile(const long long *__restrict__ t, int which,
+                                int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    long long ts = t[i];
+    double frac, a;
+    const double pi = 3.14159265358979323846264338327950288;
+    switch (which) {
+    case 0:
+    case 1:
+        a = 2.0 * pi * (double)rc_weekday(ts / 86400) / 7.0;
+        out[i] = (which == 0) ? sin(a) : cos(a);
+        break;
+    case 2:
+    case 3:
+        frac = (double)(ts % 86400) / 86400.0;
+        if (frac < 0.0) frac += 1.0;
+        a = 2.0 * pi * frac;
+        out[i] = (which == 2) ? sin(a) : cos(a);
+        break;
+    case 4:
+    case 5: {
+        int y, m, d;
+        rc_civil_from_days(ts / 86400, &y, &m, &d);
+        a = 2.0 * pi * (double)m / 12.0;
+        out[i] = (which == 4) ? sin(a) : cos(a);
+        break;
+    }
+    default: {
+        int y, m, d;
+        rc_civil_from_days(ts / 86400, &y, &m, &d);
+        a = 2.0 * pi * (double)d / 31.0;
+        out[i] = (which == 6) ? sin(a) : cos(a);
+        break;
+    }
+    }
+}
+
+/* Segment id for [start, start+len), replacing the host loop that used to build
+   it before upload. */
+__global__ void k_seg_id_tile(const int *__restrict__ ss, const int *__restrict__ sl,
+                              int nseg, int start, int len, int *__restrict__ seg)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    int s = 0;
+    for (int k = 0; k < nseg; ++k) {
+        if (i >= ss[k] && i < ss[k] + sl[k]) { s = k; break; }
+    }
+    seg[i] = s;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Sequential (one thread per segment) kernels                               */
 /* ------------------------------------------------------------------------- */
 
@@ -1097,3 +1219,421 @@ void rc_enrich_rank_stats(RcEnrichStats *out)
 }
 
 } /* extern "C" */
+
+/* ------------------------------------------------------------------------- */
+/* Projected pinned ring and direct H2D upload (issue #294)                  */
+/* ------------------------------------------------------------------------- */
+
+typedef struct RcRing {
+    int slots;
+    size_t slot_bytes;
+    void **host;
+    cudaStream_t copy_stream;
+    cudaStream_t compute_stream;
+    cudaEvent_t *copy_done;
+    cudaEvent_t *compute_done;
+    unsigned long long copy_count;
+    unsigned long long compute_count;
+    int failed;
+} RcRing;
+
+extern "C" {
+
+void rc_ring_destroy(void *v);
+
+void *rc_ring_create(int slots, size_t slot_bytes)
+{
+    if (slots < 2 || slot_bytes == 0) return NULL;
+    RcRing *r = (RcRing *)calloc(1, sizeof(RcRing));
+    if (!r) return NULL;
+    r->slots = slots;
+    r->slot_bytes = slot_bytes;
+    r->host = (void **)calloc((size_t)slots, sizeof(void *));
+    r->copy_done = (cudaEvent_t *)calloc((size_t)slots, sizeof(cudaEvent_t));
+    r->compute_done = (cudaEvent_t *)calloc((size_t)slots, sizeof(cudaEvent_t));
+    if (!r->host || !r->copy_done || !r->compute_done) { rc_ring_destroy((void *)r); return NULL; }
+    if (cudaStreamCreateWithFlags(&r->copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        rc_ring_destroy((void *)r); return NULL;
+    }
+    if (cudaStreamCreateWithFlags(&r->compute_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        rc_ring_destroy((void *)r); return NULL;
+    }
+    for (int i = 0; i < slots; ++i) {
+        /* cudaHostAlloc gives the asynchronous copy engine page-locked host
+           memory. Write-combined is deliberately not requested: the reader
+           writes and the device reads, which is the case cudaHostAllocDefault
+           documents as the safe/default choice. */
+        if (cudaHostAlloc(&r->host[i], slot_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            rc_ring_destroy((void *)r); return NULL;
+        }
+        if (cudaEventCreateWithFlags(&r->copy_done[i], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&r->compute_done[i], cudaEventDisableTiming) != cudaSuccess) {
+            rc_ring_destroy((void *)r); return NULL;
+        }
+        /* A freshly recorded event makes the first wait a no-op. */
+        cudaEventRecord(r->compute_done[i], r->compute_stream);
+    }
+    cudaStreamSynchronize(r->compute_stream);
+    return (void *)r;
+}
+
+void rc_ring_destroy(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return;
+    if (r->copy_stream) cudaStreamDestroy(r->copy_stream);
+    if (r->compute_stream) cudaStreamDestroy(r->compute_stream);
+    if (r->host) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->host[i]) cudaFreeHost(r->host[i]);
+        }
+        free(r->host);
+    }
+    if (r->copy_done) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->copy_done[i]) cudaEventDestroy(r->copy_done[i]);
+        }
+        free(r->copy_done);
+    }
+    if (r->compute_done) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->compute_done[i]) cudaEventDestroy(r->compute_done[i]);
+        }
+        free(r->compute_done);
+    }
+    free(r);
+}
+
+void *rc_ring_host(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return NULL;
+    return r->host[slot];
+}
+
+size_t rc_ring_slot_bytes(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    return r ? r->slot_bytes : 0;
+}
+
+int rc_ring_slots(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    return r ? r->slots : 0;
+}
+
+/* Enqueue one async H2D copy per projected column, then mark the slot's copy
+   event. The caller may immediately enqueue compute that waits on it. */
+int rc_ring_upload(void *v, int slot, void *const *dev_ptrs, const size_t *dev_offsets,
+                   const size_t *host_offsets, const size_t *bytes, int ncols)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    for (int i = 0; i < ncols; ++i) {
+        if (bytes[i] == 0) continue;
+        char *dst = (char *)dev_ptrs[i] + dev_offsets[i];
+        char *src = (char *)r->host[slot] + host_offsets[i];
+        cudaError_t e = cudaMemcpyAsync(dst, src, bytes[i], cudaMemcpyHostToDevice,
+                                        r->copy_stream);
+        if (e != cudaSuccess) { r->failed = 1; return -1; }
+    }
+    if (cudaEventRecord(r->copy_done[slot], r->copy_stream) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    r->copy_count += 1;
+    return 0;
+}
+
+int rc_ring_compute_begin(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    if (cudaStreamWaitEvent(r->compute_stream, r->copy_done[slot], 0) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    return 0;
+}
+
+int rc_ring_compute_end(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    if (cudaEventRecord(r->compute_done[slot], r->compute_stream) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    r->compute_count += 1;
+    return 0;
+}
+
+/* Wait until the copy that reads this pinned slot has completed, so the reader
+   can reuse it. This is an event wait, not a stream-wide synchronisation. */
+int rc_ring_wait_copy(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    return cudaEventSynchronize(r->copy_done[slot]) == cudaSuccess ? 0 : -1;
+}
+
+int rc_ring_wait_slot(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    return cudaEventSynchronize(r->compute_done[slot]) == cudaSuccess ? 0 : -1;
+}
+
+/* One synchronisation at the end of the whole projected upload, never per
+   group on the hot path. */
+int rc_ring_sync(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return -1;
+    if (cudaStreamSynchronize(r->compute_stream) != cudaSuccess) { r->failed = 1; return -1; }
+    if (cudaStreamSynchronize(r->copy_stream) != cudaSuccess) { r->failed = 1; return -1; }
+    return r->failed ? -1 : 0;
+}
+
+int rc_ring_stats(void *v, unsigned long long *copies, unsigned long long *computes,
+                  unsigned long long *bytes, int *failed)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return -1;
+    if (copies) *copies = r->copy_count;
+    if (computes) *computes = r->compute_count;
+    if (bytes) *bytes = (unsigned long long)r->slot_bytes * (unsigned long long)r->slots;
+    if (failed) *failed = r->failed;
+    return 0;
+}
+
+/* Run the per-tile compute needed by the projected path. `kind`:
+   0 ret(k), 1 lag(k), 2 range, 3 clv, 4 calendar(which). */
+int rc_ring_launch_seg_id(void *rv, void *cv, int start, int len)
+{
+    RcRing *r = (RcRing *)rv;
+    RcEnrich *c = (RcEnrich *)cv;
+    if (!r || !c || len <= 0) return -1;
+    int threads = 256;
+    int blocks = (len + threads - 1) / threads;
+    k_seg_id_tile<<<blocks, threads, 0, r->compute_stream>>>(
+        c->d_seg_start, c->d_seg_len, c->nseg, start, len, c->d_seg_id);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
+                           int start, int len, double *out)
+{
+    RcRing *r = (RcRing *)rv;
+    RcEnrich *c = (RcEnrich *)cv;
+    if (!r || !c || !out || len <= 0) return -1;
+    int threads = 256;
+    int blocks = (len + threads - 1) / threads;
+    cudaStream_t s = r->compute_stream;
+    switch (kind) {
+    case 0:
+        k_ret_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+                                              c->step, k, start, len, out);
+        break;
+    case 1:
+        k_lag_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+                                              c->step, k, start, len, out);
+        break;
+    case 2:
+        k_range_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+                                                start, len, out);
+        break;
+    case 3:
+        k_clv_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+                                              start, len, out);
+        break;
+    case 4:
+        k_calendar_tile<<<blocks, threads, 0, s>>>(c->d_times, which, start, len, out);
+        break;
+    default:
+        return -1;
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* An RcEnrich that owns the device arrays but has not uploaded the source
+   columns. The projected ring fills them group by group. `nan_mask` marks
+   value arrays that must start as NaN (bit 0..5 = open,high,low,close,volume,
+   qvolume). */
+void *rc_enrich_create_arena(int n, int nseg, int step, const int *seg_start,
+                             const int *seg_len, unsigned int nan_mask)
+{
+    if (n <= 0 || nseg <= 0) return NULL;
+    RcEnrich *c = (RcEnrich *)calloc(1, sizeof(RcEnrich));
+    if (!c) return NULL;
+    c->n = n;
+    c->nseg = nseg;
+    c->step = step;
+    size_t rows = (size_t)n;
+    double t0 = rc_now_ms();
+    int ok = 1;
+    if (rc_alloc((void **)&c->d_times, rows * sizeof(long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_open, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_high, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_low, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_close, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_volume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_qvolume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_start, (size_t)nseg * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_len, (size_t)nseg * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_id, rows * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_a, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_d, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out2, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out3, rows * sizeof(double)) != 0) ok = 0;
+    c->last.alloc_ms = rc_now_ms() - t0;
+    if (!ok) { rc_enrich_destroy(c); return NULL; }
+    t0 = rc_now_ms();
+    rc_upload(c->d_seg_start, seg_start, (size_t)nseg * sizeof(int));
+    rc_upload(c->d_seg_len, seg_len, (size_t)nseg * sizeof(int));
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = 2ULL * (unsigned long long)nseg * sizeof(int);
+    if (nan_mask & 1u) cudaMemset(c->d_open, 0xFF, rows * sizeof(double));
+    if (nan_mask & 2u) cudaMemset(c->d_high, 0xFF, rows * sizeof(double));
+    if (nan_mask & 4u) cudaMemset(c->d_low, 0xFF, rows * sizeof(double));
+    if (nan_mask & 8u) cudaMemset(c->d_close, 0xFF, rows * sizeof(double));
+    if (nan_mask & 16u) cudaMemset(c->d_volume, 0xFF, rows * sizeof(double));
+    if (nan_mask & 32u) cudaMemset(c->d_qvolume, 0xFF, rows * sizeof(double));
+    stats_end(c);
+    c->last.batch = 0;
+    return c;
+}
+
+long long *rc_enrich_times_ptr(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    return c ? c->d_times : NULL;
+}
+
+/* which: 0 open, 1 high, 2 low, 3 close, 4 volume, 5 qvolume. */
+double *rc_enrich_value_ptr(void *v, int which)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return NULL;
+    switch (which) {
+    case 0: return c->d_open;
+    case 1: return c->d_high;
+    case 2: return c->d_low;
+    case 3: return c->d_close;
+    case 4: return c->d_volume;
+    case 5: return c->d_qvolume;
+    default: return NULL;
+    }
+}
+
+double *rc_enrich_new_output(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return NULL;
+    double *p = NULL;
+    if (rc_alloc((void **)&p, (size_t)c->n * sizeof(double)) != 0) return NULL;
+    return p;
+}
+
+void rc_enrich_release_output(double *p)
+{
+    if (p) cudaFree(p);
+}
+
+int rc_enrich_download_ptr(const double *src, double *dst, int n)
+{
+    if (!src || !dst || n <= 0) return -1;
+    return cudaMemcpy(dst, src, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost) == cudaSuccess
+               ? 0
+               : -1;
+}
+
+void rc_enrich_note_projected_upload(void *v, unsigned long long bytes, double ms)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return;
+    c->last.h2d_bytes += bytes;
+    c->last.h2d_ms += ms;
+}
+
+void rc_enrich_note_projected_download(void *v, unsigned long long bytes, double ms)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return;
+    c->last.d2h_bytes += bytes;
+    c->last.d2h_ms += ms;
+}
+
+} /* extern "C" */
+
+__global__ void k_ring_busy(unsigned long long cycles)
+{
+    unsigned long long t0 = clock64();
+    while (clock64() - t0 < cycles) { __nanosleep(64); }
+}
+
+/* Event-ordering probe for the transport (tests/gpu_ring.rs). It exercises the
+   same ring/stream/event calls as the projected path: a copy of slot i+1 is
+   enqueued while the compute stream's busy kernel for slot i is still running.
+   Reports the two windows and whether they overlap. No cudaStreamSynchronize is
+   used until the final join. */
+extern "C" int rc_ring_overlap_probe(size_t bytes, int iters, unsigned long long cycles,
+                                     double *copy_ms, double *compute_ms, int *overlapped,
+                                     unsigned long long *copies, int *failed)
+{
+    if (bytes == 0 || iters < 2) return -1;
+    void *ring = rc_ring_create(2, bytes);
+    if (!ring) return -1;
+    void *d0 = NULL, *d1 = NULL;
+    if (rc_alloc(&d0, bytes) != 0 || rc_alloc(&d1, bytes) != 0) {
+        cudaFree(d0); cudaFree(d1); rc_ring_destroy(ring);
+        return -1;
+    }
+    cudaEvent_t cs, ce, ks, ke;
+    cudaEventCreate(&cs); cudaEventCreate(&ce);
+    cudaEventCreate(&ks); cudaEventCreate(&ke);
+    RcRing *r = (RcRing *)ring;
+    cudaEventRecord(cs, r->copy_stream);
+    cudaEventRecord(ks, r->compute_stream);
+    int ok = 1;
+    for (int i = 0; i < iters && ok; ++i) {
+        int slot = i % 2;
+        void *dev[1] = { (slot == 0) ? d0 : d1 };
+        size_t off[1] = { 0 };
+        size_t hoff[1] = { 0 };
+        size_t len[1] = { bytes };
+        if (rc_ring_upload(ring, slot, dev, off, hoff, len, 1) != 0) { ok = 0; break; }
+        if (rc_ring_compute_begin(ring, slot) != 0) { ok = 0; break; }
+        k_ring_busy<<<1, 1, 0, r->compute_stream>>>(cycles);
+        if (cudaGetLastError() != cudaSuccess) { ok = 0; break; }
+        if (rc_ring_compute_end(ring, slot) != 0) { ok = 0; break; }
+    }
+    if (ok) {
+        cudaEventRecord(ce, r->copy_stream);
+        cudaEventRecord(ke, r->compute_stream);
+        if (cudaEventSynchronize(ke) != cudaSuccess) ok = 0;
+        if (cudaEventSynchronize(ce) != cudaSuccess) ok = 0;
+    }
+    float cm = 0.0f, km = 0.0f, kstart = 0.0f, kend = 0.0f;
+    if (ok) {
+        cudaEventElapsedTime(&cm, cs, ce);
+        cudaEventElapsedTime(&km, ks, ke);
+        cudaEventElapsedTime(&kstart, cs, ks);
+        cudaEventElapsedTime(&kend, cs, ke);
+        if (copy_ms) *copy_ms = (double)cm;
+        if (compute_ms) *compute_ms = (double)km;
+        /* The compute stream's window starts before the copy stream finishes,
+           and it is still running after it. */
+        if (overlapped) *overlapped = (kstart < cm && kend > cm) ? 1 : 0;
+    }
+    if (copies) *copies = r->copy_count;
+    if (failed) *failed = r->failed;
+    cudaEventDestroy(cs); cudaEventDestroy(ce);
+    cudaEventDestroy(ks); cudaEventDestroy(ke);
+    cudaFree(d0); cudaFree(d1);
+    rc_ring_destroy(ring);
+    return ok ? 0 : -1;
+}
+
+

@@ -12,7 +12,9 @@ pub mod data;
 pub mod diagnostics;
 pub mod enrich; // #200: append-only OHLCV feature enrichment
 #[cfg(feature = "cuda")]
-mod enrich_gpu; // #200: resident CUDA enrichment kernels
+pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
+#[cfg(feature = "cuda")]
+pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;

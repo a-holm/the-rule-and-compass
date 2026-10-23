@@ -13,7 +13,10 @@
 //! radix sort with the CPU's `(time, symbol, row)` tie order.
 
 use crate::gpu_stats::GpuStats;
-use std::os::raw::c_int;
+use crate::projected_ring::{ProjectedRing, TileFeature};
+use crate::store::{FileStore, Projection};
+use std::collections::BTreeMap;
+use std::os::raw::{c_int, c_void};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -87,12 +90,46 @@ extern "C" {
         out: *mut f64,
     ) -> c_int;
     fn rc_enrich_rank_stats(out: *mut RawStats);
+    fn rc_enrich_create_arena(
+        n: c_int,
+        nseg: c_int,
+        step: c_int,
+        seg_start: *const c_int,
+        seg_len: *const c_int,
+        nan_mask: u32,
+    ) -> *mut Raw;
+    fn rc_enrich_times_ptr(ctx: *mut Raw) -> *mut i64;
+    fn rc_enrich_value_ptr(ctx: *mut Raw, which: c_int) -> *mut f64;
+    fn rc_enrich_new_output(ctx: *mut Raw) -> *mut f64;
+    fn rc_enrich_release_output(p: *mut f64);
+    fn rc_enrich_download_ptr(src: *const f64, dst: *mut f64, n: c_int) -> c_int;
+    fn rc_enrich_note_projected_upload(ctx: *mut Raw, bytes: u64, ms: f64);
+    fn rc_enrich_note_projected_download(ctx: *mut Raw, bytes: u64, ms: f64);
+}
+
+/// Where one projected column lands in the enrichment context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceColumn {
+    /// The exact `i64` time block.
+    Time,
+    /// `0` open, `1` high, `2` low, `3` close, `4` volume, `5` quote volume.
+    Value(i32),
+}
+
+/// One column of the device transport: a projected header index and its
+/// destination in the enrichment arena.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectedSource {
+    pub header_index: usize,
+    pub destination: DeviceColumn,
 }
 
 pub struct EnrichGpu {
     ctx: *mut Raw,
     n: usize,
     stats: GpuStats,
+    precomputed: BTreeMap<String, *mut f64>,
+    ring_bytes: u64,
 }
 
 impl EnrichGpu {
@@ -138,11 +175,251 @@ impl EnrichGpu {
             ctx,
             n: times.len(),
             stats: GpuStats::default(),
+            precomputed: BTreeMap::new(),
+            ring_bytes: 0,
         };
         // The create call owns the one-time upload; account it as a batch with
         // zero programs so the transfer totals are honest.
         g.record_creation();
         Some(g)
+    }
+
+    /// Build a context whose source columns are uploaded group by group through
+    /// the bounded pinned ring (issue #294).
+    ///
+    /// `sources` must be in projection order. `precompute` names are the
+    /// elementwise features whose tile can run while the next group copies; any
+    /// name not recognised there is simply left to the whole-column kernel.
+    pub fn from_projected(
+        store: &FileStore,
+        projection: Projection,
+        sources: &[ProjectedSource],
+        seg_start: &[u32],
+        seg_len: &[u32],
+        step: i64,
+        precompute: &[String],
+        slots: usize,
+    ) -> Option<Self> {
+        if store.n_rows() == 0 || seg_start.is_empty() {
+            return None;
+        }
+        if sources.len() != projection.len() {
+            return None;
+        }
+        if projection
+            .columns()
+            .iter()
+            .zip(sources)
+            .any(|(c, s)| c.index != s.header_index)
+        {
+            return None;
+        }
+        let n = store.n_rows();
+        if n > c_int::MAX as usize {
+            return None;
+        }
+        let starts: Vec<c_int> = seg_start.iter().map(|v| *v as c_int).collect();
+        let lens: Vec<c_int> = seg_len.iter().map(|v| *v as c_int).collect();
+        // The context owns all six value arrays; arrays the projection does not
+        // provide start as NaN, never as zero.
+        let mut nan_mask = 0u32;
+        for (bit, which) in [(0u32, 0i32), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5)] {
+            if !sources
+                .iter()
+                .any(|s| s.destination == DeviceColumn::Value(which))
+            {
+                nan_mask |= 1 << bit;
+            }
+        }
+        let ctx = unsafe {
+            rc_enrich_create_arena(
+                n as c_int,
+                starts.len() as c_int,
+                step as c_int,
+                starts.as_ptr(),
+                lens.as_ptr(),
+                nan_mask,
+            )
+        };
+        if ctx.is_null() {
+            return None;
+        }
+
+        let mut precomputed: BTreeMap<String, *mut f64> = BTreeMap::new();
+        let mut tiles: Vec<(TileFeature, *mut f64)> = Vec::new();
+        for name in precompute {
+            if let Some(feature) = tile_feature(name) {
+                let out = unsafe { rc_enrich_new_output(ctx) };
+                if !out.is_null() {
+                    precomputed.insert(name.clone(), out);
+                    tiles.push((feature, out));
+                }
+            }
+        }
+
+        let mut ring = match ProjectedRing::create(store, projection.clone(), slots) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("# enrich: projected transport unavailable: {}", e);
+                unsafe {
+                    for (_, p) in precomputed {
+                        rc_enrich_release_output(p);
+                    }
+                    rc_enrich_destroy(ctx);
+                }
+                return None;
+            }
+        };
+        let mut dests: Vec<(*mut c_void, usize)> = Vec::with_capacity(sources.len());
+        let group_rows = store.group_rows();
+        let started = std::time::Instant::now();
+        let mut upload_error: Option<String> = None;
+        loop {
+            let job = match ring.next_group() {
+                Some(Ok(j)) => j,
+                Some(Err(e)) => {
+                    upload_error = Some(e);
+                    break;
+                }
+                None => break,
+            };
+            dests.clear();
+            let at = job.group * group_rows;
+            for source in sources {
+                let (ptr, off) = match source.destination {
+                    DeviceColumn::Time => (
+                        unsafe { rc_enrich_times_ptr(ctx) } as *mut c_void,
+                        at * std::mem::size_of::<i64>(),
+                    ),
+                    DeviceColumn::Value(which) => (
+                        unsafe { rc_enrich_value_ptr(ctx, which) } as *mut c_void,
+                        at * std::mem::size_of::<f64>(),
+                    ),
+                };
+                if ptr.is_null() {
+                    upload_error = Some("projected transport: null device column".to_string());
+                    break;
+                }
+                dests.push((ptr, off));
+            }
+            if upload_error.is_some() {
+                break;
+            }
+            if let Err(e) = ring.upload(&job, &dests) {
+                upload_error = Some(e);
+                break;
+            }
+            if let Err(e) = ring.compute_begin(job.slot) {
+                upload_error = Some(e);
+                break;
+            }
+            if let Err(e) = ring.launch_seg_id(ctx as *mut c_void, at, job.len) {
+                upload_error = Some(e);
+                break;
+            }
+            for (feature, out) in &tiles {
+                if let Err(e) =
+                    ring.launch_feature(ctx as *mut c_void, *feature, at, job.len, *out)
+                {
+                    upload_error = Some(e);
+                    break;
+                }
+            }
+            if upload_error.is_some() {
+                break;
+            }
+            if let Err(e) = ring.compute_end(job.slot) {
+                upload_error = Some(e);
+                break;
+            }
+        }
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+        let finish = ring.finish();
+        let ring_stats = ring.stats();
+        if let Some(e) = upload_error {
+            eprintln!("# enrich: projected transport failed: {}; using the whole-column fallback", e);
+            unsafe {
+                for (_, p) in precomputed {
+                    rc_enrich_release_output(p);
+                }
+                rc_enrich_destroy(ctx);
+            }
+            return None;
+        }
+        if let Err(e) = finish {
+            eprintln!("# enrich: projected transport failed: {}; using the whole-column fallback", e);
+            unsafe {
+                for (_, p) in precomputed {
+                    rc_enrich_release_output(p);
+                }
+                rc_enrich_destroy(ctx);
+            }
+            return None;
+        }
+        unsafe {
+            rc_enrich_note_projected_upload(ctx, ring_stats.bytes_read, elapsed_ms);
+        }
+        let mut gpu = EnrichGpu {
+            ctx,
+            n,
+            stats: GpuStats::default(),
+            precomputed,
+            ring_bytes: ring_stats.ring_bytes,
+        };
+        // One ledger entry for the projected upload: pinned ring bytes copied,
+        // host wait time and the final join.
+        gpu.stats.add_batch(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            elapsed_ms,
+            0.0,
+            0.0,
+            elapsed_ms,
+            ring_stats.bytes_read,
+            0,
+            0,
+            n as u64,
+            false,
+        );
+        Some(gpu)
+    }
+
+    /// Download and remove one tile-precomputed feature, if it exists.
+    pub fn take_precomputed(&mut self, name: &str) -> Option<Vec<f64>> {
+        let ptr = self.precomputed.remove(name)?;
+        let mut out = vec![0.0f64; self.n];
+        let started = std::time::Instant::now();
+        let rc = unsafe { rc_enrich_download_ptr(ptr, out.as_mut_ptr(), self.n as c_int) };
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        unsafe {
+            rc_enrich_note_projected_download(
+                self.ctx,
+                (self.n as u64) * 8,
+                ms,
+            );
+            rc_enrich_release_output(ptr);
+        }
+        if rc != 0 {
+            return None;
+        }
+        self.stats.add_batch(
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            ms,
+            0.0,
+            ms,
+            0,
+            (self.n as u64) * 8,
+            0,
+            self.n as u64,
+            false,
+        );
+        Some(out)
     }
 
     fn record_creation(&mut self) {
@@ -394,11 +671,47 @@ impl EnrichGpu {
     pub fn stats(&self) -> GpuStats {
         self.stats
     }
+
+    /// Pinned ring bytes held by the projected transport (0 for the
+    /// whole-column path).
+    pub fn ring_bytes(&self) -> u64 {
+        self.ring_bytes
+    }
 }
 
 impl Drop for EnrichGpu {
     fn drop(&mut self) {
+        for (_, p) in std::mem::take(&mut self.precomputed) {
+            unsafe { rc_enrich_release_output(p) };
+        }
         unsafe { rc_enrich_destroy(self.ctx) };
+    }
+}
+
+/// Map a catalogue name to the tiled kernel the transport can run while the
+/// next group copies.
+pub fn tile_feature(name: &str) -> Option<TileFeature> {
+    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
+        return Some(TileFeature::Ret(k));
+    }
+    if let Some(k) = name
+        .strip_prefix("lag_r1_")
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        return Some(TileFeature::Lag(k));
+    }
+    match name {
+        "range1" => Some(TileFeature::Range),
+        "clv1" => Some(TileFeature::Clv),
+        "dow_sin" => Some(TileFeature::Calendar(0)),
+        "dow_cos" => Some(TileFeature::Calendar(1)),
+        "hour_sin" => Some(TileFeature::Calendar(2)),
+        "hour_cos" => Some(TileFeature::Calendar(3)),
+        "month_sin" => Some(TileFeature::Calendar(4)),
+        "month_cos" => Some(TileFeature::Calendar(5)),
+        "dom_sin" => Some(TileFeature::Calendar(6)),
+        "dom_cos" => Some(TileFeature::Calendar(7)),
+        _ => None,
     }
 }
 

@@ -41,6 +41,23 @@ This replaces the old representation, which kept both `Vec<Vec<f64>>`
   [`data-format.md`](data-format.md).
 * **No `f32`.** Storage stays `f64`; results are the numbers the user supplied.
 
+## Projected reads and the upload ring (issue #294)
+
+A projection is an index vector, not a copied table. With 20 variables plus
+time from a 364-column store, the resident storage term falls from about
+`364 · 8 · n` bytes to `21 · 8 · n`; the guard charges the projected columns
+(`storage_bytes`), a projected group buffer instead of the full-header
+`GroupBuf`, and the pinned ring (`ring_bytes`). The device tile is reported as
+`device_tile_bytes` but is not host RSS. `store_memory` in `--json` exposes all
+of these terms.
+
+The GPU transport pins **3 slots × one projected group**, capped at **64 MB**.
+At `group_rows = 65 536` and 21 `f64`/`i64` columns that is 11 MB per slot,
+33 MB for the ring. The pin is constant for the life of the run; groups stream
+through it. A group wider than the cap is a refusal, not a fallback to a full
+table. The reader writes straight into the pinned slot (`pread`), so there is
+no intermediate `Vec<f64>` and no second host copy.
+
 ## Row selectors
 
 A split, fold or evaluation subset is described by a [`RowSelector`]:

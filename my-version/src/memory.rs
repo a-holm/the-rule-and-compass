@@ -44,6 +44,10 @@ pub const SLACK_DEN: u64 = 4;
 pub const SAMPLE_BUDGET_NUM: u64 = 6;
 pub const SAMPLE_BUDGET_DEN: u64 = 10;
 
+/// Projected transport ring (issue #294): three pinned slots, capped at 64 MB.
+pub const RING_SLOTS: usize = 3;
+pub const RING_CAP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Resident cost of one column as the loader actually allocates it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColumnShape {
@@ -110,6 +114,13 @@ impl StoreShape {
             .fold(0u64, |a, c| a.saturating_add(c.per_row()))
     }
 
+    /// Resident bytes per row for a resolved projection (#294).
+    pub fn projected_bytes_per_row(&self, projection: &[usize]) -> u64 {
+        projection.iter().fold(0u64, |a, &c| {
+            a.saturating_add(self.columns.get(c).map(|c| c.per_row()).unwrap_or(0))
+        })
+    }
+
     pub fn any_i64(&self) -> bool {
         self.columns.iter().any(|c| c.int_width > 0)
     }
@@ -128,16 +139,24 @@ impl StoreShape {
         let cols = self.cols();
         let used = opts.resolved_used_cols(cols);
         let scan = opts.scan_cols.min(cols.saturating_sub(used.min(cols)));
+        let projection = opts.resolved_projection(cols);
         let g = self.n_groups() as u128;
         let group_rows = self.group_rows.max(1) as u128;
 
-        // Exact resident table.
+        // Exact resident table. A projection charges only the selected blocks
+        // (issue #294); dictionary/directory metadata is still header-sized.
         let mut storage: u128 = 0;
-        for c in &self.columns {
-            storage = storage.saturating_add(rows.saturating_mul(c.value_width as u128));
-            storage = storage.saturating_add(rows.saturating_mul(c.int_width as u128));
-            storage = storage.saturating_add(rows.saturating_mul(c.code_width as u128));
-            storage = storage.saturating_add(c.dictionary_bytes as u128);
+        let mut projected_per_row: u128 = 0;
+        for &c in &projection {
+            let col = &self.columns[c];
+            storage = storage.saturating_add(rows.saturating_mul(col.value_width as u128));
+            storage = storage.saturating_add(rows.saturating_mul(col.int_width as u128));
+            storage = storage.saturating_add(rows.saturating_mul(col.code_width as u128));
+            storage = storage.saturating_add(col.dictionary_bytes as u128);
+            projected_per_row = projected_per_row
+                .saturating_add(col.value_width as u128)
+                .saturating_add(col.int_width as u128)
+                .saturating_add(col.code_width as u128);
         }
 
         // Row-group directory (`offsets` and `code_offsets`), raw header text
@@ -149,10 +168,15 @@ impl StoreShape {
             .saturating_add((cols as u128).saturating_mul(64))
             .saturating_add(256);
 
-        // One `GroupBuf` (one f64 slice per column) plus decode scratch.
+        // One `GroupBuf` (one f64 slice per column) plus decode scratch. A
+        // projected read never allocates the unprojected group buffer.
+        let buffer_cols = if opts.projection.is_some() {
+            projected_per_row
+        } else {
+            (cols as u128).saturating_mul(8)
+        };
         let mut group_buffer = group_rows
-            .saturating_mul(cols as u128)
-            .saturating_mul(8)
+            .saturating_mul(buffer_cols)
             .saturating_add(group_rows.saturating_mul(8));
         if self.any_i64() {
             group_buffer = group_buffer.saturating_add(group_rows.saturating_mul(8));
@@ -199,11 +223,25 @@ impl StoreShape {
             .saturating_mul(used as u128)
             .saturating_mul(GPU_FIT_BYTES_PER_CELL as u128);
 
+        // #294: the projected device transport pins a bounded ring and keeps
+        // one device tile per group. Charge the ring on the host side; the
+        // device tile is reported separately (it is not host RSS).
+        let group_bytes = group_rows.saturating_mul(projected_per_row);
+        let device_tile = if opts.gpu { group_bytes } else { 0 };
+        let ring = if opts.gpu {
+            group_bytes
+                .saturating_mul(RING_SLOTS as u128)
+                .min(RING_CAP_BYTES as u128)
+        } else {
+            0
+        };
+
         let base = storage
             .saturating_add(directory)
             .saturating_add(group_buffer)
             .saturating_add(search)
             .saturating_add(fit_copy)
+            .saturating_add(ring)
             .saturating_add(fixed);
         let total = base
             .saturating_mul(SLACK_NUM as u128)
@@ -220,6 +258,10 @@ impl StoreShape {
         saturated |= s;
         let (fit_u, s) = clamp(fit_copy);
         saturated |= s;
+        let (ring_u, s) = clamp(ring);
+        saturated |= s;
+        let (tile_u, s) = clamp(device_tile);
+        saturated |= s;
         let (base_u, s) = clamp(base);
         saturated |= s;
         let (total_u, s) = clamp(total);
@@ -232,11 +274,14 @@ impl StoreShape {
             cols,
             used_cols: used,
             scan_cols: scan,
+            projected_cols: projection.len(),
             storage_bytes: storage_u,
             directory_bytes: directory_u,
             group_buffer_bytes: group_buffer_u,
             search_bytes: search_u,
             fit_copy_bytes: fit_u,
+            ring_bytes: ring_u,
+            device_tile_bytes: tile_u,
             fixed_bytes: clamp(fixed).0,
             slack_bytes: slack_u,
             total_bytes: total_u,
@@ -265,7 +310,7 @@ impl StoreShape {
         let search_per_row = (used as u64)
             .saturating_mul(stride)
             .saturating_add(FIXED_BYTES_PER_ROW);
-        let table_per_row = self.table_bytes_per_row();
+        let table_per_row = self.projected_bytes_per_row(&opts.resolved_projection(cols));
         let fit_per_row = if opts.gpu_fit {
             (used as u64).saturating_mul(6)
         } else {
@@ -284,7 +329,7 @@ impl StoreShape {
 }
 
 /// Options that turn a [`StoreShape`] into an estimate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EstimateOptions {
     /// Columns copied into the search sample: variables, targets and weight.
     /// `0` means the whole header (the projection is not known yet).
@@ -292,6 +337,10 @@ pub struct EstimateOptions {
     /// Time/group columns read during preparation but not copied into the
     /// search sample.
     pub scan_cols: usize,
+    /// Resolved read projection (header indices). `None` means the whole
+    /// header. This is what the resident table and the ring actually touch,
+    /// so storage is charged over these columns only (issue #294).
+    pub projection: Option<Vec<usize>>,
     pub gpu: bool,
     /// The GPU arm also materialises an exact `f64` fit image.
     pub gpu_fit: bool,
@@ -304,6 +353,7 @@ impl Default for EstimateOptions {
         EstimateOptions {
             used_cols: 0,
             scan_cols: 0,
+            projection: None,
             gpu: false,
             gpu_fit: false,
             mutable_prep: false,
@@ -320,6 +370,23 @@ impl EstimateOptions {
             self.used_cols.min(cols)
         }
     }
+
+    /// The resolved projection as header indices, in bounds and deduplicated.
+    pub fn resolved_projection(&self, cols: usize) -> Vec<usize> {
+        match &self.projection {
+            None => (0..cols).collect(),
+            Some(v) => {
+                let mut out: Vec<usize> = v.iter().copied().filter(|&c| c < cols).collect();
+                out.sort_unstable();
+                out.dedup();
+                if out.is_empty() {
+                    (0..cols).collect()
+                } else {
+                    out
+                }
+            }
+        }
+    }
 }
 
 /// One estimate and every term, so text/JSON can report the basis.
@@ -329,11 +396,17 @@ pub struct MemoryEstimate {
     pub cols: usize,
     pub used_cols: usize,
     pub scan_cols: usize,
+    /// Header columns actually read by the projected path.
+    pub projected_cols: usize,
     pub storage_bytes: u64,
     pub directory_bytes: u64,
     pub group_buffer_bytes: u64,
     pub search_bytes: u64,
     pub fit_copy_bytes: u64,
+    /// Pinned host ring bytes (#294).
+    pub ring_bytes: u64,
+    /// One device tile per group (#294), not part of host RSS.
+    pub device_tile_bytes: u64,
     pub fixed_bytes: u64,
     pub base_bytes: u64,
     pub slack_bytes: u64,
@@ -344,7 +417,7 @@ pub struct MemoryEstimate {
 
 impl MemoryEstimate {
     pub fn projection_cols(&self) -> usize {
-        self.used_cols.saturating_add(self.scan_cols).min(self.cols)
+        self.projected_cols
     }
 
     /// The estimate with an explicit sampled table footprint (used by the
@@ -363,8 +436,9 @@ impl MemoryEstimate {
         if opts.mutable_prep {
             stride = stride.saturating_add(MUTABLE_PREP_BYTES_PER_CELL);
         }
+        let projection = opts.resolved_projection(self.cols);
         let table = (rows as u128)
-            .saturating_mul(shape.table_bytes_per_row() as u128);
+            .saturating_mul(shape.projected_bytes_per_row(&projection) as u128);
         let fixed = (rows as u128).saturating_mul(FIXED_BYTES_PER_ROW as u128);
         let search = (rows as u128)
             .saturating_mul(used as u128)
@@ -379,9 +453,11 @@ impl MemoryEstimate {
         };
         let directory = self.directory_bytes as u128;
         let buffer = self.group_buffer_bytes as u128;
+        let ring = self.ring_bytes as u128;
         let base = table
             .saturating_add(directory)
             .saturating_add(buffer)
+            .saturating_add(ring)
             .saturating_add(search)
             .saturating_add(fit)
             .saturating_add(fixed);
@@ -508,13 +584,17 @@ mod tests {
     }
 
     #[test]
-    fn projection_changes_only_the_search_terms() {
+    fn projection_changes_storage_and_search_terms() {
         let s = shape(1_000, 7);
         let mut opts = EstimateOptions::default();
         let full = s.estimate(&opts);
         opts.used_cols = 1;
+        opts.projection = Some(vec![0]);
+        opts.gpu = true;
         let projected = s.estimate(&opts);
-        assert_eq!(full.storage_bytes, projected.storage_bytes);
+        assert!(projected.storage_bytes < full.storage_bytes);
+        assert_eq!(projected.projected_cols, 1);
+        assert!(projected.ring_bytes > 0 && projected.ring_bytes <= RING_CAP_BYTES);
         assert!(projected.search_bytes < full.search_bytes);
     }
 }
