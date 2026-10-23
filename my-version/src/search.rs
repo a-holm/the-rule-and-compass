@@ -630,6 +630,12 @@ struct GpuSearch {
     /// fit-only arm. `score_pool`/`score_population` use this, never the fit
     /// objective, so a `correlation` run cannot be ranked by SSE.
     score: Option<crate::metrics::ScoreObjective>,
+    /// #290: true once at least one batch actually ran on the device. The
+    /// route planner can keep a tiny batch on the CPU even in a GPU run, so the
+    /// backend claim must come from what ran, not from the capability flag.
+    device_eval_used: bool,
+    /// #290: true once at least one fit batch actually ran on the device.
+    device_fit_used: bool,
 }
 
 #[cfg(feature = "cuda")]
@@ -715,6 +721,8 @@ impl GpuSearch {
                     ledger: crate::gpu_stats::RunLedger::new(),
                     native_metric,
                     score,
+                    device_eval_used: false,
+                    device_fit_used: false,
                 })
             }
             None => Err(format!(
@@ -751,8 +759,10 @@ impl GpuSearch {
         train: &Sample,
         cfg: &Config,
         generation: usize,
+        dispatcher: &mut crate::dispatch::Dispatcher,
     ) {
         let mut jobs: Vec<(usize, usize, crate::fit::GpuFitPlan)> = Vec::new();
+        let mut job_decisions: Vec<crate::dispatch::Decision> = Vec::new();
         let mut fallbacks: Vec<(usize, usize, FitFallbackCause)> = Vec::new();
         // #229: the objective the batched kernel minimises. #230: the rank
         // family has no LM loss but has its own exact device polish, so it is
@@ -789,8 +799,38 @@ impl GpuSearch {
                 {
                     fallbacks.push((i, j, FitFallbackCause::MetricNotNative))
                 }
-                Ok(plan) if train.len() >= 32 * plan.nconst => jobs.push((i, j, plan)),
-                Ok(_) => fallbacks.push((i, j, FitFallbackCause::TooFewRows)),
+                Ok(plan) => {
+                    // #290: the per-stage cost model owns the row floor and the
+                    // crossover. Structural plan errors still carry their own
+                    // cause; only a valid plan reaches this timing comparison.
+                    let workload = crate::dispatch::Workload::fit(
+                        1,
+                        train.len(),
+                        plan.nconst,
+                        cfg.fit_iters,
+                    )
+                    .with_min_rows(32 * plan.nconst);
+                    let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
+                    if decision.route == crate::dispatch::Route::Device {
+                        jobs.push((i, j, plan));
+                        job_decisions.push(decision);
+                    } else {
+                        // A cost-model refusal is a policy route, not an
+                        // arithmetic fallback: label it `dispatch_cost`.
+                        let cause = match decision.reason {
+                            crate::dispatch::Reason::TooFewRows => FitFallbackCause::TooFewRows,
+                            crate::dispatch::Reason::TooManyConstants => {
+                                FitFallbackCause::TooManyConstants
+                            }
+                            crate::dispatch::Reason::UnsupportedPlan => {
+                                FitFallbackCause::UnsupportedPlan
+                            }
+                            _ => FitFallbackCause::DispatchCost,
+                        };
+                        fallbacks.push((i, j, cause));
+                        dispatcher.record(decision, 0.0, 1, workload.bytes);
+                    }
+                }
                 Err(reason) => fallbacks.push((i, j, plan_fallback_cause(reason))),
             }
         }
@@ -842,6 +882,8 @@ impl GpuSearch {
                     .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0);
             }
             if out.len() == jobs.len() {
+                // #290: a successful batch is what makes this run device-used.
+                self.device_fit_used = true;
                 // #234: the log-loss arm judges the proposal by the configured
                 // objective in exact f64, against the exact value at the
                 // starting constants. The kernel's acceptance is therefore a
@@ -912,6 +954,18 @@ impl GpuSearch {
                     self.note_fit_fallback(generation, FitFallbackCause::Launch);
                     crate::fit::note_gpu_fit(false);
                 }
+            }
+            // #290: attribute the measured batch time to the planned device
+            // decisions. The actual is split evenly across the candidates: the
+            // kernel is one batch, so a per-candidate stopwatch would be noise.
+            let per = (ms.max(0.0) as f64 / 1000.0) / jobs.len() as f64;
+            for (decision, (_, _, plan)) in job_decisions.iter().zip(jobs.iter()) {
+                dispatcher.record(
+                    *decision,
+                    per,
+                    1,
+                    crate::dispatch::estimate_fit_bytes(1, plan.nconst),
+                );
             }
         }
 
@@ -988,6 +1042,7 @@ impl GpuSearch {
         train: &Sample,
         cfg: &Config,
         generation: usize,
+        dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
         let pending: Vec<(usize, usize)> = islands
             .iter()
@@ -1011,17 +1066,17 @@ impl GpuSearch {
             // second time after the fit.
             self.fit_screened += pending.len();
             self.stats.entry(generation).or_default().fit_screened += pending.len();
-            self.evaluate_pending(islands, &pending, train, cfg, generation)?;
+            self.evaluate_pending(islands, &pending, train, cfg, generation, dispatcher)?;
             let admitted = select_promoted(islands, &pending, train.len());
             let fit_start = std::time::Instant::now();
-            self.fit_pending(islands, &admitted, train, cfg, generation);
+            self.fit_pending(islands, &admitted, train, cfg, generation, dispatcher);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
             // Re-score the survivors so selection sees their fitted constants.
-            self.evaluate_pending(islands, &admitted, train, cfg, generation)?;
+            self.evaluate_pending(islands, &admitted, train, cfg, generation, dispatcher)?;
             return Ok(());
         }
 
-        self.evaluate_pending(islands, &pending, train, cfg, generation)
+        self.evaluate_pending(islands, &pending, train, cfg, generation, dispatcher)
     }
 
     /// #169: compile and score one explicit set of pending candidates in a
@@ -1039,7 +1094,26 @@ impl GpuSearch {
         train: &Sample,
         cfg: &Config,
         generation: usize,
+        dispatcher: &mut crate::dispatch::Dispatcher,
     ) -> Result<(), String> {
+        let stage_start = std::time::Instant::now();
+        let nodes = pending
+            .iter()
+            .map(|&(i, j)| islands[i][j].complexity.max(1.0))
+            .fold(1.0f64, f64::max) as usize;
+        let eval_workload = crate::dispatch::Workload::eval(pending.len(), train.len(), nodes);
+        // #290: a fit-only device run has no native scorer, so the evaluator is
+        // CPU by contract and the plan says so. A native run lets the model
+        // choose; a small batch keeps the CPU when launch dominates.
+        let eval_decision = if self.native_metric {
+            dispatcher.plan(crate::dispatch::Stage::Eval, &eval_workload)
+        } else {
+            dispatcher.plan(
+                crate::dispatch::Stage::Eval,
+                &eval_workload.with_refusal(crate::dispatch::FallbackCause::MetricNotNative),
+            )
+        };
+        let force_cpu = eval_decision.route == crate::dispatch::Route::Cpu;
         let mut slots: Vec<(usize, usize)> = Vec::with_capacity(pending.len());
         let mut on_cpu: Vec<(usize, usize)> = Vec::new();
         let mut lowered = 0usize;
@@ -1071,7 +1145,7 @@ impl GpuSearch {
             };
             // #230: the rank family is fitted on the device but scored on the
             // CPU, so its fitness never comes from the squared-error kernel.
-            let compiled = if self.native_metric {
+            let compiled = if self.native_metric && !force_cpu {
                 crate::gpu::compile_program(&islands[i][j].tree).ok()
             } else {
                 None
@@ -1153,6 +1227,8 @@ impl GpuSearch {
                 // the readable front, and the next generation writes into the
                 // other one.
                 pool.commit();
+                // #290: only a batch that actually ran on the device sets this.
+                self.device_eval_used = true;
             }
         }
         if let Some(ticket) = ticket {
@@ -1178,8 +1254,22 @@ impl GpuSearch {
                 .record_eval_fallback(on_cpu.len() as u64, seconds);
         }
         if let Some(e) = gpu_error {
+            // Record the failed call before returning: a failed launch is still
+            // a measured stage with a route and an actual, not a silent gap.
+            dispatcher.record(
+                eval_decision,
+                stage_start.elapsed().as_secs_f64(),
+                pending.len(),
+                eval_workload.bytes,
+            );
             return Err(e);
         }
+        dispatcher.record(
+            eval_decision,
+            stage_start.elapsed().as_secs_f64(),
+            pending.len(),
+            eval_workload.bytes,
+        );
         Ok(())
     }
 
@@ -1596,16 +1686,19 @@ fn score_generation(
     cfg: &Config,
     backend_reason: &mut Option<String>,
     generation: usize,
+    dispatcher: &mut crate::dispatch::Dispatcher,
 ) -> bool {
     let Some(g) = gpu.as_mut() else {
         return false;
     };
-    match g.score(islands, train, cfg, generation) {
+    match g.score(islands, train, cfg, generation, dispatcher) {
         Ok(()) => {
             // #230: a fit-only evaluator scores on the CPU, so it must not make
             // the run claim `backend = gpu`. The device use is reported through
-            // `fit_only_device` and the `gpu.fit` counters instead.
-            *used = g.native_metric;
+            // `fit_only_device` and the `gpu.fit` counters instead. #290: a
+            // native run claims the GPU only when a batch actually ran there;
+            // the cost model may have kept every small batch on the CPU.
+            *used = g.native_metric && (g.device_eval_used || g.device_fit_used);
             true
         }
         Err(e) => {
@@ -2542,11 +2635,16 @@ pub enum FitFallbackCause {
     /// #227: the device maximum-error stage declined (allocation, launch or an
     /// inconsistent scan) and the exact CPU maximum arm took over.
     MaximumDeclined,
+    /// #290: the measured dispatch model predicted the CPU as cheaper for this
+    /// candidate's fit shape. This is a policy route, not an arithmetic
+    /// failure, and it carries its own label so it is never confused with
+    /// `ill_conditioned` or `non_finite`.
+    DispatchCost,
 }
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 13] = [
+    pub const ALL: [FitFallbackCause; 14] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -2560,6 +2658,7 @@ impl FitFallbackCause {
         FitFallbackCause::SingleClass,
         FitFallbackCause::LogLossWorse,
         FitFallbackCause::MaximumDeclined,
+        FitFallbackCause::DispatchCost,
     ];
 
     /// Stable JSON label.
@@ -2578,6 +2677,7 @@ impl FitFallbackCause {
             FitFallbackCause::SingleClass => "single_class",
             FitFallbackCause::LogLossWorse => "log_loss_worse",
             FitFallbackCause::MaximumDeclined => "maximum_declined",
+            FitFallbackCause::DispatchCost => "dispatch_cost",
         }
     }
 }
@@ -3435,6 +3535,8 @@ pub struct Outcome {
     /// #131: which native opcodes and how many CPU fallbacks each GPU batch
     /// used. `None` when the run did not use the GPU.
     pub gpu: Option<GpuRunStats>,
+    /// #290: calibrated per-stage cost model and the route ledger for this run.
+    pub dispatch: crate::dispatch::DispatchReport,
     /// #120: quality-diversity coverage report, or `None` when the layer is off.
     pub qd: Option<QdReport>,
     /// #211: why the generation loop stopped: `solved` (an error at or below
@@ -4006,6 +4108,7 @@ fn run_postfix_search(
     mut on_checkpoint: Option<CheckpointFn<'_>>,
     backend_reason: Option<String>,
     device: Option<String>,
+    dispatcher: &mut crate::dispatch::Dispatcher,
 ) -> Result<Outcome, String> {
     let pop = cfg.pop;
     let n_islands = cfg.islands.max(1);
@@ -4431,6 +4534,7 @@ fn run_postfix_search(
         backend_reason,
         device,
         gpu: Some(stats),
+        dispatch: dispatcher.snapshot(),
         qd: None,
         stop_reason,
     })
@@ -4464,6 +4568,25 @@ fn run_search(
     // every island thread (and the initial population below) sees the same
     // definitions; the list is empty unless --function was supplied.
     let blocks = expr::current_blocks();
+
+    // #290: one calibration and one route ledger per run. The probe is the
+    // startup cost model; contract stages (variation, selection, archive, I/O,
+    // features, P&L and exact refit) are planned once and recorded so the
+    // ledger answers for every stage, not only the two that can move.
+    let mut dispatcher =
+        crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::probe());
+    for stage in [
+        crate::dispatch::Stage::Vary,
+        crate::dispatch::Stage::Select,
+        crate::dispatch::Stage::Archive,
+        crate::dispatch::Stage::Features,
+        crate::dispatch::Stage::Pnl,
+        crate::dispatch::Stage::Io,
+        crate::dispatch::Stage::Refit,
+    ] {
+        let decision = dispatcher.plan(stage, &crate::dispatch::Workload::contract());
+        dispatcher.record_plan(decision, 1, 0);
+    }
 
     // #26/#141: one resident evaluator for the full training sample, used for
     // whole generations. With the default `exact` arm constants are fitted on
@@ -4721,6 +4844,31 @@ fn run_search(
         }
     }
     #[cfg(feature = "cuda")]
+    let gpu_available = gpu.is_some();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_available = false;
+    if !gpu_available {
+        // No device: the two movable stages still answer for themselves with
+        // the named cause, instead of looking like CPU-contract stages.
+        let eval = crate::dispatch::Workload::eval(
+            cfg.pop.saturating_mul(cfg.islands.max(1)),
+            train.len(),
+            cfg.max_complexity.max(1),
+        )
+        .with_refusal(crate::dispatch::FallbackCause::NoDevice);
+        let decision = dispatcher.plan(crate::dispatch::Stage::Eval, &eval);
+        dispatcher.record_plan(decision, eval.candidates, eval.bytes);
+        let fit = crate::dispatch::Workload::fit(
+            cfg.pop.saturating_mul(cfg.islands.max(1)),
+            train.len(),
+            4,
+            cfg.fit_iters.max(1),
+        )
+        .with_refusal(crate::dispatch::FallbackCause::NoDevice);
+        let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &fit);
+        dispatcher.record_plan(decision, fit.candidates, fit.bytes);
+    }
+    #[cfg(feature = "cuda")]
     let mut defer_gpu = gpu.is_some();
     #[cfg(not(feature = "cuda"))]
     let defer_gpu = false;
@@ -4945,7 +5093,7 @@ fn run_search(
     // before the first selection step reads an error.
     #[cfg(feature = "cuda")]
     {
-        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done);
+        defer_gpu = score_generation(&mut gpu, &mut gpu_used, &mut islands, train, cfg, &mut backend_reason, gens_done, &mut dispatcher);
     }
 
     // #122: the flat postfix generation loop. It is selected before the first
@@ -4976,6 +5124,7 @@ fn run_search(
                         on_checkpoint,
                         backend_reason,
                         backend_device.clone(),
+                        &mut dispatcher,
                     );
                 }
                 Ok(_) => {
@@ -5291,7 +5440,7 @@ fn run_search(
                         // Score anything the kernel could not compile (left
                         // pending) through the normal CPU fallback.
                         defer_gpu =
-                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
+                            score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
                     } else {
                         // Stop the GPU and re-score every still-pending
                         // candidate in f64 on the CPU; a failed batch must
@@ -5318,7 +5467,7 @@ fn run_search(
                     // #26: one batched call covers every candidate of the
                     // generation (the pre-#119 synchronous path).
                     defer_gpu =
-                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
+                        score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
                 }
             }
             let dev_eval = dev_lap(&mut dev_mark); // #211: evaluator batch
@@ -5665,7 +5814,7 @@ fn run_search(
             #[cfg(feature = "cuda")]
             {
                 defer_gpu =
-                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen);
+                    score_generation(&mut gpu, &mut gpu_used, &mut islands, gen_train, cfg, &mut backend_reason, gen, &mut dispatcher);
             }
 
             // #120: record this generation's evaluated behaviours. The order
@@ -5920,6 +6069,8 @@ fn run_search(
             None
         },
         gpu: gpu_stats,
+        // #290: calibrated model plus the per-stage route ledger.
+        dispatch: dispatcher.snapshot(),
         // #120: coverage of the descriptor grid for this run.
         qd: qd_archive.as_ref().map(|q| q.report()),
         stop_reason, // #211
@@ -6124,6 +6275,7 @@ mod tests {
                 "single_class",
                 "log_loss_worse",
                 "maximum_declined",
+                "dispatch_cost",
             ]
         );
         assert_eq!(

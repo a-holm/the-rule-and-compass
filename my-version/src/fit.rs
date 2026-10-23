@@ -410,6 +410,32 @@ pub fn order_stat_fit_only(metric: Metric) -> bool {
     median_fit_only(metric) || interquartile_fit_only(metric)
 }
 
+/// #290: route an arm-specific measured cost pair through the common dispatch
+/// model. The old helpers answered `n >= floor && gpu_s < cpu_s`; that boolean
+/// is now a zero-hysteresis [`crate::dispatch::Dispatcher`] decision, so the
+/// arm gates and the generic model cannot drift apart. Zero launch and zero
+/// transfer preserve the arm model exactly; the floor is expressed as a named
+/// `too_few_rows` refusal instead of a bare comparison.
+fn modelled_gpu_worthwhile(
+    n: usize,
+    p: usize,
+    sweeps: usize,
+    cpu_s: f64,
+    gpu_s: f64,
+    min_rows: usize,
+) -> bool {
+    let mut calibration = crate::dispatch::Calibration::default();
+    calibration.hysteresis = 0.0;
+    calibration.launch_s = 0.0;
+    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
+    let workload = crate::dispatch::Workload::fit(1, n, p, sweeps)
+        .with_costs(cpu_s, gpu_s)
+        .with_min_rows(min_rows)
+        .with_bytes(0);
+    dispatcher.plan(crate::dispatch::Stage::Fit, &workload).route
+        == crate::dispatch::Route::Device
+}
+
 /// #226: rows below which the device median polish is not worth its per-call
 /// latency and the CPU arm stays.
 ///
@@ -489,7 +515,8 @@ pub fn median_fit_cost(n: usize, p: usize, sweeps: usize) -> MedianFitCost {
 /// #226: whether the device median polish is predicted to be faster than the
 /// CPU polish for a sample of `n` rows and `p` constants.
 pub fn median_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= MEDIAN_GPU_MIN_ROWS && median_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = median_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(n, p, sweeps, cost.cpu_s, cost.gpu_s, MEDIAN_GPU_MIN_ROWS)
 }
 
 // --- #232: interquartile arm -------------------------------------------------
@@ -575,7 +602,15 @@ pub fn interquartile_fit_cost(n: usize, p: usize, sweeps: usize) -> Interquartil
 /// #232: whether the device interquartile polish is predicted to be faster
 /// than the exact CPU arm for a sample of `n` rows and `p` constants.
 pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= INTERQUARTILE_GPU_MIN_ROWS && interquartile_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = interquartile_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(
+        n,
+        p,
+        sweeps,
+        cost.cpu_s,
+        cost.gpu_s,
+        INTERQUARTILE_GPU_MIN_ROWS,
+    )
 }
 
 /// #227: `true` when `--fit-strategy gpu` can fit `maximum` on the device
@@ -687,7 +722,8 @@ pub fn maximum_fit_cost(n: usize, p: usize, sweeps: usize) -> MaximumFitCost {
 /// #227: whether the device maximum-error polish is predicted to be faster
 /// than the CPU polish for a sample of `n` rows and `p` constants.
 pub fn maximum_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= MAXIMUM_GPU_MIN_ROWS && maximum_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = maximum_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(n, p, sweeps, cost.cpu_s, cost.gpu_s, MAXIMUM_GPU_MIN_ROWS)
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will

@@ -10,6 +10,7 @@ pub mod column;
 pub mod complexity;
 pub mod data;
 pub mod diagnostics;
+pub mod dispatch; // #290: per-stage CPU/GPU cost model and route ledger
 pub mod enrich; // #200: append-only OHLCV feature enrichment
 #[cfg(feature = "cuda")]
 mod enrich_gpu; // #200: resident CUDA enrichment kernels

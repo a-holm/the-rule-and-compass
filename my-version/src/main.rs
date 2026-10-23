@@ -585,6 +585,17 @@ RUN INTEGRITY (#140):
   [--data <file>]            commit, data file and canonical config; exit 1 on
                              any mismatch (exit 0 when everything matches)
 
+DISPATCH (#290):
+  Dispatch is planned per stage, not per run. A ~100 ms startup probe
+  calibrates the host and anchors the device rates; every run records the
+  values and a route ledger in --json (dispatch.calibration and
+  dispatch.route_ledger) and in --run-manifest. The route is device, cpu or
+  split with a machine reason; hysteresis (h=0.3) prevents oscillation at the
+  crossover. A structural/arithmetic refusal (launch, unsupported_plan,
+  too_few_rows, too_many_constants, ill_conditioned, non_finite,
+  metric_not_native, exactness) is never chosen by a timing test. Reported
+  numbers and finalists are still the exact CPU f64 rebuild.
+
 DEVELOPMENT LOG (#211) — on by default:
   The engine writes rcsr.dev.ndjson next to --json-out (or --save), else in
   the working directory. It is the in-engine replacement for the old external
@@ -4246,6 +4257,9 @@ fn main() {
             let (gpu, fallback, refits) = fit::gpu_fit_counts();
             m.fit = Some((gpu, fallback, refits));
         }
+        // #290: the calibrated model and the route ledger are provenance, not
+        // a result: record them whenever a run manifest was requested.
+        m.dispatch = Some(outcome.dispatch.clone());
         let total_secs = run_start.elapsed().as_secs_f64();
         let phases = [
             ("data_prepare", data_prepare_secs),
@@ -5490,7 +5504,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -5521,6 +5535,7 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                 ),
+                outcome.dispatch.json(),
                 checkpoint_json,
                 null_json,
                 baselines_json,
@@ -5738,7 +5753,7 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
                 // #18: the final reading also closes the NDJSON stream.
@@ -5752,6 +5767,7 @@ fn main() {
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
                 ),
+                outcome.dispatch.json(),
                 outcome.archive.items.len(),
                 search_meta_ndjson
             );

@@ -2432,3 +2432,34 @@ maximum, the backend stays `cpu`, and the device use is recorded in `gpu.fit`
 (with `maximum_declined` among the labelled causes). Lawson IRLS on the weighted
 assembly (`minimax-bias.md` §2.3) and native maximum scoring remain open; the
 bisection is the research note's `R1`, which the note recommends first.
+
+## Per-stage dispatch and the route ledger (#290)
+
+Dispatch is planned per stage in `src/dispatch.rs`: `plan(stage, workload)`
+returns `device`, `cpu` or `split` with a machine reason. The model uses
+`R = W·N·m`, `T_dev = R/r_eval`, `T_fit = W/r_fit(N,p,sweeps)`,
+`T_xfer = bytes/BW`, a measured launch term and `T_cpu` from telemetry, with a
+hysteresis band `h = 0.3` so a stage does not oscillate at the crossover.
+`vary` stays CPU until #291; `select`, `archive`, `features`, `pnl`, `io` and
+the exact `refit` are CPU by contract.
+
+A ~100 ms startup probe measures the host rate and anchors the device rates;
+the values, source, sample count and reproducibility band are written to
+`--json` under `dispatch.calibration` (the probe wall time is provenance and
+appears only in the manifest, so the result JSON stays byte-stable) and to
+`--run-manifest` under `dispatch`.
+The per-stage `dispatch.route_ledger` carries `route`, `reason`, `calls`,
+`candidates`, `predicted_s`, `actual_s`, `actual_over_predicted`, `bytes` and
+`switches`.
+
+Structural and arithmetic refusals (`launch`, `unsupported_plan`,
+`too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`,
+`metric_not_native`, `no_device`, `exactness`) are checked before any timing
+comparison. A fast device can never turn an arithmetic failure into a CPU
+route. The fit arm adds `dispatch_cost` for a valid plan the model routes to
+the CPU, so a tuning decision is never reported as an arithmetic fallback.
+The existing median / interquartile / maximum row floors are expressed through
+the same planner with a zero-hysteresis compatibility calibration, preserving
+their measured crossovers.
+
+See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.

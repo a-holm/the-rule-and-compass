@@ -55,6 +55,11 @@ objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
 `--metric log_loss`, a rank metric, `--metric median`, `--metric
 interquartile`, `--metric maximum` or a CPU strategy.
+Dispatch is planned per stage, not per run: a calibrated cost model returns
+`device`, `cpu` or `split` plus a machine reason, with hysteresis at the
+crossover and a route ledger in `--json`/`--run-manifest`. Structural and
+arithmetic refusals are a cause set, never a timing test. See
+[`docs/dispatch.md`](docs/dispatch.md).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
