@@ -586,7 +586,7 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
 
 /* #287: native score-objective codes (`ScoreObjective::code` in metrics.rs).
    These are deliberately separate from the fit `RC_LOSS_*` codes: fitting and
-   scoring are different decisions, and `log_loss` remains fit-only. */
+   scoring are different decisions. */
 #define RC_SCORE_SQUARED 0
 #define RC_SCORE_ABSOLUTE 1
 #define RC_SCORE_LOG_SQUASHED 2
@@ -598,6 +598,27 @@ __device__ __forceinline__ float rc_exec_row(const unsigned int *__restrict__ co
 #define RC_SCORE_AICC 8
 #define RC_SCORE_BIC 9
 #define RC_SCORE_NONFINITE 2
+
+/* --- #289: native classification *scoring* codes --------------------------
+ *
+ * Label-aware row losses with `t = 2l - 1` and `p` the model output read as a
+ * logit. They are disjoint from the regression score codes (0–9) and from the
+ * fit `RC_LOSS_*` codes (0–5), so a fit launch and a score launch cannot be
+ * confused. The kernel accumulates `Σ wᵢ·lossᵢ` in f64, in fixed row order,
+ * with no atomics; it divides by `Σw` (or the row count) in the same kernel,
+ * exactly like `metrics::score_native_weighted`.
+ *
+ * Per-row arithmetic is f32 (the contract of this evaluator: f32 rows, f64
+ * accumulators), using the stable branch forms so no finite logit can overflow
+ * or cancel. `auc` is deliberately absent: it is a rank statistic, not a
+ * per-row loss.
+ */
+#define RC_SCORE_LOG_LOSS 10
+#define RC_SCORE_BRIER 11
+#define RC_SCORE_HINGE_SIGMOID 12
+#define RC_SCORE_HINGE_ORDINARY 13
+#define RC_SCORE_HINGE_SQUARED 14
+#define RC_SCORE_ALL_ZERO_WEIGHT 4
 
 /* #222: the L1 majoriser floor, the same `1e-6` the CPU `irls_fit` uses. It is
    deliberately not smaller: at |r| = 0 the exact weight is infinite, and a
@@ -660,6 +681,56 @@ __device__ __forceinline__ double rc_softplus_neg(double u)
 {
     const double a = fabs(u);
     return (u < 0.0 ? -u : 0.0) + log1p(exp(-a));
+}
+
+/* #289: the stable logistic in f32, the same branch form as the CPU
+   `metrics::sigmoid`. The naive `1/(1+exp(-x))` overflows for x < -88. */
+__device__ __forceinline__ float rc_sigmoid_f(float x)
+{
+    if (x >= 0.0f) return 1.0f / (1.0f + expf(-x));
+    const float e = expf(x);
+    return e / (1.0f + e);
+}
+
+/* #289: one labelled row loss. `tsign` is `t = 2l - 1` and `p` is the logit.
+   The definitions are exactly `metrics::classification_row_loss`:
+
+     log_loss       max(-u,0) + log1p(exp(-|u|))
+     brier          (sigmoid(p) - l)^2
+     hinge          the historical bounded surrogate 1 - t*(2*sigmoid(p)-1)
+     hinge_ordinary max(0, 1-u)
+     hinge_squared  max(0, 1-u)^2
+
+   The surrogate keeps the historical expression rather than `2*sigmoid(-u)`
+   so the pre-#289 `hinge` value does not move by a rounding step. */
+__device__ __forceinline__ float rc_class_row_loss(float p, float tsign, int loss)
+{
+    const float u = tsign * p;
+    if (loss == RC_SCORE_LOG_LOSS) {
+        const float a = fabsf(u);
+        return ((u < 0.0f) ? -u : 0.0f) + log1pf(expf(-a));
+    }
+    if (loss == RC_SCORE_BRIER) {
+        const float l = 0.5f * (tsign + 1.0f);
+        const float d = rc_sigmoid_f(p) - l;
+        return d * d;
+    }
+    if (loss == RC_SCORE_HINGE_ORDINARY) {
+        const float h = 1.0f - u;
+        return h > 0.0f ? h : 0.0f;
+    }
+    if (loss == RC_SCORE_HINGE_SQUARED) {
+        const float h = 1.0f - u;
+        return h > 0.0f ? h * h : 0.0f;
+    }
+    if (loss == RC_SCORE_HINGE_SIGMOID) {
+        const float s = 2.0f * rc_sigmoid_f(p) - 1.0f;
+        const float h = 1.0f - tsign * s;
+        return h > 0.0f ? h : 0.0f;
+    }
+    /* A regression/fit code reaching the class kernel is a launch bug: NaN is
+       visibly wrong instead of a silent substitution (#236). */
+    return CUDART_NAN_F;
 }
 
 /* #131 register contract: 6 blocks of RC_MAX_THREADS per SM. On sm_86 the
@@ -763,6 +834,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
     const unsigned int *__restrict__ off,
     int width,
     int pooled,
+    const float *__restrict__ tsign,
+    const double *__restrict__ w,
     double *__restrict__ out,
     int *__restrict__ status,
     double ybar,
@@ -784,6 +857,61 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
     double b = 0.0;
     unsigned long long best_key = 0;
     int best_row = 0;
+
+    /* #289: the label-aware classification row losses. A zero-weight row is
+       skipped before the program runs; a positive-weight non-finite prediction
+       (or label) is status 2 with `+inf`; all-zero weights is status 4. The
+       weighted mean uses `Σw` as the denominator, matching
+       `metrics::score_native_weighted`. */
+    if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
+        double wn = 0.0;
+        for (int i = tid; i < n; i += blockDim.x) {
+            const double wi = w ? w[i] : 1.0;
+            if (!isfinite(wi) || wi < 0.0) {
+                bad = 1;
+                continue;
+            }
+            if (wi == 0.0) continue;
+            const float t = tsign ? tsign[i] : CUDART_NAN_F;
+            const float pred = rc_exec_row(code, cols, n, i);
+            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
+                bad = 1;
+                continue;
+            }
+            a += wi * (double)rc_class_row_loss(pred, t, MODE);
+            wn += wi;
+        }
+        if (tid == 0) sbad = 0;
+        sh1[tid] = a;
+        sh2[tid] = wn;
+        __syncthreads();
+        if (bad) atomicOr(&sbad, 1);
+        __syncthreads();
+        if (sbad) {
+            if (tid == 0) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_NONFINITE;
+            }
+            return;
+        }
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                sh2[tid] += sh2[tid + st];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            if (!(sh2[0] > 0.0)) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            } else {
+                out[p] = sh1[0] / sh2[0];
+                status[p] = 0;
+            }
+        }
+        return;
+    }
 
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
         /* Pass 1: mean prediction. */
@@ -3327,57 +3455,104 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
 
+    /* #289: a classification launch without the uploaded label sign is refused
+       here, so it can never be scored by another objective. */
+    if (kind >= RC_SCORE_LOG_LOSS && kind <= RC_SCORE_HINGE_SQUARED && !c->has_tsign) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
     t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
     switch (kind) {
         case RC_SCORE_SQUARED:
             score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_ABSOLUTE:
             score_kernel<RC_SCORE_ABSOLUTE><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_LOG_SQUASHED:
             score_kernel<RC_SCORE_LOG_SQUASHED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_SIGNED:
             score_kernel<RC_SCORE_SIGNED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_MAXIMUM:
             score_kernel<RC_SCORE_MAXIMUM><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION:
             score_kernel<RC_SCORE_CORRELATION><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_CORRELATION_SIGNED:
             score_kernel<RC_SCORE_CORRELATION_SIGNED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AIC:
             score_kernel<RC_SCORE_AIC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_AICC:
             score_kernel<RC_SCORE_AICC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         case RC_SCORE_BIC:
             score_kernel<RC_SCORE_BIC><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_LOG_LOSS:
+            score_kernel<RC_SCORE_LOG_LOSS><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_BRIER:
+            score_kernel<RC_SCORE_BRIER><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_HINGE_SIGMOID:
+            score_kernel<RC_SCORE_HINGE_SIGMOID><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_HINGE_ORDINARY:
+            score_kernel<RC_SCORE_HINGE_ORDINARY><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
+                c->d_score_out, c->d_score_status, c->ybar, c->syy);
+            break;
+        case RC_SCORE_HINGE_SQUARED:
+            score_kernel<RC_SCORE_HINGE_SQUARED><<<nprog, threads>>>(
+                c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
+                c->d_tsign, c->d_w64,
                 c->d_score_out, c->d_score_status, c->ybar, c->syy);
             break;
         default:
@@ -3536,6 +3711,36 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
  * by itself. Passing `NULL` clears it, and every log-loss launch is then
  * refused.
  */
+/* #289: the per-row score weight vector, shared with the fit kernel's
+ * `d_w64`. `NULL` clears it (every row weighs 1). A weighted classification
+ * score reads `Σ wᵢ·lossᵢ`; the host divides by `Σw`. Rows with `w = 0` are
+ * skipped before the program runs, so a masked undefined branch contributes
+ * nothing.
+ *
+ * Uploaded once per sample rather than per batch. `rc_set_fit_data` also
+ * allocates this vector (with the same values) when the GPU fit arm runs; the
+ * last upload wins and both uses read the same base weight.
+ */
+int rc_set_score_weights(void *ctx, const double *w)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c) return -1;
+    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    if (!w) return 0;
+    size_t yb = sizeof(double) * (size_t)c->n;
+    if (rc_alloc((void **)&c->d_w64, yb) != 0) {
+        c->d_w64 = 0;
+        return -1;
+    }
+    rc_upload(c->d_w64, w, yb);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(c->d_w64);
+        c->d_w64 = 0;
+        return -1;
+    }
+    return 0;
+}
+
 int rc_set_fit_sign(void *ctx, const double *sign)
 {
     RcCtx *c = (RcCtx *)ctx;

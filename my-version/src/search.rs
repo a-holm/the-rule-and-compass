@@ -25,6 +25,8 @@ use crate::metrics::{score_weighted, Metric};
 use crate::multi;
 use crate::pareto::{Archive, Sol};
 #[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
+#[cfg(feature = "cuda")]
 use crate::postfix::{unique_slots, Arena, FrontParents, Variation};
 // #18: convergence statistics live in their own module; the search only calls
 // `ProgressStats::observe` once per generation.
@@ -573,13 +575,15 @@ impl Ind {
 /// kernel launch. Constants are still fitted on the CPU *before* the batch: the
 /// GPU only supplies the fitness that selection consumes.
 ///
-/// The kernel accumulates one objective in `f32`; [`GpuSearch::score`] divides
-/// by the row count so the search sees its mean. For `--metric squared` that is
-/// the mean squared error and for `--metric log_squashed` the mean
-/// `ln(1 + r²)` (#229), both native on the device; every other metric keeps the
-/// CPU evaluator (#236). Either way the value is only used to guide the search:
-/// the archive and every reported number are rebuilt on the full training
-/// sample with the CPU `f64` evaluator.
+/// The kernel accumulates one objective per row (`f32` per row, `f64`
+/// accumulator) and returns the sum; the search divides it by `Σw` (or the row
+/// count) so it sees the configured metric's mean. Native objectives are
+/// squared, log_squashed (#229), absolute (#222), and the label-aware
+/// classification family log_loss/Brier/hinge/hinge_ordinary/hinge_squared
+/// (#289); every other metric keeps the CPU evaluator with a named reason
+/// (#236). The value is only used to guide the search: the archive and every
+/// reported number are rebuilt on the full training sample with the CPU `f64`
+/// evaluator.
 #[cfg(feature = "cuda")]
 struct GpuSearch {
     ev: crate::gpu::GpuEvaluator,
@@ -646,7 +650,8 @@ impl GpuSearch {
         loss: crate::fit::DeviceLoss,
         native_metric: bool,
         score: Option<crate::metrics::ScoreObjective>,
-        // #234: the device fit needs the label sign for a log-loss run.
+        // #234/#289: the device fit or classification score needs the label
+        // sign for a log-loss run.
         logistic_fit: bool,
         // #284: the run clock every device interval is placed on.
         run_start: std::time::Instant,
@@ -677,10 +682,21 @@ impl GpuSearch {
             Some(mut ev) => {
                 // #284: one clock for evaluator and fit intervals.
                 ev.set_run_start(run_start);
-                // #229: the evaluator must accumulate the objective the run
-                // ranks on. `gpu_blocker` has already refused any metric without
-                // a native kernel loss, so this is the configured objective.
+                // #229: the legacy evaluator accumulates the fit objective the
+                // run ranks on; `gpu_blocker` has already refused any metric
+                // without a native kernel objective.
                 ev.set_loss(loss);
+                // #289: a classification score uploads its label sign once per
+                // sample, whether or not the device also fits constants. The
+                // fit-only log-loss arm needs the same vector for the fit
+                // kernel, so it is uploaded once and shared.
+                if score.is_some() || logistic_fit {
+                    let sign =
+                        crate::fit::classification_signs_weighted(&train.y, &train.w);
+                    if !ev.set_fit_sign(&sign) {
+                        return Err("the device refused the classification label sign".to_string());
+                    }
+                }
                 // #169: the batched fit's final polish runs on the exact f64
                 // rows, so its constants are not limited by the f32 evaluator
                 // copy. Only the GPU-fit arm pays this second resident copy.
@@ -691,14 +707,14 @@ impl GpuSearch {
                             cols64[v * n_rows + r] = x;
                         }
                     }
-                    let _ = ev.set_fit_data(&cols64, &train.y, &train.w);
-                    // #234: the log-loss arm reads the label sign from the
-                    // device. Uploading it here (once per run) keeps the
-                    // midpoint rule over the whole sample in one place; a
-                    // device that refuses the upload turns every log-loss
-                    // candidate into a labelled CPU fallback.
-                    if logistic_fit {
-                        let _ = ev.set_fit_sign(&crate::fit::classification_signs(&train.y));
+                    if !ev.set_fit_data(&cols64, &train.y, &train.w) {
+                        return Err("the device refused the f64 fit rows".to_string());
+                    }
+                } else if !train.w.is_empty() {
+                    // #289: a weighted run whose fit stays on the CPU still
+                    // needs the per-row weights for the native score.
+                    if !ev.set_score_weights(&train.w) {
+                        return Err("the device refused the row weights".to_string());
                     }
                 }
                 Ok(GpuSearch {
@@ -782,10 +798,15 @@ impl GpuSearch {
         // #234: a single-class fit sample has no finite log-loss optimum. The
         // counts come from the same midpoint rule the CPU arm uses, so the
         // device never fits a sign the sample does not support.
-        let single_class = crate::fit::fit_only_loss(cfg.metric).is_some() && {
-            let (pos, neg) = crate::fit::class_counts(&train.y);
-            pos == 0 || neg == 0
-        };
+        // #289: the predicate is the *fit* objective, not the fit-only split:
+        // `log_loss` now has a native scorer, but its device fit still needs
+        // both classes to have a finite optimum.
+        let single_class = crate::fit::fit_loss(cfg.metric)
+            == Some(crate::fit::DeviceLoss::Logistic)
+            && {
+                let (pos, neg) = crate::fit::class_counts_weighted(&train.y, &train.w);
+                pos == 0 || neg == 0
+            };
         for &(i, j) in admitted {
             if single_class {
                 fallbacks.push((i, j, FitFallbackCause::SingleClass));
@@ -1226,9 +1247,10 @@ impl GpuSearch {
                     .iter()
                     .zip(batch.values.iter().zip(batch.status.iter()))
                 {
-                    // #287: a non-finite row is `+inf` with a status; an Ok
-                    // value is already the configured statistic (mean, RSS +
-                    // penalty, max, or 1-rho), never an SSE to divide by n.
+                    // #287/#289: a non-finite row is `+inf` with a status; an
+                    // Ok value is already the configured statistic (mean, RSS +
+                    // penalty, max, 1-rho or a weighted classification mean),
+                    // never an SSE to divide by n.
                     islands[i][j].error = if status.is_ok() {
                         value
                     } else {
@@ -1994,12 +2016,17 @@ fn score_pipeline_batch(
 
 /// #26: whether a run may use the GPU at all.
 ///
-/// Restricted to the single-output, unweighted, full-sample path with a
-/// **native device objective**: multi-output and implicit objectives need more
-/// than one prediction per row, `--predictor-samples` changes the rows every
-/// generation, weighted rows need a per-row weight array the evaluator does not
-/// have, and every metric without a native kernel loss would be ranked by a
+/// Restricted to the single-output, full-sample path with a **native device
+/// objective**: multi-output and implicit objectives need more than one
+/// prediction per row, `--predictor-samples` changes the rows every generation,
+/// and every metric without a native kernel objective would be ranked by a
 /// proxy it is not defined on. Each of those keeps the CPU evaluator.
+///
+/// #289: the classification scorer carries the per-row weights, so `--weight`
+/// is admitted for log_loss/Brier/the hinge forms; the regression kernels still
+/// have no weighted path, so a weighted regression run keeps the CPU. `auc` is
+/// refused by name (a rank statistic, #288), not by a generic
+/// "classification metric".
 ///
 /// #230: the rank family has no native **scoring** objective yet, so this gate
 /// still reports it as CPU. Its **fit** stage is admitted separately by
@@ -2010,8 +2037,15 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
         return Some("multi-output objective");
     }
+    // #289: only the classification scorer has a device weight path. A
+    // weighted regression run keeps the exact CPU evaluator rather than
+    // dropping the weights.
     if !train.w.is_empty() {
-        return Some("weighted rows");
+        let class_native = crate::metrics::native_score_objective(cfg.metric)
+            .map_or(false, |o| o.is_classification());
+        if !class_native {
+            return Some("weighted rows need a native classification scorer");
+        }
     }
     // #236/#287: a metric may use the device only when the score-dispatch
     // table names a native statistic for it; otherwise the *named* refusal is
@@ -4687,14 +4721,11 @@ fn run_search(
                     None
                 }
                 None => {
-                    // #287: the score gate is independent of the fit objective.
-                    // The evaluator gets a `ScoreObjective`; `loss` only seeds
-                    // the legacy fit/eval field and is `Squared` when the metric
-                    // has no device LM loss (correlation, signed, maximum).
-                    // The score gate is independent of the fit objective.
-                    // `loss` only seeds the legacy fit/eval field and is
-                    // `Squared` when the metric has no device LM loss
-                    // (correlation, signed, maximum).
+                    // #287/#289: the score gate is independent of the fit
+                    // objective. The evaluator gets a `ScoreObjective`; `loss`
+                    // only seeds the legacy fit/eval field and is `Squared`
+                    // when the metric has no device LM loss (correlation,
+                    // signed, maximum, Brier, hinge).
                     let _objective = crate::metrics::native_score_objective(cfg.metric)
                         .expect("gpu_blocker admits only native score objectives");
                     let loss = crate::fit::fit_loss(cfg.metric)

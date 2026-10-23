@@ -14,12 +14,12 @@
 //!    LM unless the tree is affine/separable), on the untouched tree;
 //! 4. finalists are always refit exactly with [`refit_finalists_exact`].
 //!
-//! #234: `log_loss` is the first metric whose **fit** is native on the device
-//! and whose **fitness** is not ([`DeviceLoss::for_metric`] deliberately
-//! excludes it: the evaluator has no label semantics). The arm is fit-only —
-//! the search scores every candidate with the exact CPU log-loss and only the
-//! constants come from the kernel — and the exact objective is what decides
-//! whether a proposal replaces its starting constants.
+//! #234: `log_loss` was the first metric whose **fit** is native on the device.
+//! At #234 its **fitness** was not ([`DeviceLoss::for_metric`] excludes it: the
+//! regression row loss has no label semantics); #289 adds a separate
+//! [`crate::metrics::ScoreObjective`] scorer, so the search now ranks it on the
+//! device while this arm still uses the exact objective to decide whether a
+//! proposal replaces its starting constants.
 //!
 //! #229: the gate and the refit are **metric-aware**. A `log_squashed`
 //! proposal that improves `mean ln(1 + r²)` can be worse in SSE; judging it by
@@ -571,11 +571,13 @@ impl BatchedFitter for BatchedGpu<'_> {
             // than fitted against a sign the data does not support; the caller
             // labels it and the exact CPU arm keeps the candidate.
             if loss == DeviceLoss::Logistic {
-                let (pos, neg) = class_counts(y);
+                let (pos, neg) = class_counts_weighted(y, w);
                 if pos == 0 || neg == 0 {
                     return vec![None; trees.len()];
                 }
-                let sign = classification_signs(y);
+                // #289: the weighted midpoint is the one the weighted scorer
+                // uses, so a masked row cannot relabel a row that counts.
+                let sign = classification_signs_weighted(y, w);
                 if !self.ev.borrow_mut().set_fit_sign(&sign) {
                     return vec![None; trees.len()];
                 }

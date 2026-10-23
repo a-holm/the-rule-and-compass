@@ -45,9 +45,11 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236 / #287: the CUDA evaluator scores only metrics that the dispatch
-/// table maps to a native `ScoreObjective`. A refused metric must never be
-/// handed to it, or a slope/rank run is silently ranked by MSE.
+/// #236 / #287 / #289: the CUDA evaluator scores only metrics that the
+/// dispatch table maps to a native `ScoreObjective`. A refused metric must
+/// never be handed to it, or a slope/rank run is silently ranked by MSE.
+/// `log_loss`, `brier` and the hinge forms are native since #289, so they are
+/// asserted in the included list below instead.
 #[test]
 fn refused_metrics_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
@@ -57,8 +59,6 @@ fn refused_metrics_never_use_the_gpu_evaluator() {
         Metric::RankCorrelationSigned,
         Metric::Interquartile,
         Metric::Auc,
-        Metric::LogLoss,
-        Metric::Hinge,
         Metric::Slope,
         Metric::ImplicitDerivative,
         Metric::ImplicitResidual,
@@ -97,6 +97,11 @@ fn native_score_objectives_are_table_driven() {
         Metric::Aic,
         Metric::Aicc,
         Metric::Bic,
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
     ] {
         assert!(
             rcsr::metrics::native_score_objective(metric).is_some(),

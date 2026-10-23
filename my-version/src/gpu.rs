@@ -705,8 +705,12 @@ extern "C" {
     fn rc_unified() -> i32;
     fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
     /* #234: the per-row label sign `t = 2l - 1` the log-loss fit arm reads. A
-       null pointer clears it, and every log-loss launch is then refused. */
+       null pointer clears it, and every log-loss launch is then refused.
+       #289: the same resident vector is the classification scorer's label. */
     fn rc_set_fit_sign(ctx: *mut RawCtx, sign: *const f64) -> i32;
+    /* #289: the per-row score weight vector, uploaded once per sample. A null
+       pointer clears it (every row weighs 1). */
+    fn rc_set_score_weights(ctx: *mut RawCtx, w: *const f64) -> i32;
     /* #169: batched LM constant fitting over the resident dataset.
        #229: `metric` selects the objective: 0 = squared, 1 = log-squashed,
        2 = correlation (1-|rho|), 3 = correlation_signed (1-rho).
@@ -1064,8 +1068,7 @@ pub struct GpuEvaluator {
     /// #284: evaluator side of the run ledger. `GpuStats` keeps the additive C
     /// windows; this keeps the device intervals whose union is device-busy.
     ledger: crate::gpu_stats::RunLedger,
-    /// #229: the objective every evaluation accumulates. Defaults to squared;
-    /// the legacy fit/eval path sets it from `--metric`; search scoring uses
+    /// #229: the legacy SSE objective. The search's native scoring path uses
     /// [`crate::metrics::ScoreObjective`] via `score_pool` (#287).
     loss: crate::fit::DeviceLoss,
 }
@@ -1091,15 +1094,13 @@ impl GpuEvaluator {
         }
     }
 
-    /// #229: the objective this evaluator accumulates. The search sets it once
-    /// per run; it must match the metric the search ranks on, or a robust run
-    /// would be ranked by squared error (the bug #236 closed the gate for).
+    /// #229: the legacy SSE objective this evaluator accumulates.
     pub(crate) fn set_loss(&mut self, loss: crate::fit::DeviceLoss) {
         self.loss = loss;
     }
 
-    /// #229: the objective this evaluator currently accumulates. Test-only:
-    /// the search sets it once and never needs to read it back.
+    /// #229: the legacy SSE objective. Test-only: the search's native scoring
+    /// path selects a [`crate::metrics::ScoreObjective`] per batch.
     #[cfg(test)]
     pub(crate) fn loss(&self) -> crate::fit::DeviceLoss {
         self.loss
@@ -1121,13 +1122,17 @@ impl GpuEvaluator {
         unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 }
     }
 
-    /// #234: upload the per-row label sign `t = 2·l − 1` the log-loss arm of
-    /// the batched fit reads, with `l` from the target midpoint
-    /// ([`crate::fit::classification_signs`]). Must follow
-    /// [`Self::set_fit_data`] (the buffer is sized by the resident row count)
-    /// and precede any `DeviceLoss::Logistic` batch; a launch without it is
-    /// refused on the device, so the arm can never fall back to another
-    /// objective. An empty slice clears the vector.
+    /// #234/#289: upload the per-row label sign `t = 2·l − 1`, with `l` from
+    /// the target midpoint ([`crate::fit::classification_signs`]).
+    ///
+    /// The same resident vector serves the log-loss **fit** and every native
+    /// classification **score**: a one-block-per-candidate kernel cannot take
+    /// the midpoint over the sample by itself, and the host already applies the
+    /// single midpoint rule. Must follow the resident row count (which
+    /// [`Self::new`] fixes) and precede any `DeviceLoss::Logistic` or
+    /// classification batch; a launch without it is refused on the device, so
+    /// the arm can never fall back to another objective. An empty slice clears
+    /// the vector.
     pub fn set_fit_sign(&mut self, sign: &[f64]) -> bool {
         if sign.is_empty() {
             return unsafe { rc_set_fit_sign(self.ctx, std::ptr::null()) == 0 };
@@ -1136,6 +1141,22 @@ impl GpuEvaluator {
             return false;
         }
         unsafe { rc_set_fit_sign(self.ctx, sign.as_ptr()) == 0 }
+    }
+
+    /// #289: upload the per-row weights the classification scorer reads.
+    ///
+    /// The classification kernel accumulates `Σ wᵢ·lossᵢ` and divides by
+    /// `Σw` in f64, exactly `metrics::score_native_weighted`. A zero-weight row
+    /// is skipped before its prediction is read. An empty slice clears the
+    /// vector (every row weighs 1).
+    pub fn set_score_weights(&mut self, w: &[f64]) -> bool {
+        if w.is_empty() {
+            return unsafe { rc_set_score_weights(self.ctx, std::ptr::null()) == 0 };
+        }
+        if w.len() as u64 != self.n_rows {
+            return false;
+        }
+        unsafe { rc_set_score_weights(self.ctx, w.as_ptr()) == 0 }
     }
 
     pub fn device_name() -> String {

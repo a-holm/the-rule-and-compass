@@ -161,11 +161,13 @@ ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
                              positive. A weight of 2 means \"this row twice\":
                              absolute, squared, correlation, correlation_signed,
-                             signed, log_squashed, implicit, implicit_residual become
+                             signed, log_squashed, log_loss, brier and the three
+                             hinge forms, implicit and implicit_residual become
                              weighted means, and aic/aicc/bic use the weighted
-                             RSS. Refused for metrics with no weighted definition
-                             (median, maximum, interquartile, slope,
-                             rank_correlation, auc, log_loss, hinge).
+                             RSS. A zero-weight row is skipped before its
+                             prediction or label is read. Refused for metrics
+                             with no weighted definition (median, maximum,
+                             interquartile, slope, rank_correlation, auc).
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   See docs/time-series.md for which preparation steps read ahead.
@@ -324,13 +326,17 @@ SEARCH:
                              absolute  squared  correlation  correlation_signed
                              median  maximum  signed  log_squashed
                              rank_correlation  rank_correlation_signed
-                             interquartile  slope  auc  log_loss  hinge  aic  aicc  bic
+                             interquartile  slope  auc  log_loss  brier  hinge
+                             hinge_ordinary  hinge_squared  aic  aicc  bic
                              implicit  implicit_residual  (implicit model)
                              correlation/rank_correlation score 1-|r| and accept an
                              inverted model; the _signed variants score 1-r and
-                             require the right direction. auc/log_loss/hinge treat
-                             the target as two classes and reject targets with
-                             more than two distinct values. signed scores the
+                             require the right direction. auc/log_loss/brier and
+                             the hinge forms treat the target as two classes and
+                             reject targets with more than two distinct values.
+                             hinge is the historical bounded sigmoid surrogate
+                             (2*sigma(-t*p)); hinge_ordinary is max(0,1-t*p) and
+                             hinge_squared is its square. signed scores the
                              absolute mean residual |mean(y-f)| (a weighted mean
                              with --weight); it has a documented degeneracy: its
                              optimum is a whole manifold at exactly 0.
@@ -388,8 +394,10 @@ SEARCH:
                              metric and both fit strategies). Constants are
                              fitted to the configured --metric: squared/aic/
                              aicc/bic use exact least squares; absolute and
-                             log_squashed use IRLS; auc/log_loss/hinge use
-                             logistic IRLS; signed uses the squared fit plus a
+                             log_squashed use IRLS; auc/log_loss/brier/hinge and
+                             the SVM hinge forms use logistic IRLS (a warm start
+                             judged by the configured metric); signed uses the
+                             squared fit plus a
                              constrained least-squares projection onto the
                              zero-mean-residual manifold (exact to f64, two
                              passes, no optimiser); correlation/correlation_signed
@@ -421,9 +429,10 @@ SEARCH:
                              with per-row Lawson weights and true-MAE
                              acceptance (#222), the logistic log-loss on the
                              binary label with per-row Fisher weights q(1-q) and
-                             a softplus trial objective (#234; fit-only — the
-                             device proposes constants and the exact CPU f64
-                             log-loss judges, scores and refits), or — for
+                             a softplus trial objective (#234; the device
+                             proposes constants and the exact CPU f64 log-loss
+                             judges and refits; since #289 the search also
+                             scores log_loss natively on the device), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
                              (#230; fit-only, the fitness stays on the CPU), with
@@ -3576,13 +3585,25 @@ fn main() {
             let name = target_names.get(j).map(|s| s.as_str()).unwrap_or(target.as_str());
             // Check the union of both sides: a distinct class that happens to
             // sit only in the held-out rows still makes the target multi-valued.
-            let values: Vec<f64> = prepared
-                .train
-                .target(j)
-                .iter()
-                .chain(prepared.test.target(j))
-                .copied()
-                .collect();
+            // #289: a zero-weight row is invisible to the metric, so it must
+            // not be able to make an otherwise binary target look
+            // multi-valued. Filter each side by its own weights before the
+            // distinct-value check.
+            let weighted_values = |sample: &data::Sample| -> Vec<f64> {
+                let target = sample.target(j);
+                if sample.w.is_empty() {
+                    target.to_vec()
+                } else {
+                    target
+                        .iter()
+                        .zip(&sample.w)
+                        .filter(|(_, w)| **w > 0.0)
+                        .map(|(v, _)| *v)
+                        .collect()
+                }
+            };
+            let mut values = weighted_values(&prepared.train);
+            values.extend(weighted_values(&prepared.test));
             if let Some(why) = metrics::classification_target_error(&values) {
                 eprintln!(
                     "error: --metric {} treats '{}' as a binary target, but {}",
