@@ -3426,8 +3426,16 @@ float rc_score_batch(void *ctx, const unsigned int *prog,
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nprog <= 0 || !out || !status) return -1.0f;
     if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1.0f;
-    return rc_score_launch(c, c->d_prog, c->d_off, 0, 0, nprog, kind,
-                           pcount, out, status);
+    /* #285 moved the packed upload into the persistent arena. The legacy
+       `d_prog`/`d_off` pointers are no longer filled, so score the arena slot
+       `rc_set_programs` just wrote. Wait for its H2D copy before launching. */
+    const int slot = c->arena_slot;
+    if (!c->arena_prog[slot] || !c->arena_off[slot]) return -1.0f;
+    if (c->arena_upload_async) {
+        cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
+    }
+    return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
+                           nprog, kind, pcount, out, status);
 }
 
 /* #287: score the fixed-slot programs already uploaded to `which`. */
