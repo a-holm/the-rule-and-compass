@@ -287,6 +287,28 @@ fn weighted_classification_is_supported_and_normalised_by_sum_w() {
     }
 }
 
+/// #289: a positive-weight non-finite target is invalid, not a label: the CPU
+/// scorer refuses it and the uploaded sign is NaN so the device does too. A
+/// masked non-finite target is still ignored.
+#[test]
+fn a_positive_weight_non_finite_target_is_invalid() {
+    let y = [0.0, 1.0, f64::NAN, 1.0];
+    let w = [1.0, 1.0, 1.0, 1.0];
+    assert!(fit::classification_signs_weighted(&y, &w)
+        .iter()
+        .all(|v| v.is_nan()));
+    assert_eq!(fit::class_counts_weighted(&y, &w), (0, 0));
+    assert_eq!(
+        metrics::score_weighted(&[0.0, 0.0, 0.0, 0.0], &y, &w, Metric::LogLoss, 0),
+        f64::INFINITY
+    );
+    // Masked: the row is invisible and the other labels are valid.
+    let w0 = [1.0, 1.0, 0.0, 1.0];
+    let signs = fit::classification_signs_weighted(&y, &w0);
+    assert_eq!(signs, vec![-1.0, 1.0, -1.0, 1.0]);
+    assert_eq!(fit::class_counts_weighted(&y, &w0), (2, 1));
+}
+
 /// #289: on a weighted sample the midpoint and the class counts follow the
 /// positive-weight rows only, which is the label the device is given.
 #[test]

@@ -3209,7 +3209,13 @@ pub fn classification_signs_weighted(y: &[f64], w: &[f64]) -> Vec<f64> {
     }
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for (&v, &wi) in y.iter().zip(w) {
-        if wi > 0.0 && v.is_finite() {
+        if wi > 0.0 {
+            if !v.is_finite() {
+                // A positive-weight non-finite target is invalid, not a label.
+                // NaN signs make the device reject the row instead of silently
+                // assigning it to a class the CPU scorer refuses.
+                return vec![f64::NAN; y.len()];
+            }
             lo = lo.min(v);
             hi = hi.max(v);
         }
@@ -3223,6 +3229,15 @@ pub fn classification_signs_weighted(y: &[f64], w: &[f64]) -> Vec<f64> {
 
 /// #289: `(positives, negatives)` among rows with `w > 0`.
 pub fn class_counts_weighted(y: &[f64], w: &[f64]) -> (usize, usize) {
+    if !w.is_empty()
+        && y.iter()
+            .zip(w)
+            .any(|(&v, &wi)| wi > 0.0 && !v.is_finite())
+    {
+        // No valid labels: the caller labels this sample `single_class` and
+        // keeps the exact CPU arm rather than fitting a NaN sign.
+        return (0, 0);
+    }
     let signs = classification_signs_weighted(y, w);
     let pos = if w.is_empty() {
         signs.iter().filter(|&&t| t > 0.0).count()
