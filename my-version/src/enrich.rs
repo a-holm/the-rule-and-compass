@@ -1966,6 +1966,10 @@ pub fn gpu_supports(name: &str) -> bool {
         // Cross-sectional ranks use the device segmented sort in the xs pass.
         return true;
     }
+    if is_mtf(name) {
+        // #296: the complete MTF family has a device resample + causal join.
+        return true;
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
         if (1..=120).contains(&k) {
             return true;
@@ -6057,6 +6061,9 @@ fn enrich_inner(
             || name.starts_with("cross_")
         {
             OpClass::Join
+        } else if is_mtf(name) {
+            // Higher-timeframe resample + monotone causal join.
+            OpClass::Join
         } else {
             OpClass::Elementwise
         }
@@ -6077,13 +6084,26 @@ fn enrich_inner(
             *gpu_cols.entry("labels").or_insert(0) += labels.len();
         }
     }
-    let plans = plan_groups(
+    let mut plans = plan_groups(
         &fam_counts,
         &gpu_cols,
         store.n_rows(),
         opts.gpu,
         gpu_available,
     );
+    // #296: the 1.05M paired fixture measured the device MTF phase slower than
+    // the CPU reference (5.08 s vs 6.45 s on two symbol segments). Until a
+    // 16M paired run establishes the crossover, keep the new device path
+    // opt-in with `--gpu on`; `auto` remains the CPU reference.
+    if opts.gpu != GpuMode::On {
+        if let Some(plan) = plans.iter_mut().find(|p| p.group == "mtf" && p.backend == "gpu") {
+            plan.backend = "cpu";
+            plan.gpu_cols = 0;
+            plan.cpu_cols = plan.cols;
+            plan.reason =
+                "MTF device crossover not measured at 16M rows; use --gpu on".to_string();
+        }
+    }
 
     // Input checksum (the same file is copied, not rebuilt).
     let input_sha = manifest::sha256_file(&opts.data)
@@ -6170,9 +6190,65 @@ fn enrich_inner(
     // audited column list cannot drift from the bytes actually read.
     #[allow(unused_mut)]
     let mut device_projection: Option<(String, Vec<String>)> = None;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_kernel_seconds = 0.0;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_transfer_bytes = 0u64;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_h2d_seconds = 0.0;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_d2h_seconds = 0.0;
     #[cfg(feature = "cuda")]
     let mut gpu_ctx: Option<crate::enrich_gpu::EnrichGpu> = None;
 
+    #[cfg(feature = "cuda")]
+    {
+        // #296: the MTF family owns a separate context because it needs the
+        // higher-timeframe arena, not the base-length enrichment scratch. It
+        // reads only the base columns the projection also needs (time + OHLC).
+        let mtf_wanted: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| is_mtf(n))
+            .cloned()
+            .collect();
+        if !mtf_wanted.is_empty() {
+            let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let open = column_all(&store, cols.open)?;
+            let high = column_all(&store, cols.high)?;
+            let low = column_all(&store, cols.low)?;
+            let close = column_all(&store, cols.close)?;
+            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+            match crate::mtf_gpu::compute(
+                &times,
+                &open,
+                &high,
+                &low,
+                &close,
+                &seg_start,
+                &seg_len,
+                step,
+                &mtf_wanted,
+            ) {
+                Some((columns, stats)) => {
+                    for (name, values) in columns {
+                        if let Some(t) = temp.get_mut(&name) {
+                            t.write_values(&values)?;
+                            gpu_done.insert(name);
+                        }
+                    }
+                    mtf_kernel_seconds = stats.kernel_s;
+                    mtf_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                    mtf_h2d_seconds = stats.h2d_s;
+                    mtf_d2h_seconds = stats.d2h_s;
+                }
+                None => gpu_fallback += mtf_wanted.len(),
+            }
+            for name in &mtf_wanted {
+                gpu_names.remove(name);
+            }
+        }
+    }
     #[cfg(feature = "cuda")]
     if !gpu_names.is_empty() || gpu_labels {
         // Projected transport: only the raw columns the device needs, read
@@ -6358,10 +6434,19 @@ fn enrich_inner(
             }
         }
         let stats = gpu.stats();
-        gpu_kernel_seconds = stats.kernel_s;
-        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
-        gpu_h2d_seconds = stats.h2d_s;
-        gpu_d2h_seconds = stats.d2h_s;
+        gpu_kernel_seconds = stats.kernel_s + mtf_kernel_seconds;
+        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + mtf_transfer_bytes;
+        gpu_h2d_seconds = stats.h2d_s + mtf_h2d_seconds;
+        gpu_d2h_seconds = stats.d2h_s + mtf_d2h_seconds;
+    }
+
+    // If only the MTF context ran, its ledger is still the GPU share.
+    #[cfg(feature = "cuda")]
+    if gpu_ctx.is_none() {
+        gpu_kernel_seconds = mtf_kernel_seconds;
+        gpu_transfer_bytes = mtf_transfer_bytes;
+        gpu_h2d_seconds = mtf_h2d_seconds;
+        gpu_d2h_seconds = mtf_d2h_seconds;
     }
 
     // Everything planned for the CPU (including failed GPU calls).
@@ -6931,7 +7016,10 @@ INPUT / OUTPUT:
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
-                          off runs the CPU reference
+                          off runs the CPU reference. The MTF family uses one
+                          device resample + causal join per timeframe and keeps
+                          the CPU NaN/gap/bar_age contract; it is opt-in with
+                          --gpu on until the 16M crossover is measured.
   --no-gpu, --cpu         force CPU
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout
@@ -6964,7 +7052,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              resampled from the base series and joined only after it closes:
              higher.time + timeframe_seconds <= base.time. Windows count
              higher-timeframe bars; a gap is NaN, and bar_age reports the
-             exact seconds since the last closed higher bar.
+             exact seconds since the last closed higher bar. With --features
+             cuda and --gpu on, all 36 columns dispatch to the device resample
+             + causal join (src/cuda/mtf.cu); auto stays on the CPU until the
+             16M crossover is measured. Non-transcendental leaves are bitwise
+             and vol is within 1e-12.
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.
