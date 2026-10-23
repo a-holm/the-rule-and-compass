@@ -105,6 +105,9 @@ extern "C" {
     fn rc_enrich_download_ptr(src: *const f64, dst: *mut f64, n: c_int) -> c_int;
     fn rc_enrich_note_projected_upload(ctx: *mut Raw, bytes: u64, ms: f64);
     fn rc_enrich_note_projected_download(ctx: *mut Raw, bytes: u64, ms: f64);
+    fn rc_enrich_batch_capacity(ctx: *mut Raw) -> c_int;
+    fn rc_enrich_batch_host(ctx: *mut Raw) -> *mut f64;
+    fn rc_enrich_batch_run(ctx: *mut Raw, ops: *const BatchOp, nops: c_int) -> c_int;
 }
 
 /// Where one projected column lands in the enrichment context.
@@ -131,6 +134,109 @@ pub struct EnrichGpu {
     precomputed: BTreeMap<String, *mut f64>,
     ring_bytes: u64,
 }
+
+/// #300: one feature for the batched output path.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct BatchOp {
+    kind: c_int,
+    a: c_int,
+    b: c_int,
+    c: c_int,
+    param: f64,
+}
+
+impl BatchOp {
+    pub fn ret(k: usize) -> Self {
+        Self { kind: 1, a: k as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn lag(k: usize) -> Self {
+        Self { kind: 2, a: k as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn range() -> Self {
+        Self { kind: 3, a: 0, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn clv() -> Self {
+        Self { kind: 4, a: 0, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn calendar(which: usize) -> Self {
+        Self { kind: 5, a: which as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn ma(w: usize) -> Self {
+        Self { kind: 6, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn vol(w: usize) -> Self {
+        Self { kind: 7, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn bb_width(w: usize) -> Self {
+        Self { kind: 8, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn vz(w: usize) -> Self {
+        Self { kind: 9, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn donchian(w: usize) -> Self {
+        Self { kind: 10, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn ema(span: usize) -> Self {
+        Self { kind: 11, a: span as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn rsi(period: usize) -> Self {
+        Self { kind: 12, a: period as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    pub fn atr(period: usize) -> Self {
+        Self { kind: 13, a: period as c_int, b: 0, c: 0, param: 0.0 }
+    }
+    #[allow(dead_code)]
+    pub fn label(horizon: usize, cost_bps: f64, vol_window: usize, stride: usize) -> Self {
+        Self {
+            kind: 14,
+            a: horizon as c_int,
+            b: vol_window as c_int,
+            c: stride as c_int,
+            param: cost_bps,
+        }
+    }
+    #[allow(dead_code)]
+    pub fn macd() -> Self {
+        Self { kind: 15, a: 0, b: 0, c: 0, param: 0.0 }
+    }
+    /// Number of output columns this operation writes.
+    pub fn slots(&self) -> usize {
+        if self.kind == 15 {
+            3
+        } else {
+            1
+        }
+    }
+}
+
+/// #300: a completed family block, read directly from the pinned arena.
+///
+/// The borrow keeps the context alive; the next [`EnrichGpu::batch`] call
+/// overwrites the arena, so callers must finish writing the block first.
+pub struct BatchBlock<'a> {
+    gpu: &'a mut EnrichGpu,
+    count: usize,
+    rows: usize,
+}
+
+impl BatchBlock<'_> {
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.count
+    }
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+    pub fn column(&self, i: usize) -> &[f64] {
+        assert!(i < self.count, "batch column index out of range");
+        let ptr = unsafe { rc_enrich_batch_host(self.gpu.ctx) };
+        assert!(!ptr.is_null(), "pinned batch arena is missing");
+        unsafe { std::slice::from_raw_parts(ptr.add(i * self.rows), self.rows) }
+    }
+}
+
 
 impl EnrichGpu {
     /// Upload the resident source columns and segment table once.
@@ -666,6 +772,40 @@ impl EnrichGpu {
         } else {
             None
         }
+    }
+
+    /// #300: how many output columns fit in the 64 MiB per-family arena.
+    /// Zero means the store is too wide for the arena and the caller keeps the
+    /// per-column staging path.
+    pub fn batch_capacity(&self) -> usize {
+        let cap = unsafe { rc_enrich_batch_capacity(self.ctx) };
+        cap.max(0) as usize
+    }
+
+    /// #300: launch several family kernels back-to-back and copy their outputs
+    /// out with one pinned, chunked `cudaMemcpy2DAsync` per row chunk. The
+    /// returned block borrows the context until the caller has written it.
+    pub fn batch(&mut self, ops: &[BatchOp]) -> Option<BatchBlock<'_>> {
+        if ops.is_empty() {
+            return None;
+        }
+        let slots: usize = ops.iter().map(BatchOp::slots).sum();
+        if slots == 0 || slots > self.batch_capacity() {
+            return None;
+        }
+        let started = std::time::Instant::now();
+        let rc = unsafe { rc_enrich_batch_run(self.ctx, ops.as_ptr(), ops.len() as c_int) };
+        let ok = rc == 0;
+        self.record(started, ok);
+        if !ok {
+            return None;
+        }
+        let rows = self.n;
+        Some(BatchBlock {
+            gpu: self,
+            count: slots,
+            rows,
+        })
     }
 
     pub fn stats(&self) -> GpuStats {

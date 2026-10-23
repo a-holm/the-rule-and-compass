@@ -426,7 +426,9 @@ atomically instead of streaming it. See
   16.1M-row OHLCV panel the GPU feature phase is **1.49x** the CPU (72.1 % of
   columns dispatched, zero fallbacks) while end-to-end wall is decided by the
   append write; the output checksum is computed while the blocks stream, so a
-  multi-gigabyte store is never read twice. See
+  multi-gigabyte store is never read twice. GPU output blocks share a 64 MiB
+  arena and a pinned chunked D2H copy, and cost model v2 charges the measured
+  `BW_write` separately from kernel and transfer time. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they

@@ -85,3 +85,19 @@ split=temporal | selector: train range 0..600 (600 rows) | test range 600..800 (
 therefore cannot be computed from a streaming group scan; when an out-of-core
 backing is added those metrics must stay resident, be capped, or be reported as
 approximate.
+
+## Enrichment output staging (#300)
+
+`rcsr enrich` stages each feature column to a temporary `f64` file before the
+append pass. The writer uses a 64 KiB staging block (`ENRICH_TEMP_WRITE_CHUNK_BYTES`),
+and the GPU path adds a per-family output arena plus its pinned host mirror.
+Both are capped at **64 MiB** (`GPU_OUTPUT_ARENA_BYTES` /
+`GPU_PINNED_STAGE_BYTES`); a family block whose columns do not fit falls back to
+the per-column staging path, so the bound does not grow with the 358-column
+catalogue. `memory::enrich_output_stage_bytes(rows, columns)` returns the
+charged bytes, `min(rows * columns * 8, 64 MiB) + 64 KiB`.
+
+At 16.1M rows one `f64` column is 128 MiB, so the arena cannot hold even one
+full column; that case uses per-column staging and is reported as such. At the
+3.87M-row scale the arena holds two columns, and a 500k-row parity fixture holds
+eight. The pinned mirror is reused across blocks, never allocated per column.

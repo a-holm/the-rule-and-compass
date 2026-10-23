@@ -1440,6 +1440,8 @@ pub struct Options {
     pub eth_symbol: String,
     pub eth_data: Option<String>,
     pub gpu: GpuMode,
+    /// Measured sequential write bandwidth used by cost model v2 (#300).
+    pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
     pub dry_run: bool,
     pub json: bool,
@@ -1463,6 +1465,7 @@ impl Default for Options {
             eth_symbol: "ETHUSDT".to_string(),
             eth_data: None,
             gpu: GpuMode::Auto,
+            write_bw: None,
             allow_lockbox: false,
             dry_run: false,
             json: false,
@@ -1515,10 +1518,15 @@ pub struct Report {
     pub gpu_fallback: usize,
     /// Measured device windows for the enrichment phase (#118 ledger).
     pub gpu_kernel_seconds: f64,
+    /// Measured device→host time (#294/#300), separate from kernel time.
+    pub gpu_d2h_seconds: f64,
+    /// Measured host staging writes of GPU output blocks (#300).
+    pub gpu_write_seconds: f64,
+    /// Write bandwidth charged by cost model v2 (#300), bytes/second.
+    pub write_bw: f64,
     pub gpu_transfer_bytes: u64,
     /// Measured host→device and device→host windows (#294 benchmark ledger).
     pub gpu_h2d_seconds: f64,
-    pub gpu_d2h_seconds: f64,
     /// #294: FNV-1a 64 of the resolved device read projection.
     pub projection_hash: Option<String>,
     /// #294: exact header columns the projected transport read.
@@ -1558,13 +1566,16 @@ impl Report {
                 self.gpu_device.as_deref().unwrap_or("none")
             ),
             format!(
-                "# enrich: gpu_columns={} cpu_columns={} gpu_share={:.3} fallback={} kernel={:.3}s transfer_bytes={}",
+                "# enrich: gpu_columns={} cpu_columns={} gpu_share={:.3} fallback={} kernel={:.3}s d2h={:.3}s write={:.3}s transfer_bytes={} write_bw={:.0}",
                 self.gpu_columns,
                 self.cpu_columns,
                 self.gpu_share,
                 self.gpu_fallback,
                 self.gpu_kernel_seconds,
-                self.gpu_transfer_bytes
+                self.gpu_d2h_seconds,
+                self.gpu_write_seconds,
+                self.gpu_transfer_bytes,
+                self.write_bw
             ),
             format!(
                 "# enrich: read={:.3}s feature={:.3}s xs={:.3}s write={:.3}s total={:.3}s peak_rss={:.1} MiB",
@@ -1672,7 +1683,7 @@ impl Report {
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
-             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"transfer_bytes\":{}}},\n  \
+             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0}}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
@@ -1703,7 +1714,9 @@ impl Report {
             self.gpu_kernel_seconds,
             self.gpu_h2d_seconds,
             self.gpu_d2h_seconds,
+            self.gpu_write_seconds,
             self.gpu_transfer_bytes,
+            self.write_bw,
             self.projection_hash
                 .as_deref()
                 .map(jstr)
@@ -2038,6 +2051,52 @@ pub fn gpu_kernels_compiled() -> bool {
 /// stay on the CPU.
 pub const GPU_MIN_ROWS: usize = 1_000_000;
 pub const GPU_TRANSFER_BYTES_PER_SECOND: f64 = 12_000_000_000.0;
+/// Measured sequential write bandwidth of the shared ext4 store on
+/// `/mnt/lager` (2026-10-23, 512 MiB `dd conv=fdatasync`: **222 MB/s**). This is
+/// the temp-file write term the pre-#300 model omitted. It is deliberately a
+/// conservative filesystem figure: the same disk measured 64 MB/s while the
+/// 16M-row full-catalogue run was appending, so a planner on a busier disk
+/// should pass a smaller value through [`plan_groups_with_write_bw`] (the CLI
+/// exposes `--write-bw`).
+pub const GPU_WRITE_BYTES_PER_SECOND: f64 = 222_000_000.0;
+/// Device-to-host transfer bandwidth used by the cost model. Kept separate from
+/// the resident upload rate so the write term cannot hide behind the bus.
+pub const GPU_D2H_BYTES_PER_SECOND: f64 = GPU_TRANSFER_BYTES_PER_SECOND;
+/// Hard cap for the per-family output arena (#300). A block whose columns do
+/// not fit falls back to per-column staging.
+pub const GPU_OUTPUT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Measure sequential write bandwidth (bytes/second) in `dir`.
+///
+/// Writes `bytes` of zeroes with a 1 MiB buffer and `sync_all` on the file, so
+/// the result is a durable-write figure rather than page-cache speed. Used by
+/// the ignored `measure_write_bandwidth` test and by operators calibrating
+/// `--write-bw` for a different filesystem.
+pub fn measure_write_bandwidth(dir: &Path, bytes: u64) -> Result<f64, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let path = dir.join(format!("rcsr-bw-{}.bin", std::process::id()));
+    let mut file = std::fs::File::create(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let buf = vec![0u8; 1 << 20];
+    let started = std::time::Instant::now();
+    let mut left = bytes;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        left -= n as u64;
+    }
+    file.sync_all()
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    let seconds = started.elapsed().as_secs_f64();
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+    if seconds <= 0.0 {
+        return Err("write bandwidth clock produced zero seconds".to_string());
+    }
+    Ok(bytes as f64 / seconds)
+}
+
 /// Fixed per-run device setup (context, probe, launch glue).
 pub const GPU_FIXED_OVERHEAD_MS: f64 = 50.0;
 /// One-time host read of the source columns plus the resident upload, per
@@ -2053,7 +2112,40 @@ pub fn plan_groups(
     gpu_requested: GpuMode,
     gpu_available: bool,
 ) -> Vec<GroupPlan> {
+    plan_groups_with_write_bw(
+        counts,
+        gpu_cols,
+        n_rows,
+        gpu_requested,
+        gpu_available,
+        GPU_WRITE_BYTES_PER_SECOND,
+    )
+}
+
+/// Cost model v2 (#300): include the measured output write.
+///
+/// ```text
+/// gpu_s = fixed + context(n) + h2d/BW_h2d + cells/rate_kernel
+///       + d2h/BW_d2h + write_bytes/BW_write
+/// ```
+///
+/// `write_bps` is the calibrated filesystem write bandwidth. A slower disk can
+/// flip a family to the CPU, which is exactly the decision the old model could
+/// not express.
+pub fn plan_groups_with_write_bw(
+    counts: &BTreeMap<&'static str, (usize, OpClass)>,
+    gpu_cols: &BTreeMap<&'static str, usize>,
+    n_rows: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    write_bps: f64,
+) -> Vec<GroupPlan> {
     let mut out = Vec::new();
+    let write_bps = if write_bps.is_finite() && write_bps > 0.0 {
+        write_bps
+    } else {
+        GPU_WRITE_BYTES_PER_SECOND
+    };
     for (group, (cols, op)) in counts {
         let op = *op;
         let cells = n_rows.saturating_mul(*cols).max(1) as f64;
@@ -2061,12 +2153,14 @@ pub fn plan_groups(
         let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
         let gpu_cells = gpu_cells_n as f64;
-        let gpu_bytes = gpu_cells_n as f64 * 8.0 * 2.0;
+        let transfer_bytes = gpu_cells_n as f64 * 8.0;
         let context_ms =
             GPU_FIXED_OVERHEAD_MS + GPU_CONTEXT_MS_PER_MROW * n_rows as f64 / 1_000_000.0;
         let gpu_s = context_ms / 1000.0
-            + gpu_bytes / GPU_TRANSFER_BYTES_PER_SECOND
-            + gpu_cells / op.gpu_cells_per_second();
+            + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
+            + gpu_cells / op.gpu_cells_per_second()
+            + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
+            + transfer_bytes / write_bps;
         let cpu_supported_s = gpu_cells / op.cpu_cells_per_second();
         let (backend, reason) = if gpu_requested == GpuMode::Off {
             ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
@@ -5725,6 +5819,52 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
     }
 }
 
+/// #300: the same dispatch as [`gpu_feature`], as a descriptor for the batched
+/// output arena. `None` means the name has no single-slot batch kernel.
+#[cfg(feature = "cuda")]
+fn gpu_batch_op(name: &str) -> Option<crate::enrich_gpu::BatchOp> {
+    use crate::enrich_gpu::BatchOp;
+    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::ret(k));
+    }
+    if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::ma(w));
+    }
+    if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::vol(w));
+    }
+    if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::lag(k));
+    }
+    if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::donchian(w));
+    }
+    Some(match name {
+        "bb20_bw" => BatchOp::bb_width(20),
+        "bb50_bw" => BatchOp::bb_width(50),
+        "vz96" => BatchOp::vz(96),
+        "range1" => BatchOp::range(),
+        "clv1" => BatchOp::clv(),
+        "dow_sin" => BatchOp::calendar(0),
+        "dow_cos" => BatchOp::calendar(1),
+        "hour_sin" => BatchOp::calendar(2),
+        "hour_cos" => BatchOp::calendar(3),
+        "month_sin" => BatchOp::calendar(4),
+        "month_cos" => BatchOp::calendar(5),
+        "dom_sin" => BatchOp::calendar(6),
+        "dom_cos" => BatchOp::calendar(7),
+        "ema8" => BatchOp::ema(8),
+        "ema20" => BatchOp::ema(20),
+        "ema50" => BatchOp::ema(50),
+        "ema100" => BatchOp::ema(100),
+        "ema200" => BatchOp::ema(200),
+        "rsi6" => BatchOp::rsi(6),
+        "rsi28" => BatchOp::rsi(28),
+        "atr50" => BatchOp::atr(50),
+        _ => return None,
+    })
+}
+
 /// Run an enrichment into a temporary output file.
 pub fn build(opts: &Options) -> Result<Report, String> {
     enrich(opts)
@@ -6084,12 +6224,14 @@ fn enrich_inner(
             *gpu_cols.entry("labels").or_insert(0) += labels.len();
         }
     }
-    let mut plans = plan_groups(
+    let write_bw = opts.write_bw.unwrap_or(GPU_WRITE_BYTES_PER_SECOND);
+    let mut plans = plan_groups_with_write_bw(
         &fam_counts,
         &gpu_cols,
         store.n_rows(),
         opts.gpu,
         gpu_available,
+        write_bw,
     );
     // #296: the 1.05M paired fixture measured the device MTF phase slower than
     // the CPU reference (5.08 s vs 6.45 s on two symbol segments). Until a
@@ -6181,11 +6323,13 @@ fn enrich_inner(
     #[allow(unused_mut)]
     let mut gpu_kernel_seconds = 0.0;
     #[allow(unused_mut)]
+    let mut gpu_d2h_seconds = 0.0;
+    #[allow(unused_mut)]
+    let mut gpu_write_seconds = 0.0;
+    #[allow(unused_mut)]
     let mut gpu_transfer_bytes = 0u64;
     #[allow(unused_mut)]
     let mut gpu_h2d_seconds = 0.0;
-    #[allow(unused_mut)]
-    let mut gpu_d2h_seconds = 0.0;
     // #294: the resolved device read projection, recorded in the report so the
     // audited column list cannot drift from the bytes actually read.
     #[allow(unused_mut)]
@@ -6367,7 +6511,9 @@ fn enrich_inner(
                         _ => &h,
                     };
                     if let Some(t) = temp.get_mut(name) {
+                        let tw = Instant::now();
                         t.write_values(vals)?;
+                        gpu_write_seconds += tw.elapsed().as_secs_f64();
                         gpu_done.insert(name.clone());
                     }
                 }
@@ -6383,16 +6529,95 @@ fn enrich_inner(
             .filter(|n| !n.starts_with("macd"))
             .cloned()
             .collect();
-        for name in names {
-            // A feature computed per uploaded tile already lives on the device.
-            if let Some(vals) = gpu.take_precomputed(&name) {
-                let ok = match temp.get_mut(&name) {
-                    Some(t) => {
-                        t.write_values(&vals)?;
-                        true
-                    }
+        // #300: batch family/column blocks through one output arena and one
+        // pinned chunked D2H. Falls back to the per-column staging path when
+        // the arena cannot hold the block (a 16M-row column is 128 MiB, above
+        // the 64 MiB cap) or when a kernel fails.
+        let mut fallback: Vec<String> = Vec::new();
+        // `RCSR_ENRICH_GPU_BATCH=0` keeps the per-column staging path for a
+        // paired A/B measurement of the batched output arena.
+        let cap = if std::env::var("RCSR_ENRICH_GPU_BATCH").ok().as_deref() == Some("0") {
+            0
+        } else {
+            gpu.batch_capacity()
+        };
+        let mut jobs: Vec<(String, crate::enrich_gpu::BatchOp)> = Vec::new();
+        for name in &names {
+            // #294: a feature computed while the projected tiles uploaded is
+            // already on the device; write it once and keep it out of the
+            // batch arena so its temp file cannot be appended twice.
+            if let Some(vals) = gpu.take_precomputed(name) {
+                let tw = Instant::now();
+                let ok = match temp.get_mut(name) {
+                    Some(t) => t.write_values(&vals).is_ok(),
                     None => false,
                 };
+                gpu_write_seconds += tw.elapsed().as_secs_f64();
+                if ok {
+                    gpu_done.insert(name.clone());
+                    gpu_names.remove(name);
+                } else {
+                    fallback.push(name.clone());
+                }
+                continue;
+            }
+            match gpu_batch_op(name) {
+                Some(op) => jobs.push((name.clone(), op)),
+                None => fallback.push(name.clone()),
+            }
+        }
+        let mut i = 0usize;
+        while i < jobs.len() && cap > 0 {
+            let start = i;
+            let mut slots = 0usize;
+            while i < jobs.len() && slots + jobs[i].1.slots() <= cap {
+                slots += jobs[i].1.slots();
+                i += 1;
+            }
+            if i == start {
+                fallback.push(jobs[i].0.clone());
+                i += 1;
+                continue;
+            }
+            let ops: Vec<crate::enrich_gpu::BatchOp> =
+                jobs[start..i].iter().map(|(_, op)| *op).collect();
+            let mut written = false;
+            if let Some(block) = gpu.batch(&ops) {
+                written = true;
+                for (slot, (name, _)) in jobs[start..i].iter().enumerate() {
+                    let tw = Instant::now();
+                    let ok = match temp.get_mut(name) {
+                        Some(t) => t.write_values(block.column(slot)).is_ok(),
+                        None => false,
+                    };
+                    gpu_write_seconds += tw.elapsed().as_secs_f64();
+                    if ok {
+                        gpu_done.insert(name.clone());
+                    } else {
+                        written = false;
+                    }
+                }
+            }
+            if !written {
+                for (name, _) in &jobs[start..i] {
+                    fallback.push(name.clone());
+                }
+            }
+        }
+        let _ = fallback;
+        for name in names {
+            if gpu_done.contains(&name) {
+                gpu_names.remove(&name);
+                continue;
+            }
+            // A feature computed per uploaded tile already lives on the device.
+            if let Some(vals) = gpu.take_precomputed(&name) {
+                let tw = Instant::now();
+                let ok = match temp.get_mut(&name) {
+                    Some(t) => t.write_values(&vals).is_ok(),
+                    None => false,
+                };
+                gpu_write_seconds += tw.elapsed().as_secs_f64();
                 if ok {
                     gpu_done.insert(name.clone());
                 } else {
@@ -6405,8 +6630,10 @@ fn enrich_inner(
             let ok = match vals {
                 Some(vals) => match temp.get_mut(&name) {
                     Some(t) => {
-                        t.write_values(&vals)?;
-                        true
+                        let tw = Instant::now();
+                        let ok = t.write_values(&vals).is_ok();
+                        gpu_write_seconds += tw.elapsed().as_secs_f64();
+                        ok
                     }
                     None => false,
                 },
@@ -6425,7 +6652,9 @@ fn enrich_inner(
                 match vals {
                     Some(v) => {
                         if let Some(t) = temp.get_mut(name) {
+                            let tw = Instant::now();
                             t.write_values(&v)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name.clone());
                         }
                     }
@@ -6620,9 +6849,9 @@ fn enrich_inner(
                         ranks = gpu.rank(&values, &panel.times, &panel.sym_key);
                         let stats = gpu.stats();
                         gpu_kernel_seconds = stats.kernel_s;
+                        gpu_d2h_seconds = stats.d2h_s;
                         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
                         gpu_h2d_seconds = stats.h2d_s;
-                        gpu_d2h_seconds = stats.d2h_s;
                     }
                 }
                 let (ranks, from_gpu) = match ranks {
@@ -6756,9 +6985,11 @@ fn enrich_inner(
             gpu_share,
             gpu_fallback,
             gpu_kernel_seconds,
+            gpu_d2h_seconds,
+            gpu_write_seconds,
+            write_bw,
             gpu_transfer_bytes,
             gpu_h2d_seconds,
-            gpu_d2h_seconds,
             projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
             projection_columns: device_projection
                 .as_ref()
@@ -6811,9 +7042,11 @@ fn enrich_inner(
         gpu_share,
         gpu_fallback,
         gpu_kernel_seconds,
+        gpu_d2h_seconds,
+        gpu_write_seconds,
+        write_bw,
         gpu_transfer_bytes,
         gpu_h2d_seconds,
-        gpu_d2h_seconds,
         projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
         projection_columns: device_projection
             .as_ref()
@@ -6934,6 +7167,14 @@ pub fn run(args: &[String]) -> ! {
                 opts.gpu = GpuMode::On;
             }
             "--no-gpu" | "--cpu" => opts.gpu = GpuMode::Off,
+            "--write-bw" => {
+                let v = val!();
+                let mbps: f64 = v.parse().unwrap_or(0.0);
+                if !(mbps > 0.0) {
+                    fail("--write-bw needs a positive MB/s value");
+                }
+                opts.write_bw = Some(mbps * 1_000_000.0);
+            }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -7021,6 +7262,8 @@ INPUT / OUTPUT:
                           the CPU NaN/gap/bar_age contract; it is opt-in with
                           --gpu on until the 16M crossover is measured.
   --no-gpu, --cpu         force CPU
+  --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
+                          (default 222 MB/s on the shared ext4 store)
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout
 
