@@ -119,6 +119,11 @@ pub struct EvalSpec {
     /// the test block is only scored after that choice is fixed. Requires
     /// `validation_frac > 0`.
     pub candidates: Vec<String>,
+    /// #304: recompute each test block's long-only P&L through the fused
+    /// canonical reduction (the device kernel when available, the identical
+    /// CPU canonical path otherwise) and report it beside the scalar evaluator.
+    /// The scalar evaluator remains the reported authority.
+    pub device_pnl: bool,
     /// Reset every pool seam to flat (the historical behaviour). The default
     /// carries the ending position of one test block into the next, so pooled
     /// total variation includes `|p_end - q_start|`.
@@ -201,6 +206,36 @@ pub struct WindowResult {
     /// Time step inferred from the test timestamps, when it was inferable.
     pub inferred_period_seconds: Option<f64>,
     pub metrics: Metrics,
+    /// #304: fused canonical/device long-only P&L for this test block.
+    pub device_pnl: Option<DevicePnlCheck>,
+}
+
+/// #304: one test block's fused long-only reduction, plus the two benchmarks.
+#[derive(Clone, Debug)]
+pub struct DevicePnlCheck {
+    /// `cuda` when the device kernel ran, `cpu-canonical` when the identical
+    /// CPU segment reduction ran (non-CUDA build or no device).
+    pub backend: String,
+    pub segment_rows: usize,
+    pub tile_candidates: usize,
+    pub strategy: crate::trading_gpu::PnlTotals,
+    pub cash: crate::trading_gpu::PnlTotals,
+    pub buy_and_hold: crate::trading_gpu::PnlTotals,
+    /// Sum of the scalar evaluator's per-row net returns.
+    pub cpu_net: f64,
+    /// `strategy.net - cpu_net`; a screening check, not a reported P&L.
+    pub net_delta: f64,
+}
+
+/// #304: report-level summary of the fused reduction.
+#[derive(Clone, Debug)]
+pub struct DevicePnlSummary {
+    pub backend: String,
+    pub segment_rows: usize,
+    pub tile_candidates: usize,
+    pub windows: usize,
+    pub rows: u64,
+    pub max_abs_net_delta: f64,
 }
 
 /// The complete report for all windows plus the pooled series.
@@ -241,6 +276,8 @@ pub struct Report {
     pub memory_bound: String,
     /// #145: was the lockbox override explicitly set for this run?
     pub allow_lockbox: bool,
+    /// #304: fused long-only reduction summary when `--device-pnl` was set.
+    pub device_pnl: Option<DevicePnlSummary>,
     dropped_rows: usize,
 }
 
@@ -745,6 +782,7 @@ impl Accum {
                 cost_side,
                 ppy,
                 &mut fresh_previous,
+                spec.device_pnl,
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
@@ -756,6 +794,7 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut HashMap::new(),
+                    false,
                 )
             } else {
                 evaluate_window(
@@ -765,6 +804,7 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut pooled_previous,
+                    false,
                 )
             };
             if !spec.pool_reset_flat {
@@ -800,6 +840,7 @@ impl Accum {
                 dropped_rows: d.dropped,
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
+                device_pnl: ev.device,
             });
         }
 
@@ -814,6 +855,32 @@ impl Accum {
             "inferred from the median test time step (365-day year)".to_string()
         };
         let sign_test = fold_sign_test(&windows);
+        let device_pnl = if spec.device_pnl {
+            let mut backend = String::new();
+            let mut rows = 0u64;
+            let mut count = 0usize;
+            let mut max_abs_net_delta = 0.0f64;
+            for w in &windows {
+                if let Some(d) = &w.device_pnl {
+                    if backend.is_empty() {
+                        backend = d.backend.clone();
+                    }
+                    rows += d.strategy.rows;
+                    count += 1;
+                    max_abs_net_delta = max_abs_net_delta.max(d.net_delta.abs());
+                }
+            }
+            Some(DevicePnlSummary {
+                backend,
+                segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+                tile_candidates: crate::trading_gpu::MAX_TILE_CANDIDATES,
+                windows: count,
+                rows,
+                max_abs_net_delta,
+            })
+        } else {
+            None
+        };
         let selected_on = if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
@@ -849,6 +916,7 @@ impl Accum {
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
             allow_lockbox: spec.allow_lockbox,
+            device_pnl,
             dropped_rows: dropped,
         })
     }
@@ -1065,6 +1133,7 @@ struct WindowEval {
     stats: Stats,
     first_positions: HashMap<u64, f64>,
     end_positions: HashMap<u64, f64>,
+    device: Option<DevicePnlCheck>,
 }
 
 /// One timestamp's `(sum, count)` cross-section.
@@ -1176,6 +1245,7 @@ fn evaluate_window(
     cost_side: f64,
     ppy: f64,
     previous: &mut HashMap<u64, f64>,
+    device_pnl: bool,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
     // Non-finite score/target rows are dropped, exactly as before.
@@ -1260,6 +1330,65 @@ fn evaluate_window(
         }
     }
 
+    // #304: recompute the same long-only book through the fused canonical
+    // reduction. Rows are already in `(group, time)` order, which is the
+    // group-contiguous order the reducer requires. The scalar evaluator above
+    // stays the reported authority; this block is a device/canonical check.
+    let device = if device_pnl {
+        let mut ord_scores = Vec::with_capacity(n);
+        let mut ord_returns = Vec::with_capacity(n);
+        let mut ord_groups = Vec::with_capacity(n);
+        for &i in &order {
+            let row = &rows[valid[i]];
+            ord_scores.push(scores[valid[i]]);
+            ord_returns.push(row.target);
+            ord_groups.push(row.group);
+        }
+        let params = crate::trading_gpu::PnlParams {
+            threshold,
+            per_side_bps: cost_side * 10_000.0,
+            segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+            cash_return: 0.0,
+        };
+        #[cfg(feature = "cuda")]
+        let report = crate::trading_gpu::reduce_device(
+            &ord_scores,
+            &ord_returns,
+            &ord_groups,
+            &params,
+            256,
+            65_536,
+        );
+        #[cfg(feature = "cuda")]
+        let backend = if report.is_some() {
+            "cuda".to_string()
+        } else {
+            "cpu-canonical".to_string()
+        };
+        #[cfg(not(feature = "cuda"))]
+        let report: Option<crate::trading_gpu::PnlReport> = None;
+        #[cfg(not(feature = "cuda"))]
+        let backend = "cpu-canonical".to_string();
+        let report = match report {
+            Some(r) => r,
+            None => crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
+                .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e)),
+        };
+        let cpu_net = net.iter().sum::<f64>();
+        Some(DevicePnlCheck {
+            backend,
+            segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+            tile_candidates: crate::trading_gpu::MAX_TILE_CANDIDATES,
+            strategy: report.strategy,
+            cash: report.cash,
+            buy_and_hold: report.buy_and_hold,
+            cpu_net,
+            net_delta: report.strategy.net - cpu_net,
+        })
+    } else {
+        None
+    };
+
     // Equal-weight the groups present at each timestamp. Times are sorted so the
     // return series has the same order as the Python reference.
     let mut time_order = order;
@@ -1286,6 +1415,7 @@ fn evaluate_window(
         stats,
         first_positions,
         end_positions,
+        device,
     }
 }
 
@@ -1485,6 +1615,44 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #304: one fused-reduction total as JSON.
+fn pnl_totals_json(t: &crate::trading_gpu::PnlTotals) -> String {
+    format!(
+        "{{\"rows\":{},\"long_rows\":{},\"entries\":{},\"exits\":{},\
+         \"trades\":{},\"hits\":{},\"final_exits\":{},\"gross\":{},\
+         \"cost\":{},\"turnover\":{},\"net\":{},\"exposure\":{},\"hit_rate\":{}}}",
+        t.rows,
+        t.long_rows,
+        t.entries,
+        t.exits,
+        t.trades,
+        t.hits,
+        t.final_exits,
+        jnum(t.gross),
+        jnum(t.cost),
+        jnum(t.turnover),
+        jnum(t.net),
+        jnum(t.exposure()),
+        jnum(t.hit_rate())
+    )
+}
+
+fn device_pnl_json(d: &DevicePnlCheck) -> String {
+    format!(
+        "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
+         \"strategy\":{},\"cash\":{},\"buy_and_hold\":{},\
+         \"cpu_net\":{},\"net_delta\":{}}}",
+        jstr(&d.backend),
+        d.segment_rows,
+        d.tile_candidates,
+        pnl_totals_json(&d.strategy),
+        pnl_totals_json(&d.cash),
+        pnl_totals_json(&d.buy_and_hold),
+        jnum(d.cpu_net),
+        jnum(d.net_delta)
+    )
+}
+
 fn md_num(v: f64) -> String {
     if v.is_finite() {
         format!("{:.6}", v)
@@ -1541,7 +1709,7 @@ impl WindowResult {
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
-             \"metrics\":{}}}",
+             \"metrics\":{},\"device_pnl\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
             jnum(self.window.train_end),
@@ -1558,7 +1726,10 @@ impl WindowResult {
             self.test_rows,
             self.dropped_rows,
             self.inferred_period_seconds.map_or("null".to_string(), jnum),
-            self.metrics.json()
+            self.metrics.json(),
+            self.device_pnl
+                .as_ref()
+                .map_or("null".to_string(), device_pnl_json)
         )
     }
 }
@@ -1612,7 +1783,7 @@ impl Report {
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
              \"source\":{},\"memory_bound\":{},\"dropped_rows\":{},\
-             \"windows\":[{}],\"pooled\":{}}}",
+             \"device_pnl\":{},\"windows\":[{}],\"pooled\":{}}}",
             jstr(env!("CARGO_PKG_VERSION")),
             jstr(&self.expression),
             jstr(&self.target),
@@ -1651,6 +1822,18 @@ impl Report {
             jstr(&self.source),
             jstr(&self.memory_bound),
             self.dropped_rows,
+            self.device_pnl.as_ref().map_or("null".to_string(), |d| {
+                format!(
+                    "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
+                     \"windows\":{},\"rows\":{},\"max_abs_net_delta\":{}}}",
+                    jstr(&d.backend),
+                    d.segment_rows,
+                    d.tile_candidates,
+                    d.windows,
+                    d.rows,
+                    jnum(d.max_abs_net_delta)
+                )
+            }),
             windows.join(","),
             self.pooled.json()
         )

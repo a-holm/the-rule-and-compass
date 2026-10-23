@@ -152,7 +152,10 @@ boundary and charges the seam term `|p_end - q_start|` (pass
 `--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
 candidates by their validation error; the test block is never a selection
 input. The fold sign test is reported as not applicable for expanding folds
-because `test_k` lies inside `train_{k+1}`. See
+because `test_k` lies inside `train_{k+1}`. Pass `--device-pnl` to recompute
+each test block through the fused f64 long-only reduction (`src/trading_gpu.rs`
+plus the CUDA kernel `src/cuda/pnl.cu`) and report it with cash and
+buy-and-hold benchmarks; the scalar evaluator stays the reported authority. See
 [`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
 definitions and the reference-agreement check against the Python evaluator, and
 [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for the pinned 4M-row

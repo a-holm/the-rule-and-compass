@@ -72,6 +72,43 @@ selection on test. A single `--expr` keeps the original behaviour.
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
 
+## Fused long-only P&L (`--device-pnl`)
+
+`--device-pnl` recomputes each test block's long-only book through the fused
+reduction in `src/trading_gpu.rs` (device kernel `src/cuda/pnl.cu` when built
+with `--features cuda`, otherwise the identical canonical CPU segments). It is
+a cross-check beside the scalar evaluator; the scalar evaluator and its metrics
+remain the reported authority.
+
+The reduction is the same rule, with `f64` accumulation for every term:
+
+```
+p_i     = 1 if isfinite(score_i) and score_i > threshold else 0
+d_i     = p_i - p_{i-1},              p at a group start = 0
+gross_i = p_i * r_i
+cost_i  = s * |d_i| + [i is the group's last row] * s * p_i
+net_i   = gross_i - cost_i
+```
+
+* Positions are `{0, 1}`. A negative position is a hard error; there is no short
+  kernel.
+* A round trip costs `2s`; the final exit is charged exactly once per group, so
+  a book ending long pays one extra side. Flat is free.
+* `gross`, `cost`, `turnover` (`sum |d|`), `net`, exposure, entries, exits,
+  trades, hits and final exits are summed per canonical 8,192-row segment over
+  32 fixed virtual lanes (row offset modulo 32), merged by a fixed pairwise
+  lane tree and then in ascending segment order.
+* The device path never allocates `P x N`: candidates stream through a declared
+  tile of at most 8 candidates. Alone, padded, 4 k and 64 k chunks and
+  128/256/512 threads produce identical bits.
+* `cash` (`p = 0`, zero net and cost by default) and `buy-and-hold`
+  (`p = 1`, `net = sum(r) - 2s * groups`) are reported with the strategy block.
+
+The JSON gains a `device_pnl` object per window and a report-level summary with
+`backend`, `segment_rows`, `tile_candidates`, `rows` and
+`max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
+`cpu-canonical` on a non-CUDA build or when no device is available.
+
 ## Metrics
 
 Per window and pooled:
