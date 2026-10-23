@@ -240,6 +240,7 @@ pub fn json() -> String {
 {{\"name\":\"--eth-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"ETH benchmark store when --data does not contain it\"}},\
 {{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; auto uses a registered exact kernel only when it beats the CPU, on forces it above the 1M-row floor, off runs the CPU reference\"}},\
 {{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
+{{\"name\":\"--write-bw\",\"type\":\"float\",\"default\":\"222 MB/s\",\"description\":\"measured sequential write bandwidth for cost model v2; the write term is charged separately from D2H\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout\"}}]}},\n  \

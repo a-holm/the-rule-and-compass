@@ -168,6 +168,13 @@ fn gpu_columns_match_cpu_and_report_the_share() {
         "GPU share {:.3}, kernel {:.4}s, transfer {} bytes",
         gpu.gpu_share, gpu.gpu_kernel_seconds, gpu.gpu_transfer_bytes
     );
+    eprintln!(
+        "feature {:.3}s, d2h {:.3}s, gpu staging write {:.3}s, write_bw {:.0} B/s",
+        gpu.feature_seconds, gpu.gpu_d2h_seconds, gpu.gpu_write_seconds, gpu.write_bw
+    );
+    assert!(gpu.gpu_d2h_seconds > 0.0, "D2H must be recorded separately");
+    assert!(gpu.gpu_write_seconds > 0.0, "output staging write must be timed");
+    assert!(gpu.write_bw > 0.0);
 
     // Same-column feature hashes are reported for both paths. The elementwise
     // and non-transcendental families are bit-identical; the report keeps the
@@ -292,5 +299,117 @@ fn advertised_catalogue_matches_between_cpu_and_gpu_on_a_large_store() {
         compared >= advertised.len(),
         "compared only {compared} numeric columns for {} advertised names",
         advertised.len()
+    );
+}
+
+/// #300: the batched output arena returns exactly the same values as the
+/// per-column path, with one pinned chunked D2H per block and no per-column
+/// download.
+#[test]
+fn batch_output_matches_per_column_downloads() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let rows = 20_000usize;
+    let step = 3600i64;
+    let mut times = Vec::with_capacity(rows);
+    let mut open = Vec::with_capacity(rows);
+    let mut high = Vec::with_capacity(rows);
+    let mut low = Vec::with_capacity(rows);
+    let mut close = Vec::with_capacity(rows);
+    let mut volume = Vec::with_capacity(rows);
+    let mut qvolume = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let p = 100.0 + (i as f64 * 0.013).sin() * 7.0;
+        times.push(i as i64 * step + if i > 12_000 { 5 * step } else { 0 });
+        open.push(p);
+        high.push(p + 0.4);
+        low.push(p - 0.3);
+        close.push(p + (i as f64 * 0.11).sin() * 0.1);
+        volume.push(10.0 + (i % 97) as f64);
+        qvolume.push(1000.0 + (i % 89) as f64);
+    }
+    let starts = [0u32, 10_000u32];
+    let lens = [10_000u32, 10_000u32];
+    let mut gpu = rcsr::enrich_gpu::EnrichGpu::new(
+        &times, &open, &high, &low, &close, &volume, &qvolume, &starts, &lens, step,
+    )
+    .expect("device context");
+    assert!(
+        gpu.batch_capacity() >= 3,
+        "a 20k-row block should fit several columns in the 64 MiB arena"
+    );
+
+    // Reference: the existing one-column-at-a-time entry points.
+    let want = vec![
+        ("r5", gpu.ret(5).unwrap()),
+        ("ma20", gpu.ma(20).unwrap()),
+        ("vol20", gpu.vol(20).unwrap()),
+        ("range1", gpu.range().unwrap()),
+        ("clv1", gpu.clv().unwrap()),
+        ("dow_sin", gpu.calendar(0).unwrap()),
+        ("ema20", gpu.ema(20).unwrap()),
+        ("rsi6", gpu.rsi_py(6).unwrap()),
+        ("atr50", gpu.atr_py(50).unwrap()),
+        ("don20", gpu.donchian(20).unwrap()),
+        ("lag_r1_3", gpu.lag(3).unwrap()),
+        ("vz96", gpu.vz(96).unwrap()),
+        ("bb20_bw", gpu.bb_width(20).unwrap()),
+    ];
+    let (m, s, h) = gpu.macd().unwrap();
+
+    use rcsr::enrich_gpu::BatchOp;
+    let ops: Vec<BatchOp> = vec![
+        BatchOp::ret(5),
+        BatchOp::ma(20),
+        BatchOp::vol(20),
+        BatchOp::range(),
+        BatchOp::clv(),
+        BatchOp::calendar(0),
+        BatchOp::ema(20),
+        BatchOp::rsi(6),
+        BatchOp::atr(50),
+        BatchOp::donchian(20),
+        BatchOp::lag(3),
+        BatchOp::vz(96),
+        BatchOp::bb_width(20),
+        BatchOp::macd(),
+    ];
+    let before = gpu.stats();
+    {
+        let block = gpu.batch(&ops).expect("batched output block");
+        assert_eq!(block.len(), want.len() + 3);
+        for (i, (name, expected)) in want.iter().enumerate() {
+            let got = block.column(i);
+            assert_eq!(got.len(), expected.len(), "column {name} length");
+            assert!(
+                got.iter()
+                    .zip(expected.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "column {name} differs"
+            );
+        }
+        for (i, expected) in [m.as_slice(), s.as_slice(), h.as_slice()].iter().enumerate() {
+            let got = block.column(want.len() + i);
+            assert!(
+                got.iter()
+                    .zip(expected.iter())
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "macd slot {i} differs"
+            );
+        }
+    }
+    let after = gpu.stats();
+    let delta = after.since(&before);
+    let expected_bytes = rows as u64 * 8 * (want.len() as u64 + 3);
+    assert_eq!(delta.d2h_bytes, expected_bytes);
+    assert!(delta.d2h_s > 0.0, "the pinned D2H window must be measured");
+    assert!(delta.kernel_s > 0.0);
+    eprintln!(
+        "# batch block: {} columns, d2h {:.3} ms, kernel {:.3} ms",
+        ops.iter().map(|o| o.slots()).sum::<usize>(),
+        delta.d2h_s * 1e3,
+        delta.kernel_s * 1e3
     );
 }

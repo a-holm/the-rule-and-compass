@@ -40,6 +40,26 @@ pub const GPU_FIT_BYTES_PER_CELL: u64 = 8;
 pub const SLACK_NUM: u64 = 5;
 pub const SLACK_DEN: u64 = 4;
 
+/// #300: the per-family GPU output arena is capped at 64 MiB. A block whose
+/// columns do not fit falls back to per-column staging, so this bound holds for
+/// every column count.
+pub const GPU_OUTPUT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+/// #300: the pinned host mirror has the same bound as the device arena.
+pub const GPU_PINNED_STAGE_BYTES: u64 = GPU_OUTPUT_ARENA_BYTES;
+/// #300: `TempColumn` stages a feature file in 64 KiB blocks; two buffers can
+/// be live while a batch block is written.
+pub const ENRICH_TEMP_WRITE_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// #300: resident bytes charged for the batched enrichment output path.
+/// `rows × columns × 8` is bounded by the arena, so the result never grows
+/// without limit when a 358-column catalogue is enriched.
+pub fn enrich_output_stage_bytes(rows: u64, columns: u64) -> u64 {
+    rows.saturating_mul(columns)
+        .saturating_mul(8)
+        .min(GPU_OUTPUT_ARENA_BYTES)
+        .saturating_add(ENRICH_TEMP_WRITE_CHUNK_BYTES)
+}
+
 /// The sample path may use at most 60 % of the budget.
 pub const SAMPLE_BUDGET_NUM: u64 = 6;
 pub const SAMPLE_BUDGET_DEN: u64 = 10;

@@ -60,9 +60,47 @@ typedef struct RcEnrich {
     double *d_out;
     double *d_out2;
     double *d_out3;
+    /* #300: one output arena per family block plus its pinned host mirror.
+       The arena is capped at RC_BATCH_ARENA_BYTES; a family block that does
+       not fit falls back to the per-column staging path. */
+    double *d_batch;
+    double *h_pinned;
+    int batch_cap;
     RcEnrichStats last;
     double batch_start_ms;
 } RcEnrich;
+
+/* #300: hard cap for the per-family output arena and the pinned D2H mirror. */
+#define RC_BATCH_ARENA_BYTES (64ULL * 1024ULL * 1024ULL)
+#define RC_BATCH_CHUNK_BYTES (4ULL * 1024ULL * 1024ULL)
+
+/* #300: operation descriptors for the batched output path. The parameter
+   meanings match the single-column entry points below. */
+enum {
+    RC_OP_RET = 1,
+    RC_OP_LAG,
+    RC_OP_RANGE,
+    RC_OP_CLV,
+    RC_OP_CALENDAR,
+    RC_OP_MA,
+    RC_OP_VOL,
+    RC_OP_BB_WIDTH,
+    RC_OP_VZ,
+    RC_OP_DONCHIAN,
+    RC_OP_EMA,
+    RC_OP_RSI,
+    RC_OP_ATR,
+    RC_OP_LABEL,
+    RC_OP_MACD
+};
+
+typedef struct RcEnrichOp {
+    int kind;
+    int a;
+    int b;
+    int c;
+    double param;
+} RcEnrichOp;
 
 static double rc_now_ms(void)
 {
@@ -884,6 +922,12 @@ void rc_enrich_destroy(void *v)
     cudaFree(c->d_out);
     cudaFree(c->d_out2);
     cudaFree(c->d_out3);
+    cudaFree(c->d_batch);
+#if defined(RCSR_UNIFIED)
+    /* Managed memory needs no host free. */
+#else
+    if (c->h_pinned) cudaFreeHost(c->h_pinned);
+#endif
     free(c);
 }
 
@@ -1116,6 +1160,208 @@ int rc_enrich_label(void *v, int horizon, double cost_bps, int vol_window, int s
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
 }
+
+/* #300: launch one descriptor into `c->d_out` (and `d_out2/d_out3` for MACD),
+   with no host download. Returns the number of output slots written. */
+static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
+{
+    int threads = 256, blocks = (c->n + threads - 1) / threads;
+    int sthreads = 128, sblocks = (c->nseg + sthreads - 1) / sthreads;
+    switch (op->kind) {
+    case RC_OP_RET:
+        k_ret<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+                                   c->n, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_LAG:
+        k_lag<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+                                   c->n, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_RANGE:
+        k_range<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+                                     c->n, c->d_out);
+        return 1;
+    case RC_OP_CLV:
+        k_clv<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+                                   c->n, c->d_out);
+        return 1;
+    case RC_OP_CALENDAR:
+        k_calendar<<<blocks, threads>>>(c->d_times, c->n, op->a, c->d_out);
+        return 1;
+    case RC_OP_MA:
+        k_ma<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                    c->d_seg_len, c->nseg, c->step, op->a,
+                                    c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_VOL:
+        k_vol<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                     c->d_seg_len, c->nseg, c->step, op->a,
+                                     c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+        return 1;
+    case RC_OP_BB_WIDTH:
+        k_bb_width<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                          c->d_seg_len, c->nseg, c->step, op->a,
+                                          c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_VZ:
+        k_vz<<<sblocks, sthreads>>>(c->d_times, c->d_volume, c->d_seg_start,
+                                    c->d_seg_len, c->nseg, c->step, op->a,
+                                    c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+        return 1;
+    case RC_OP_DONCHIAN:
+        k_donchian<<<sblocks, sthreads>>>(c->d_times, c->d_high, c->d_low,
+                                          c->d_close, c->d_seg_start, c->d_seg_len,
+                                          c->nseg, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_EMA:
+        k_ema_ratio<<<sblocks, sthreads>>>(c->d_times, c->d_close,
+                                           c->d_seg_start, c->d_seg_len, c->nseg,
+                                           c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_RSI:
+        k_rsi_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                        c->d_seg_len, c->nseg, c->step, op->a,
+                                        c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_ATR:
+        k_atr_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_high,
+                                        c->d_low, c->d_seg_start, c->d_seg_len,
+                                        c->nseg, c->step, op->a, c->d_a, c->d_out);
+        return 1;
+    case RC_OP_LABEL:
+        k_label<<<sblocks, sthreads>>>(c->d_times, c->d_open, c->d_close,
+                                       c->d_seg_start, c->d_seg_len, c->nseg,
+                                       c->step, op->a, op->param, op->b,
+                                       op->c, c->d_out);
+        return 1;
+    case RC_OP_MACD:
+        k_macd<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                      c->d_seg_len, c->nseg, c->step, c->d_out,
+                                      c->d_out2, c->d_out3);
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+int rc_enrich_batch_capacity(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c || c->n <= 0) return 0;
+    size_t col_bytes = (size_t)c->n * sizeof(double);
+    if (col_bytes == 0 || col_bytes > RC_BATCH_ARENA_BYTES) return 0;
+    return (int)(RC_BATCH_ARENA_BYTES / col_bytes);
+}
+
+double *rc_enrich_batch_host(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    return c ? c->h_pinned : NULL;
+}
+
+int rc_enrich_batch_run(void *v, const RcEnrichOp *ops, int nops)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c || !ops || nops <= 0) return -1;
+    int cap = rc_enrich_batch_capacity(c);
+    if (cap <= 0) return -1;
+    int total_slots = 0;
+    for (int i = 0; i < nops; ++i) {
+        int s = ops[i].kind == RC_OP_MACD ? 3 : 1;
+        total_slots += s;
+    }
+    if (total_slots <= 0 || total_slots > cap) return -1;
+    size_t col_bytes = (size_t)c->n * sizeof(double);
+    size_t bytes = col_bytes * (size_t)total_slots;
+    int ok = 1;
+    stats_begin(c);
+    if (!c->d_batch) {
+        double t0 = rc_now_ms();
+        if (rc_alloc((void **)&c->d_batch, (size_t)cap * col_bytes) != 0) ok = 0;
+        c->last.alloc_ms += rc_now_ms() - t0;
+    }
+#if defined(RCSR_UNIFIED)
+    if (ok && !c->h_pinned) c->h_pinned = c->d_batch;
+#else
+    if (ok && !c->h_pinned) {
+        double t0 = rc_now_ms();
+        if (cudaHostAlloc((void **)&c->h_pinned, (size_t)cap * col_bytes,
+                          cudaHostAllocDefault) != cudaSuccess) {
+            ok = 0;
+        }
+        c->last.alloc_ms += rc_now_ms() - t0;
+    }
+#endif
+    if (!ok) {
+        stats_end(c);
+        c->last.failed = 1;
+        return -1;
+    }
+    c->batch_cap = cap;
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    double l = rc_now_ms();
+    int slot = 0;
+    for (int i = 0; i < nops && ok; ++i) {
+        int written = rc_batch_launch(c, &ops[i]);
+        if (written <= 0 || slot + written > total_slots) {
+            ok = 0;
+            break;
+        }
+        cudaMemcpyAsync(c->d_batch + (size_t)slot * c->n, c->d_out,
+                        col_bytes, cudaMemcpyDeviceToDevice, 0);
+        if (written == 3) {
+            cudaMemcpyAsync(c->d_batch + (size_t)(slot + 1) * c->n, c->d_out2,
+                            col_bytes, cudaMemcpyDeviceToDevice, 0);
+            cudaMemcpyAsync(c->d_batch + (size_t)(slot + 2) * c->n, c->d_out3,
+                            col_bytes, cudaMemcpyDeviceToDevice, 0);
+        }
+        slot += written;
+    }
+    c->last.launch_ms += rc_now_ms() - l;
+    if (ok && slot != total_slots) ok = 0;
+    double s = rc_now_ms();
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    c->last.sync_ms += rc_now_ms() - s;
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms += ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+
+    if (ok) {
+        /* One chunked 2-D copy for the whole block: the source and destination
+           pitch are one full column, so each chunk carries every column's
+           same row range and no per-column download is issued. */
+        size_t chunk_rows = RC_BATCH_CHUNK_BYTES / (size_t)(total_slots * sizeof(double));
+        if (chunk_rows < 1) chunk_rows = 1;
+        double d = rc_now_ms();
+        for (size_t off = 0; off < (size_t)c->n && ok; off += chunk_rows) {
+            size_t rows = (size_t)c->n - off;
+            if (rows > chunk_rows) rows = chunk_rows;
+            cudaError_t rc = cudaMemcpy2DAsync(
+                c->h_pinned + off, col_bytes,
+                c->d_batch + off, col_bytes,
+                rows * sizeof(double), (size_t)total_slots,
+                cudaMemcpyDeviceToHost, 0);
+            if (rc != cudaSuccess) ok = 0;
+        }
+        if (ok) {
+            cudaError_t rc = cudaDeviceSynchronize();
+            if (rc != cudaSuccess) ok = 0;
+        }
+        c->last.d2h_ms += rc_now_ms() - d;
+        c->last.d2h_bytes += (unsigned long long)bytes;
+    }
+    stats_end(c);
+    c->last.batch = 1;
+    c->last.failed = ok ? 0 : 1;
+    return ok ? 0 : -1;
+}
+
 
 /* Stable segmented rank. `keys`, `rows`, `offsets` and `gid` are host arrays
    built in the same (time, symbol, row) order as the CPU reference; the sort

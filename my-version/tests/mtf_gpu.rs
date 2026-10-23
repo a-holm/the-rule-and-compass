@@ -170,7 +170,11 @@ fn gpu_mtf_36_columns_match_cpu_and_dispatch_without_fallback() {
     assert_eq!(auto.gpu_columns, 0);
     let auto_plan = auto.plans.iter().find(|p| p.group == "mtf").expect("auto mtf plan");
     assert_eq!(auto_plan.backend, "cpu");
-    assert!(auto_plan.reason.contains("crossover"), "reason: {}", auto_plan.reason);
+    assert!(
+        auto_plan.reason.contains("crossover") || auto_plan.reason.contains("not below"),
+        "reason: {}",
+        auto_plan.reason
+    );
     for (a, b) in auto.features.iter().zip(cpu.features.iter()) {
         assert_eq!(a.name, b.name);
         assert_eq!(a.hash, b.hash, "auto MTF must stay the CPU reference");

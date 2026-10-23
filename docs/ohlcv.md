@@ -564,14 +564,29 @@ every chunk size (tested). Cross-sectional ties are resolved by symbol and row
 order.
 
 The CPU path is always present. `plan_groups` estimates CPU time and GPU time
-(kernel + two transfers + the one-time resident upload) per family from rows,
+(kernel + transfers + the one-time resident upload) per family from rows,
 output columns and operation class (elementwise, calendar trig, rolling
-sum/std/extrema, Wilder scan, segmented rank, join). A family is dispatched to
-the GPU only when a device is usable, the store has at least one million rows,
-an exact kernel is registered for those columns, and the estimated GPU time is
-*strictly* lower than the CPU time. The context and source columns are uploaded
-once per run; a second family does not re-upload `time/open/high/low/close/
-volume/quote_volume`.
+sum/std/extrema, Wilder scan, segmented rank, join). Cost model v2 (#300) adds
+the output write explicitly:
+
+```text
+gpu_s = fixed + context(n) + h2d/BW_h2d + cells/rate_kernel
+      + d2h/BW_d2h + write_bytes/BW_write
+```
+
+`BW_write` is measured, not assumed. On the shared ext4 store a 512 MiB
+`dd conv=fdatasync` measured **222 MB/s** (2026-10-23); the same disk measured
+about **62 MB/s** for a 1.96 GB feature-staging pass while hashing per column,
+which is why the report prints raw `write_s` next to `d2h_s` and `kernel_s`.
+`--write-bw <MB/s>` overrides the planner constant for another filesystem, and
+`tests/enrich.rs::measure_write_bandwidth_on_a_filesystem` re-measures it
+(`RCSR_BW_DIR=<dir> cargo test --release --test enrich measure_write_bandwidth
+-- --ignored --nocapture`). A family is dispatched to the GPU only when a device
+is usable, the store has at least one million rows, an exact kernel is
+registered for those columns, and the estimated GPU time is *strictly* lower
+than the CPU time. The context and source columns are uploaded once per run; a
+second family does not re-upload `time/open/high/low/close/volume/
+quote_volume`.
 
 `--gpu auto` (the default) applies the cost model. `--gpu on` *forces* every
 registered kernel above the row floor, which is how the parity fixture exercises
@@ -585,8 +600,9 @@ labels run one thread per symbol segment in the same operation order as the CPU,
 with `-fmad=false` so multiply-add association is identical. Cross-sectional
 ranks use a stable segmented radix sort with the CPU's `(time, symbol, row)` tie
 order. All accumulation is f64. The report records `gpu_columns`,
-`cpu_columns`, `gpu_share`, `fallback`, kernel seconds and transfer bytes in both
-the text log and the JSON sidecar.
+`cpu_columns`, `gpu_share`, `fallback`, kernel, D2H, staging-write seconds,
+transfer bytes and the charged `write_bw` in both the text log and the JSON
+sidecar.
 
 ### GPU enrichment measurement (2026-10-21)
 
@@ -710,6 +726,40 @@ feature phase, same machine and load class):
 On the 16.1M-row cell the CPU arm went from 1408.5 s to 900.7 s (23:30 -> 15:01)
 with the **same output SHA-256** (`a4c99c95...`): the 27.26 GB second read
 disappeared and the bytes did not change.
+
+### Batched output arc and pinned chunked D2H (#300)
+
+The GPU output path no longer allocates one host `Vec` and issues one download
+per feature column. `EnrichGpu::batch` takes a block of feature descriptors,
+launches the kernels back-to-back into one device arena, and copies the whole
+block out with a single pinned `cudaMemcpy2DAsync` per row chunk (4 MiB chunks;
+source and destination pitch are one full column). The host then writes the
+columns sequentially to their temp files, preserving the exact per-column bytes,
+hashes and output order.
+
+The arena and its pinned mirror are capped at **64 MiB**
+(`GPU_OUTPUT_ARENA_BYTES`). A block whose columns do not fit — at 16.1M rows one
+`f64` column is 128 MiB, so even one column exceeds the cap — falls back to the
+per-column staging path with the reason recorded. `RCSR_ENRICH_GPU_BATCH=0`
+selects the per-column path for an A/B measurement. The report now carries
+`gpu.kernel_s`, `gpu.d2h_s`, `gpu.write_s`, `gpu.transfer_bytes` and the
+`write_bw` charged by the planner, separately.
+
+Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
+--dry-run` (same input, same 118 dispatched columns, alternating order, two runs
+each):
+
+| path | feature phase (mean) | kernel | D2H | staging write |
+|---|---:|---:|---:|---:|
+| batched arena | **33.75 s** | 0.23 s | **0.31 s** | 31.68 s |
+| per-column | 34.40 s | 0.22 s | 0.84 s | 31.60 s |
+
+The pinned block cuts D2H by **2.7x** and the whole feature phase by about
+**2 %**; it is write-bound, not transfer-bound. The 1.96 GB of temp output took
+31.6 s (about 62 MB/s including per-column SHA-256), which is the floor the cost
+model now exposes. No 16.1M full-catalogue paired run is claimed here: the
+64 MiB arena forbids batching at that width, so that arm keeps the per-column
+staging path and its 180–300 s write floor.
 
 ### Measured enrichment (2026-10-21)
 
