@@ -231,6 +231,7 @@ fn eval_spec(windows: Vec<Window>) -> EvalSpec {
         embargo: None,
         cost_bps: 10.0,
         threshold_quantile: 0.7,
+        threshold_fixed: None,
         validation_frac: 0.0,
         periods_per_year: None,
         candidates: Vec::new(),

@@ -47,6 +47,7 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         embargo: None,
         cost_bps: 10.0,
         threshold_quantile: 0.70,
+        threshold_fixed: None,
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
         candidates: Vec::new(),
@@ -197,7 +198,7 @@ fn known_expression_threshold_costs_and_metrics() {
     // The first test period is -2% from the start; the final exit makes the
     // last period -2% as well, so the peak-to-trough is still -2%.
     assert!((w.metrics.max_drawdown - (-0.02)).abs() < 1e-15);
-    assert_eq!(w.threshold_source, "train");
+    assert_eq!(w.threshold_source, "train_type7");
 }
 
 #[test]
@@ -266,12 +267,12 @@ fn threshold_uses_only_train_or_validation_rows() {
     s.threshold_quantile = 0.5;
     let r = walkforward::run_table(&t, &s, "test").unwrap();
     assert!((r.windows[0].threshold - 1.5).abs() < 1e-15);
-    assert_eq!(r.windows[0].threshold_source, "train");
+    assert_eq!(r.windows[0].threshold_source, "train_type7");
 
     // With a validation slice, the threshold comes from the trailing half.
     s.validation_frac = 0.5;
     let r = walkforward::run_table(&t, &s, "test").unwrap();
-    assert_eq!(r.windows[0].threshold_source, "validation");
+    assert_eq!(r.windows[0].threshold_source, "validation_type7");
     assert_eq!(r.windows[0].validation_rows, 2);
     assert!((r.windows[0].threshold - 2.5).abs() < 1e-15);
 }

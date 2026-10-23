@@ -186,7 +186,8 @@ pub fn json() -> String {
 {{\"name\":\"--horizon\",\"type\":\"float\",\"default\":\"0\",\"description\":\"forward-label horizon in seconds; minimum purge/embargo\"}},\
 {{\"name\":\"--embargo\",\"type\":\"float\",\"default\":\"horizon\",\"description\":\"extra gap between train_end and test_start\"}},\
 {{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"10\",\"description\":\"cost per side in basis points\"}},\
-{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"training/validation score quantile\"}},\
+{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"exact type-7 training/validation score quantile; order-preserving radix select, f64 interpolation\"}},\
+{{\"name\":\"--threshold-fixed\",\"type\":\"float\",\"default\":\"none\",\"description\":\"pre-registered fixed threshold instead of a quantile; reported with threshold_source = fixed\"}},\
 {{\"name\":\"--policy\",\"type\":\"enum\",\"default\":\"threshold\",\"description\":\"threshold | band | dp; band is a long-only no-trade band, dp keeps the threshold book and reports an exact hindsight bound (never a strategy P&L)\"}},\
 {{\"name\":\"--band\",\"type\":\"float\",\"default\":\"0\",\"description\":\"half-width beta of the no-trade band in score units; beta=0 with --policy band reproduces the threshold rule\"}},\
 {{\"name\":\"--min-hold\",\"type\":\"int\",\"default\":\"1\",\"description\":\"minimum consecutive long rows before a band exit\"}},\
