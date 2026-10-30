@@ -5424,6 +5424,37 @@ mod tests {
     }
 
     #[test]
+    fn printed_r6_law_with_its_five_constants_involves_the_bias_and_the_offset() {
+        // The 10 h run's rank-6 law in the search's normalised inputs:
+        // c0 + c1/(c2 + exp(z_vol96)) + c3*(c4 - z_macd_hist), with
+        // df/dc0 = 1 and df/dc4 = c3. c0 and c4 only enter as c0 + c3*c4.
+        let x = spread_rows(60, 2);
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        constant(-0.0252),
+                        node(
+                            Op::Div,
+                            vec![constant(-0.0261), node(Op::Add, vec![constant(-0.2172), node(Op::Exp, vec![input(0)])])],
+                        ),
+                    ],
+                ),
+                node(Op::Mul, vec![constant(0.0074), node(Op::Sub, vec![constant(-0.0108), input(1)])]),
+            ],
+        );
+        let y: Vec<f64> = x.iter().enumerate().map(|(i, r)| -0.0827 + 0.01 * r[0] + 0.02 * wiggle(i, 2.0)).collect();
+        let e = constant_errors(&tree, &x, &y).expect("errors");
+        assert_eq!(e.rank, 4, "{e:?}");
+        assert_eq!(e.involved, vec![0, 4]);
+        assert!(e.ill_conditioned && !e.identified());
+        assert!(e.std_errors[0].is_infinite() && e.std_errors[4].is_infinite());
+        assert!(e.std_errors[1].is_finite() && e.std_errors[2].is_finite() && e.std_errors[3].is_finite());
+    }
+
+    #[test]
     fn near_collinear_but_identified_reports_condition_index() {
         let rho: f64 = 1.0 - 1e-6;
         let s = (1.0 - rho * rho).sqrt();

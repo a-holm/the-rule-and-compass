@@ -85,6 +85,9 @@ pub struct MemberInput<'a> {
     pub hash: u64,
     pub expression: &'a str,
     pub identified: bool,
+    /// False when the member must never be selected for a reason outside the
+    /// loss comparison (negative return-space R2 on the selection sample).
+    pub presentable: bool,
     pub val_pred: &'a [f64],
     pub test_pred: &'a [f64],
 }
@@ -131,7 +134,7 @@ pub struct GateConfig {
 #[derive(Clone, Debug, Default)]
 pub struct MemberGate {
     pub identified: bool,
-    /// Identified with a finite validation loss: part of the walk.
+    /// Identified and presentable with a finite validation loss: part of the walk.
     pub eligible: bool,
     pub supported: bool,
     /// Label of the entry that blocked it, `delta` and `se`.
@@ -233,7 +236,7 @@ pub fn evaluate(
         .enumerate()
         .map(|(i, m)| MemberGate {
             identified: m.identified,
-            eligible: have_val && m.identified && member_val[i].is_some(),
+            eligible: have_val && m.identified && m.presentable && member_val[i].is_some(),
             ..MemberGate::default()
         })
         .collect();
@@ -393,6 +396,7 @@ mod tests {
         preds: Vec<Vec<f64>>,
         costs: Vec<f64>,
         identified: Vec<bool>,
+        presentable: Vec<bool>,
     }
 
     fn members<'a>(f: &'a Fixture, test: &'a [f64], names: &'a [String]) -> Vec<MemberInput<'a>> {
@@ -403,6 +407,7 @@ mod tests {
                 hash: i as u64,
                 expression: &names[i],
                 identified: f.identified[i],
+                presentable: f.presentable[i],
                 val_pred: &f.preds[i],
                 test_pred: test,
             })
@@ -417,7 +422,7 @@ mod tests {
         let a = series(|t| r(t) - 0.20 - p1(t));
         let b: Vec<f64> = (0..T).map(|t| a[t] - 0.05 - p2(t)).collect();
         let c: Vec<f64> = (0..T).map(|t| a[t] - 0.15 - p2(t)).collect();
-        Fixture { preds: vec![a, b, c], costs: vec![3.0, 5.0, 8.0], identified: vec![true; 3] }
+        Fixture { preds: vec![a, b, c], costs: vec![3.0, 5.0, 8.0], identified: vec![true; 3], presentable: vec![true; 3] }
     }
 
     fn run(f: &Fixture) -> GateReport {
@@ -456,7 +461,7 @@ mod tests {
     fn an_equivalent_cheap_member_does_not_block_a_better_one() {
         let a = series(|t| r(t) - 0.09 - 2.0 * p1(t));
         let b = series(|t| r(t) - 0.25 - p2(t));
-        let f = Fixture { preds: vec![a, b], costs: vec![3.0, 5.0], identified: vec![true; 2] };
+        let f = Fixture { preds: vec![a, b], costs: vec![3.0, 5.0], identified: vec![true; 2], presentable: vec![true; 2] };
         let rep = run(&f);
         let za = rep.members[0].validation[0].delta / rep.members[0].validation[0].se;
         let zb = rep.members[1].validation[0].delta / rep.members[1].validation[0].se;
@@ -470,7 +475,7 @@ mod tests {
     #[test]
     fn supported_but_not_beyond_bonferroni_is_no_signal() {
         let a = series(|t| r(t) - 0.15 - p1(t));
-        let f = Fixture { preds: vec![a], costs: vec![3.0], identified: vec![true] };
+        let f = Fixture { preds: vec![a], costs: vec![3.0], identified: vec![true], presentable: vec![true] };
         let rep = run(&f);
         assert!(rep.members[0].supported);
         assert!(close(rep.z_null, 1.6448536270, 1e-9));
@@ -488,6 +493,18 @@ mod tests {
         assert_eq!(rep.selected_rank, Some(1));
         assert!(!rep.supported_ranks.contains(&3));
         // The unidentified member is still compared.
+        assert!(!rep.members[2].validation.is_empty());
+        assert_eq!(rep.eligible, 2);
+    }
+
+    #[test]
+    fn non_presentable_members_are_never_supported_or_selected() {
+        let mut f = walk_fixture();
+        f.presentable[2] = false;
+        let rep = run(&f);
+        assert!(!rep.members[2].supported && !rep.members[2].eligible);
+        assert_eq!(rep.selected_rank, Some(1));
+        assert!(!rep.supported_ranks.contains(&3));
         assert!(!rep.members[2].validation.is_empty());
         assert_eq!(rep.eligible, 2);
     }
@@ -531,6 +548,7 @@ mod tests {
             hash: m.hash,
             expression: m.expression,
             identified: m.identified,
+            presentable: m.presentable,
             val_pred: m.val_pred,
             test_pred: m.test_pred,
         }

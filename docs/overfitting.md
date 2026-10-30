@@ -478,6 +478,8 @@ A Pareto front lists models; it does not say whether any of them beats a trivial
 
 **Per-member flags.** Every member reports `comparisons.validation` and `comparisons.test` against each reference (`delta`, `se`, `better|equivalent|worse` at `z`) and the flags `beats_mean_test`, `beats_zero_param_test`, `beats_mean_validation`, `beats_zero_param_validation` (null without a structure) and `validated` (the member is the selected one). With a target spec, `return_space` reports for each slice the correlation of `r_hat = c + m*g*y_hat` with `r` and `R2 = 1 - SSE/SS0` against the zero return forecast, using `TargetSpec::return_from_target`. Rows at a clip bound are excluded because the label only bounds the return there.
 
+**Presentation rule.** A member whose return-space `r2_vs_zero` on the validation sample is negative is not presentable: it reports `presentable: false` with `presentable_reason: "negative_return_r2_on_validation"`, takes no part in the supported-front walk and is never `selected_rank`. It stays in `pareto` with all its comparisons. The test block never decides presentability. Without a target spec every member is presentable.
+
 **Shuffled test.** Permuting the targets of the test block changes `comparisons.test` only. `selection`, `noise` and every `gates` object are byte-identical.
 
 ### 3.11 Stability selection — implemented
