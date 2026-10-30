@@ -328,10 +328,10 @@ fn weighted_labels_ignore_masked_rows() {
 
 // --------------------------------------------------------- the search gate --
 
-/// #289: `gpu_blocker` admits the classification objectives and refuses `auc`
-/// with a named reason instead of the old generic "classification metric". A
-/// weighted regression run is still refused because its kernel has no weight
-/// path yet.
+/// #289/#288: `gpu_blocker` admits the classification objectives. `auc` is an
+/// exact rank statistic (#288): it is admitted from the order/rank row floor on
+/// a two-valued target and names the floor below it. A weighted regression run
+/// is still refused because its kernel has no weight path yet.
 #[cfg(feature = "cuda")]
 #[test]
 fn the_device_gate_admits_classification_and_names_auc() {
@@ -350,7 +350,9 @@ fn the_device_gate_admits_classification_and_names_auc() {
         );
     }
     let why = search::backend_blocker_reason(&cfg(Metric::Auc), &s).unwrap();
-    assert!(why.contains("auc") && why.contains("#288"), "{why}");
+    assert!(why.contains("4096-row device floor"), "{why}");
+    let big = binary_sample(fit::MEDIAN_GPU_MIN_ROWS + 64, 0.5, 0.1, 2);
+    assert_eq!(search::backend_blocker_reason(&cfg(Metric::Auc), &big), None);
     // A weighted classification run is admitted; a weighted squared run is not.
     s.w = vec![1.0; s.len()];
     assert_eq!(
