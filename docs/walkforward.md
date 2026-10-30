@@ -33,6 +33,36 @@ set; the test block is never consulted. Quantiles use linear interpolation
 (numpy's default, type 7), so a reference run that uses `np.quantile(x, q)`
 gets the same threshold bit for bit.
 
+### Exact threshold (#305)
+
+The threshold is a **discrete input**: a one-ulp difference flips every row
+whose score sits on the boundary. `rcsr` therefore selects the type-7 quantile
+exactly instead of sorting or sketching:
+
+* each finite score is mapped to an order-preserving unsigned key; negative
+  zero is canonicalised to positive zero and NaN/`±inf` are excluded, exactly
+  as the reference `quantile` filters them;
+* the two ranks bracketing `h = (n - 1) * q` are selected by a 256-bin radix
+  count, and the interpolation `lo + (h - lo) * (hi - lo)` is evaluated in
+  `f64` with the same expression as numpy's type 7;
+* the radix count is integer-only, so chunk boundaries, batch composition and
+  thread count cannot change `theta`.
+
+`--threshold-fixed <theta>` supplies a pre-registered constant instead. The
+window report names the provenance in `threshold_source`:
+`train_type7`, `validation_type7` or `fixed`. An approximate/sketch threshold
+may be used to screen candidates, but it is labelled screening-only and cannot
+place a reported position.
+
+### Shared valid-row mask (#305)
+
+A row enters the P&L denominator only when **both** its score and its target
+are finite (`trading_gpu::ValidMask`). This is deliberately stricter than
+`position_for`, which only checks the score: in the pinned cell six rows have a
+finite score and a `NaN` target, and keeping them would change exposure, hit
+rate and every pooled return. `position = 1` iff the mask says the row is valid
+and `score > theta`; `score == theta` is flat.
+
 There is intentionally no arbitrary test-block selector: the test block is
 defined by the window's time bounds.
 
@@ -47,11 +77,70 @@ report records `selection.selected_on = "validation"` and
 validation slice are refused, because the only remaining alternative would be
 selection on test. A single `--expr` keeps the original behaviour.
 
+### Banded finalist selection (#308)
+
+`--select-band` replaces validation MSE as the selection statistic with the
+long-only P&L band. It is for the case where the search ranks candidates on a
+fast surrogate and the report must return the exact winner: a near tie on the
+screen must not hide a different candidate on the full rows.
+
+For each window, after the exact threshold is frozen on the validation slice:
+
+1. score every candidate on the validation rows with the fused long-only
+   reduction (`trading_gpu::reduce_device` when the CUDA feature and a device
+   are present, otherwise the identical canonical CPU segments). The value is a
+   **screening** score only; it never appears as a reported P&L;
+2. with `P` candidates set `K = min(P, max(8, P/16))` and
+   `epsilon = max(2e-3, 0.005 * |J_K|)`, where `J_K` is the screening score at
+   rank `K`;
+3. admit every candidate with a finite screening score at least
+   `J_K - epsilon`; non-finite screens are never admitted;
+4. rescore every admitted candidate on the full validation rows with the exact
+   CPU `f64` path (`selection::rescore_exact`), using the same threshold, the
+   shared valid-row mask and the canonical `(group, time, row)` order;
+5. order the admitted set by `(higher net, lower turnover, lower complexity,
+   lower index)`. The comparison is a total order: net `+inf` is best, net
+   `-inf`/`NaN` is worst, turnover `-inf` is best and turnover
+   `+inf`/`NaN` is worst, with `f64::total_cmp` inside each class.
+
+The function also rescores the out-of-band candidates as an audit and reports
+`recall_band`. If the exhaustive exact winner is outside the band the run fails
+loudly instead of reporting the wrong finalist. The JSON block carries
+`surrogate_rank`, `exact_rank`, `band` (cut rank, cut score, epsilon, lower
+bound, `finalists_considered`), `recall_band` and `scored_by: "cpu_f64"`.
+`--select-band` requires more than one `--expr` and `--validation-frac > 0`;
+the test block is never read before the candidate is frozen.
+
+`epsilon` is measured, not assumed. The 200-candidate fixture in
+`tests/pnl_gpu.rs` plants the exact CPU winner `0.0005` below the screening cut;
+with `P = 200`, `K = 12`, `J_K = 0.4989` and
+`epsilon = max(0.002, 0.005 * |J_K|) = 0.0024945`, so the admitted band starts
+at `0.4964055`. The test then requires recall 1.0 and equality of the reported
+finalist with exhaustive CPU selection. A wider band costs only exact CPU
+rescores; a narrower one fails the recall audit rather than silently dropping
+the winner.
+
 ## Position rule, costs and aggregation
 
-* `position = 1` if `score > threshold` and the score is finite, otherwise `0`.
-  There is no short leg and no leverage; `rcsr::walkforward::position_for`
-  exposes the rule.
+* `position = 1` if `score > threshold`, the score is finite and the shared
+  valid-row mask keeps the row (target finite too), otherwise `0`. There is no
+  short leg and no leverage; `rcsr::walkforward::position_for` exposes the
+  score-only comparison and `rcsr::trading_gpu::long_positions` the masked
+  vector.
+* `--policy threshold` (default) is the rule above.
+* `--policy band` is a long-only no-trade band. With threshold `θ` and
+  half-width `β = --band`, an entry needs `score > θ + β`; a long book stays
+  long while `score > θ − β` and exits when the score is non-finite or at/below
+  `θ − β`. `--min-hold K` (default 1) delays an exit until the book has been
+  long for `K` consecutive rows, counting the entry row. `β = 0` with
+  `--min-hold 1` reproduces the threshold rule **bit for bit**. The band is a
+  deterministic `{0,+1}` finite-state automaton; it never opens a short.
+* `--policy dp` keeps the reported book on the threshold rule and adds the
+  exact hindsight-optimal DP as a diagnostic `hindsight_bound`. The DP is the
+  best path with hindsight, so it always flatters the strategy and is **never**
+  reported as the strategy's P&L. The report labels it `"label":
+  "hindsight_bound"`, `"is_strategy": false`, and carries the threshold book's
+  net, the gap and `rule_le_bound`.
 * `--cost-bps` is charged **per side** on `|position - previous position|`,
   separately inside each `--group-by` series. Every series starts flat, so an
   entry costs one side and its exit (including the **final** exit of every
@@ -72,6 +161,75 @@ selection on test. A single `--expr` keeps the original behaviour.
   timestamp/symbol row order would count spurious changes at every symbol
   boundary; this implementation does not.
 
+## Associative carries and chunk invariance
+
+The band and the hindsight DP are implemented as associative carries in
+`rcsr::trading_gpu`, with the serial CPU reference kept as the authority.
+
+* **Band (`Carry2`).** A row block induces, for each start state
+  `s ∈ {0, 1}`, an end state `e(s)` and a reward `w(s)`. The carry is
+  `(e0, e1, w0, w1)`, identity `(0, 1, 0, 0)`, and blocks compose
+  left-then-right:
+  `e(s) = right.e(left.e(s))`, `w(s) = left.w(s) + right.w(left.e(s))`.
+  The final exit is charged on the last row of each group; the group seam resets
+  the carry. `--min-hold K > 1` uses the `K+1`-state `CooldownCarry` variant.
+* **Hindsight DP (`DpCarry`).** `M_t = [[0, −s], [r_t − s, r_t]]` (destination
+  rows, source columns) is combined with the associative `(max, +)` product;
+  identity `[[0, −∞], [−∞, 0]]`. The answer is
+  `max(V_T(0), V_T(1) − s)`, four max-adds per row, `O(2n)` for the whole
+  scan. Ties use a fixed destination/source order, so the result is
+  deterministic. The DP resets at every group seam and its per-group bounds add.
+* Chunks are merged in ascending order. A chunk that ends inside a group
+  continues the same carry, so **alone, 1-row, 4 k and 64 k chunks produce
+  identical carry bits and bounds**. Nothing in these scans depends on the
+  thread count (the serial reference is used for the reported book) or on a
+  `P×N` allocation.
+
+```sh
+# no-trade band, beta 0.1, minimum hold 3 rows
+rcsr walkforward ... --policy band --band 0.1 --min-hold 3
+
+# threshold strategy plus the exact hindsight bound (never a strategy)
+rcsr walkforward ... --policy dp
+```
+
+## Fused long-only P&L (`--device-pnl`)
+
+`--device-pnl` recomputes each test block's long-only book through the fused
+reduction in `src/trading_gpu.rs` (device kernel `src/cuda/pnl.cu` when built
+with `--features cuda`, otherwise the identical canonical CPU segments). It is
+a cross-check beside the scalar evaluator; the scalar evaluator and its metrics
+remain the reported authority.
+
+The reduction is the same rule, with `f64` accumulation for every term:
+
+```
+p_i     = 1 if isfinite(score_i) and score_i > threshold else 0
+d_i     = p_i - p_{i-1},              p at a group start = 0
+gross_i = p_i * r_i
+cost_i  = s * |d_i| + [i is the group's last row] * s * p_i
+net_i   = gross_i - cost_i
+```
+
+* Positions are `{0, 1}`. A negative position is a hard error; there is no short
+  kernel.
+* A round trip costs `2s`; the final exit is charged exactly once per group, so
+  a book ending long pays one extra side. Flat is free.
+* `gross`, `cost`, `turnover` (`sum |d|`), `net`, exposure, entries, exits,
+  trades, hits and final exits are summed per canonical 8,192-row segment over
+  32 fixed virtual lanes (row offset modulo 32), merged by a fixed pairwise
+  lane tree and then in ascending segment order.
+* The device path never allocates `P x N`: candidates stream through a declared
+  tile of at most 8 candidates. Alone, padded, 4 k and 64 k chunks and
+  128/256/512 threads produce identical bits.
+* `cash` (`p = 0`, zero net and cost by default) and `buy-and-hold`
+  (`p = 1`, `net = sum(r) - 2s * groups`) are reported with the strategy block.
+
+The JSON gains a `device_pnl` object per window and a report-level summary with
+`backend`, `segment_rows`, `tile_candidates`, `rows` and
+`max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
+`cpu-canonical` on a non-CUDA build or when no device is available.
+
 ## Metrics
 
 Per window and pooled:
@@ -80,7 +238,9 @@ Per window and pooled:
 |---|---|
 | Sharpe | `mean / std(ddof=1) * sqrt(periods_per_year)`; `n/a` when the series is too short or has zero variance |
 | CAGR | `equity_end^(periods_per_year / periods) - 1` |
-| max drawdown | most negative `equity / running_peak - 1` (starts from equity 1) |
+| max drawdown | most negative `equity / running_peak - 1` (starts from equity 1); `-1` on ruin |
+| Sortino | `(mean - MAR) / DD * sqrt(periods_per_year)`, where `DD = sqrt(sum(min(r-MAR,0)^2)/n)` (population, `ddof=0`) and `MAR` is 0 by default |
+| log-growth | mean of `log1p(r)` per period; `-inf` when any `r <= -1` (ruin) |
 | turnover | `sum |position change| / years`, where `years = periods / periods_per_year` |
 | exposure | long rows / test rows |
 | hit rate | long rows with `target > 0` / long rows |
@@ -93,7 +253,30 @@ Per window and pooled:
 `--periods-per-year` should be given when the time unit is not epoch seconds.
 Without it, the evaluator infers the period from the median positive time step
 of the test rows (`365*86400 / dt`), which gives 365 for daily crypto bars and
-8760 for hourly bars. The report always states the value it used.
+8760 for hourly bars. The report always states the value it used and, since
+#307, also records it in `risk_model` with the annualisation mode.
+
+**Per-period versus daily.** Every risk statistic in this report is computed on
+the per-period series and annualised with `sqrt(periods_per_year)` (Sharpe,
+Sortino) or `periods_per_year` (alpha). That is a *per-period* statistic: hourly
+returns with `periods_per_year = 8760` are not the same as a daily Sharpe. For a
+daily Sharpe, compound the hourly returns into daily returns first
+(`risk::compound_blocks(&returns, 24)`) and then annualise the daily series with
+`periods_per_year = 365`. Cash (zero variance) reports `NaN` Sharpe and `NaN`
+Sortino, never `0`.
+
+## Risk monoids
+
+`rcsr::risk` exposes the exact `f64` chunk-merge carries behind these numbers
+(#307): Welford/Chan `(n, mean, M2)` for mean/variance/Sharpe, `(n,
+sum(min(r-MAR,0)^2))` for Sortino, `(n, sum(log1p(r)), ruined)` for log-growth,
+`(n,total,min,max,dd,ruined)` on log equity for drawdown, and `(n, sum x, sum y,
+sum xy, sum x^2)` for beta/alpha. Each carries a fixed canonical merge order;
+`RiskAccumulator::push_chunk` buffers a trailing partial so arbitrary chunk
+sizes give identical bits, and `merge` appends canonical shards in ascending
+order. The serial `walkforward::sharpe` and `equity_metrics` remain the
+reference; the risk module is tested to `1e-12` against them on 100 k returns.
+There is no short or borrow kernel: the input is the long-only period series.
 
 ## Fold sign test
 

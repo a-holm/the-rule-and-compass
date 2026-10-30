@@ -12,10 +12,14 @@
 //!   `[train_start, train_end)` and test range `[test_start, test_end)`.
 //! * The gap `test_start - train_end` must be at least the label horizon
 //!   (`--horizon`) and the requested embargo. Rows in the gap are purged.
-//! * The threshold is a quantile of the expression score over the training
-//!   rows, or over an optional trailing validation slice of those rows. The
-//!   test block is never consulted. The quantile uses the linear interpolation
-//!   rule (numpy's default, type 7).
+//! * The threshold is an exact type-7 quantile (numpy's default) of the
+//!   expression score over the training rows, or over an optional trailing
+//!   validation slice of those rows. The test block is never consulted. #305
+//!   selects the two ranks around `h = (n - 1) q` by order-preserving radix
+//!   count and interpolates in `f64`; a pre-registered `--threshold-fixed`
+//!   value is reported with `threshold_source = "fixed"`.
+//! * A row enters the P&L denominator only when both score and target are
+//!   finite, through the shared `trading_gpu::ValidMask`.
 //! * `position = 1` when the score is strictly greater than the threshold and
 //!   the score is finite, otherwise `0`. There is no short leg and no leverage.
 //! * Costs are `cost_bps` per side on `|position - previous position|` inside
@@ -36,6 +40,7 @@ use crate::column::GroupBuf;
 use crate::data::{self, Table};
 use crate::expr::{self, Node};
 use crate::store::{self, FileStore};
+use crate::trading_gpu::{self, Threshold, ThresholdSource, ValidMask};
 use std::collections::HashMap;
 
 /// Default per-side cost in basis points (10 bp, as in the pilot).
@@ -89,6 +94,37 @@ impl Window {
     }
 }
 
+/// The position policy. `Dp` keeps the threshold strategy as the reported book
+/// and adds the exact hindsight DP as a diagnostic bound, never as a strategy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Policy {
+    Threshold,
+    Band,
+    Dp,
+}
+
+impl Policy {
+    pub fn parse(src: &str) -> Result<Policy, String> {
+        match src {
+            "threshold" => Ok(Policy::Threshold),
+            "band" => Ok(Policy::Band),
+            "dp" | "hindsight" => Ok(Policy::Dp),
+            other => Err(format!(
+                "unknown policy '{}'; expected threshold | band | dp",
+                other
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Policy::Threshold => "threshold",
+            Policy::Band => "band",
+            Policy::Dp => "dp",
+        }
+    }
+}
+
 /// Everything the evaluator needs. Construct this from the CLI or directly
 /// from Rust; [`run_path`] dispatches `.rcsb` vs CSV.
 #[derive(Clone, Debug)]
@@ -109,6 +145,9 @@ pub struct EvalSpec {
     pub cost_bps: f64,
     /// Quantile of the training/validation score used as the long threshold.
     pub threshold_quantile: f64,
+    /// Pre-registered fixed threshold. When set, it overrides the quantile and
+    /// the report says `threshold_source = "fixed"`.
+    pub threshold_fixed: Option<f64>,
     /// Optional trailing fraction of the training time range kept as validation.
     pub validation_frac: f64,
     /// Override the inferred annualisation (e.g. 365 for calendar days,
@@ -119,6 +158,27 @@ pub struct EvalSpec {
     /// the test block is only scored after that choice is fixed. Requires
     /// `validation_frac > 0`.
     pub candidates: Vec<String>,
+    /// #308: select among candidates with the band protocol instead of
+    /// validation MSE. The screening score is the fused long-only reduction on
+    /// validation rows; the admitted set is rescored on the full validation rows
+    /// in exact CPU `f64` and the winner is chosen by
+    /// `(net, turnover, complexity, index)`. Requires `validation_frac > 0` and
+    /// more than one `--expr`.
+    pub band_select: bool,
+    /// #304: recompute each test block's long-only P&L through the fused
+    /// canonical reduction (the device kernel when available, the identical
+    /// CPU canonical path otherwise) and report it beside the scalar evaluator.
+    /// The scalar evaluator remains the reported authority.
+    pub device_pnl: bool,
+    /// #306: threshold | band | dp. `dp` keeps the threshold book and adds the
+    /// hindsight bound; it is never reported as the strategy's P&L.
+    pub policy: Policy,
+    /// #306: half-width `beta` of the no-trade band, in score units. Only used
+    /// by [`Policy::Band`]; `0` reproduces the plain threshold rule.
+    pub band_width: f64,
+    /// #306: minimum consecutive long rows before a band exit is allowed
+    /// (>= 1; `1` is the plain band).
+    pub min_hold: usize,
     /// Reset every pool seam to flat (the historical behaviour). The default
     /// carries the ending position of one test block into the next, so pooled
     /// total variation includes `|p_end - q_start|`.
@@ -144,6 +204,12 @@ pub struct Metrics {
     pub cagr: f64,
     /// Most negative peak-to-trough equity drawdown (a negative number).
     pub max_drawdown: f64,
+    /// Annualised Sortino ratio (#307). `NaN` when undefined.
+    pub sortino: f64,
+    /// Per-period log-growth from `ln_1p` (#307); `-inf` on ruin.
+    pub log_growth: f64,
+    /// Minimum acceptable return used by the Sortino denominator.
+    pub sortino_mar: f64,
     /// Position changes per year (sum of |delta position| / years).
     pub turnover: f64,
     /// Fraction of test rows with a long position.
@@ -201,6 +267,72 @@ pub struct WindowResult {
     /// Time step inferred from the test timestamps, when it was inferable.
     pub inferred_period_seconds: Option<f64>,
     pub metrics: Metrics,
+    /// #304: fused canonical/device long-only P&L for this test block.
+    pub device_pnl: Option<DevicePnlCheck>,
+    /// #306: band/cooldown carry check when the band policy was selected.
+    pub band: Option<BandCheck>,
+    /// #306: exact hindsight DP bound when the dp policy was selected.
+    pub hindsight_bound: Option<HindsightBound>,
+    /// #308: banded finalist provenance when `--select-band` was used.
+    pub band_selection: Option<crate::selection::BandSelection>,
+}
+
+/// #306: the band/cooldown book and its associative carry.
+#[derive(Clone, Debug)]
+pub struct BandCheck {
+    pub band_width: f64,
+    pub min_hold: usize,
+    /// `carry2` for the 2-state band, `cooldown-K` for the K+1-state variant.
+    pub carry: String,
+    pub groups: usize,
+    /// Additive net from the composed carry (including every final exit).
+    pub net: f64,
+    /// Scalar evaluator's sum of per-row net returns.
+    pub scalar_net: f64,
+}
+
+/// #306: the exact hindsight DP, labelled as a bound and not a strategy.
+#[derive(Clone, Debug)]
+pub struct HindsightBound {
+    /// Always `hindsight_bound`; kept explicit in the JSON.
+    pub label: String,
+    /// Exact `O(2n)` max-plus DP value.
+    pub net: f64,
+    /// The reported threshold book's net for the same rows.
+    pub rule_net: f64,
+    /// `net - rule_net`; always non-negative up to floating-point rounding.
+    pub gap: f64,
+    pub groups: usize,
+    /// `rule_net <= net` (with a 1e-12 absolute tolerance for summation order).
+    pub rule_le_bound: bool,
+}
+
+/// #304: one test block's fused long-only reduction, plus the two benchmarks.
+#[derive(Clone, Debug)]
+pub struct DevicePnlCheck {
+    /// `cuda` when the device kernel ran, `cpu-canonical` when the identical
+    /// CPU segment reduction ran (non-CUDA build or no device).
+    pub backend: String,
+    pub segment_rows: usize,
+    pub tile_candidates: usize,
+    pub strategy: crate::trading_gpu::PnlTotals,
+    pub cash: crate::trading_gpu::PnlTotals,
+    pub buy_and_hold: crate::trading_gpu::PnlTotals,
+    /// Sum of the scalar evaluator's per-row net returns.
+    pub cpu_net: f64,
+    /// `strategy.net - cpu_net`; a screening check, not a reported P&L.
+    pub net_delta: f64,
+}
+
+/// #304: report-level summary of the fused reduction.
+#[derive(Clone, Debug)]
+pub struct DevicePnlSummary {
+    pub backend: String,
+    pub segment_rows: usize,
+    pub tile_candidates: usize,
+    pub windows: usize,
+    pub rows: u64,
+    pub max_abs_net_delta: f64,
 }
 
 /// The complete report for all windows plus the pooled series.
@@ -215,6 +347,12 @@ pub struct Report {
     pub pooled: Metrics,
     pub cost_bps: f64,
     pub threshold_quantile: f64,
+    /// The pre-registered fixed threshold, when one was supplied.
+    pub threshold_fixed: Option<f64>,
+    /// #306: position policy and its band parameters.
+    pub policy: Policy,
+    pub band_width: f64,
+    pub min_hold: usize,
     pub validation_frac: f64,
     pub horizon: f64,
     pub embargo: f64,
@@ -226,6 +364,8 @@ pub struct Report {
     /// Which fibre selected the candidate(s). Always validation when more than
     /// one candidate is present; `test` is never a selection input.
     pub selected_on: String,
+    /// #308: whether the band protocol selected the candidate.
+    pub band_select: bool,
     /// True when no test row influenced candidate or threshold selection.
     pub test_used_for_selection: bool,
     /// Pooled seam policy and the extra cost the carried boundary charged.
@@ -241,6 +381,8 @@ pub struct Report {
     pub memory_bound: String,
     /// #145: was the lockbox override explicitly set for this run?
     pub allow_lockbox: bool,
+    /// #304: fused long-only reduction summary when `--device-pnl` was set.
+    pub device_pnl: Option<DevicePnlSummary>,
     dropped_rows: usize,
 }
 
@@ -475,11 +617,22 @@ fn validate_windows(spec: &EvalSpec) -> Result<(), String> {
     if !(0.0..=1.0).contains(&spec.threshold_quantile) {
         return Err("--threshold-quantile must be in [0, 1]".to_string());
     }
+    if let Some(theta) = spec.threshold_fixed {
+        if !theta.is_finite() {
+            return Err("--threshold-fixed must be finite".to_string());
+        }
+    }
     if !(0.0..1.0).contains(&spec.validation_frac) {
         return Err("--validation-frac must be in [0, 1)".to_string());
     }
     if !spec.cost_bps.is_finite() || spec.cost_bps < 0.0 {
         return Err("--cost-bps must be finite and non-negative".to_string());
+    }
+    if !spec.band_width.is_finite() || spec.band_width < 0.0 {
+        return Err("--band must be finite and non-negative".to_string());
+    }
+    if spec.min_hold == 0 {
+        return Err("--min-hold must be at least 1".to_string());
     }
     if spec.candidates.len() > 1 && spec.validation_frac <= 0.0 {
         return Err(
@@ -700,13 +853,14 @@ impl Accum {
             // Score every candidate on the validation fibre, then freeze the
             // choice before touching the test block.
             let mut best: Option<(usize, f64, f64)> = None;
+            let mut thresholds = vec![f64::NAN; d.train_scores.len()];
             for (c, scores) in d.train_scores.iter().enumerate() {
                 let source_scores = if has_validation {
                     &d.validation_scores[c]
                 } else {
                     scores
                 };
-                if source_scores.is_empty() {
+                if source_scores.is_empty() && spec.threshold_fixed.is_none() {
                     return Err(format!(
                         "window '{}': no finite {} scores for candidate {} to set the threshold",
                         d.window.label,
@@ -719,20 +873,75 @@ impl Accum {
                 } else {
                     0.0
                 };
-                let threshold = quantile(source_scores, spec.threshold_quantile);
+                let threshold = if let Some(theta) = spec.threshold_fixed {
+                    Threshold::fixed(theta)?.value()
+                } else if has_validation {
+                    Threshold::validation_type7(source_scores, spec.threshold_quantile).value()
+                } else {
+                    Threshold::train_type7(source_scores, spec.threshold_quantile).value()
+                };
+                thresholds[c] = threshold;
                 match best {
                     Some((_, best_err, _)) if best_err <= err => {}
                     _ => best = Some((c, err, threshold)),
                 }
             }
-            let (candidate, validation_error, threshold) =
-                best.expect("at least one candidate");
-            let validation_error = if has_validation {
-                Some(validation_error)
+            let mut band_selection = None;
+            let (candidate, validation_error, threshold) = if spec.band_select {
+                if !has_validation {
+                    return Err(format!(
+                        "window '{}': --select-band needs --validation-frac > 0, \
+                         because the test block may not choose the candidate",
+                        d.window.label
+                    ));
+                }
+                let targets: Vec<f64> = d.validation_rows.iter().map(|r| r.target).collect();
+                let groups: Vec<u64> = d.validation_rows.iter().map(|r| r.group).collect();
+                let times: Vec<f64> = d.validation_rows.iter().map(|r| r.time).collect();
+                let rows = crate::selection::BandRows {
+                    targets: &targets,
+                    groups: &groups,
+                    times: &times,
+                };
+                let options = crate::selection::BandOptions {
+                    cost_bps: spec.cost_bps,
+                    ..crate::selection::BandOptions::default()
+                };
+                let mut candidates: Vec<crate::selection::BandCandidate<'_>> =
+                    Vec::with_capacity(d.validation_scores.len());
+                for c in 0..d.validation_scores.len() {
+                    let surrogate = crate::selection::screening_net(
+                        &rows,
+                        &d.validation_scores[c],
+                        thresholds[c],
+                        &options,
+                    )?;
+                    candidates.push(crate::selection::BandCandidate {
+                        index: c,
+                        surrogate,
+                        complexity: expr::complexity(&trees[c]),
+                        scores: &d.validation_scores[c],
+                        threshold: thresholds[c],
+                    });
+                }
+                let selection = crate::selection::select_band(&rows, &candidates, &options)
+                    .map_err(|e| format!("window '{}': {}", d.window.label, e))?;
+                let chosen = selection.selected_index;
+                let err = validation_mse(&d.validation_rows, &d.validation_scores[chosen]);
+                band_selection = Some(selection);
+                (chosen, Some(err), thresholds[chosen])
             } else {
-                None
+                let (c, err, theta) = best.expect("at least one candidate");
+                let err = if has_validation { Some(err) } else { None };
+                (c, err, theta)
             };
-            let source_name = if has_validation { "validation" } else { "train" };
+            let source_name = if spec.threshold_fixed.is_some() {
+                ThresholdSource::Fixed
+            } else if has_validation {
+                ThresholdSource::ValidationType7
+            } else {
+                ThresholdSource::TrainType7
+            };
             let (ppy, inferred_dt) = match spec.periods_per_year {
                 Some(v) => (v, None),
                 None => infer_frequency(&d.test_rows),
@@ -745,6 +954,10 @@ impl Accum {
                 cost_side,
                 ppy,
                 &mut fresh_previous,
+                spec.policy,
+                spec.band_width,
+                spec.min_hold,
+                spec.device_pnl,
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
@@ -756,6 +969,10 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut HashMap::new(),
+                    spec.policy,
+                    spec.band_width,
+                    spec.min_hold,
+                    false,
                 )
             } else {
                 evaluate_window(
@@ -765,6 +982,10 @@ impl Accum {
                     cost_side,
                     ppy,
                     &mut pooled_previous,
+                    spec.policy,
+                    spec.band_width,
+                    spec.min_hold,
+                    false,
                 )
             };
             if !spec.pool_reset_flat {
@@ -793,13 +1014,17 @@ impl Accum {
                 candidate,
                 validation_error,
                 threshold,
-                threshold_source: source_name.to_string(),
+                threshold_source: source_name.as_str().to_string(),
                 train_rows,
                 validation_rows: d.validation_scores[candidate].len(),
                 test_rows: ev.stats.rows,
                 dropped_rows: d.dropped,
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
+                device_pnl: ev.device,
+                band: ev.band,
+                hindsight_bound: ev.hindsight_bound,
+                band_selection,
             });
         }
 
@@ -814,6 +1039,32 @@ impl Accum {
             "inferred from the median test time step (365-day year)".to_string()
         };
         let sign_test = fold_sign_test(&windows);
+        let device_pnl = if spec.device_pnl {
+            let mut backend = String::new();
+            let mut rows = 0u64;
+            let mut count = 0usize;
+            let mut max_abs_net_delta = 0.0f64;
+            for w in &windows {
+                if let Some(d) = &w.device_pnl {
+                    if backend.is_empty() {
+                        backend = d.backend.clone();
+                    }
+                    rows += d.strategy.rows;
+                    count += 1;
+                    max_abs_net_delta = max_abs_net_delta.max(d.net_delta.abs());
+                }
+            }
+            Some(DevicePnlSummary {
+                backend,
+                segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+                tile_candidates: crate::trading_gpu::MAX_TILE_CANDIDATES,
+                windows: count,
+                rows,
+                max_abs_net_delta,
+            })
+        } else {
+            None
+        };
         let selected_on = if expressions.len() > 1 {
             "validation".to_string()
         } else if spec.validation_frac > 0.0 {
@@ -834,6 +1085,10 @@ impl Accum {
             pooled,
             cost_bps: spec.cost_bps,
             threshold_quantile: spec.threshold_quantile,
+            threshold_fixed: spec.threshold_fixed,
+            policy: spec.policy,
+            band_width: spec.band_width,
+            min_hold: spec.min_hold,
             validation_frac: spec.validation_frac,
             horizon: spec.horizon,
             embargo: spec.embargo_seconds(),
@@ -841,6 +1096,7 @@ impl Accum {
             annualization,
             candidates: expressions,
             selected_on,
+            band_select: spec.band_select,
             test_used_for_selection: false,
             pool_reset_flat: spec.pool_reset_flat,
             seam_cost,
@@ -849,6 +1105,7 @@ impl Accum {
             source: source.to_string(),
             memory_bound: memory_bound.to_string(),
             allow_lockbox: spec.allow_lockbox,
+            device_pnl,
             dropped_rows: dropped,
         })
     }
@@ -1065,6 +1322,9 @@ struct WindowEval {
     stats: Stats,
     first_positions: HashMap<u64, f64>,
     end_positions: HashMap<u64, f64>,
+    device: Option<DevicePnlCheck>,
+    band: Option<BandCheck>,
+    hindsight_bound: Option<HindsightBound>,
 }
 
 /// One timestamp's `(sum, count)` cross-section.
@@ -1159,12 +1419,12 @@ impl CrossSection {
 }
 
 /// The position rule, exposed so a test can pin the "never short" property.
+///
+/// It is the score-only rule; reported P&L applies the stricter shared mask
+/// (score **and** target finite) first. The comparison is strict, so
+/// `score == threshold` is flat.
 pub fn position_for(score: f64, threshold: f64) -> f64 {
-    if score.is_finite() && score > threshold {
-        1.0
-    } else {
-        0.0
-    }
+    trading_gpu::long_position(score, threshold) as f64
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -1176,12 +1436,20 @@ fn evaluate_window(
     cost_side: f64,
     ppy: f64,
     previous: &mut HashMap<u64, f64>,
+    policy: Policy,
+    band_width: f64,
+    min_hold: usize,
+    device_pnl: bool,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
-    // Non-finite score/target rows are dropped, exactly as before.
-    let valid: Vec<usize> = (0..rows.len())
-        .filter(|&i| scores[i].is_finite() && rows[i].target.is_finite())
-        .collect();
+    // #305: one shared mask, score and target both finite. `position_for`
+    // alone would keep a finite score with a NaN target; that is the six-row
+    // difference documented in docs/walkforward.md.
+    let mut mask = ValidMask::new(rows.len());
+    for i in 0..rows.len() {
+        mask.set(i, scores[i].is_finite() && rows[i].target.is_finite());
+    }
+    let valid: Vec<usize> = mask.indices().collect();
     let n = valid.len();
     let mut positions = vec![0.0f64; n];
     let mut costs = vec![0.0f64; n];
@@ -1203,9 +1471,74 @@ fn evaluate_window(
             .then_with(|| ra.time.partial_cmp(&rb.time).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.cmp(&b))
     });
+
+    // Rows in the group-contiguous order used by the carry scans and by the
+    // #304 reduction. The scalar book below stays in this same order.
+    let mut ord_scores = Vec::with_capacity(n);
+    let mut ord_returns = Vec::with_capacity(n);
+    let mut ord_groups = Vec::with_capacity(n);
     for &i in &order {
         let row = &rows[valid[i]];
-        let pos = position_for(scores[valid[i]], threshold);
+        ord_scores.push(scores[valid[i]]);
+        ord_returns.push(row.target);
+        ord_groups.push(row.group);
+    }
+
+    // #306: the band/cooldown book. `positions` are aligned with `order`;
+    // `net` includes the final exit of every group. `dp` deliberately keeps
+    // the threshold book: the DP is a bound, not a strategy.
+    let band_scan: Option<(Vec<f64>, f64, usize, String)> = if policy == Policy::Band {
+        let params = crate::trading_gpu::BandParams {
+            threshold,
+            band: band_width,
+            min_hold,
+        };
+        if min_hold > 1 {
+            let scan = crate::trading_gpu::cooldown_scan(
+                &ord_scores,
+                &ord_returns,
+                &ord_groups,
+                &params,
+                cost_side,
+                65_536,
+            )
+            .unwrap_or_else(|e| panic!("cooldown scan failed: {}", e));
+            let net = scan.net();
+            Some((
+                scan.positions,
+                net,
+                scan.carries.len(),
+                format!("cooldown-{}", min_hold),
+            ))
+        } else {
+            let scan = crate::trading_gpu::band_scan(
+                &ord_scores,
+                &ord_returns,
+                &ord_groups,
+                &params,
+                cost_side,
+                65_536,
+            )
+            .unwrap_or_else(|e| panic!("band scan failed: {}", e));
+            let net = scan.net();
+            Some((
+                scan.positions,
+                net,
+                scan.carries.len(),
+                "carry2".to_string(),
+            ))
+        }
+    } else {
+        None
+    };
+
+    for (k, &i) in order.iter().enumerate() {
+        let row = &rows[valid[i]];
+        let pos = match &band_scan {
+            Some((positions, _, _, _)) => positions[k],
+            // #305: strict `>` and a non-finite score is flat.
+            None => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
+        };
         let prev = previous.get(&row.group).copied().unwrap_or(0.0);
         let delta = pos - prev;
         let cost = cost_side * delta.abs();
@@ -1260,6 +1593,85 @@ fn evaluate_window(
         }
     }
 
+    // #304: recompute the same long-only book through the fused canonical
+    // reduction. Rows are already in `(group, time)` order, which is the
+    // group-contiguous order the reducer requires. The scalar evaluator above
+    // stays the reported authority; this block is a device/canonical check.
+    let device = if device_pnl {
+        let params = crate::trading_gpu::PnlParams {
+            threshold,
+            per_side_bps: cost_side * 10_000.0,
+            segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+            cash_return: 0.0,
+        };
+        #[cfg(feature = "cuda")]
+        let report = crate::trading_gpu::reduce_device(
+            &ord_scores,
+            &ord_returns,
+            &ord_groups,
+            &params,
+            256,
+            65_536,
+        );
+        #[cfg(feature = "cuda")]
+        let backend = if report.is_some() {
+            "cuda".to_string()
+        } else {
+            "cpu-canonical".to_string()
+        };
+        #[cfg(not(feature = "cuda"))]
+        let report: Option<crate::trading_gpu::PnlReport> = None;
+        #[cfg(not(feature = "cuda"))]
+        let backend = "cpu-canonical".to_string();
+        let report = match report {
+            Some(r) => r,
+            None => crate::trading_gpu::reduce(&ord_scores, &ord_returns, &ord_groups, &params)
+                .unwrap_or_else(|e| panic!("canonical P&L reduction failed: {}", e)),
+        };
+        let cpu_net = net.iter().sum::<f64>();
+        Some(DevicePnlCheck {
+            backend,
+            segment_rows: crate::trading_gpu::DEFAULT_SEGMENT_ROWS,
+            tile_candidates: crate::trading_gpu::MAX_TILE_CANDIDATES,
+            strategy: report.strategy,
+            cash: report.cash,
+            buy_and_hold: report.buy_and_hold,
+            cpu_net,
+            net_delta: report.strategy.net - cpu_net,
+        })
+    } else {
+        None
+    };
+
+    let scalar_net = net.iter().sum::<f64>();
+    let band = band_scan.map(|(_, band_net, groups, carry)| BandCheck {
+        band_width,
+        min_hold,
+        carry,
+        groups,
+        net: band_net,
+        scalar_net,
+    });
+
+    // #306: exact hindsight DP for the same rows and costs. It is reported as
+    // a bound only; the threshold (or band) book above remains the strategy.
+    let hindsight_bound = if policy == Policy::Dp {
+        let scan = crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536)
+            .unwrap_or_else(|e| panic!("hindsight DP scan failed: {}", e));
+        let bound = scan.bound(cost_side);
+        Some(HindsightBound {
+            label: "hindsight_bound".to_string(),
+            net: bound,
+            rule_net: scalar_net,
+            gap: bound - scalar_net,
+            groups: scan.carries.len(),
+            rule_le_bound: scalar_net <= bound + 1e-12,
+        })
+    } else {
+        None
+    };
+
+
     // Equal-weight the groups present at each timestamp. Times are sorted so the
     // return series has the same order as the Python reference.
     let mut time_order = order;
@@ -1286,6 +1698,9 @@ fn evaluate_window(
         stats,
         first_positions,
         end_positions,
+        device,
+        band,
+        hindsight_bound,
     }
 }
 
@@ -1299,6 +1714,11 @@ fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics
     let sharpe_ratio = sharpe(returns, ppy);
     let gross_sharpe = sharpe(gross, ppy);
     let (total_return, cagr, max_drawdown) = equity_metrics(returns, ppy);
+    // #307: the same period series through the chunk-mergeable risk monoids.
+    // `max_drawdown` stays on the serial reference; the risk-module parity test
+    // pins the monoid to that reference, and Sortino/log-growth are new report
+    // fields from the monoid.
+    let risk = crate::risk::risk_stats(returns, ppy, crate::risk::DEFAULT_SORTINO_MAR);
     let exposure = ratio(stats.active, stats.rows);
     let hit_rate = ratio(stats.hits, stats.active);
     let avg_cost = if stats.active == 0 {
@@ -1329,6 +1749,9 @@ fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics
         sharpe: sharpe_ratio,
         cagr,
         max_drawdown,
+        sortino: risk.sortino,
+        log_growth: risk.log_growth_per_period,
+        sortino_mar: risk.sortino_mar,
         turnover,
         exposure,
         hit_rate,
@@ -1376,7 +1799,7 @@ pub fn sharpe(returns: &[f64], periods_per_year: f64) -> f64 {
     }
 }
 
-fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
+pub(crate) fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
     if returns.is_empty() {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
@@ -1407,24 +1830,14 @@ fn equity_metrics(returns: &[f64], ppy: f64) -> (f64, f64, f64) {
 // ---------------------------------------------------------------------------
 
 /// Linear-interpolation quantile (numpy's default, Hyndman-Fan type 7).
+///
+/// #305: this delegates to the exact order-preserving radix selection in
+/// [`crate::trading_gpu`]. The result is bit-identical to the former sort
+/// implementation (pinned by `tests/walkforward.rs` and `tests/pnl_gpu.rs`),
+/// but selection is `O(4n)` counts and cannot depend on a comparison-sort
+/// tie order. Non-finite values are filtered exactly as before.
 pub fn quantile(values: &[f64], q: f64) -> f64 {
-    let mut v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();
-    if v.is_empty() {
-        return f64::NAN;
-    }
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    if v.len() == 1 {
-        return v[0];
-    }
-    let q = q.clamp(0.0, 1.0);
-    let h = (v.len() - 1) as f64 * q;
-    let lo = h.floor() as usize;
-    let hi = h.ceil() as usize;
-    if lo == hi {
-        v[lo]
-    } else {
-        v[lo] + (h - lo as f64) * (v[hi] - v[lo])
-    }
+    trading_gpu::type7_quantile_f64(values, q).theta
 }
 
 fn median(values: &mut [f64]) -> Option<f64> {
@@ -1485,6 +1898,71 @@ fn jnum(v: f64) -> String {
     }
 }
 
+/// #304: one fused-reduction total as JSON.
+fn pnl_totals_json(t: &crate::trading_gpu::PnlTotals) -> String {
+    format!(
+        "{{\"rows\":{},\"long_rows\":{},\"entries\":{},\"exits\":{},\
+         \"trades\":{},\"hits\":{},\"final_exits\":{},\"gross\":{},\
+         \"cost\":{},\"turnover\":{},\"net\":{},\"exposure\":{},\"hit_rate\":{}}}",
+        t.rows,
+        t.long_rows,
+        t.entries,
+        t.exits,
+        t.trades,
+        t.hits,
+        t.final_exits,
+        jnum(t.gross),
+        jnum(t.cost),
+        jnum(t.turnover),
+        jnum(t.net),
+        jnum(t.exposure()),
+        jnum(t.hit_rate())
+    )
+}
+
+fn device_pnl_json(d: &DevicePnlCheck) -> String {
+    format!(
+        "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
+         \"strategy\":{},\"cash\":{},\"buy_and_hold\":{},\
+         \"cpu_net\":{},\"net_delta\":{}}}",
+        jstr(&d.backend),
+        d.segment_rows,
+        d.tile_candidates,
+        pnl_totals_json(&d.strategy),
+        pnl_totals_json(&d.cash),
+        pnl_totals_json(&d.buy_and_hold),
+        jnum(d.cpu_net),
+        jnum(d.net_delta)
+    )
+}
+
+fn band_check_json(b: &BandCheck) -> String {
+    format!(
+        "{{\"band_width\":{},\"min_hold\":{},\"carry\":{},\"groups\":{},\
+         \"net\":{},\"scalar_net\":{},\"net_delta\":{}}}",
+        jnum(b.band_width),
+        b.min_hold,
+        jstr(&b.carry),
+        b.groups,
+        jnum(b.net),
+        jnum(b.scalar_net),
+        jnum(b.net - b.scalar_net)
+    )
+}
+
+fn hindsight_bound_json(h: &HindsightBound) -> String {
+    format!(
+        "{{\"label\":{},\"is_strategy\":false,\"net\":{},\"rule_net\":{},\
+         \"gap\":{},\"groups\":{},\"rule_le_bound\":{}}}",
+        jstr(&h.label),
+        jnum(h.net),
+        jnum(h.rule_net),
+        jnum(h.gap),
+        h.groups,
+        h.rule_le_bound
+    )
+}
+
 fn md_num(v: f64) -> String {
     if v.is_finite() {
         format!("{:.6}", v)
@@ -1504,7 +1982,8 @@ fn md_bps(v: f64) -> String {
 impl Metrics {
     fn json(&self) -> String {
         format!(
-            "{{\"sharpe\":{},\"cagr\":{},\"max_drawdown\":{},\"turnover\":{},\
+            "{{\"sharpe\":{},\"cagr\":{},\"max_drawdown\":{},\"sortino\":{},\
+             \"sortino_mar\":{},\"log_growth\":{},\"turnover\":{},\
              \"exposure\":{},\"hit_rate\":{},\"break_even_hit_rate\":{},\
              \"trades\":{},\"entries\":{},\"rows\":{},\"active_rows\":{},\
              \"periods\":{},\"periods_per_year\":{},\"total_return\":{},\
@@ -1513,6 +1992,9 @@ impl Metrics {
             jnum(self.sharpe),
             jnum(self.cagr),
             jnum(self.max_drawdown),
+            jnum(self.sortino),
+            jnum(self.sortino_mar),
+            jnum(self.log_growth),
             jnum(self.turnover),
             jnum(self.exposure),
             jnum(self.hit_rate),
@@ -1541,7 +2023,8 @@ impl WindowResult {
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
-             \"metrics\":{}}}",
+             \"metrics\":{},\"device_pnl\":{},\"band\":{},\"hindsight_bound\":{},\
+             \"band_selection\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
             jnum(self.window.train_end),
@@ -1558,7 +2041,19 @@ impl WindowResult {
             self.test_rows,
             self.dropped_rows,
             self.inferred_period_seconds.map_or("null".to_string(), jnum),
-            self.metrics.json()
+            self.metrics.json(),
+            self.device_pnl
+                .as_ref()
+                .map_or("null".to_string(), device_pnl_json),
+            self.band
+                .as_ref()
+                .map_or("null".to_string(), band_check_json),
+            self.hindsight_bound
+                .as_ref()
+                .map_or("null".to_string(), hindsight_bound_json),
+            self.band_selection
+                .as_ref()
+                .map_or("null".to_string(), |s| s.json())
         )
     }
 }
@@ -1593,6 +2088,19 @@ impl Report {
             self.allow_lockbox,
             overlap.join(",")
         );
+        let position_rule = match self.policy {
+            Policy::Threshold => {
+                "long/flat: 1 if score > threshold else 0; never short; no leverage"
+            }
+            Policy::Band => {
+                "long/flat no-trade band: enter when score > threshold+band, exit when \
+                 score <= threshold-band after the minimum hold; never short; no leverage"
+            }
+            Policy::Dp => {
+                "reported book is the threshold rule; the DP value is a hindsight_bound, \
+                 not a strategy; never short; no leverage"
+            }
+        };
         format!(
             "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"walkforward\",\
              \"expression\":{},\"target\":{},\"variables\":[{}],\"time\":{},\
@@ -1601,18 +2109,35 @@ impl Report {
              \"purge\":{{\"horizon_seconds\":{},\"embargo_seconds\":{}}},\
              \"cost_model\":{{\"per_side_bps\":{},\"round_trip_bps\":{},\
              \"charged_on\":\"|position change| per group; per-window metrics start flat, pooled carries the boundary\"}},\
-             \"position_rule\":\"long/flat: 1 if score > threshold else 0; never short; no leverage\",\
-             \"threshold\":{{\"quantile\":{},\"method\":\"linear interpolation (numpy type 7)\",\
-             \"source\":\"train or validation only\"}},\
+             \"position_rule\":{},\
+             \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
+             \"min_hold\":{},\"short\":false}},\
+             \"threshold\":{{\"quantile\":{},\"fixed\":{},\
+             \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
+             \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
+             \"screening_only\":false,\"source\":{}}},\
              \"annualization\":{{\"periods_per_year\":{},\"method\":{}}},\
+             \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":{},\
+             \"sharpe\":{{\"scale\":\"sqrt(periods_per_year)\",\"ddof\":1,\
+             \"undefined\":\"n<2, sd=0 (cash) or periods_per_year<=0\"}},\
+             \"sortino\":{{\"mar\":{},\
+             \"denominator\":\"population RMS of min(R-MAR,0) over all periods (ddof=0)\",\
+             \"scale\":\"sqrt(periods_per_year)\"}},\
+             \"log_growth\":{{\"transform\":\"log1p\",\"unit\":\"per-period\",\
+             \"ruin\":\"R<=-1 => -inf\"}},\
+             \"drawdown\":{{\"equity\":\"log\",\"unit\":\"fraction of peak\",\
+             \"sign\":\"negative or zero\",\"ruin\":\"-1\"}},\
+             \"beta_alpha\":{{\"beta\":\"dimensionless\",\"alpha\":\"per-period\",\
+             \"annualized_alpha_scale\":\"periods_per_year\"}}}},\
              \"candidates\":[{}],\"selection\":{{\"selected_on\":{},\
-             \"test_used_for_selection\":{},\"candidate_count\":{}}},\
+             \"band_select\":{},\"test_used_for_selection\":{},\
+             \"candidate_count\":{}}},\
              \"pooled_seam\":{{\"reset_flat\":{},\"seam_cost\":{},\"seam_trades\":{}}},\
              \"sign_test\":{{\"positive\":{},\"total\":{},\"applicable\":{},\
              \"p_value\":{},\"method\":{}}},\
              \"lockbox\":{},\
              \"source\":{},\"memory_bound\":{},\"dropped_rows\":{},\
-             \"windows\":[{}],\"pooled\":{}}}",
+             \"device_pnl\":{},\"windows\":[{}],\"pooled\":{}}}",
             jstr(env!("CARGO_PKG_VERSION")),
             jstr(&self.expression),
             jstr(&self.target),
@@ -1628,15 +2153,29 @@ impl Report {
             jnum(self.embargo),
             jnum(self.cost_bps),
             jnum(self.cost_bps * 2.0),
+            jstr(position_rule),
+            jstr(self.policy.as_str()),
+            self.policy == Policy::Dp,
+            jnum(self.band_width),
+            self.min_hold,
             jnum(self.threshold_quantile),
+            self.threshold_fixed.map_or("null".to_string(), jnum),
+            jstr(self
+                .windows
+                .first()
+                .map(|w| w.threshold_source.as_str())
+                .unwrap_or("none")),
             jnum(self.periods_per_year),
             jstr(&self.annualization),
+            jnum(self.periods_per_year),
+            jnum(crate::risk::DEFAULT_SORTINO_MAR),
             self.candidates
                 .iter()
                 .map(|v| jstr(v))
                 .collect::<Vec<_>>()
                 .join(","),
             jstr(&self.selected_on),
+            self.band_select,
             self.test_used_for_selection,
             self.candidates.len(),
             self.pool_reset_flat,
@@ -1651,6 +2190,18 @@ impl Report {
             jstr(&self.source),
             jstr(&self.memory_bound),
             self.dropped_rows,
+            self.device_pnl.as_ref().map_or("null".to_string(), |d| {
+                format!(
+                    "{{\"backend\":{},\"segment_rows\":{},\"tile_candidates\":{},\
+                     \"windows\":{},\"rows\":{},\"max_abs_net_delta\":{}}}",
+                    jstr(&d.backend),
+                    d.segment_rows,
+                    d.tile_candidates,
+                    d.windows,
+                    d.rows,
+                    jnum(d.max_abs_net_delta)
+                )
+            }),
             windows.join(","),
             self.pooled.json()
         )
@@ -1688,9 +2239,42 @@ impl Report {
             self.group_by.as_deref().unwrap_or("(none: one series)")
         ));
         s.push_str("## Rules\n\n");
+        let policy_line = match self.policy {
+            Policy::Threshold => {
+                "- Long/flat only: `position = 1` when `score > threshold`, else `0`; never short, no leverage.\n".to_string()
+            }
+            Policy::Band => format!(
+                "- Long/flat no-trade band (`beta = {}`, minimum hold {}): enter when `score > threshold + beta`, exit when `score <= threshold - beta` after the hold; never short, no leverage.\n",
+                md_num(self.band_width),
+                self.min_hold
+            ),
+            Policy::Dp => {
+                "- Reported book: the plain threshold rule. The DP value is a **hindsight bound**, not a strategy; never short, no leverage.\n".to_string()
+            }
+        };
+        let threshold_rule = if let Some(theta) = self.threshold_fixed {
+            format!(
+                "pre-registered fixed theta = {} (no data fitting; source `fixed`)",
+                theta
+            )
+        } else {
+            format!(
+                "q{:.4} of the {} scores, exact type-7 order-statistic selection \
+                 (order-preserving radix select, f64 interpolation; source `{}`)",
+                self.threshold_quantile,
+                if self.validation_frac > 0.0 {
+                    "training/validation split"
+                } else {
+                    "training"
+                },
+                self.windows
+                    .first()
+                    .map(|w| w.threshold_source.as_str())
+                    .unwrap_or("none")
+            )
+        };
         s.push_str(&format!(
-            "- Long/flat only: `position = 1` when `score > threshold`, else `0`; never short, no leverage.\n\
-             - Threshold: q{:.4} of the {} scores, linear interpolation (numpy type 7).\n\
+            "{}- Threshold: {}.\n\
              - Cost: {:.4} bp per side on `|position change|`, so {:.4} bp per round trip.\n\
              - Per-window metrics start every group flat; the pooled path {} and its total\n\
                variation includes the seam term `|p_end - q_start|`.\n\
@@ -1698,12 +2282,8 @@ impl Report {
              - Purge: horizon {:.1}s, embargo {:.1}s.\n\
              - Annualisation: {} ({:.6} periods/year).\n\
              - Source: {}.\n\n",
-            self.threshold_quantile,
-            if self.validation_frac > 0.0 {
-                "training/validation split"
-            } else {
-                "training"
-            },
+            policy_line,
+            threshold_rule,
             self.cost_bps,
             self.cost_bps * 2.0,
             if self.pool_reset_flat {
@@ -1787,6 +2367,12 @@ impl Report {
             md_num(p.gross_sharpe)
         ));
         s.push_str(&format!(
+            "Sortino (MAR {}): {}; log-growth per period: {}.\n",
+            md_num(p.sortino_mar),
+            md_num(p.sortino),
+            md_num(p.log_growth)
+        ));
+        s.push_str(&format!(
             "\nPooled seam: {}; extra seam cost {} ({} trade(s)); pooled total variation {}.\n",
             if self.pool_reset_flat {
                 "flat reset at every boundary"
@@ -1854,6 +2440,10 @@ impl Report {
             p.break_even_hit_rate,
             p.trades,
             p.rows
+        ));
+        s.push_str(&format!(
+            "risk: Sortino(MAR {:.4}) {:.4}  log-growth/period {:.6}\n",
+            p.sortino_mar, p.sortino, p.log_growth
         ));
         s.push_str(&format!(
             "seam: {}  seam cost {:.4} bp  seam trades {}  pooled |delta| {:.6}",

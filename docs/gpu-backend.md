@@ -1650,6 +1650,35 @@ to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
 CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
 substitute for either.
 
+## Long-only P&L reduction (issue #304)
+
+`src/cuda/pnl.cu` is a separate, fused long-only `{0, +1}` P&L reduction over a
+candidate's score vector. It is not the search scorer and it does not evaluate
+expressions; it consumes scores and accumulates the same book the scalar
+`walkforward` evaluator builds. `rcsr walkforward --device-pnl` exercises it as
+a cross-check beside the reported CPU metrics.
+
+The design follows the determinism contract of the batched fit:
+
+* rows are split into fixed 8,192-row **canonical segments**; inside a segment
+  rows go to 32 virtual lanes by `(row - segment_start) % 32`, and the lanes
+  merge through a fixed pairwise tree;
+* a segment is always split over the same lanes, so 128, 256 and 512 threads
+  change warp ownership only, never summation order; a warp reads 32 consecutive
+  rows at a time instead of striding by the whole segment;
+* chunks that end inside a segment resume the per-segment accumulator in device
+  memory, so alone/padded/4 k/64 k chunks are bit-identical;
+* all P&L terms are `f64`; only the input score is `f32`;
+* candidates stream through a declared tile of at most 8 candidates, so the
+  path never materialises `P x N` scores;
+* the final exit is charged once per group, positions are only `{0, 1}`, and a
+  negative position is rejected (no short kernel).
+
+The CPU canonical path in `src/trading_gpu.rs` uses the same segments and merge
+order, so device/CPU parity is bit-identical on the fixtures (and within
+`1e-9` relative, the acceptance gate, even if a future input exposes a rounding
+difference).
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |

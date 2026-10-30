@@ -50,12 +50,14 @@ pub mod prep; // #123: raw archives -> column store
 pub mod progress_stats;
 pub mod qd; // #120: quality-diversity descriptor grid
 pub mod resample; // #92: index-based resampling with a BLB cap
+pub mod risk; // #307: exact risk monoids (Sharpe, Sortino, log-growth, drawdown, beta/alpha)
 pub mod rng;
 pub mod schema;
 pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
+pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
 pub mod zip; // #123: minimal stored/deflate ZIP reader
