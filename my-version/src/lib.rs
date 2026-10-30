@@ -17,6 +17,9 @@ pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
 #[cfg(feature = "cuda")]
 pub mod mtf_gpu; // #296: device MTF resample and causal join
+#[cfg(feature = "cuda")]
+pub mod panel_prep_gpu; // #301: fused device duplicate/resample/gap pass
+pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
