@@ -1703,4 +1703,52 @@ mod device_conformance {
             }
         }
     }
+
+    #[test]
+    fn device_cash_and_buy_and_hold_are_bit_identical_alone_padded_and_across_chunks_and_threads() {
+        use rcsr::baselines::{control_positions, device_totals, position_totals, POSITION_THRESHOLD};
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 70_000usize;
+        let (scores, returns, groups) = long_run_data(n);
+        let params = PnlParams { segment_rows: 64, ..PnlParams::default() };
+        let strat: Vec<f64> = scores.iter().map(|&s| if s > 0.0 { 1.0 } else { 0.0 }).collect();
+        // Cash, buy-and-hold, constant, matched exposure.
+        let books = control_positions(&strat, &groups, true, 7).unwrap();
+        let cpu: Vec<_> = books
+            .iter()
+            .map(|b| position_totals(b, &returns, &groups, &params).unwrap())
+            .collect();
+
+        let via_entry = device_totals(&books, &returns, &groups, &params).expect("device");
+        for (k, (c, d)) in cpu.iter().zip(&via_entry).enumerate() {
+            assert_eq!(c.bits(), d.bits(), "control {k} entry point");
+        }
+
+        for threads in [128usize, 256, 512] {
+            for chunk in [4_096usize, 65_536] {
+                // Alone: each control as a one-candidate tile.
+                for (k, b) in books.iter().enumerate() {
+                    let got = reduce_device_batch(
+                        &[b.as_slice()], &returns, &groups, &[POSITION_THRESHOLD], &params, threads, chunk,
+                    )
+                    .unwrap();
+                    assert_eq!(cpu[k].bits(), got[0].strategy.bits(), "alone {k} t{threads} c{chunk}");
+                }
+                // Padded: the four controls plus filler books in a full tile.
+                let mut tile: Vec<&[f64]> = books.iter().map(|b| b.as_slice()).collect();
+                while tile.len() < MAX_TILE_CANDIDATES {
+                    tile.push(books[3].as_slice());
+                }
+                let th = vec![POSITION_THRESHOLD; tile.len()];
+                let got = reduce_device_batch(&tile, &returns, &groups, &th, &params, threads, chunk)
+                    .unwrap();
+                for k in 0..4 {
+                    assert_eq!(cpu[k].bits(), got[k].strategy.bits(), "padded {k} t{threads} c{chunk}");
+                }
+            }
+        }
+    }
 }
