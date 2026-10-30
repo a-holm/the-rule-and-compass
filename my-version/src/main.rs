@@ -101,7 +101,7 @@ USAGE:
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
              [--target-spec <file>]
-  rcsr verify-manifest <manifest.json> [--data <file>]
+  rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
                               default (phases, fit/eval share, fallback
@@ -531,7 +531,13 @@ SEARCH:
                              selection and archiving. Independent of
                              --predictor-samples
   --patience <N>             stop after N generations without improvement (default 40)
-  --time-budget <seconds>    wall-clock limit (default: none)
+  --time-budget <seconds>    wall-clock limit of this process (default: none).
+                             The generation in progress finishes, its progress
+                             event and checkpoint are written, and the result
+                             reports stop_reason time_budget with
+                             converged_early false. The checkpoint is not
+                             terminal: --resume runs more generations and may
+                             set a new --time-budget
   --gpu                      assert that the GPU must guide the search: an
                              error (exit 2) when the binary was not built with
                              --features cuda or no device is present. Without
@@ -556,7 +562,13 @@ SEARCH:
                              are not bit-identical because f32 fitness can
                              change the trajectory. JSON reports the measured
                              kernel/sync/alloc/copy wall, the evaluator-window
-                             kernel duty, and the #284 run ledger: exclusive
+                             kernel duty (eval_kernel_duty, with eval_window_s),
+                             device_seconds_incl_fit, device_fraction_of_run and
+                             eval_fraction_of_run (divided by
+                             timing.total_seconds, the one runtime of the
+                             process), batches_per_s (evaluator batches per
+                             evaluator second, not generations), and the #284
+                             run ledger: exclusive
                              stage seconds (vary/eval/fit/select/archive/
                              features/pnl/io/host_other), device-busy as the
                              union of device intervals over run wall, fit kernel
@@ -612,7 +624,13 @@ CHECKPOINTS:
                              generations; saving does not change the search.
                              Writes are atomic and the previous good generation
                              is kept as <file>.prev
-  --save-every <N>           generation interval for --save (default 25)
+  --save-every <N>           generation interval for --save (default 25). A
+                             checkpoint is also written when 15 minutes have
+                             passed since the last one, so slow generations
+                             are never 25 generations of lost work. The exit
+                             checkpoint carries the exact f64 post-refit
+                             archive (final), its archive_hash and an
+                             error_kind label for the search state
   --resume <file>            continue from a checkpoint. The saved search
                              settings win; --generations may only be raised.
                              Training and test data must match the saved
@@ -622,15 +640,26 @@ CHECKPOINTS:
   --allow-backend-change     resume a checkpoint on a different backend
                              (cpu<->gpu) and say so on stderr and in the
                              run manifest
+  --allow-build-change       resume a checkpoint written by a different
+                             binary, commit, version, device, driver or
+                             thread count (#256). Without it the mismatch
+                             is refused (exit 3). A time-budget stop is not
+                             terminal: --resume continues it and
+                             --time-budget may be set again
 
 RUN INTEGRITY (#140):
-  --run-manifest <file>      atomically write a JSON manifest with commit,
-                             dirty state, binary SHA-256, data checksum and
-                             fingerprint, resolved config, seed, backend,
+  --run-manifest <file>      atomically write a JSON manifest with the build
+                             commit (recorded when the binary was built, not by
+                             a runtime git call), binary SHA-256, data checksum
+                             and fingerprint, resolved config, seed, backend,
                              device/driver/CUDA, UTC start/end and phase timings;
-                             update it atomically at the end
-  verify-manifest <file>     check a manifest against the current binary,
-  [--data <file>]            commit, data file and canonical config; exit 1 on
+                             update it atomically at the end. start_utc is the
+                             process start, end_utc the end of the process work
+                             and phases_seconds.total equals
+                             timing.total_seconds in the result JSON
+  verify-manifest <file>     check a manifest against the current binary (or the
+  [--data <file>]            file named by --binary, for a preserved binary),
+  [--binary <file>]          data file and canonical config; exit 1 on
                              any mismatch (exit 0 when everything matches)
 
 DISPATCH (#290):
@@ -881,6 +910,9 @@ fn gpu_json(
     // (best MSE versus constant-mean MSE). Every other metric reports null
     // rather than a mixed-unit ratio.
     metric_is_squared: bool,
+    // #256: `timing.total_seconds`, the one runtime of the process. The
+    // `*_of_run` fractions divide by it.
+    process_total_s: f64,
 ) -> String {
     let Some(g) = g else {
         return "null".to_string();
@@ -979,6 +1011,17 @@ fn gpu_json(
         a.wall_s
     };
     let run_duty = g.ledger.duty_run();
+    // #256: the device works in the evaluator calls and in the fit kernels.
+    let device_incl_fit = a.wall_s + g.ledger.fit_kernel_s();
+    let device_fraction = rcsr::gpu_stats::Ratio::new(
+        device_incl_fit,
+        process_total_s,
+        "fraction",
+        "process",
+    );
+    let eval_fraction =
+        rcsr::gpu_stats::Ratio::new(a.wall_s, process_total_s, "fraction", "process");
+    let eval_duty = rcsr::gpu_stats::Ratio::new(a.kernel_s, a.wall_s, "fraction", "evaluator_window");
     let ledger = ledger_json(
         &g.ledger,
         &a,
@@ -987,7 +1030,7 @@ fn gpu_json(
         metric_is_squared,
     );
     format!(
-        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"generations_per_s\":{},\"batches_per_s\":{},\"duty_cycle\":{},\"duty_source\":\"eval_kernel_s / eval_wall_s (evaluator window, not run)\",\"duty_scope\":\"evaluator_window\",\"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"quality_scope\":\"evaluator_window_like_unit_ratio\",\"quality_per_gpu_hour_run\":{},\"ledger\":{},\"generations\":[{}],\"totals\":{}, {}}}",
+        "{{\"kernel_s\":{},\"launch_s\":{},\"sync_s\":{},\"alloc_s\":{},\"h2d_s\":{},\"d2h_s\":{},\"transfer_s\":{},\"window_s\":{},\"host_s\":{},\"accounted_s\":{},\"wall_s\":{},\"idle_s\":{},\"residual_fraction\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"batches\":{},\"failed_batches\":{},\"programs\":{},\"evals\":{},\"row_evals\":{},\"evals_per_s\":{},\"row_evals_per_s\":{},\"batches_per_s\":{},\"eval_kernel_duty\":{},\"eval_window_s\":{},\"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\"eval_fraction_of_run\":{},\"process_total_s\":{},\"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"sm_occupancy\":null,\"occupancy_source\":\"ncu (not run)\",\"quality_per_gpu_hour\":{},\"quality_scope\":\"evaluator_window_like_unit_ratio\",\"quality_per_gpu_hour_run\":{},\"ledger\":{},\"generations\":[{}],\"totals\":{}, {}}}",
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.sync_s),
@@ -1010,13 +1053,17 @@ fn gpu_json(
         a.row_evals,
         jnum(a.evals_per_s()),
         jnum(a.row_evals_per_s()),
-        jnum(a.generations_per_s()),
         jnum(if a.wall_s > 0.0 {
             a.batches as f64 / a.wall_s
         } else {
             0.0
         }),
-        jnum(a.duty_cycle()),
+        ratio_json(Some(&eval_duty)),
+        jnum(a.wall_s),
+        jnum(device_incl_fit),
+        ratio_json(Some(&device_fraction)),
+        ratio_json(Some(&eval_fraction)),
+        jnum(process_total_s),
         jnum(run_wall),
         jnum(g.ledger.device_busy_s()),
         ratio_json(Some(&run_duty)),
@@ -1116,6 +1163,111 @@ fn timing_json_g(t: &PhaseTimings, gates: Option<f64>) -> String {
     out
 }
 
+/// #256: the human summary of a finished search: elapsed, phase timings and
+/// the GPU ledger lines. It is printed for the text format and, unless
+/// `--quiet`, for `--json`/`--json-out` too, so a result file never hides the
+/// line that reports GPU time.
+fn eprint_run_summary(
+    outcome: &rcsr::search::Outcome,
+    cfg: &search::Config,
+    train: &data::Sample,
+    elapsed: f64,
+    timing: &PhaseTimings,
+) {
+    eprintln!(
+        "# elapsed: {:.2}s | generations: {} | pareto members: {}{}",
+        elapsed,
+        outcome.generations,
+        outcome.archive.items.len(),
+        if outcome.stopped_early() {
+            format!(" (stopped early: {})", outcome.stop_reason)
+        } else {
+            String::new()
+        }
+    );
+    eprintln!("# time: {}", timing.text());
+    // #121: the fallback counters are not only in --json; a text
+    // run says how much work the CPU pool carried.
+    if let Some(g) = &outcome.gpu {
+        let programs: usize =
+            g.generations.iter().map(|s| s.unsupported_programs).sum();
+        if programs > 0 {
+            let seconds: f64 =
+                g.generations.iter().map(|s| s.fallback_seconds).sum();
+            eprintln!(
+                "# gpu: cpu fallback {} programs in {:.3}s on {} worker(s)",
+                programs,
+                seconds,
+                g.generations
+                    .last()
+                    .map(|s| s.fallback_workers)
+                    .unwrap_or(0)
+            );
+        }
+    }
+    if let Some(g) = &outcome.gpu {
+        let a = &g.accounting;
+        let ledger = &g.ledger;
+        eprintln!(
+            "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | eval duty={:.1}% (eval window) | run duty={:.1}% (device-busy union / run wall {:.3}s) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
+            a.kernel_s,
+            a.sync_s,
+            a.alloc_s,
+            a.h2d_s,
+            a.d2h_s,
+            a.launch_s,
+            a.host_s,
+            a.wall_s,
+            100.0 * a.duty_cycle(),
+            100.0 * ledger.duty_run().value,
+            ledger.wall_s(),
+            a.evals_per_s(),
+            a.row_evals_per_s(),
+            if cfg.metric == rcsr::metrics::Metric::Squared {
+                ledger
+                    .quality_per_gpu_hour(
+                        gpu_best_error(outcome),
+                        gpu_baseline_error(train),
+                    )
+                    .value
+            } else {
+                f64::NAN
+            }
+        );
+        eprintln!(
+            "# gpu ledger: wall={:.3}s stages[vary={:.3} eval={:.3} fit={:.3} select={:.3} archive={:.3} host_other={:.3}] unaccounted={:.3}s ({:.2}%) | device_busy={:.3}s intervals={} overlap={:.3}s | fit kernel={:.3}s fallback={:.3}s refits={:.3}s | admitted={} device={} fallback={} [{}]",
+            ledger.wall_s(),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Vary),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Eval),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Fit),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Select),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Archive),
+            ledger.stage_s(rcsr::gpu_stats::Stage::HostOther),
+            ledger.unaccounted_s(),
+            100.0 * if ledger.wall_s() > 0.0 {
+                ledger.unaccounted_s() / ledger.wall_s()
+            } else {
+                0.0
+            },
+            ledger.device_busy_s(),
+            ledger.intervals().len(),
+            ledger.device_overlap_s(),
+            ledger.fit_kernel_s(),
+            ledger.fit_fallback_s(),
+            ledger.refit_s(),
+            ledger.admitted(),
+            ledger.device_fits(),
+            ledger.fallback_fits(),
+            ledger
+                .fallback_by_cause()
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+}
+
 /// #120: QD coverage in the human-readable log.
 fn qd_text(q: Option<&qd::QdReport>) {
     if let Some(q) = q {
@@ -1185,12 +1337,13 @@ struct PhaseTimings {
 impl PhaseTimings {
     fn json(&self) -> String {
         format!(
-            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"total_seconds\":{},\"gpu_seconds\":{}}}",
+            "{{\"prep_seconds\":{},\"search_seconds\":{},\"baselines_seconds\":{},\"diagnostics_seconds\":{},\"report_seconds\":{},\"unaccounted_seconds\":{},\"total_seconds\":{},\"gpu_seconds\":{}}}",
             jnum(self.prep),
             jnum(self.search),
             jnum(self.baselines),
             jnum(self.diagnostics),
             jnum(self.report),
+            jnum(self.unaccounted()),
             jnum(self.total),
             jnum(self.gpu)
         )
@@ -1203,7 +1356,13 @@ impl PhaseTimings {
         )
     }
 
-    #[cfg(test)]
+    /// #256: `total` minus the measured phases. The phases and this remainder
+    /// add up to `total_seconds` exactly; `total_seconds` is the one runtime of
+    /// the process.
+    fn unaccounted(&self) -> f64 {
+        self.total - self.phases_sum()
+    }
+
     fn phases_sum(&self) -> f64 {
         self.prep + self.search + self.baselines + self.diagnostics + self.report
     }
@@ -1296,6 +1455,12 @@ impl DevSink {
             .map(|s| s.error)
             .fold(f64::INFINITY, f64::min);
         let gpu_wall = outcome.gpu.as_ref().map(|g| g.accounting.wall_s);
+        // #256: the device was busy in the evaluator calls and in the fit
+        // kernels; the evaluator window alone undercounts a fit-heavy run.
+        let device_s = outcome
+            .gpu
+            .as_ref()
+            .map(|g| g.accounting.wall_s + g.ledger.fit_kernel_s());
         let (events, bytes, dropped) = self.stats();
         let end = rcsr::devlog::RunEnd {
             generations: outcome.generations,
@@ -1308,7 +1473,9 @@ impl DevSink {
             json_path,
             peak_rss_bytes: rcsr::devlog::peak_rss_bytes(),
             gpu_wall_s: gpu_wall,
-            device_hours: gpu_wall.map(|w| w / 3600.0),
+            device_hours: device_s.map(|d| d / 3600.0),
+            device_seconds_incl_fit: device_s,
+            device_fraction_of_run: device_s.map(|d| if wall_s > 0.0 { d / wall_s } else { 0.0 }),
             run_wall_s: outcome.gpu.as_ref().map(|g| g.ledger.wall_s()),
             device_busy_s: outcome.gpu.as_ref().map(|g| g.ledger.device_busy_s()),
             duty_run: outcome.gpu.as_ref().map(|g| g.ledger.duty_run().value),
@@ -1339,7 +1506,7 @@ fn dev_run_start(
     max_bytes: u64,
     resumed_from: Option<String>,
 ) -> rcsr::devlog::RunStart {
-    let (commit, dirty) = manifest::git_info();
+    let (commit, dirty) = manifest::build_info();
     let exe = std::env::current_exe().unwrap_or_default();
     let train = rcsr::checkpoint::fingerprint(&prepared.train);
     let test = rcsr::checkpoint::fingerprint(&prepared.test);
@@ -1757,6 +1924,7 @@ fn main() {
     let mut resume_path: Option<String> = None;
     // #140: run integrity flags.
     let mut allow_backend_change = false;
+    let mut allow_build_change = false;
     let mut run_manifest_path: Option<String> = None;
     let mut no_project = false;
     let mut json_out: Option<String> = None;
@@ -2323,6 +2491,7 @@ fn main() {
             }
             "--resume" => resume_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
+            "--allow-build-change" => allow_build_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
             "--no-project" => no_project = true,
             // #211: the development log. It is on by default; `--no-dev-log`
@@ -2492,6 +2661,10 @@ fn main() {
     }
     if allow_backend_change && resume_path.is_none() {
         eprintln!("error: --allow-backend-change only applies to --resume");
+        std::process::exit(EXIT_USAGE);
+    }
+    if allow_build_change && resume_path.is_none() {
+        eprintln!("error: --allow-build-change only applies to --resume");
         std::process::exit(EXIT_USAGE);
     }
     if json_out.is_some() {
@@ -2675,12 +2848,6 @@ fn main() {
                 cfg.patience, saved.patience
             ));
         }
-        if time_budget_set && cfg.time_budget != saved.time_budget {
-            conflicts.push(format!(
-                "--time-budget {:?} (saved {:?})",
-                cfg.time_budget, saved.time_budget
-            ));
-        }
         if predictor_samples_set && cfg.predictor_samples != saved.predictor_samples {
             conflicts.push(format!(
                 "--predictor-samples {:?} (saved {:?})",
@@ -2774,6 +2941,12 @@ fn main() {
         if generations_set {
             effective.generations = cfg.generations;
         }
+        // #256: the time budget limits one process, not the trajectory, so a
+        // resumed run takes the budget it is given (a stopped run is resumed
+        // exactly to get more time).
+        if time_budget_set {
+            effective.time_budget = cfg.time_budget;
+        }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
         cfg = effective;
@@ -2852,6 +3025,9 @@ fn main() {
     // #140: phase timings for the run manifest start here, before the table is
     // read, so the manifest covers the whole run rather than just the search.
     let run_start = std::time::Instant::now();
+    // #256: the manifest's `start_utc` is the process start, not the moment the
+    // first data hash finished.
+    let run_start_utc = manifest::utc_now();
     let data_path = match data_path {
         Some(p) => p,
         None => {
@@ -3991,6 +4167,23 @@ fn main() {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+        // #256: the binary, commit, device, driver and thread count are part
+        // of what produced the saved state.
+        let current_identity =
+            rcsr::provenance::BuildIdentity::current(current_backend == Backend::Gpu);
+        if let Err(e) = cp.check_identity(&current_identity, allow_build_change) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+        if let Some(saved) = &cp.identity {
+            let diff = saved.differences(&current_identity);
+            if !diff.is_empty() {
+                eprintln!(
+                    "# checkpoint: build identity changed ({}) (allowed by --allow-build-change)",
+                    diff.join("; ")
+                );
+            }
+        }
         if cp.backend != Backend::Unknown && cp.backend != current_backend {
             backend_change = Some((
                 cp.backend.as_str().to_string(),
@@ -4103,6 +4296,7 @@ fn main() {
             store_memory_estimate.map(|m| m.total_bytes),
         );
         let mut m = m;
+        m.start_utc = run_start_utc.clone();
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),
@@ -4538,28 +4732,6 @@ fn main() {
     // Compatibility: `elapsed_seconds` has always meant the search phase.
     let elapsed = search_seconds;
     let diagnostics_start = std::time::Instant::now();
-
-    // #140: atomically finish the manifest with an end timestamp and timings.
-    if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
-        // #169: record the fit arm's ledger when the GPU fit ran.
-        if outcome.gpu.is_some() {
-            let (gpu, fallback, refits) = fit::gpu_fit_counts();
-            m.fit = Some((gpu, fallback, refits));
-        }
-        // #290: the calibrated model and the route ledger are provenance, not
-        // a result: record them whenever a run manifest was requested.
-        m.dispatch = Some(outcome.dispatch.clone());
-        let total_secs = run_start.elapsed().as_secs_f64();
-        let phases = [
-            ("data_prepare", data_prepare_secs),
-            ("search", elapsed),
-            ("total", total_secs),
-        ];
-        if let Err(e) = m.write(path, Some(&manifest::utc_now()), &phases) {
-            eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
-        }
-    }
 
     // #116: opt-in arm counts. This line is diagnostics only and never feeds
     // back into the search.
@@ -5183,6 +5355,32 @@ fn main() {
         md.push_str(&time_markdown(&timing));
     }
 
+    // #140: atomically finish the manifest with an end timestamp and timings.
+    // #256: written after the diagnostics, so `end_utc` is the end of the
+    // process work and `phases_seconds.total` is `timing.total_seconds`.
+    if let (Some(path), Some(m)) = (&run_manifest_path, &mut manifest_state) {
+        // #169: record the fit arm's ledger when the GPU fit ran.
+        if outcome.gpu.is_some() {
+            let (gpu, fallback, refits) = fit::gpu_fit_counts();
+            m.fit = Some((gpu, fallback, refits));
+        }
+        // #290: the calibrated model and the route ledger are provenance, not
+        // a result: record them whenever a run manifest was requested.
+        m.dispatch = Some(outcome.dispatch.clone());
+        let phases = [
+            ("data_prepare", data_prepare_secs),
+            ("search", timing.search),
+            ("baselines", timing.baselines),
+            ("diagnostics", timing.diagnostics),
+            ("report", timing.report),
+            ("total", timing.total),
+        ];
+        if let Err(e) = m.write(path, Some(&manifest::utc_now()), &phases) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+
     // #120: fixed-reference validation HV is computed before any display
     // truncation or selection reordering, from the full archive this run
     // produced.
@@ -5214,98 +5412,7 @@ fn main() {
     match format {
         Format::Text => {
             if !quiet {
-                eprintln!(
-                    "# elapsed: {:.2}s | generations: {} | pareto members: {}{}",
-                    elapsed,
-                    outcome.generations,
-                    outcome.archive.items.len(),
-                    if outcome.converged_early {
-                        " (stopped early)"
-                    } else {
-                        ""
-                    }
-                );
-                eprintln!("# time: {}", timing.text());
-                // #121: the fallback counters are not only in --json; a text
-                // run says how much work the CPU pool carried.
-                if let Some(g) = &outcome.gpu {
-                    let programs: usize =
-                        g.generations.iter().map(|s| s.unsupported_programs).sum();
-                    if programs > 0 {
-                        let seconds: f64 =
-                            g.generations.iter().map(|s| s.fallback_seconds).sum();
-                        eprintln!(
-                            "# gpu: cpu fallback {} programs in {:.3}s on {} worker(s)",
-                            programs,
-                            seconds,
-                            g.generations
-                                .last()
-                                .map(|s| s.fallback_workers)
-                                .unwrap_or(0)
-                        );
-                    }
-                }
-                if let Some(g) = &outcome.gpu {
-                    let a = &g.accounting;
-                    let ledger = &g.ledger;
-                    eprintln!(
-                        "# gpu: kernel={:.3}s sync={:.3}s alloc={:.3}s h2d={:.3}s d2h={:.3}s launch={:.3}s host={:.3}s wall={:.3}s | eval duty={:.1}% (eval window) | run duty={:.1}% (device-busy union / run wall {:.3}s) | {:.0} evals/s, {:.3e} row-evals/s | {:.3} decades/GPU-h",
-                        a.kernel_s,
-                        a.sync_s,
-                        a.alloc_s,
-                        a.h2d_s,
-                        a.d2h_s,
-                        a.launch_s,
-                        a.host_s,
-                        a.wall_s,
-                        100.0 * a.duty_cycle(),
-                        100.0 * ledger.duty_run().value,
-                        ledger.wall_s(),
-                        a.evals_per_s(),
-                        a.row_evals_per_s(),
-                        if cfg.metric == rcsr::metrics::Metric::Squared {
-                            ledger
-                                .quality_per_gpu_hour(
-                                    gpu_best_error(&outcome),
-                                    gpu_baseline_error(&prepared.train),
-                                )
-                                .value
-                        } else {
-                            f64::NAN
-                        }
-                    );
-                    eprintln!(
-                        "# gpu ledger: wall={:.3}s stages[vary={:.3} eval={:.3} fit={:.3} select={:.3} archive={:.3} host_other={:.3}] unaccounted={:.3}s ({:.2}%) | device_busy={:.3}s intervals={} overlap={:.3}s | fit kernel={:.3}s fallback={:.3}s refits={:.3}s | admitted={} device={} fallback={} [{}]",
-                        ledger.wall_s(),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::Vary),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::Eval),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::Fit),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::Select),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::Archive),
-                        ledger.stage_s(rcsr::gpu_stats::Stage::HostOther),
-                        ledger.unaccounted_s(),
-                        100.0 * if ledger.wall_s() > 0.0 {
-                            ledger.unaccounted_s() / ledger.wall_s()
-                        } else {
-                            0.0
-                        },
-                        ledger.device_busy_s(),
-                        ledger.intervals().len(),
-                        ledger.device_overlap_s(),
-                        ledger.fit_kernel_s(),
-                        ledger.fit_fallback_s(),
-                        ledger.refit_s(),
-                        ledger.admitted(),
-                        ledger.device_fits(),
-                        ledger.fallback_fits(),
-                        ledger
-                            .fallback_by_cause()
-                            .iter()
-                            .map(|(k, v)| format!("{}={}", k, v))
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    );
-                }
+                eprint_run_summary(&outcome, &cfg, &prepared.train, elapsed, &timing);
                 qd_text(outcome.qd.as_ref());
                 eprintln!(
                     "# validation hv ({}): {:.6} (ref error {}, {} front points; fixed reference; complexity span {}..{}, compare only runs with the same span)",
@@ -5575,6 +5682,10 @@ fn main() {
             }
         }
         Format::Json => {
+            // #256: `--json-out` must not hide the line that reports GPU time.
+            if !quiet {
+                eprint_run_summary(&outcome, &cfg, &prepared.train, elapsed, &timing);
+            }
             let (
                 weight_column_json,
                 weight_sum_json,
@@ -5892,7 +6003,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -5913,6 +6024,7 @@ fn main() {
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.converged_early,
+                jstr(outcome.stop_reason),
                 // #18: the four convergence numbers.
                 outcome.convergence.json(),
                 jnum(elapsed),
@@ -5923,6 +6035,7 @@ fn main() {
                     gpu_baseline_error(&prepared.train),
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
+                    timing.total,
                 ),
                 outcome.dispatch.json(),
                 checkpoint_json,
@@ -6147,9 +6260,10 @@ fn main() {
             };
             let search_meta_ndjson = format!("{}{}", predictor_ndjson, fit_ndjson);
             println!(
-                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"pareto_members\":{}{}}}",
+                "{{\"event\":\"done\",\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"pareto_members\":{}{}}}",
                 outcome.generations,
                 outcome.converged_early,
+                jstr(outcome.stop_reason),
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
@@ -6160,6 +6274,7 @@ fn main() {
                     gpu_baseline_error(&prepared.train),
                     cfg.fit_strategy.name(),
                     cfg.metric == rcsr::metrics::Metric::Squared,
+                    timing.total,
                 ),
                 outcome.dispatch.json(),
                 outcome.archive.items.len(),
@@ -6351,7 +6466,7 @@ fn run_multi_output(
                     elapsed,
                     outcome.generations,
                     outcome.archive.items.len(),
-                    if outcome.converged_early {
+                    if outcome.stopped_early() {
                         " (stopped early)"
                     } else {
                         ""
@@ -6470,7 +6585,7 @@ fn run_multi_output(
                 )
             };
             let result_json = format!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"multi_output\":true,\"target\":{},\"targets\":[{}],\"variables\":[{}],\"train_rows\":{},\"test_rows\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"elapsed_seconds\":{},\"timing\":{},\"backend\":\"{}\",\"backend_reason\":{},\"device\":{},\"qd\":{},\"pareto\":[{}]}}",
                 jstr(VERSION),
                 cfg.seed,
                 jstr(cfg.metric.name()),
@@ -6482,6 +6597,7 @@ fn run_multi_output(
                 prepared.test.len(),
                 outcome.generations,
                 outcome.converged_early,
+                jstr(outcome.stop_reason),
                 jnum(elapsed),
                 timing.json(),
                 // #141: the effective backend, never inferred from flags.
@@ -6512,9 +6628,10 @@ fn run_multi_output(
             // #134: the closing event carries the same timing ledger as the
             // single-output stream and the multi-output JSON object.
             println!(
-                "{{\"event\":\"done\",\"multi_output\":true,\"generations_run\":{},\"converged_early\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{},\"targets\":[{}],\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
+                "{{\"event\":\"done\",\"multi_output\":true,\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"elapsed_seconds\":{},\"timing\":{},\"pareto_members\":{},\"targets\":[{}],\"backend\":\"{}\",\"backend_reason\":{},\"device\":{}}}",
                 outcome.generations,
                 outcome.converged_early,
+                jstr(outcome.stop_reason),
                 jnum(elapsed),
                 timing.json(),
                 outcome.archive.items.len(),
@@ -6832,7 +6949,8 @@ fn time_markdown(t: &PhaseTimings) -> String {
          | report | {:.3} |\n\
          | **total wall** | **{:.3}** |\n\n\
          `elapsed_seconds` in JSON is the search phase, kept for compatibility;\n\
-         use `total_seconds` (or the sum above) for wall-clock cost.\n",
+         `total_seconds` is the one runtime of the process. The phases and\n\
+         `unaccounted_seconds` add up to it.\n",
         t.prep, t.search, t.baselines, t.diagnostics, t.report, t.total
     )
 }
@@ -6880,7 +6998,7 @@ fn summary_markdown(
         cfg.metric.name(),
         cfg.seed,
         outcome.generations,
-        if outcome.converged_early {
+        if outcome.stopped_early() {
             " (stopped early)"
         } else {
             ""
@@ -8765,23 +8883,36 @@ OPTIONS:
     )
 }
 
-/// `rcsr verify-manifest <path> [--data <file>]` (issue #140).
+/// `rcsr verify-manifest <path> [--data <file>] [--binary <file>]` (issues #140, #256).
 ///
 /// Exit 0 when every check passes, 1 on any mismatch, 2 on a usage error.
 fn run_verify_manifest(args: &[String]) -> ! {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         println!(
-            "rcsr verify-manifest <manifest.json> [--data <file>]\n\n\
-             Check a --run-manifest against the current binary, git commit, data\n\
-             file and canonical configuration. Exit 0 when all match, 1 otherwise."
+            "rcsr verify-manifest <manifest.json> [--data <file>] [--binary <file>]\n\n\
+             Check a --run-manifest against the current binary, build commit, data\n\
+             file and canonical configuration. --binary names the executable to\n\
+             hash instead of the running one (the preserved binary of a finished\n\
+             run). Exit 0 when all match, 1 otherwise."
         );
         std::process::exit(EXIT_OK);
     }
     let mut path: Option<String> = None;
     let mut data: Option<String> = None;
+    let mut binary: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--binary" | "-b" => {
+                i += 1;
+                match args.get(i) {
+                    Some(v) => binary = Some(v.clone()),
+                    None => {
+                        eprintln!("error: --binary requires a value");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--data" | "-d" => {
                 i += 1;
                 match args.get(i) {
@@ -8810,7 +8941,7 @@ fn run_verify_manifest(args: &[String]) -> ! {
         eprintln!("error: verify-manifest needs a manifest path");
         std::process::exit(EXIT_USAGE);
     };
-    match manifest::verify(&path, data.as_deref()) {
+    match manifest::verify(&path, data.as_deref(), binary.as_deref()) {
         Ok(lines) => {
             for line in lines {
                 println!("{}", line);
@@ -9557,7 +9688,7 @@ mod tests {
         g.fit_fallback_bounded = 0;
         g.fit_fallback_workers = 8;
         g.fit_fallback_max = 4096;
-        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true);
+        let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
             json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
@@ -9586,7 +9717,7 @@ mod tests {
         l.record_interval(Stage::Fit, 1, 3.0, 5.0);
         let mut g = search::GpuRunStats::default();
         g.ledger = l;
-        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true);
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 10.0);
         for key in [
             "\"ledger\":",
             "\"stages\":",
@@ -9603,7 +9734,17 @@ mod tests {
         ] {
             assert!(json.contains(key), "gpu JSON is missing {key}: {}", json);
         }
-        assert!(json.contains("\"duty_scope\":\"evaluator_window\""));
+        assert!(json.contains("\"scope\":\"evaluator_window\""));
+        assert!(!json.contains("\"duty_cycle\""));
+        assert!(!json.contains("\"generations_per_s\""));
+        for key in [
+            "\"device_seconds_incl_fit\":1.5",
+            "\"device_fraction_of_run\":{\"value\":0.15,\"numerator\":1.5,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"process\"}",
+            "\"eval_fraction_of_run\":{\"value\":0,",
+            "\"process_total_s\":10",
+        ] {
+            assert!(json.contains(key), "gpu JSON is missing {key}: {}", json);
+        }
         // The schema and help must name the run-scoped fields, not just the
         // evaluator-window ones.
         for needle in ["device_busy_s", "duty_run", "fallback_by_cause", "run_ledger"] {
@@ -9633,6 +9774,75 @@ mod tests {
         let q = st.quality_per_gpu_hour(0.103_464_003_567_670_26, 0.105_885_819_341_126_06);
         assert!((q.value - 4.844_205).abs() < 1e-5);
         assert!((q.value - 3085.48).abs() > 1.0);
+    }
+
+    /// #256: the published 10 h cell, end to end through the JSON writer. The
+    /// evaluator window gives `4.844205` decades per hour (best MSE
+    /// 0.10346400356767026 against the constant-mean MSE 0.10588581934112606
+    /// over 7.46761867 s), never `3085.48`.
+    #[test]
+    fn gpu_json_reports_the_published_cell_with_like_units() {
+        let mut g = search::GpuRunStats::default();
+        g.accounting.wall_s = 7.467_618_67;
+        g.accounting.kernel_s = 7.0;
+        g.accounting.batches = 62;
+        let json = gpu_json(
+            &Some(g),
+            0.103_464_003_567_670_26,
+            0.105_885_819_341_126_06,
+            "exact",
+            true,
+            38_114.998,
+        );
+        assert!(!json.contains("3085.48"), "{}", json);
+        assert!(json.contains("\"quality_per_gpu_hour\":4.8442"), "{}", json);
+        // Batches per evaluator second, under its true name.
+        assert!(json.contains("\"batches_per_s\":8.302"), "{}", json);
+        assert!(!json.contains("\"generations_per_s\""), "{}", json);
+    }
+
+    /// #256: the run-level device fractions, from the 10 h run's own numbers:
+    /// 596.599 s of fit kernels plus the 7.468 s evaluator window is 604.067 s
+    /// of device work, 1.585 % of the 38 114.998 s process.
+    #[test]
+    fn gpu_json_device_fractions_use_the_process_runtime() {
+        use rcsr::gpu_stats::{RunLedger, Stage};
+        let mut l = RunLedger::new();
+        l.set_wall(37_870.245);
+        l.record_stage(Stage::Fit, 36_959.0);
+        l.record_fit(36_959.0, 596.599, 100.0);
+        let mut g = search::GpuRunStats::default();
+        g.accounting.wall_s = 7.468;
+        g.ledger = l;
+        let json = gpu_json(&Some(g), 0.1, 0.2, "gpu", true, 38_114.998);
+        let key = "\"device_fraction_of_run\":{\"value\":";
+        let at = json.find(key).expect("device_fraction_of_run") + key.len();
+        let value: f64 = json[at..]
+            .split(',')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("a number");
+        assert!((value - 604.067 / 38_114.998).abs() < 1e-9, "{}", value);
+        assert!((value - 0.01585).abs() < 1e-5, "{}", value);
+        assert!(json.contains("\"device_seconds_incl_fit\":604.06"), "{}", json);
+        assert!(json.contains("\"process_total_s\":38114.998"), "{}", json);
+    }
+
+    /// #256: the phases and the unaccounted remainder add up to the runtime.
+    #[test]
+    fn timing_phases_and_remainder_add_up_to_the_runtime() {
+        let t = PhaseTimings {
+            prep: 10.099,
+            search: 37_870.245,
+            baselines: 213.711,
+            diagnostics: 20.943,
+            report: 0.0,
+            total: 38_114.998,
+            gpu: 7.468,
+        };
+        let sum = t.phases_sum() + t.unaccounted();
+        assert!((sum - t.total).abs() < 1e-9);
+        assert!(t.json().contains("\"unaccounted_seconds\":"));
     }
 
     /// #71: the guard and the import command must be discoverable.

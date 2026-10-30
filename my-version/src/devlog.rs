@@ -358,6 +358,14 @@ pub struct FitGen {
     pub refits: usize,
     /// CPU fallback counts labelled by cause.
     pub fallback_by_cause: Vec<(String, usize)>,
+    /// #256: wall seconds of the whole fit stage in this generation (device
+    /// call, CPU fallback, write-back). Booked as `phases.fit`, not `eval`.
+    pub host_seconds: f64,
+    /// #256: wall seconds of the exact CPU fit-fallback inside `host_seconds`.
+    pub fallback_seconds: f64,
+    /// #256: workers the fit-fallback batch used. This is the fit pool; the
+    /// top-level `fallback.workers` is the evaluator's pool.
+    pub fallback_workers: usize,
 }
 
 impl FitGen {
@@ -368,12 +376,16 @@ impl FitGen {
             .map(|(k, v)| format!("{}:{}", text(k), v))
             .collect();
         format!(
-            "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}}}}",
+            "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\
+             \"host_seconds\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
             self.refits,
-            causes.join(",")
+            causes.join(","),
+            num(self.host_seconds),
+            num(self.fallback_seconds),
+            self.fallback_workers
         )
     }
 }
@@ -419,12 +431,19 @@ pub struct GenRecord {
     // Phase windows, all measured on the search's main thread.
     pub prep_s: f64,
     pub search_s: f64,
+    /// Candidate evaluation alone; the fit stage is `fit_s` (#256).
     pub eval_s: f64,
     pub select_s: f64,
     pub archive_s: f64,
-    /// Constant-fitting CPU time, summed over the island threads.
+    /// #256: the constant-fit stage (GPU fit call, CPU fallback, write-back),
+    /// taken out of the windows it ran in. `prep + search + eval + select +
+    /// archive + fit = wall`.
+    pub fit_s: f64,
+    /// Constant-fitting CPU time: the island threads plus the exact CPU
+    /// fit-fallback pool (wall seconds).
     pub fit_cpu_s: f64,
-    /// Candidate-evaluation CPU time, summed over the island threads.
+    /// Candidate-evaluation CPU time: the island threads plus the evaluator's
+    /// CPU fallback pool (wall seconds).
     pub eval_cpu_s: f64,
     // Error distribution over this generation's population.
     pub best_error: f64,
@@ -495,12 +514,12 @@ impl GenRecord {
         format!(
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"summary\",\
              \"generation\":{},\"total\":{},\"t\":{},\"wall\":{},\
-             \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\
+             \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
              \"fit_cpu\":{},\"eval_cpu\":{}}},\
              \"error\":{{\"best\":{},\"median\":{}}},\
              \"archive\":{{\"size\":{}}},\
              \"fit\":{{\"attempts\":{},\"gpu\":{},\"fallback\":{}}},\
-             \"gpu\":{},\"fallback\":{{\"seconds\":{},\"workers\":{}}},\
+             \"gpu\":{},\"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"convergence\":{{\"percent_converged\":{}}}}}",
             SCHEMA,
             VERSION,
@@ -513,6 +532,7 @@ impl GenRecord {
             num(self.eval_s),
             num(self.select_s),
             num(self.archive_s),
+            num(self.fit_s),
             num(self.fit_cpu_s),
             num(self.eval_cpu_s),
             num(self.best_error),
@@ -535,14 +555,14 @@ impl GenRecord {
             "{{\"schema\":\"{}\",\"v\":{},\"event\":\"generation\",\"level\":\"full\",\
              \"generation\":{},\"total\":{},\
              \"t\":{},\"wall\":{},\
-             \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\
+             \"phases\":{{\"prep\":{},\"search\":{},\"eval\":{},\"select\":{},\"archive\":{},\"fit\":{},\
              \"fit_cpu\":{},\"eval_cpu\":{}}},\
              \"error\":{{\"best\":{},\"p05\":{},\"p25\":{},\"median\":{},\"p75\":{},\"p95\":{}}},\
              \"archive\":{{\"size\":{},\"hypervolume\":{},\"hash\":{},\"offers\":{},\"admissions\":{}}},\
              \"variation\":{{\"attempts\":{},\"duplicates\":{},\"too_complex\":{},\"offspring\":{},\
              \"fitted\":{},\"refits\":{},\"dedup_rate\":{}}},\
              \"gpu\":{},\"fit\":{},\
-             \"fallback\":{{\"seconds\":{},\"workers\":{}}},\
+             \"fallback\":{{\"scope\":\"evaluator_pool\",\"seconds\":{},\"workers\":{}}},\
              \"qd\":{},\
              \"convergence\":{{\"confidence\":{},\"stability\":{},\"maturity\":{},\
              \"percent_converged\":{}}},\
@@ -558,6 +578,7 @@ impl GenRecord {
             num(self.eval_s),
             num(self.select_s),
             num(self.archive_s),
+            num(self.fit_s),
             num(self.fit_cpu_s),
             num(self.eval_cpu_s),
             num(self.best_error),
@@ -710,10 +731,15 @@ pub struct RunEnd {
     /// Where the final result JSON went; `null` when it streamed to stdout.
     pub json_path: Option<String>,
     pub peak_rss_bytes: Option<u64>,
-    /// GPU full-path wall for the whole run.
+    /// GPU full-path wall of the evaluator calls only (the evaluator window).
     pub gpu_wall_s: Option<f64>,
-    /// `gpu_wall_s / 3600`, the evaluator-window device-hours.
+    /// #256: `device_seconds_incl_fit / 3600`.
     pub device_hours: Option<f64>,
+    /// #256: evaluator full-path wall plus the fit kernels' device seconds.
+    pub device_seconds_incl_fit: Option<f64>,
+    /// #256: `device_seconds_incl_fit / wall_s` (the process wall at the end
+    /// of the search).
+    pub device_fraction_of_run: Option<f64>,
     /// #284: run wall from the ledger.
     pub run_wall_s: Option<f64>,
     /// #284: union of device intervals over the run.
@@ -739,6 +765,7 @@ pub fn run_end_json(r: &RunEnd) -> String {
         "{{\"schema\":\"{}\",\"v\":{},\"event\":\"run_end\",\"generations\":{},\"stop\":{},\
          \"wall\":{},\"search\":{},\"archive\":{{\"size\":{},\"best_error\":{},\"hash\":{}}},\
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
+         \"device_seconds_incl_fit\":{},\"device_fraction_of_run\":{},\
          \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
          \"fit_kernel_s\":{},\"fit_fallback_s\":{},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
@@ -764,6 +791,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(v) => num(v),
             None => "null".to_string(),
         },
+        opt_num(r.device_seconds_incl_fit),
+        opt_num(r.device_fraction_of_run),
         opt_num(r.run_wall_s),
         opt_num(r.device_busy_s),
         opt_num(r.duty_run),
@@ -1052,6 +1081,7 @@ mod tests {
             eval_s: 0.02,
             select_s: 0.01,
             archive_s: 0.01,
+            fit_s: 0.05,
             fit_cpu_s: 0.18,
             eval_cpu_s: 0.02,
             best_error: 0.5,
@@ -1089,6 +1119,9 @@ mod tests {
                 fallback: 2,
                 refits: 1,
                 fallback_by_cause: vec![("ill_conditioned".to_string(), 2)],
+                host_seconds: 0.05,
+                fallback_seconds: 0.03,
+                fallback_workers: 4,
             },
             fallback_s: 0.001,
             fallback_workers: 1,
@@ -1118,6 +1151,7 @@ mod tests {
         assert_eq!(parsed.get("generation").and_then(|v| v.as_usize()), Some(3));
         let phases = parsed.get("phases").unwrap();
         assert_eq!(phases.get("fit_cpu").and_then(|v| v.as_f64()), Some(0.18));
+        assert_eq!(phases.get("fit").and_then(|v| v.as_f64()), Some(0.05));
         let archive = parsed.get("archive").unwrap();
         assert_eq!(archive.get("size").and_then(|v| v.as_usize()), Some(4));
         assert_eq!(
@@ -1130,6 +1164,14 @@ mod tests {
         let causes = fit.get("fallback_by_cause").and_then(|v| v.as_obj()).unwrap();
         assert_eq!(causes[0].0, "ill_conditioned");
         assert_eq!(causes[0].1.as_usize(), Some(2));
+        assert_eq!(fit.get("host_seconds").and_then(|v| v.as_f64()), Some(0.05));
+        assert_eq!(fit.get("fallback_seconds").and_then(|v| v.as_f64()), Some(0.03));
+        assert_eq!(fit.get("fallback_workers").and_then(|v| v.as_usize()), Some(4));
+        let eval_pool = parsed.get("fallback").unwrap();
+        assert_eq!(
+            eval_pool.get("scope").and_then(|v| v.as_str()),
+            Some("evaluator_pool")
+        );
         let islands = parsed.get("islands").and_then(|v| match v {
             Json::Arr(a) => Some(a.clone()),
             _ => None,

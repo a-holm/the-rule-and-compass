@@ -25,6 +25,11 @@
 //! | `data train|test <rows> <hash>` | data fingerprint |
 //! | `archive <members> <cap>` | archive header |
 //! | `sol <complexity> <cost> <error> <tree>` | one archive member |
+//! | `error_kind f32_proxy|f64` | #256: what the `sol` and `ind` errors are |
+//! | `archive_hash <hex>` | #256: `Archive::hash` of the `sol` members |
+//! | `final <members> <cap> <hash>` | #256: the post-refit f64 archive header |
+//! | `fsol <complexity> <cost> <error> <tree>` | #256: one post-refit member |
+//! | `build <field> <value>` | #256: version, commit, binary_sha256, device, driver, threads |
 //! | `island <i> <stagnant>` | per-island counter |
 //! | `rng <i|main> <idx> <624 words>` | exact MT19937 state |
 //! | `ind <i> <error> <complexity> <tree>` | one population member |
@@ -43,6 +48,7 @@ use crate::data::Sample;
 use crate::expr::{AggKind, Node, Op};
 use crate::metrics::Metric;
 use crate::pareto::{Archive, Sol};
+use crate::provenance::BuildIdentity;
 use crate::rng::Mt;
 use crate::search::Config;
 // #25: units are part of the saved search settings, so a resumed run keeps the
@@ -112,6 +118,48 @@ impl Backend {
     }
 }
 
+/// #256: what the stored `sol` and `ind` errors are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// Scored by the f32 device kernel, optimistic by up to `3e-7` relative.
+    F32Proxy,
+    /// Exact CPU f64.
+    F64,
+    /// A checkpoint written before the kind was recorded.
+    Unknown,
+}
+
+impl ErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorKind::F32Proxy => "f32_proxy",
+            ErrorKind::F64 => "f64",
+            ErrorKind::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<ErrorKind, String> {
+        match s {
+            "f32_proxy" => Ok(ErrorKind::F32Proxy),
+            "f64" => Ok(ErrorKind::F64),
+            "unknown" => Ok(ErrorKind::Unknown),
+            other => Err(format!(
+                "error_kind must be 'f32_proxy', 'f64' or 'unknown', got '{}'",
+                other
+            )),
+        }
+    }
+
+    /// The kind a search on `backend` stores in its archive and populations.
+    pub fn for_backend(backend: Backend) -> ErrorKind {
+        match backend {
+            Backend::Gpu => ErrorKind::F32Proxy,
+            Backend::Cpu => ErrorKind::F64,
+            Backend::Unknown => ErrorKind::Unknown,
+        }
+    }
+}
+
 /// A complete, resumable search state.
 pub struct Checkpoint {
     /// The search settings that produced the saved state (including the
@@ -125,8 +173,9 @@ pub struct Checkpoint {
     pub config_hash: u64,
     /// Generations completed, i.e. the next generation to run.
     pub generations: usize,
-    /// True when the saved run had already stopped (converged, patience or
-    /// time budget). Resuming such a checkpoint does not run more generations.
+    /// True when the saved run declared itself finished (solved or patience).
+    /// Resuming such a checkpoint does not run more generations. A time-budget
+    /// stop is never terminal (#256): the budget is a property of one process.
     pub stopped_early: bool,
     /// Best error seen so far, for the patience comparison.
     pub best_prev: f64,
@@ -141,6 +190,15 @@ pub struct Checkpoint {
     /// The RNG used to build the initial populations. Kept for completeness;
     /// a resumed search never re-runs initialisation.
     pub main_rng: Mt,
+    /// #256: whether `archive` and the populations hold f32 proxy errors.
+    pub error_kind: ErrorKind,
+    /// #256: the post-refit archive in exact f64, exactly as the run reported
+    /// it. Absent in a mid-run checkpoint. A resume ignores it: the search
+    /// continues from `archive`.
+    pub final_archive: Option<Archive>,
+    /// #256: the process that wrote the checkpoint. `None` for a file written
+    /// before the identity was recorded.
+    pub identity: Option<BuildIdentity>,
 }
 
 /// The operators in [`Op::index`] order. The array index is exactly
@@ -472,6 +530,16 @@ impl Checkpoint {
         writeln!(out, "no_improve {}", self.no_improve).unwrap();
         writeln!(out, "data train {} {}", self.train.rows, self.train.hash).unwrap();
         writeln!(out, "data test {} {}", self.test.rows, self.test.hash).unwrap();
+        writeln!(out, "error_kind {}", self.error_kind.as_str()).unwrap();
+        if let Some(id) = &self.identity {
+            writeln!(out, "build version {}", id.version).unwrap();
+            writeln!(out, "build commit {}", id.commit).unwrap();
+            writeln!(out, "build binary_sha256 {}", id.binary_sha256).unwrap();
+            writeln!(out, "build device {}", id.device).unwrap();
+            writeln!(out, "build driver {}", id.driver).unwrap();
+            writeln!(out, "build threads {}", id.threads).unwrap();
+        }
+        writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
         writeln!(out, "archive {} {}", self.archive.items.len(), self.archive.cap).unwrap();
         for sol in &self.archive.items {
             writeln!(
@@ -483,6 +551,20 @@ impl Checkpoint {
                 encode_tree(&sol.tree)
             )
             .unwrap();
+        }
+        if let Some(fin) = &self.final_archive {
+            writeln!(out, "final {} {} {:016x}", fin.items.len(), fin.cap, fin.hash()).unwrap();
+            for sol in &fin.items {
+                writeln!(
+                    out,
+                    "fsol {} {} {} {}",
+                    sol.complexity,
+                    encode_f64(sol.cost),
+                    encode_f64(sol.error),
+                    encode_tree(&sol.tree)
+                )
+                .unwrap();
+            }
         }
 
         let (words, idx) = self.main_rng.state();
@@ -556,6 +638,11 @@ impl Checkpoint {
         let mut island_rngs: Vec<Option<Mt>> = Vec::new();
         let mut island_pops: Vec<Option<Vec<Individual>>> = Vec::new();
         let mut main_rng: Option<Mt> = None;
+        let mut error_kind: Option<ErrorKind> = None;
+        let mut stored_archive_hash: Option<u64> = None;
+        let mut build_fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut final_header: Option<(usize, usize, u64)> = None;
+        let mut final_sols: Vec<Sol> = Vec::new();
 
         for (lineno, line) in lines.enumerate() {
             let lineno = lineno + 2; // first line is line 1
@@ -661,6 +748,64 @@ impl Checkpoint {
                         return Err(format!("line {}: archive cap must be at least 1", lineno));
                     }
                     set_once(&mut archive_header, (members, cap), "archive", lineno)?;
+                }
+                "error_kind" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: error_kind has no value", lineno))?;
+                    let kind = ErrorKind::parse(v).map_err(|e| format!("line {}: {}", lineno, e))?;
+                    set_once(&mut error_kind, kind, "error_kind", lineno)?;
+                }
+                "archive_hash" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: archive_hash has no value", lineno))?;
+                    let h = u64::from_str_radix(v, 16)
+                        .map_err(|_| format!("line {}: bad archive_hash '{}'", lineno, v))?;
+                    set_once(&mut stored_archive_hash, h, "archive_hash", lineno)?;
+                }
+                "build" => {
+                    let rest = line
+                        .strip_prefix("build ")
+                        .ok_or_else(|| format!("line {}: malformed build record", lineno))?;
+                    let (key, value) = rest
+                        .split_once(' ')
+                        .ok_or_else(|| format!("line {}: build record '{}' has no value", lineno, key_hint(rest)))?;
+                    if build_fields
+                        .insert(key.to_string(), value.trim().to_string())
+                        .is_some()
+                    {
+                        return Err(format!("line {}: duplicate build field '{}'", lineno, key));
+                    }
+                }
+                "final" => {
+                    let members = parse_num::<usize>(&parts, 1, lineno, "final members")?;
+                    let cap = parse_num::<usize>(&parts, 2, lineno, "final cap")?;
+                    let hash = parts
+                        .get(3)
+                        .and_then(|v| u64::from_str_radix(v, 16).ok())
+                        .ok_or_else(|| format!("line {}: bad final archive hash", lineno))?;
+                    if cap == 0 {
+                        return Err(format!("line {}: final cap must be at least 1", lineno));
+                    }
+                    set_once(&mut final_header, (members, cap, hash), "final", lineno)?;
+                }
+                "fsol" => {
+                    if final_header.is_none() {
+                        return Err(format!(
+                            "line {}: fsol record before the final header",
+                            lineno
+                        ));
+                    }
+                    let complexity = parse_num::<usize>(&parts, 1, lineno, "fsol complexity")?;
+                    let cost = parse_f64_at(&parts, 2, lineno, "fsol cost")?;
+                    let error = parse_f64_at(&parts, 3, lineno, "fsol error")?;
+                    let tree_text = parts.get(4..).filter(|t| !t.is_empty()).ok_or_else(|| {
+                        format!("line {}: fsol record has no tree", lineno)
+                    })?;
+                    let tree = decode_tree(&tree_text.join(" "))
+                        .map_err(|e| format!("line {}: {}", lineno, e))?;
+                    final_sols.push(Sol { complexity, cost, error, tree });
                 }
                 "sol" => {
                     if archive_header.is_none() {
@@ -848,6 +993,57 @@ impl Checkpoint {
 
         let mut archive = Archive::new(cap);
         archive.items = sols;
+        if let Some(stored) = stored_archive_hash {
+            if stored != archive.hash() {
+                return Err(format!(
+                    "checkpoint is corrupt: archive_hash {:016x} but the stored members hash to {:016x}",
+                    stored,
+                    archive.hash()
+                ));
+            }
+        }
+        let final_archive = match final_header {
+            Some((members, fcap, hash)) => {
+                if final_sols.len() != members {
+                    return Err(format!(
+                        "checkpoint is truncated or inconsistent: final header says {} member(s), found {}",
+                        members,
+                        final_sols.len()
+                    ));
+                }
+                let mut fin = Archive::new(fcap);
+                fin.items = final_sols;
+                if fin.hash() != hash {
+                    return Err(format!(
+                        "checkpoint is corrupt: final archive hash {:016x} but the stored members hash to {:016x}",
+                        hash,
+                        fin.hash()
+                    ));
+                }
+                Some(fin)
+            }
+            None => None,
+        };
+        let identity = if build_fields.is_empty() {
+            None
+        } else {
+            let field = |k: &str| -> Result<String, String> {
+                build_fields
+                    .get(k)
+                    .cloned()
+                    .ok_or_else(|| format!("checkpoint is incomplete: missing 'build {}'", k))
+            };
+            Some(BuildIdentity {
+                version: field("version")?,
+                commit: field("commit")?,
+                binary_sha256: field("binary_sha256")?,
+                device: field("device")?,
+                driver: field("driver")?,
+                threads: field("threads")?
+                    .parse()
+                    .map_err(|_| "checkpoint has a bad 'build threads' value".to_string())?,
+            })
+        };
         Ok(Checkpoint {
             config,
             backend,
@@ -862,6 +1058,9 @@ impl Checkpoint {
             islands,
             stagnant,
             main_rng,
+            error_kind: error_kind.unwrap_or(ErrorKind::Unknown),
+            final_archive,
+            identity,
         })
     }
 
@@ -916,6 +1115,29 @@ impl Checkpoint {
             ));
         }
         Ok(())
+    }
+
+    /// Refuse a resume under a different binary, commit, version, device,
+    /// driver or thread count unless the caller explicitly allows it (#256).
+    /// A checkpoint written before the identity was recorded cannot be checked.
+    pub fn check_identity(
+        &self,
+        current: &BuildIdentity,
+        allow_change: bool,
+    ) -> Result<(), String> {
+        let Some(saved) = &self.identity else {
+            return Ok(());
+        };
+        let diff = saved.differences(current);
+        if diff.is_empty() || allow_change {
+            return Ok(());
+        }
+        Err(format!(
+            "checkpoint build identity mismatch ({}); pass --allow-build-change to \
+             resume under a different binary, device or thread count (the trajectory \
+             may differ)",
+            diff.join("; ")
+        ))
     }
 
     /// Refuse a resume onto data other than the data that produced this state.

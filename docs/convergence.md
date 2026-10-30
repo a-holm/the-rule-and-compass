@@ -134,6 +134,14 @@ Nothing in the search depends on this threshold — it changes no stopping rule 
 it is only a reading for the caller. Early stopping is still controlled by
 `--patience` and `--time-budget`.
 
+The result JSON carries `stop_reason` (`solved`, `patience`, `time_budget`,
+`generations` or `already_stopped`) and `converged_early` (#256).
+`converged_early` is true only when the engine stopped on `solved` or
+`patience` **and** the final `percent_converged` is at least `0.75`. A
+`time_budget` stop never sets it: the engine did not declare convergence. The
+terminating generation of a `time_budget` stop still emits its progress and
+development-log events.
+
 ## Reading the numbers
 
 | reading | interpretation |

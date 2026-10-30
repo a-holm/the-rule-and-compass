@@ -156,6 +156,46 @@ fn checkpoint_resume_reproduces_the_uninterrupted_run() {
     assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
 }
 
+/// #256: a time-budget stop on the flat path is not convergence, reports every
+/// generation it ran, writes a resumable checkpoint with the post-refit archive
+/// and continues to exactly the uninterrupted run.
+#[test]
+fn a_time_budget_stop_on_the_flat_path_is_resumable() {
+    use std::sync::{Arc, Mutex};
+    let data = sample(160);
+    let full = cfg(VariationMode::Postfix, 1, 4096, 4);
+    let uninterrupted = run(&full, &data, &data);
+
+    let seen: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let mut budget = cfg(VariationMode::Postfix, 1, 4096, 4);
+    budget.time_budget = Some(0.0);
+    budget.progress = Some(Arc::new(move |p: search::Progress| {
+        sink.lock().unwrap().push(p.generation);
+    }));
+    let mut last: Option<String> = None;
+    let stopped = search::run_resumable(&budget, &data, &data, None, 1, |cp| {
+        last = Some(cp.to_text());
+    })
+    .expect("budget leg");
+    assert_eq!(stopped.stop_reason, "time_budget");
+    assert!(!stopped.converged_early);
+    assert_eq!(stopped.generations, 1);
+    assert_eq!(*seen.lock().unwrap(), vec![1]);
+
+    let cp = rcsr::checkpoint::Checkpoint::from_text(&last.expect("a checkpoint")).unwrap();
+    assert!(!cp.stopped_early, "a time-budget stop is not terminal");
+    assert_eq!(cp.error_kind, rcsr::checkpoint::ErrorKind::F32Proxy);
+    let fin = cp.final_archive.as_ref().expect("post-refit archive");
+    assert_eq!(fin.hash(), stopped.archive.hash());
+
+    let resumed = search::run_resumable(&full, &data, &data, Some(cp), 0, |_| {})
+        .expect("resume after the budget stop");
+    assert_eq!(resumed.generations, 4);
+    assert_eq!(describe(&uninterrupted), describe(&resumed));
+    assert_eq!(uninterrupted.archive.hash(), resumed.archive.hash());
+}
+
 #[test]
 fn unsupported_operators_fall_back_and_postfix_refuses() {
     let data = sample(120);

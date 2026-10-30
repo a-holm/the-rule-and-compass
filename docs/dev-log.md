@@ -174,7 +174,7 @@ both levels; the fields marked **full** only exist in a `full` log.
 | field | meaning |
 |---|---|
 | `command` | the command line, verbatim |
-| `version`, `commit`, `dirty` | binary version and git state (`manifest::git_info`) |
+| `version`, `commit`, `dirty` | binary version and the commit recorded when the binary was built (`manifest::build_info`; #256) |
 | `binary_sha256` | SHA-256 of the running executable |
 | `data.path`, `data.sha256` | the input path and its SHA-256 (`null` for stdin) |
 | `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` full load, `false`/`N` explicit sample, `null` for a CSV |
@@ -200,11 +200,12 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `wall` | both | the generation's wall up to the archive/convergence boundary |
 | `phases.prep` | both | per-generation sample draws and the carried-population refit |
 | `phases.search` | both | the island-thread scope: variation, fitting and inline scoring |
-| `phases.eval` | both | the batched evaluator call and its CPU fallback rescore |
+| `phases.eval` | both | the batched evaluator call and its CPU fallback rescore; the fit stage is not in it (#256) |
+| `phases.fit` | both | #256: the constant-fit stage (GPU fit call, exact CPU fallback fits, write-back), taken out of the eval, prep and island windows it ran in |
 | `phases.select` | both | screened successive-halving promotion and population selection |
 | `phases.archive` | both | Pareto insertions and the best/quantile bookkeeping |
-| `phases.fit_cpu` | both | constant-fitting CPU time, **summed over the island threads** |
-| `phases.eval_cpu` | both | candidate-evaluation CPU time, **summed over the island threads** |
+| `phases.fit_cpu` | both | constant-fitting CPU time, **summed over the island threads**, plus the exact CPU fit-fallback wall seconds (#256) |
+| `phases.eval_cpu` | both | candidate-evaluation CPU time, **summed over the island threads**, plus the evaluator's CPU fallback pool wall seconds (#256) |
 | `error.best` | both | best finite error in the generation's population |
 | `error.median` | both | median of the same population |
 | `error.p05`, `p25`, `p75`, `p95` | full | the rest of the population distribution (Hyndman–Fan type 7) |
@@ -217,9 +218,10 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `fit.gpu` | both | candidates the GPU fit returned usable constants for |
 | `fit.fallback` | both | candidates refit by the exact CPU arm |
 | `fit.refits` | full | exact CPU refits recorded for this generation |
+| `fit.host_seconds`, `fit.fallback_seconds`, `fit.fallback_workers` | full | #256: wall of the whole fit stage in this generation, the exact CPU fit-fallback inside it, and the width of the **fit** fallback pool |
 | `fit.fallback_by_cause` | full | CPU fallback counts labelled by cause (`unsupported_plan`, `too_few_rows`, `too_many_constants`, `ill_conditioned`, `non_finite`, `launch`, …) |
 | `gpu` | both | `null` without a GPU batch: `batches`, `programs`, `kernel_s`, `wall_s`, `duty`, `native`, `lowered`, `fallbacks`, `fallback_s`, `fallback_workers` |
-| `fallback.seconds`, `fallback.workers` | both | what the CPU fallback pool cost and how wide it was |
+| `fallback.seconds`, `fallback.workers`, `fallback.scope` | both | the **evaluator** fallback pool (`scope` is `evaluator_pool`): what it cost and how wide it was. The fit fallback is `fit.fallback_*`. |
 | `variation.attempts` | full | candidate generation attempts |
 | `variation.duplicates` | full | attempts rejected as structural duplicates (`--no-dedup` makes this 0) |
 | `variation.too_complex` | full | offspring rejected by `--max-complexity` |
@@ -233,7 +235,7 @@ Emitted at the same boundary as `--progress`, once per completed generation
 | `islands` | full | best error of each island's population, in island order |
 | `rng` | full | hash of the island and main MT19937 states at this boundary |
 
-The five `phases` (excluding the two summed CPU times) are disjoint windows on
+The six `phases` (excluding the two summed CPU times) are disjoint windows on
 the search's main thread and add up to `wall`. `fit_cpu` and `eval_cpu` overlap
 them: the islands run in parallel, so those are CPU-time sums, not wall time.
 That is why the analyzer reports the fit share of the island CPU budget as
@@ -264,7 +266,8 @@ because that loop has neither.
 | `archive` | the final `size`, `best_error` and `hash` |
 | `json` | where the result JSON went (`null` = stdout) |
 | `peak_rss_bytes` | the process high-water mark from `/proc/self/status` `VmHWM` (`null` off Linux) |
-| `gpu_wall_s`, `device_hours` | measured evaluator full-path wall and `gpu_wall_s / 3600` (evaluator-window scope, not the run) |
+| `gpu_wall_s` | measured evaluator full-path wall (the evaluator window only) |
+| `device_seconds_incl_fit`, `device_hours`, `device_fraction_of_run` | #256: evaluator wall plus fit kernel seconds, that over 3600, and that over `wall` |
 | `run_wall_s`, `device_busy_s`, `duty_run` | #284 run ledger: run wall, **union** of device intervals, and their ratio |
 | `unaccounted_s` | `run_wall_s − Σ stage_s`; >1 % of wall is a telemetry defect |
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
@@ -382,8 +385,8 @@ On a fit-heavy cell (3 000 rows, `--metric squared --fit-iters 10 --pop 200
 That reading points at one lever, the batched GPU fit already in the engine
 (#169). Re-running the identical command with `--gpu --fit-strategy gpu` produced,
 in its own dev log, `search` 6.15 s instead of 13.18 s (`wall` 13.2 s → 6.2 s,
-**2.1×**), `fit_cpu` 0 and the fit moved into `phases.eval` (5.50 s, GPU kernel
-0.012 s) with the fallback causes `ill_conditioned: 2`, `unsupported_plan: 5` —
+**2.1×**), `fit_cpu` 0 and the fit moved into the eval window (5.50 s, GPU kernel
+0.012 s; since #256 it is booked as `phases.fit`) with the fallback causes `ill_conditioned: 2`, `unsupported_plan: 5` —
 which is the next thing to look at, because 99.8 % of that window is host-side
 work, not the device. The archive differed (`2.928` vs `2.696` best error on the
 same seed) because the GPU path fits in `f32` and polishes in `f64`: it is a
