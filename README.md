@@ -412,7 +412,9 @@ atomically instead of streaming it. See
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
   masks, and the `cross` group adds the complete #273 BTC/ETH benchmark
   context, equal-weight market state, breadth, dispersion, average-correlation
-  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. The
+  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. On
+  the CUDA path one device `(time,symbol,row)` permutation serves every rank
+  column, with non-members and NaN keyed last. The
   fused flow and price-action device producers materialise their twelve and
   eleven derived columns from one base pass per family, with a declared
   `bitwise`/`1e-12` tier per column (`feature_registry.parity_tier`). The

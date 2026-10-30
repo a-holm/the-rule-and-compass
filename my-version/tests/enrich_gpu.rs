@@ -43,6 +43,50 @@ fn write_store(path: &str, rows: &[(i64, String, f64, f64, f64, f64, f64)], grou
     store::write_store_with_time(path, &table, group_rows, Some(0)).unwrap();
 }
 
+/// Point-in-time panel: `member_asof` predates some rows, producing genuine
+/// non-members, plus a few gaps that make the source return `NaN`.
+fn write_pit_store(path: &str, symbols: usize, per_symbol: usize, group_rows: usize) {
+    let mut text = String::from("ts,symbol,open,high,low,close,volume,quote_volume,member_asof\n");
+    for k in 0..symbols {
+        let mut close = 100.0 + k as f64;
+        for i in 0..per_symbol {
+            // A gap leaves a hole in one symbol's series every ~1k bars.
+            if i % 997 == 500 && k % 4 == 0 {
+                continue;
+            }
+            let t = 1_700_000_000i64 + i as i64 * 900;
+            let ret = if i % 5 == 0 {
+                0.002
+            } else {
+                0.0005 * ((k % 3) as f64 - 1.0)
+            };
+            let next = close * (1.0 + ret);
+            // Symbol 7 is pre-listing on every 11th row: the row exists but is
+            // not a PIT member at its own timestamp.
+            let member = if k == 7 && i % 11 == 0 {
+                t + 900
+            } else {
+                t
+            };
+            let high = next.max(close) + 0.1;
+            let low = next.min(close) - 0.1;
+            let volume = 10.0 + (i % 97) as f64;
+            let name = match k {
+                0 => "BTCUSDT".to_string(),
+                1 => "ETHUSDT".to_string(),
+                _ => format!("SYM{k:02}"),
+            };
+            text.push_str(&format!(
+                "{t},{name},{close},{high},{low},{next},{volume},{},{member}\n",
+                next * volume
+            ));
+            close = next;
+        }
+    }
+    let table = data::parse_table_with_time(&text, false, Some("ts")).unwrap();
+    store::write_store_with_time(path, &table, group_rows, Some(0)).unwrap();
+}
+
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "rcsr-enrich-gpu-{}-{}-{}",
@@ -186,6 +230,130 @@ fn gpu_columns_match_cpu_and_report_the_share() {
         .filter(|(a, b)| a.name == b.name && a.hash == b.hash)
         .count();
     eprintln!("identical feature hashes: {}/{}", same, cpu.features.len());
+}
+
+#[test]
+fn gpu_cross_section_ranks_are_exact_and_chunk_invariant() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let dir = tmp_dir("xs-rank");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let per_symbol = 48_000usize;
+    let symbols = 21usize;
+    write_pit_store(&src, symbols, per_symbol, 65_536);
+
+    let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
+    let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
+    let gpu_out_4k = dir.join("gpu4k.rcsb").to_string_lossy().into_owned();
+    let gpu_out_1 = dir.join("gpu1.rcsb").to_string_lossy().into_owned();
+
+    let mut cpu_opts = opts(&src, &cpu_out, "xs", GpuMode::Off);
+    cpu_opts.chunk_rows = 65_536;
+    let cpu = enrich::build(&cpu_opts).unwrap();
+
+    let mut gpu_opts = opts(&src, &gpu_out, "xs", GpuMode::On);
+    gpu_opts.chunk_rows = 65_536;
+    let gpu = enrich::build(&gpu_opts).unwrap();
+    assert_eq!(gpu.gpu_fallback, 0, "ranks must not fall back: {:?}", gpu.plans);
+    assert_eq!(
+        gpu.gpu_columns,
+        cpu.features.len(),
+        "every xs column should use a device kernel, plans={:?}",
+        gpu.plans
+    );
+
+    let names: Vec<String> = cpu.features.iter().map(|f| f.name.clone()).collect();
+    let mut finite = 0usize;
+    for name in &names {
+        let a = column(&cpu_out, name);
+        let b = column(&gpu_out, name);
+        assert_eq!(a.len(), b.len());
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.is_nan(), y.is_nan(), "column {name} row {i}: CPU {x:?} GPU {y:?}");
+            if x.is_finite() {
+                finite += 1;
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "column {name} row {i}: ranks must be bit-identical (CPU {x:?} GPU {y:?})"
+                );
+            }
+        }
+    }
+    assert!(finite > 0, "fixture must produce finite ranks");
+
+    // PIT: a pre-listing row's own rank is NaN even though its source return is
+    // finite. Symbols 0 and 4 skip gap rows, so symbol 7 starts after them.
+    let pre = column(&gpu_out, "xs_rank_r1");
+    let gap_rows = (0..per_symbol).filter(|i| i % 997 == 500).count();
+    let base = 7 * per_symbol - 2 * gap_rows;
+    let mut checked = 0usize;
+    for i in (11..per_symbol).step_by(11) {
+        assert!(
+            pre[base + i].is_nan(),
+            "pre-listing row {i} entered the device rank"
+        );
+        checked += 1;
+    }
+    assert!(checked > 1000);
+
+    // Batch invariance: the device permutation is built from the whole panel,
+    // so --chunk-rows must not change a single bit.
+    let hashes = |r: &enrich::Report| {
+        r.features
+            .iter()
+            .map(|f| (f.name.clone(), f.hash.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut four_k = opts(&src, &gpu_out_4k, "xs", GpuMode::On);
+    four_k.chunk_rows = 4096;
+    let four_k = enrich::build(&four_k).unwrap();
+    assert_eq!(hashes(&gpu), hashes(&four_k), "--chunk-rows 4096 changed a rank");
+
+    let mut one = opts(&src, &gpu_out_1, "xs", GpuMode::On);
+    one.chunk_rows = 1;
+    let one = enrich::build(&one).unwrap();
+    assert_eq!(hashes(&gpu), hashes(&one), "--chunk-rows 1 changed a rank");
+    assert_eq!(gpu.gpu_fallback, 0);
+}
+
+/// #295 paired measurement: the cross-section stage (`xs_seconds`) of the same
+/// PIT panel with `--gpu off` (host sorts) and `--gpu on` (one device
+/// permutation plus segmented sorts). `RCSR_XS_SYMBOLS` and `RCSR_XS_ROWS` size
+/// the panel. Run with `--ignored --nocapture`.
+#[test]
+#[ignore = "throughput measurement; needs a CUDA device"]
+fn measure_cross_section_stage() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let env = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let symbols = env("RCSR_XS_SYMBOLS", 100);
+    let per_symbol = env("RCSR_XS_ROWS", 40_000);
+    let dir = tmp_dir("xs-measure");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    write_pit_store(&src, symbols, per_symbol, 65_536);
+    for features in ["xs", "cross"] {
+        let mut line = Vec::new();
+        for (tag, mode) in [("cpu", GpuMode::Off), ("gpu", GpuMode::On)] {
+            let out = dir.join(format!("{features}-{tag}.rcsb")).to_string_lossy().into_owned();
+            let r = enrich::build(&opts(&src, &out, features, mode)).unwrap();
+            line.push(format!(
+                "{tag}: xs_seconds={:.3} total={:.3} gpu_columns={} kernel_s={:.3}",
+                r.xs_seconds, r.total_seconds, r.gpu_columns, r.gpu_kernel_seconds
+            ));
+        }
+        eprintln!(
+            "xs-measure features={features} rows={} symbols={symbols} | {}",
+            symbols * per_symbol,
+            line.join(" | ")
+        );
+    }
 }
 
 #[test]
