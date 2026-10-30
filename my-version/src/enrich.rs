@@ -602,6 +602,9 @@ pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
     if let Some(tier) = crate::features_gpu::device_tier(name) {
         return tier;
     }
+    if let Some(tier) = crate::bench_gpu::device_tier(name) {
+        return tier;
+    }
     "reference"
 }
 
@@ -1844,7 +1847,10 @@ impl OpClass {
             OpClass::RollingExtrema => 15_000_000.0,
             OpClass::WilderScan => 20_000_000.0,
             OpClass::Rank => 4_000_000.0,
-            OpClass::Join => 40_000_000.0,
+            // #299: per-row BTreeMap lookups; 15 lookup columns on the
+            // 16.1M-row panel took 451.1 s (0.54 M cells/s), and the 28-column
+            // family with 7 rolling-beta columns 1250.6 s (0.36 M cells/s).
+            OpClass::Join => 360_000.0,
         }
     }
     fn gpu_cells_per_second(self) -> f64 {
@@ -1862,7 +1868,8 @@ impl OpClass {
             OpClass::RollingExtrema => 180_000_000.0,
             OpClass::WilderScan => 8_000_000.0,
             OpClass::Rank => 40_000_000.0,
-            OpClass::Join => 250_000_000.0,
+            // #299: kernel + D2H of the 28-column family, 451 M cells in 3.78 s.
+            OpClass::Join => 100_000_000.0,
         }
     }
 }
@@ -1960,6 +1967,9 @@ pub fn family_of(name: &str) -> &'static str {
         || name.starts_with("beta_btc")
         || name.starts_with("cross_")
         || name.starts_with("mkt_")
+        || name.starts_with("eth_")
+        || name.starts_with("rel_eth")
+        || name.starts_with("beta_eth")
     {
         "btc"
     } else if name.starts_with("dow_")
@@ -2004,6 +2014,11 @@ pub fn gpu_supports(name: &str) -> bool {
     if crate::features_gpu::is_device_flow(name)
         || crate::features_gpu::is_device_price_action(name)
     {
+        return true;
+    }
+    // #299: benchmark joins, relative returns and rolling beta, including the
+    // compact names that share the benchmark join.
+    if crate::bench_gpu::is_device_bench(name) {
         return true;
     }
     if is_compact(name)
@@ -3506,6 +3521,23 @@ impl Cross {
     }
     fn at(map: &BTreeMap<i64, f64>, t: i64) -> f64 {
         map.get(&t).copied().unwrap_or(f64::NAN)
+    }
+    /// The benchmark as sorted unique `(time, planes)` arrays for the device
+    /// join (#299). Empty when the benchmark symbol was not loaded.
+    fn bench_series(&self) -> crate::bench_gpu::BenchSeries {
+        use crate::bench_gpu::*;
+        let plane = |m: &BTreeMap<i64, f64>| m.values().copied().collect::<Vec<f64>>();
+        let mut b = BenchSeries::default();
+        b.times = self.r1.keys().copied().collect();
+        b.planes[PLANE_R1] = plane(&self.r1);
+        b.planes[PLANE_R16] = plane(&self.r16);
+        b.planes[PLANE_R20] = plane(&self.r20);
+        b.planes[PLANE_R96] = plane(&self.r96);
+        b.planes[PLANE_R672] = plane(&self.r672);
+        b.planes[PLANE_VOL20] = plane(&self.vol20);
+        b.planes[PLANE_VOL96] = plane(&self.vol96);
+        b.planes[PLANE_VOLUME] = plane(&self.volume);
+        b
     }
 }
 
@@ -5667,8 +5699,23 @@ fn wants_market_state(requested: &[String]) -> bool {
     })
 }
 
+/// Whether the per-timestamp market means run on the device (#299).
+#[cfg(feature = "cuda")]
+fn market_device_enabled(mode: GpuMode, rows: usize) -> bool {
+    match mode {
+        GpuMode::Off => false,
+        GpuMode::On => true,
+        GpuMode::Auto => rows >= GPU_MIN_ROWS,
+    }
+}
+
 /// Compute equal-weight market state, breadth, dispersion, relative-to-market
 /// and the average-correlation proxy from the point-in-time cross-sections.
+///
+/// With a device (#299) the per-timestamp reductions run there in the same
+/// `(time, symbol, row)` addition order; any device failure falls back to the
+/// CPU loop for that block. Returns the columns the device produced.
+#[allow(clippy::too_many_arguments)]
 fn market_state_pass(
     panel: &CrossPanel,
     temp: &mut BTreeMap<String, TempColumn>,
@@ -5678,9 +5725,12 @@ fn market_state_pass(
     cols: &Cols,
     cross: &Cross,
     step: i64,
-) -> Result<(), String> {
+    mut dev: Option<&mut dyn crate::bench_gpu::MarketDevice>,
+) -> Result<BTreeSet<String>, String> {
+    use crate::bench_gpu::{WANT_BREADTH, WANT_DISPERSION, WANT_MEAN, WANT_REL};
     let rows = panel.times.len();
     let wants = |n: &str| requested.iter().any(|x| x == n);
+    let mut done: BTreeSet<String> = BTreeSet::new();
     let wants_r16 = wants("mkt_r16")
         || wants("mkt_ew_ret16")
         || wants("breadth")
@@ -5695,6 +5745,21 @@ fn market_state_pass(
 
     if wants_r16 {
         let src = source_values(temp, "r16", rows)?;
+        let mut mask = WANT_MEAN;
+        if wants("breadth") || wants("mkt_breadth") {
+            mask |= WANT_BREADTH;
+        }
+        if wants("dispersion") || wants("mkt_dispersion") {
+            mask |= WANT_DISPERSION;
+        }
+        if wants("rel_mkt16") {
+            mask |= WANT_REL;
+        }
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask));
+        let on_device = device.is_some();
+        let (mkt, breadth, dispersion, rel) = if let Some(st) = device {
+            (st.mean, st.breadth, st.dispersion, st.rel)
+        } else {
         let mut mkt = vec![f64::NAN; rows];
         let mut breadth = vec![f64::NAN; rows];
         let mut dispersion = vec![f64::NAN; rows];
@@ -5739,6 +5804,18 @@ fn market_state_pass(
                 }
             }
         }
+        (mkt, breadth, dispersion, rel)
+        };
+        if on_device {
+            for n in [
+                "mkt_r16", "mkt_ew_ret16", "breadth", "mkt_breadth", "dispersion",
+                "mkt_dispersion", "rel_mkt16",
+            ] {
+                if wants(n) {
+                    done.insert(n.to_string());
+                }
+            }
+        }
         write_cross_output(temp, requested, &["mkt_r16", "mkt_ew_ret16"], &mkt)?;
         write_cross_output(temp, requested, &["breadth", "mkt_breadth"], &breadth)?;
         write_cross_output(temp, requested, &["dispersion", "mkt_dispersion"], &dispersion)?;
@@ -5747,6 +5824,12 @@ fn market_state_pass(
 
     if wants_r96 {
         let src = source_values(temp, "r96", rows)?;
+        let mask = WANT_MEAN | if wants("rel_mkt96") { WANT_REL } else { 0 };
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, mask));
+        let on_device = device.is_some();
+        let (mkt, rel) = if let Some(st) = device {
+            (st.mean, st.rel)
+        } else {
         let mut mkt = vec![f64::NAN; rows];
         let mut rel = vec![f64::NAN; rows];
         for group in panel.groups() {
@@ -5775,12 +5858,26 @@ fn market_state_pass(
                 }
             }
         }
+        (mkt, rel)
+        };
+        if on_device {
+            for n in ["mkt_r96", "rel_mkt96"] {
+                if wants(n) {
+                    done.insert(n.to_string());
+                }
+            }
+        }
         write_cross_output(temp, requested, &["mkt_r96"], &mkt)?;
         write_cross_output(temp, requested, &["rel_mkt96"], &rel)?;
     }
 
     if wants_vol96 {
         let src = source_values(temp, "vol96", rows)?;
+        let device = dev.as_mut().and_then(|d| d.group_stats(&src, WANT_MEAN));
+        let on_device = device.is_some();
+        let mkt = if let Some(st) = device {
+            st.mean
+        } else {
         let mut mkt = vec![f64::NAN; rows];
         for group in panel.groups() {
             let mut vals = Vec::new();
@@ -5803,39 +5900,72 @@ fn market_state_pass(
                 }
             }
         }
+        mkt
+        };
+        if on_device {
+            done.insert("mkt_vol96".to_string());
+        }
         write_cross_output(temp, requested, &["mkt_vol96"], &mkt)?;
     }
 
     if wants_r1 {
         let r1 = source_values(temp, "r1", rows)?;
-        let mut mkt = vec![f64::NAN; rows];
-        let mut by_time = BTreeMap::new();
-        for group in panel.groups() {
-            let mut vals = Vec::new();
-            let mut sum = 0.0;
-            for &r in group {
-                let r = r as usize;
-                if panel.member[r] && r1[r].is_finite() {
-                    vals.push(r);
-                    sum += r1[r];
+        // The CPU equal-weight mean per timestamp, also the `by_time` lookup the
+        // CPU correlation proxy needs.
+        let cpu_means = || {
+            let mut mkt = vec![f64::NAN; rows];
+            let mut by_time = BTreeMap::new();
+            for group in panel.groups() {
+                let mut vals = Vec::new();
+                let mut sum = 0.0;
+                for &r in group {
+                    let r = r as usize;
+                    if panel.member[r] && r1[r].is_finite() {
+                        vals.push(r);
+                        sum += r1[r];
+                    }
+                }
+                if vals.len() < MIN_CROSS_MEMBERS {
+                    continue;
+                }
+                let mean = sum / vals.len() as f64;
+                let t = panel.times[group[0] as usize];
+                by_time.insert(t, mean);
+                for &r in group {
+                    let r = r as usize;
+                    if panel.member[r] {
+                        mkt[r] = mean;
+                    }
                 }
             }
-            if vals.len() < MIN_CROSS_MEMBERS {
-                continue;
-            }
-            let mean = sum / vals.len() as f64;
-            let t = panel.times[group[0] as usize];
-            by_time.insert(t, mean);
-            for &r in group {
-                let r = r as usize;
-                if panel.member[r] {
-                    mkt[r] = mean;
+            (mkt, by_time)
+        };
+        let mut cpu_by_time = None;
+        if wants("mkt_ew_ret1") {
+            let device = dev.as_mut().and_then(|d| d.group_stats(&r1, WANT_MEAN));
+            let mkt = match device {
+                Some(st) => {
+                    done.insert("mkt_ew_ret1".to_string());
+                    st.mean
                 }
-            }
+                None => {
+                    let (mkt, by_time) = cpu_means();
+                    cpu_by_time = Some(by_time);
+                    mkt
+                }
+            };
+            write_cross_output(temp, requested, &["mkt_ew_ret1"], &mkt)?;
         }
-        write_cross_output(temp, requested, &["mkt_ew_ret1"], &mkt)?;
 
         if wants_corr {
+            if let Some(avg) = dev.as_mut().and_then(|d| d.avg_corr(&r1)) {
+                done.insert("avg_corr".to_string());
+                write_cross_output(temp, requested, &["avg_corr"], &avg)?;
+            } else {
+            let by_time = match cpu_by_time.take() {
+                Some(b) => b,
+                None => cpu_means().1,
+            };
             // Average correlation proxy: mean over members of the trailing
             // 96-bar correlation between the member's one-bar return and the
             // equal-weight market return. O(rows) via per-symbol prefixes.
@@ -5913,6 +6043,7 @@ fn market_state_pass(
                 }
             }
             write_cross_output(temp, requested, &["avg_corr"], &avg)?;
+            }
         }
     }
 
@@ -5931,6 +6062,12 @@ fn market_state_pass(
                 ))
             }
         };
+        let bench = cross.bench_series();
+        let device = dev.as_mut().and_then(|d| d.volume_share(&vol, &bench));
+        let on_device = device.is_some();
+        let share = if let Some(share) = device {
+            share
+        } else {
         let mut share = vec![f64::NAN; rows];
         for group in panel.groups() {
             let mut total = 0.0;
@@ -5958,10 +6095,15 @@ fn market_state_pass(
                 }
             }
         }
+        share
+        };
+        if on_device {
+            done.insert("btc_volume_share".to_string());
+        }
         write_cross_output(temp, requested, &["btc_volume_share"], &share)?;
     }
 
-    Ok(())
+    Ok(done)
 }
 
 // ---------------------------------------------------------------------------
@@ -6442,6 +6584,9 @@ fn enrich_inner(
         } else if name.starts_with("btc")
             || name.starts_with("rel_btc")
             || name.starts_with("beta_btc")
+            || name.starts_with("eth_")
+            || name.starts_with("rel_eth")
+            || name.starts_with("beta_eth")
             || name.starts_with("mkt_")
             || name.starts_with("cross_")
         {
@@ -6581,13 +6726,13 @@ fn enrich_inner(
     #[allow(unused_mut)]
     let mut device_projection: Option<(String, Vec<String>)> = None;
     #[allow(unused_mut, unused_variables)]
-    let mut mtf_kernel_seconds = 0.0;
+    let mut side_kernel_seconds = 0.0;
     #[allow(unused_mut, unused_variables)]
-    let mut mtf_transfer_bytes = 0u64;
+    let mut side_transfer_bytes = 0u64;
     #[allow(unused_mut, unused_variables)]
-    let mut mtf_h2d_seconds = 0.0;
+    let mut side_h2d_seconds = 0.0;
     #[allow(unused_mut, unused_variables)]
-    let mut mtf_d2h_seconds = 0.0;
+    let mut side_d2h_seconds = 0.0;
     #[cfg(feature = "cuda")]
     let mut gpu_ctx: Option<crate::enrich_gpu::EnrichGpu> = None;
 
@@ -6627,14 +6772,66 @@ fn enrich_inner(
                             gpu_done.insert(name);
                         }
                     }
-                    mtf_kernel_seconds = stats.kernel_s;
-                    mtf_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
-                    mtf_h2d_seconds = stats.h2d_s;
-                    mtf_d2h_seconds = stats.d2h_s;
+                    side_kernel_seconds += stats.kernel_s;
+                    side_transfer_bytes += stats.h2d_bytes + stats.d2h_bytes;
+                    side_h2d_seconds += stats.h2d_s;
+                    side_d2h_seconds += stats.d2h_s;
                 }
                 None => gpu_fallback += mtf_wanted.len(),
             }
             for name in &mtf_wanted {
+                gpu_names.remove(name);
+            }
+        }
+        // #299: benchmark joins, relative returns and rolling beta run in their
+        // own small context: base time + close, the segment table and the
+        // benchmark series. A failure keeps the CPU reference for all of them.
+        let bench_wanted: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| crate::bench_gpu::is_device_bench(n))
+            .cloned()
+            .collect();
+        if !bench_wanted.is_empty() {
+            let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let close = column_all(&store, cols.close)?;
+            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+            let btc = cross.bench_series();
+            let eth_series = eth.bench_series();
+            let self_flags: Vec<u8> = segs
+                .iter()
+                .map(|s| (!cross.symbol.is_empty() && s.symbol == cross.symbol) as u8)
+                .chain(
+                    segs.iter()
+                        .map(|s| (!eth.symbol.is_empty() && s.symbol == eth.symbol) as u8),
+                )
+                .collect();
+            match crate::bench_gpu::compute(
+                &times,
+                &close,
+                &seg_start,
+                &seg_len,
+                step,
+                Some(&btc),
+                Some(&eth_series),
+                &self_flags,
+                &bench_wanted,
+            ) {
+                Some((columns, stats)) => {
+                    for (name, values) in columns {
+                        if let Some(t) = temp.get_mut(&name) {
+                            t.write_values(&values)?;
+                            gpu_done.insert(name);
+                        }
+                    }
+                    side_kernel_seconds += stats.kernel_s;
+                    side_transfer_bytes += stats.h2d_bytes + stats.d2h_bytes;
+                    side_h2d_seconds += stats.h2d_s;
+                    side_d2h_seconds += stats.d2h_s;
+                }
+                None => gpu_fallback += bench_wanted.len(),
+            }
+            for name in &bench_wanted {
                 gpu_names.remove(name);
             }
         }
@@ -6999,19 +7196,19 @@ fn enrich_inner(
             }
         }
         let stats = gpu.stats();
-        gpu_kernel_seconds = stats.kernel_s + mtf_kernel_seconds;
-        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + mtf_transfer_bytes;
-        gpu_h2d_seconds = stats.h2d_s + mtf_h2d_seconds;
-        gpu_d2h_seconds = stats.d2h_s + mtf_d2h_seconds;
+        gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
+        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
+        gpu_h2d_seconds = stats.h2d_s + side_h2d_seconds;
+        gpu_d2h_seconds = stats.d2h_s + side_d2h_seconds;
     }
 
     // If only the MTF context ran, its ledger is still the GPU share.
     #[cfg(feature = "cuda")]
     if gpu_ctx.is_none() {
-        gpu_kernel_seconds = mtf_kernel_seconds;
-        gpu_transfer_bytes = mtf_transfer_bytes;
-        gpu_h2d_seconds = mtf_h2d_seconds;
-        gpu_d2h_seconds = mtf_d2h_seconds;
+        gpu_kernel_seconds = side_kernel_seconds;
+        gpu_transfer_bytes = side_transfer_bytes;
+        gpu_h2d_seconds = side_h2d_seconds;
+        gpu_d2h_seconds = side_d2h_seconds;
     }
 
     // Everything planned for the CPU (including failed GPU calls).
@@ -7114,8 +7311,103 @@ fn enrich_inner(
             member_col.map(|c| (c, member_dtype.unwrap())),
         )?;
 
+        #[cfg(feature = "cuda")]
+        let xs_rank_gpu = requested
+            .iter()
+            .any(|n| n.starts_with("xs_rank_"))
+            && gpu_available
+            && opts.gpu != GpuMode::Off
+            && plans
+                .iter()
+                .any(|p| p.group == "xs" && p.backend == "gpu");
+        // #299: the per-timestamp market means run on the device through the
+        // same resident (time, symbol, row) permutation as the ranks.
+        #[cfg(feature = "cuda")]
+        let market_gpu = wants_market_state(&requested)
+            && gpu_available
+            && market_device_enabled(opts.gpu, store.n_rows());
+        #[cfg(feature = "cuda")]
+        if (xs_rank_gpu || market_gpu) && gpu_ctx.is_none() {
+            let times_all = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let nan = vec![f64::NAN; store.n_rows()];
+            let volume = match cols.volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let quote_volume = match cols.quote_volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan,
+            };
+            let nan_col = vec![f64::NAN; store.n_rows()];
+            let trades = match cols.trades {
+                Some(c) => column_all(&store, c)?,
+                None => nan_col.clone(),
+            };
+            let taker_buy_base = match cols.taker_buy_base {
+                Some(c) => column_all(&store, c)?,
+                None => nan_col.clone(),
+            };
+            let taker_buy_quote = match cols.taker_buy_quote {
+                Some(c) => column_all(&store, c)?,
+                None => nan_col,
+            };
+            let mut present = 0u32;
+            if cols.volume.is_some() {
+                present |= crate::features_gpu::PRESENT_VOLUME;
+            }
+            if cols.quote_volume.is_some() {
+                present |= crate::features_gpu::PRESENT_QUOTE_VOLUME;
+            }
+            if cols.trades.is_some() {
+                present |= crate::features_gpu::PRESENT_TRADES;
+            }
+            if cols.taker_buy_base.is_some() {
+                present |= crate::features_gpu::PRESENT_TAKER_BUY;
+            }
+            if cols.taker_buy_quote.is_some() {
+                present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
+            }
+            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+            gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
+                &times_all,
+                &column_all(&store, cols.open)?,
+                &column_all(&store, cols.high)?,
+                &column_all(&store, cols.low)?,
+                &column_all(&store, cols.close)?,
+                &volume,
+                &quote_volume,
+                &trades,
+                &taker_buy_base,
+                &taker_buy_quote,
+                present,
+                &seg_start,
+                &seg_len,
+                step,
+            );
+        }
+
+        #[cfg(feature = "cuda")]
+        let mut market_prepared = false;
+        #[cfg(feature = "cuda")]
+        if market_gpu {
+            if let Some(gpu) = gpu_ctx.as_mut() {
+                market_prepared = gpu.prepare_cross_section(&panel.sym_key, Some(&panel.member));
+            }
+        }
+
         if wants_market_state(&requested) {
-            market_state_pass(
+            #[cfg(feature = "cuda")]
+            let device: Option<&mut dyn crate::bench_gpu::MarketDevice> = if market_prepared {
+                gpu_ctx
+                    .as_mut()
+                    .map(|g| g as &mut dyn crate::bench_gpu::MarketDevice)
+            } else {
+                None
+            };
+            #[cfg(not(feature = "cuda"))]
+            let device: Option<&mut dyn crate::bench_gpu::MarketDevice> = None;
+            let market_done = market_state_pass(
                 &panel,
                 &mut temp,
                 &requested,
@@ -7124,7 +7416,28 @@ fn enrich_inner(
                 &cols,
                 &cross,
                 step,
+                device,
             )?;
+            #[cfg(feature = "cuda")]
+            if market_gpu {
+                gpu_fallback += requested
+                    .iter()
+                    .filter(|n| {
+                        crate::bench_gpu::is_device_market(n) && !market_done.contains(*n)
+                    })
+                    .count();
+                if let Some(gpu) = gpu_ctx.as_ref() {
+                    let stats = gpu.stats();
+                    gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
+                    gpu_transfer_bytes =
+                        stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
+                    gpu_h2d_seconds = stats.h2d_s + side_h2d_seconds;
+                    gpu_d2h_seconds = stats.d2h_s + side_d2h_seconds;
+                }
+            }
+            for n in market_done {
+                gpu_done.insert(n);
+            }
         }
 
         let rank_names: Vec<String> = requested
@@ -7133,72 +7446,6 @@ fn enrich_inner(
             .cloned()
             .collect();
         if !rank_names.is_empty() {
-            #[cfg(feature = "cuda")]
-            let xs_gpu = gpu_available
-                && opts.gpu != GpuMode::Off
-                && plans
-                    .iter()
-                    .any(|p| p.group == "xs" && p.backend == "gpu");
-            #[cfg(feature = "cuda")]
-            if xs_gpu && gpu_ctx.is_none() {
-                let times_all = i64_column_all(&store, time_col, cols.time_dtype)?;
-                let nan = vec![f64::NAN; store.n_rows()];
-                let volume = match cols.volume {
-                    Some(c) => column_all(&store, c)?,
-                    None => nan.clone(),
-                };
-                let quote_volume = match cols.quote_volume {
-                    Some(c) => column_all(&store, c)?,
-                    None => nan,
-                };
-                let nan_col = vec![f64::NAN; store.n_rows()];
-                let trades = match cols.trades {
-                    Some(c) => column_all(&store, c)?,
-                    None => nan_col.clone(),
-                };
-                let taker_buy_base = match cols.taker_buy_base {
-                    Some(c) => column_all(&store, c)?,
-                    None => nan_col.clone(),
-                };
-                let taker_buy_quote = match cols.taker_buy_quote {
-                    Some(c) => column_all(&store, c)?,
-                    None => nan_col,
-                };
-                let mut present = 0u32;
-                if cols.volume.is_some() {
-                    present |= crate::features_gpu::PRESENT_VOLUME;
-                }
-                if cols.quote_volume.is_some() {
-                    present |= crate::features_gpu::PRESENT_QUOTE_VOLUME;
-                }
-                if cols.trades.is_some() {
-                    present |= crate::features_gpu::PRESENT_TRADES;
-                }
-                if cols.taker_buy_base.is_some() {
-                    present |= crate::features_gpu::PRESENT_TAKER_BUY;
-                }
-                if cols.taker_buy_quote.is_some() {
-                    present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
-                }
-                let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
-                let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-                gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
-                    &times_all,
-                    &column_all(&store, cols.open)?,
-                    &column_all(&store, cols.high)?,
-                    &column_all(&store, cols.low)?,
-                    &column_all(&store, cols.close)?,
-                    &volume,
-                    &quote_volume,
-                    &trades,
-                    &taker_buy_base,
-                    &taker_buy_quote,
-                    present,
-                    &seg_start,
-                    &seg_len,
-                    step,
-                );
-            }
             #[cfg(feature = "cuda")]
             let mut xs_prepared = false;
             for rank_name in &rank_names {
@@ -7229,10 +7476,11 @@ fn enrich_inner(
                         if xs_prepared {
                             ranks = gpu.rank(&values);
                             let stats = gpu.stats();
-                            gpu_kernel_seconds = stats.kernel_s;
-                            gpu_d2h_seconds = stats.d2h_s;
-                            gpu_h2d_seconds = stats.h2d_s;
-                            gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                            gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
+                            gpu_d2h_seconds = stats.d2h_s + side_d2h_seconds;
+                            gpu_h2d_seconds = stats.h2d_s + side_h2d_seconds;
+                            gpu_transfer_bytes =
+                                stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
                         }
                     }
                 }
@@ -7642,7 +7890,13 @@ INPUT / OUTPUT:
                           off runs the CPU reference. The MTF family uses one
                           device resample + causal join per timeframe and keeps
                           the CPU NaN/gap/bar_age contract; it is opt-in with
-                          --gpu on until the 16M crossover is measured.
+                          --gpu on until the 16M crossover is measured. The
+                          benchmark family (btc_*, eth_*, rel_*, beta_*,
+                          cross_ret1, cross_beta20, beta384) joins the BTC/ETH
+                          series by exact timestamp on the device (a missing
+                          benchmark bar is NaN) and the per-timestamp market
+                          means (mkt_*, breadth, dispersion, rel_mkt*, avg_corr,
+                          btc_volume_share) reuse the cross-section permutation.
   --no-gpu, --cpu         force CPU
   --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
                           (default 222 MB/s on the shared ext4 store)
