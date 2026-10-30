@@ -231,11 +231,17 @@ fn eval_spec(windows: Vec<Window>) -> EvalSpec {
         embargo: None,
         cost_bps: 10.0,
         threshold_quantile: 0.7,
+        threshold_fixed: None,
         validation_frac: 0.0,
         periods_per_year: None,
         candidates: Vec::new(),
+        band_select: false,
         pool_reset_flat: false,
         allow_lockbox: false,
+        device_pnl: false,
+        policy: rcsr::walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
     }
 }
 

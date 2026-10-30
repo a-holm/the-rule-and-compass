@@ -178,6 +178,7 @@ pub fn json() -> String {
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
 {{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
+{{\"name\":\"--select-band\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"#308 banded finalist selection: screen repeated candidates with the fused long-only validation P&L, admit K=max(8,P/16) plus an epsilon band, rescore admitted candidates on full validation rows in exact CPU f64 and rank by (net, turnover, complexity, index); JSON carries surrogate_rank, exact_rank, band, epsilon, finalists_considered, recall_band and scored_by=cpu_f64; needs --validation-frac > 0\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
 {{\"name\":\"--group-by\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel group column; costs and positions are per group\"}},\
@@ -186,13 +187,25 @@ pub fn json() -> String {
 {{\"name\":\"--horizon\",\"type\":\"float\",\"default\":\"0\",\"description\":\"forward-label horizon in seconds; minimum purge/embargo\"}},\
 {{\"name\":\"--embargo\",\"type\":\"float\",\"default\":\"horizon\",\"description\":\"extra gap between train_end and test_start\"}},\
 {{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"10\",\"description\":\"cost per side in basis points\"}},\
-{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"training/validation score quantile\"}},\
+{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"exact type-7 training/validation score quantile; order-preserving radix select, f64 interpolation\"}},\
+{{\"name\":\"--threshold-fixed\",\"type\":\"float\",\"default\":\"none\",\"description\":\"pre-registered fixed threshold instead of a quantile; reported with threshold_source = fixed\"}},\
+{{\"name\":\"--policy\",\"type\":\"enum\",\"default\":\"threshold\",\"description\":\"threshold | band | dp; band is a long-only no-trade band, dp keeps the threshold book and reports an exact hindsight bound (never a strategy P&L)\"}},\
+{{\"name\":\"--band\",\"type\":\"float\",\"default\":\"0\",\"description\":\"half-width beta of the no-trade band in score units; beta=0 with --policy band reproduces the threshold rule\"}},\
+{{\"name\":\"--min-hold\",\"type\":\"int\",\"default\":\"1\",\"description\":\"minimum consecutive long rows before a band exit\"}},\
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
 {{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
+{{\"name\":\"--device-pnl\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"recompute each test block through the fused f64 long-only reduction (CUDA kernel when available, identical canonical CPU segments otherwise) and report it with cash and buy-and-hold benchmarks; the scalar evaluator remains the authority\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
-{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}],\
+         \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":\"the reported annualisation value\",\
+         \"sharpe\":\"mean/sd(ddof=1)*sqrt(periods_per_year); NaN when n<2 or sd=0 (cash)\",\
+         \"sortino\":\"(mean-MAR)/(population RMS of min(R-MAR,0))*sqrt(periods_per_year); default MAR 0\",\
+         \"log_growth\":\"mean of log1p(R); -inf on R<=-1 (ruin)\",\
+         \"drawdown\":\"log-equity peak-to-trough as a negative fraction; -1 on ruin\",\
+         \"beta_alpha\":\"beta from (n,sum x,sum y,sum xy,sum x^2); alpha per period, annualised by periods_per_year\",\
+         \"daily\":\"compound blocks with risk::compound_blocks then use periods_per_year=365\"}}}},\n  \
          \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
  {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\

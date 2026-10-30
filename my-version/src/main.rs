@@ -7585,6 +7585,16 @@ OPTIONS:
   --target <col>             forward-return column used for P&L
   --expr <formula>           score expression, variables resolved by column name;
                              repeat to select among candidates on the validation slice
+  --select-band              #308: select among repeated --expr candidates with
+                             the P&L band instead of validation MSE. The screen is
+                             the fused long-only reduction on validation rows; the
+                             admitted set is rescored on the full validation rows in
+                             exact CPU f64 and ranked by
+                             (net, turnover, complexity, index). Requires
+                             --validation-frac > 0 and more than one --expr; the
+                             JSON carries surrogate_rank, exact_rank, band,
+                             epsilon, finalists_considered, recall_band and
+                             scored_by=cpu_f64
   --vars <a,b,...>           feature columns (default: all numeric except target,
                              time and group)
   --time <col>               time/ordering column (numbers or YYYY-MM-DD)
@@ -7598,7 +7608,20 @@ OPTIONS:
   --embargo <seconds>        extra gap between train_end and test_start
                              (default: the horizon)
   --cost-bps <f>             cost per side in basis points (default {DEFAULT_COST_BPS})
-  --threshold-quantile <q>   training/validation score quantile (default {DEFAULT_QUANTILE})
+  --threshold-quantile <q>   exact type-7 training/validation score quantile
+                             (default {DEFAULT_QUANTILE}); selected by order-preserving
+                             radix count, so theta is bit-identical to numpy
+  --threshold-fixed <theta>  pre-registered fixed threshold instead of a quantile;
+                             reported with threshold_source = fixed
+  --policy <p>               threshold | band | dp (default threshold). band is a
+                             long-only no-trade band; dp keeps the threshold book
+                             and reports the exact hindsight DP as a bound, never
+                             as the strategy's P&L
+  --band <f>                 half-width beta of the no-trade band in score units
+                             (default 0; with --policy band, beta=0 reproduces
+                             the threshold rule bit for bit)
+  --min-hold <n>             minimum consecutive long rows before a band exit
+                             (default 1; requires --policy band)
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -7607,6 +7630,11 @@ OPTIONS:
                              position, so total variation includes |p_end-q_start|
   --periods-per-year <f>     annualisation override (default: infer from the
                              median test time step; 365 for daily crypto bars)
+  --device-pnl               recompute each test block through the fused
+                             long-only reduction (f64 canonical segments; the
+                             CUDA kernel when built with --features cuda) and
+                             report it with cash and buy-and-hold benchmarks.
+                             The scalar evaluator remains the reported authority
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
@@ -7641,9 +7669,16 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut embargo: Option<f64> = None;
     let mut cost_bps = walkforward::DEFAULT_COST_BPS;
     let mut quantile = walkforward::DEFAULT_QUANTILE;
+    let mut quantile_set = false;
+    let mut threshold_fixed: Option<f64> = None;
+    let mut policy = walkforward::Policy::Threshold;
+    let mut band_width = 0.0f64;
+    let mut min_hold = 1usize;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
+    let mut device_pnl = false;
+    let mut band_select = false;
     let mut json = false;
     let mut out: Option<String> = None;
     let mut markdown: Option<String> = None;
@@ -7727,6 +7762,40 @@ fn run_walkforward(args: &[String]) -> ! {
                     need(args, i + 1, "--threshold-quantile"),
                     "--threshold-quantile",
                 );
+                quantile_set = true;
+                i += 1;
+            }
+            "--threshold-fixed" => {
+                threshold_fixed = Some(number(
+                    need(args, i + 1, "--threshold-fixed"),
+                    "--threshold-fixed",
+                ));
+                i += 1;
+            }
+            "--policy" => {
+                let src = need(args, i + 1, "--policy");
+                policy = match walkforward::Policy::parse(&src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                i += 1;
+            }
+            "--band" | "--band-width" => {
+                band_width = number(need(args, i + 1, "--band"), "--band");
+                i += 1;
+            }
+            "--min-hold" => {
+                let src = need(args, i + 1, "--min-hold");
+                min_hold = match src.parse::<usize>() {
+                    Ok(v) if v >= 1 => v,
+                    _ => {
+                        eprintln!("error: --min-hold needs an integer >= 1, got '{}'", src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
                 i += 1;
             }
             "--validation-frac" => {
@@ -7744,6 +7813,8 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--pool-reset-flat" => pool_reset_flat = true,
+            "--device-pnl" => device_pnl = true,
+            "--select-band" => band_select = true,
             "--json" => json = true,
             "--out" => {
                 out = Some(need(args, i + 1, "--out"));
@@ -7755,6 +7826,38 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--quiet" => quiet = true,
             "--allow-lockbox" => allow_lockbox = true,
+            other if other.starts_with("--policy=") => {
+                let src = &other["--policy=".len()..];
+                policy = match walkforward::Policy::parse(src) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+            }
+            other if other.starts_with("--band=") => {
+                band_width = number(
+                    other["--band=".len()..].to_string(),
+                    "--band",
+                );
+            }
+            other if other.starts_with("--band-width=") => {
+                band_width = number(
+                    other["--band-width=".len()..].to_string(),
+                    "--band-width",
+                );
+            }
+            other if other.starts_with("--min-hold=") => {
+                let src = &other["--min-hold=".len()..];
+                min_hold = match src.parse::<usize>() {
+                    Ok(v) if v >= 1 => v,
+                    _ => {
+                        eprintln!("error: --min-hold needs an integer >= 1, got '{}'", src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+            }
             other if other.starts_with('-') => {
                 eprintln!(
                     "error: unknown walkforward option '{}'\n\n{}",
@@ -7781,6 +7884,30 @@ fn run_walkforward(args: &[String]) -> ! {
     });
     if expressions.is_empty() {
         eprintln!("error: walkforward needs --expr\n\n{}", walkforward_usage());
+        std::process::exit(EXIT_USAGE);
+    }
+    if threshold_fixed.is_some() && quantile_set {
+        eprintln!(
+            "error: --threshold-fixed and --threshold-quantile are alternatives; \
+             pass one of them\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if band_select && expressions.len() < 2 {
+        eprintln!(
+            "error: --select-band needs at least two --expr candidates; \
+             one candidate has nothing to select\n\n{}",
+            walkforward_usage()
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    if band_select && validation_frac <= 0.0 {
+        eprintln!(
+            "error: --select-band needs --validation-frac > 0; the test block \
+             may not choose the candidate\n\n{}",
+            walkforward_usage()
+        );
         std::process::exit(EXIT_USAGE);
     }
     let expression = expressions[0].clone();
@@ -7854,11 +7981,17 @@ fn run_walkforward(args: &[String]) -> ! {
         embargo,
         cost_bps,
         threshold_quantile: quantile,
+        threshold_fixed,
         validation_frac,
         periods_per_year,
         candidates,
+        band_select,
         pool_reset_flat,
         allow_lockbox,
+        device_pnl,
+        policy,
+        band_width,
+        min_hold,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,

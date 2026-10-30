@@ -151,12 +151,24 @@ group flat; pooled P&L carries each group's ending position across a window
 boundary and charges the seam term `|p_end - q_start|` (pass
 `--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
 candidates by their validation error; the test block is never a selection
-input. The fold sign test is reported as not applicable for expanding folds
-because `test_k` lies inside `train_{k+1}`. See
-[`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
-definitions and the reference-agreement check against the Python evaluator, and
-[`docs/eval-benchmark.md`](docs/eval-benchmark.md) for the pinned 4M-row
-Python-vs-Rust benchmark protocol and the measured 10x evidence.
+input. `--select-band` selects those repeated candidates with the long-only P&L
+band instead: a screening score admits a measured `epsilon` band, the admitted
+set is rescored on full validation rows in exact CPU `f64`, and a deterministic
+`(net, turnover, complexity, index)` tie-break picks the finalist; the JSON
+carries the surrogate/exact ranks, band width and recall audit. The fold sign
+test is reported as not applicable for expanding folds
+because `test_k` lies inside `train_{k+1}`. Pass `--device-pnl` to recompute
+each test block through the fused f64 long-only reduction (`src/trading_gpu.rs`
+plus the CUDA kernel `src/cuda/pnl.cu`) and report it with cash and
+buy-and-hold benchmarks; the scalar evaluator stays the reported authority.
+`--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
+associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
+adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
+strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
+semantics, metric definitions and the reference-agreement check against the
+Python evaluator, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
+the pinned 4M-row Python-vs-Rust benchmark protocol and the measured 10x
+evidence.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
