@@ -1922,6 +1922,12 @@ legacy stream. They now share two per-context regions:
 * **Arithmetic is unchanged.** Same kernels, launch shapes, owner threads and
   reduction orders; only buffer lifetime and stream differ. A failed launch
   drains the stream before returning, and the caller keeps the CPU arm.
+* **Correlation LM step is single-threaded.** `ft_corr_mask_gauge` negates and
+  masks the shared `jtj`/`jtr` in place, so only thread 0 runs it, in the same
+  branch as `ft_solve`. Running it on every thread raced on the in-place
+  negation and made the correlation fit differ in the last digits on about one
+  run in a thousand. `gpu::fit_tests::correlation_fit_is_bit_stable_over_repeats`
+  guards it.
 
 `GpuEvaluator::arena_report()` exposes `fit_alloc_calls`, `fit_growths`,
 `fit_steady_alloc_calls`, `fit_batches`, `fit_device_bytes` and
