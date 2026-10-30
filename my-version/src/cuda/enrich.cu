@@ -737,13 +737,71 @@ __global__ void k_label(const long long *__restrict__ t, const double *__restric
 /* Cross-sectional rank                                                      */
 /* ------------------------------------------------------------------------- */
 
+#define RC_RANK_INVALID 0xFFFFFFFFFFFFFFFFULL
+
+/* Order key for an f64 that matches the CPU's `partial_cmp` on finite values:
+   -0.0 and +0.0 are the same tie, and NaN/invalid rows sort last. */
 __device__ __forceinline__ unsigned long long rc_sort_key(double v)
 {
-    if (isnan(v)) return 0xFFFFFFFFFFFFFFFFULL;
+    if (isnan(v)) return RC_RANK_INVALID;
     unsigned long long bits;
     memcpy(&bits, &v, sizeof(bits));
+    if (bits == 0x8000000000000000ULL) bits = 0ULL;
     if (bits & 0x8000000000000000ULL) return ~bits;
     return bits | 0x8000000000000000ULL;
+}
+
+__global__ void k_iota_u32(unsigned int *__restrict__ order, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) order[p] = (unsigned int)p;
+}
+
+__global__ void k_keys_from_sym(const unsigned int *__restrict__ sym,
+                                unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) keys[p] = (unsigned long long)sym[p];
+}
+
+/* Signed time as an order-preserving u64; the permutation sort is radix, so a
+   raw two's-complement negative would order after every positive timestamp. */
+__global__ void k_keys_from_time(const long long *__restrict__ times,
+                                 const unsigned int *__restrict__ order,
+                                 unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) {
+        unsigned long long t = (unsigned long long)times[order[p]];
+        keys[p] = t ^ 0x8000000000000000ULL;
+    }
+}
+
+/* One flag per slot of the time-ordered permutation. An inclusive sum turns
+   the flags into group ids without an atomic counter, so the layout is
+   deterministic. */
+__global__ void k_group_boundary(const long long *__restrict__ times,
+                                 const unsigned int *__restrict__ order,
+                                 unsigned int *__restrict__ flags, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    flags[p] = (p == 0 || times[order[p]] != times[order[p - 1]]) ? 1u : 0u;
+}
+
+/* Inclusive sum of the boundary flags counts groups from one. */
+__global__ void k_gid_zero_based(unsigned int *__restrict__ gid, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) gid[p] -= 1u;
+}
+
+__global__ void k_group_starts(const unsigned int *__restrict__ flags,
+                               const unsigned int *__restrict__ gid,
+                               int *__restrict__ off, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n && flags[p]) off[gid[p]] = p;
 }
 
 __global__ void k_count_finite(const unsigned long long *__restrict__ keys,
@@ -754,9 +812,23 @@ __global__ void k_count_finite(const unsigned long long *__restrict__ keys,
     if (g >= ngroups) return;
     unsigned int c = 0;
     for (int p = off[g]; p < off[g + 1]; ++p) {
-        if (keys[p] != 0xFFFFFFFFFFFFFFFFULL) c += 1;
+        if (keys[p] != RC_RANK_INVALID) c += 1;
     }
     counts[g] = c;
+}
+
+/* Build one column's sort keys in permutation slot order. Non-members and
+   non-finite sources share the invalid key, so they sort to the end of their
+   timestamp and never enter the finite count or a rank. */
+__global__ void k_rank_keys(const double *__restrict__ src,
+                            const unsigned int *__restrict__ order,
+                            const unsigned char *__restrict__ member,
+                            unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    unsigned int r = order[p];
+    keys[p] = member[r] ? rc_sort_key(src[r]) : RC_RANK_INVALID;
 }
 
 __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
@@ -773,7 +845,7 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
     unsigned int pos = (unsigned int)p - (unsigned int)off[g];
     double v = NAN;
     if (pos < finite && finite >= 20 &&
-        keys[p] != 0xFFFFFFFFFFFFFFFFULL) {
+        keys[p] != RC_RANK_INVALID) {
         v = 2.0 * (double)pos / (double)(finite - 1) - 1.0;
     }
     out[rows[p]] = v;
@@ -782,9 +854,6 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
 /* ------------------------------------------------------------------------- */
 /* C API                                                                     */
 /* ------------------------------------------------------------------------- */
-
-/* Stats slot for the rank call, which does not own an RcEnrich context. */
-static RcEnrichStats g_rank_last;
 
 extern "C" void rc_enrich_destroy(void *v);
 
@@ -827,6 +896,39 @@ int rc_tail_exotic(const long long *t, const double *high, const double *low,
                    const double *close, const int *seg_id, const int *ss,
                    const int *sl, int nseg, int n, int step, int which,
                    double *out);
+}
+
+/* Free only the cross-section permutation/rank arena. */
+static void rc_xs_free(RcEnrich *c)
+{
+    if (!c) return;
+    cudaFree(c->d_xs_order);
+    cudaFree(c->d_xs_order_tmp);
+    cudaFree(c->d_xs_rows_out);
+    cudaFree(c->d_xs_gid);
+    cudaFree(c->d_xs_counts);
+    cudaFree(c->d_xs_sym);
+    cudaFree(c->d_xs_off);
+    cudaFree(c->d_xs_keys);
+    cudaFree(c->d_xs_keys_out);
+    cudaFree(c->d_xs_member);
+    cudaFree(c->d_xs_src);
+    cudaFree(c->d_xs_temp);
+    c->d_xs_order = NULL;
+    c->d_xs_order_tmp = NULL;
+    c->d_xs_rows_out = NULL;
+    c->d_xs_gid = NULL;
+    c->d_xs_counts = NULL;
+    c->d_xs_sym = NULL;
+    c->d_xs_off = NULL;
+    c->d_xs_keys = NULL;
+    c->d_xs_keys_out = NULL;
+    c->d_xs_member = NULL;
+    c->d_xs_src = NULL;
+    c->d_xs_temp = NULL;
+    c->xs_temp_bytes = 0;
+    c->xs_groups = 0;
+    c->xs_ready = 0;
 }
 
 extern "C" {
@@ -953,7 +1055,7 @@ void rc_enrich_destroy(void *v)
     if (c->h_pinned) cudaFreeHost(c->h_pinned);
 #endif
     cudaFree(c->d_feat);
-
+    rc_xs_free(c);
     free(c);
 }
 
@@ -1547,105 +1649,208 @@ int rc_enrich_batch_run(void *v, const RcEnrichOp *ops, int nops)
 }
 
 
-/* Stable segmented rank. `keys`, `rows`, `offsets` and `gid` are host arrays
-   built in the same (time, symbol, row) order as the CPU reference; the sort
-   is stable, so equal values keep that tie order. */
-int rc_enrich_rank(const unsigned long long *keys, const unsigned int *rows,
-                   const int *offsets, const unsigned int *gid, int n, int ngroups,
-                   double *out)
+/* ------------------------------------------------------------------------- */
+/* Cross-section permutation and segmented rank (#295)                       */
+/* ------------------------------------------------------------------------- */
+
+/* Build the (time, symbol, row) permutation once and keep it resident.
+   Two stable radix sorts reproduce the CPU's `sort_unstable_by` order:
+   symbol first, then time. Equal times therefore keep symbol and row order. */
+int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
+                         const unsigned char *member)
 {
-    double t0 = rc_now_ms();
-    RcEnrichStats st;
-    memset(&st, 0, sizeof(st));
-    unsigned long long *d_keys = NULL, *d_keys_out = NULL;
-    unsigned int *d_rows = NULL, *d_rows_out = NULL, *d_counts = NULL, *d_gid = NULL;
-    int *d_off = NULL;
-    void *d_temp = NULL;
-    double *d_out = NULL;
-    size_t temp_bytes = 0;
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return -1;
+    stats_begin(c);
+    if (c->n <= 0 || !sym_key) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    if (c->xs_ready) {
+        stats_end(c);
+        return 0;
+    }
+    size_t n = (size_t)c->n;
     int ok = 1;
-    if (rc_alloc((void **)&d_keys, (size_t)n * sizeof(unsigned long long)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_keys_out, (size_t)n * sizeof(unsigned long long)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_rows, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_rows_out, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_off, (size_t)(ngroups + 1) * sizeof(int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_gid, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_counts, (size_t)ngroups * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_out, (size_t)n * sizeof(double)) != 0) ok = 0;
-    st.alloc_ms = rc_now_ms() - t0;
+    double t_alloc = rc_now_ms();
+    if (rc_alloc((void **)&c->d_xs_order, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_order_tmp, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_rows_out, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_gid, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_sym, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_keys, n * sizeof(unsigned long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_keys_out, n * sizeof(unsigned long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_member, n * sizeof(unsigned char)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_src, n * sizeof(double)) != 0) ok = 0;
     if (ok) {
-        t0 = rc_now_ms();
-        rc_upload(d_keys, keys, (size_t)n * sizeof(unsigned long long));
-        rc_upload(d_rows, rows, (size_t)n * sizeof(unsigned int));
-        rc_upload(d_off, offsets, (size_t)(ngroups + 1) * sizeof(int));
-        rc_upload(d_gid, gid, (size_t)n * sizeof(unsigned int));
-        st.h2d_ms = rc_now_ms() - t0;
-        st.h2d_bytes = (unsigned long long)n * (sizeof(unsigned long long) +
-                                                sizeof(unsigned int) +
-                                                sizeof(unsigned int)) +
-                       (unsigned long long)(ngroups + 1) * sizeof(int);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            NULL, temp_bytes, d_keys, d_keys_out, d_rows, d_rows_out,
-            n, ngroups, d_off, d_off + 1);
-        t0 = rc_now_ms();
-        if (rc_alloc(&d_temp, temp_bytes) != 0) {
-            ok = 0;
-        } else {
-            st.alloc_ms += rc_now_ms() - t0;
-            cudaEvent_t ev0, ev1;
-            cudaEventCreate(&ev0);
-            cudaEventCreate(&ev1);
-            cudaEventRecord(ev0, 0);
-            double l = rc_now_ms();
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                d_temp, temp_bytes, d_keys, d_keys_out, d_rows, d_rows_out,
-                n, ngroups, d_off, d_off + 1);
-            st.launch_ms = rc_now_ms() - l;
-            double sy = rc_now_ms();
-            cudaEventRecord(ev1, 0);
-            cudaEventSynchronize(ev1);
-            st.sync_ms = rc_now_ms() - sy;
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, ev0, ev1);
-            st.kernel_ms += ms;
-            cudaEventDestroy(ev0);
-            cudaEventDestroy(ev1);
-        }
+        t_alloc = rc_now_ms() - t_alloc;
+        c->last.alloc_ms = t_alloc;
     }
-    if (ok) {
-        int threads = 128;
-        int cblocks = (ngroups + threads - 1) / threads;
-        k_count_finite<<<cblocks, threads>>>(d_keys_out, d_off, ngroups, d_counts);
-        int rblocks = (n + threads - 1) / threads;
-        k_rank_scatter<<<rblocks, threads>>>(d_keys_out, d_rows_out, d_off, d_counts,
-                                             d_gid, n, d_out);
-        cudaDeviceSynchronize();
-        t0 = rc_now_ms();
-        rc_download(out, d_out, (size_t)n * sizeof(double));
-        st.d2h_ms = rc_now_ms() - t0;
-        st.d2h_bytes = (unsigned long long)n * sizeof(double);
-        st.batch = 1;
+    if (!ok) {
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    double t0 = rc_now_ms();
+    rc_upload(c->d_xs_sym, sym_key, n * sizeof(unsigned int));
+    if (member) {
+        rc_upload(c->d_xs_member, member, n * sizeof(unsigned char));
     } else {
-        st.failed = 1;
+        cudaMemset(c->d_xs_member, 1, n * sizeof(unsigned char));
     }
-    st.wall_ms = rc_now_ms() - t0;
-    cudaFree(d_keys);
-    cudaFree(d_keys_out);
-    cudaFree(d_rows);
-    cudaFree(d_rows_out);
-    cudaFree(d_off);
-    cudaFree(d_gid);
-    cudaFree(d_counts);
-    cudaFree(d_out);
-    cudaFree(d_temp);
-    /* The caller reads this through a small host shim. */
-    g_rank_last = st;
-    return ok ? 0 : -1;
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = (unsigned long long)n * (sizeof(unsigned int) +
+                                                 sizeof(unsigned char));
+
+    size_t t1 = 0, t2 = 0;
+    cub::DeviceRadixSort::SortPairs(
+        NULL, t1, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_order_tmp, c->n);
+    cub::DeviceScan::InclusiveSum(NULL, t2, c->d_xs_rows_out, c->d_xs_gid,
+                                  c->n);
+    size_t temp_bytes = t1 > t2 ? t1 : t2;
+    t0 = rc_now_ms();
+    if (rc_alloc(&c->d_xs_temp, temp_bytes) != 0) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    c->last.alloc_ms += rc_now_ms() - t0;
+    c->xs_temp_bytes = temp_bytes;
+
+    int threads = 256;
+    int blocks = (c->n + threads - 1) / threads;
+    double l0 = rc_now_ms();
+    k_iota_u32<<<blocks, threads>>>(c->d_xs_order, c->n);
+    k_keys_from_sym<<<blocks, threads>>>(c->d_xs_sym, c->d_xs_keys, c->n);
+    c->last.launch_ms += rc_now_ms() - l0;
+
+    /* Pass 1: stable by symbol. The value carried along is the row index. */
+    cub::DeviceRadixSort::SortPairs(
+        c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_order_tmp, c->n);
+    /* Pass 2: stable by time. Equal times retain the symbol/row order. */
+    k_keys_from_time<<<blocks, threads>>>(c->d_times, c->d_xs_order_tmp,
+                                          c->d_xs_keys, c->n);
+    cub::DeviceRadixSort::SortPairs(
+        c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order_tmp, c->d_xs_order, c->n);
+
+    /* Group boundaries, ids and starts from the time-ordered permutation. */
+    k_group_boundary<<<blocks, threads>>>(c->d_times, c->d_xs_order,
+                                          c->d_xs_rows_out, c->n);
+    cub::DeviceScan::InclusiveSum(c->d_xs_temp, temp_bytes, c->d_xs_rows_out,
+                                  c->d_xs_gid, c->n);
+    k_gid_zero_based<<<blocks, threads>>>(c->d_xs_gid, c->n);
+    unsigned int last_gid = 0;
+    cudaMemcpy(&last_gid, c->d_xs_gid + (c->n - 1), sizeof(unsigned int),
+               cudaMemcpyDeviceToHost);
+    int groups = (int)last_gid + 1;
+    if (groups < 1) groups = 1;
+    c->xs_groups = groups;
+
+    t0 = rc_now_ms();
+    ok = rc_alloc((void **)&c->d_xs_off, (size_t)(groups + 1) * sizeof(int)) == 0 &&
+         rc_alloc((void **)&c->d_xs_counts,
+                  (size_t)groups * sizeof(unsigned int)) == 0;
+    c->last.alloc_ms += rc_now_ms() - t0;
+    if (ok) {
+        k_group_starts<<<blocks, threads>>>(c->d_xs_rows_out, c->d_xs_gid,
+                                            c->d_xs_off, c->n);
+        int end = c->n;
+        cudaMemcpy(c->d_xs_off + groups, &end, sizeof(int),
+                   cudaMemcpyHostToDevice);
+        cudaFree(c->d_xs_sym);
+        c->d_xs_sym = NULL;
+        c->xs_ready = 1;
+    }
+
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms = ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    if (!ok) {
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    c->last.batch = 1;
+    stats_end(c);
+    return 0;
 }
 
-void rc_enrich_rank_stats(RcEnrichStats *out)
+/* Rank one source column across the cached permutation. The stable segmented
+   sort uses (value, symbol, row) via the cached order, and only finite PIT
+   members enter the count; every other row is NaN. */
+int rc_enrich_xs_rank(void *v, const double *src, double *out)
 {
-    if (out) *out = g_rank_last;
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return -1;
+    stats_begin(c);
+    if (!c->xs_ready || !src || !out) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    size_t n = (size_t)c->n;
+    double t0 = rc_now_ms();
+    rc_upload(c->d_xs_src, src, n * sizeof(double));
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = (unsigned long long)n * sizeof(double);
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    int threads = 256;
+    int blocks = (c->n + threads - 1) / threads;
+    double l0 = rc_now_ms();
+    k_rank_keys<<<blocks, threads>>>(c->d_xs_src, c->d_xs_order,
+                                     c->d_xs_member, c->d_xs_keys, c->n);
+    c->last.launch_ms = rc_now_ms() - l0;
+    double l1 = rc_now_ms();
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        c->d_xs_temp, c->xs_temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_rows_out, c->n, c->xs_groups,
+        c->d_xs_off, c->d_xs_off + 1);
+    c->last.launch_ms += rc_now_ms() - l1;
+    int cblocks = (c->xs_groups + threads - 1) / threads;
+    k_count_finite<<<cblocks, threads>>>(c->d_xs_keys_out, c->d_xs_off,
+                                         c->xs_groups, c->d_xs_counts);
+    k_rank_scatter<<<blocks, threads>>>(c->d_xs_keys_out, c->d_xs_rows_out,
+                                        c->d_xs_off, c->d_xs_counts,
+                                        c->d_xs_gid, c->n, c->d_xs_src);
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms = ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+
+    t0 = rc_now_ms();
+    rc_download(out, c->d_xs_src, n * sizeof(double));
+    c->last.d2h_ms = rc_now_ms() - t0;
+    c->last.d2h_bytes = (unsigned long long)n * sizeof(double);
+    c->last.batch = 1;
+    cudaError_t err = cudaGetLastError();
+    c->last.failed = (err != cudaSuccess) ? 1 : 0;
+    stats_end(c);
+    return c->last.failed ? -1 : 0;
 }
 
 } /* extern "C" */

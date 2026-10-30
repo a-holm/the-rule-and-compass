@@ -9,8 +9,10 @@
 //! The kernels are f64 and deterministic. Sequential families (rolling sums and
 //! standard deviations, Wilder/EMA scans, Donchian, labels) run one thread per
 //! symbol segment and use the same operation order as the CPU reference, so
-//! their columns hash identically. Cross-sectional ranks use a stable segmented
-//! radix sort with the CPU's `(time, symbol, row)` tie order.
+//! their columns hash identically. Cross-sectional ranks build one device
+//! `(time, symbol, row)` permutation per run and reuse it for every rank
+//! column; each column is a stable segmented radix sort by `(value, symbol,
+//! row)` with the CPU's tie, NaN and PIT-member policy.
 
 use crate::gpu_stats::GpuStats;
 use crate::projected_ring::{ProjectedRing, TileFeature};
@@ -95,16 +97,11 @@ extern "C" {
         stride: c_int,
         out: *mut f64,
     ) -> c_int;
-    fn rc_enrich_rank(
-        keys: *const u64,
-        rows: *const u32,
-        offsets: *const c_int,
-        gid: *const u32,
-        n: c_int,
-        ngroups: c_int,
-        out: *mut f64,
+    fn rc_enrich_xs_prepare(
+        ctx: *mut Raw,
+        sym_key: *const u32,
+        member: *const u8,
     ) -> c_int;
-    fn rc_enrich_rank_stats(out: *mut RawStats);
     fn rc_enrich_create_arena(
         n: c_int,
         nseg: c_int,
@@ -123,6 +120,7 @@ extern "C" {
     fn rc_enrich_batch_capacity(ctx: *mut Raw) -> c_int;
     fn rc_enrich_batch_host(ctx: *mut Raw) -> *mut f64;
     fn rc_enrich_batch_run(ctx: *mut Raw, ops: *const BatchOp, nops: c_int) -> c_int;
+    fn rc_enrich_xs_rank(ctx: *mut Raw, src: *const f64, out: *mut f64) -> c_int;
 }
 
 /// Where one projected column lands in the enrichment context.
@@ -832,81 +830,50 @@ impl EnrichGpu {
         })
     }
 
-    /// Cross-sectional ranks. The `(time, symbol, row)` permutation and the
-    /// stable segmented sort reproduce [`crate::enrich::xs_rank`] exactly.
-    pub fn rank(&mut self, src: &[f64], times: &[i64], sym_key: &[u32]) -> Option<Vec<f64>> {
-        let n = src.len();
-        if n == 0 || times.len() != n || sym_key.len() != n {
-            return None;
+    /// Build the device `(time, symbol, row)` permutation and cached timestamp
+    /// segments once. Every [`rank`](Self::rank) column reuses them.
+    ///
+    /// `times` are the resident columns uploaded by [`new`](Self::new); `member`
+    /// is the point-in-time mask (`None` means every row is a member). Rows
+    /// that are non-members are excluded exactly like the CPU reference.
+    pub fn prepare_cross_section(
+        &mut self,
+        sym_key: &[u32],
+        member: Option<&[bool]>,
+    ) -> bool {
+        if sym_key.len() != self.n {
+            return false;
         }
-        let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_unstable_by(|&a, &b| {
-            let (a, b) = (a as usize, b as usize);
-            times[a]
-                .cmp(&times[b])
-                .then(sym_key[a].cmp(&sym_key[b]))
-                .then(a.cmp(&b))
-        });
-        let mut offsets: Vec<c_int> = Vec::new();
-        let mut gid = vec![0u32; n];
-        let mut i = 0usize;
-        while i < order.len() {
-            let t = times[order[i] as usize];
-            let mut j = i;
-            while j < order.len() && times[order[j] as usize] == t {
-                j += 1;
+        let mask: Option<Vec<u8>> =
+            member.map(|m| m.iter().map(|&b| b as u8).collect());
+        if let Some(m) = &mask {
+            if m.len() != self.n {
+                return false;
             }
-            offsets.push(i as c_int);
-            let g = (offsets.len() - 1) as u32;
-            for slot in gid.iter_mut().take(j).skip(i) {
-                *slot = g;
-            }
-            i = j;
         }
-        offsets.push(n as c_int);
-        let keys: Vec<u64> = order
-            .iter()
-            .map(|&r| sort_key(src[r as usize]))
-            .collect();
-        let rows: Vec<u32> = order;
         let started = std::time::Instant::now();
-        let mut out = self.out();
         let rc = unsafe {
-            rc_enrich_rank(
-                keys.as_ptr(),
-                rows.as_ptr(),
-                offsets.as_ptr(),
-                gid.as_ptr(),
-                n as c_int,
-                (offsets.len() - 1) as c_int,
-                out.as_mut_ptr(),
+            rc_enrich_xs_prepare(
+                self.ctx,
+                sym_key.as_ptr(),
+                mask.as_ref().map_or(std::ptr::null(), |m| m.as_ptr()),
             )
         };
         let ok = rc == 0;
-        let mut raw = RawStats::default();
-        unsafe { rc_enrich_rank_stats(&mut raw) };
-        let outer_ms = started.elapsed().as_secs_f64() * 1e3;
-        let windows = raw.alloc_ms + raw.h2d_ms + raw.launch_ms + raw.sync_ms + raw.d2h_ms;
-        self.stats.add_batch(
-            raw.kernel_ms,
-            raw.launch_ms,
-            raw.sync_ms,
-            raw.alloc_ms,
-            raw.h2d_ms,
-            raw.d2h_ms,
-            (outer_ms - windows).max(0.0),
-            outer_ms.max(raw.wall_ms),
-            raw.h2d_bytes,
-            raw.d2h_bytes,
-            0,
-            n as u64,
-            !ok || raw.failed != 0,
-        );
-        if ok {
-            Some(out)
-        } else {
-            None
+        self.record(started, ok);
+        ok
+    }
+
+    /// Cross-sectional ranks against the cached device permutation. The stable
+    /// segmented sort keeps the CPU's `(time, symbol, row)` tie order and treats
+    /// `-0.0`/`+0.0` as one tie; non-members and non-finite values are `NaN`,
+    /// and a timestamp with fewer than 20 finite PIT members is all `NaN`.
+    pub fn rank(&mut self, src: &[f64]) -> Option<Vec<f64>> {
+        if src.len() != self.n {
+            return None;
         }
+        let ctx = self.ctx;
+        self.one(|p| unsafe { rc_enrich_xs_rank(ctx, src.as_ptr(), p) })
     }
 
     /// #300: how many output columns fit in the 64 MiB per-family arena.
@@ -1007,15 +974,171 @@ pub fn tile_feature(name: &str) -> Option<TileFeature> {
     }
 }
 
-fn sort_key(v: f64) -> u64 {
-    if v.is_nan() {
-        u64::MAX
-    } else {
-        let bits = v.to_bits();
-        if bits & (1u64 << 63) != 0 {
-            !bits
-        } else {
-            bits | (1u64 << 63)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CPU reference: stable `(time, symbol, row)` groups, finite PIT members
+    /// only, positional ranks scaled to `[-1, 1]`.
+    fn cpu_rank(
+        src: &[f64],
+        times: &[i64],
+        sym: &[u32],
+        member: &[bool],
+    ) -> Vec<f64> {
+        let rows = src.len();
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        order.sort_unstable_by(|&a, &b| {
+            let (a, b) = (a as usize, b as usize);
+            times[a]
+                .cmp(&times[b])
+                .then(sym[a].cmp(&sym[b]))
+                .then(a.cmp(&b))
+        });
+        let mut out = vec![f64::NAN; rows];
+        let mut i = 0;
+        while i < order.len() {
+            let t = times[order[i] as usize];
+            let mut j = i;
+            while j < order.len() && times[order[j] as usize] == t {
+                j += 1;
+            }
+            let mut group: Vec<usize> = (i..j)
+                .map(|k| order[k] as usize)
+                .filter(|&r| src[r].is_finite() && member[r])
+                .collect();
+            group.sort_unstable_by(|&a, &b| {
+                src[a]
+                    .partial_cmp(&src[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(sym[a].cmp(&sym[b]))
+                    .then(a.cmp(&b))
+            });
+            let m = group.len();
+            if m >= 20 {
+                for (rank, &r) in group.iter().enumerate() {
+                    out[r] = 2.0 * rank as f64 / (m - 1) as f64 - 1.0;
+                }
+            }
+            i = j;
         }
+        out
+    }
+
+    fn fixture(rows_per_symbol: usize, symbols: usize) -> (Vec<i64>, Vec<u32>, Vec<f64>, Vec<bool>, Vec<u32>, Vec<u32>) {
+        let n = rows_per_symbol * symbols;
+        let mut times = Vec::with_capacity(n);
+        let mut sym = Vec::with_capacity(n);
+        let mut src = Vec::with_capacity(n);
+        let mut member = Vec::with_capacity(n);
+        let mut seg_start = Vec::with_capacity(symbols);
+        let mut seg_len = Vec::with_capacity(symbols);
+        for k in 0..symbols {
+            seg_start.push((k * rows_per_symbol) as u32);
+            seg_len.push(rows_per_symbol as u32);
+            for i in 0..rows_per_symbol {
+                times.push(1_700_000_000i64 + i as i64 * 900);
+                sym.push(k as u32);
+                // Quantised values create many ties; the 0/-0 rows make the
+                // signed-zero policy observable.
+                let v = if i % 4093 == 0 {
+                    if k % 2 == 0 { 0.0 } else { -0.0 }
+                } else if i % 1009 == 0 && k == 3 {
+                    f64::NAN
+                } else {
+                    (((i * 7 + k * 3) % 31) as f64) / 10.0
+                };
+                src.push(v);
+                // One symbol drops out on every 17th timestamp; with 21
+                // symbols that leaves 20 at most timestamps and 19 whenever a
+                // NaN or a second dropout is present.
+                member.push(!(k == 5 && i % 17 == 0));
+            }
+        }
+        (times, sym, src, member, seg_start, seg_len)
+    }
+
+    fn open_context(
+        times: &[i64],
+        seg_start: &[u32],
+        seg_len: &[u32],
+    ) -> EnrichGpu {
+        let n = times.len();
+        let close = vec![100.0f64; n];
+        EnrichGpu::new(
+            times,
+            &close,
+            &close,
+            &close,
+            &close,
+            &vec![0.0; n],
+            &vec![0.0; n],
+            seg_start,
+            seg_len,
+            900,
+        )
+        .expect("CUDA context")
+    }
+
+    #[test]
+    fn device_permutation_and_segmented_rank_match_cpu_reference() {
+        if !crate::gpu::probe().available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let (times, sym, src, member, seg_start, seg_len) = fixture(20_000, 21);
+        let mut gpu = open_context(&times, &seg_start, &seg_len);
+        assert!(gpu.prepare_cross_section(&sym, Some(&member)));
+        // The permutation is idempotent and shared by every column.
+        assert!(gpu.prepare_cross_section(&sym, Some(&member)));
+        let got = gpu.rank(&src).expect("device rank");
+        let want = cpu_rank(&src, &times, &sym, &member);
+        let finite = want.iter().filter(|v| v.is_finite()).count();
+        assert!(finite > 0, "fixture must produce finite ranks");
+        for (i, (a, b)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                a.is_nan(),
+                b.is_nan(),
+                "row {i}: CPU {a:?} vs GPU {b:?}"
+            );
+            if a.is_finite() {
+                assert_eq!(a.to_bits(), b.to_bits(), "row {i}: CPU {a:?} vs GPU {b:?}");
+            }
+        }
+        // A non-member's own rank is NaN even when its source is finite.
+        assert!(got
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !member[*i])
+            .all(|(_, v)| v.is_nan()));
+    }
+
+    #[test]
+    fn device_rank_is_identical_across_reuse_and_column_order() {
+        if !crate::gpu::probe().available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        let (times, sym, src, member, seg_start, seg_len) = fixture(10_000, 21);
+        let mut gpu = open_context(&times, &seg_start, &seg_len);
+        assert!(gpu.prepare_cross_section(&sym, Some(&member)));
+        let first = gpu.rank(&src).unwrap();
+        let second = gpu.rank(&src).unwrap();
+        let other: Vec<f64> = src.iter().map(|v| -v).collect();
+        let other_rank = gpu.rank(&other).unwrap();
+        let third = gpu.rank(&src).unwrap();
+        assert_eq!(
+            first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            second.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            first.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            third.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "a different column must not change a cached permutation"
+        );
+        assert_eq!(
+            other_rank.iter().filter(|v| v.is_finite()).count(),
+            first.iter().filter(|v| v.is_finite()).count()
+        );
     }
 }

@@ -426,7 +426,7 @@ fn cross_formula(name: &str) -> &'static str {
         "btc_volume_share" => "BTC volume / total PIT member volume at t",
         "xs_rank_r1" | "xs_rank_r16" | "xs_rank_r20" | "xs_rank_vol20"
         | "xs_rank_amihud96" | "cs_rank_r60" => {
-            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row"
+            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row, -0==+0; one device (time,symbol,row) permutation reused"
         }
         _ => "see docs/ohlcv.md",
     }
@@ -7199,6 +7199,8 @@ fn enrich_inner(
                     step,
                 );
             }
+            #[cfg(feature = "cuda")]
+            let mut xs_prepared = false;
             for rank_name in &rank_names {
                 let src = cross_source(rank_name)
                     .ok_or_else(|| format!("no source registered for '{}'", rank_name))?;
@@ -7206,7 +7208,6 @@ fn enrich_inner(
                 #[allow(unused_mut)]
                 let mut ranks = None;
                 let gpu_eligible = rank_name.starts_with("xs_rank_")
-                    && panel.member.iter().all(|m| *m)
                     && gpu_available
                     && opts.gpu != GpuMode::Off
                     && plans
@@ -7215,12 +7216,24 @@ fn enrich_inner(
                 #[cfg(feature = "cuda")]
                 if gpu_eligible {
                     if let Some(gpu) = gpu_ctx.as_mut() {
-                        ranks = gpu.rank(&values, &panel.times, &panel.sym_key);
-                        let stats = gpu.stats();
-                        gpu_kernel_seconds = stats.kernel_s;
-                        gpu_d2h_seconds = stats.d2h_s;
-                        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
-                        gpu_h2d_seconds = stats.h2d_s;
+                        // One device (time, symbol, row) permutation and one
+                        // membership mask serve every rank column.
+                        if !xs_prepared
+                            && gpu.prepare_cross_section(
+                                &panel.sym_key,
+                                Some(&panel.member),
+                            )
+                        {
+                            xs_prepared = true;
+                        }
+                        if xs_prepared {
+                            ranks = gpu.rank(&values);
+                            let stats = gpu.stats();
+                            gpu_kernel_seconds = stats.kernel_s;
+                            gpu_d2h_seconds = stats.d2h_s;
+                            gpu_h2d_seconds = stats.h2d_s;
+                            gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                        }
                     }
                 }
                 let (ranks, from_gpu) = match ranks {
@@ -7650,7 +7663,9 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   donchian   don20, don96; don96 is the compact centred channel position
   calendar   dow_sin dow_cos hour_sin hour_cos month_sin month_cos dom_sin dom_cos
   lags       lag_r1_1 .. lag_r1_10
-  xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section)
+  xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section;
+             finite PIT members only, ties by symbol then row, N>=20, and the
+             CUDA path reuses one device (time,symbol,row) permutation)
   btc        btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60
   cross      complete #273 family: btc/eth returns, vol and beta; equal-weight
              market mkt_r16 mkt_r96 mkt_vol96; breadth dispersion avg_corr;

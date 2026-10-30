@@ -73,6 +73,23 @@ typedef struct RcEnrich {
     int feat_cap;
     int base_reads;
     int base_passes;
+    /* Cross-section permutation (#295), built once and reused by every rank
+       column: the (time, symbol, row) order, group ids and segment offsets. */
+    unsigned int *d_xs_order;
+    unsigned int *d_xs_order_tmp;
+    unsigned int *d_xs_rows_out;
+    unsigned int *d_xs_gid;
+    unsigned int *d_xs_counts;
+    unsigned int *d_xs_sym;
+    int *d_xs_off;
+    unsigned long long *d_xs_keys;
+    unsigned long long *d_xs_keys_out;
+    unsigned char *d_xs_member;
+    double *d_xs_src;
+    void *d_xs_temp;
+    size_t xs_temp_bytes;
+    int xs_groups;
+    int xs_ready;
     RcEnrichStats last;
     double batch_start_ms;
 } RcEnrich;

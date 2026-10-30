@@ -485,9 +485,10 @@ different member's market state `NaN`.
 
 Ranks (`xs_rank_r1 r16 r20 vol20 amihud96`, plus the legacy `cs_rank_r60`) are
 `2*(rank-1)/(n-1)-1` in `[-1,1]`. They use finite PIT members only, require
-`N>=20`, and break ties by symbol name then row order. `xs_rank_amihud96`
-inherits the #270 Amihud input requirement (`quote_volume`); a missing raw
-field fails closed naming both the rank and the field.
+`N>=20`, and break ties by symbol name then row order. `-0.0` and `+0.0` are one
+value for that tie order. `xs_rank_amihud96` inherits the #270 Amihud input
+requirement (`quote_volume`); a missing raw field fails closed naming both the
+rank and the field.
 
 Point-in-time membership is a row filter, not a survivor universe. When the
 store carries `member_asof`, only rows with `member_asof <= t` enter a
@@ -591,11 +592,24 @@ prints the nominal warm-up, the observed `NaN` count and the first finite row.
 that truncating the store never changes an earlier value.
 
 `xs_rank_*` ranks each timestamp across PIT symbols, ignores non-finite source
-values, breaks ties by symbol name then row order, maps the rank to `[-1,1]`,
-and returns `NaN` when fewer than 20 finite members are present. The pass holds
-one source column, the time column, a row permutation and the rank column
-(about 32 B/row), never the whole panel.
+values and non-members, breaks ties by symbol name then row order, maps the rank
+to `[-1,1]`, and returns `NaN` when fewer than 20 finite members are present.
+`-0.0` and `+0.0` are one tie. The pass holds one source column, the time column,
+a row permutation and the rank column (about 32 B/row), never the whole panel.
 `rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
+On the CUDA path the `(time, symbol, row)` permutation, timestamp group ids and
+segment offsets are built once on the device and reused by every rank column;
+each column is a stable segmented sort by `(value, symbol, row)` with invalid
+and non-member rows keyed last, so no per-column host sort runs.
+
+Measured on 4 M rows, 100 symbols, PIT panel with non-members (NVIDIA GeForce RTX 3060, `cargo test
+--release --features cuda --test enrich_gpu measure_cross_section_stage --
+--ignored --nocapture`): the four `xs` rank columns take `xs_seconds` 4.02 s
+with `--gpu off` and 1.75 s with `--gpu on`. The `cross` family takes 12.6 s and
+8.4 s of a 235 s run. Equal-weight market state, breadth, dispersion and
+`avg_corr` stay on the CPU in their original addition order, so their bits are
+unchanged; the residual stage is under 4 % of the run, so a device port is
+declined until a larger share is measured.
 
 ### `py15m` parity
 
@@ -734,8 +748,10 @@ scans and labels run one thread per symbol segment in the same operation order
 as the CPU, with `-fmad=false` so multiply-add association is identical.
 Rolling extrema in the tail use a blocked prefix-suffix pass instead of the old
 `O(n*w)` loop. Cross-sectional
-ranks use a stable segmented radix sort with the CPU's `(time, symbol, row)` tie
-order. All accumulation is f64. The report records `gpu_columns`,
+ranks build one device `(time, symbol, row)` permutation per run, then use a
+stable segmented radix sort by `(value, symbol, row)` for each column; PIT
+non-members and non-finite values are keyed last and `-0`/`+0` share the CPU
+tie order. All accumulation is f64. The report records `gpu_columns`,
 `cpu_columns`, `gpu_share`, `fallback`, kernel, D2H, staging-write seconds,
 transfer bytes and the charged `write_bw` in both the text log and the JSON
 sidecar.
