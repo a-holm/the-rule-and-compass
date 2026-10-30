@@ -7,7 +7,6 @@
 
 use crate::data::{Prepared, Sample};
 use crate::devlog::{num, text};
-use crate::diagnostics::least_squares_linear;
 use crate::expr::{self, Node};
 use crate::gates::{self, Cmp, Comparison, GateConfig, GateReport, MemberInput, References, RowsView, Verdict};
 use crate::metrics::{self, Metric};
@@ -238,6 +237,7 @@ pub fn run(
     spec: Option<&TargetSpec>,
     members: &[MemberFacts],
     opts: &Options,
+    linear_coef: Option<&[f64]>,
 ) -> Output {
     let start = std::time::Instant::now();
     let structural = spec.is_some_and(target_structure::structural) && prepared.target_scale.is_some();
@@ -327,7 +327,7 @@ pub fn run(
     } else {
         prepared.train.y.iter().sum::<f64>() / prepared.train.y.len() as f64
     };
-    let coef = least_squares_linear(&prepared.train);
+    let coef: Option<Vec<f64>> = linear_coef.map(|c| c.to_vec());
     let lin = |s: &Sample, kept: &[usize]| -> Vec<f64> {
         let c = coef.as_ref().expect("linear coefficients");
         kept.iter()

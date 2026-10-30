@@ -180,6 +180,19 @@ impl Baselines {
         baseline_samples: usize,
         seed: u32,
     ) -> Baselines {
+        Baselines::fit_sampled_coef(train, test_folds, metric, baseline_samples, seed).0
+    }
+
+    /// As [`Baselines::fit_sampled`], also returning the least-squares line
+    /// `[b0, b1, ..]` of the linear baseline so that a caller scoring it on
+    /// other rows does not refit it (#257).
+    pub fn fit_sampled_coef(
+        train: &Sample,
+        test_folds: &[Sample],
+        metric: Metric,
+        baseline_samples: usize,
+        seed: u32,
+    ) -> (Baselines, Option<Vec<f64>>) {
         // Mean.
         let mean = if train.is_empty() {
             f64::NAN
@@ -247,7 +260,7 @@ impl Baselines {
         let sampled = train_q.rows < train.len() || test_sampled;
         let knn_seconds = knn_start.elapsed().as_secs_f64();
 
-        Baselines {
+        let baselines = Baselines {
             mean: mean_err,
             linear: linear_err,
             knn: BaselineError {
@@ -262,7 +275,8 @@ impl Baselines {
             knn_test_query_sem: test_sem,
             knn_capped: sampled,
             knn_seconds,
-        }
+        };
+        (baselines, coef)
     }
 
     /// #69: the extra fields of the `baselines.knn` object in `--json` /

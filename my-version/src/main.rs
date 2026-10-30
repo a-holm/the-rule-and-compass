@@ -4836,44 +4836,6 @@ fn main() {
             );
         }
     }
-    // #257: validation gates on the archive members (archive order).
-    let gate_out: Option<rcsr::gate_run::Output> = if gates_active {
-        let facts: Vec<rcsr::gate_run::MemberFacts> = sorted
-            .iter()
-            .zip(&rows)
-            .enumerate()
-            .map(|(k, (s, r))| rcsr::gate_run::MemberFacts {
-                archive_rank: k + 1,
-                cost: s.cost,
-                tree: &s.tree,
-                expression: &r.expression,
-                identified: r.constant_errors.as_ref().map_or(true, |c| c.identified()),
-                practically_identified: r
-                    .constant_errors
-                    .as_ref()
-                    .and_then(|c| c.practically_identified()),
-            })
-            .collect();
-        let out = rcsr::gate_run::run(
-            &prepared,
-            target_active.as_ref().map(|a| &a.spec),
-            &facts,
-            &gate_opts,
-        );
-        for (r, j) in rows.iter_mut().zip(&out.member_json) {
-            r.gate_json = j.clone();
-        }
-        if format == Format::Text && !quiet {
-            for line in &out.text {
-                eprintln!("{}", line);
-            }
-        }
-        Some(out)
-    } else {
-        None
-    };
-    let gate_seconds = gate_out.as_ref().map(|g| g.seconds);
-    let gate_selected_archive_rank = gate_out.as_ref().and_then(|g| g.report.selected_rank);
     // #111: selection. Reorder the front by the chosen criterion and renumber
     // the display rank; the archive rank is kept for reports that need the
     // underlying search order. `test_error` is never a criterion. With no
@@ -4920,7 +4882,7 @@ fn main() {
     // #69: the k-NN reference set is always all training rows; only the query
     // rows are optionally sampled by `--baseline-samples`.
     let baselines_start = std::time::Instant::now();
-    let baselines = diagnostics::Baselines::fit_sampled(
+    let (baselines, linear_coef) = diagnostics::Baselines::fit_sampled_coef(
         &prepared.train,
         &fold_samples,
         cfg.metric,
@@ -4928,6 +4890,52 @@ fn main() {
         cfg.seed,
     );
     let baselines_seconds = baselines_start.elapsed().as_secs_f64();
+
+    // #257: validation gates on the archive members (archive order).
+    let gate_out: Option<rcsr::gate_run::Output> = if gates_active {
+        let out = {
+            let mut by_archive: Vec<&Row> = rows.iter().collect();
+            by_archive.sort_by_key(|r| r.archive_rank);
+            let facts: Vec<rcsr::gate_run::MemberFacts> = sorted
+                .iter()
+                .zip(&by_archive)
+                .enumerate()
+                .map(|(k, (s, r))| rcsr::gate_run::MemberFacts {
+                    archive_rank: k + 1,
+                    cost: s.cost,
+                    tree: &s.tree,
+                    expression: &r.expression,
+                    identified: r.constant_errors.as_ref().map_or(true, |c| c.identified()),
+                    practically_identified: r
+                        .constant_errors
+                        .as_ref()
+                        .and_then(|c| c.practically_identified()),
+                })
+                .collect();
+            rcsr::gate_run::run(
+                &prepared,
+                target_active.as_ref().map(|a| &a.spec),
+                &facts,
+                &gate_opts,
+                linear_coef.as_deref(),
+            )
+        };
+        for (k, j) in out.member_json.iter().enumerate() {
+            if let Some(r) = rows.iter_mut().find(|r| r.archive_rank == k + 1) {
+                r.gate_json = j.clone();
+            }
+        }
+        if format == Format::Text && !quiet {
+            for line in &out.text {
+                eprintln!("{}", line);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+    let gate_seconds = gate_out.as_ref().map(|g| g.seconds);
+    let gate_selected_archive_rank = gate_out.as_ref().and_then(|g| g.report.selected_rank);
     let diagnostics_start = std::time::Instant::now();
 
     // Stability selection (issue #20): bootstrap the training rows, re-run the
