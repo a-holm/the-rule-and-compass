@@ -274,6 +274,11 @@ that can turn a flat strategy into a spectacular one.
 **Verify.** `tests/enrich.rs` pins hand-built higher-bar values for all 36
 columns, the NaN/gap cases, `bar_age` (0 at the close and mid-bucket values), the
 future-shift failure through `ohlcv::lookahead_violations`, and prefix replay.
+`tests/panel_pit.rs` and `tests/panel_gpu.rs` (#302) repeat the same checks for the
+PIT membership and MTF as-of joins on the CPU reference and the device merge:
+`<=` boundaries at `as_of` and at `h.time + tf`, a finite `bar_age` on a stale
+bucket, chain resets at `member=0`, listing, delisting and migration, prefix
+replay at 20 cuts, and a future-shifted column that fails `lookahead_violations`.
 `docs/mtf-inventory.json` is the 36-row inventory; `rcsr schema` lists every
 column with `family=mtf`, timeframe and PIT rule.
 

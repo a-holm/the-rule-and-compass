@@ -20,6 +20,9 @@ pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
 pub mod mtf_gpu; // #296: device MTF resample and causal join
 #[cfg(feature = "cuda")]
 pub mod panel_prep_gpu; // #301: fused device duplicate/resample/gap pass
+pub mod panel_pit; // #302: exact CPU reference for the PIT membership/MTF as-of joins
+#[cfg(feature = "cuda")]
+pub mod panel_pit_gpu; // #302: device PIT as-of merge joins
 pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
