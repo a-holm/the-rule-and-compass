@@ -23,6 +23,7 @@ inputs that differ only where the answer must not change. The detectors live in
 | D9 corporate actions | a split/dividend is applied only from the instant it is known; adjusted **and** unadjusted series are returned | a factor learned after a cut rewrites an earlier row |
 | D10 join | right-side keys must be unique and the result may not multiply rows | a duplicate key fans out a join |
 | D11 determinism | FNV-1a hash of the resolved spec (including the tzdb version) | two collection paths disagree |
+| D13a-c target | a declared target (`--target-spec`): the future return or target as an input (a), a scale window that ends after the decision time (b), a structural term whose zero-return prediction depends on a column (c) | the label can be scored without forecasting a return; D13c has the override `--allow-target-structure` |
 | D12 fixtures | clean and leaky synthetic panels test the tests | the suite no longer catches the planted leak |
 
 `Report::assert_clean()` **panics** on a leak and prints the detector, column
@@ -50,6 +51,11 @@ The command runs the D0–D6/D11/D12 panel suite (the optional `--bars`,
 | 2 | usage error |
 | 3 | input error |
 | 5 | **leakage detected** |
+
+`rcsr audit --target-spec FILE` adds D13a-c for the target against `--vars` (all
+numeric columns except the target and time when `--vars` is absent). The same
+check runs before every search with a spec and exits 5 on a finding. See
+`docs/time-series.md` §2b.
 
 The JSON report contains `clean`, `checks`, `exit_code`, `spec_hash`,
 `tzdb_version`, `rows`, `horizon`, `overlap_rows`, `effective_n`, a
