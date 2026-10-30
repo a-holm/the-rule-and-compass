@@ -138,7 +138,13 @@ fn e1a_rungs_and_flags_without_a_validation_slice() {
 fn e1b_e2_e3_verdict_noise_and_identification_with_a_validation_slice() {
     let j = run(&["--validation-frac", "0.1"]);
     print_summary("E1b", &j);
-    rung_checks(&j);
+    // The rungs fit on 90 % of the training rows here, so only the
+    // zero-parameter rung (no fitted parameter) keeps its E1a value.
+    let zero = num(&j, &["baselines", "target_structure", "rungs", "zero_param", "test_error"]);
+    assert!((zero - 0.104_582_698).abs() <= 1e-8, "{zero}");
+    for m in members(&j) {
+        assert_eq!(at(m, &["beats_zero_param_test"]), &Json::Bool(false));
+    }
     assert_eq!(at(&j, &["selection", "verdict"]).as_str(), Some("no_signal"));
     assert_eq!(at(&j, &["selection", "selected_rank"]), &Json::Null);
     let search = num(&j, &["timing", "search_seconds"]);
