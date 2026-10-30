@@ -1554,6 +1554,12 @@ pub struct SplitSpec {
     /// #145: permit a train or test row inside the 2026H2 lockbox. `false` is
     /// the safe default for every caller of [`prepare_full`].
     pub allow_lockbox: bool,
+    /// #254: label end offset of the declared target, seconds. Training rows
+    /// within this many seconds of a validation or test row are dropped.
+    pub purge_seconds: Option<f64>,
+    /// #254: the target spec's scale column. Its raw values for the prepared
+    /// rows are returned in [`Prepared::target_scale`].
+    pub scale_column: Option<String>,
 }
 
 impl Default for SplitSpec {
@@ -1571,6 +1577,8 @@ impl Default for SplitSpec {
             exclude: None,
             time: TimeSpec::default(),
             allow_lockbox: false,
+            purge_seconds: None,
+            scale_column: None,
         }
     }
 }
@@ -1616,6 +1624,21 @@ pub struct SplitReport {
     /// evaluation is a scan or a gather.
     pub selector: String,
     pub notes: Vec<String>,
+    /// #254: label end offset the target spec requires, seconds.
+    pub required_purge_seconds: Option<f64>,
+    /// #254: smallest stamp distance between a retained training row and a
+    /// test row, seconds. Recorded with or without a spec.
+    pub purge_seconds: Option<f64>,
+    /// #254: the same between retained fit rows and validation rows.
+    pub validation_purge_seconds: Option<f64>,
+    /// #254: training rows (fit and validation) dropped for being within the
+    /// required purge of a test row.
+    pub purged_test_boundary_rows: usize,
+    /// #254: fit rows dropped for being within the required purge of a
+    /// validation row.
+    pub purged_validation_boundary_rows: usize,
+    /// `target_spec` when a purge was derived from a spec, else `none`.
+    pub purge_source: &'static str,
 }
 
 pub struct Prepared {
@@ -1643,6 +1666,18 @@ pub struct Prepared {
     /// unless the caller used [`prepare_full_targets_weighted_with_indices`];
     /// the ordinary preparation does not pay this `O(N)` allocation.
     pub train_indices: Vec<usize>,
+    /// #254: raw values of [`SplitSpec::scale_column`] for the prepared rows,
+    /// aligned with the samples. `None` unless the column was requested.
+    pub target_scale: Option<TargetScale>,
+}
+
+/// Raw scale-column values of the prepared rows (#254).
+#[derive(Clone, Debug, Default)]
+pub struct TargetScale {
+    pub train: Vec<f64>,
+    pub validation: Option<Vec<f64>>,
+    /// The pooled test block, in the order of [`Prepared::test`].
+    pub test: Vec<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2603,6 +2638,45 @@ fn prepare_full_targets_weighted_inner(
         }
     }
 
+    // #254: purge by time with the label end offset of the declared target.
+    // The time axis is global, so cross-symbol overlap and misaligned
+    // temporal-group series are covered too.
+    let stamps = if spec.time_col.is_some() || spec.purge_seconds.is_some() {
+        split_stamps(filtered, spec)?
+    } else {
+        None
+    };
+    if let Some(l) = spec.purge_seconds {
+        let Some(st) = &stamps else {
+            return Err(
+                "target spec: a purge in seconds needs a time column holding epoch seconds \
+                 (pass --time <column>)"
+                    .to_string(),
+            );
+        };
+        report.required_purge_seconds = Some(l);
+        report.purge_source = "target_spec";
+        let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+        let test_times = sorted_finite(st, &test_idx);
+        let before = train_idx.len() + validation_idx.len();
+        train_idx = purge_near(st, std::mem::take(&mut train_idx), &test_times, l);
+        validation_idx = purge_near(st, std::mem::take(&mut validation_idx), &test_times, l);
+        report.purged_test_boundary_rows = before - train_idx.len() - validation_idx.len();
+        if !validation_idx.is_empty() {
+            let val_times = sorted_finite(st, &validation_idx);
+            let before = train_idx.len();
+            train_idx = purge_near(st, std::mem::take(&mut train_idx), &val_times, l);
+            report.purged_validation_boundary_rows = before - train_idx.len();
+        }
+        if train_idx.is_empty() {
+            return Err(format!(
+                "training split is empty after purging {} row(s) within {}s of the validation or test rows",
+                report.purged_test_boundary_rows + report.purged_validation_boundary_rows,
+                l
+            ));
+        }
+    }
+
     // #145: the search trains and scores on these rows, so both sides must be
     // clear of the lockbox unless the caller declared a final test.
     check_split_lockbox(filtered, spec, &train_idx, &fold_idx, &mut report)?;
@@ -2932,6 +3006,15 @@ fn prepare_full_targets_weighted_inner(
     report.validation_rows = validation_idx.len();
     report.test_rows = fold_idx.iter().map(|f| f.len()).sum();
     report.folds = fold_idx.len().max(1);
+    if let Some(st) = &stamps {
+        let test_idx: Vec<usize> = fold_idx.iter().flatten().copied().collect();
+        let test_times = sorted_finite(st, &test_idx);
+        report.purge_seconds = min_distance(st, &train_idx, &test_times);
+        if !validation_idx.is_empty() {
+            let val_times = sorted_finite(st, &validation_idx);
+            report.validation_purge_seconds = min_distance(st, &train_idx, &val_times);
+        }
+    }
 
     // `cells` is the single prepared copy: inputs in `0..nv`, targets after.
     // The samples below normalise out of it directly instead of keeping another
@@ -3071,8 +3154,32 @@ fn prepare_full_targets_weighted_inner(
         Vec::new()
     };
 
+    let target_scale = match &spec.scale_column {
+        Some(name) => {
+            let j = filtered
+                .index_of(name)
+                .map_err(|e| format!("target spec: scale column: {}", e))?;
+            if !filtered.numeric[j] {
+                return Err(format!("target spec: scale column '{}' is not numeric", name));
+            }
+            let col = filtered.col(j);
+            let pick = |idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| col[i]).collect() };
+            Some(TargetScale {
+                train: pick(&train_idx),
+                validation: if validation_idx.is_empty() {
+                    None
+                } else {
+                    Some(pick(&validation_idx))
+                },
+                test: pick(&test_idx),
+            })
+        }
+        None => None,
+    };
+
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
+        target_scale,
         train,
         validation,
         test,
@@ -3797,6 +3904,88 @@ fn check_split_lockbox(
     report.lockbox_train = guard.check_times("training split", &train_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
     Ok(())
+}
+
+/// Row stamps in epoch seconds for the purge and the realised distances, or
+/// `None` without a usable time column. A spec-derived purge (`purge_seconds`)
+/// needs epoch seconds, so any other column is a usage error then.
+fn split_stamps(t: &Table, spec: &SplitSpec) -> Result<Option<Vec<f64>>, String> {
+    let Some(tc) = spec.time_col else {
+        return Ok(None);
+    };
+    let needs = spec.purge_seconds.is_some();
+    let keys = match time_keys_with(t, tc, &spec.time) {
+        Ok((keys, _)) => keys,
+        Err(e) if needs => return Err(format!("target spec: time column: {}", e)),
+        Err(_) => return Ok(None),
+    };
+    let (lo, hi) = keys
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite())
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), v| (a.min(v), b.max(v)));
+    if !crate::lockbox::plausible_epoch_seconds(lo, hi) {
+        if needs {
+            return Err(
+                "target spec: the time column is not epoch seconds; a horizon in seconds \
+                 cannot be checked without a time axis"
+                    .to_string(),
+            );
+        }
+        return Ok(None);
+    }
+    Ok(Some(keys))
+}
+
+fn sorted_finite(stamps: &[f64], idx: &[usize]) -> Vec<f64> {
+    let mut v: Vec<f64> = idx
+        .iter()
+        .map(|&i| stamps[i])
+        .filter(|x| x.is_finite())
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v
+}
+
+/// Smallest `|stamp - other|` over the given sorted stamps, or `None` when
+/// either side has no finite stamp.
+fn nearest_distance(x: f64, sorted: &[f64]) -> f64 {
+    let p = sorted.partition_point(|&v| v < x);
+    let mut d = f64::INFINITY;
+    if p < sorted.len() {
+        d = d.min(sorted[p] - x);
+    }
+    if p > 0 {
+        d = d.min(x - sorted[p - 1]);
+    }
+    d
+}
+
+/// Keep the rows whose stamp is at least `l` seconds from every stamp in
+/// `sorted`. A row without a finite stamp is kept.
+fn purge_near(stamps: &[f64], rows: Vec<usize>, sorted: &[f64], l: f64) -> Vec<usize> {
+    if sorted.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|&i| {
+            let x = stamps[i];
+            !x.is_finite() || !(nearest_distance(x, sorted) < l)
+        })
+        .collect()
+}
+
+fn min_distance(stamps: &[f64], rows: &[usize], sorted: &[f64]) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let d = rows
+        .iter()
+        .map(|&i| stamps[i])
+        .filter(|x| x.is_finite())
+        .map(|x| nearest_distance(x, sorted))
+        .fold(f64::INFINITY, f64::min);
+    d.is_finite().then_some(d)
 }
 
 /// Split one time-ordered sequence into a training prefix and `folds`

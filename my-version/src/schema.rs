@@ -31,6 +31,8 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
         ("--allow-lockbox", "flag", "false", "permit train or test rows in the 2026H2 crypto lockbox (declared final test only)"),
+        ("--target-spec", "string", "<data stem>.targets.json when present", "declared target spec (rcsr-target-spec/1): D13 structure refusal, purge derived from the label window, zero-parameter rung baselines.target_structure; see \"target_spec\""),
+        ("--allow-target-structure", "flag", "false", "run a target whose null prediction depends on a column (D13c) for a diagnostic replay: prints a warning, records check.status = overridden and a proxy table. D13a and D13b stay fatal"),
         ("--validation-frac", "float", "0", "fraction of the chronological training period held out as a validation slice for selection (0 = off); the test block is scoring-only"),
         ("--select-by", "enum", "validation-if-present", "candidate ranking criterion: train | validation | aicc; test_error is never a criterion"),
         ("--weight", "string", "none", "per-row weight column (finite, >= 0, at least one positive; supported metrics: absolute, squared, correlation, correlation_signed, signed, log_squashed, log_loss, brier, hinge, hinge_ordinary, hinge_squared, implicit, implicit_residual, aic, aicc, bic; normalised by sum w, and a zero-weight row is skipped before its prediction or label is read)"),
@@ -166,6 +168,7 @@ pub fn json() -> String {
 {{\"name\":\"--time-unit\",\"type\":\"enum\",\"default\":\"s\",\"description\":\"s | ms | us | ns for a numeric time column\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except time\",\"description\":\"feature columns to probe\"}},\
 {{\"name\":\"--horizon\",\"type\":\"int\",\"default\":\"1\",\"description\":\"label horizon in rows (D5/D6)\"}},\
+{{\"name\":\"--target-spec\",\"type\":\"string\",\"default\":\"<data stem>.targets.json\",\"description\":\"declared target spec; runs D13a-c (future return in --vars, look-ahead scale, structural term) against --vars\"}},\
 {{\"name\":\"--join-on\",\"type\":\"string\",\"default\":\"none\",\"description\":\"check this key column for row-multiplying duplicates (D10)\"}},\
 {{\"name\":\"--bars\",\"type\":\"string\",\"default\":\"none\",\"description\":\"OHLCV CSV time,open,high,low,close,volume[,vwap] for D2 resample reconciliation\"}},\
 {{\"name\":\"--resample-small\",\"type\":\"int\",\"default\":\"15\",\"description\":\"small factor for the D2 cascade\"}},\
@@ -283,13 +286,15 @@ pub fn json() -> String {
          \"engine_catalogue\":{},\n  \
          \"feature_registry\":{},\n  \
          \"gpu_feature_parity\":{{\"mtf\":{{\"family\":\"mtf\",\"columns\":36,\"timeframes\":[\"1h\",\"4h\",\"1d\"],\"tier\":\"bitwise; vol sqrt <=1e-12\",\"dispatch\":\"opt-in: --gpu on until the 16M crossover is measured\",\"kernel\":\"src/cuda/mtf.cu\",\"test\":\"tests/mtf_gpu.rs\"}},\"engine_tail\":{{\"family\":\"engine-tail\",\"columns\":26,\"tier\":\"bitwise extrema; log-derived exotic <=1e-6; recurrences <=1e-12\",\"dispatch\":\"registered; --gpu auto uses cost model v2, --gpu on forces\",\"kernel\":\"src/cuda/tail.cu\",\"test\":\"tests/enrich_gpu.rs\"}}}},\n  \
+         \"target_spec\":{},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
         jstr("symbolic regression: find an interpretable f(x) ~ y"),
         items,
         operators.join(","),
         crate::enrich::engine_catalogue_json(),
-        crate::enrich::registry_json()
+        crate::enrich::registry_json(),
+        crate::target::schema_json()
     )
 }
 

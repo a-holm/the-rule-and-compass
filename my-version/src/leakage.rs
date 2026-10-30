@@ -589,6 +589,79 @@ mod tests {
 /// library cannot drift apart.
 pub const AUDIT_EXIT_CODE: i32 = 5;
 
+/// D13: checks of a declared target against the model inputs (#254).
+///
+/// * `D13a` the future return, or the target itself, is an input;
+/// * `D13b` the scale column's window ends after the decision time;
+/// * `D13c` the label has a structural term: its null prediction depends on a
+///   column, so a model can score by recovering that column from proxies. The
+///   only finding with an override (`--allow-target-structure`).
+///
+/// It reads metadata only: no row is loaded.
+pub fn target_structure(spec: &crate::target::TargetSpec, vars: &[String]) -> Report {
+    let mut report = Report {
+        checks: 3,
+        leaks: Vec::new(),
+    };
+    let in_vars = |name: &str| vars.iter().any(|v| v == name);
+    if let Some(r) = &spec.return_column {
+        if in_vars(r) {
+            report.leaks.push(Leak::new(
+                "D13a",
+                Some(r.clone()),
+                None,
+                format!(
+                    "future return '{}' of target '{}' is an input variable",
+                    r, spec.column
+                ),
+            ));
+        }
+    }
+    if in_vars(&spec.column) {
+        report.leaks.push(Leak::new(
+            "D13a",
+            Some(spec.column.clone()),
+            None,
+            format!("target '{}' is an input variable", spec.column),
+        ));
+    }
+    if let crate::target::Scale::Column {
+        column,
+        ends_at_offset_seconds,
+        ..
+    } = &spec.scale
+    {
+        let decision = spec.entry_offset_seconds + spec.delay_seconds;
+        if *ends_at_offset_seconds > decision {
+            report.leaks.push(Leak::new(
+                "D13b",
+                Some(column.clone()),
+                None,
+                format!(
+                    "scale '{}' of target '{}' ends {}s after the row stamp, after the decision time at {}s",
+                    column, spec.column, ends_at_offset_seconds, decision
+                ),
+            ));
+        }
+    }
+    if spec.structural_term() {
+        report.leaks.push(Leak::new(
+            "D13c",
+            spec.scale_column().map(str::to_string),
+            None,
+            format!(
+                "target '{}' ({}) has a structural term: its prediction at zero return is {}, a function of '{}'; \
+                 volatility proxies recover it without forecasting returns (diagnostic replays: --allow-target-structure)",
+                spec.column,
+                spec.name,
+                spec.null_formula(),
+                spec.scale_column().unwrap_or("?")
+            ),
+        ));
+    }
+    report
+}
+
 /// The tz database version used by the deterministic spec hash. A real tzdb
 /// dependency would report its own version here; the core crate has no
 /// dependencies, so the value is an explicit build fact.

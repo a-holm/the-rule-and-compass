@@ -1,0 +1,17 @@
+{"schema":"rcsr-target-spec/1","targets":[
+ {"column":"y60","name":"y60m","kind":"forward_return","deprecated":true,
+  "return_column":"fwd60","return_units":"log",
+  "horizon_seconds":3600,"entry_offset_seconds":900,"delay_seconds":0,
+  "entry_price":"open of the next 15m bar","exit_price":"close of the 4th next 15m bar",
+  "offset":0.002,
+  "scale":{"kind":"column","column":"vol96","multiplier":6.0,"window_seconds":86400,"ends_at_offset_seconds":900},
+  "clip":[-1.0,1.0],"units":"log_return/(6*vol96)","cost_bps":20.0,"cost_in_label":true,
+  "construction_columns":["vol96"],
+  "note":"compact 100-symbol panel; universe selected on 2026 quote volume (survivor-biased, not PIT); smoke and regression only; no performance claim"},
+ {"column":"fwd60","name":"ret_60m","kind":"forward_return","deprecated":false,
+  "return_column":"fwd60","return_units":"log",
+  "horizon_seconds":3600,"entry_offset_seconds":900,"delay_seconds":0,
+  "entry_price":"open of the next 15m bar","exit_price":"close of the 4th next 15m bar",
+  "offset":0.0,"scale":{"kind":"constant","value":1.0},"clip":null,
+  "units":"log_return","cost_bps":null,"cost_in_label":false,"construction_columns":[],
+  "note":"compact 100-symbol panel; survivor-biased, not PIT; no performance claim"}]}

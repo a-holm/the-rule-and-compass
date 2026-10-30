@@ -12,6 +12,28 @@ loader to scan it group by group and materialise a bounded, hash-selected
 sample, with RSS bounded by the group buffer and the sample, not by the file.
 Sampling never happens automatically, and the run records `full_rows=false`.
 
+## Target spec sidecar
+
+A label column can carry a declaration of how it was built. `<data stem>.targets.json`
+beside the data (`panel.rcsb` and `panel.csv` both read `panel.targets.json`) is
+loaded when `--target-spec` is absent and it has an entry for `--target`:
+
+```json
+{"schema":"rcsr-target-spec/1","targets":[
+ {"column":"fwd60","name":"ret_60m","kind":"forward_return","deprecated":false,
+  "return_column":"fwd60","return_units":"log",
+  "horizon_seconds":3600,"entry_offset_seconds":900,"delay_seconds":0,
+  "entry_price":"open of the next 15m bar","exit_price":"close of the 4th next 15m bar",
+  "offset":0.0,"scale":{"kind":"constant","value":1.0},"clip":null,
+  "units":"log_return","cost_bps":null,"cost_in_label":false,
+  "construction_columns":[],"note":null}]}
+```
+
+`rcsr schema` lists every field (`target_spec.fields`). An invalid file is exit 2,
+an unreadable one exit 3. A sidecar without an entry for the target means no
+spec; `--target-spec` without one is exit 2. The spec's scale column is read
+from the table even when it is not an input. See `docs/time-series.md` §2b.
+
 ## Memory guard
 
 ```sh
