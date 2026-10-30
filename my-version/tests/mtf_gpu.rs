@@ -366,3 +366,172 @@ fn symbol_batches_and_chunk_sizes_write_the_same_bytes() {
     let hb: Vec<_> = rb.features.iter().map(|f| (f.name.clone(), f.hash.clone())).collect();
     assert_eq!(ha, hb, "chunk size changed the MTF bytes");
 }
+
+fn holey(symbol: &str, span: usize, step: i64, hole_every: usize, phase: f64) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let all = wavy(symbol, span, 0, step, phase, None);
+    all.into_iter()
+        .enumerate()
+        .filter(|(i, _)| hole_every == 0 || i % hole_every != hole_every / 2)
+        .map(|(_, r)| r)
+        .collect()
+}
+
+#[test]
+fn long_holey_symbol_stays_on_the_device() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    // 21,000-bar span, 21 single-bar holes: 20,979 rows.
+    let rows = holey("AAA", 21_000, 900, 1_000, 0.0);
+    assert_eq!(rows.len(), 20_979);
+    let wanted = enrich::mtf_names();
+    let cols = compute(&rows, &wanted);
+    assert_eq!(cols.len(), 36);
+
+    let dir = tmp_dir("holey");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 4_096);
+    enrich::build(&opts(&src, &cpu_out, "mtf", GpuMode::Off, 4_096)).unwrap();
+    for name in &wanted {
+        let want = column(&cpu_out, name);
+        let got = &cols[name];
+        assert_eq!(want.len(), got.len(), "{name} length");
+        for (i, (x, y)) in want.iter().zip(got.iter()).enumerate() {
+            if name.ends_with("_vol") {
+                assert!(close_enough(*x, *y), "{name} row {i}: CPU {x:?} GPU {y:?}");
+            } else {
+                assert_eq!(x.to_bits(), y.to_bits(), "{name} row {i}: CPU {x:?} GPU {y:?}");
+            }
+        }
+    }
+}
+
+fn sweep_rows(nseg: usize, step: i64, hole_k: usize, big_gap: bool) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut rows = Vec::new();
+    for s in 0..nseg {
+        let sym = format!("S{s}");
+        let bars = 3_000usize;
+        let mut shift = (s as i64 * 1_234) % 3_600;
+        for i in 0..bars {
+            if big_gap && s == 0 && i == bars / 2 {
+                shift += 2 * 86_400 + 17;
+            }
+            if hole_k > 0 && (i * 7 + s) % hole_k == 0 {
+                continue;
+            }
+            let t = shift + i as i64 * step;
+            let x = (i + s) as f64;
+            let p = 50.0 + 3.0 * (x * 0.21).sin();
+            rows.push((t, sym.clone(), p, p + 1.0, p - 1.0, p + 0.3, 5.0));
+        }
+    }
+    rows
+}
+
+#[test]
+fn bucket_capacity_bounds_every_timeframe() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    for step in [60i64, 300, 420, 900, 3600] {
+        for nseg in [1usize, 3, 7] {
+            for hole_k in [0usize, 997, 50, 3] {
+                for big_gap in [false, true] {
+                    let rows = sweep_rows(nseg, step, hole_k, big_gap);
+                    let (times, open, high, low, close, seg_start, seg_len) = split_segments(&rows);
+                    let capacity = mtf_gpu::bucket_capacity(&times, &seg_start, &seg_len);
+                    let case = format!("step {step} nseg {nseg} hole 1/{hole_k} gap {big_gap}");
+                    assert!(capacity <= times.len(), "{case}: capacity {capacity} > n {}", times.len());
+                    let mut gpu = mtf_gpu::MtfGpu::new(&times, &open, &high, &low, &close, &seg_start, &seg_len, step)
+                        .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    assert_eq!(gpu.capacity(), capacity);
+                    for tf in [3_600i64, 14_400, 86_400] {
+                        gpu.prepare(tf).unwrap_or_else(|e| panic!("{case} tf {tf}: {e}"));
+                        assert!(
+                            gpu.total_buckets() <= capacity,
+                            "{case} tf {tf}: {} buckets > capacity {capacity}",
+                            gpu.total_buckets()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn sub_hour_and_non_hour_multiple_timeframes_are_rejected_with_their_own_code() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let rows = holey("AAA", 2_000, 900, 0, 0.0);
+    let (times, open, high, low, close, seg_start, seg_len) = split_segments(&rows);
+    let mut gpu = mtf_gpu::MtfGpu::new(&times, &open, &high, &low, &close, &seg_start, &seg_len, 900).unwrap();
+    for tf in [900i64, 1_800, 5_400] {
+        let err = gpu.prepare(tf).unwrap_err();
+        assert_eq!((err.stage, err.code), ("prepare", 6), "tf {tf}");
+    }
+    gpu.prepare(3_600).unwrap();
+}
+
+// 48 long holey symbols: 1,006,992 rows, above the 1M-row dispatch floor.
+fn big_holey_rows() -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    (0..48)
+        .flat_map(|s| holey(&format!("H{s:02}"), 21_000, 900, 1_000, s as f64 * 0.3))
+        .collect()
+}
+
+#[test]
+fn enrich_on_the_long_holey_fixture_reports_no_fallback() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let rows = big_holey_rows();
+    let dir = tmp_dir("holey-enrich");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 65_536);
+    let r = enrich::build(&opts(&src, &out, "mtf", GpuMode::On, 65_536)).unwrap();
+    assert_eq!(r.gpu_fallback, 0);
+    assert_eq!(r.gpu_columns, 36);
+}
+
+#[test]
+fn a_forced_device_failure_warns_once_and_matches_the_cpu_bytes() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let rows = big_holey_rows();
+    let dir = tmp_dir("forced");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let on_out = dir.join("on.rcsb").to_string_lossy().into_owned();
+    let off_out = dir.join("off.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &rows, 65_536);
+    let run = |out: &str, gpu: &str, force: bool| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rcsr"));
+        cmd.args(["enrich", "--data", &src, "--out", out, "--features", "mtf", "--allow-lockbox", "--gpu", gpu]);
+        if force {
+            cmd.env("RCSR_MTF_GPU_FORCE_TF_SECONDS", "900");
+        }
+        cmd.output().unwrap()
+    };
+    let on = run(&on_out, "on", true);
+    assert!(on.status.success(), "{}", String::from_utf8_lossy(&on.stderr));
+    let stderr = String::from_utf8_lossy(&on.stderr);
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.contains("device MTF failed")).collect();
+    assert_eq!(warnings.len(), 1, "stderr: {stderr}");
+    assert!(warnings[0].contains("stage prepare code 6"), "{}", warnings[0]);
+    let off = run(&off_out, "off", false);
+    assert!(off.status.success());
+    for name in enrich::mtf_names() {
+        let a = column(&on_out, &name);
+        let b = column(&off_out, &name);
+        assert!(a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "{name}");
+    }
+}
