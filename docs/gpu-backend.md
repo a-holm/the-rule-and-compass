@@ -1881,6 +1881,52 @@ synchronises through the allocator, and can overlap the next upload with the
 current kernel. That is the prerequisite for #286/#291/#292, not a stand-alone
 speed-up.
 
+## Persistent fit and score buffers (issue #334)
+
+`rc_fit_batch`, `rc_rank_score_batch`, `rc_order_stat_score_batch` and
+`rc_max_scan_batch` used to call `cudaMalloc`/`cudaFree` for their inputs,
+outputs and sort workspace on every call (8 allocations and 8 frees per fit
+batch), copy through pageable memory with blocking `cudaMemcpy` and launch on the
+legacy stream. They now share two per-context regions:
+
+* **One device region** (`fs_dev`) holds, per call, `[inputs | outputs | work]`
+  with every part aligned to 256 bytes. The work part carries the rank
+  workspace (keys, sorted keys, rows, flags, run starts, prefix sums) and CUB's
+  temporary storage, or the order-statistic keys and sort storage.
+* **One pinned host region** (`fs_host`) mirrors `[inputs | outputs]`, so a
+  batch is one `cudaMemcpyAsync` up, the unchanged kernels, one
+  `cudaMemcpyAsync` down, all on the non-blocking `s_fit` stream. The only
+  synchronisation is one `cudaEventSynchronize` on `ev_fit_done` per batch. An
+  event recorded on the legacy stream orders the batch after the synchronous
+  dataset uploads without blocking the host.
+* **High-water growth.** A region is reallocated only when a batch needs more
+  bytes than it holds, with 25 % headroom. Each device or pinned allocate and
+  free is counted in `fit_alloc_calls`, each growth in `fit_growths`. A call is a
+  steady-state call (`fit_steady_alloc_calls`) when the same kind of batch (fit,
+  rank, order statistic, maximum) has already completed once. The lazy f64 twins
+  of the resident rows and the cached target ranks are dataset setup, counted in
+  `fit_alloc_calls` only.
+* **Arithmetic is unchanged.** Same kernels, launch shapes, owner threads and
+  reduction orders; only buffer lifetime and stream differ. A failed launch
+  drains the stream before returning, and the caller keeps the CPU arm.
+
+`GpuEvaluator::arena_report()` exposes `fit_alloc_calls`, `fit_growths`,
+`fit_steady_alloc_calls`, `fit_batches`, `fit_device_bytes` and
+`fit_pinned_bytes`. The run ledger reports the same counters as
+`gpu.ledger.fit.alloc` (`calls`, `growths`, `steady_alloc_calls`, `batches`,
+scope `run`, units `allocator calls`); `rcsr schema` documents the field.
+`steady_alloc_calls` is 0 while batch shapes stay inside the high-water mark; a
+search whose batches keep growing shows the growths there.
+
+Tests: `gpu::persistent_tests` in `src/gpu.rs` asserts 0 allocator calls over
+100 fit batches and 100 batches each of the rank, median, interquartile and
+maximum stages after warm-up, the counted growth for a larger batch, and a
+bitwise hash of fit constants, SSE, status, rank sums, order statistics and
+maximum scans that was captured on the allocating path. `tests/gpu_persistent.rs`
+holds the archive hashes of GPU-fit searches captured on the allocating path and
+a code inspection of the entry points (no legacy-stream launch, no synchronous
+copy, no allocator call).
+
 ## Measuring the full GPU path (issue #118)
 
 The older benchmark placed an event pair immediately after the launch, so

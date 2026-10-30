@@ -124,6 +124,15 @@ typedef struct RcArenaReport {
     unsigned long long steady_alloc_calls;
     unsigned long long overlapped_uploads;
     unsigned long long batches;
+    /* #334: the fit and score regions. `fs_steady_alloc_calls` counts
+       allocator calls after the first successful batch of the same kind and
+       stays at zero while the batch shape is stable. */
+    unsigned long long fs_alloc_calls;
+    unsigned long long fs_growths;
+    unsigned long long fs_steady_alloc_calls;
+    unsigned long long fs_batches;
+    unsigned long long fs_dev_bytes;
+    unsigned long long fs_pinned_bytes;
 } RcArenaReport;
 
 struct RcCtx {
@@ -171,12 +180,22 @@ struct RcCtx {
        reuses it for every trial instead of re-sorting the target. */
     long long *d_rank_b;
     int rank_ready;
-    /* #227: reusable device arena for the exact maximum-error scan. The
-       bisection on the error level calls the scan once per round, so the
-       per-call `cudaMalloc`/`cudaFree` churn of the one-shot selection arms
-       would dominate; the arena is grown, never shrunk. */
-    void *d_mm;
-    size_t mm_bytes;
+    /* #334: persistent fit and score regions (see `rc_fs_reserve`). The device
+       region holds every input, output and workspace of the batched fit, rank,
+       order-statistic and maximum stages; the pinned region stages their
+       packed inputs and outputs. Both only grow. */
+    cudaStream_t s_fit;
+    cudaEvent_t ev_fit_done;
+    cudaEvent_t ev_legacy;
+    unsigned char *fs_dev;
+    size_t fs_dev_bytes;
+    unsigned char *fs_host;
+    size_t fs_host_bytes;
+    unsigned long long fs_alloc_calls;
+    unsigned long long fs_growths;
+    unsigned long long fs_steady_alloc_calls;
+    unsigned long long fs_batches;
+    unsigned long long fs_path_batches[4];
     int n;
     int v;
     int nprog;
@@ -2635,7 +2654,7 @@ static int ft_launch(RcCtx *c,
         }
         opted_in = 1;
     }
-    fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes>>>(
+    fit_kernel<MAXC, CHUNK, PCHUNK><<<nprog, CHUNK, bytes, c->s_fit>>>(
         c->d_cols, c->d_y, c->d_tsign, c->d_cols64, c->d_y64, c->d_tsign64, c->d_w64, c->n,
         c->v, d_prog, d_off, d_p, kmax, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
@@ -2698,6 +2717,172 @@ static void rc_download(void *dst, const void *src, size_t bytes)
     cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
 }
 #endif
+
+/* --- #334: persistent fit and score regions --------------------------------
+ *
+ * `rc_fit_batch`, `rc_rank_score_batch`, `rc_order_stat_score_batch` and
+ * `rc_max_scan_batch` used to `cudaMalloc` their inputs, outputs and sort
+ * workspace and `cudaFree` them again on every call, copy through pageable
+ * memory with blocking `cudaMemcpy` and run on the legacy stream. They now
+ * share one device region (`fs_dev`) and one pinned host region (`fs_host`)
+ * per context. Both are grown at the high-water mark only, and every growth
+ * is counted. A batch is: one asynchronous upload of the packed inputs, the
+ * unchanged kernels, one asynchronous download of the packed outputs, all on
+ * the non-blocking `s_fit` stream, and one event synchronisation.
+ *
+ * The device region is laid out per call as
+ *   [ inputs | outputs | work ]
+ * with every part aligned to 256 bytes. The pinned region mirrors the first
+ * two parts, so one `cudaMemcpyAsync` moves all inputs and one moves all
+ * outputs. Kernels, launch shapes and reduction orders are untouched. */
+#define RC_FS_FIT 0
+#define RC_FS_RANK 1
+#define RC_FS_ORDER 2
+#define RC_FS_MAX 3
+
+static size_t rc_fs_take(size_t *cur, size_t bytes)
+{
+    size_t o = (*cur + 255) & ~(size_t)255;
+    *cur = o + bytes;
+    return o;
+}
+
+/* An allocator call on the fit/score path. After the first successful batch
+   of the same kind it is a steady-state call and must stay at zero. */
+static void rc_fs_note(RcCtx *c, int kind)
+{
+    c->fs_alloc_calls++;
+    if (c->fs_path_batches[kind] > 0) c->fs_steady_alloc_calls++;
+}
+
+/* Grow the device and pinned regions to at least the requested sizes. Nothing
+   is in flight when this runs: every batch ends on an event synchronisation. */
+static int rc_fs_reserve(RcCtx *c, int kind, size_t dev_bytes, size_t host_bytes)
+{
+    if (!c->s_fit) return -1;
+    if (dev_bytes < 256) dev_bytes = 256;
+    if (host_bytes < 256) host_bytes = 256;
+    if (dev_bytes > c->fs_dev_bytes) {
+        if (c->fs_dev) {
+            cudaFree(c->fs_dev);
+            rc_fs_note(c, kind);
+            c->fs_dev = 0;
+            c->fs_dev_bytes = 0;
+        }
+        void *p = 0;
+        size_t want = dev_bytes + dev_bytes / 4;
+        int rc = rc_alloc(&p, want);
+        if (rc != 0) {
+            cudaGetLastError();
+            want = dev_bytes;
+            p = 0;
+            rc = rc_alloc(&p, want);
+        }
+        if (rc != 0) {
+            cudaGetLastError();
+            return -1;
+        }
+        rc_fs_note(c, kind);
+        c->fs_growths++;
+        c->fs_dev = (unsigned char *)p;
+        c->fs_dev_bytes = want;
+    }
+    if (host_bytes > c->fs_host_bytes) {
+        if (c->fs_host) {
+            cudaFreeHost(c->fs_host);
+            rc_fs_note(c, kind);
+            c->fs_host = 0;
+            c->fs_host_bytes = 0;
+        }
+        void *p = 0;
+        size_t want = host_bytes + host_bytes / 4;
+        if (cudaHostAlloc(&p, want, cudaHostAllocDefault) != cudaSuccess) {
+            cudaGetLastError();
+            want = host_bytes;
+            p = 0;
+            if (cudaHostAlloc(&p, want, cudaHostAllocDefault) != cudaSuccess) {
+                cudaGetLastError();
+                return -1;
+            }
+        }
+        rc_fs_note(c, kind);
+        c->fs_growths++;
+        c->fs_host = (unsigned char *)p;
+        c->fs_host_bytes = want;
+    }
+    return 0;
+}
+
+/* Order this batch after all earlier work on the legacy stream (the
+   synchronous dataset uploads and lazy casts), without blocking the host. */
+static void rc_fs_begin(RcCtx *c)
+{
+    cudaEventRecord(c->ev_legacy, 0);
+    cudaStreamWaitEvent(c->s_fit, c->ev_legacy, 0);
+}
+
+static void rc_fs_h2d(RcCtx *c, void *dst, const void *src, size_t bytes)
+{
+    if (bytes) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, c->s_fit);
+}
+
+static void rc_fs_d2h(RcCtx *c, void *dst, const void *src, size_t bytes)
+{
+    if (bytes) cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, c->s_fit);
+}
+
+/* The single synchronisation of a batch. Returns 0 when every enqueued
+   operation completed without error. */
+static int rc_fs_finish(RcCtx *c)
+{
+    cudaEventRecord(c->ev_fit_done, c->s_fit);
+    cudaError_t e = cudaEventSynchronize(c->ev_fit_done);
+    cudaError_t l = cudaGetLastError();
+    return (e == cudaSuccess && l == cudaSuccess) ? 0 : -1;
+}
+
+static void rc_fs_ok(RcCtx *c, int kind)
+{
+    c->fs_path_batches[kind]++;
+    c->fs_batches++;
+}
+
+/* Failure path: nothing enqueued may still touch the shared regions when the
+   next batch rewrites them. */
+static void rc_fs_drain(RcCtx *c)
+{
+    cudaStreamSynchronize(c->s_fit);
+    cudaGetLastError();
+}
+
+/* Lazy f64 twins of the resident rows, cast on the fit stream. Cold setup, not
+   a steady-state allocation. Returns 0 when both exist. */
+static int rc_fs_f64_twins(RcCtx *c)
+{
+    if (c->d_cols64 && c->d_y64) return 0;
+    if (!c->d_cols64) {
+        if (rc_alloc((void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
+            c->d_cols64 = 0;
+            return -1;
+        }
+        c->fs_alloc_calls++;
+        int threads = 256;
+        long long total = (long long)c->n * (long long)c->v;
+        long long blocks = (total + threads - 1) / threads;
+        cast_f32_to_f64_kernel<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_cols, c->d_cols64, total);
+    }
+    if (!c->d_y64) {
+        if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
+            c->d_y64 = 0;
+            return -1;
+        }
+        c->fs_alloc_calls++;
+        int threads = 256;
+        long long yblocks = (c->n + threads - 1) / threads;
+        cast_f32_to_f64_kernel<<<(int)yblocks, threads, 0, c->s_fit>>>(c->d_y, c->d_y64, c->n);
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
 
 
 /* --- #230: exact rank-correlation stage ----------------------------------
@@ -3010,6 +3195,15 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     if (cudaStreamCreateWithFlags(&c->s_h2d, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
     if (streams_ok && cudaStreamCreateWithFlags(&c->s_d2h, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
     if (streams_ok && cudaStreamCreateWithFlags(&c->s_eval, cudaStreamNonBlocking) != cudaSuccess) streams_ok = 0;
+    /* #334: the fit/score stream. Failure leaves `s_fit` null, which makes the
+       fit and score entry points decline (the caller keeps the CPU arm). */
+    if (cudaStreamCreateWithFlags(&c->s_fit, cudaStreamNonBlocking) != cudaSuccess ||
+        cudaEventCreateWithFlags(&c->ev_fit_done, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&c->ev_legacy, cudaEventDisableTiming) != cudaSuccess) {
+        cudaGetLastError();
+        if (c->s_fit) cudaStreamDestroy(c->s_fit);
+        c->s_fit = 0;
+    }
     for (int i = 0; streams_ok && i < 2; ++i) {
         if (cudaEventCreateWithFlags(&c->ev_upload[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
         if (streams_ok && cudaEventCreateWithFlags(&c->ev_slot_done[i], cudaEventDisableTiming) != cudaSuccess) streams_ok = 0;
@@ -3044,7 +3238,13 @@ void rc_destroy(void *ctx)
     if (c->d_pool[1]) cudaFree(c->d_pool[1]);
     if (c->d_hash) cudaFree(c->d_hash);
     if (c->d_rank_b) cudaFree(c->d_rank_b);
-    if (c->d_mm) cudaFree(c->d_mm);
+    if (c->fs_dev) cudaFree(c->fs_dev);
+    if (c->fs_host) cudaFreeHost(c->fs_host);
+    if (c->s_fit) {
+        cudaStreamDestroy(c->s_fit);
+        cudaEventDestroy(c->ev_fit_done);
+        cudaEventDestroy(c->ev_legacy);
+    }
     /* #285: arena, staging rings, streams and events. */
     for (int i = 0; i < 2; ++i) {
         if (c->arena_prog[i]) cudaFree(c->arena_prog[i]);
@@ -3278,6 +3478,12 @@ int rc_arena_report(void *ctx, RcArenaReport *out)
     out->steady_alloc_calls = c->steady_alloc_calls;
     out->overlapped_uploads = c->overlapped_uploads;
     out->batches = c->arena_batches;
+    out->fs_alloc_calls = c->fs_alloc_calls;
+    out->fs_growths = c->fs_growths;
+    out->fs_steady_alloc_calls = c->fs_steady_alloc_calls;
+    out->fs_batches = c->fs_batches;
+    out->fs_dev_bytes = (unsigned long long)c->fs_dev_bytes;
+    out->fs_pinned_bytes = (unsigned long long)c->fs_host_bytes;
     return 0;
 }
 
@@ -3812,80 +4018,60 @@ float rc_fit_batch(void *ctx,
        so the arm can never run on another objective. */
     if (metric == RC_LOSS_LOGISTIC && !c->has_tsign) return -1.0f;
     if (kmax > FT_MAX_CONST_LARGE) return -1.0f;
-    unsigned int *d_prog = 0;
-    unsigned int *d_off = 0;
-    int *d_p = 0;
-    double *d_c0 = 0;
-    int *d_gauge = 0;
-    double *d_c = 0;
-    double *d_sse = 0;
-    int *d_status = 0;
-    size_t prog_words = (size_t)off[nprog];
-    size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
-    int ok = 1;
-    if (rc_alloc((void **)&d_prog, sizeof(unsigned int) * prog_words) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nprog + 1)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nprog) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_c0, cbytes) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_gauge, sizeof(int) * (size_t)nprog * 2) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_c, cbytes) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_sse, sizeof(double) * (size_t)nprog) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nprog) != 0) ok = 0;
-    if (ok && (!c->d_cols64 || !c->d_y64)) {
-        size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
-        size_t yb = sizeof(double) * (size_t)c->n;
-        if (rc_alloc((void **)&c->d_cols64, cb) != 0) {
-            c->d_cols64 = 0;
-            ok = 0;
-        }
-        if (ok && rc_alloc((void **)&c->d_y64, yb) != 0) {
-            c->d_y64 = 0;
-            ok = 0;
-        }
-        if (ok) {
-            int threads = 256;
-            long long total = (long long)c->n * (long long)c->v;
-            long long blocks = (total + threads - 1) / threads;
-            cast_f32_to_f64_kernel<<<(int)blocks, threads>>>(c->d_cols, c->d_cols64, total);
-            long long yblocks = (c->n + threads - 1) / threads;
-            cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
-            if (cudaGetLastError() != cudaSuccess) ok = 0;
-        }
+    const size_t prog_words = (size_t)off[nprog];
+    const size_t cbytes = sizeof(double) * (size_t)nprog * (size_t)kmax;
+    /* #334: [ prog | off | pcount | c0 | gauge ] then [ c | sse | status ]. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nprog + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
+    const size_t o_c0 = rc_fs_take(&cur, cbytes);
+    const size_t o_gauge = rc_fs_take(&cur, sizeof(int) * (size_t)nprog * 2);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_c = rc_fs_take(&cur, cbytes);
+    const size_t o_sse = rc_fs_take(&cur, sizeof(double) * (size_t)nprog);
+    const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nprog);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    if (rc_fs_reserve(c, RC_FS_FIT, io_end, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
     }
-    if (ok) {
-        rc_upload(d_prog, prog, sizeof(unsigned int) * prog_words);
-        rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
-        rc_upload(d_p, pcount, sizeof(int) * (size_t)nprog);
-        rc_upload(d_c0, c0, cbytes);
-        rc_upload(d_gauge, gauge, sizeof(int) * (size_t)nprog * 2);
-        cudaEventRecord(c->t0, 0);
-        int launched;
-        if (kmax <= FT_MAX_CONST_SMALL) {
-            launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
-        } else {
-            launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
-                c, nprog, kmax, d_prog, d_off, d_p, d_c0, d_gauge, iters, metric, d_c, d_sse, d_status);
-        }
-        cudaEventRecord(c->t1, 0);
-        cudaEventSynchronize(c->t1);
-        if (launched != 0 || cudaGetLastError() != cudaSuccess) {
-            ok = 0;
-        } else {
-            rc_download(outc, d_c, cbytes);
-            rc_download(outsse, d_sse, sizeof(double) * (size_t)nprog);
-            rc_download(outstatus, d_status, sizeof(int) * (size_t)nprog);
-        }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nprog + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nprog);
+    memcpy(host + o_c0, c0, cbytes);
+    memcpy(host + o_gauge, gauge, sizeof(int) * (size_t)nprog * 2);
+    rc_fs_h2d(c, base, host, in_end);
+    cudaEventRecord(c->t0, c->s_fit);
+    int launched;
+    if (kmax <= FT_MAX_CONST_SMALL) {
+        launched = ft_launch<FT_MAX_CONST_SMALL, FT_CHUNK_SMALL, FT_PCHUNK>(
+            c, nprog, kmax, (const unsigned int *)(base + o_prog),
+            (const unsigned int *)(base + o_off), (const int *)(base + o_p),
+            (const double *)(base + o_c0), (const int *)(base + o_gauge), iters, metric,
+            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
+    } else {
+        launched = ft_launch<FT_MAX_CONST_LARGE, FT_CHUNK_LARGE, FT_PCHUNK>(
+            c, nprog, kmax, (const unsigned int *)(base + o_prog),
+            (const unsigned int *)(base + o_off), (const int *)(base + o_p),
+            (const double *)(base + o_c0), (const int *)(base + o_gauge), iters, metric,
+            (double *)(base + o_c), (double *)(base + o_sse), (int *)(base + o_status));
     }
-    if (d_prog) cudaFree(d_prog);
-    if (d_off) cudaFree(d_off);
-    if (d_p) cudaFree(d_p);
-    if (d_c0) cudaFree(d_c0);
-    if (d_gauge) cudaFree(d_gauge);
-    if (d_c) cudaFree(d_c);
-    if (d_sse) cudaFree(d_sse);
-    if (d_status) cudaFree(d_status);
-    if (!ok) return -1.0f;
+    cudaEventRecord(c->t1, c->s_fit);
+    if (launched != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    rc_fs_d2h(c, host + in_end, base + in_end, io_end - in_end);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    memcpy(outc, host + o_c, cbytes);
+    memcpy(outsse, host + o_sse, sizeof(double) * (size_t)nprog);
+    memcpy(outstatus, host + o_status, sizeof(int) * (size_t)nprog);
+    rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
@@ -3918,139 +4104,151 @@ typedef struct RcRankWork {
     size_t temp_bytes;
 } RcRankWork;
 
-static void rc_rank_work_free(RcRankWork *w)
+/* Bytes of CUB temporary storage the rank sweep needs for `total` keys in
+ * `nsegs` segments: the largest of the sort and the two scans. Pure size
+ * queries, no device pointer is read. */
+static size_t rc_rank_temp_bytes(long long total, int nsegs)
 {
-    if (w->keys) cudaFree(w->keys);
-    if (w->keys_out) cudaFree(w->keys_out);
-    if (w->rows) cudaFree(w->rows);
-    if (w->rows_out) cudaFree(w->rows_out);
-    if (w->flags) cudaFree(w->flags);
-    if (w->ord) cudaFree(w->ord);
-    if (w->gather) cudaFree(w->gather);
-    if (w->prefix) cudaFree(w->prefix);
-    if (w->starts) cudaFree(w->starts);
-    if (w->temp) cudaFree(w->temp);
-    memset(w, 0, sizeof(*w));
+    size_t tb = 0, ts = 0, tsc = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        (void *)NULL, tb, (const unsigned long long *)NULL, (unsigned long long *)NULL,
+        (const unsigned int *)NULL, (unsigned int *)NULL, (int)total, nsegs,
+        (const int *)NULL, (const int *)NULL);
+    cub::DeviceScan::InclusiveSum((void *)NULL, ts, (const int *)NULL, (int *)NULL, (int)total);
+    cub::DeviceScan::ExclusiveSum((void *)NULL, tsc, (const long long *)NULL, (long long *)NULL,
+                                  (int)total);
+    if (ts > tb) tb = ts;
+    if (tsc > tb) tb = tsc;
+    /* CUB may report a zero-byte requirement for a tiny input; keep at least
+       one byte so the pointer is valid. */
+    if (tb == 0) tb = 1;
+    return tb;
 }
 
-static int rc_rank_work_alloc(RcRankWork *w, long long total)
+/* Carve the rank workspace for `total` keys out of the persistent device
+ * region, starting at `*cur`. `prefix` has one extra slot: a run's end may be
+ * `total`, and the contribution kernel reads `prefix[end]`. The scan writes
+ * into the base allocation (CUB expects aligned output pointers; scanning into
+ * `prefix + 1` is misaligned and produced wrong sums), and `k_rank_tail` fills
+ * the last slot afterwards. */
+static void rc_rank_work_layout(size_t *cur, long long total, size_t temp_bytes, size_t *o)
 {
-    memset(w, 0, sizeof(*w));
-    int ok = 1;
-    if (rc_alloc((void **)&w->keys, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->keys_out, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->rows, sizeof(unsigned int) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->rows_out, sizeof(unsigned int) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->flags, sizeof(int) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->ord, sizeof(int) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->gather, sizeof(long long) * (size_t)total) != 0) ok = 0;
-    /* `prefix` has one extra slot: a run's end may be `total`, and the
-       contribution kernel reads `prefix[end]`. The scan writes into the base
-       allocation (CUB expects aligned output pointers; scanning into
-       `prefix + 1` is misaligned and produced wrong sums), and
-       `k_rank_tail` fills the last slot afterwards. */
-    if (ok && rc_alloc((void **)&w->prefix, sizeof(long long) * (size_t)(total + 1)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&w->starts, sizeof(long long) * (size_t)total) != 0) ok = 0;
-    if (!ok) rc_rank_work_free(w);
-    return ok ? 0 : -1;
+    o[0] = rc_fs_take(cur, sizeof(unsigned long long) * (size_t)total);
+    o[1] = rc_fs_take(cur, sizeof(unsigned long long) * (size_t)total);
+    o[2] = rc_fs_take(cur, sizeof(unsigned int) * (size_t)total);
+    o[3] = rc_fs_take(cur, sizeof(unsigned int) * (size_t)total);
+    o[4] = rc_fs_take(cur, sizeof(int) * (size_t)total);
+    o[5] = rc_fs_take(cur, sizeof(int) * (size_t)total);
+    o[6] = rc_fs_take(cur, sizeof(long long) * (size_t)total);
+    o[7] = rc_fs_take(cur, sizeof(long long) * (size_t)(total + 1));
+    o[8] = rc_fs_take(cur, sizeof(long long) * (size_t)total);
+    o[9] = rc_fs_take(cur, temp_bytes);
+}
+
+static void rc_rank_work_bind(RcRankWork *w, unsigned char *base, const size_t *o,
+                              size_t temp_bytes)
+{
+    w->keys = (unsigned long long *)(base + o[0]);
+    w->keys_out = (unsigned long long *)(base + o[1]);
+    w->rows = (unsigned int *)(base + o[2]);
+    w->rows_out = (unsigned int *)(base + o[3]);
+    w->flags = (int *)(base + o[4]);
+    w->ord = (int *)(base + o[5]);
+    w->gather = (long long *)(base + o[6]);
+    w->prefix = (long long *)(base + o[7]);
+    w->starts = (long long *)(base + o[8]);
+    w->temp = base + o[9];
+    w->temp_bytes = temp_bytes;
 }
 
 /* Sort, mark run starts, prefix-sum the gathered target ranks and scatter the
- * run starts. `d_b` may be NULL for a run-only sweep (the target stage). */
-static int rc_rank_runs(RcRankWork *w, const long long *d_b, int n, long long total,
+ * run starts, all on the fit stream. `d_b` may be NULL for a run-only sweep
+ * (the target stage). `w->temp` was sized by `rc_rank_temp_bytes`. */
+static int rc_rank_runs(RcCtx *c, RcRankWork *w, const long long *d_b, int n, long long total,
                         int nsegs, int *d_off)
 {
+    cudaStream_t s = c->s_fit;
     int threads = 256;
     long long blocks = (total + threads - 1) / threads;
     if (blocks > 65535) blocks = 65535;
     if (blocks < 1) blocks = 1;
-    /* Size the temporary storage for the largest of the three primitives. */
-    size_t tb = 0, ts = 0, tsc = 0;
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        NULL, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
-        d_off + 1);
-    cub::DeviceScan::InclusiveSum(NULL, ts, w->flags, w->ord, (int)total);
-    cub::DeviceScan::ExclusiveSum(NULL, tsc, w->gather, w->prefix, (int)total);
-    if (ts > tb) tb = ts;
-    if (tsc > tb) tb = tsc;
-    /* CUB may report a zero-byte requirement for a tiny input; cudaMalloc(0)
-       is not portable, so ask for at least one byte. */
-    if (tb == 0) tb = 1;
-    if (rc_alloc(&w->temp, tb) != 0) return -1;
-    w->temp_bytes = tb;
+    size_t tb = w->temp_bytes;
     cub::DeviceSegmentedRadixSort::SortPairs(
         w->temp, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
-        d_off + 1);
+        d_off + 1, 0, (int)(sizeof(unsigned long long) * 8), s);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    k_rank_flags<<<(int)blocks, threads>>>(w->keys_out, w->rows_out, d_b, n, total,
-                                           w->flags, w->gather);
+    k_rank_flags<<<(int)blocks, threads, 0, s>>>(w->keys_out, w->rows_out, d_b, n, total,
+                                                 w->flags, w->gather);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    cub::DeviceScan::InclusiveSum(w->temp, tb, w->flags, w->ord, (int)total);
-    cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total);
-    k_rank_tail<<<1, 1>>>(w->prefix, w->gather, total);
+    tb = w->temp_bytes;
+    cub::DeviceScan::InclusiveSum(w->temp, tb, w->flags, w->ord, (int)total, s);
+    tb = w->temp_bytes;
+    cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total, s);
+    k_rank_tail<<<1, 1, 0, s>>>(w->prefix, w->gather, total);
     if (cudaGetLastError() != cudaSuccess) return -1;
-    k_rank_starts<<<(int)blocks, threads>>>(w->flags, w->ord, w->starts, total);
+    k_rank_starts<<<(int)blocks, threads, 0, s>>>(w->flags, w->ord, w->starts, total);
     if (cudaGetLastError() != cudaSuccess) return -1;
     return 0;
 }
 
-/* Ensure the f64 twin of the target exists (the rank stage needs f64 input). */
-static int rc_rank_ensure_y64(RcCtx *c)
-{
-    if (c->d_y64) return 0;
-    if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
-        c->d_y64 = 0;
-        return -1;
-    }
-    int threads = 256;
-    long long yblocks = (c->n + threads - 1) / threads;
-    cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
-    if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(c->d_y64);
-        c->d_y64 = 0;
-        return -1;
-    }
-    return 0;
-}
-
-/* Compute and cache `B`, twice the centred average rank of the target rows. */
+/* Compute and cache `B`, twice the centred average rank of the target rows.
+ * Cold setup, run once per fit sample. */
 static int rc_rank_prepare(void *ctx)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->rank_ready) return 0;
     if (c->n <= 0) return -1;
-    if (rc_rank_ensure_y64(c) != 0) return -1;
+    if (!c->s_fit) return -1;
+    const long long total = c->n;
+    const size_t temp_bytes = rc_rank_temp_bytes(total, 1);
+    size_t cur = 0;
+    const size_t o_seg = rc_fs_take(&cur, sizeof(int) * 2);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_nruns = rc_fs_take(&cur, sizeof(int));
+    const size_t io_end = rc_fs_take(&cur, 0);
+    size_t wo[10];
+    rc_rank_work_layout(&cur, total, temp_bytes, wo);
+    if (rc_fs_reserve(c, RC_FS_RANK, cur, io_end) != 0) return -1;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1;
+    }
     if (rc_alloc((void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
         c->d_rank_b = 0;
         return -1;
     }
+    c->fs_alloc_calls++;
     RcRankWork w;
-    long long total = c->n;
-    if (rc_rank_work_alloc(&w, total) != 0) return -1;
-    int *d_off = 0;
-    int host_off[2] = {0, c->n};
-    int ok = (rc_alloc((void **)&d_off, sizeof(int) * 2) == 0);
+    rc_rank_work_bind(&w, c->fs_dev, wo, temp_bytes);
+    int *d_off = (int *)(c->fs_dev + o_seg);
+    int *host_off = (int *)(c->fs_host + o_seg);
+    host_off[0] = 0;
+    host_off[1] = c->n;
+    rc_fs_h2d(c, c->fs_dev, c->fs_host, in_end);
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    k_rank_keys_from_double<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_y64, total, w.keys, w.rows);
+    int ok = (cudaGetLastError() == cudaSuccess) &&
+             (rc_rank_runs(c, &w, NULL, c->n, total, 1, d_off) == 0);
     if (ok) {
-        rc_upload(d_off, host_off, sizeof(int) * 2);
-        int threads = 256;
-        long long blocks = (total + threads - 1) / threads;
-        if (blocks > 65535) blocks = 65535;
-        k_rank_keys_from_double<<<(int)blocks, threads>>>(c->d_y64, total, w.keys, w.rows);
-        ok = (cudaGetLastError() == cudaSuccess) && (rc_rank_runs(&w, NULL, c->n, total, 1, d_off) == 0);
+        rc_fs_d2h(c, c->fs_host + o_nruns, w.ord + (total - 1), sizeof(int));
+        if (rc_fs_finish(c) != 0) ok = 0;
     }
     if (ok) {
-        int nruns = 0;
-        rc_download(&nruns, w.ord + (total - 1), sizeof(int));
-        long long nrun = nruns;
+        long long nrun = *(int *)(c->fs_host + o_nruns);
         int tb = 256;
         long long rb = (nrun + tb - 1) / tb;
         if (rb > 65535) rb = 65535;
-        k_rank_fill_b<<<(int)rb, tb>>>(w.rows_out, w.starts, (int)nrun, c->n, c->d_rank_b);
+        k_rank_fill_b<<<(int)rb, tb, 0, c->s_fit>>>(w.rows_out, w.starts, (int)nrun, c->n,
+                                                    c->d_rank_b);
         ok = cudaGetLastError() == cudaSuccess;
+        if (rc_fs_finish(c) != 0) ok = 0;
+    } else {
+        rc_fs_drain(c);
     }
-    if (d_off) cudaFree(d_off);
-    rc_rank_work_free(&w);
     if (!ok) {
         cudaFree(c->d_rank_b);
         c->d_rank_b = 0;
@@ -4085,79 +4283,80 @@ float rc_rank_score_batch(void *ctx,
     if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
     if (c->n <= 1) return -1.0f;
     if (rc_rank_prepare(ctx) != 0) return -1.0f;
-    if (rc_rank_ensure_y64(c) != 0) return -1.0f;
     const int nsegs = nsets * ntrials;
     const long long total = (long long)nsegs * (long long)c->n;
     if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
-    unsigned int *d_prog = 0, *d_off = 0;
-    int *d_p = 0;
-    double *d_c0 = 0;
-    unsigned long long *d_out = 0;
-    int *d_status = 0;
-    unsigned long long *d_bb = 0;
-    int *d_seg_off = 0;
-    RcRankWork w;
-    memset(&w, 0, sizeof(w));
-    int ok = 1;
     const size_t prog_words = (size_t)off[nsets];
-    if (rc_alloc((void **)&d_prog, sizeof(unsigned int) * prog_words) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nsets + 1)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nsets) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_c0, sizeof(double) * (size_t)nsegs * (size_t)kmax) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_out, sizeof(unsigned long long) * 4 * (size_t)nsegs) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nsegs) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_bb, sizeof(unsigned long long) * 2) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_seg_off, sizeof(int) * (size_t)(nsegs + 1)) != 0) ok = 0;
-    if (ok) {
-        rc_upload(d_prog, prog, sizeof(unsigned int) * prog_words);
-        rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
-        rc_upload(d_p, pcount, sizeof(int) * (size_t)nsets);
-        rc_upload(d_c0, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
-        int *host_seg = (int *)malloc(sizeof(int) * (size_t)(nsegs + 1));
-        if (!host_seg) {
-            ok = 0;
-        } else {
-            for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
-            rc_upload(d_seg_off, host_seg, sizeof(int) * (size_t)(nsegs + 1));
-            free(host_seg);
-        }
-        cudaMemset(d_status, 0, sizeof(int) * (size_t)nsegs);
+    const size_t c0_bytes = sizeof(double) * (size_t)nsegs * (size_t)kmax;
+    const size_t temp_bytes = rc_rank_temp_bytes(total, nsegs);
+    /* #334: [ prog | off | pcount | c0 | seg_off ] then [ out | status | bb ]
+       then the rank workspace. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nsets + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nsets);
+    const size_t o_c0 = rc_fs_take(&cur, c0_bytes);
+    const size_t o_seg = rc_fs_take(&cur, sizeof(int) * (size_t)(nsegs + 1));
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_out = rc_fs_take(&cur, sizeof(unsigned long long) * 4 * (size_t)nsegs);
+    const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nsegs);
+    const size_t o_bb = rc_fs_take(&cur, sizeof(unsigned long long) * 2);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    size_t wo[10];
+    rc_rank_work_layout(&cur, total, temp_bytes, wo);
+    if (rc_fs_reserve(c, RC_FS_RANK, cur, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
     }
-    if (ok && rc_rank_work_alloc(&w, total) != 0) ok = 0;
-    float ms = -1.0f;
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + o_c0, c0, c0_bytes);
+    int *host_seg = (int *)(host + o_seg);
+    for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
+    rc_fs_h2d(c, base, host, in_end);
+    cudaMemsetAsync(base + o_status, 0, sizeof(int) * (size_t)nsegs, c->s_fit);
+    RcRankWork w;
+    rc_rank_work_bind(&w, base, wo, temp_bytes);
+    unsigned int *d_prog = (unsigned int *)(base + o_prog);
+    unsigned int *d_off = (unsigned int *)(base + o_off);
+    double *d_c0 = (double *)(base + o_c0);
+    int *d_seg_off = (int *)(base + o_seg);
+    unsigned long long *d_out = (unsigned long long *)(base + o_out);
+    int *d_status = (int *)(base + o_status);
+    unsigned long long *d_bb = (unsigned long long *)(base + o_bb);
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    cudaEventRecord(c->t0, c->s_fit);
+    k_rank_predict<<<(int)blocks, threads, 0, c->s_fit>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
+                                                          c->n, nsegs, ntrials, w.keys, w.rows,
+                                                          d_status);
+    int ok = cudaGetLastError() == cudaSuccess;
+    if (ok && rc_rank_runs(c, &w, c->d_rank_b, c->n, total, nsegs, d_seg_off) != 0) ok = 0;
     if (ok) {
-        int threads = 256;
-        long long blocks = (total + threads - 1) / threads;
-        if (blocks > 65535) blocks = 65535;
-        cudaEventRecord(c->t0, 0);
-        k_rank_predict<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
-                                                 c->n, nsegs, ntrials, w.keys, w.rows, d_status);
+        k_rank_contrib<<<nsegs, 256, 0, c->s_fit>>>(w.starts, w.prefix, w.ord, c->n, total, nsegs,
+                                                    d_out);
+        k_rank_bb<<<1, 256, 0, c->s_fit>>>(c->d_rank_b, c->n, d_bb);
         ok = cudaGetLastError() == cudaSuccess;
-        if (ok && rc_rank_runs(&w, c->d_rank_b, c->n, total, nsegs, d_seg_off) != 0) ok = 0;
-        if (ok) {
-            k_rank_contrib<<<nsegs, 256>>>(w.starts, w.prefix, w.ord, c->n, total, nsegs, d_out);
-            k_rank_bb<<<1, 256>>>(c->d_rank_b, c->n, d_bb);
-            ok = cudaGetLastError() == cudaSuccess;
-        }
-        cudaEventRecord(c->t1, 0);
-        cudaEventSynchronize(c->t1);
-        if (ok) {
-            cudaEventElapsedTime(&ms, c->t0, c->t1);
-            rc_download(out, d_out, sizeof(unsigned long long) * 4 * (size_t)nsegs);
-            rc_download(out_status, d_status, sizeof(int) * (size_t)nsegs);
-            rc_download(out_bb, d_bb, sizeof(unsigned long long) * 2);
-        }
     }
-    if (d_prog) cudaFree(d_prog);
-    if (d_off) cudaFree(d_off);
-    if (d_p) cudaFree(d_p);
-    if (d_c0) cudaFree(d_c0);
-    if (d_out) cudaFree(d_out);
-    if (d_status) cudaFree(d_status);
-    if (d_bb) cudaFree(d_bb);
-    if (d_seg_off) cudaFree(d_seg_off);
-    rc_rank_work_free(&w);
-    if (!ok) return -1.0f;
+    cudaEventRecord(c->t1, c->s_fit);
+    if (!ok) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    rc_fs_d2h(c, host + in_end, base + in_end, io_end - in_end);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    memcpy(out, host + o_out, sizeof(unsigned long long) * 4 * (size_t)nsegs);
+    memcpy(out_status, host + o_status, sizeof(int) * (size_t)nsegs);
+    memcpy(out_bb, host + o_bb, sizeof(unsigned long long) * 2);
+    rc_fs_ok(c, RC_FS_RANK);
+    float ms = -1.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
 }
 
@@ -4439,52 +4638,6 @@ __global__ void k_max_scan(const unsigned int *__restrict__ prog,
     }
 }
 
-/* #227: make sure the f64 twins of the resident rows exist. Same lazy cast the
- * median arm does, factored out because the maximum arm calls the scan dozens
- * of times per candidate. */
-static int rc_mm_f64(RcCtx *c)
-{
-    if (c->d_cols64 && c->d_y64) return 0;
-    if (!c->d_cols64) {
-        if (rc_alloc((void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
-            c->d_cols64 = 0;
-            return -1;
-        }
-        int threads = 256;
-        long long total = (long long)c->n * (long long)c->v;
-        long long blocks = (total + threads - 1) / threads;
-        cast_f32_to_f64_kernel<<<(int)blocks, threads>>>(c->d_cols, c->d_cols64, total);
-    }
-    if (!c->d_y64) {
-        if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
-            c->d_y64 = 0;
-            return -1;
-        }
-        int threads = 256;
-        long long yblocks = (c->n + threads - 1) / threads;
-        cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
-    }
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
-}
-
-/* Reserve `bytes` from the reusable arena, aligned to 256 bytes. */
-static int rc_mm_reserve(RcCtx *c, size_t bytes)
-{
-    if (bytes <= c->mm_bytes) return 0;
-    if (c->d_mm) {
-        cudaFree(c->d_mm);
-        c->d_mm = 0;
-        c->mm_bytes = 0;
-    }
-    size_t want = bytes + (bytes >> 1) + 4096;
-    if (rc_alloc(&c->d_mm, want) != 0) {
-        c->d_mm = 0;
-        return -1;
-    }
-    c->mm_bytes = want;
-    return 0;
-}
-
 /* Exact maximum-error scan of `nsets * ntrials` prediction vectors.
  *
  * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
@@ -4510,44 +4663,37 @@ float rc_max_scan_batch(void *ctx,
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0 || kmax > FT_MAX_CONST_LARGE) return -1.0f;
     if (c->n <= 0) return -1.0f;
-    if (rc_mm_f64(c) != 0) return -1.0f;
     const int nsegs = nsets * ntrials;
     if ((long long)nsegs * (long long)c->n > 0x7FFFFFFFLL) return -1.0f;
     const size_t prog_words = (size_t)off[nsets];
-    const size_t align = 256;
-    const size_t sz_prog = ((sizeof(unsigned int) * prog_words + align - 1) / align) * align;
-    const size_t sz_off = ((sizeof(unsigned int) * (size_t)(nsets + 1) + align - 1) / align) * align;
-    const size_t sz_p = ((sizeof(int) * (size_t)nsets + align - 1) / align) * align;
-    const size_t sz_c0 =
-        ((sizeof(double) * (size_t)nsegs * (size_t)kmax + align - 1) / align) * align;
-    const size_t sz_coords = ((sizeof(int) * (size_t)nsegs + align - 1) / align) * align;
-    const size_t sz_levels = ((sizeof(double) * (size_t)nsegs + align - 1) / align) * align;
-    const size_t sz_out = ((sizeof(RcMaxOut) * (size_t)nsegs + align - 1) / align) * align;
-    const size_t total_bytes = sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels + sz_out;
-    if (rc_mm_reserve(c, total_bytes) != 0) return -1.0f;
-    char *base = (char *)c->d_mm;
-    unsigned int *d_prog = (unsigned int *)base;
-    unsigned int *d_off = (unsigned int *)(base + sz_prog);
-    int *d_p = (int *)(base + sz_prog + sz_off);
-    double *d_c0 = (double *)(base + sz_prog + sz_off + sz_p);
-    int *d_coords = (int *)(base + sz_prog + sz_off + sz_p + sz_c0);
-    double *d_levels = (double *)(base + sz_prog + sz_off + sz_p + sz_c0 + sz_coords);
-    RcMaxOut *d_out = (RcMaxOut *)(base + sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels);
-
-    /* One host->device copy for the whole request. The bisection calls this
-       once per round, so six separately synchronised `cudaMemcpy` calls per
-       round would be most of its latency on a small batch. The host block uses
-       the same aligned layout as the arena. A null `coords`/`levels` means
-       "maximum only": `-1` / NaN for every segment, filled here on the host. */
-    const size_t in_bytes = sz_prog + sz_off + sz_p + sz_c0 + sz_coords + sz_levels;
-    char *host = (char *)calloc(1, in_bytes);
-    if (!host) return -1.0f;
-    memcpy(host, prog, sizeof(unsigned int) * prog_words);
-    memcpy(host + sz_prog, off, sizeof(unsigned int) * (size_t)(nsets + 1));
-    memcpy(host + sz_prog + sz_off, pcount, sizeof(int) * (size_t)nsets);
-    memcpy(host + sz_prog + sz_off + sz_p, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
-    int *h_coords = (int *)(host + sz_prog + sz_off + sz_p + sz_c0);
-    double *h_levels = (double *)(host + sz_prog + sz_off + sz_p + sz_c0 + sz_coords);
+    /* #334: [ prog | off | pcount | c0 | coords | levels ] then [ out ]. A null
+       `coords`/`levels` means "maximum only": `-1` / NaN for every segment,
+       filled here on the host. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nsets + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nsets);
+    const size_t o_c0 = rc_fs_take(&cur, sizeof(double) * (size_t)nsegs * (size_t)kmax);
+    const size_t o_coords = rc_fs_take(&cur, sizeof(int) * (size_t)nsegs);
+    const size_t o_levels = rc_fs_take(&cur, sizeof(double) * (size_t)nsegs);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_out = rc_fs_take(&cur, sizeof(RcMaxOut) * (size_t)nsegs);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    if (rc_fs_reserve(c, RC_FS_MAX, io_end, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memset(host, 0, in_end);
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + o_c0, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
+    int *h_coords = (int *)(host + o_coords);
+    double *h_levels = (double *)(host + o_levels);
     for (int seg = 0; seg < nsegs; ++seg) {
         h_coords[seg] = coords ? coords[seg] : -1;
         if (levels && coords) {
@@ -4556,26 +4702,25 @@ float rc_max_scan_batch(void *ctx,
             memcpy(&h_levels[seg], "\xff\xff\xff\xff\xff\xff\xff\xff", sizeof(double));
         }
     }
-    rc_upload(base, host, in_bytes);
-    free(host);
-    float ms = -1.0f;
+    rc_fs_h2d(c, base, host, in_end);
+    cudaEventRecord(c->t0, c->s_fit);
+    k_max_scan<<<nsegs, FT_MM_THREADS, 0, c->s_fit>>>(
+        (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+        (const int *)(base + o_p), (const double *)(base + o_c0), kmax,
+        (const int *)(base + o_coords), (const double *)(base + o_levels), c->d_cols64,
+        c->d_y64, c->n, nsegs, ntrials, (RcMaxOut *)(base + o_out));
     int ok = cudaGetLastError() == cudaSuccess;
-    if (ok) {
-        cudaEventRecord(c->t0, 0);
-        k_max_scan<<<nsegs, FT_MM_THREADS>>>(d_prog, d_off, d_p, d_c0, kmax, d_coords,
-                                             d_levels, c->d_cols64, c->d_y64, c->n, nsegs,
-                                             ntrials, d_out);
-        ok = cudaGetLastError() == cudaSuccess;
-        cudaEventRecord(c->t1, 0);
-        cudaEventSynchronize(c->t1);
-        if (ok && cudaGetLastError() != cudaSuccess) ok = 0;
+    cudaEventRecord(c->t1, c->s_fit);
+    if (!ok) {
+        rc_fs_drain(c);
+        return -1.0f;
     }
-    if (ok) {
-        cudaEventElapsedTime(&ms, c->t0, c->t1);
-        rc_download(out, d_out, sizeof(RcMaxOut) * (size_t)nsegs);
-        if (cudaGetLastError() != cudaSuccess) ok = 0;
-    }
-    if (!ok) return -1.0f;
+    rc_fs_d2h(c, host + o_out, base + o_out, sizeof(RcMaxOut) * (size_t)nsegs);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    memcpy(out, host + o_out, sizeof(RcMaxOut) * (size_t)nsegs);
+    rc_fs_ok(c, RC_FS_MAX);
+    float ms = -1.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
 }
 
@@ -4611,122 +4756,94 @@ float rc_order_stat_score_batch(void *ctx,
     if (!c || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
     if (what != 0 && what != 1) return -1.0f;
     if (c->n <= 0) return -1.0f;
-    if (!c->d_cols64 || !c->d_y64) {
-        /* The f64 twins are normally uploaded once by `rc_set_fit_data`; a
-           direct caller without them gets the f32-rounded inputs, exactly like
-           `rc_fit_batch`'s own fallback. */
-        size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
-        size_t yb = sizeof(double) * (size_t)c->n;
-        if (!c->d_cols64) {
-            if (rc_alloc((void **)&c->d_cols64, cb) != 0) {
-                c->d_cols64 = 0;
-                return -1.0f;
-            }
-            int threads = 256;
-            long long total = (long long)c->n * (long long)c->v;
-            long long blocks = (total + threads - 1) / threads;
-            cast_f32_to_f64_kernel<<<(int)blocks, threads>>>(c->d_cols, c->d_cols64, total);
-        }
-        if (!c->d_y64) {
-            if (rc_alloc((void **)&c->d_y64, yb) != 0) {
-                c->d_y64 = 0;
-                return -1.0f;
-            }
-            int threads = 256;
-            long long yblocks = (c->n + threads - 1) / threads;
-            cast_f32_to_f64_kernel<<<(int)yblocks, threads>>>(c->d_y, c->d_y64, c->n);
-        }
-        if (cudaGetLastError() != cudaSuccess) return -1.0f;
-    }
     const int nsegs = nsets * ntrials;
     const long long total = (long long)nsegs * (long long)c->n;
     if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
-    unsigned int *d_prog = 0, *d_off = 0;
-    int *d_p = 0;
-    double *d_c0 = 0;
-    unsigned long long *d_keys = 0;
-    unsigned long long *d_keys_out = 0;
-    double *d_val = 0;
-    int *d_status = 0;
-    int *d_seg_off = 0;
-    void *d_temp = 0;
-    size_t temp_bytes = 0;
-    int ok = 1;
     const size_t prog_words = (size_t)off[nsets];
-    if (rc_alloc((void **)&d_prog, sizeof(unsigned int) * prog_words) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_off, sizeof(unsigned int) * (size_t)(nsets + 1)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_p, sizeof(int) * (size_t)nsets) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_c0, sizeof(double) * (size_t)nsegs * (size_t)kmax) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_keys, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_keys_out, sizeof(unsigned long long) * (size_t)total) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_val, sizeof(double) * (size_t)nsegs) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_status, sizeof(int) * (size_t)nsegs) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_seg_off, sizeof(int) * (size_t)(nsegs + 1)) != 0) ok = 0;
+    const size_t c0_bytes = sizeof(double) * (size_t)nsegs * (size_t)kmax;
+    /* Size the CUB temporary storage once per call (it depends on the segment
+       count and length, not on the values). */
+    size_t temp_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortKeys(
+        (void *)NULL, temp_bytes, (const unsigned long long *)NULL, (unsigned long long *)NULL,
+        (int)total, nsegs, (const int *)NULL, (const int *)NULL);
+    if (temp_bytes == 0) temp_bytes = 1;
+    /* #334: [ prog | off | pcount | c0 | seg_off ] then [ value | status ] then
+       the key buffers and the sort workspace. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nsets + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nsets);
+    const size_t o_c0 = rc_fs_take(&cur, c0_bytes);
+    const size_t o_seg = rc_fs_take(&cur, sizeof(int) * (size_t)(nsegs + 1));
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_val = rc_fs_take(&cur, sizeof(double) * (size_t)nsegs);
+    const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nsegs);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    const size_t o_keys = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)total);
+    const size_t o_keys_out = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)total);
+    const size_t o_temp = rc_fs_take(&cur, temp_bytes);
+    if (rc_fs_reserve(c, RC_FS_ORDER, cur, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    /* The f64 twins are normally uploaded once by `rc_set_fit_data`; a direct
+       caller without them gets the f32-rounded inputs, exactly like
+       `rc_fit_batch`'s own fallback. */
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + o_c0, c0, c0_bytes);
+    int *host_seg = (int *)(host + o_seg);
+    for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
+    rc_fs_h2d(c, base, host, in_end);
+    cudaMemsetAsync(base + o_status, 0, sizeof(int) * (size_t)nsegs, c->s_fit);
+    unsigned int *d_prog = (unsigned int *)(base + o_prog);
+    unsigned int *d_off = (unsigned int *)(base + o_off);
+    double *d_c0 = (double *)(base + o_c0);
+    int *d_seg_off = (int *)(base + o_seg);
+    double *d_val = (double *)(base + o_val);
+    int *d_status = (int *)(base + o_status);
+    unsigned long long *d_keys = (unsigned long long *)(base + o_keys);
+    unsigned long long *d_keys_out = (unsigned long long *)(base + o_keys_out);
+    void *d_temp = base + o_temp;
+    int threads = 256;
+    long long blocks = (total + threads - 1) / threads;
+    if (blocks > 65535) blocks = 65535;
+    if (blocks < 1) blocks = 1;
+    cudaEventRecord(c->t0, c->s_fit);
+    k_order_stat_keys<<<(int)blocks, threads, 0, c->s_fit>>>(d_prog, d_off, d_c0, kmax,
+                                                             c->d_cols64, c->d_y64, c->n, nsegs,
+                                                             ntrials, d_keys, d_status);
+    int ok = cudaGetLastError() == cudaSuccess;
     if (ok) {
-        rc_upload(d_prog, prog, sizeof(unsigned int) * prog_words);
-        rc_upload(d_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
-        rc_upload(d_p, pcount, sizeof(int) * (size_t)nsets);
-        rc_upload(d_c0, c0, sizeof(double) * (size_t)nsegs * (size_t)kmax);
-        int *host_seg = (int *)malloc(sizeof(int) * (size_t)(nsegs + 1));
-        if (!host_seg) {
-            ok = 0;
-        } else {
-            for (int s = 0; s <= nsegs; ++s) host_seg[s] = s * c->n;
-            rc_upload(d_seg_off, host_seg, sizeof(int) * (size_t)(nsegs + 1));
-            free(host_seg);
-        }
-        cudaMemset(d_status, 0, sizeof(int) * (size_t)nsegs);
-        /* Size the CUB temporary storage once per call (it depends on the
-           segment count and length, not on the values). */
+        size_t tb = temp_bytes;
         cub::DeviceSegmentedRadixSort::SortKeys(
-            NULL, temp_bytes, d_keys, d_keys_out, (int)total, nsegs, d_seg_off,
-            d_seg_off + 1);
-        if (temp_bytes == 0) temp_bytes = 1;
-        if (rc_alloc(&d_temp, temp_bytes) != 0) ok = 0;
-    }
-    float ms = -1.0f;
-    if (ok) {
-        int threads = 256;
-        long long blocks = (total + threads - 1) / threads;
-        if (blocks > 65535) blocks = 65535;
-        if (blocks < 1) blocks = 1;
-        cudaEventRecord(c->t0, 0);
-        k_order_stat_keys<<<(int)blocks, threads>>>(d_prog, d_off, d_c0, kmax, c->d_cols64,
-                                                c->d_y64, c->n, nsegs, ntrials, d_keys,
-                                                d_status);
+            d_temp, tb, d_keys, d_keys_out, (int)total, nsegs, d_seg_off, d_seg_off + 1, 0,
+            (int)(sizeof(unsigned long long) * 8), c->s_fit);
         ok = cudaGetLastError() == cudaSuccess;
-        if (ok) {
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                d_temp, temp_bytes, d_keys, d_keys_out, (int)total, nsegs, d_seg_off,
-                d_seg_off + 1);
-            ok = cudaGetLastError() == cudaSuccess;
-        }
-        if (ok) {
-            k_order_stat_pick<<<nsegs, RC_OS_PICK_THREADS>>>(d_keys_out, c->n, nsegs, what,
-                                                             d_val, d_status);
-            ok = cudaGetLastError() == cudaSuccess;
-        }
-        cudaEventRecord(c->t1, 0);
-        cudaEventSynchronize(c->t1);
-        if (ok && cudaGetLastError() != cudaSuccess) ok = 0;
-        if (ok) {
-            cudaEventElapsedTime(&ms, c->t0, c->t1);
-            rc_download(out_value, d_val, sizeof(double) * (size_t)nsegs);
-            rc_download(out_status, d_status, sizeof(int) * (size_t)nsegs);
-            if (cudaGetLastError() != cudaSuccess) ok = 0;
-        }
     }
-    if (d_prog) cudaFree(d_prog);
-    if (d_off) cudaFree(d_off);
-    if (d_p) cudaFree(d_p);
-    if (d_c0) cudaFree(d_c0);
-    if (d_keys) cudaFree(d_keys);
-    if (d_keys_out) cudaFree(d_keys_out);
-    if (d_val) cudaFree(d_val);
-    if (d_status) cudaFree(d_status);
-    if (d_seg_off) cudaFree(d_seg_off);
-    if (d_temp) cudaFree(d_temp);
-    if (!ok) return -1.0f;
+    if (ok) {
+        k_order_stat_pick<<<nsegs, RC_OS_PICK_THREADS, 0, c->s_fit>>>(d_keys_out, c->n, nsegs,
+                                                                      what, d_val, d_status);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    cudaEventRecord(c->t1, c->s_fit);
+    if (!ok) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    rc_fs_d2h(c, host + in_end, base + in_end, io_end - in_end);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    memcpy(out_value, host + o_val, sizeof(double) * (size_t)nsegs);
+    memcpy(out_status, host + o_status, sizeof(int) * (size_t)nsegs);
+    rc_fs_ok(c, RC_FS_ORDER);
+    float ms = -1.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
     return ms;
 }
 

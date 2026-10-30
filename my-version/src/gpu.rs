@@ -596,6 +596,12 @@ struct RawArenaReport {
     steady_alloc_calls: u64,
     overlapped_uploads: u64,
     batches: u64,
+    fs_alloc_calls: u64,
+    fs_growths: u64,
+    fs_steady_alloc_calls: u64,
+    fs_batches: u64,
+    fs_dev_bytes: u64,
+    fs_pinned_bytes: u64,
 }
 
 /// #285: what the batch arena is doing, for a test, benchmark or report.
@@ -616,6 +622,21 @@ pub struct ArenaReport {
     pub overlapped_uploads: u64,
     /// Batches collected through the arena.
     pub batches: u64,
+    /// #334: allocator calls made by the persistent fit and score regions
+    /// (device and pinned, allocate and free), cold and steady.
+    pub fit_alloc_calls: u64,
+    /// #334: how many times the fit/score regions grew to a new high-water mark.
+    pub fit_growths: u64,
+    /// #334: fit/score allocator calls made after the first successful batch of
+    /// the same kind (fit, rank, order statistic or maximum). Zero while the
+    /// batch shape stays inside the high-water mark.
+    pub fit_steady_alloc_calls: u64,
+    /// #334: fit and score batches completed through the persistent regions.
+    pub fit_batches: u64,
+    /// #334: current size of the persistent device region in bytes.
+    pub fit_device_bytes: u64,
+    /// #334: current size of the pinned staging region in bytes.
+    pub fit_pinned_bytes: u64,
 }
 
 impl ArenaReport {
@@ -634,6 +655,12 @@ impl ArenaReport {
             steady_alloc_calls: raw.steady_alloc_calls,
             overlapped_uploads: raw.overlapped_uploads,
             batches: raw.batches,
+            fit_alloc_calls: raw.fs_alloc_calls,
+            fit_growths: raw.fs_growths,
+            fit_steady_alloc_calls: raw.fs_steady_alloc_calls,
+            fit_batches: raw.fs_batches,
+            fit_device_bytes: raw.fs_dev_bytes,
+            fit_pinned_bytes: raw.fs_pinned_bytes,
         }
     }
 }
@@ -1380,6 +1407,12 @@ impl GpuEvaluator {
             steady_alloc_calls: 0,
             overlapped_uploads: 0,
             batches: 0,
+            fs_alloc_calls: 0,
+            fs_growths: 0,
+            fs_steady_alloc_calls: 0,
+            fs_batches: 0,
+            fs_dev_bytes: 0,
+            fs_pinned_bytes: 0,
         };
         if unsafe { rc_arena_report(self.ctx, &mut raw) } != 0 {
             return ArenaReport::from_raw(&raw);
@@ -8070,5 +8103,294 @@ mod order_stat_tests {
                 cpu_polish / gpu_polish
             );
         }
+    }
+}
+
+/// #334: persistent fit and score buffers. The golden hashes were captured from
+/// the per-call allocating path before the change; the persistent path must
+/// reproduce them bit for bit.
+#[cfg(test)]
+#[cfg(feature = "cuda")]
+mod persistent_tests {
+    use super::*;
+    use crate::expr::{constant, input, node};
+    use crate::fit::{gpu_fit_plan_reason, DeviceLoss};
+
+    const N: usize = 1_536;
+
+    struct Fixture {
+        cols32: Vec<f32>,
+        cols64: Vec<f64>,
+        y32: Vec<f32>,
+        y: Vec<f64>,
+    }
+
+    fn fixture(n: usize) -> Fixture {
+        let nv = 2;
+        let mut cols32 = vec![0.0f32; nv * n];
+        let mut cols64 = vec![0.0f64; nv * n];
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = -2.0 + 4.0 * i as f64 / (n - 1) as f64;
+            let t = if i % 3 == 2 { -2.0 + 4.0 * (i - 1) as f64 / (n - 1) as f64 } else { t };
+            let s = (((i * 37) % 101) as f64) / 50.0 - 1.0;
+            let v = 1.4 * (0.9 * t).sin() + 0.3 * t + 0.1 * s;
+            let v = if i % 5 == 4 { 0.0 } else { v };
+            cols32[i] = t as f32;
+            cols32[n + i] = s as f32;
+            cols64[i] = t;
+            cols64[n + i] = s;
+            y.push(v);
+        }
+        let y32 = y.iter().map(|&v| v as f32).collect();
+        Fixture { cols32, cols64, y32, y }
+    }
+
+    fn evaluator(f: &Fixture) -> Option<GpuEvaluator> {
+        let mut ev = match GpuEvaluator::new(&f.cols32, N, 2, &f.y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return None;
+            }
+        };
+        assert!(ev.set_fit_data(&f.cols64, &f.y, &[]), "f64 fit data upload");
+        Some(ev)
+    }
+
+    fn trees() -> Vec<Node> {
+        let lin = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.15)],
+        );
+        let sine = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(1.1),
+                        node(
+                            Op::Sin,
+                            vec![node(Op::Add, vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.1)])],
+                        ),
+                    ],
+                ),
+                node(Op::Mul, vec![constant(0.2), input(1)]),
+            ],
+        );
+        let tied = node(Op::Abs, vec![node(Op::Add, vec![input(0), constant(-0.25)])]);
+        vec![lin, sine, tied]
+    }
+
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn new() -> Self {
+            Fnv(0xcbf2_9ce4_8422_2325)
+        }
+        fn u64(&mut self, v: u64) {
+            for b in v.to_le_bytes() {
+                self.0 ^= b as u64;
+                self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        fn f64(&mut self, v: f64) {
+            self.u64(v.to_bits());
+        }
+    }
+
+    fn trials_for(plans: &[&crate::fit::GpuFitPlan], ntrials: usize) -> Vec<Vec<Vec<f64>>> {
+        plans
+            .iter()
+            .map(|p| {
+                (0..ntrials)
+                    .map(|t| {
+                        let mut c = p.c0.clone();
+                        for (i, v) in c.iter_mut().enumerate() {
+                            *v *= 1.0 + 0.013 * (t as f64 + 1.0) + 0.002 * i as f64;
+                        }
+                        c
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// One fit batch per loss, one rank batch, both order statistics and the
+    /// maximum scan, folded into one hash.
+    fn workload(ev: &mut GpuEvaluator, plans: &[&crate::fit::GpuFitPlan]) -> u64 {
+        let mut h = Fnv::new();
+        for loss in [DeviceLoss::Squared, DeviceLoss::LogSquashed, DeviceLoss::Absolute] {
+            let (out, ms) = ev.fit_batch(plans, 6, loss);
+            assert!(ms >= 0.0, "{loss:?} fit batch ran");
+            for o in &out {
+                h.u64(o.status as u64);
+                h.f64(o.sse);
+                for &c in &o.c {
+                    h.f64(c);
+                }
+            }
+        }
+        let trials = trials_for(plans, 4);
+        let rank = ev.rank_score_trials(plans, &trials).expect("rank batch");
+        for row in &rank {
+            for s in row {
+                match s {
+                    Some(s) => {
+                        h.u64(s.ab as u64);
+                        h.u64((s.ab >> 64) as u64);
+                        h.u64(s.aa as u64);
+                        h.u64((s.aa >> 64) as u64);
+                        h.u64(s.bb as u64);
+                        h.u64((s.bb >> 64) as u64);
+                    }
+                    None => h.u64(u64::MAX),
+                }
+            }
+        }
+        for what in 0..2 {
+            let r = if what == 0 {
+                ev.median_score_trials(plans, &trials)
+            } else {
+                ev.interquartile_score_trials(plans, &trials)
+            }
+            .expect("order-statistic batch");
+            for row in &r {
+                for v in row {
+                    h.f64(v.unwrap_or(f64::NAN));
+                }
+            }
+        }
+        let mx = ev.max_score_trials(plans, &trials).expect("max batch");
+        for row in &mx {
+            for v in row {
+                match v {
+                    Some(m) => {
+                        h.f64(m.value);
+                        h.u64(m.row as u64);
+                    }
+                    None => h.u64(u64::MAX),
+                }
+            }
+        }
+        h.0
+    }
+
+    fn plans_of(trees: &[Node]) -> Vec<crate::fit::GpuFitPlan> {
+        trees.iter().map(|t| gpu_fit_plan_reason(t).expect("an eligible plan")).collect()
+    }
+
+    /// Value captured from the pre-change per-call allocating path.
+    const GOLDEN_WORKLOAD: u64 = 0xdcc9_bb82_1db2_9ad8;
+
+    #[test]
+    fn persistent_buffers_reproduce_the_allocating_path_bit_for_bit() {
+        let f = fixture(N);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let owned = plans_of(&trees());
+        let plans: Vec<&crate::fit::GpuFitPlan> = owned.iter().collect();
+        let a = workload(&mut ev, &plans);
+        eprintln!("PERSISTENT_WORKLOAD_HASH={a:#018x}");
+        let b = workload(&mut ev, &plans);
+        assert_eq!(a, b, "repeat on the same context differs");
+        assert_eq!(a, GOLDEN_WORKLOAD, "differs from the pre-change path");
+    }
+
+    /// After one warm-up batch of each kind, 100 consecutive fit batches and
+    /// 100 batches each of the rank, median and interquartile stages make no
+    /// allocator call, grow nothing and leave both regions at their size.
+    #[test]
+    fn steady_state_fit_and_score_batches_make_no_allocator_calls() {
+        let f = fixture(N);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let owned = plans_of(&trees());
+        let plans: Vec<&crate::fit::GpuFitPlan> = owned.iter().collect();
+        let trials = trials_for(&plans, 4);
+        let fit = |ev: &mut GpuEvaluator| {
+            let (out, ms) = ev.fit_batch(&plans, 4, DeviceLoss::Squared);
+            assert!(ms >= 0.0 && out.len() == plans.len(), "fit batch ran");
+        };
+        // Warm-up: the first batch of each kind sizes the regions.
+        fit(&mut ev);
+        ev.rank_score_trials(&plans, &trials).expect("rank warm-up");
+        ev.median_score_trials(&plans, &trials).expect("median warm-up");
+        ev.interquartile_score_trials(&plans, &trials).expect("iqr warm-up");
+        ev.max_score_trials(&plans, &trials).expect("max warm-up");
+        let warm = ev.arena_report();
+        assert!(warm.fit_growths > 0 && warm.fit_alloc_calls > 0, "{warm:?}");
+        assert!(warm.fit_device_bytes > 0 && warm.fit_pinned_bytes > 0, "{warm:?}");
+
+        for _ in 0..100 {
+            fit(&mut ev);
+        }
+        let after_fit = ev.arena_report();
+        assert_eq!(after_fit.fit_steady_alloc_calls, 0, "{after_fit:?}");
+        assert_eq!(after_fit.fit_alloc_calls, warm.fit_alloc_calls, "{after_fit:?}");
+        assert_eq!(after_fit.fit_batches - warm.fit_batches, 100);
+
+        for _ in 0..100 {
+            ev.rank_score_trials(&plans, &trials).expect("rank batch");
+        }
+        let after_rank = ev.arena_report();
+        assert_eq!(after_rank.fit_steady_alloc_calls, 0, "{after_rank:?}");
+        assert_eq!(after_rank.fit_alloc_calls, warm.fit_alloc_calls, "{after_rank:?}");
+        assert_eq!(after_rank.fit_batches - after_fit.fit_batches, 100);
+
+        for what in 0..2 {
+            for _ in 0..100 {
+                if what == 0 {
+                    ev.median_score_trials(&plans, &trials).expect("median batch");
+                } else {
+                    ev.interquartile_score_trials(&plans, &trials).expect("iqr batch");
+                }
+            }
+        }
+        for _ in 0..100 {
+            ev.max_score_trials(&plans, &trials).expect("max batch");
+        }
+        let end = ev.arena_report();
+        assert_eq!(end.fit_steady_alloc_calls, 0, "{end:?}");
+        assert_eq!(end.fit_alloc_calls, warm.fit_alloc_calls, "{end:?}");
+        assert_eq!(end.fit_growths, warm.fit_growths, "{end:?}");
+        assert_eq!(end.fit_device_bytes, warm.fit_device_bytes, "{end:?}");
+        assert_eq!(end.fit_pinned_bytes, warm.fit_pinned_bytes, "{end:?}");
+
+        // A smaller batch stays inside the high-water mark.
+        let small: Vec<&crate::fit::GpuFitPlan> = plans[..1].to_vec();
+        let (out, ms) = ev.fit_batch(&small, 4, DeviceLoss::Squared);
+        assert!(ms >= 0.0 && out.len() == 1);
+        let small_trials = trials_for(&small, 2);
+        ev.rank_score_trials(&small, &small_trials).expect("small rank batch");
+        let shrunk = ev.arena_report();
+        assert_eq!(shrunk.fit_alloc_calls, warm.fit_alloc_calls, "{shrunk:?}");
+        assert_eq!(shrunk.fit_steady_alloc_calls, 0, "{shrunk:?}");
+    }
+
+    /// A batch past the high-water mark grows the regions exactly once, the
+    /// growth is counted as a steady-state allocator call, and the next
+    /// batch of that size is free again.
+    #[test]
+    fn a_larger_batch_grows_the_regions_once_and_is_counted() {
+        let f = fixture(N);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let owned = plans_of(&trees());
+        let one: Vec<&crate::fit::GpuFitPlan> = owned[..1].iter().collect();
+        let all: Vec<&crate::fit::GpuFitPlan> = owned.iter().collect();
+        let (_, ms) = ev.fit_batch(&one, 4, DeviceLoss::Squared);
+        assert!(ms >= 0.0);
+        let before = ev.arena_report();
+        assert_eq!(before.fit_steady_alloc_calls, 0, "{before:?}");
+        let many: Vec<&crate::fit::GpuFitPlan> = (0..400).map(|k| all[k % all.len()]).collect();
+        let (_, ms) = ev.fit_batch(&many, 4, DeviceLoss::Squared);
+        assert!(ms >= 0.0);
+        let grown = ev.arena_report();
+        assert!(grown.fit_growths > before.fit_growths, "{grown:?}");
+        assert!(grown.fit_steady_alloc_calls > 0, "{grown:?}");
+        let (_, ms) = ev.fit_batch(&many, 4, DeviceLoss::Squared);
+        assert!(ms >= 0.0);
+        let again = ev.arena_report();
+        assert_eq!(again.fit_alloc_calls, grown.fit_alloc_calls, "{again:?}");
+        assert_eq!(again.fit_growths, grown.fit_growths, "{again:?}");
     }
 }
