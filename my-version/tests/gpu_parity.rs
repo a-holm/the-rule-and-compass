@@ -1100,7 +1100,7 @@ fn pit_asof_joins_are_byte_identical_and_causal() {
 ///
 /// Each arm is a separate invocation so no single lock hold covers both.
 #[test]
-#[ignore = "large store, see docs/ohlcv.md (RCSR_PARITY_ARM=cpu|gpu|compare); the gpu arm is blocked by a projected-ring hang (issue pending)"]
+#[ignore = "large store, see docs/ohlcv.md (RCSR_PARITY_ARM=cpu|gpu|compare); the gpu arm is blocked by a projected-ring hang (#352)"]
 fn large_store_parity_at_the_declared_tiers() {
     let store_path = std::env::var("RCSR_PARITY_STORE")
         .unwrap_or_else(|_| "/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb".to_string());

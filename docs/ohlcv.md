@@ -1080,7 +1080,7 @@ for arm in cpu gpu compare; do
 done
 ```
 
-The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical per-column hashes. On 2026-10-30 the `cpu` arm finished (298 columns, 2579 s wall, 1603 s feature phase, 1.2 GB peak RSS); the `gpu` arm hung in the projected ring (the reader thread waits for a free slot that is never returned) and was killed, so the 16.1M CPU/GPU comparison is not yet recorded.
+The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical per-column hashes. On 2026-10-30 the `cpu` arm finished (298 columns, 2579 s wall, 1603 s feature phase, 1.2 GB peak RSS); the `gpu` arm hung in the projected ring (#352; the reader thread waits for a free slot that is never returned) and was killed, so the 16.1M CPU/GPU comparison is not yet recorded.
 
 ### Measured enrichment (2026-10-21)
 
