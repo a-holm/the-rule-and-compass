@@ -175,6 +175,14 @@ is the zero forecast, the out-of-sample benchmark of Gu, Kelly and Xiu (RFS
 2020, eq. 19). `TargetSpec::return_from_target` maps a label-space value back to
 a return for tools that report return-space metrics.
 
+With a structural term the run also fits the affine rung `a + b*S`, the 20-bin
+`E[y|S]` and the OLS rung on the scale column, all on fit-train only, and reports
+all four in `baselines.target_structure.rungs` with train, validation and test
+errors (`docs/overfitting.md` section 3.10b). A spec with a constant scale and a
+zero offset has no structure: the reference is the mean. Per-member flags
+`beats_zero_param_test` and `beats_zero_param_validation` say whether a member
+beats the zero-parameter rung beyond noise.
+
 **Verify.** `cargo test --release target::`, `tests/target_spec.rs`; the golden
 cell test `tests/target_golden.rs` (ignored; needs `RCSR_COMPACT_CELL`).
 
@@ -285,6 +293,19 @@ column with `family=mtf`, timeframe and PIT rule.
 operators, complexity cap and feature set. Do not keep re-reading the same
 `test_error` hundreds of times. Freeze the expression, then score it once on a
 lockbox that was excluded from every choice.
+
+On a time-ordered run the engine designates a selected member only from a
+validation slice (`--validation-frac`). Without one the verdict is `unvalidated`,
+`selected_rank` is null and the run prints one warning: the front is a menu.
+`--require-validation` refuses such a run with exit 2; campaign recipes pass it.
+The `--select-by` order is display only. The selected member comes from the
+validation gates: a member is supported when it improves on the last supported
+one by more than `--equivalence-z` (default 1) Driscoll-Kraay standard errors of
+the paired loss differential, and the verdict is `signal` only when the top
+supported member beats the reference (the affine rung with a declared
+structure, else the mean) by a one-sided Bonferroni threshold at 0.05. Test
+errors are scoring-only. For overlapping labels set `--noise-lag` to at least
+the horizon in steps minus one; with a target spec the horizon is read from it.
 
 Example with a numeric year column:
 
