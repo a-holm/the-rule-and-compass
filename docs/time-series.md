@@ -243,6 +243,36 @@ it is also used for choices, there is no holdout.
 * `tests/reports.rs::json_stays_valid_when_a_report_is_requested` and the
   report tests cover the non-search evaluation path.
 
+### Exact threshold and the shared mask (walk-forward)
+
+**Check.** When a walk-forward threshold is reported, it must be the exact
+type-7 quantile of the train/validation scores, not a sketch. `rcsr walkforward`
+selects the two ranks around `h = (n - 1) q` by order-preserving radix count,
+canonicalises `-0` to `+0`, drops NaN/`±inf`, and interpolates in `f64`. The
+window's `threshold_source` is `train_type7`, `validation_type7` or `fixed`
+(a pre-registered `--threshold-fixed` value).
+
+Positions use the shared valid-row mask: a row is usable only when **both** its
+score and target are finite. That matters at the boundary — in the pinned eval
+cell six rows have a finite score and a `NaN` target. Keeping them would change
+exposure and every pooled return even though `position_for` alone would score
+the row. `score == theta` is flat (`strict >`).
+
+**What fails.** A histogram/subsample quantile places reported positions, so the
+reported P&L depends on the sketch; or the score-only and score-and-target
+masks disagree, so the P&L, risk and baseline tables use different
+denominators.
+
+**Verify.**
+
+* `tests/pnl_gpu.rs` compares exact radix selection with a CPU sort on 1e6
+  scores containing duplicates, NaNs and `±0` (bit-identical `theta` and
+  positions), reproduces the six-row NaN-target difference, and checks batch
+  and thread-count invariance.
+* `--threshold-fixed` is reported as `threshold_source = "fixed"`; a
+  screening-only threshold is refused by the position vector.
+* `docs/walkforward.md` § Exact threshold carries the contract.
+
 ---
 
 ## 6. Panel data: groups are not one-hot inputs

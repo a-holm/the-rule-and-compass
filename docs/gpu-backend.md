@@ -144,6 +144,45 @@ and is the cheapest first check on a rented Spark; it does not measure native
 native run.
 
 
+## Projected transport (#294)
+
+A wide store is a **read policy** problem before it is a device problem. When
+`--data` is a `.rcsb` store and `--vars` and `--time` are given, the search
+loads only the variables, targets, `--weight`, `--time` and `--group-by`
+columns. `--no-project` restores the full-column load for an A/B run. Filters,
+`--dtype` expansion and `--sample-rows` also keep the full path because they
+need the whole header.
+
+`Projection` resolves exact column names against the header, refuses a missing
+or dictionary-only name instead of dropping it, stores header indices in header
+order, and hashes `index:name:dtype;` with FNV-1a 64. The hash and the exact
+column list are written to `--run-manifest` as `projection.{hash,columns,indices}`.
+`--json` for `rcsr enrich` carries the same pair for its device read.
+
+The device path does not build a `Table` at all. `ProjectedRing` owns two or
+three `cudaHostAlloc` slots capped at 64 MB total, plus one reader thread that
+`pread`s the projected blocks straight into the pinned slot. The main thread
+enqueues one `cudaMemcpyAsync` per projected column on a copy stream and runs
+the next group's segment-id and elementwise feature tile (`r*`, `lag_r1_*`,
+`range1`, `clv1`, calendar) on a compute stream. A copy event guards slot reuse;
+a compute event guards the slot's device writes. The only stream
+synchronisation is the final join after the last group. A group larger than the
+cap is refused with its byte count rather than silently shrinking the
+projection.
+
+`rcsr enrich --gpu on` uses this transport by default. It reads only
+`ts/open/high/low/close` plus optional `volume/quote_volume`; the transport
+upload is measured in `gpu.transfer_bytes`. On a store that cannot be projected
+(e.g. a text-only field required as a numeric kernel input) the historical
+whole-column upload is used and reported, never silently.
+
+Measured on the RTX 3060 with the 6 400-row fixture: a 3-slot 7-column ring is
+constant across 100 groups, tiled `r1/r5/lag/range/clv/calendar` columns are
+bit-identical to the whole-column kernels, and the copy/compute event windows
+overlap (`tests/gpu_ring.rs`). `RCSR_NO_PROJECTED_UPLOAD=1` forces the
+historical whole-column upload for a paired run; it is a measurement escape
+hatch, not a supported production mode.
+
 ## How it works
 
 **Bytecode.** Each expression is compiled once into a compact postfix program of
@@ -1969,6 +2008,35 @@ to read GPU performance counters) on this host, so `sm_occupancy` stays `null`.
 `nsys profile -t cuda` traces the run, but its importer is missing here, so no
 CUPTI duty number is claimed. Kernel-time duty from the ledger is not a
 substitute for either.
+
+## Long-only P&L reduction (issue #304)
+
+`src/cuda/pnl.cu` is a separate, fused long-only `{0, +1}` P&L reduction over a
+candidate's score vector. It is not the search scorer and it does not evaluate
+expressions; it consumes scores and accumulates the same book the scalar
+`walkforward` evaluator builds. `rcsr walkforward --device-pnl` exercises it as
+a cross-check beside the reported CPU metrics.
+
+The design follows the determinism contract of the batched fit:
+
+* rows are split into fixed 8,192-row **canonical segments**; inside a segment
+  rows go to 32 virtual lanes by `(row - segment_start) % 32`, and the lanes
+  merge through a fixed pairwise tree;
+* a segment is always split over the same lanes, so 128, 256 and 512 threads
+  change warp ownership only, never summation order; a warp reads 32 consecutive
+  rows at a time instead of striding by the whole segment;
+* chunks that end inside a segment resume the per-segment accumulator in device
+  memory, so alone/padded/4 k/64 k chunks are bit-identical;
+* all P&L terms are `f64`; only the input score is `f32`;
+* candidates stream through a declared tile of at most 8 candidates, so the
+  path never materialises `P x N` scores;
+* the final exit is charged once per group, positions are only `{0, 1}`, and a
+  negative position is rejected (no short kernel).
+
+The CPU canonical path in `src/trading_gpu.rs` uses the same segments and merge
+order, so device/CPU parity is bit-identical on the fixtures (and within
+`1e-9` relative, the acceptance gate, even if a future input exposes a rounding
+difference).
 
 ## Verified versus unverified
 

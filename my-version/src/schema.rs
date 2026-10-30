@@ -113,6 +113,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--save-every", "int", "25", "checkpoint interval in generations (requires --save)"),
         ("--resume", "string", "none", "resume a checkpoint; saved search settings win, only --generations may be raised, data and backend must match"),
         ("--allow-backend-change", "flag", "false", "permit --resume across cpu<->gpu (recorded on stderr and in --run-manifest)"),
+        ("--no-project", "flag", "false", "load every column of a .rcsb store. The default projects a store read to --vars, targets, --weight, --time and --group-by when --vars and --time are both given; the resolved projection hash, column list and header indices are written to --run-manifest. --no-project is the A/B escape hatch and keeps the unprojected path"),
         // #140: run integrity.
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (commit, dirty, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, UTC start/end, phase timings); updated atomically at the end"),
         ("--dev-log", "string", "rcsr.dev.ndjson next to --json-out/--save, else the working directory", "write the bounded NDJSON development log to this path instead of the default. The log is ON BY DEFAULT (see --dev-log-level and --no-dev-log): run_start, generation events, checkpoint and run_end, schema `rcsr-devlog/1`, documented in docs/dev-log.md. Never changes the archive, results or config hash; no raw rows"),
@@ -179,6 +180,7 @@ pub fn json() -> String {
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
 {{\"name\":\"--expr\",\"type\":\"string\",\"default\":\"none\",\"description\":\"score expression; variables resolve by column name; repeat to select candidates on validation\"}},\
+{{\"name\":\"--select-band\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"#308 banded finalist selection: screen repeated candidates with the fused long-only validation P&L, admit K=max(8,P/16) plus an epsilon band, rescore admitted candidates on full validation rows in exact CPU f64 and rank by (net, turnover, complexity, index); JSON carries surrogate_rank, exact_rank, band, epsilon, finalists_considered, recall_band and scored_by=cpu_f64; needs --validation-frac > 0\"}},\
 {{\"name\":\"--vars\",\"type\":\"csv\",\"default\":\"all numeric except target/time/group\",\"description\":\"feature columns\"}},\
 {{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time/ordering column\"}},\
 {{\"name\":\"--group-by\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel group column; costs and positions are per group\"}},\
@@ -187,13 +189,25 @@ pub fn json() -> String {
 {{\"name\":\"--horizon\",\"type\":\"float\",\"default\":\"0\",\"description\":\"forward-label horizon in seconds; minimum purge/embargo\"}},\
 {{\"name\":\"--embargo\",\"type\":\"float\",\"default\":\"horizon\",\"description\":\"extra gap between train_end and test_start\"}},\
 {{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"10\",\"description\":\"cost per side in basis points\"}},\
-{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"training/validation score quantile\"}},\
+{{\"name\":\"--threshold-quantile\",\"type\":\"float\",\"default\":\"0.7\",\"description\":\"exact type-7 training/validation score quantile; order-preserving radix select, f64 interpolation\"}},\
+{{\"name\":\"--threshold-fixed\",\"type\":\"float\",\"default\":\"none\",\"description\":\"pre-registered fixed threshold instead of a quantile; reported with threshold_source = fixed\"}},\
+{{\"name\":\"--policy\",\"type\":\"enum\",\"default\":\"threshold\",\"description\":\"threshold | band | dp; band is a long-only no-trade band, dp keeps the threshold book and reports an exact hindsight bound (never a strategy P&L)\"}},\
+{{\"name\":\"--band\",\"type\":\"float\",\"default\":\"0\",\"description\":\"half-width beta of the no-trade band in score units; beta=0 with --policy band reproduces the threshold rule\"}},\
+{{\"name\":\"--min-hold\",\"type\":\"int\",\"default\":\"1\",\"description\":\"minimum consecutive long rows before a band exit\"}},\
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
 {{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
+{{\"name\":\"--device-pnl\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"recompute each test block through the fused f64 long-only reduction (CUDA kernel when available, identical canonical CPU segments otherwise) and report it with cash and buy-and-hold benchmarks; the scalar evaluator remains the authority\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
-{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}]}},\n  \
+{{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}],\
+         \"risk_model\":{{\"mode\":\"per-period\",\"periods_per_year\":\"the reported annualisation value\",\
+         \"sharpe\":\"mean/sd(ddof=1)*sqrt(periods_per_year); NaN when n<2 or sd=0 (cash)\",\
+         \"sortino\":\"(mean-MAR)/(population RMS of min(R-MAR,0))*sqrt(periods_per_year); default MAR 0\",\
+         \"log_growth\":\"mean of log1p(R); -inf on R<=-1 (ruin)\",\
+         \"drawdown\":\"log-equity peak-to-trough as a negative fraction; -1 on ruin\",\
+         \"beta_alpha\":\"beta from (n,sum x,sum y,sum xy,sum x^2); alpha per period, annualised by periods_per_year\",\
+         \"daily\":\"compound blocks with risk::compound_blocks then use periods_per_year=365\"}}}},\n  \
          \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
  {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\
@@ -226,7 +240,7 @@ pub fn json() -> String {
          \"enrich\":{{\"command\":\"rcsr enrich\",\"summary\":\"append causal, gap-aware OHLCV features to an existing .rcsb store without rebuilding it\",\"doc\":\"docs/ohlcv.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"existing .rcsb store or a CSV (loaded once into a temporary store)\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"<data>.enriched.rcsb\",\"description\":\"output store; existing columns are copied byte for byte\"}},\
-{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"default financial feature set: returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, cross, py15m, mtf, compact, flow, price_action, all, or explicit names; #125 names/groups also accepted. compact is the exact 52-name parity/smoke subset; flow is vwap plus the nine derived OHLCV/flow columns; mtf is the 36 causal multi-timeframe columns; cross is the complete #273 BTC/ETH benchmark, market-state, breadth, dispersion, average-correlation and [-1,1] rank family; price_action is the continuous candle geometry and multi-bar structure of #261 (clv16 body16 rng_atr prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96; batr is shared with compact). engine_catalogue lists all 254 engine names (216 catalogue + 38 compact-only) with family, warm-up and exact formula, and feature_registry lists every default-set column as available:true or available:false with its missing dependency; an unavailable or unknown name fails closed\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"default financial feature set: returns, ma, vol, atr, rsi, bollinger, vz, range, candle, donchian, calendar, lags, xs, btc, cross, py15m, mtf, compact, flow, price_action, all, or explicit names; #125 names/groups also accepted. compact is the exact 52-name parity/smoke subset; flow is vwap plus the nine derived OHLCV/flow columns; mtf is the 36 causal multi-timeframe columns (device resample + causal join under --features cuda --gpu on; auto stays CPU until the 16M crossover is measured); cross is the complete #273 BTC/ETH benchmark, market-state, breadth, dispersion, average-correlation and [-1,1] rank family (finite PIT members only, N>=20, ties by symbol then row, -0==+0; CUDA ranks reuse one device (time,symbol,row) permutation and a stable segmented sort); price_action is the continuous candle geometry and multi-bar structure of #261 (clv16 body16 rng_atr prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96; batr is shared with compact); the twelve derived flow columns and the eleven price-action columns have fused CUDA producers on one base pass per family, registered only in a --features cuda build. engine_catalogue lists all 254 engine names (216 catalogue + 38 compact-only) with family, warm-up and exact formula, and feature_registry lists every default-set column as available:true or available:false with its missing dependency and its declared parity_tier (bitwise, 1e-12, unavailable or reference); an unavailable or unknown name fails closed\"}},\
 {{\"name\":\"--label\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n> (repeatable; labels are targets)\"}},\
 {{\"name\":\"--replace\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"overwrite an existing numeric column in place; default refuses a duplicate and preserves every column\"}},\
 {{\"name\":\"--chunk-rows\",\"type\":\"int\",\"default\":\"65536\",\"description\":\"read/compute batch; arithmetic and output hashes are identical for every size\"}},\
@@ -240,6 +254,7 @@ pub fn json() -> String {
 {{\"name\":\"--eth-data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"ETH benchmark store when --data does not contain it\"}},\
 {{\"name\":\"--gpu\",\"type\":\"enum\",\"default\":\"auto\",\"description\":\"auto | on | off; auto uses a registered exact kernel only when it beats the CPU, on forces it above the 1M-row floor, off runs the CPU reference\"}},\
 {{\"name\":\"--no-gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"force CPU (alias --cpu)\"}},\
+{{\"name\":\"--write-bw\",\"type\":\"float\",\"default\":\"222 MB/s\",\"description\":\"measured sequential write bandwidth for cost model v2; the write term is charged separately from D2H\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout\"}}]}},\n  \
@@ -264,6 +279,7 @@ pub fn json() -> String {
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"engine_catalogue\":{},\n  \
          \"feature_registry\":{},\n  \
+         \"gpu_feature_parity\":{{\"mtf\":{{\"family\":\"mtf\",\"columns\":36,\"timeframes\":[\"1h\",\"4h\",\"1d\"],\"tier\":\"bitwise; vol sqrt <=1e-12\",\"dispatch\":\"opt-in: --gpu on until the 16M crossover is measured\",\"kernel\":\"src/cuda/mtf.cu\",\"test\":\"tests/mtf_gpu.rs\"}},\"engine_tail\":{{\"family\":\"engine-tail\",\"columns\":26,\"tier\":\"bitwise extrema; log-derived exotic <=1e-6; recurrences <=1e-12\",\"dispatch\":\"registered; --gpu auto uses cost model v2, --gpu on forces\",\"kernel\":\"src/cuda/tail.cu\",\"test\":\"tests/enrich_gpu.rs\"}}}},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
         jstr(VERSION),
         jstr("symbolic regression: find an interpretable f(x) ~ y"),

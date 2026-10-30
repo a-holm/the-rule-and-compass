@@ -41,6 +41,23 @@ This replaces the old representation, which kept both `Vec<Vec<f64>>`
   [`data-format.md`](data-format.md).
 * **No `f32`.** Storage stays `f64`; results are the numbers the user supplied.
 
+## Projected reads and the upload ring (issue #294)
+
+A projection is an index vector, not a copied table. With 20 variables plus
+time from a 364-column store, the resident storage term falls from about
+`364 · 8 · n` bytes to `21 · 8 · n`; the guard charges the projected columns
+(`storage_bytes`), a projected group buffer instead of the full-header
+`GroupBuf`, and the pinned ring (`ring_bytes`). The device tile is reported as
+`device_tile_bytes` but is not host RSS. `store_memory` in `--json` exposes all
+of these terms.
+
+The GPU transport pins **3 slots × one projected group**, capped at **64 MB**.
+At `group_rows = 65 536` and 21 `f64`/`i64` columns that is 11 MB per slot,
+33 MB for the ring. The pin is constant for the life of the run; groups stream
+through it. A group wider than the cap is a refusal, not a fallback to a full
+table. The reader writes straight into the pinned slot (`pread`), so there is
+no intermediate `Vec<f64>` and no second host copy.
+
 ## Row selectors
 
 A split, fold or evaluation subset is described by a [`RowSelector`]:
@@ -68,3 +85,19 @@ split=temporal | selector: train range 0..600 (600 rows) | test range 600..800 (
 therefore cannot be computed from a streaming group scan; when an out-of-core
 backing is added those metrics must stay resident, be capped, or be reported as
 approximate.
+
+## Enrichment output staging (#300)
+
+`rcsr enrich` stages each feature column to a temporary `f64` file before the
+append pass. The writer uses a 64 KiB staging block (`ENRICH_TEMP_WRITE_CHUNK_BYTES`),
+and the GPU path adds a per-family output arena plus its pinned host mirror.
+Both are capped at **64 MiB** (`GPU_OUTPUT_ARENA_BYTES` /
+`GPU_PINNED_STAGE_BYTES`); a family block whose columns do not fit falls back to
+the per-column staging path, so the bound does not grow with the 358-column
+catalogue. `memory::enrich_output_stage_bytes(rows, columns)` returns the
+charged bytes, `min(rows * columns * 8, 64 MiB) + 64 KiB`.
+
+At 16.1M rows one `f64` column is 128 MiB, so the arena cannot hold even one
+full column; that case uses per-column staging and is reported as such. At the
+3.87M-row scale the arena holds two columns, and a 500k-row parity fixture holds
+eight. The pinned mirror is reused across blocks, never allocated per column.

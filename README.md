@@ -159,12 +159,24 @@ group flat; pooled P&L carries each group's ending position across a window
 boundary and charges the seam term `|p_end - q_start|` (pass
 `--pool-reset-flat` for the historical reset). Repeat `--expr` to select among
 candidates by their validation error; the test block is never a selection
-input. The fold sign test is reported as not applicable for expanding folds
-because `test_k` lies inside `train_{k+1}`. See
-[`docs/walkforward.md`](docs/walkforward.md) for the semantics, metric
-definitions and the reference-agreement check against the Python evaluator, and
-[`docs/eval-benchmark.md`](docs/eval-benchmark.md) for the pinned 4M-row
-Python-vs-Rust benchmark protocol and the measured 10x evidence.
+input. `--select-band` selects those repeated candidates with the long-only P&L
+band instead: a screening score admits a measured `epsilon` band, the admitted
+set is rescored on full validation rows in exact CPU `f64`, and a deterministic
+`(net, turnover, complexity, index)` tie-break picks the finalist; the JSON
+carries the surrogate/exact ranks, band width and recall audit. The fold sign
+test is reported as not applicable for expanding folds
+because `test_k` lies inside `train_{k+1}`. Pass `--device-pnl` to recompute
+each test block through the fused f64 long-only reduction (`src/trading_gpu.rs`
+plus the CUDA kernel `src/cuda/pnl.cu`) and report it with cash and
+buy-and-hold benchmarks; the scalar evaluator stays the reported authority.
+`--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
+associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
+adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
+strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
+semantics, metric definitions and the reference-agreement check against the
+Python evaluator, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
+the pinned 4M-row Python-vs-Rust benchmark protocol and the measured 10x
+evidence.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
@@ -377,7 +389,12 @@ atomically instead of streaming it. See
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
   `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
-  the preparation block, manifest and dev log. `rcsr
+  the preparation block, manifest and dev log. When a store is read with
+  `--vars` and `--time`, the default **projects the read** to those variables,
+  targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
+  the guard charges only them, and the resolved hash and column list go into
+  `--run-manifest` (`--no-project` restores the full-column load for an A/B
+  run). `rcsr
   import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
   v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).
@@ -404,13 +421,23 @@ atomically instead of streaming it. See
   deviation) with the documented zero-volume/zero-trade and gap policies, the
   `mtf` group emits all 36 multi-timeframe columns
   (`mtf_<1h|4h|1d>_<leaf>`), joined only after the higher bar has closed with
-  explicit `bar_age` staleness, the `price_action` group adds the continuous
+  explicit `bar_age` staleness (the same resample and causal join dispatch to
+  the device under `--features cuda` and `--gpu on`), the engine-tail kernels
+  cover return/MA parameters, `don20`/`don96`, stochastic, ATR/ADX/DI,
+  Bollinger and the registered exotic statistics with `O(n)` blocked extrema
+  and one shared gap policy (`r16`, `r96` and `don96` no longer fall through
+  the compact guard), the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
   masks, and the `cross` group adds the complete #273 BTC/ETH benchmark
   context, equal-weight market state, breadth, dispersion, average-correlation
-  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. The
+  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. On
+  the CUDA path one device `(time,symbol,row)` permutation serves every rank
+  column, with non-members and NaN keyed last. The
+  fused flow and price-action device producers materialise their twelve and
+  eleven derived columns from one base pass per family, with a declared
+  `bitwise`/`1e-12` tier per column (`feature_registry.parity_tier`). The
   default financial feature set is registered in `rcsr schema`
   (`feature_registry`): every available column has a tested producer, and
   registered-but-unavailable derivative columns fail closed with the missing
@@ -421,13 +448,16 @@ atomically instead of streaming it. See
   mapping for every name shared by several groups. The CPU path is always
   available; a per-family cost model
 
-  decides CPU vs GPU and records the reason, GPU builds upload the source
-  columns once and report the GPU column share, and the 3.9M-row measurement
+  decides CPU vs GPU and records the reason, GPU builds read only the required
+  source blocks into a bounded pinned ring and copy them straight to the device
+  (no full `Table`), report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the
   16.1M-row OHLCV panel the GPU feature phase is **1.49x** the CPU (72.1 % of
   columns dispatched, zero fallbacks) while end-to-end wall is decided by the
   append write; the output checksum is computed while the blocks stream, so a
-  multi-gigabyte store is never read twice. See
+  multi-gigabyte store is never read twice. GPU output blocks share a 64 MiB
+  arena and a pinned chunked D2H copy, and cost model v2 charges the measured
+  `BW_write` separately from kernel and transfer time. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
@@ -510,7 +540,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
-     [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
      [--allow-lockbox]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]

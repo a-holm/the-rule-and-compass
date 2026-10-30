@@ -47,12 +47,116 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         embargo: None,
         cost_bps: 10.0,
         threshold_quantile: 0.70,
+        threshold_fixed: None,
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
         candidates: Vec::new(),
+        band_select: false,
         pool_reset_flat: false,
         allow_lockbox: false,
+        device_pnl: false,
+        policy: walkforward::Policy::Threshold,
+        band_width: 0.0,
+        min_hold: 1,
     }
+}
+
+#[test]
+fn device_pnl_check_matches_the_scalar_book() {
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 4.0, 0.01),
+        (5.0, 5.0, -0.02),
+        (6.0, 6.0, 0.03),
+        (7.0, 7.0, -0.01),
+    ]);
+    let mut s = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    s.cost_bps = 100.0;
+    s.threshold_quantile = 0.5;
+    s.device_pnl = true;
+    let r = walkforward::run_table(&t, &s, "test").unwrap();
+    let d = r.windows[0].device_pnl.as_ref().expect("device P&L block");
+    let m = &r.windows[0].metrics;
+    assert_eq!(d.strategy.rows, m.rows as u64);
+    assert_eq!(d.strategy.entries, m.entries as u64);
+    assert_eq!(d.strategy.trades, m.trades as u64);
+    assert!((d.strategy.net - d.cpu_net).abs() <= 1e-12);
+    assert!((d.strategy.turnover - m.total_abs_delta).abs() <= 1e-12);
+    assert_eq!(d.cash.net, 0.0);
+    assert_eq!(d.cash.cost, 0.0);
+    let summary = r.device_pnl.as_ref().expect("report summary");
+    assert_eq!(summary.windows, 1);
+    assert_eq!(summary.rows, m.rows as u64);
+    assert!(summary.max_abs_net_delta <= 1e-12);
+    assert!(r.json().contains("\"device_pnl\""));
+    assert!(r.json().contains("\"buy_and_hold\""));
+}
+
+#[test]
+fn band_and_dp_policies_are_reported_and_dp_is_only_a_bound() {
+    // Training x = 0..3 => q50 threshold 1.5. Test scores 1.8 are above the
+    // threshold but below threshold+beta, so the band stays flat while the
+    // threshold rule is long.
+    let t = single(&[
+        (0.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (2.0, 2.0, 0.0),
+        (3.0, 3.0, 0.0),
+        (4.0, 1.8, 0.01),
+        (5.0, 0.0, -0.02),
+        (6.0, 1.8, 0.03),
+        (7.0, 0.0, -0.01),
+    ]);
+
+    let mut threshold = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    threshold.threshold_quantile = 0.5;
+    let tr = walkforward::run_table(&t, &threshold, "test").unwrap();
+    assert_eq!(tr.windows[0].metrics.active_rows, 2);
+
+    let mut band_zero = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    band_zero.threshold_quantile = 0.5;
+    band_zero.policy = walkforward::Policy::Band;
+    band_zero.band_width = 0.0;
+    let bz = walkforward::run_table(&t, &band_zero, "test").unwrap();
+    // beta=0 reproduces the threshold book bit for bit.
+    assert_eq!(bz.windows[0].metrics.active_rows, 2);
+    assert_eq!(bz.windows[0].metrics.trades, tr.windows[0].metrics.trades);
+    assert_eq!(
+        bz.windows[0].metrics.total_abs_delta.to_bits(),
+        tr.windows[0].metrics.total_abs_delta.to_bits()
+    );
+    assert!(bz.json().contains("\"policy\":{\"name\":\"band\""));
+
+    let mut band = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    band.threshold_quantile = 0.5;
+    band.policy = walkforward::Policy::Band;
+    band.band_width = 0.6;
+    let br = walkforward::run_table(&t, &band, "test").unwrap();
+    assert_eq!(br.windows[0].metrics.active_rows, 0);
+    let bc = br.windows[0].band.as_ref().expect("band carry check");
+    assert_eq!(bc.carry, "carry2");
+    assert_eq!(bc.groups, 1);
+
+    let mut dp = spec("x", vec![window("w", 0.0, 4.0, 4.0, 8.0)]);
+    dp.threshold_quantile = 0.5;
+    dp.policy = walkforward::Policy::Dp;
+    let dr = walkforward::run_table(&t, &dp, "test").unwrap();
+    let h = dr.windows[0]
+        .hindsight_bound
+        .as_ref()
+        .expect("hindsight bound");
+    assert_eq!(h.label, "hindsight_bound");
+    assert!(h.rule_le_bound);
+    assert!(h.net + 1e-12 >= h.rule_net);
+    // The reported book is still the threshold strategy, not the DP path.
+    assert_eq!(dr.windows[0].metrics.active_rows, 2);
+    let json = dr.json();
+    assert!(json.contains("\"hindsight_bound\":{\"label\":\"hindsight_bound\""));
+    assert!(json.contains("\"is_strategy\":false"));
+    assert!(json.contains("\"policy\":{\"name\":\"dp\",\"hindsight_bound\":true"));
 }
 
 #[test]
@@ -95,7 +199,7 @@ fn known_expression_threshold_costs_and_metrics() {
     // The first test period is -2% from the start; the final exit makes the
     // last period -2% as well, so the peak-to-trough is still -2%.
     assert!((w.metrics.max_drawdown - (-0.02)).abs() < 1e-15);
-    assert_eq!(w.threshold_source, "train");
+    assert_eq!(w.threshold_source, "train_type7");
 }
 
 #[test]
@@ -164,12 +268,12 @@ fn threshold_uses_only_train_or_validation_rows() {
     s.threshold_quantile = 0.5;
     let r = walkforward::run_table(&t, &s, "test").unwrap();
     assert!((r.windows[0].threshold - 1.5).abs() < 1e-15);
-    assert_eq!(r.windows[0].threshold_source, "train");
+    assert_eq!(r.windows[0].threshold_source, "train_type7");
 
     // With a validation slice, the threshold comes from the trailing half.
     s.validation_frac = 0.5;
     let r = walkforward::run_table(&t, &s, "test").unwrap();
-    assert_eq!(r.windows[0].threshold_source, "validation");
+    assert_eq!(r.windows[0].threshold_source, "validation_type7");
     assert_eq!(r.windows[0].validation_rows, 2);
     assert!((r.windows[0].threshold - 2.5).abs() < 1e-15);
 }
