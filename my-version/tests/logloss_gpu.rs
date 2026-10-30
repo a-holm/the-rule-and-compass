@@ -5,8 +5,9 @@
 //! 1. **the label rule** — `t = 2·[y > (min y + max y)/2] − 1`, subset
 //!    independent for a two-valued target, single-class refused;
 //! 2. **the objective is the configured one** — `log_loss` has a native *fit*
-//!    objective and deliberately no device *fitness* (`DeviceLoss::for_metric`
-//!    is `None`), so a regression cannot rank a log-loss run by squared error;
+//!    objective and, since #289, a native *fitness* objective
+//!    (`ScoreObjective::LogLoss`; the regression `DeviceLoss::for_metric` stays
+//!    `None`), so it can never be ranked by squared error;
 //! 3. **the proposal gate** — a device proposal is kept only when the exact
 //!    `f64` log-loss at it is finite and no worse than at the start;
 //! 4. **the device kernel** — parity with the CPU `logistic_irls` on the
@@ -142,22 +143,30 @@ fn a_single_class_target_is_counted_as_one_class() {
 
 // ---------------------------------------------- objective, never a proxy ----
 
-/// #234 §5: `log_loss` has a native **fit** objective and no device **fitness**.
-/// The two predicates are what keep a log-loss run from being ranked by squared
-/// error: `for_metric` is the evaluator gate and must stay `None`.
+/// #234 §5 + #289: `log_loss` has a native **fit** objective and, since #289,
+/// a native **score** objective in its own label-aware kernel. The scoring
+/// objective is not a `DeviceLoss`: it is `ScoreObjective::LogLoss` with the
+/// disjoint code 6, so a fit launch can never be mistaken for a score launch
+/// and the evaluator is still never ranked by squared error.
 #[test]
-fn log_loss_has_a_native_fit_objective_and_no_device_fitness() {
+fn log_loss_has_a_native_fit_objective_and_a_native_score_objective() {
     assert_eq!(fit::fit_loss(Metric::LogLoss), Some(fit::DeviceLoss::Logistic));
     assert_eq!(
         fit::DeviceLoss::for_metric(Metric::LogLoss),
         None,
-        "the evaluator accumulates rho(pred - y) and has no label semantics"
+        "the regression row loss still has no label semantics"
     );
+    assert_eq!(
+        metrics::ScoreObjective::for_metric(Metric::LogLoss),
+        Some(metrics::ScoreObjective::LogLoss)
+    );
+    assert_eq!(metrics::ScoreObjective::LogLoss.code(), 10);
     assert!(!fit::DeviceLoss::Logistic.scores_on_device());
     assert!(!fit::DeviceLoss::Correlation.scores_on_device());
     assert!(fit::DeviceLoss::Absolute.scores_on_device());
-    // The launch code is distinct from every code the kernel already takes
-    // (0 squared, 1 log-squashed, 2/3 correlation, 4 absolute).
+    // The fit code is distinct from the classification score code; the
+    // regression score codes are 0–9 (#287), the classification block 10–14
+    // (#289).
     assert_eq!(fit::DeviceLoss::Logistic.code(), 5);
     let mut codes: Vec<i32> = [
         fit::DeviceLoss::Squared,
@@ -183,13 +192,13 @@ fn log_loss_has_a_native_fit_objective_and_no_device_fitness() {
     assert!(fit::gpu_fit_metric_error(Metric::LogLoss).is_none());
 }
 
-/// #234: `log_loss` is a **fit-only** objective: `fit_loss` names the device
-/// objective, `for_metric` (the evaluator gate) does not, and
-/// `fit_only_loss` says so. A fit-only run therefore reports `backend = cpu` —
-/// every number a user reads is the exact CPU log-loss — while the device fits.
+/// #289: `log_loss` is no longer fit-only. It has both a device fit objective
+/// (`Logistic`) and a native scorer (`ScoreObjective::LogLoss`), so the same
+/// metric may be fitted **and** ranked on the device, while every reported
+/// number is still the exact CPU `f64` rebuild.
 #[test]
-fn log_loss_is_a_fit_only_objective() {
-    assert!(fit::fit_only_loss(Metric::LogLoss).is_some());
+fn log_loss_is_no_longer_a_fit_only_objective() {
+    assert!(fit::fit_only_loss(Metric::LogLoss).is_none());
     assert!(fit::fit_only_loss(Metric::Squared).is_none());
     assert!(fit::fit_only_loss(Metric::Absolute).is_none());
     assert!(fit::fit_only_loss(Metric::Auc).is_none());
@@ -201,10 +210,15 @@ fn log_loss_is_a_fit_only_objective() {
             fit_strategy: strategy,
             ..Default::default()
         };
+        let want = if cfg!(feature = "cuda") {
+            Backend::Gpu
+        } else {
+            Backend::Cpu
+        };
         assert_eq!(
             search::effective_backend(&cfg, &train),
-            Backend::Cpu,
-            "{strategy:?}: a fit-only run is scored on the CPU"
+            want,
+            "{strategy:?}: log_loss has a native device scorer"
         );
     }
 }
@@ -358,9 +372,11 @@ fn tiny_logloss_config(seed: u32) -> Config {
     }
 }
 
-/// #234: `--no-fit` is a true no-op for a log-loss run: the device arm is not
-/// even built (`fit_iters == 0`), so a `gpu` request and a CPU run produce the
-/// same archive, the same constants and the same reported loss.
+/// #234/#289: `--no-fit` is a true no-op for the fit arm: with
+/// `fit_iters == 0` no arm is built, so a `gpu` request and a CPU run explore
+/// the same constants. Since #289 the GPU also scores natively, so the fitness
+/// is the f32 device value during the search; the reported archive is the exact
+/// CPU rebuild in both arms.
 #[test]
 fn log_loss_no_fit_is_a_true_noop() {
     let train = binary_sample(200, 0.5, 0.1, 21);
@@ -381,8 +397,14 @@ fn log_loss_no_fit_is_a_true_noop() {
     );
     assert_eq!(cpu.archive.items.len(), gpu.archive.items.len());
     for (a, b) in cpu.archive.items.iter().zip(&gpu.archive.items) {
-        assert_eq!(a.error.to_bits(), b.error.to_bits(), "--no-fit moved a score");
         assert_eq!(bits(&a.tree), bits(&b.tree), "--no-fit moved a constant");
+        assert_eq!(
+            a.error.to_bits(),
+            b.error.to_bits(),
+            "the reported archive is the exact CPU rebuild"
+        );
+        let cpu_value = log_loss_of(&a.tree, &train);
+        assert_eq!(a.error.to_bits(), cpu_value.to_bits());
     }
 }
 
@@ -688,12 +710,12 @@ mod device {
             labelled += n;
         }
         assert_eq!(labelled, g.fit_fallback);
-        // The fitness is the exact CPU log-loss, never a device number.
+        // The *reported* fitness is the exact CPU log-loss rebuild, never a
+        // device number, and the run claims the device-scored backend.
         for s in &out.archive.items {
             assert_eq!(s.error.to_bits(), log_loss_of(&s.tree, &train).to_bits());
         }
-        // The run must not claim a device-scored backend.
-        assert_eq!(out.backend, rcsr::backend::Kind::Cpu);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu);
     }
 
     /// #234: a single-class training sample completes, with the `single_class`
@@ -876,9 +898,9 @@ fn bench_logloss_end_to_end() {
                 causes.join(","),
                 g.fit_refits
             );
-            // #234: a fit-only arm scores every candidate in the CPU fallback
-            // pool, so its fitness time is the per-generation
-            // `fallback_seconds` sum — the same ledger a GPU run reports.
+            // #234/#289: only unsupported programs use the CPU fallback pool;
+            // a native classification run scores supported candidates on the
+            // device. `fallback_seconds` remains the CPU-scoring time.
             let cpu_fitness: f64 = g.generations.iter().map(|s| s.fallback_seconds).sum();
             eprintln!(
                 "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s ({:.1}% of fit_host) \

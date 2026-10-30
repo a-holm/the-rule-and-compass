@@ -200,6 +200,12 @@ pub struct Analysis {
     pub search_s: f64,
     pub peak_rss_bytes: Option<u64>,
     pub device_hours: Option<f64>,
+    pub run_wall_s: Option<f64>,
+    pub device_busy_s: Option<f64>,
+    pub duty_run: Option<f64>,
+    pub unaccounted_s: Option<f64>,
+    pub fit_kernel_s: Option<f64>,
+    pub fit_fallback_s: Option<f64>,
     pub start_utc: String,
     pub end_utc: String,
     pub final_hash: String,
@@ -329,6 +335,12 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         a.search_s = f(e.get("search"));
         a.peak_rss_bytes = opt_f(e.get("peak_rss_bytes")).map(|v| v as u64);
         a.device_hours = opt_f(e.get("device_hours"));
+        a.run_wall_s = opt_f(e.get("run_wall_s"));
+        a.device_busy_s = opt_f(e.get("device_busy_s"));
+        a.duty_run = opt_f(e.get("duty_run"));
+        a.unaccounted_s = opt_f(e.get("unaccounted_s"));
+        a.fit_kernel_s = opt_f(e.get("fit_kernel_s"));
+        a.fit_fallback_s = opt_f(e.get("fit_fallback_s"));
         a.end_utc = string_field(e, "end");
         a.log_events = opt_f(e.get("events")).map(|v| v as u64).unwrap_or(0);
         a.log_bytes = opt_f(e.get("bytes")).map(|v| v as u64).unwrap_or(0);
@@ -656,7 +668,30 @@ pub fn render(a: &Analysis) -> String {
         None => out.push_str("| peak RSS | not available on this platform |\n"),
     }
     if let Some(h) = a.device_hours {
-        out.push_str(&format!("| device-hours | {:.6} |\n", h));
+        out.push_str(&format!("| device-hours (evaluator window) | {:.6} |\n", h));
+    }
+    if let Some(w) = a.run_wall_s {
+        out.push_str(&format!("| run ledger wall | {:.3} s |\n", w));
+    }
+    if let Some(b) = a.device_busy_s {
+        out.push_str(&format!("| device-busy (interval union) | {:.3} s |\n", b));
+    }
+    if let Some(d) = a.duty_run {
+        out.push_str(&format!("| run duty (union / wall) | {:.2}% |\n", 100.0 * d));
+    }
+    if let Some(u) = a.unaccounted_s {
+        let pct = a
+            .run_wall_s
+            .filter(|w| *w > 0.0)
+            .map(|w| 100.0 * u / w)
+            .unwrap_or(0.0);
+        out.push_str(&format!("| ledger unaccounted | {:.3} s ({:.2}%) |\n", u, pct));
+    }
+    if let Some(k) = a.fit_kernel_s {
+        out.push_str(&format!("| fit kernel seconds | {:.3} s |\n", k));
+    }
+    if let Some(f) = a.fit_fallback_s {
+        out.push_str(&format!("| fit CPU fallback | {:.3} s |\n", f));
     }
     out.push_str(&format!("| started / ended | {} / {} |\n", a.start_utc, a.end_utc));
     out.push_str(&format!(

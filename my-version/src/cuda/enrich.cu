@@ -24,45 +24,39 @@
 
 #include <cub/cub.cuh>
 
-typedef struct RcEnrichStats {
-    double kernel_ms;
-    double launch_ms;
-    double sync_ms;
-    double alloc_ms;
-    double h2d_ms;
-    double d2h_ms;
-    double wall_ms;
-    unsigned long long h2d_bytes;
-    unsigned long long d2h_bytes;
-    int batch;
-    int failed;
-} RcEnrichStats;
+#include "enrich_common.h"
 
-typedef struct RcEnrich {
-    int n;
-    int nseg;
-    int step;
-    long long *d_times;
-    double *d_open;
-    double *d_high;
-    double *d_low;
-    double *d_close;
-    double *d_volume;
-    double *d_qvolume;
-    int *d_seg_start;
-    int *d_seg_len;
-    int *d_seg_id;
-    /* Scratch arena, reused by every family. */
-    double *d_a;
-    double *d_b;
-    double *d_c;
-    double *d_d;
-    double *d_out;
-    double *d_out2;
-    double *d_out3;
-    RcEnrichStats last;
-    double batch_start_ms;
-} RcEnrich;
+/* #300: hard cap for the per-family output arena and the pinned D2H mirror. */
+#define RC_BATCH_ARENA_BYTES (64ULL * 1024ULL * 1024ULL)
+#define RC_BATCH_CHUNK_BYTES (4ULL * 1024ULL * 1024ULL)
+
+/* #300: operation descriptors for the batched output path. The parameter
+   meanings match the single-column entry points below. */
+enum {
+    RC_OP_RET = 1,
+    RC_OP_LAG,
+    RC_OP_RANGE,
+    RC_OP_CLV,
+    RC_OP_CALENDAR,
+    RC_OP_MA,
+    RC_OP_VOL,
+    RC_OP_BB_WIDTH,
+    RC_OP_VZ,
+    RC_OP_DONCHIAN,
+    RC_OP_EMA,
+    RC_OP_RSI,
+    RC_OP_ATR,
+    RC_OP_LABEL,
+    RC_OP_MACD
+};
+
+typedef struct RcEnrichOp {
+    int kind;
+    int a;
+    int b;
+    int c;
+    double param;
+} RcEnrichOp;
 
 static double rc_now_ms(void)
 {
@@ -278,6 +272,128 @@ __global__ void k_calendar(const long long *__restrict__ t, int n, int which,
         break;
     }
     }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Tiled elementwise kernels (#294 direct projected upload)                  */
+/* ------------------------------------------------------------------------- */
+
+/* The same arithmetic as k_ret/k_lag/k_range/k_clv/k_calendar, restricted to
+   [start, start+len). The transport runs one of these per uploaded group on
+   the compute stream, so the H2D copy of group g+1 overlaps the kernel of g.
+   State (close/times/seg_id) before `start` is already resident and ready. */
+
+__global__ void k_ret_tile(const long long *__restrict__ t, const double *__restrict__ c,
+                           const int *__restrict__ seg, int step, int k,
+                           int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    double v = NAN;
+    if (i >= k && seg[i] == seg[i - k] &&
+        t[i] - t[i - k] == (long long)k * step &&
+        c[i] > 0.0 && c[i - k] > 0.0) {
+        v = log(c[i] / c[i - k]);
+    }
+    out[i] = v;
+}
+
+__global__ void k_lag_tile(const long long *__restrict__ t, const double *__restrict__ c,
+                           const int *__restrict__ seg, int step, int k,
+                           int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    double v = NAN;
+    int j = i - k;
+    if (j >= 1 && seg[i] == seg[j] && t[i] - t[j] == (long long)k * step &&
+        t[j] - t[j - 1] == (long long)step) {
+        double a = c[j], b = c[j - 1];
+        if (a > 0.0 && b > 0.0) v = log(a / b);
+    }
+    out[i] = v;
+}
+
+__global__ void k_range_tile(const double *__restrict__ high, const double *__restrict__ low,
+                             const double *__restrict__ close, int start, int len,
+                             double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    out[i] = close[i] > 0.0 ? (high[i] - low[i]) / close[i] : NAN;
+}
+
+__global__ void k_clv_tile(const double *__restrict__ high, const double *__restrict__ low,
+                           const double *__restrict__ close, int start, int len,
+                           double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    if (!(isfinite(high[i]) && isfinite(low[i]) && isfinite(close[i]))) {
+        out[i] = NAN;
+        return;
+    }
+    double r = high[i] - low[i];
+    out[i] = r > 0.0 ? (close[i] - low[i]) / r - 0.5 : -0.5;
+}
+
+__global__ void k_calendar_tile(const long long *__restrict__ t, int which,
+                                int start, int len, double *__restrict__ out)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    long long ts = t[i];
+    double frac, a;
+    const double pi = 3.14159265358979323846264338327950288;
+    switch (which) {
+    case 0:
+    case 1:
+        a = 2.0 * pi * (double)rc_weekday(ts / 86400) / 7.0;
+        out[i] = (which == 0) ? sin(a) : cos(a);
+        break;
+    case 2:
+    case 3:
+        frac = (double)(ts % 86400) / 86400.0;
+        if (frac < 0.0) frac += 1.0;
+        a = 2.0 * pi * frac;
+        out[i] = (which == 2) ? sin(a) : cos(a);
+        break;
+    case 4:
+    case 5: {
+        int y, m, d;
+        rc_civil_from_days(ts / 86400, &y, &m, &d);
+        a = 2.0 * pi * (double)m / 12.0;
+        out[i] = (which == 4) ? sin(a) : cos(a);
+        break;
+    }
+    default: {
+        int y, m, d;
+        rc_civil_from_days(ts / 86400, &y, &m, &d);
+        a = 2.0 * pi * (double)d / 31.0;
+        out[i] = (which == 6) ? sin(a) : cos(a);
+        break;
+    }
+    }
+}
+
+/* Segment id for [start, start+len), replacing the host loop that used to build
+   it before upload. */
+__global__ void k_seg_id_tile(const int *__restrict__ ss, const int *__restrict__ sl,
+                              int nseg, int start, int len, int *__restrict__ seg)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= len) return;
+    int i = start + p;
+    int s = 0;
+    for (int k = 0; k < nseg; ++k) {
+        if (i >= ss[k] && i < ss[k] + sl[k]) { s = k; break; }
+    }
+    seg[i] = s;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -530,7 +646,8 @@ __global__ void k_atr_py(const long long *__restrict__ t, const double *__restri
         int i = start + p;
         double v = NAN;
         if (isfinite(high[i]) && isfinite(low[i])) {
-            if (p == 0 || !isfinite(close[i - 1])) {
+            if (p == 0 || !isfinite(close[i - 1]) ||
+                t[i] - t[i - 1] != (long long)step) {
                 v = high[i] - low[i];
             } else {
                 double pc = close[i - 1];
@@ -620,13 +737,71 @@ __global__ void k_label(const long long *__restrict__ t, const double *__restric
 /* Cross-sectional rank                                                      */
 /* ------------------------------------------------------------------------- */
 
+#define RC_RANK_INVALID 0xFFFFFFFFFFFFFFFFULL
+
+/* Order key for an f64 that matches the CPU's `partial_cmp` on finite values:
+   -0.0 and +0.0 are the same tie, and NaN/invalid rows sort last. */
 __device__ __forceinline__ unsigned long long rc_sort_key(double v)
 {
-    if (isnan(v)) return 0xFFFFFFFFFFFFFFFFULL;
+    if (isnan(v)) return RC_RANK_INVALID;
     unsigned long long bits;
     memcpy(&bits, &v, sizeof(bits));
+    if (bits == 0x8000000000000000ULL) bits = 0ULL;
     if (bits & 0x8000000000000000ULL) return ~bits;
     return bits | 0x8000000000000000ULL;
+}
+
+__global__ void k_iota_u32(unsigned int *__restrict__ order, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) order[p] = (unsigned int)p;
+}
+
+__global__ void k_keys_from_sym(const unsigned int *__restrict__ sym,
+                                unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) keys[p] = (unsigned long long)sym[p];
+}
+
+/* Signed time as an order-preserving u64; the permutation sort is radix, so a
+   raw two's-complement negative would order after every positive timestamp. */
+__global__ void k_keys_from_time(const long long *__restrict__ times,
+                                 const unsigned int *__restrict__ order,
+                                 unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) {
+        unsigned long long t = (unsigned long long)times[order[p]];
+        keys[p] = t ^ 0x8000000000000000ULL;
+    }
+}
+
+/* One flag per slot of the time-ordered permutation. An inclusive sum turns
+   the flags into group ids without an atomic counter, so the layout is
+   deterministic. */
+__global__ void k_group_boundary(const long long *__restrict__ times,
+                                 const unsigned int *__restrict__ order,
+                                 unsigned int *__restrict__ flags, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    flags[p] = (p == 0 || times[order[p]] != times[order[p - 1]]) ? 1u : 0u;
+}
+
+/* Inclusive sum of the boundary flags counts groups from one. */
+__global__ void k_gid_zero_based(unsigned int *__restrict__ gid, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n) gid[p] -= 1u;
+}
+
+__global__ void k_group_starts(const unsigned int *__restrict__ flags,
+                               const unsigned int *__restrict__ gid,
+                               int *__restrict__ off, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p < n && flags[p]) off[gid[p]] = p;
 }
 
 __global__ void k_count_finite(const unsigned long long *__restrict__ keys,
@@ -637,9 +812,23 @@ __global__ void k_count_finite(const unsigned long long *__restrict__ keys,
     if (g >= ngroups) return;
     unsigned int c = 0;
     for (int p = off[g]; p < off[g + 1]; ++p) {
-        if (keys[p] != 0xFFFFFFFFFFFFFFFFULL) c += 1;
+        if (keys[p] != RC_RANK_INVALID) c += 1;
     }
     counts[g] = c;
+}
+
+/* Build one column's sort keys in permutation slot order. Non-members and
+   non-finite sources share the invalid key, so they sort to the end of their
+   timestamp and never enter the finite count or a rank. */
+__global__ void k_rank_keys(const double *__restrict__ src,
+                            const unsigned int *__restrict__ order,
+                            const unsigned char *__restrict__ member,
+                            unsigned long long *__restrict__ keys, int n)
+{
+    int p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= n) return;
+    unsigned int r = order[p];
+    keys[p] = member[r] ? rc_sort_key(src[r]) : RC_RANK_INVALID;
 }
 
 __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
@@ -656,7 +845,7 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
     unsigned int pos = (unsigned int)p - (unsigned int)off[g];
     double v = NAN;
     if (pos < finite && finite >= 20 &&
-        keys[p] != 0xFFFFFFFFFFFFFFFFULL) {
+        keys[p] != RC_RANK_INVALID) {
         v = 2.0 * (double)pos / (double)(finite - 1) - 1.0;
     }
     out[rows[p]] = v;
@@ -666,16 +855,89 @@ __global__ void k_rank_scatter(const unsigned long long *__restrict__ keys,
 /* C API                                                                     */
 /* ------------------------------------------------------------------------- */
 
-/* Stats slot for the rank call, which does not own an RcEnrich context. */
-static RcEnrichStats g_rank_last;
-
 extern "C" void rc_enrich_destroy(void *v);
+
+/* #298 engine-tail entry points live in `tail.cu`; they take raw device
+   pointers so that translation unit does not need the RcEnrich layout. */
+extern "C" {
+int rc_tail_donchian(const long long *t, const double *high, const double *low,
+                     const double *close, const int *seg_id, const int *ss,
+                     const int *sl, int nseg, int n, int step, int w, int centred,
+                     double *out);
+int rc_tail_stoch(const long long *t, const double *high, const double *low,
+                  const double *close, const int *seg_id, const int *ss,
+                  const int *sl, int nseg, int n, int step, int w, int mean_w,
+                  int which, double *out, double *scratch);
+int rc_tail_atr(const long long *t, const double *high, const double *low,
+                const double *close, const int *ss, const int *sl, int nseg,
+                int n, int step, int period, int which, double *out);
+int rc_tail_batr(const long long *t, const double *open, const double *high,
+                 const double *low, const double *close, const int *ss,
+                 const int *sl, int nseg, int n, int step, int period,
+                 double *out);
+int rc_tail_gapatr(const long long *t, const double *open, const double *high,
+                   const double *low, const double *close, const int *ss,
+                   const int *sl, int nseg, int n, int step, int period,
+                   double *out);
+int rc_tail_volrat(const long long *t, const double *high, const double *low,
+                   const double *close, const int *ss, const int *sl, int nseg,
+                   int n, int step, int p1, int p2, double *out);
+int rc_tail_adx(const long long *t, const double *high, const double *low,
+                const double *close, const int *ss, const int *sl, int nseg,
+                int n, int step, int period, int which, double *out);
+int rc_tail_bb_z(const long long *t, const double *close, const int *ss,
+                 const int *sl, int nseg, int n, int step, int w, int mode,
+                 double *out);
+int rc_tail_ma_slope(const long long *t, const double *close, const int *ss,
+                     const int *sl, int nseg, int n, int step, int w, int lag,
+                     double *out);
+int rc_tail_tod(const long long *t, int n, int step, int want_sin, double *out);
+int rc_tail_exotic(const long long *t, const double *high, const double *low,
+                   const double *close, const int *seg_id, const int *ss,
+                   const int *sl, int nseg, int n, int step, int which,
+                   double *out);
+}
+
+/* Free only the cross-section permutation/rank arena. */
+static void rc_xs_free(RcEnrich *c)
+{
+    if (!c) return;
+    cudaFree(c->d_xs_order);
+    cudaFree(c->d_xs_order_tmp);
+    cudaFree(c->d_xs_rows_out);
+    cudaFree(c->d_xs_gid);
+    cudaFree(c->d_xs_counts);
+    cudaFree(c->d_xs_sym);
+    cudaFree(c->d_xs_off);
+    cudaFree(c->d_xs_keys);
+    cudaFree(c->d_xs_keys_out);
+    cudaFree(c->d_xs_member);
+    cudaFree(c->d_xs_src);
+    cudaFree(c->d_xs_temp);
+    c->d_xs_order = NULL;
+    c->d_xs_order_tmp = NULL;
+    c->d_xs_rows_out = NULL;
+    c->d_xs_gid = NULL;
+    c->d_xs_counts = NULL;
+    c->d_xs_sym = NULL;
+    c->d_xs_off = NULL;
+    c->d_xs_keys = NULL;
+    c->d_xs_keys_out = NULL;
+    c->d_xs_member = NULL;
+    c->d_xs_src = NULL;
+    c->d_xs_temp = NULL;
+    c->xs_temp_bytes = 0;
+    c->xs_groups = 0;
+    c->xs_ready = 0;
+}
 
 extern "C" {
 
 void *rc_enrich_create(const long long *times, const double *open, const double *high,
                        const double *low, const double *close, const double *volume,
-                       const double *qvolume, int n, const int *seg_start,
+                       const double *qvolume, const double *trades,
+                       const double *taker_buy_base, const double *taker_buy_quote,
+                       unsigned int present, int n, const int *seg_start,
                        const int *seg_len, int nseg, int step)
 {
     if (n <= 0 || nseg <= 0) return NULL;
@@ -684,6 +946,7 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     c->n = n;
     c->nseg = nseg;
     c->step = step;
+    c->present = present;
     size_t rows = (size_t)n;
     double t0 = rc_now_ms();
     int ok = 1;
@@ -694,9 +957,13 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     if (ok && rc_alloc((void **)&c->d_close, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_volume, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_qvolume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_trades, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tb, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tbq, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_start, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_len, (size_t)nseg * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_seg_id, rows * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_run_id, rows * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_a, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
@@ -717,25 +984,40 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     rc_upload(c->d_close, close, rows * sizeof(double));
     rc_upload(c->d_volume, volume, rows * sizeof(double));
     rc_upload(c->d_qvolume, qvolume, rows * sizeof(double));
+    rc_upload(c->d_trades, trades, rows * sizeof(double));
+    rc_upload(c->d_tb, taker_buy_base, rows * sizeof(double));
+    rc_upload(c->d_tbq, taker_buy_quote, rows * sizeof(double));
     rc_upload(c->d_seg_start, seg_start, (size_t)nseg * sizeof(int));
     rc_upload(c->d_seg_len, seg_len, (size_t)nseg * sizeof(int));
     c->last.h2d_ms = rc_now_ms() - t0;
-    c->last.h2d_bytes = 8ULL * (unsigned long long)rows * 8ULL +
+    c->last.h2d_bytes = 8ULL * (unsigned long long)rows * 11ULL +
                         8ULL * (unsigned long long)nseg;
     /* Segment id per row, derived once on the host and uploaded with the rest
        of the resident data. It lets elementwise kernels refuse to cross a
        symbol boundary without a per-row lookup table on the device. */
     int *seg_id = (int *)malloc(rows * sizeof(int));
-    if (!seg_id) {
+    int *run_id = (int *)malloc(rows * sizeof(int));
+    if (!seg_id || !run_id) {
+        free(seg_id);
+        free(run_id);
         rc_enrich_destroy(c);
         return NULL;
     }
+    int run = 0;
     for (int s = 0; s < nseg; ++s) {
-        for (int j = 0; j < seg_len[s]; ++j) seg_id[seg_start[s] + j] = s;
+        for (int j = 0; j < seg_len[s]; ++j) {
+            int i = seg_start[s] + j;
+            seg_id[i] = s;
+            if (j > 0 && times[i] - times[i - 1] != (long long)step) run += 1;
+            run_id[i] = run;
+        }
+        run += 1;
     }
     rc_upload(c->d_seg_id, seg_id, rows * sizeof(int));
+    rc_upload(c->d_run_id, run_id, rows * sizeof(int));
     free(seg_id);
-    c->last.h2d_bytes += (unsigned long long)rows * sizeof(int);
+    free(run_id);
+    c->last.h2d_bytes += (unsigned long long)rows * sizeof(int) * 2ULL;
     stats_end(c);
     c->last.batch = 0;
     return c;
@@ -752,9 +1034,13 @@ void rc_enrich_destroy(void *v)
     cudaFree(c->d_close);
     cudaFree(c->d_volume);
     cudaFree(c->d_qvolume);
+    cudaFree(c->d_trades);
+    cudaFree(c->d_tb);
+    cudaFree(c->d_tbq);
     cudaFree(c->d_seg_start);
     cudaFree(c->d_seg_len);
     cudaFree(c->d_seg_id);
+    cudaFree(c->d_run_id);
     cudaFree(c->d_a);
     cudaFree(c->d_b);
     cudaFree(c->d_c);
@@ -762,6 +1048,14 @@ void rc_enrich_destroy(void *v)
     cudaFree(c->d_out);
     cudaFree(c->d_out2);
     cudaFree(c->d_out3);
+    cudaFree(c->d_batch);
+#if defined(RCSR_UNIFIED)
+    /* Managed memory needs no host free. */
+#else
+    if (c->h_pinned) cudaFreeHost(c->h_pinned);
+#endif
+    cudaFree(c->d_feat);
+    rc_xs_free(c);
     free(c);
 }
 
@@ -801,6 +1095,38 @@ void rc_enrich_last_stats(void *v, RcEnrichStats *out)
         rc_download(dst, src, (size_t)c->n * sizeof(double));                 \
         c->last.d2h_ms += rc_now_ms() - _d;                                   \
         c->last.d2h_bytes += (unsigned long long)c->n * sizeof(double);       \
+    } while (0)
+
+/* Tail entries own their kernels and synchronise internally; this wrapper keeps
+   the same ledger windows as the in-file kernels. */
+#define RC_TAIL(c, call, out)                                                 \
+    do {                                                                      \
+        stats_begin(c);                                                       \
+        cudaEvent_t _e0, _e1;                                                 \
+        cudaEventCreate(&_e0);                                                \
+        cudaEventCreate(&_e1);                                                \
+        cudaEventRecord(_e0, 0);                                              \
+        double _l = rc_now_ms();                                              \
+        int _rc = (call);                                                     \
+        c->last.launch_ms += rc_now_ms() - _l;                                \
+        double _s = rc_now_ms();                                              \
+        cudaEventRecord(_e1, 0);                                              \
+        cudaEventSynchronize(_e1);                                            \
+        c->last.sync_ms += rc_now_ms() - _s;                                  \
+        float _ms = 0.0f;                                                     \
+        cudaEventElapsedTime(&_ms, _e0, _e1);                                 \
+        c->last.kernel_ms += _ms;                                             \
+        cudaEventDestroy(_e0);                                                \
+        cudaEventDestroy(_e1);                                                \
+        if (_rc != 0) {                                                       \
+            c->last.failed = 1;                                               \
+            stats_end(c);                                                     \
+            return -1;                                                        \
+        }                                                                     \
+        RC_DOWNLOAD(c, out, c->d_out);                                        \
+        c->last.failed = (cudaGetLastError() != cudaSuccess) ? 1 : 0;         \
+        stats_end(c);                                                         \
+        return c->last.failed ? -1 : 0;                                       \
     } while (0)
 
 #define RC_END(c)                                                             \
@@ -919,14 +1245,140 @@ int rc_enrich_vz(void *v, int w, double *out)
 int rc_enrich_donchian(void *v, int w, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
-    RC_ELEM_BEGIN(c, 0, 0);
-    int threads = 128, blocks = (c->nseg + threads - 1) / threads;
-    RC_ELEM_LAUNCH(c, (k_donchian<<<blocks, threads>>>(c->d_times, c->d_high, c->d_low,
-                                                       c->d_close, c->d_seg_start,
-                                                       c->d_seg_len, c->nseg, c->step, w,
-                                                       c->d_out)));
+    RC_TAIL(c, (rc_tail_donchian(c->d_times, c->d_high, c->d_low, c->d_close,
+                                c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                                c->nseg, c->n, c->step, w, 0, c->d_out)),
+            out);
+}
+
+int rc_enrich_donchian_centred(void *v, int w, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_donchian(c->d_times, c->d_high, c->d_low, c->d_close,
+                                c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                                c->nseg, c->n, c->step, w, 1, c->d_out)),
+            out);
+}
+
+int rc_enrich_stoch(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    /* The mean3 prefix needs (n + nseg + 1) doubles for sum and count each. */
+    double *scratch = NULL;
+    if (which == 1) {
+        size_t nb = (size_t)c->n + (size_t)c->nseg + 1;
+        if (cudaMalloc((void **)&scratch, 2 * nb * sizeof(double)) != cudaSuccess) {
+            return -1;
+        }
+    }
+    stats_begin(c);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    cudaEventRecord(e0, 0);
+    double l = rc_now_ms();
+    int rc = rc_tail_stoch(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_id, c->d_seg_start, c->d_seg_len, c->nseg,
+                           c->n, c->step, 14, 3, which, c->d_out, scratch);
+    c->last.launch_ms += rc_now_ms() - l;
+    double s = rc_now_ms();
+    cudaEventRecord(e1, 0);
+    cudaEventSynchronize(e1);
+    c->last.sync_ms += rc_now_ms() - s;
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    c->last.kernel_ms += ms;
+    cudaEventDestroy(e0);
+    cudaEventDestroy(e1);
+    if (scratch) cudaFree(scratch);
+    if (rc != 0) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     RC_DOWNLOAD(c, out, c->d_out);
-    RC_END(c);
+    c->last.failed = (cudaGetLastError() != cudaSuccess) ? 1 : 0;
+    stats_end(c);
+    return c->last.failed ? -1 : 0;
+}
+
+int rc_enrich_atr(void *v, int period, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_atr(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                           c->step, period, which, c->d_out)),
+            out);
+}
+
+int rc_enrich_batr(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_batr(c->d_times, c->d_open, c->d_high, c->d_low,
+                            c->d_close, c->d_seg_start, c->d_seg_len, c->nseg,
+                            c->n, c->step, 14, c->d_out)),
+            out);
+}
+
+int rc_enrich_gapatr(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_gapatr(c->d_times, c->d_open, c->d_high, c->d_low,
+                              c->d_close, c->d_seg_start, c->d_seg_len, c->nseg,
+                              c->n, c->step, 14, c->d_out)),
+            out);
+}
+
+int rc_enrich_volrat(void *v, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_volrat(c->d_times, c->d_high, c->d_low, c->d_close,
+                              c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                              c->step, 16, 96, c->d_out)),
+            out);
+}
+
+int rc_enrich_adx(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_adx(c->d_times, c->d_high, c->d_low, c->d_close,
+                           c->d_seg_start, c->d_seg_len, c->nseg, c->n,
+                           c->step, 14, which, c->d_out)),
+            out);
+}
+
+int rc_enrich_bb_z(void *v, int w, int mode, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_bb_z(c->d_times, c->d_close, c->d_seg_start,
+                            c->d_seg_len, c->nseg, c->n, c->step, w, mode,
+                            c->d_out)),
+            out);
+}
+
+int rc_enrich_ma_slope(void *v, int w, int lag, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_ma_slope(c->d_times, c->d_close, c->d_seg_start,
+                                c->d_seg_len, c->nseg, c->n, c->step, w, lag,
+                                c->d_out)),
+            out);
+}
+
+int rc_enrich_tod(void *v, int want_sin, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_tod(c->d_times, c->n, c->step, want_sin, c->d_out)),
+            out);
+}
+
+int rc_enrich_exotic(void *v, int which, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    RC_TAIL(c, (rc_tail_exotic(c->d_times, c->d_high, c->d_low, c->d_close,
+                              c->d_seg_id, c->d_seg_start, c->d_seg_len,
+                              c->nseg, c->n, c->step, which, c->d_out)),
+            out);
 }
 
 int rc_enrich_ema(void *v, int span, double *out)
@@ -995,105 +1447,846 @@ int rc_enrich_label(void *v, int horizon, double cost_bps, int vol_window, int s
     RC_END(c);
 }
 
-/* Stable segmented rank. `keys`, `rows`, `offsets` and `gid` are host arrays
-   built in the same (time, symbol, row) order as the CPU reference; the sort
-   is stable, so equal values keep that tie order. */
-int rc_enrich_rank(const unsigned long long *keys, const unsigned int *rows,
-                   const int *offsets, const unsigned int *gid, int n, int ngroups,
-                   double *out)
+/* #300: launch one descriptor into `c->d_out` (and `d_out2/d_out3` for MACD),
+   with no host download. Returns the number of output slots written. */
+static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
 {
-    double t0 = rc_now_ms();
-    RcEnrichStats st;
-    memset(&st, 0, sizeof(st));
-    unsigned long long *d_keys = NULL, *d_keys_out = NULL;
-    unsigned int *d_rows = NULL, *d_rows_out = NULL, *d_counts = NULL, *d_gid = NULL;
-    int *d_off = NULL;
-    void *d_temp = NULL;
-    double *d_out = NULL;
-    size_t temp_bytes = 0;
+    int threads = 256, blocks = (c->n + threads - 1) / threads;
+    int sthreads = 128, sblocks = (c->nseg + sthreads - 1) / sthreads;
+    switch (op->kind) {
+    case RC_OP_RET:
+        k_ret<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+                                   c->n, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_LAG:
+        k_lag<<<blocks, threads>>>(c->d_times, c->d_close, c->d_seg_id,
+                                   c->n, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_RANGE:
+        k_range<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+                                     c->n, c->d_out);
+        return 1;
+    case RC_OP_CLV:
+        k_clv<<<blocks, threads>>>(c->d_high, c->d_low, c->d_close,
+                                   c->n, c->d_out);
+        return 1;
+    case RC_OP_CALENDAR:
+        k_calendar<<<blocks, threads>>>(c->d_times, c->n, op->a, c->d_out);
+        return 1;
+    case RC_OP_MA:
+        k_ma<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                    c->d_seg_len, c->nseg, c->step, op->a,
+                                    c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_VOL:
+        k_vol<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                     c->d_seg_len, c->nseg, c->step, op->a,
+                                     c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+        return 1;
+    case RC_OP_BB_WIDTH:
+        k_bb_width<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                          c->d_seg_len, c->nseg, c->step, op->a,
+                                          c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_VZ:
+        k_vz<<<sblocks, sthreads>>>(c->d_times, c->d_volume, c->d_seg_start,
+                                    c->d_seg_len, c->nseg, c->step, op->a,
+                                    c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+        return 1;
+    case RC_OP_DONCHIAN:
+        k_donchian<<<sblocks, sthreads>>>(c->d_times, c->d_high, c->d_low,
+                                          c->d_close, c->d_seg_start, c->d_seg_len,
+                                          c->nseg, c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_EMA:
+        k_ema_ratio<<<sblocks, sthreads>>>(c->d_times, c->d_close,
+                                           c->d_seg_start, c->d_seg_len, c->nseg,
+                                           c->step, op->a, c->d_out);
+        return 1;
+    case RC_OP_RSI:
+        k_rsi_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                        c->d_seg_len, c->nseg, c->step, op->a,
+                                        c->d_a, c->d_b, c->d_c, c->d_out);
+        return 1;
+    case RC_OP_ATR:
+        k_atr_py<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_high,
+                                        c->d_low, c->d_seg_start, c->d_seg_len,
+                                        c->nseg, c->step, op->a, c->d_a, c->d_out);
+        return 1;
+    case RC_OP_LABEL:
+        k_label<<<sblocks, sthreads>>>(c->d_times, c->d_open, c->d_close,
+                                       c->d_seg_start, c->d_seg_len, c->nseg,
+                                       c->step, op->a, op->param, op->b,
+                                       op->c, c->d_out);
+        return 1;
+    case RC_OP_MACD:
+        k_macd<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
+                                      c->d_seg_len, c->nseg, c->step, c->d_out,
+                                      c->d_out2, c->d_out3);
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+int rc_enrich_batch_capacity(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c || c->n <= 0) return 0;
+    size_t col_bytes = (size_t)c->n * sizeof(double);
+    if (col_bytes == 0 || col_bytes > RC_BATCH_ARENA_BYTES) return 0;
+    return (int)(RC_BATCH_ARENA_BYTES / col_bytes);
+}
+
+double *rc_enrich_batch_host(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    return c ? c->h_pinned : NULL;
+}
+
+int rc_enrich_batch_run(void *v, const RcEnrichOp *ops, int nops)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c || !ops || nops <= 0) return -1;
+    int cap = rc_enrich_batch_capacity(c);
+    if (cap <= 0) return -1;
+    int total_slots = 0;
+    for (int i = 0; i < nops; ++i) {
+        int s = ops[i].kind == RC_OP_MACD ? 3 : 1;
+        total_slots += s;
+    }
+    if (total_slots <= 0 || total_slots > cap) return -1;
+    size_t col_bytes = (size_t)c->n * sizeof(double);
+    size_t bytes = col_bytes * (size_t)total_slots;
     int ok = 1;
-    if (rc_alloc((void **)&d_keys, (size_t)n * sizeof(unsigned long long)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_keys_out, (size_t)n * sizeof(unsigned long long)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_rows, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_rows_out, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_off, (size_t)(ngroups + 1) * sizeof(int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_gid, (size_t)n * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_counts, (size_t)ngroups * sizeof(unsigned int)) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&d_out, (size_t)n * sizeof(double)) != 0) ok = 0;
-    st.alloc_ms = rc_now_ms() - t0;
-    if (ok) {
-        t0 = rc_now_ms();
-        rc_upload(d_keys, keys, (size_t)n * sizeof(unsigned long long));
-        rc_upload(d_rows, rows, (size_t)n * sizeof(unsigned int));
-        rc_upload(d_off, offsets, (size_t)(ngroups + 1) * sizeof(int));
-        rc_upload(d_gid, gid, (size_t)n * sizeof(unsigned int));
-        st.h2d_ms = rc_now_ms() - t0;
-        st.h2d_bytes = (unsigned long long)n * (sizeof(unsigned long long) +
-                                                sizeof(unsigned int) +
-                                                sizeof(unsigned int)) +
-                       (unsigned long long)(ngroups + 1) * sizeof(int);
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            NULL, temp_bytes, d_keys, d_keys_out, d_rows, d_rows_out,
-            n, ngroups, d_off, d_off + 1);
-        t0 = rc_now_ms();
-        if (rc_alloc(&d_temp, temp_bytes) != 0) {
+    stats_begin(c);
+    if (!c->d_batch) {
+        double t0 = rc_now_ms();
+        if (rc_alloc((void **)&c->d_batch, (size_t)cap * col_bytes) != 0) ok = 0;
+        c->last.alloc_ms += rc_now_ms() - t0;
+    }
+#if defined(RCSR_UNIFIED)
+    if (ok && !c->h_pinned) c->h_pinned = c->d_batch;
+#else
+    if (ok && !c->h_pinned) {
+        double t0 = rc_now_ms();
+        if (cudaHostAlloc((void **)&c->h_pinned, (size_t)cap * col_bytes,
+                          cudaHostAllocDefault) != cudaSuccess) {
             ok = 0;
-        } else {
-            st.alloc_ms += rc_now_ms() - t0;
-            cudaEvent_t ev0, ev1;
-            cudaEventCreate(&ev0);
-            cudaEventCreate(&ev1);
-            cudaEventRecord(ev0, 0);
-            double l = rc_now_ms();
-            cub::DeviceSegmentedRadixSort::SortPairs(
-                d_temp, temp_bytes, d_keys, d_keys_out, d_rows, d_rows_out,
-                n, ngroups, d_off, d_off + 1);
-            st.launch_ms = rc_now_ms() - l;
-            double sy = rc_now_ms();
-            cudaEventRecord(ev1, 0);
-            cudaEventSynchronize(ev1);
-            st.sync_ms = rc_now_ms() - sy;
-            float ms = 0.0f;
-            cudaEventElapsedTime(&ms, ev0, ev1);
-            st.kernel_ms += ms;
-            cudaEventDestroy(ev0);
-            cudaEventDestroy(ev1);
         }
+        c->last.alloc_ms += rc_now_ms() - t0;
     }
+#endif
+    if (!ok) {
+        stats_end(c);
+        c->last.failed = 1;
+        return -1;
+    }
+    c->batch_cap = cap;
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    double l = rc_now_ms();
+    int slot = 0;
+    for (int i = 0; i < nops && ok; ++i) {
+        int written = rc_batch_launch(c, &ops[i]);
+        if (written <= 0 || slot + written > total_slots) {
+            ok = 0;
+            break;
+        }
+        cudaMemcpyAsync(c->d_batch + (size_t)slot * c->n, c->d_out,
+                        col_bytes, cudaMemcpyDeviceToDevice, 0);
+        if (written == 3) {
+            cudaMemcpyAsync(c->d_batch + (size_t)(slot + 1) * c->n, c->d_out2,
+                            col_bytes, cudaMemcpyDeviceToDevice, 0);
+            cudaMemcpyAsync(c->d_batch + (size_t)(slot + 2) * c->n, c->d_out3,
+                            col_bytes, cudaMemcpyDeviceToDevice, 0);
+        }
+        slot += written;
+    }
+    c->last.launch_ms += rc_now_ms() - l;
+    if (ok && slot != total_slots) ok = 0;
+    double s = rc_now_ms();
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    c->last.sync_ms += rc_now_ms() - s;
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms += ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+
     if (ok) {
-        int threads = 128;
-        int cblocks = (ngroups + threads - 1) / threads;
-        k_count_finite<<<cblocks, threads>>>(d_keys_out, d_off, ngroups, d_counts);
-        int rblocks = (n + threads - 1) / threads;
-        k_rank_scatter<<<rblocks, threads>>>(d_keys_out, d_rows_out, d_off, d_counts,
-                                             d_gid, n, d_out);
-        cudaDeviceSynchronize();
-        t0 = rc_now_ms();
-        rc_download(out, d_out, (size_t)n * sizeof(double));
-        st.d2h_ms = rc_now_ms() - t0;
-        st.d2h_bytes = (unsigned long long)n * sizeof(double);
-        st.batch = 1;
-    } else {
-        st.failed = 1;
+        /* One chunked 2-D copy for the whole block: the source and destination
+           pitch are one full column, so each chunk carries every column's
+           same row range and no per-column download is issued. */
+        size_t chunk_rows = RC_BATCH_CHUNK_BYTES / (size_t)(total_slots * sizeof(double));
+        if (chunk_rows < 1) chunk_rows = 1;
+        double d = rc_now_ms();
+        for (size_t off = 0; off < (size_t)c->n && ok; off += chunk_rows) {
+            size_t rows = (size_t)c->n - off;
+            if (rows > chunk_rows) rows = chunk_rows;
+            cudaError_t rc = cudaMemcpy2DAsync(
+                c->h_pinned + off, col_bytes,
+                c->d_batch + off, col_bytes,
+                rows * sizeof(double), (size_t)total_slots,
+                cudaMemcpyDeviceToHost, 0);
+            if (rc != cudaSuccess) ok = 0;
+        }
+        if (ok) {
+            cudaError_t rc = cudaDeviceSynchronize();
+            if (rc != cudaSuccess) ok = 0;
+        }
+        c->last.d2h_ms += rc_now_ms() - d;
+        c->last.d2h_bytes += (unsigned long long)bytes;
     }
-    st.wall_ms = rc_now_ms() - t0;
-    cudaFree(d_keys);
-    cudaFree(d_keys_out);
-    cudaFree(d_rows);
-    cudaFree(d_rows_out);
-    cudaFree(d_off);
-    cudaFree(d_gid);
-    cudaFree(d_counts);
-    cudaFree(d_out);
-    cudaFree(d_temp);
-    /* The caller reads this through a small host shim. */
-    g_rank_last = st;
+    stats_end(c);
+    c->last.batch = 1;
+    c->last.failed = ok ? 0 : 1;
     return ok ? 0 : -1;
 }
 
-void rc_enrich_rank_stats(RcEnrichStats *out)
+
+/* ------------------------------------------------------------------------- */
+/* Cross-section permutation and segmented rank (#295)                       */
+/* ------------------------------------------------------------------------- */
+
+/* Build the (time, symbol, row) permutation once and keep it resident.
+   Two stable radix sorts reproduce the CPU's `sort_unstable_by` order:
+   symbol first, then time. Equal times therefore keep symbol and row order. */
+int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
+                         const unsigned char *member)
 {
-    if (out) *out = g_rank_last;
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return -1;
+    stats_begin(c);
+    if (c->n <= 0 || !sym_key) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    if (c->xs_ready) {
+        stats_end(c);
+        return 0;
+    }
+    size_t n = (size_t)c->n;
+    int ok = 1;
+    double t_alloc = rc_now_ms();
+    if (rc_alloc((void **)&c->d_xs_order, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_order_tmp, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_rows_out, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_gid, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_sym, n * sizeof(unsigned int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_keys, n * sizeof(unsigned long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_keys_out, n * sizeof(unsigned long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_member, n * sizeof(unsigned char)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_xs_src, n * sizeof(double)) != 0) ok = 0;
+    if (ok) {
+        t_alloc = rc_now_ms() - t_alloc;
+        c->last.alloc_ms = t_alloc;
+    }
+    if (!ok) {
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    double t0 = rc_now_ms();
+    rc_upload(c->d_xs_sym, sym_key, n * sizeof(unsigned int));
+    if (member) {
+        rc_upload(c->d_xs_member, member, n * sizeof(unsigned char));
+    } else {
+        cudaMemset(c->d_xs_member, 1, n * sizeof(unsigned char));
+    }
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = (unsigned long long)n * (sizeof(unsigned int) +
+                                                 sizeof(unsigned char));
+
+    size_t t1 = 0, t2 = 0;
+    cub::DeviceRadixSort::SortPairs(
+        NULL, t1, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_order_tmp, c->n);
+    cub::DeviceScan::InclusiveSum(NULL, t2, c->d_xs_rows_out, c->d_xs_gid,
+                                  c->n);
+    size_t temp_bytes = t1 > t2 ? t1 : t2;
+    t0 = rc_now_ms();
+    if (rc_alloc(&c->d_xs_temp, temp_bytes) != 0) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    c->last.alloc_ms += rc_now_ms() - t0;
+    c->xs_temp_bytes = temp_bytes;
+
+    int threads = 256;
+    int blocks = (c->n + threads - 1) / threads;
+    double l0 = rc_now_ms();
+    k_iota_u32<<<blocks, threads>>>(c->d_xs_order, c->n);
+    k_keys_from_sym<<<blocks, threads>>>(c->d_xs_sym, c->d_xs_keys, c->n);
+    c->last.launch_ms += rc_now_ms() - l0;
+
+    /* Pass 1: stable by symbol. The value carried along is the row index. */
+    cub::DeviceRadixSort::SortPairs(
+        c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_order_tmp, c->n);
+    /* Pass 2: stable by time. Equal times retain the symbol/row order. */
+    k_keys_from_time<<<blocks, threads>>>(c->d_times, c->d_xs_order_tmp,
+                                          c->d_xs_keys, c->n);
+    cub::DeviceRadixSort::SortPairs(
+        c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order_tmp, c->d_xs_order, c->n);
+
+    /* Group boundaries, ids and starts from the time-ordered permutation. */
+    k_group_boundary<<<blocks, threads>>>(c->d_times, c->d_xs_order,
+                                          c->d_xs_rows_out, c->n);
+    cub::DeviceScan::InclusiveSum(c->d_xs_temp, temp_bytes, c->d_xs_rows_out,
+                                  c->d_xs_gid, c->n);
+    k_gid_zero_based<<<blocks, threads>>>(c->d_xs_gid, c->n);
+    unsigned int last_gid = 0;
+    cudaMemcpy(&last_gid, c->d_xs_gid + (c->n - 1), sizeof(unsigned int),
+               cudaMemcpyDeviceToHost);
+    int groups = (int)last_gid + 1;
+    if (groups < 1) groups = 1;
+    c->xs_groups = groups;
+
+    t0 = rc_now_ms();
+    ok = rc_alloc((void **)&c->d_xs_off, (size_t)(groups + 1) * sizeof(int)) == 0 &&
+         rc_alloc((void **)&c->d_xs_counts,
+                  (size_t)groups * sizeof(unsigned int)) == 0;
+    c->last.alloc_ms += rc_now_ms() - t0;
+    if (ok) {
+        k_group_starts<<<blocks, threads>>>(c->d_xs_rows_out, c->d_xs_gid,
+                                            c->d_xs_off, c->n);
+        int end = c->n;
+        cudaMemcpy(c->d_xs_off + groups, &end, sizeof(int),
+                   cudaMemcpyHostToDevice);
+        cudaFree(c->d_xs_sym);
+        c->d_xs_sym = NULL;
+        c->xs_ready = 1;
+    }
+
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms = ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+    if (!ok) {
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    c->last.batch = 1;
+    stats_end(c);
+    return 0;
+}
+
+/* Rank one source column across the cached permutation. The stable segmented
+   sort uses (value, symbol, row) via the cached order, and only finite PIT
+   members enter the count; every other row is NaN. */
+int rc_enrich_xs_rank(void *v, const double *src, double *out)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return -1;
+    stats_begin(c);
+    if (!c->xs_ready || !src || !out) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+    size_t n = (size_t)c->n;
+    double t0 = rc_now_ms();
+    rc_upload(c->d_xs_src, src, n * sizeof(double));
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = (unsigned long long)n * sizeof(double);
+
+    cudaEvent_t ev0, ev1;
+    cudaEventCreate(&ev0);
+    cudaEventCreate(&ev1);
+    cudaEventRecord(ev0, 0);
+    int threads = 256;
+    int blocks = (c->n + threads - 1) / threads;
+    double l0 = rc_now_ms();
+    k_rank_keys<<<blocks, threads>>>(c->d_xs_src, c->d_xs_order,
+                                     c->d_xs_member, c->d_xs_keys, c->n);
+    c->last.launch_ms = rc_now_ms() - l0;
+    double l1 = rc_now_ms();
+    cub::DeviceSegmentedRadixSort::SortPairs(
+        c->d_xs_temp, c->xs_temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
+        c->d_xs_order, c->d_xs_rows_out, c->n, c->xs_groups,
+        c->d_xs_off, c->d_xs_off + 1);
+    c->last.launch_ms += rc_now_ms() - l1;
+    int cblocks = (c->xs_groups + threads - 1) / threads;
+    k_count_finite<<<cblocks, threads>>>(c->d_xs_keys_out, c->d_xs_off,
+                                         c->xs_groups, c->d_xs_counts);
+    k_rank_scatter<<<blocks, threads>>>(c->d_xs_keys_out, c->d_xs_rows_out,
+                                        c->d_xs_off, c->d_xs_counts,
+                                        c->d_xs_gid, c->n, c->d_xs_src);
+    cudaEventRecord(ev1, 0);
+    cudaEventSynchronize(ev1);
+    float ms = 0.0f;
+    cudaEventElapsedTime(&ms, ev0, ev1);
+    c->last.kernel_ms = ms;
+    cudaEventDestroy(ev0);
+    cudaEventDestroy(ev1);
+
+    t0 = rc_now_ms();
+    rc_download(out, c->d_xs_src, n * sizeof(double));
+    c->last.d2h_ms = rc_now_ms() - t0;
+    c->last.d2h_bytes = (unsigned long long)n * sizeof(double);
+    c->last.batch = 1;
+    cudaError_t err = cudaGetLastError();
+    c->last.failed = (err != cudaSuccess) ? 1 : 0;
+    stats_end(c);
+    return c->last.failed ? -1 : 0;
 }
 
 } /* extern "C" */
+
+/* ------------------------------------------------------------------------- */
+/* Projected pinned ring and direct H2D upload (issue #294)                  */
+/* ------------------------------------------------------------------------- */
+
+typedef struct RcRing {
+    int slots;
+    size_t slot_bytes;
+    void **host;
+    cudaStream_t copy_stream;
+    cudaStream_t compute_stream;
+    cudaEvent_t *copy_done;
+    cudaEvent_t *compute_done;
+    unsigned long long copy_count;
+    unsigned long long compute_count;
+    int failed;
+} RcRing;
+
+extern "C" {
+
+void rc_ring_destroy(void *v);
+
+void *rc_ring_create(int slots, size_t slot_bytes)
+{
+    if (slots < 2 || slot_bytes == 0) return NULL;
+    RcRing *r = (RcRing *)calloc(1, sizeof(RcRing));
+    if (!r) return NULL;
+    r->slots = slots;
+    r->slot_bytes = slot_bytes;
+    r->host = (void **)calloc((size_t)slots, sizeof(void *));
+    r->copy_done = (cudaEvent_t *)calloc((size_t)slots, sizeof(cudaEvent_t));
+    r->compute_done = (cudaEvent_t *)calloc((size_t)slots, sizeof(cudaEvent_t));
+    if (!r->host || !r->copy_done || !r->compute_done) { rc_ring_destroy((void *)r); return NULL; }
+    if (cudaStreamCreateWithFlags(&r->copy_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        rc_ring_destroy((void *)r); return NULL;
+    }
+    if (cudaStreamCreateWithFlags(&r->compute_stream, cudaStreamNonBlocking) != cudaSuccess) {
+        rc_ring_destroy((void *)r); return NULL;
+    }
+    for (int i = 0; i < slots; ++i) {
+        /* cudaHostAlloc gives the asynchronous copy engine page-locked host
+           memory. Write-combined is deliberately not requested: the reader
+           writes and the device reads, which is the case cudaHostAllocDefault
+           documents as the safe/default choice. */
+        if (cudaHostAlloc(&r->host[i], slot_bytes, cudaHostAllocDefault) != cudaSuccess) {
+            rc_ring_destroy((void *)r); return NULL;
+        }
+        if (cudaEventCreateWithFlags(&r->copy_done[i], cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&r->compute_done[i], cudaEventDisableTiming) != cudaSuccess) {
+            rc_ring_destroy((void *)r); return NULL;
+        }
+        /* A freshly recorded event makes the first wait a no-op. */
+        cudaEventRecord(r->compute_done[i], r->compute_stream);
+    }
+    cudaStreamSynchronize(r->compute_stream);
+    return (void *)r;
+}
+
+void rc_ring_destroy(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return;
+    if (r->copy_stream) cudaStreamDestroy(r->copy_stream);
+    if (r->compute_stream) cudaStreamDestroy(r->compute_stream);
+    if (r->host) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->host[i]) cudaFreeHost(r->host[i]);
+        }
+        free(r->host);
+    }
+    if (r->copy_done) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->copy_done[i]) cudaEventDestroy(r->copy_done[i]);
+        }
+        free(r->copy_done);
+    }
+    if (r->compute_done) {
+        for (int i = 0; i < r->slots; ++i) {
+            if (r->compute_done[i]) cudaEventDestroy(r->compute_done[i]);
+        }
+        free(r->compute_done);
+    }
+    free(r);
+}
+
+void *rc_ring_host(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return NULL;
+    return r->host[slot];
+}
+
+size_t rc_ring_slot_bytes(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    return r ? r->slot_bytes : 0;
+}
+
+int rc_ring_slots(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    return r ? r->slots : 0;
+}
+
+/* Enqueue one async H2D copy per projected column, then mark the slot's copy
+   event. The caller may immediately enqueue compute that waits on it. */
+int rc_ring_upload(void *v, int slot, void *const *dev_ptrs, const size_t *dev_offsets,
+                   const size_t *host_offsets, const size_t *bytes, int ncols)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    for (int i = 0; i < ncols; ++i) {
+        if (bytes[i] == 0) continue;
+        char *dst = (char *)dev_ptrs[i] + dev_offsets[i];
+        char *src = (char *)r->host[slot] + host_offsets[i];
+        cudaError_t e = cudaMemcpyAsync(dst, src, bytes[i], cudaMemcpyHostToDevice,
+                                        r->copy_stream);
+        if (e != cudaSuccess) { r->failed = 1; return -1; }
+    }
+    if (cudaEventRecord(r->copy_done[slot], r->copy_stream) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    r->copy_count += 1;
+    return 0;
+}
+
+int rc_ring_compute_begin(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    if (cudaStreamWaitEvent(r->compute_stream, r->copy_done[slot], 0) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    return 0;
+}
+
+int rc_ring_compute_end(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    if (cudaEventRecord(r->compute_done[slot], r->compute_stream) != cudaSuccess) {
+        r->failed = 1; return -1;
+    }
+    r->compute_count += 1;
+    return 0;
+}
+
+/* Wait until the copy that reads this pinned slot has completed, so the reader
+   can reuse it. This is an event wait, not a stream-wide synchronisation. */
+int rc_ring_wait_copy(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    return cudaEventSynchronize(r->copy_done[slot]) == cudaSuccess ? 0 : -1;
+}
+
+int rc_ring_wait_slot(void *v, int slot)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r || slot < 0 || slot >= r->slots) return -1;
+    return cudaEventSynchronize(r->compute_done[slot]) == cudaSuccess ? 0 : -1;
+}
+
+/* One synchronisation at the end of the whole projected upload, never per
+   group on the hot path. */
+int rc_ring_sync(void *v)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return -1;
+    if (cudaStreamSynchronize(r->compute_stream) != cudaSuccess) { r->failed = 1; return -1; }
+    if (cudaStreamSynchronize(r->copy_stream) != cudaSuccess) { r->failed = 1; return -1; }
+    return r->failed ? -1 : 0;
+}
+
+int rc_ring_stats(void *v, unsigned long long *copies, unsigned long long *computes,
+                  unsigned long long *bytes, int *failed)
+{
+    RcRing *r = (RcRing *)v;
+    if (!r) return -1;
+    if (copies) *copies = r->copy_count;
+    if (computes) *computes = r->compute_count;
+    if (bytes) *bytes = (unsigned long long)r->slot_bytes * (unsigned long long)r->slots;
+    if (failed) *failed = r->failed;
+    return 0;
+}
+
+/* Run the per-tile compute needed by the projected path. `kind`:
+   0 ret(k), 1 lag(k), 2 range, 3 clv, 4 calendar(which). */
+int rc_ring_launch_seg_id(void *rv, void *cv, int start, int len)
+{
+    RcRing *r = (RcRing *)rv;
+    RcEnrich *c = (RcEnrich *)cv;
+    if (!r || !c || len <= 0) return -1;
+    int threads = 256;
+    int blocks = (len + threads - 1) / threads;
+    k_seg_id_tile<<<blocks, threads, 0, r->compute_stream>>>(
+        c->d_seg_start, c->d_seg_len, c->nseg, start, len, c->d_seg_id);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
+                           int start, int len, double *out)
+{
+    RcRing *r = (RcRing *)rv;
+    RcEnrich *c = (RcEnrich *)cv;
+    if (!r || !c || !out || len <= 0) return -1;
+    int threads = 256;
+    int blocks = (len + threads - 1) / threads;
+    cudaStream_t s = r->compute_stream;
+    switch (kind) {
+    case 0:
+        k_ret_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+                                              c->step, k, start, len, out);
+        break;
+    case 1:
+        k_lag_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
+                                              c->step, k, start, len, out);
+        break;
+    case 2:
+        k_range_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+                                                start, len, out);
+        break;
+    case 3:
+        k_clv_tile<<<blocks, threads, 0, s>>>(c->d_high, c->d_low, c->d_close,
+                                              start, len, out);
+        break;
+    case 4:
+        k_calendar_tile<<<blocks, threads, 0, s>>>(c->d_times, which, start, len, out);
+        break;
+    default:
+        return -1;
+    }
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* An RcEnrich that owns the device arrays but has not uploaded the source
+   columns. The projected ring fills them group by group. `nan_mask` marks
+   value arrays that must start as NaN (bit 0..5 = open,high,low,close,volume,
+   qvolume). */
+void *rc_enrich_create_arena(int n, int nseg, int step, const int *seg_start,
+                             const int *seg_len, unsigned int nan_mask)
+{
+    if (n <= 0 || nseg <= 0) return NULL;
+    RcEnrich *c = (RcEnrich *)calloc(1, sizeof(RcEnrich));
+    if (!c) return NULL;
+    c->n = n;
+    c->nseg = nseg;
+    c->step = step;
+    size_t rows = (size_t)n;
+    double t0 = rc_now_ms();
+    int ok = 1;
+    if (rc_alloc((void **)&c->d_times, rows * sizeof(long long)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_open, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_high, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_low, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_close, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_volume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_qvolume, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_trades, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tb, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_tbq, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_start, (size_t)nseg * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_len, (size_t)nseg * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_seg_id, rows * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_a, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_d, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out2, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_out3, rows * sizeof(double)) != 0) ok = 0;
+    c->last.alloc_ms = rc_now_ms() - t0;
+    if (!ok) { rc_enrich_destroy(c); return NULL; }
+    t0 = rc_now_ms();
+    rc_upload(c->d_seg_start, seg_start, (size_t)nseg * sizeof(int));
+    rc_upload(c->d_seg_len, seg_len, (size_t)nseg * sizeof(int));
+    c->last.h2d_ms = rc_now_ms() - t0;
+    c->last.h2d_bytes = 2ULL * (unsigned long long)nseg * sizeof(int);
+    if (nan_mask & 1u) cudaMemset(c->d_open, 0xFF, rows * sizeof(double));
+    if (nan_mask & 2u) cudaMemset(c->d_high, 0xFF, rows * sizeof(double));
+    if (nan_mask & 4u) cudaMemset(c->d_low, 0xFF, rows * sizeof(double));
+    if (nan_mask & 8u) cudaMemset(c->d_close, 0xFF, rows * sizeof(double));
+    if (nan_mask & 16u) cudaMemset(c->d_volume, 0xFF, rows * sizeof(double));
+    if (nan_mask & 32u) cudaMemset(c->d_qvolume, 0xFF, rows * sizeof(double));
+    if (nan_mask & 64u) cudaMemset(c->d_trades, 0xFF, rows * sizeof(double));
+    if (nan_mask & 128u) cudaMemset(c->d_tb, 0xFF, rows * sizeof(double));
+    if (nan_mask & 256u) cudaMemset(c->d_tbq, 0xFF, rows * sizeof(double));
+    /* #297: presence bits derive from the same mask; a clear bit means the
+       optional column was not projected and must stay NaN. */
+    c->present = 0;
+    if (!(nan_mask & 16u)) c->present |= RC_PRESENT_VOLUME;
+    if (!(nan_mask & 32u)) c->present |= RC_PRESENT_QUOTE_VOLUME;
+    if (!(nan_mask & 64u)) c->present |= RC_PRESENT_TRADES;
+    if (!(nan_mask & 128u)) c->present |= RC_PRESENT_TAKER_BUY;
+    if (!(nan_mask & 256u)) c->present |= RC_PRESENT_TAKER_BUY_QV;
+    stats_end(c);
+    c->last.batch = 0;
+    return c;
+}
+
+long long *rc_enrich_times_ptr(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    return c ? c->d_times : NULL;
+}
+
+/* which: 0 open, 1 high, 2 low, 3 close, 4 volume, 5 qvolume,
+   6 trades, 7 taker-buy base, 8 taker-buy quote. */
+double *rc_enrich_value_ptr(void *v, int which)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return NULL;
+    switch (which) {
+    case 0: return c->d_open;
+    case 1: return c->d_high;
+    case 2: return c->d_low;
+    case 3: return c->d_close;
+    case 4: return c->d_volume;
+    case 5: return c->d_qvolume;
+    case 6: return c->d_trades;
+    case 7: return c->d_tb;
+    case 8: return c->d_tbq;
+    default: return NULL;
+    }
+}
+
+double *rc_enrich_new_output(void *v)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return NULL;
+    double *p = NULL;
+    if (rc_alloc((void **)&p, (size_t)c->n * sizeof(double)) != 0) return NULL;
+    return p;
+}
+
+void rc_enrich_release_output(double *p)
+{
+    if (p) cudaFree(p);
+}
+
+int rc_enrich_download_ptr(const double *src, double *dst, int n)
+{
+    if (!src || !dst || n <= 0) return -1;
+    return cudaMemcpy(dst, src, (size_t)n * sizeof(double), cudaMemcpyDeviceToHost) == cudaSuccess
+               ? 0
+               : -1;
+}
+
+void rc_enrich_note_projected_upload(void *v, unsigned long long bytes, double ms)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return;
+    c->last.h2d_bytes += bytes;
+    c->last.h2d_ms += ms;
+}
+
+void rc_enrich_note_projected_download(void *v, unsigned long long bytes, double ms)
+{
+    RcEnrich *c = (RcEnrich *)v;
+    if (!c) return;
+    c->last.d2h_bytes += bytes;
+    c->last.d2h_ms += ms;
+}
+
+} /* extern "C" */
+
+__global__ void k_ring_busy(unsigned long long cycles)
+{
+    unsigned long long t0 = clock64();
+    while (clock64() - t0 < cycles) { __nanosleep(64); }
+}
+
+/* Event-ordering probe for the transport (tests/gpu_ring.rs). It exercises the
+   same ring/stream/event calls as the projected path: a copy of slot i+1 is
+   enqueued while the compute stream's busy kernel for slot i is still running.
+   Reports the two windows and whether they overlap. No cudaStreamSynchronize is
+   used until the final join. */
+extern "C" int rc_ring_overlap_probe(size_t bytes, int iters, unsigned long long cycles,
+                                     double *copy_ms, double *compute_ms, int *overlapped,
+                                     unsigned long long *copies, int *failed)
+{
+    if (bytes == 0 || iters < 2) return -1;
+    void *ring = rc_ring_create(2, bytes);
+    if (!ring) return -1;
+    void *d0 = NULL, *d1 = NULL;
+    if (rc_alloc(&d0, bytes) != 0 || rc_alloc(&d1, bytes) != 0) {
+        cudaFree(d0); cudaFree(d1); rc_ring_destroy(ring);
+        return -1;
+    }
+    cudaEvent_t cs, ce, ks, ke;
+    cudaEventCreate(&cs); cudaEventCreate(&ce);
+    cudaEventCreate(&ks); cudaEventCreate(&ke);
+    RcRing *r = (RcRing *)ring;
+    cudaEventRecord(cs, r->copy_stream);
+    cudaEventRecord(ks, r->compute_stream);
+    int ok = 1;
+    for (int i = 0; i < iters && ok; ++i) {
+        int slot = i % 2;
+        void *dev[1] = { (slot == 0) ? d0 : d1 };
+        size_t off[1] = { 0 };
+        size_t hoff[1] = { 0 };
+        size_t len[1] = { bytes };
+        if (rc_ring_upload(ring, slot, dev, off, hoff, len, 1) != 0) { ok = 0; break; }
+        if (rc_ring_compute_begin(ring, slot) != 0) { ok = 0; break; }
+        k_ring_busy<<<1, 1, 0, r->compute_stream>>>(cycles);
+        if (cudaGetLastError() != cudaSuccess) { ok = 0; break; }
+        if (rc_ring_compute_end(ring, slot) != 0) { ok = 0; break; }
+    }
+    if (ok) {
+        cudaEventRecord(ce, r->copy_stream);
+        cudaEventRecord(ke, r->compute_stream);
+        if (cudaEventSynchronize(ke) != cudaSuccess) ok = 0;
+        if (cudaEventSynchronize(ce) != cudaSuccess) ok = 0;
+    }
+    float cm = 0.0f, km = 0.0f, kstart = 0.0f, kend = 0.0f;
+    if (ok) {
+        cudaEventElapsedTime(&cm, cs, ce);
+        cudaEventElapsedTime(&km, ks, ke);
+        cudaEventElapsedTime(&kstart, cs, ks);
+        cudaEventElapsedTime(&kend, cs, ke);
+        if (copy_ms) *copy_ms = (double)cm;
+        if (compute_ms) *compute_ms = (double)km;
+        /* The compute stream's window starts before the copy stream finishes,
+           and it is still running after it. */
+        if (overlapped) *overlapped = (kstart < cm && kend > cm) ? 1 : 0;
+    }
+    if (copies) *copies = r->copy_count;
+    if (failed) *failed = r->failed;
+    cudaEventDestroy(cs); cudaEventDestroy(ce);
+    cudaEventDestroy(ks); cudaEventDestroy(ke);
+    cudaFree(d0); cudaFree(d1);
+    rc_ring_destroy(ring);
+    return ok ? 0 : -1;
+}
+
+

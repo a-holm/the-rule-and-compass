@@ -39,6 +39,7 @@ timings. It contains:
 | `data.train`, `data.test` | prepared-sample row count and FNV-1a fingerprint, exactly as the checkpoint records them |
 | `config.hash`, `config.seed`, `config.canonical` | the canonical configuration text, its FNV-1a hash and the search seed |
 | `backend`, `device` | `cpu`/`gpu`, device name, driver version and CUDA version |
+| `dispatch` | #290: the calibrated `r_eval`/`r_fit`/`bw`/`launch` values, probe wall time, source and band, plus the per-stage route ledger (`route`, `reason`, `calls`, `candidates`, `predicted_s`, `actual_s`, `bytes`, `switches`) |
 | `resume.from`, `resume.backend_change` | checkpoint path and an allowed backend change, if any |
 | `phases_seconds` | `data_prepare`, `search`, `total` |
 

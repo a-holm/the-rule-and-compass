@@ -426,7 +426,7 @@ fn cross_formula(name: &str) -> &'static str {
         "btc_volume_share" => "BTC volume / total PIT member volume at t",
         "xs_rank_r1" | "xs_rank_r16" | "xs_rank_r20" | "xs_rank_vol20"
         | "xs_rank_amihud96" | "cs_rank_r60" => {
-            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row"
+            "2*(rank-1)/(n-1)-1 per timestamp; PIT finite, N>=20, ties symbol then row, -0==+0; one device (time,symbol,row) permutation reused"
         }
         _ => "see docs/ohlcv.md",
     }
@@ -581,10 +581,28 @@ pub struct RegistryEntry {
     pub warmup: usize,
     pub available: bool,
     pub derived: bool,
+    /// Declared CPU/GPU parity tier: `bitwise`, `1e-12`, `unavailable`, or
+    /// `reference` when this issue does not claim a device tier.
+    pub parity_tier: &'static str,
     pub formula: String,
     pub source: &'static str,
     pub pit: &'static str,
     pub reason: Option<String>,
+}
+
+/// Declared parity tier for a registry entry.
+///
+/// Only the fused flow / price-action columns and the reserved derivatives make
+/// a device claim in #297; every other name is the CPU reference and is marked
+/// `reference` rather than silently implying byte parity.
+pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
+    if family == "derivatives" {
+        return "unavailable";
+    }
+    if let Some(tier) = crate::features_gpu::device_tier(name) {
+        return tier;
+    }
+    "reference"
 }
 
 /// The default financial feature registry.
@@ -623,6 +641,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: 0,
             available: true,
             derived: false,
+            parity_tier: declared_parity_tier(name, family),
             formula: "input column".to_string(),
             source: "input",
             pit: "bar t",
@@ -640,6 +659,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: flow_warmup(name),
             available: true,
             derived: false,
+            parity_tier: declared_parity_tier(name, "flow"),
             formula: flow_formula(name).to_string(),
             source: "raw OHLCV/flow columns",
             pit: "close of bar t; trailing windows inclusive; gaps are NaN; \
@@ -660,6 +680,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup,
             available: true,
             derived: false,
+            parity_tier: declared_parity_tier(&name, "cross"),
             formula,
             source: match cross_source(&name) {
                 Some("volume") => "raw volume + all PIT members",
@@ -694,6 +715,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: nominal_warmup(name),
             available: true,
             derived: *name == "wasym1",
+            parity_tier: declared_parity_tier(name, family),
             formula: compact_formula(name).to_string(),
             source,
             pit: "close of bar t; trailing windows inclusive; gaps are NaN",
@@ -712,6 +734,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: nominal_warmup(&name),
             available: true,
             derived: false,
+            parity_tier: declared_parity_tier(&name, family_of(&name)),
             formula: engine_formula(&name).to_string(),
             source: "ohlcv::Bar",
             pit: "close of bar t; trailing windows inclusive; gaps are NaN; no forward fill",
@@ -724,6 +747,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
     for tf in MTF_TIMEFRAMES {
         for leaf in MTF_LEAVES {
             let name = format!("mtf_{}_{}", tf, leaf);
+            let parity_tier = declared_parity_tier(&name, "mtf");
             push_unique(&mut out, RegistryEntry {
                 name,
                 family: "mtf",
@@ -731,6 +755,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
                 warmup: mtf_warmup(leaf),
                 available: true,
                 derived: false,
+                parity_tier,
                 formula: format!("resample to {}; {}; causal close join", tf, mtf_formula(leaf)),
                 source: "base OHLCV bars",
                 pit: "higher.time + timeframe_seconds() <= t; last closed higher bar only; \
@@ -747,6 +772,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: price_action_warmup(name),
             available: true,
             derived: false,
+            parity_tier: declared_parity_tier(name, "price_action"),
             formula: price_action_formula(name).to_string(),
             source: "15m OHLCV bars; not a target construction column",
             pit: "close of bar t; trailing windows inclusive; any missing bucket \
@@ -762,6 +788,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             warmup: 0,
             available: false,
             derived: false,
+            parity_tier: "unavailable",
             formula: "reserved derivative column".to_string(),
             source: "none",
             pit: "not available",
@@ -778,7 +805,7 @@ pub fn registry_json() -> String {
         .map(|e| {
             format!(
                 "{{\"name\":{},\"family\":{},\"timeframe\":{},\"warmup\":{},\
-                 \"available\":{},\"derived\":{},\"formula\":{},\"formula_sha256\":{},\
+                 \"available\":{},\"derived\":{},\"parity_tier\":{},\"formula\":{},\"formula_sha256\":{},\
                  \"source\":{},\"pit\":{},\"reason\":{}}}",
                 jstr(&e.name),
                 jstr(e.family),
@@ -786,6 +813,7 @@ pub fn registry_json() -> String {
                 e.warmup,
                 e.available,
                 e.derived,
+                jstr(e.parity_tier),
                 jstr(&e.formula),
                 jstr(&manifest::sha256_hex(e.formula.as_bytes())),
                 jstr(e.source),
@@ -827,11 +855,12 @@ pub fn engine_catalogue_json() -> String {
         .filter_map(|name| reg.iter().find(|e| e.name == *name))
         .map(|e| {
             format!(
-                "{{\"name\":{},\"family\":{},\"warmup\":{},\"available\":{},\"formula\":{}}}",
+                "{{\"name\":{},\"family\":{},\"warmup\":{},\"available\":{},\"parity_tier\":{},\"formula\":{}}}",
                 jstr(&e.name),
                 jstr(e.family),
                 e.warmup,
                 e.available,
+                jstr(e.parity_tier),
                 jstr(&e.formula)
             )
         })
@@ -1440,6 +1469,8 @@ pub struct Options {
     pub eth_symbol: String,
     pub eth_data: Option<String>,
     pub gpu: GpuMode,
+    /// Measured sequential write bandwidth used by cost model v2 (#300).
+    pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
     pub dry_run: bool,
     pub json: bool,
@@ -1463,6 +1494,7 @@ impl Default for Options {
             eth_symbol: "ETHUSDT".to_string(),
             eth_data: None,
             gpu: GpuMode::Auto,
+            write_bw: None,
             allow_lockbox: false,
             dry_run: false,
             json: false,
@@ -1515,7 +1547,19 @@ pub struct Report {
     pub gpu_fallback: usize,
     /// Measured device windows for the enrichment phase (#118 ledger).
     pub gpu_kernel_seconds: f64,
+    /// Measured device→host time (#294/#300), separate from kernel time.
+    pub gpu_d2h_seconds: f64,
+    /// Measured host staging writes of GPU output blocks (#300).
+    pub gpu_write_seconds: f64,
+    /// Write bandwidth charged by cost model v2 (#300), bytes/second.
+    pub write_bw: f64,
     pub gpu_transfer_bytes: u64,
+    /// Measured host→device and device→host windows (#294 benchmark ledger).
+    pub gpu_h2d_seconds: f64,
+    /// #294: FNV-1a 64 of the resolved device read projection.
+    pub projection_hash: Option<String>,
+    /// #294: exact header columns the projected transport read.
+    pub projection_columns: Vec<String>,
     pub read_seconds: f64,
     pub feature_seconds: f64,
     pub xs_seconds: f64,
@@ -1551,13 +1595,16 @@ impl Report {
                 self.gpu_device.as_deref().unwrap_or("none")
             ),
             format!(
-                "# enrich: gpu_columns={} cpu_columns={} gpu_share={:.3} fallback={} kernel={:.3}s transfer_bytes={}",
+                "# enrich: gpu_columns={} cpu_columns={} gpu_share={:.3} fallback={} kernel={:.3}s d2h={:.3}s write={:.3}s transfer_bytes={} write_bw={:.0}",
                 self.gpu_columns,
                 self.cpu_columns,
                 self.gpu_share,
                 self.gpu_fallback,
                 self.gpu_kernel_seconds,
-                self.gpu_transfer_bytes
+                self.gpu_d2h_seconds,
+                self.gpu_write_seconds,
+                self.gpu_transfer_bytes,
+                self.write_bw
             ),
             format!(
                 "# enrich: read={:.3}s feature={:.3}s xs={:.3}s write={:.3}s total={:.3}s peak_rss={:.1} MiB",
@@ -1569,6 +1616,13 @@ impl Report {
                 self.peak_rss_bytes as f64 / (1024.0 * 1024.0)
             ),
         ];
+        if let Some(hash) = &self.projection_hash {
+            out.push(format!(
+                "# enrich: projection_hash={} columns={}",
+                hash,
+                self.projection_columns.join(",")
+            ));
+        }
         for f in &self.features {
             out.push(format!(
                 "# enrich-feature: name={} warmup={} nan_rows={} prevalence={:.6} first_finite_row={} first_finite_time={} first_finite_iso={} label={}",
@@ -1658,7 +1712,8 @@ impl Report {
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
-             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"transfer_bytes\":{}}},\n  \
+             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0}}},\n  \
+             \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
@@ -1686,7 +1741,20 @@ impl Report {
             self.gpu_share,
             self.gpu_fallback,
             self.gpu_kernel_seconds,
+            self.gpu_h2d_seconds,
+            self.gpu_d2h_seconds,
+            self.gpu_write_seconds,
             self.gpu_transfer_bytes,
+            self.write_bw,
+            self.projection_hash
+                .as_deref()
+                .map(jstr)
+                .unwrap_or_else(|| "null".to_string()),
+            self.projection_columns
+                .iter()
+                .map(|c| jstr(c))
+                .collect::<Vec<_>>()
+                .join(","),
             self.read_seconds,
             self.feature_seconds,
             self.xs_seconds,
@@ -1789,7 +1857,9 @@ impl OpClass {
             OpClass::Calendar => 300_000_000.0,
             OpClass::RollingSum => 100_000_000.0,
             OpClass::RollingStd => 60_000_000.0,
-            OpClass::RollingExtrema => 8_000_000.0,
+            // #298 blocked extrema: 4.58 ms for 1M rows at w=96 on the RTX
+            // 3060 (218M rows/s). 180M is the conservative planner figure.
+            OpClass::RollingExtrema => 180_000_000.0,
             OpClass::WilderScan => 8_000_000.0,
             OpClass::Rank => 40_000_000.0,
             OpClass::Join => 250_000_000.0,
@@ -1928,30 +1998,84 @@ pub fn gpu_supports(name: &str) -> bool {
     if !cfg!(feature = "cuda") {
         return false;
     }
+    // #297: the fused flow and price-action producers materialise their
+    // columns with a declared parity tier; they must be reachable even when a
+    // shared name (cmf20) is also in the compact subset.
+    if crate::features_gpu::is_device_flow(name)
+        || crate::features_gpu::is_device_price_action(name)
+    {
+        return true;
+    }
     if is_compact(name)
-        && !matches!(name, "clv1" | "dow_sin" | "dow_cos" | "macd_hist")
+        && !matches!(
+            name,
+            // #298: exact tail kernels. The compact pass remains the CPU
+            // reference for every name not listed here.
+            "clv1"
+                | "dow_sin"
+                | "dow_cos"
+                | "macd_hist"
+                | "r16"
+                | "r96"
+                | "r672"
+                | "ma96"
+                | "ma672"
+                | "ma_slope672"
+                | "natr14"
+                | "adx14"
+                | "di_diff14"
+                | "bb96"
+                | "bb_width96"
+                | "batr"
+                | "gapatr"
+                | "volrat"
+                | "don96"
+                | "ou_hl96"
+                | "acf1"
+                | "vr4"
+                | "rskew96"
+                | "jump_share"
+                | "semivar_asym"
+                | "cusum_abs_z"
+                | "tod_sin"
+                | "tod_cos"
+                | "vol16"
+                | "vol96"
+                | "vol_z96"
+                | "rsi14"
+        )
     {
         // The compact profile is computed by one CPU reference pass. Only the
-        // compact names whose arithmetic is already bit-identical to a
-        // registered kernel (clv1, weekday calendar, macd_hist) may dispatch.
+        // compact names whose arithmetic has an exact registered kernel may
+        // dispatch; the rest stay on the reference path.
         return false;
     }
     if name.starts_with("xs_rank_") {
         // Cross-sectional ranks use the device segmented sort in the xs pass.
         return true;
     }
+    if is_mtf(name) {
+        // #296: the complete MTF family has a device resample + causal join.
+        return true;
+    }
+    if name == "ret1" || name == "ret5" {
+        return true;
+    }
+    if name == "ma_slope672" {
+        return true;
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
-        if (1..=120).contains(&k) {
+        if k > 0 {
             return true;
         }
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        if ma_names().iter().any(|n| n == &format!("ma{}", w)) {
+        if w > 0 {
             return true;
         }
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
-        if vol_names().iter().any(|n| n == &format!("vol{}", w)) {
+        if w > 0 {
             return true;
         }
     }
@@ -1969,7 +2093,12 @@ pub fn gpu_supports(name: &str) -> bool {
         name,
         "bb20_bw"
             | "bb50_bw"
+            | "bb_width96"
+            | "bb20_z"
+            | "bb50"
+            | "bb96"
             | "vz96"
+            | "vol_z96"
             | "range1"
             | "clv1"
             | "dow_sin"
@@ -1980,6 +2109,8 @@ pub fn gpu_supports(name: &str) -> bool {
             | "month_cos"
             | "dom_sin"
             | "dom_cos"
+            | "tod_sin"
+            | "tod_cos"
             | "ema8"
             | "ema20"
             | "ema50"
@@ -1989,8 +2120,30 @@ pub fn gpu_supports(name: &str) -> bool {
             | "macd_sig"
             | "macd_hist"
             | "rsi6"
+            | "rsi14"
             | "rsi28"
+            | "atr14"
+            | "natr14"
             | "atr50"
+            | "batr"
+            | "gapatr"
+            | "volrat"
+            | "stoch_k"
+            | "stoch_d"
+            | "adx14"
+            | "di_plus"
+            | "di_minus"
+            | "di_diff14"
+            | "rmean5"
+            | "rstd5"
+            | "close_pos20"
+            | "ou_hl96"
+            | "acf1"
+            | "vr4"
+            | "rskew96"
+            | "jump_share"
+            | "semivar_asym"
+            | "cusum_abs_z"
     )
 }
 
@@ -2008,6 +2161,52 @@ pub fn gpu_kernels_compiled() -> bool {
 /// stay on the CPU.
 pub const GPU_MIN_ROWS: usize = 1_000_000;
 pub const GPU_TRANSFER_BYTES_PER_SECOND: f64 = 12_000_000_000.0;
+/// Measured sequential write bandwidth of the shared ext4 store on
+/// `/mnt/lager` (2026-10-23, 512 MiB `dd conv=fdatasync`: **222 MB/s**). This is
+/// the temp-file write term the pre-#300 model omitted. It is deliberately a
+/// conservative filesystem figure: the same disk measured 64 MB/s while the
+/// 16M-row full-catalogue run was appending, so a planner on a busier disk
+/// should pass a smaller value through [`plan_groups_with_write_bw`] (the CLI
+/// exposes `--write-bw`).
+pub const GPU_WRITE_BYTES_PER_SECOND: f64 = 222_000_000.0;
+/// Device-to-host transfer bandwidth used by the cost model. Kept separate from
+/// the resident upload rate so the write term cannot hide behind the bus.
+pub const GPU_D2H_BYTES_PER_SECOND: f64 = GPU_TRANSFER_BYTES_PER_SECOND;
+/// Hard cap for the per-family output arena (#300). A block whose columns do
+/// not fit falls back to per-column staging.
+pub const GPU_OUTPUT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Measure sequential write bandwidth (bytes/second) in `dir`.
+///
+/// Writes `bytes` of zeroes with a 1 MiB buffer and `sync_all` on the file, so
+/// the result is a durable-write figure rather than page-cache speed. Used by
+/// the ignored `measure_write_bandwidth` test and by operators calibrating
+/// `--write-bw` for a different filesystem.
+pub fn measure_write_bandwidth(dir: &Path, bytes: u64) -> Result<f64, String> {
+    use std::io::Write;
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    let path = dir.join(format!("rcsr-bw-{}.bin", std::process::id()));
+    let mut file = std::fs::File::create(&path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let buf = vec![0u8; 1 << 20];
+    let started = std::time::Instant::now();
+    let mut left = bytes;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("{}: {}", path.display(), e))?;
+        left -= n as u64;
+    }
+    file.sync_all()
+        .map_err(|e| format!("{}: {}", path.display(), e))?;
+    let seconds = started.elapsed().as_secs_f64();
+    drop(file);
+    let _ = std::fs::remove_file(&path);
+    if seconds <= 0.0 {
+        return Err("write bandwidth clock produced zero seconds".to_string());
+    }
+    Ok(bytes as f64 / seconds)
+}
+
 /// Fixed per-run device setup (context, probe, launch glue).
 pub const GPU_FIXED_OVERHEAD_MS: f64 = 50.0;
 /// One-time host read of the source columns plus the resident upload, per
@@ -2023,20 +2222,124 @@ pub fn plan_groups(
     gpu_requested: GpuMode,
     gpu_available: bool,
 ) -> Vec<GroupPlan> {
+    plan_groups_full(
+        counts,
+        gpu_cols,
+        n_rows,
+        usize::MAX,
+        gpu_requested,
+        gpu_available,
+        GPU_WRITE_BYTES_PER_SECOND,
+    )
+}
+
+/// Cost model v2 (#300): include the measured output write.
+///
+/// ```text
+/// gpu_s = fixed + context(n) + h2d/BW_h2d + cells/rate_kernel
+///       + d2h/BW_d2h + write_bytes/BW_write
+/// ```
+///
+/// `write_bps` is the calibrated filesystem write bandwidth. A slower disk can
+/// flip a family to the CPU, which is exactly the decision the old model could
+/// not express.
+pub fn plan_groups_with_write_bw(
+    counts: &BTreeMap<&'static str, (usize, OpClass)>,
+    gpu_cols: &BTreeMap<&'static str, usize>,
+    n_rows: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    write_bps: f64,
+) -> Vec<GroupPlan> {
+    plan_groups_full(
+        counts,
+        gpu_cols,
+        n_rows,
+        usize::MAX,
+        gpu_requested,
+        gpu_available,
+        write_bps,
+    )
+}
+
+/// Minimum symbol segments for an automatic fused-family dispatch. The fused
+/// consumers parallelise over segments: with two symbols the 109-block device
+/// grid is idle and the CPU reference is faster. `--gpu on` still forces it.
+pub const FUSED_MIN_SEGMENTS: usize = 32;
+
+/// [`plan_groups`] with the store's symbol count, so fused families can decline
+/// when their segment-parallel consumers would not fill the device.
+pub fn plan_groups_with_segments(
+    counts: &BTreeMap<&'static str, (usize, OpClass)>,
+    gpu_cols: &BTreeMap<&'static str, usize>,
+    n_rows: usize,
+    n_segments: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+) -> Vec<GroupPlan> {
+    plan_groups_full(
+        counts,
+        gpu_cols,
+        n_rows,
+        n_segments,
+        gpu_requested,
+        gpu_available,
+        GPU_WRITE_BYTES_PER_SECOND,
+    )
+}
+
+/// The combined planner: symbol count (fused-family floor) and calibrated
+/// write bandwidth (#300).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_groups_full(
+    counts: &BTreeMap<&'static str, (usize, OpClass)>,
+    gpu_cols: &BTreeMap<&'static str, usize>,
+    n_rows: usize,
+    n_segments: usize,
+    gpu_requested: GpuMode,
+    gpu_available: bool,
+    write_bps: f64,
+) -> Vec<GroupPlan> {
     let mut out = Vec::new();
+    let write_bps = if write_bps.is_finite() && write_bps > 0.0 {
+        write_bps
+    } else {
+        GPU_WRITE_BYTES_PER_SECOND
+    };
     for (group, (cols, op)) in counts {
         let op = *op;
         let cells = n_rows.saturating_mul(*cols).max(1) as f64;
-        let cpu_s = cells / op.cpu_cells_per_second();
+        let cpu_s = match crate::features_gpu::fused_cost(group) {
+            Some(cost) => {
+                cost.cpu_ms_per_mrow_column * (n_rows as f64 / 1_000_000.0)
+                    * (*cols as f64)
+                    / 1000.0
+            }
+            None => cells / op.cpu_cells_per_second(),
+        };
         let supported = (*gpu_cols.get(group).unwrap_or(&0)).min(*cols);
         let gpu_cells_n = n_rows.saturating_mul(supported).max(1);
         let gpu_cells = gpu_cells_n as f64;
-        let gpu_bytes = gpu_cells_n as f64 * 8.0 * 2.0;
+        let transfer_bytes = gpu_cells_n as f64 * 8.0;
         let context_ms =
             GPU_FIXED_OVERHEAD_MS + GPU_CONTEXT_MS_PER_MROW * n_rows as f64 / 1_000_000.0;
-        let gpu_s = context_ms / 1000.0
-            + gpu_bytes / GPU_TRANSFER_BYTES_PER_SECOND
-            + gpu_cells / op.gpu_cells_per_second();
+        let gpu_s = if let Some(fused_ms) =
+            crate::features_gpu::estimate_fused_ms(group, n_rows, supported)
+        {
+            // Fused base + consumers: the base is paid once, not per column.
+            // The write/D2H terms are #300's calibrated output-path cost.
+            context_ms / 1000.0
+                + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
+                + fused_ms / 1000.0
+                + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
+                + transfer_bytes / write_bps
+        } else {
+            context_ms / 1000.0
+                + transfer_bytes / GPU_TRANSFER_BYTES_PER_SECOND
+                + gpu_cells / op.gpu_cells_per_second()
+                + transfer_bytes / GPU_D2H_BYTES_PER_SECOND
+                + transfer_bytes / write_bps
+        };
         let cpu_supported_s = gpu_cells / op.cpu_cells_per_second();
         let (backend, reason) = if gpu_requested == GpuMode::Off {
             ("cpu", "GPU disabled by --no-gpu/--cpu".to_string())
@@ -2053,6 +2356,16 @@ pub fn plan_groups(
             ("cpu", "no usable CUDA device".to_string())
         } else if gpu_requested == GpuMode::On {
             ("gpu", "forced by --gpu on".to_string())
+        } else if crate::features_gpu::fused_cost(group).is_some()
+            && n_segments < FUSED_MIN_SEGMENTS
+        {
+            (
+                "cpu",
+                format!(
+                    "{} symbol segments is below the {} segment floor for the fused {} family",
+                    n_segments, FUSED_MIN_SEGMENTS, group
+                ),
+            )
         } else if gpu_s < cpu_supported_s {
             ("gpu", "estimated GPU time is below CPU".to_string())
         } else {
@@ -2420,6 +2733,9 @@ struct Cols {
     quote_volume: Option<usize>,
     trades: Option<usize>,
     taker_buy_base: Option<usize>,
+    /// Only read by the CUDA context (#297); the CPU producers do not need it.
+    #[allow(dead_code)]
+    taker_buy_quote: Option<usize>,
     symbol: Option<usize>,
 }
 
@@ -2778,23 +3094,20 @@ fn clv1(s: &Series) -> Vec<f64> {
 }
 
 fn donchian(s: &Series, w: usize) -> Vec<f64> {
-    let mut out = vec![f64::NAN; s.len()];
-    for i in 0..s.len() {
-        if !contig(&s.times, i, w, s.step) {
-            continue;
-        }
-        let lo = i + 1 - w;
-        let mut hi = f64::NEG_INFINITY;
-        let mut low = f64::INFINITY;
-        for j in lo..=i {
-            hi = hi.max(s.high[j]);
-            low = low.min(s.low[j]);
-        }
-        if hi > low && low.is_finite() {
-            out[i] = (s.close[i] - low) / (hi - low);
-        }
-    }
-    out
+    // Same strict window policy as the device extrema: a non-finite high or
+    // low anywhere in the window makes the channel missing. This is bit-exact
+    // with the blocked prefix-suffix kernel.
+    let hi = rolling_max(&s.high, w, &s.times, s.step);
+    let lo = rolling_min(&s.low, w, &s.times, s.step);
+    (0..s.len())
+        .map(|i| {
+            if hi[i] > lo[i] && lo[i].is_finite() {
+                (s.close[i] - lo[i]) / (hi[i] - lo[i])
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -3277,6 +3590,10 @@ fn load_benchmark(
         taker_buy_base: find_col(
             &cnames,
             &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
+        ),
+        taker_buy_quote: find_col(
+            &cnames,
+            &["taker_buy_quote", "takerbuyquote", "tbq"],
         ),
         symbol: find_symbol_col(&cnames, None),
     };
@@ -5654,6 +5971,15 @@ fn market_state_pass(
 /// Dispatch one registered catalogue name to its CUDA kernel.
 #[cfg(feature = "cuda")]
 fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec<f64>> {
+    if name == "ret1" {
+        return gpu.ret(1);
+    }
+    if name == "ret5" {
+        return gpu.ret(5);
+    }
+    if name == "ma_slope672" {
+        return gpu.ma_slope(672, 672);
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
         return gpu.ret(k);
     }
@@ -5666,13 +5992,20 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
     if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.lag(k);
     }
+    if name == "don96" {
+        return gpu.donchian_centred(96);
+    }
     if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.donchian(w);
     }
     match name {
         "bb20_bw" => gpu.bb_width(20),
         "bb50_bw" => gpu.bb_width(50),
-        "vz96" => gpu.vz(96),
+        "bb_width96" => gpu.bb_width(96),
+        "bb20_z" => gpu.bb_z(20, 0),
+        "bb50" => gpu.bb_z(50, 1),
+        "bb96" => gpu.bb_z(96, 1),
+        "vz96" | "vol_z96" => gpu.vz(96),
         "range1" => gpu.range(),
         "clv1" => gpu.clv(),
         "dow_sin" => gpu.calendar(0),
@@ -5683,6 +6016,8 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         "month_cos" => gpu.calendar(5),
         "dom_sin" => gpu.calendar(6),
         "dom_cos" => gpu.calendar(7),
+        "tod_sin" => gpu.tod(true),
+        "tod_cos" => gpu.tod(false),
         "ema8" => gpu.ema(8),
         "ema20" => gpu.ema(20),
         "ema50" => gpu.ema(50),
@@ -5690,9 +6025,81 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         "ema200" => gpu.ema(200),
         "rsi6" => gpu.rsi_py(6),
         "rsi28" => gpu.rsi_py(28),
-        "atr50" => gpu.atr_py(50),
+        "rsi14" => gpu.rsi_py(14),
+        "atr14" => gpu.atr(14, 3),
+        "natr14" => gpu.atr(14, 1),
+        "atr50" => gpu.atr(50, 2),
+        "batr" => gpu.batr(),
+        "gapatr" => gpu.gapatr(),
+        "volrat" => gpu.volrat(),
+        "stoch_k" => gpu.stoch(0),
+        "stoch_d" => gpu.stoch(1),
+        "adx14" => gpu.adx(0),
+        "di_plus" => gpu.adx(1),
+        "di_minus" => gpu.adx(2),
+        "di_diff14" => gpu.adx(3),
+        "rmean5" => gpu.exotic(0),
+        "rstd5" => gpu.exotic(1),
+        "close_pos20" => gpu.exotic(2),
+        "ou_hl96" => gpu.exotic(3),
+        "acf1" => gpu.exotic(4),
+        "vr4" => gpu.exotic(5),
+        "rskew96" => gpu.exotic(6),
+        "jump_share" => gpu.exotic(7),
+        "semivar_asym" => gpu.exotic(8),
+        "cusum_abs_z" => gpu.exotic(9),
         _ => None,
     }
+}
+
+/// #300: the same dispatch as [`gpu_feature`], as a descriptor for the batched
+/// output arena. `None` means the name has no single-slot batch kernel.
+#[cfg(feature = "cuda")]
+fn gpu_batch_op(name: &str) -> Option<crate::enrich_gpu::BatchOp> {
+    use crate::enrich_gpu::BatchOp;
+    if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::ret(k));
+    }
+    if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::ma(w));
+    }
+    if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::vol(w));
+    }
+    if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::lag(k));
+    }
+    if name == "don96" {
+        // The centred compact form is not the generic donchian batch op.
+        return None;
+    }
+    if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
+        return Some(BatchOp::donchian(w));
+    }
+    Some(match name {
+        "bb20_bw" => BatchOp::bb_width(20),
+        "bb50_bw" => BatchOp::bb_width(50),
+        "vz96" => BatchOp::vz(96),
+        "range1" => BatchOp::range(),
+        "clv1" => BatchOp::clv(),
+        "dow_sin" => BatchOp::calendar(0),
+        "dow_cos" => BatchOp::calendar(1),
+        "hour_sin" => BatchOp::calendar(2),
+        "hour_cos" => BatchOp::calendar(3),
+        "month_sin" => BatchOp::calendar(4),
+        "month_cos" => BatchOp::calendar(5),
+        "dom_sin" => BatchOp::calendar(6),
+        "dom_cos" => BatchOp::calendar(7),
+        "ema8" => BatchOp::ema(8),
+        "ema20" => BatchOp::ema(20),
+        "ema50" => BatchOp::ema(50),
+        "ema100" => BatchOp::ema(100),
+        "ema200" => BatchOp::ema(200),
+        "rsi6" => BatchOp::rsi(6),
+        "rsi28" => BatchOp::rsi(28),
+        "atr50" => BatchOp::atr(50),
+        _ => return None,
+    })
 }
 
 /// Run an enrichment into a temporary output file.
@@ -5783,6 +6190,10 @@ fn enrich_inner(
         taker_buy_base: find_col(
             &names,
             &["taker_buy_base", "taker_buy", "takerbuybase", "taker_buy_volume", "tb"],
+        ),
+        taker_buy_quote: find_col(
+            &names,
+            &["taker_buy_quote", "takerbuyquote", "tbq"],
         ),
         symbol: symbol_col,
     };
@@ -5992,6 +6403,10 @@ fn enrich_inner(
     let classify = |name: &str| -> OpClass {
         if name.starts_with("xs_") {
             OpClass::Rank
+        } else if crate::features_gpu::is_device_flow(name) {
+            OpClass::RollingStd
+        } else if crate::features_gpu::is_device_price_action(name) {
+            OpClass::WilderScan
         } else if FLOW_NAMES.contains(&name) {
             OpClass::RollingStd
         } else if name.starts_with("vol")
@@ -6031,6 +6446,9 @@ fn enrich_inner(
             || name.starts_with("cross_")
         {
             OpClass::Join
+        } else if is_mtf(name) {
+            // Higher-timeframe resample + monotone causal join.
+            OpClass::Join
         } else {
             OpClass::Elementwise
         }
@@ -6051,13 +6469,29 @@ fn enrich_inner(
             *gpu_cols.entry("labels").or_insert(0) += labels.len();
         }
     }
-    let plans = plan_groups(
+    let write_bw = opts.write_bw.unwrap_or(GPU_WRITE_BYTES_PER_SECOND);
+    let mut plans = plan_groups_full(
         &fam_counts,
         &gpu_cols,
         store.n_rows(),
+        segs.len(),
         opts.gpu,
         gpu_available,
+        write_bw,
     );
+    // #296: the 1.05M paired fixture measured the device MTF phase slower than
+    // the CPU reference (5.08 s vs 6.45 s on two symbol segments). Until a
+    // 16M paired run establishes the crossover, keep the new device path
+    // opt-in with `--gpu on`; `auto` remains the CPU reference.
+    if opts.gpu != GpuMode::On {
+        if let Some(plan) = plans.iter_mut().find(|p| p.group == "mtf" && p.backend == "gpu") {
+            plan.backend = "cpu";
+            plan.gpu_cols = 0;
+            plan.cpu_cols = plan.cols;
+            plan.reason =
+                "MTF device crossover not measured at 16M rows; use --gpu on".to_string();
+        }
+    }
 
     // Input checksum (the same file is copied, not rebuilt).
     let input_sha = manifest::sha256_file(&opts.data)
@@ -6135,40 +6569,213 @@ fn enrich_inner(
     #[allow(unused_mut)]
     let mut gpu_kernel_seconds = 0.0;
     #[allow(unused_mut)]
+    let mut gpu_d2h_seconds = 0.0;
+    #[allow(unused_mut)]
+    let mut gpu_write_seconds = 0.0;
+    #[allow(unused_mut)]
     let mut gpu_transfer_bytes = 0u64;
+    #[allow(unused_mut)]
+    let mut gpu_h2d_seconds = 0.0;
+    // #294: the resolved device read projection, recorded in the report so the
+    // audited column list cannot drift from the bytes actually read.
+    #[allow(unused_mut)]
+    let mut device_projection: Option<(String, Vec<String>)> = None;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_kernel_seconds = 0.0;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_transfer_bytes = 0u64;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_h2d_seconds = 0.0;
+    #[allow(unused_mut, unused_variables)]
+    let mut mtf_d2h_seconds = 0.0;
     #[cfg(feature = "cuda")]
     let mut gpu_ctx: Option<crate::enrich_gpu::EnrichGpu> = None;
 
     #[cfg(feature = "cuda")]
+    {
+        // #296: the MTF family owns a separate context because it needs the
+        // higher-timeframe arena, not the base-length enrichment scratch. It
+        // reads only the base columns the projection also needs (time + OHLC).
+        let mtf_wanted: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| is_mtf(n))
+            .cloned()
+            .collect();
+        if !mtf_wanted.is_empty() {
+            let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let open = column_all(&store, cols.open)?;
+            let high = column_all(&store, cols.high)?;
+            let low = column_all(&store, cols.low)?;
+            let close = column_all(&store, cols.close)?;
+            let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
+            let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
+            match crate::mtf_gpu::compute(
+                &times,
+                &open,
+                &high,
+                &low,
+                &close,
+                &seg_start,
+                &seg_len,
+                step,
+                &mtf_wanted,
+            ) {
+                Some((columns, stats)) => {
+                    for (name, values) in columns {
+                        if let Some(t) = temp.get_mut(&name) {
+                            t.write_values(&values)?;
+                            gpu_done.insert(name);
+                        }
+                    }
+                    mtf_kernel_seconds = stats.kernel_s;
+                    mtf_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                    mtf_h2d_seconds = stats.h2d_s;
+                    mtf_d2h_seconds = stats.d2h_s;
+                }
+                None => gpu_fallback += mtf_wanted.len(),
+            }
+            for name in &mtf_wanted {
+                gpu_names.remove(name);
+            }
+        }
+    }
+    #[cfg(feature = "cuda")]
     if !gpu_names.is_empty() || gpu_labels {
-        let times = i64_column_all(&store, time_col, cols.time_dtype)?;
-        let nan = vec![f64::NAN; store.n_rows()];
-        let volume = match cols.volume {
-            Some(c) => column_all(&store, c)?,
-            None => nan.clone(),
-        };
-        let quote_volume = match cols.quote_volume {
-            Some(c) => column_all(&store, c)?,
-            None => nan,
-        };
-        let open = column_all(&store, cols.open)?;
-        let high = column_all(&store, cols.high)?;
-        let low = column_all(&store, cols.low)?;
-        let close = column_all(&store, cols.close)?;
+        // Projected transport: only the raw columns the device needs, read
+        // group by group into a bounded pinned ring. Open/high/low/close are
+        // required; volume/quote_volume/trades/taker_buy_* are optional and
+        // start as NaN.
+        let mut wanted: Vec<(usize, crate::enrich_gpu::DeviceColumn)> = vec![
+            (time_col, crate::enrich_gpu::DeviceColumn::Time),
+            (cols.open, crate::enrich_gpu::DeviceColumn::Value(0)),
+            (cols.high, crate::enrich_gpu::DeviceColumn::Value(1)),
+            (cols.low, crate::enrich_gpu::DeviceColumn::Value(2)),
+            (cols.close, crate::enrich_gpu::DeviceColumn::Value(3)),
+        ];
+        if let Some(c) = cols.volume {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(4)));
+        }
+        if let Some(c) = cols.quote_volume {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(5)));
+        }
+        if let Some(c) = cols.trades {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(6)));
+        }
+        if let Some(c) = cols.taker_buy_base {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(7)));
+        }
+        if let Some(c) = cols.taker_buy_quote {
+            wanted.push((c, crate::enrich_gpu::DeviceColumn::Value(8)));
+        }
+        wanted.sort_by_key(|(i, _)| *i);
+        wanted.dedup_by_key(|(i, _)| *i);
+        let proj_names: Vec<String> = wanted.iter().map(|(i, _)| names[*i].clone()).collect();
         let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
         let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-        gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
-            &times,
-            &open,
-            &high,
-            &low,
-            &close,
-            &volume,
-            &quote_volume,
-            &seg_start,
-            &seg_len,
-            step,
-        );
+        let precompute: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| crate::enrich_gpu::tile_feature(n).is_some())
+            .cloned()
+            .collect();
+        if let Ok(projection) = crate::store::Projection::resolve_owned(&store, &proj_names) {
+            let sources: Vec<crate::enrich_gpu::ProjectedSource> = projection
+                .columns()
+                .iter()
+                .filter_map(|c| {
+                    wanted
+                        .iter()
+                        .find(|(i, _)| *i == c.index)
+                        .map(|(i, d)| crate::enrich_gpu::ProjectedSource {
+                            header_index: *i,
+                            destination: *d,
+                        })
+                })
+                .collect();
+            device_projection = Some((projection.hash_hex(), projection.names()));
+            // A/B escape hatch: force the historical whole-column upload.
+            let disabled = std::env::var("RCSR_NO_PROJECTED_UPLOAD")
+                .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+                .unwrap_or(false);
+            if disabled {
+                device_projection = None;
+            } else {
+                gpu_ctx = crate::enrich_gpu::EnrichGpu::from_projected(
+                    &store,
+                    projection,
+                    &sources,
+                    &seg_start,
+                    &seg_len,
+                    step,
+                    &precompute,
+                    3,
+                );
+            }
+        }
+        if gpu_ctx.is_none() {
+            // Fallback: the historical whole-column upload. It is the narrow
+            // path for an exotic store layout, not the default.
+            let times = i64_column_all(&store, time_col, cols.time_dtype)?;
+            let nan = vec![f64::NAN; store.n_rows()];
+            let volume = match cols.volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let quote_volume = match cols.quote_volume {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let open = column_all(&store, cols.open)?;
+            let high = column_all(&store, cols.high)?;
+            let low = column_all(&store, cols.low)?;
+            let close = column_all(&store, cols.close)?;
+            // #297: optional flow columns are present only when the store
+            // carries them. An absent column is uploaded as NaN and the fused
+            // base pass emits NaN, never 0.
+            let trades = match cols.trades {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let taker_buy_base = match cols.taker_buy_base {
+                Some(c) => column_all(&store, c)?,
+                None => nan.clone(),
+            };
+            let taker_buy_quote = match cols.taker_buy_quote {
+                Some(c) => column_all(&store, c)?,
+                None => nan,
+            };
+            let mut present = 0u32;
+            if cols.volume.is_some() {
+                present |= crate::features_gpu::PRESENT_VOLUME;
+            }
+            if cols.quote_volume.is_some() {
+                present |= crate::features_gpu::PRESENT_QUOTE_VOLUME;
+            }
+            if cols.trades.is_some() {
+                present |= crate::features_gpu::PRESENT_TRADES;
+            }
+            if cols.taker_buy_base.is_some() {
+                present |= crate::features_gpu::PRESENT_TAKER_BUY;
+            }
+            if cols.taker_buy_quote.is_some() {
+                present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
+            }
+            gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
+                &times,
+                &open,
+                &high,
+                &low,
+                &close,
+                &volume,
+                &quote_volume,
+                &trades,
+                &taker_buy_base,
+                &taker_buy_quote,
+                present,
+                &seg_start,
+                &seg_len,
+                step,
+            );
+        }
         if gpu_ctx.is_none() {
             // No device context: the whole planned GPU share falls back.
             gpu_fallback += gpu_names.len() + if gpu_labels { labels.len() } else { 0 };
@@ -6193,7 +6800,9 @@ fn enrich_inner(
                         _ => &h,
                     };
                     if let Some(t) = temp.get_mut(name) {
+                        let tw = Instant::now();
                         t.write_values(vals)?;
+                        gpu_write_seconds += tw.elapsed().as_secs_f64();
                         gpu_done.insert(name.clone());
                     }
                 }
@@ -6204,18 +6813,163 @@ fn enrich_inner(
                 gpu_names.remove(n);
             }
         }
+        // #297: the flow and price-action families are fused. Run the base
+        // pass once per family, then download each requested column. A family
+        // failure falls back to the CPU reference for every column in it.
+        let flow_wanted: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| crate::features_gpu::is_device_flow(n))
+            .cloned()
+            .collect();
+        if !flow_wanted.is_empty() {
+            let refs: Vec<&str> = flow_wanted.iter().map(String::as_str).collect();
+            match gpu.flow_all(&refs) {
+                Some(cols) => {
+                    for (name, vals) in cols {
+                        if let Some(t) = temp.get_mut(&name) {
+                            t.write_values(&vals)?;
+                            gpu_done.insert(name);
+                        }
+                    }
+                }
+                None => gpu_fallback += flow_wanted.len(),
+            }
+            for n in &flow_wanted {
+                gpu_names.remove(n);
+            }
+        }
+        let pa_wanted: Vec<String> = gpu_names
+            .iter()
+            .filter(|n| crate::features_gpu::is_device_price_action(n))
+            .cloned()
+            .collect();
+        if !pa_wanted.is_empty() {
+            let refs: Vec<&str> = pa_wanted.iter().map(String::as_str).collect();
+            match gpu.price_action_all(&refs) {
+                Some(cols) => {
+                    for (name, vals) in cols {
+                        if let Some(t) = temp.get_mut(&name) {
+                            t.write_values(&vals)?;
+                            gpu_done.insert(name);
+                        }
+                    }
+                }
+                None => gpu_fallback += pa_wanted.len(),
+            }
+            for n in &pa_wanted {
+                gpu_names.remove(n);
+            }
+        }
         let names: Vec<String> = gpu_names
             .iter()
             .filter(|n| !n.starts_with("macd"))
             .cloned()
             .collect();
+        // #300: batch family/column blocks through one output arena and one
+        // pinned chunked D2H. Falls back to the per-column staging path when
+        // the arena cannot hold the block (a 16M-row column is 128 MiB, above
+        // the 64 MiB cap) or when a kernel fails.
+        let mut fallback: Vec<String> = Vec::new();
+        // `RCSR_ENRICH_GPU_BATCH=0` keeps the per-column staging path for a
+        // paired A/B measurement of the batched output arena.
+        let cap = if std::env::var("RCSR_ENRICH_GPU_BATCH").ok().as_deref() == Some("0") {
+            0
+        } else {
+            gpu.batch_capacity()
+        };
+        let mut jobs: Vec<(String, crate::enrich_gpu::BatchOp)> = Vec::new();
+        for name in &names {
+            // #294: a feature computed while the projected tiles uploaded is
+            // already on the device; write it once and keep it out of the
+            // batch arena so its temp file cannot be appended twice.
+            if let Some(vals) = gpu.take_precomputed(name) {
+                let tw = Instant::now();
+                let ok = match temp.get_mut(name) {
+                    Some(t) => t.write_values(&vals).is_ok(),
+                    None => false,
+                };
+                gpu_write_seconds += tw.elapsed().as_secs_f64();
+                if ok {
+                    gpu_done.insert(name.clone());
+                    gpu_names.remove(name);
+                } else {
+                    fallback.push(name.clone());
+                }
+                continue;
+            }
+            match gpu_batch_op(name) {
+                Some(op) => jobs.push((name.clone(), op)),
+                None => fallback.push(name.clone()),
+            }
+        }
+        let mut i = 0usize;
+        while i < jobs.len() && cap > 0 {
+            let start = i;
+            let mut slots = 0usize;
+            while i < jobs.len() && slots + jobs[i].1.slots() <= cap {
+                slots += jobs[i].1.slots();
+                i += 1;
+            }
+            if i == start {
+                fallback.push(jobs[i].0.clone());
+                i += 1;
+                continue;
+            }
+            let ops: Vec<crate::enrich_gpu::BatchOp> =
+                jobs[start..i].iter().map(|(_, op)| *op).collect();
+            let mut written = false;
+            if let Some(block) = gpu.batch(&ops) {
+                written = true;
+                for (slot, (name, _)) in jobs[start..i].iter().enumerate() {
+                    let tw = Instant::now();
+                    let ok = match temp.get_mut(name) {
+                        Some(t) => t.write_values(block.column(slot)).is_ok(),
+                        None => false,
+                    };
+                    gpu_write_seconds += tw.elapsed().as_secs_f64();
+                    if ok {
+                        gpu_done.insert(name.clone());
+                    } else {
+                        written = false;
+                    }
+                }
+            }
+            if !written {
+                for (name, _) in &jobs[start..i] {
+                    fallback.push(name.clone());
+                }
+            }
+        }
+        let _ = fallback;
         for name in names {
+            if gpu_done.contains(&name) {
+                gpu_names.remove(&name);
+                continue;
+            }
+            // A feature computed per uploaded tile already lives on the device.
+            if let Some(vals) = gpu.take_precomputed(&name) {
+                let tw = Instant::now();
+                let ok = match temp.get_mut(&name) {
+                    Some(t) => t.write_values(&vals).is_ok(),
+                    None => false,
+                };
+                gpu_write_seconds += tw.elapsed().as_secs_f64();
+                if ok {
+                    gpu_done.insert(name.clone());
+                } else {
+                    gpu_fallback += 1;
+                }
+                gpu_names.remove(&name);
+                continue;
+            }
             let vals = gpu_feature(&name, gpu);
             let ok = match vals {
                 Some(vals) => match temp.get_mut(&name) {
                     Some(t) => {
-                        t.write_values(&vals)?;
-                        true
+                        let tw = Instant::now();
+                        let ok = t.write_values(&vals).is_ok();
+                        gpu_write_seconds += tw.elapsed().as_secs_f64();
+                        ok
                     }
                     None => false,
                 },
@@ -6234,7 +6988,9 @@ fn enrich_inner(
                 match vals {
                     Some(v) => {
                         if let Some(t) = temp.get_mut(name) {
+                            let tw = Instant::now();
                             t.write_values(&v)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name.clone());
                         }
                     }
@@ -6243,8 +6999,19 @@ fn enrich_inner(
             }
         }
         let stats = gpu.stats();
-        gpu_kernel_seconds = stats.kernel_s;
-        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+        gpu_kernel_seconds = stats.kernel_s + mtf_kernel_seconds;
+        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + mtf_transfer_bytes;
+        gpu_h2d_seconds = stats.h2d_s + mtf_h2d_seconds;
+        gpu_d2h_seconds = stats.d2h_s + mtf_d2h_seconds;
+    }
+
+    // If only the MTF context ran, its ledger is still the GPU share.
+    #[cfg(feature = "cuda")]
+    if gpu_ctx.is_none() {
+        gpu_kernel_seconds = mtf_kernel_seconds;
+        gpu_transfer_bytes = mtf_transfer_bytes;
+        gpu_h2d_seconds = mtf_h2d_seconds;
+        gpu_d2h_seconds = mtf_d2h_seconds;
     }
 
     // Everything planned for the CPU (including failed GPU calls).
@@ -6384,9 +7151,38 @@ fn enrich_inner(
                     Some(c) => column_all(&store, c)?,
                     None => nan,
                 };
+                let nan_col = vec![f64::NAN; store.n_rows()];
+                let trades = match cols.trades {
+                    Some(c) => column_all(&store, c)?,
+                    None => nan_col.clone(),
+                };
+                let taker_buy_base = match cols.taker_buy_base {
+                    Some(c) => column_all(&store, c)?,
+                    None => nan_col.clone(),
+                };
+                let taker_buy_quote = match cols.taker_buy_quote {
+                    Some(c) => column_all(&store, c)?,
+                    None => nan_col,
+                };
+                let mut present = 0u32;
+                if cols.volume.is_some() {
+                    present |= crate::features_gpu::PRESENT_VOLUME;
+                }
+                if cols.quote_volume.is_some() {
+                    present |= crate::features_gpu::PRESENT_QUOTE_VOLUME;
+                }
+                if cols.trades.is_some() {
+                    present |= crate::features_gpu::PRESENT_TRADES;
+                }
+                if cols.taker_buy_base.is_some() {
+                    present |= crate::features_gpu::PRESENT_TAKER_BUY;
+                }
+                if cols.taker_buy_quote.is_some() {
+                    present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
+                }
                 let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
                 let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-                gpu_ctx = crate::enrich_gpu::EnrichGpu::new(
+                gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
                     &times_all,
                     &column_all(&store, cols.open)?,
                     &column_all(&store, cols.high)?,
@@ -6394,11 +7190,17 @@ fn enrich_inner(
                     &column_all(&store, cols.close)?,
                     &volume,
                     &quote_volume,
+                    &trades,
+                    &taker_buy_base,
+                    &taker_buy_quote,
+                    present,
                     &seg_start,
                     &seg_len,
                     step,
                 );
             }
+            #[cfg(feature = "cuda")]
+            let mut xs_prepared = false;
             for rank_name in &rank_names {
                 let src = cross_source(rank_name)
                     .ok_or_else(|| format!("no source registered for '{}'", rank_name))?;
@@ -6406,7 +7208,6 @@ fn enrich_inner(
                 #[allow(unused_mut)]
                 let mut ranks = None;
                 let gpu_eligible = rank_name.starts_with("xs_rank_")
-                    && panel.member.iter().all(|m| *m)
                     && gpu_available
                     && opts.gpu != GpuMode::Off
                     && plans
@@ -6415,10 +7216,24 @@ fn enrich_inner(
                 #[cfg(feature = "cuda")]
                 if gpu_eligible {
                     if let Some(gpu) = gpu_ctx.as_mut() {
-                        ranks = gpu.rank(&values, &panel.times, &panel.sym_key);
-                        let stats = gpu.stats();
-                        gpu_kernel_seconds = stats.kernel_s;
-                        gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                        // One device (time, symbol, row) permutation and one
+                        // membership mask serve every rank column.
+                        if !xs_prepared
+                            && gpu.prepare_cross_section(
+                                &panel.sym_key,
+                                Some(&panel.member),
+                            )
+                        {
+                            xs_prepared = true;
+                        }
+                        if xs_prepared {
+                            ranks = gpu.rank(&values);
+                            let stats = gpu.stats();
+                            gpu_kernel_seconds = stats.kernel_s;
+                            gpu_d2h_seconds = stats.d2h_s;
+                            gpu_h2d_seconds = stats.h2d_s;
+                            gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes;
+                        }
                     }
                 }
                 let (ranks, from_gpu) = match ranks {
@@ -6552,7 +7367,16 @@ fn enrich_inner(
             gpu_share,
             gpu_fallback,
             gpu_kernel_seconds,
+            gpu_d2h_seconds,
+            gpu_write_seconds,
+            write_bw,
             gpu_transfer_bytes,
+            gpu_h2d_seconds,
+            projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
+            projection_columns: device_projection
+                .as_ref()
+                .map(|(_, c)| c.clone())
+                .unwrap_or_default(),
             read_seconds,
             feature_seconds,
             xs_seconds,
@@ -6600,7 +7424,16 @@ fn enrich_inner(
         gpu_share,
         gpu_fallback,
         gpu_kernel_seconds,
+        gpu_d2h_seconds,
+        gpu_write_seconds,
+        write_bw,
         gpu_transfer_bytes,
+        gpu_h2d_seconds,
+        projection_hash: device_projection.as_ref().map(|(h, _)| h.clone()),
+        projection_columns: device_projection
+            .as_ref()
+            .map(|(_, c)| c.clone())
+            .unwrap_or_default(),
         read_seconds,
         feature_seconds,
         xs_seconds,
@@ -6716,6 +7549,14 @@ pub fn run(args: &[String]) -> ! {
                 opts.gpu = GpuMode::On;
             }
             "--no-gpu" | "--cpu" => opts.gpu = GpuMode::Off,
+            "--write-bw" => {
+                let v = val!();
+                let mbps: f64 = v.parse().unwrap_or(0.0);
+                if !(mbps > 0.0) {
+                    fail("--write-bw needs a positive MB/s value");
+                }
+                opts.write_bw = Some(mbps * 1_000_000.0);
+            }
             "--allow-lockbox" => opts.allow_lockbox = true,
             "--dry-run" => opts.dry_run = true,
             "--json" => opts.json = true,
@@ -6798,8 +7639,13 @@ INPUT / OUTPUT:
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
                           forces every registered kernel above the 1M-row floor;
-                          off runs the CPU reference
+                          off runs the CPU reference. The MTF family uses one
+                          device resample + causal join per timeframe and keeps
+                          the CPU NaN/gap/bar_age contract; it is opt-in with
+                          --gpu on until the 16M crossover is measured.
   --no-gpu, --cpu         force CPU
+  --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
+                          (default 222 MB/s on the shared ext4 store)
   --dry-run               print the report and write nothing
   --json                  print the JSON report on stdout
 
@@ -6817,7 +7663,9 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   donchian   don20, don96; don96 is the compact centred channel position
   calendar   dow_sin dow_cos hour_sin hour_cos month_sin month_cos dom_sin dom_cos
   lags       lag_r1_1 .. lag_r1_10
-  xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section)
+  xs         xs_rank_r1 xs_rank_r20 xs_rank_vol20 (per-timestamp cross-section;
+             finite PIT members only, ties by symbol then row, N>=20, and the
+             CUDA path reuses one device (time,symbol,row) permutation)
   btc        btc_r1 btc_r20 btc_vol20 rel_btc_r1 rel_btc_r20 beta_btc_60
   cross      complete #273 family: btc/eth returns, vol and beta; equal-weight
              market mkt_r16 mkt_r96 mkt_vol96; breadth dispersion avg_corr;
@@ -6831,7 +7679,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              resampled from the base series and joined only after it closes:
              higher.time + timeframe_seconds <= base.time. Windows count
              higher-timeframe bars; a gap is NaN, and bar_age reports the
-             exact seconds since the last closed higher bar.
+             exact seconds since the last closed higher bar. With --features
+             cuda and --gpu on, all 36 columns dispatch to the device resample
+             + causal join (src/cuda/mtf.cu); auto stays on the CPU until the
+             16M crossover is measured. Non-transcendental leaves are bitwise
+             and vol is within 1e-12.
   compact    the exact 52-column compact regression subset, 15m base, compact
              names and order (r16..don96). It is a parity/smoke subset, not the
              production feature set.
@@ -6839,13 +7691,18 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
              taker_imb16, trade_intensity96, avg_trade_size96, amihud96,
              zero_ret_share96, obv_z96, cvd_proxy, vwap_dev96. Trailing 15m
              windows; a gap-spanning window is NaN; zero volume/trades is NaN
-             for the affected ratios and illiquidity.
+             for the affected ratios and illiquidity. In a --features cuda build
+             the twelve derived flow columns (these ten plus cmf20 and
+             vwap20_dev) come from one fused base pass; the registry family has
+             17 columns including the five raw flow inputs.
   price_action  clv16 body16 rng_atr prev_range_pos inside_s outside_s
              engulf_s harami_s run8 nr4 trend96 (#261). Continuous geometry and
              multi-bar structure; two-bar strengths replace hard flags. A
              zero-range/zero-volume bar, a missing prior bucket or a window that
              spans a gap is NaN. `batr` is materialised by the compact profile
-             and completes the twelve-name default block.
+             and completes the twelve-name default block. The eleven columns
+             have a fused CUDA producer; `rcsr schema` declares their
+             bitwise/1e-12 parity tier.
   all        every legacy group above except cross, py15m, mtf, compact, flow and price_action
 
   #125 names and groups (ta:core, ta:full, exotic:cheap, candle:geometry,

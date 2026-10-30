@@ -5,10 +5,11 @@
 //! `src/fit/interquartile.rs` (the ladder and the rank window). These
 //! integration tests pin the search contract:
 //!
-//! * `--metric interquartile` may use the GPU **fit** arm only when
-//!   `--fit-strategy gpu` is requested; it is a fit-only arm: the backend stays
-//!   `cpu`, the fitness is scored by the CPU evaluator with the exact
-//!   interquartile window mean, and the population is never ranked by SSE;
+//! * the exact window mean also **scores** the population on the device from
+//!   `INTERQUARTILE_GPU_MIN_ROWS` (#288), so the backend is `gpu` at or above
+//!   the floor; below it the exact CPU window mean runs with a named reason,
+//!   and the population is never ranked by SSE;
+//! * `--fit-strategy gpu` additionally moves constants through the exact polish;
 //! * reported errors are the exact CPU window mean of the stored tree;
 //! * fixed seed/device is deterministic, and `--no-fit` is a true no-op;
 //! * every fallback is labelled and the ledger adds up;
@@ -82,9 +83,9 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
-/// #232: an explicit `--fit-strategy gpu` with `--metric interquartile` is a
-/// valid combination now (it used to be a usage error), and it is fit-only:
-/// the scoring backend stays `cpu`.
+/// #232/#288: an explicit `--fit-strategy gpu` with `--metric interquartile`
+/// is a valid combination, and the metric now has a native *scoring* entry
+/// point as well as the fit-only arm.
 #[test]
 fn an_explicit_gpu_strategy_may_fit_interquartile() {
     assert!(
@@ -94,17 +95,19 @@ fn an_explicit_gpu_strategy_may_fit_interquartile() {
     assert!(rcsr::fit::interquartile_fit_only(Metric::Interquartile));
     assert!(rcsr::fit::order_stat_fit_only(Metric::Interquartile));
     assert!(!rcsr::fit::interquartile_fit_only(Metric::Median));
-    // The scoring gate is unchanged: the evaluator cannot score the window
-    // mean, so the backend is `cpu` and the fitness stays f64 on the CPU.
+    // The objective-loss table still has no interquartile entry: the exact
+    // order-statistic batch scorer is a separate scoring shape (#288), so a
+    // run is never ranked by squared error.
     assert_eq!(
         rcsr::fit::DeviceLoss::for_metric(Metric::Interquartile),
         None
     );
 }
 
-/// #232: the arm is opt-in, fit-only, and never the default.
+/// #288: below the scoring floor the exact CPU window mean runs; above it the
+/// device statistic scores the population.
 #[test]
-fn interquartile_gpu_fit_is_opt_in_and_never_the_default() {
+fn interquartile_gpu_scoring_respects_the_measured_row_floor() {
     let s = sample(96, 3);
     let cfg = Config {
         gpu: true,
@@ -125,6 +128,18 @@ fn interquartile_gpu_fit_is_opt_in_and_never_the_default() {
         ..cfg
     };
     assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    let big = sample(rcsr::fit::INTERQUARTILE_GPU_MIN_ROWS + 32, 3);
+    let cfg = Config {
+        gpu: true,
+        metric: Metric::Interquartile,
+        ..Default::default()
+    };
+    let expected = if cfg!(feature = "cuda") {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), expected);
 }
 
 /// #232: the cost model keeps a small sample on the exact CPU interquartile
@@ -147,7 +162,9 @@ fn a_small_sample_keeps_the_labelled_cpu_interquartile_arm() {
     );
     let why = out.backend_reason.unwrap_or_default();
     assert!(
-        why.contains("interquartile fit arm") || why.contains("not scored natively"),
+        why.contains("interquartile fit arm")
+            || why.contains("not scored natively")
+            || why.contains("4096-row device floor"),
         "the CPU decision must be labelled: {why:?}"
     );
 }
@@ -166,9 +183,10 @@ fn gpu_interquartile_run_is_deterministic_and_reports_the_exact_objective() {
     let test = sample(300, 6);
     let a = search::run(&iqr_config(11), &train, &test);
     let b = search::run(&iqr_config(11), &train, &test);
-    // Fit-only: the device moves constants, the CPU scores and reports.
-    assert_eq!(a.backend, rcsr::backend::Kind::Cpu);
-    assert!(a.device.is_some(), "the fit arm used a device");
+    // #288: the device moves constants *and* scores the exact window mean, so
+    // the backend is `gpu`; the archive is still rebuilt in CPU f64.
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    assert!(a.device.is_some(), "the device scored the population");
     assert_eq!(describe(&a), describe(&b), "repeated seed differs");
     assert_eq!(a.test_errors, b.test_errors);
     let g = a.gpu.as_ref().expect("a GPU report");
@@ -215,7 +233,9 @@ fn no_fit_is_a_true_noop_for_the_interquartile_gpu_arm() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let train = sample(rcsr::fit::INTERQUARTILE_GPU_MIN_ROWS + 32, 7);
+    // Below the #288 scoring floor: `--no-fit` leaves neither a fit arm nor a
+    // native scorer, so the exact CPU window mean is the only arm.
+    let train = sample(rcsr::fit::INTERQUARTILE_GPU_MIN_ROWS - 32, 7);
     let test = sample(200, 8);
     let base = Config {
         fit_iters: 0,

@@ -268,6 +268,7 @@ fn panel_options() -> EstimateOptions {
     EstimateOptions {
         used_cols: 53, // 52 variables + target
         scan_cols: 2,  // time + group
+        projection: None,
         gpu: true,
         gpu_fit: true,
         mutable_prep: false,
@@ -298,6 +299,7 @@ fn the_3_9m_panel_estimates_near_the_measured_footprint() {
         + estimate.group_buffer_bytes
         + estimate.search_bytes
         + estimate.fit_copy_bytes
+        + estimate.ring_bytes
         + estimate.fixed_bytes;
     assert_eq!(terms, estimate.base_bytes);
     assert_eq!(estimate.base_bytes + estimate.slack_bytes, estimate.total_bytes);
@@ -315,16 +317,18 @@ fn the_15_9m_store_scales_with_cells_not_a_global_constant() {
 }
 
 #[test]
-fn the_projection_changes_the_search_copy_not_the_storage() {
+fn the_projection_reduces_storage_and_the_search_copy() {
     let shape = panel_shape(100_000);
     let mut opts = panel_options();
     let full = shape.estimate(&opts);
     opts.used_cols = 5;
     opts.scan_cols = 0;
+    opts.projection = Some((0..5).collect());
     opts.gpu = false;
     opts.gpu_fit = false;
     let projected = shape.estimate(&opts);
-    assert_eq!(full.storage_bytes, projected.storage_bytes);
+    assert!(projected.storage_bytes < full.storage_bytes);
+    assert_eq!(projected.projected_cols, 5);
     assert_eq!(full.directory_bytes, projected.directory_bytes);
     assert!(projected.search_bytes < full.search_bytes);
     assert!(projected.total_bytes < full.total_bytes);

@@ -330,3 +330,29 @@ The k-NN baseline reports its own sampling fields (`reference_rows`,
 `query_rows`, `capped`, `sem`, `seconds`); on an uncapped run
 `baselines_seconds` is the magnitude of that exact O(N²·d) work, not zero.
 
+### GPU run ledger (`gpu.ledger`, #284)
+
+`timing` is the process ledger. `gpu.ledger` is the run-scoped device ledger,
+with one wall clock and exclusive main-thread stages:
+
+| field | meaning |
+|---|---|
+| `wall_s` | search-phase run wall measured by the ledger clock |
+| `stages.{vary,eval,fit,select,archive,features,pnl,io,host_other}_s` | exclusive stage seconds; `fit` is partitioned out of `eval` exactly once |
+| `stage_sum_s`, `unaccounted_s`, `closure` | `Σ stage_s + unaccounted_s = wall_s`; `closure` is the `{value,numerator,denominator,units,scope}` residual, acceptance `< 1 %` |
+| `device_busy_s` | **union** of device intervals across streams, never their sum |
+| `device_busy_sum_s`, `device_overlap_s`, `device_intervals` | the naive sum, the double count it would introduce, and the interval count |
+| `duty_run` | `device_busy_s / wall_s`, units `fraction`, scope `run` |
+| `eval_kernel_duty`, `fit_kernel_duty` | scoped sub-ratios (`evaluator_window`, `fit_stage`) |
+| `device_split` | evaluator kernel/launch/copy/alloc seconds plus the fit kernel split, all in seconds |
+| `fit.kernel_s`, `fit.fallback_s`, `fit.refit_s` | raw device kernel, measured exact-CPU fallback and finalist-refit seconds |
+| `fit.admitted/device_fits/fallback_fits/fallback_by_cause` | fit counters and every labelled fallback cause |
+| `eval_fallback.programs/seconds` | evaluator CPU-fallback work |
+| `quality_per_gpu_hour` | decades per run wall-hour, with like-unit errors and full provenance |
+
+The older `gpu.duty_cycle` remains the evaluator-window kernel fraction
+(`duty_scope = "evaluator_window"`). It is not the run-level number; use
+`gpu.ledger.duty_run` for “how busy was the device during the run?”. A GPU run
+answers `Σ stage_s + unaccounted_s = wall_s` within 1 %; a CPU run still reports
+`"gpu": null`.
+

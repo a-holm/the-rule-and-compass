@@ -11,6 +11,488 @@
 //! fraction. It is not `nvidia-smi`'s 1 Hz "some kernel was resident" sample and
 //! it is not SM occupancy. Achieved occupancy needs `ncu`; this type leaves it
 //! out entirely rather than inventing it.
+//!
+//! #284: [`GpuStats`] stays the evaluator-window sub-ledger. [`RunLedger`] is
+//! the run-scoped ledger: one wall clock, exclusive stage seconds, and the
+//! **union** of device intervals (never their sum). Every derived field is a
+//! [`Ratio`] carrying numerator, denominator, units and scope, so a rate cannot
+//! silently acquire the wrong denominator.
+
+/// #284: the stages a run can spend wall time in. The names are the JSON keys
+/// and match `09-dispatch-architecture.md` §7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Stage {
+    /// Variation, mutation, crossover and simplification.
+    Vary,
+    /// Candidate evaluation (including its host glue).
+    Eval,
+    /// Constant fitting, including the exact CPU fallback and finalist refits.
+    Fit,
+    /// Selection and promotion.
+    Select,
+    /// Pareto archive insertion and bookkeeping.
+    Archive,
+    /// Feature construction (enrichment) when it runs in the same run.
+    Features,
+    /// P&L / walk-forward work.
+    Pnl,
+    /// Loading, writing, checkpoints and hashing.
+    Io,
+    /// Every other measured main-thread window.
+    HostOther,
+}
+
+impl Stage {
+    pub const ALL: [Stage; 9] = [
+        Stage::Vary,
+        Stage::Eval,
+        Stage::Fit,
+        Stage::Select,
+        Stage::Archive,
+        Stage::Features,
+        Stage::Pnl,
+        Stage::Io,
+        Stage::HostOther,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Stage::Vary => "vary",
+            Stage::Eval => "eval",
+            Stage::Fit => "fit",
+            Stage::Select => "select",
+            Stage::Archive => "archive",
+            Stage::Features => "features",
+            Stage::Pnl => "pnl",
+            Stage::Io => "io",
+            Stage::HostOther => "host_other",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Stage::Vary => 0,
+            Stage::Eval => 1,
+            Stage::Fit => 2,
+            Stage::Select => 3,
+            Stage::Archive => 4,
+            Stage::Features => 5,
+            Stage::Pnl => 6,
+            Stage::Io => 7,
+            Stage::HostOther => 8,
+        }
+    }
+}
+
+/// #284: a derived value and the four facts needed to audit it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ratio {
+    pub value: f64,
+    pub numerator: f64,
+    pub denominator: f64,
+    pub units: &'static str,
+    pub scope: &'static str,
+}
+
+impl Ratio {
+    /// A ratio with its own provenance. A zero or non-finite denominator makes
+    /// the value `0.0`; the raw numerator and denominator are still reported so
+    /// a reader can see why.
+    pub fn new(
+        numerator: f64,
+        denominator: f64,
+        units: &'static str,
+        scope: &'static str,
+    ) -> Self {
+        let value = if numerator.is_finite() && denominator.is_finite() && denominator > 0.0 {
+            numerator / denominator
+        } else {
+            0.0
+        };
+        Self { value, numerator, denominator, units, scope }
+    }
+
+    /// A ratio that is explicitly undefined: `value = null` in JSON, with the
+    /// numerator/denominator that failed the precondition.
+    pub fn undefined(
+        numerator: f64,
+        denominator: f64,
+        units: &'static str,
+        scope: &'static str,
+    ) -> Self {
+        Self { value: f64::NAN, numerator, denominator, units, scope }
+    }
+
+    pub fn is_defined(&self) -> bool {
+        self.value.is_finite()
+    }
+}
+
+/// #284: one half-open `[start_s, end_s)` interval on the run clock. Device
+/// intervals are merged by [`RunLedger::device_busy_s`]; `stream` is retained
+/// so a reader can see that two intervals were concurrent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Interval {
+    pub stage: Stage,
+    pub stream: u32,
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+/// #284: run-scoped telemetry. Stage seconds are exclusive main-thread windows;
+/// device intervals are used only for the union. The two measures may differ
+/// (device work can overlap host work), which is why the ledger reports both.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunLedger {
+    stage_s: [f64; 9],
+    intervals: Vec<Interval>,
+    /// One clock for every derived field in this ledger.
+    wall_s: f64,
+    /// Measured evaluator kernel seconds, summed from the device's raw events.
+    eval_kernel_s: f64,
+    /// Whole evaluator full-path wall, the denominator for the evaluator-window
+    /// kernel duty. It includes generation-0 scoring, which can happen before
+    /// the generation loop's exclusive eval stage starts.
+    eval_window_s: f64,
+    /// Whole fit stage: device kernel + host upload/download + CPU fallback.
+    fit_host_s: f64,
+    /// Fit kernel seconds only, summed from the device's raw events.
+    fit_kernel_s: f64,
+    /// Exact CPU fallback seconds inside the fit stage.
+    fit_fallback_s: f64,
+    /// Exact CPU f64 finalist refit seconds (a subset of the fit stage).
+    refit_s: f64,
+    /// Candidates admitted to the fit stage.
+    admitted: u64,
+    /// Admitted candidates the device fitted.
+    device_fits: u64,
+    /// Admitted candidates refit by the exact CPU arm.
+    fallback_fits: u64,
+    /// Fit fallbacks labelled by cause.
+    fallback_by_cause: std::collections::BTreeMap<String, usize>,
+    /// Candidates scored by the evaluator's CPU fallback pool.
+    eval_fallback_programs: u64,
+    /// Wall seconds the evaluator's CPU fallback pool spent.
+    eval_fallback_s: f64,
+    /// Finalist refits performed.
+    refits: u64,
+}
+
+impl RunLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one exclusive main-thread stage window. Negative and non-finite
+    /// durations are ignored: a clock that went backwards is not evidence.
+    pub fn record_stage(&mut self, stage: Stage, seconds: f64) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.stage_s[stage.index()] += seconds;
+        }
+    }
+
+    /// #284: move a measured fit sub-window out of the enclosing eval window.
+    /// Fit is nested inside eval (screening → fit → rescore), so it is
+    /// reclassified rather than added: the stage sum must not grow.
+    pub fn reclassify_eval_to_fit(&mut self, seconds: f64) {
+        if !seconds.is_finite() || seconds <= 0.0 {
+            return;
+        }
+        let take = seconds.min(self.stage_s[Stage::Eval.index()]);
+        self.stage_s[Stage::Eval.index()] -= take;
+        self.stage_s[Stage::Fit.index()] += take;
+    }
+
+    /// Add one device interval. The interval is clamped to a finite,
+    /// non-negative half-open window; an invalid interval is not recorded.
+    pub fn record_interval(&mut self, stage: Stage, stream: u32, start_s: f64, end_s: f64) {
+        if !start_s.is_finite() || !end_s.is_finite() || end_s <= start_s {
+            return;
+        }
+        let start_s = start_s.max(0.0);
+        if end_s <= start_s {
+            return;
+        }
+        self.intervals.push(Interval { stage, stream, start_s, end_s });
+    }
+
+    /// Record the evaluator's measured device kernel window. `start_s` is on the
+    /// same run clock as the stage windows; `kernel_s` comes from the raw
+    /// device event pair, not from the host envelope.
+    pub fn record_eval_kernel(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
+        if kernel_s.is_finite() && kernel_s > 0.0 {
+            self.eval_kernel_s += kernel_s;
+            self.record_interval(Stage::Eval, stream, start_s, start_s + kernel_s);
+        }
+    }
+
+    /// Record the fit stage totals. `host_s` includes the device call, the CPU
+    /// fallback and write-back; `kernel_s` and `fallback_s` are its two
+    /// non-overlapping measured leaves.
+    pub fn record_fit(&mut self, host_s: f64, kernel_s: f64, fallback_s: f64) {
+        if host_s.is_finite() && host_s > 0.0 {
+            self.fit_host_s += host_s;
+        }
+        if kernel_s.is_finite() && kernel_s > 0.0 {
+            self.fit_kernel_s += kernel_s;
+        }
+        if fallback_s.is_finite() && fallback_s > 0.0 {
+            self.fit_fallback_s += fallback_s;
+        }
+    }
+
+    /// Record one fit device kernel interval on the run clock.
+    pub fn record_fit_kernel_interval(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
+        if kernel_s.is_finite() && kernel_s > 0.0 {
+            self.record_interval(Stage::Fit, stream, start_s, start_s + kernel_s);
+        }
+    }
+
+    pub fn record_refit(&mut self, refits: u64, seconds: f64) {
+        self.refits += refits;
+        if seconds.is_finite() && seconds > 0.0 {
+            self.refit_s += seconds;
+        }
+    }
+
+    pub fn record_fit_counters(
+        &mut self,
+        admitted: u64,
+        device_fits: u64,
+        fallback_fits: u64,
+        by_cause: std::collections::BTreeMap<String, usize>,
+    ) {
+        self.admitted += admitted;
+        self.device_fits += device_fits;
+        self.fallback_fits += fallback_fits;
+        for (name, count) in by_cause {
+            *self.fallback_by_cause.entry(name).or_default() += count;
+        }
+    }
+
+    pub fn record_eval_fallback(&mut self, programs: u64, seconds: f64) {
+        self.eval_fallback_programs += programs;
+        if seconds.is_finite() && seconds > 0.0 {
+            self.eval_fallback_s += seconds;
+        }
+    }
+
+    /// #284: set the evaluator full-path wall, the scope of the evaluator-window
+    /// kernel duty. It can cover generation-0 scoring outside the loop stages.
+    pub fn set_eval_window(&mut self, seconds: f64) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.eval_window_s = seconds;
+        }
+    }
+
+    pub fn eval_window_s(&self) -> f64 {
+        self.eval_window_s
+    }
+
+    /// Merge another ledger's device intervals and canonical sub-ledgers into
+    /// this one. Stage windows are **not** merged: the caller owns the single
+    /// main-thread decomposition.
+    pub fn absorb(&mut self, other: &RunLedger) {
+        self.intervals.extend_from_slice(&other.intervals);
+        self.eval_kernel_s += other.eval_kernel_s;
+        self.eval_window_s += other.eval_window_s;
+        self.fit_host_s += other.fit_host_s;
+        self.fit_kernel_s += other.fit_kernel_s;
+        self.fit_fallback_s += other.fit_fallback_s;
+        self.refit_s += other.refit_s;
+        self.refits += other.refits;
+        self.admitted += other.admitted;
+        self.device_fits += other.device_fits;
+        self.fallback_fits += other.fallback_fits;
+        self.eval_fallback_programs += other.eval_fallback_programs;
+        self.eval_fallback_s += other.eval_fallback_s;
+        for (name, count) in &other.fallback_by_cause {
+            *self.fallback_by_cause.entry(name.clone()).or_default() += *count;
+        }
+    }
+
+    pub fn set_wall(&mut self, wall_s: f64) {
+        if wall_s.is_finite() && wall_s > 0.0 {
+            self.wall_s = wall_s;
+        }
+    }
+
+    pub fn wall_s(&self) -> f64 {
+        self.wall_s
+    }
+
+    pub fn stage_s(&self, stage: Stage) -> f64 {
+        self.stage_s[stage.index()]
+    }
+
+    pub fn stage_sum_s(&self) -> f64 {
+        self.stage_s.iter().sum()
+    }
+
+    pub fn intervals(&self) -> &[Interval] {
+        &self.intervals
+    }
+
+    pub fn eval_kernel_s(&self) -> f64 {
+        self.eval_kernel_s
+    }
+
+    pub fn fit_host_s(&self) -> f64 {
+        self.fit_host_s
+    }
+
+    pub fn fit_kernel_s(&self) -> f64 {
+        self.fit_kernel_s
+    }
+
+    pub fn fit_fallback_s(&self) -> f64 {
+        self.fit_fallback_s
+    }
+
+    pub fn refit_s(&self) -> f64 {
+        self.refit_s
+    }
+
+    pub fn refits(&self) -> u64 {
+        self.refits
+    }
+
+    pub fn admitted(&self) -> u64 {
+        self.admitted
+    }
+
+    pub fn device_fits(&self) -> u64 {
+        self.device_fits
+    }
+
+    pub fn fallback_fits(&self) -> u64 {
+        self.fallback_fits
+    }
+
+    pub fn fallback_by_cause(&self) -> &std::collections::BTreeMap<String, usize> {
+        &self.fallback_by_cause
+    }
+
+    pub fn eval_fallback_programs(&self) -> u64 {
+        self.eval_fallback_programs
+    }
+
+    pub fn eval_fallback_s(&self) -> f64 {
+        self.eval_fallback_s
+    }
+
+    /// Arithmetic sum of every recorded device interval. This is **not** the
+    /// duty numerator; it exists only so the ledger can show the double count
+    /// that a sum would introduce.
+    pub fn device_busy_sum_s(&self) -> f64 {
+        self.intervals.iter().map(|i| i.end_s - i.start_s).sum()
+    }
+
+    /// Measure of the union of all device intervals, across every stream.
+    pub fn device_busy_s(&self) -> f64 {
+        union_len(&self.intervals)
+    }
+
+    /// Seconds counted twice by a naive sum: `sum - union`.
+    pub fn device_overlap_s(&self) -> f64 {
+        (self.device_busy_sum_s() - self.device_busy_s()).max(0.0)
+    }
+
+    /// Wall not attributed to any exclusive stage window.
+    pub fn unaccounted_s(&self) -> f64 {
+        (self.wall_s - self.stage_sum_s()).max(0.0)
+    }
+
+    /// `Σ stage_s + unaccounted = wall_run`.
+    pub fn closure_error_s(&self) -> f64 {
+        self.stage_sum_s() + self.unaccounted_s() - self.wall_s
+    }
+
+    /// The unaccounted share of run wall: `unaccounted_s / wall_s`. The
+    /// acceptance threshold is `0.01` (1 %), so a reader sees the gap rather
+    /// than a ratio that the `max(0)` in [`Self::unaccounted_s`] always zeroes.
+    pub fn closure_residual(&self) -> Ratio {
+        Ratio::new(self.unaccounted_s(), self.wall_s, "fraction", "run")
+    }
+
+    pub fn duty_run(&self) -> Ratio {
+        Ratio::new(self.device_busy_s(), self.wall_s, "fraction", "run")
+    }
+
+    pub fn eval_kernel_duty(&self) -> Ratio {
+        // The evaluator window, not the loop's exclusive eval stage: generation
+        // 0 can be scored before the loop and still belongs to this duty.
+        let denominator = if self.eval_window_s > 0.0 {
+            self.eval_window_s
+        } else {
+            self.stage_s(Stage::Eval)
+        };
+        Ratio::new(self.eval_kernel_s, denominator, "fraction", "evaluator_window")
+    }
+
+    pub fn fit_kernel_duty(&self) -> Ratio {
+        Ratio::new(self.fit_kernel_s, self.fit_host_s, "fraction", "fit_stage")
+    }
+
+    pub fn fallback_fraction(&self) -> Ratio {
+        Ratio::new(
+            self.fallback_fits as f64,
+            self.admitted as f64,
+            "fraction",
+            "admitted_fits",
+        )
+    }
+
+    /// Decades of error reduction per wall-hour, using **like units** for the
+    /// two errors (both MSE or both SSE, never one of each).
+    pub fn quality_per_gpu_hour(&self, best_error: f64, baseline_error: f64) -> Ratio {
+        let decades = if best_error.is_finite()
+            && best_error > 0.0
+            && baseline_error.is_finite()
+            && baseline_error > 0.0
+            && self.wall_s > 0.0
+        {
+            -(best_error / baseline_error).log10()
+        } else {
+            f64::NAN
+        };
+        let hours = self.wall_s / 3600.0;
+        if decades.is_finite() {
+            Ratio::new(decades, hours, "decades_per_gpu_hour", "run")
+        } else {
+            Ratio::undefined(decades, hours, "decades_per_gpu_hour", "run")
+        }
+    }
+}
+
+/// #284: length of the union of half-open intervals. Sorting by start and
+/// merging on `start <= current_end` is the standard sweep; equal endpoints do
+/// not double count a zero-length gap.
+fn union_len(intervals: &[Interval]) -> f64 {
+    if intervals.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<&Interval> = intervals.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.start_s
+            .partial_cmp(&b.start_s)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.end_s.partial_cmp(&b.end_s).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    let mut total = 0.0;
+    let mut cur_start = sorted[0].start_s;
+    let mut cur_end = sorted[0].end_s;
+    for iv in sorted.iter().skip(1) {
+        if iv.start_s <= cur_end {
+            cur_end = cur_end.max(iv.end_s);
+        } else {
+            total += cur_end - cur_start;
+            cur_start = iv.start_s;
+            cur_end = iv.end_s;
+        }
+    }
+    total + (cur_end - cur_start)
+}
 
 /// #118: accumulated GPU accounting for a run, in seconds and bytes.
 ///
@@ -183,9 +665,13 @@ impl GpuStats {
     }
 
     /// Decades of error reduction against the constant-mean baseline per
-    /// GPU-hour: `-log10(best_error / baseline_error) / hours`. Positive means
-    /// the searched model beats the trivial mean predictor. `None` when either
-    /// error is not finite/positive or no GPU time was measured.
+    /// evaluator-window GPU-hour: `-log10(best_error / baseline_error) / hours`.
+    /// Positive means the searched model beats the trivial mean predictor.
+    /// `best_error` and `baseline_error` **must be the same unit and the same
+    /// rows** (both MSE or both SSE); the caller owns that contract. `None`
+    /// when either error is not finite/positive or no GPU time was measured.
+    /// #284 adds the run-scoped, provenance-carrying
+    /// [`RunLedger::quality_per_gpu_hour`].
     pub fn quality_per_gpu_hour(&self, best_error: f64, baseline_error: f64) -> Option<f64> {
         if !best_error.is_finite()
             || best_error <= 0.0
@@ -285,7 +771,84 @@ mod tests {
         assert!(st.residual_fraction().abs() < 1e-12);
     }
 
-    /// #118: `since()` differences a benchmark window without losing bytes.
+    /// #284: device-busy is the interval **union**, not the sum. Two streams
+    /// overlap for 1 s; the sum says 4 s, the union says 3 s, duty cannot exceed
+    /// one, and the double-count is reported rather than hidden.
+    #[test]
+    fn run_ledger_unions_overlapping_streams() {
+        let mut l = RunLedger::new();
+        l.record_interval(Stage::Eval, 0, 0.0, 2.0);
+        l.record_interval(Stage::Fit, 1, 1.0, 3.0);
+        l.set_wall(5.0);
+        assert!((l.device_busy_sum_s() - 4.0).abs() < 1e-12);
+        assert!((l.device_busy_s() - 3.0).abs() < 1e-12);
+        assert!((l.device_overlap_s() - 1.0).abs() < 1e-12);
+        let duty = l.duty_run();
+        assert!((duty.value - 0.6).abs() < 1e-12);
+        assert!(duty.value <= 1.0);
+        // No stage windows were recorded, so the closure residual is the whole
+        // run wall rather than a fabricated zero.
+        assert!((l.closure_residual().value - 1.0).abs() < 1e-12);
+        assert_eq!(l.closure_residual().numerator, 5.0);
+        assert_eq!(duty.numerator, 3.0);
+        assert_eq!(duty.denominator, 5.0);
+        assert_eq!(duty.units, "fraction");
+        assert_eq!(duty.scope, "run");
+        // Nested intervals are one union member, not two.
+        l.record_interval(Stage::Eval, 2, 0.5, 1.5);
+        assert!((l.device_busy_s() - 3.0).abs() < 1e-12);
+    }
+
+    /// #284: the ledger closes to the run wall and reports an explicit residual
+    /// instead of inventing an `other` bucket. A 1,000-generation replay is the
+    /// acceptance shape: 1 % of wall is the threshold.
+    #[test]
+    fn run_ledger_closes_over_a_thousand_generation_replay() {
+        let mut l = RunLedger::new();
+        let mut t = 0.0;
+        for gen in 0..1_000 {
+            let prep = 0.0001;
+            let vary = 0.01;
+            let eval = 0.02;
+            let select = 0.005;
+            let archive = 0.002;
+            l.record_stage(Stage::HostOther, prep);
+            l.record_stage(Stage::Vary, vary);
+            l.record_stage(Stage::Eval, eval);
+            l.record_stage(Stage::Select, select);
+            l.record_stage(Stage::Archive, archive);
+            let fit = 0.004;
+            l.record_fit(fit, 0.003, 0.0005);
+            // Fit is a sub-window of eval, so the exclusive eval stage is the
+            // measured eval window minus the nested fit window.
+            l.record_stage(Stage::Eval, -fit); // ignored by design
+            l.record_fit_counters(1, if gen % 2 == 0 { 1 } else { 0 }, if gen % 2 == 0 { 0 } else { 1 }, std::collections::BTreeMap::new());
+            l.record_interval(Stage::Eval, 0, t, t + 0.015);
+            l.record_interval(Stage::Fit, 1, t + 0.012, t + 0.016);
+            t += prep + vary + eval + select + archive;
+        }
+        l.set_wall(t);
+        assert!(l.closure_residual().value.abs() < 0.01, "closure {:?}", l.closure_residual());
+        assert!(l.duty_run().value <= 1.0);
+        assert_eq!(l.admitted(), 1_000);
+        assert_eq!(l.device_fits() + l.fallback_fits(), 1_000);
+    }
+
+    /// #284: quality per GPU-hour takes two errors in the same unit. Using an
+    /// SSE baseline against an MSE best is the #256 defect; here the two are
+    /// both MSE and the answer is the documented 4.844205.
+    #[test]
+    fn quality_per_gpu_hour_requires_like_units() {
+        let mut l = RunLedger::new();
+        l.set_wall(7.467_618_67);
+        let q = l.quality_per_gpu_hour(0.103_464_003_567_670_26, 0.105_885_819_341_126_06);
+        assert!((q.value - 4.844_205).abs() < 1e-5, "{:?}", q);
+        assert_eq!(q.units, "decades_per_gpu_hour");
+        assert_eq!(q.scope, "run");
+        assert!((q.denominator - 7.467_618_67 / 3600.0).abs() < 1e-15);
+    }
+
+    /// #284: `since()` differences a benchmark window without losing bytes.
     #[test]
     fn since_subtracts_a_snapshot() {
         let mut st = GpuStats::default();

@@ -15,6 +15,14 @@ use crate::checkpoint::{
 use crate::search::Config;
 use std::path::Path;
 
+/// A resolved read projection recorded in the manifest (issue #294).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionRecord {
+    pub hash: String,
+    pub columns: Vec<String>,
+    pub indices: Vec<usize>,
+}
+
 /// The facts collected once, before the search starts.
 #[derive(Clone)]
 pub struct Manifest {
@@ -39,6 +47,9 @@ pub struct Manifest {
     /// #169: batched-GPU fit ledger `(gpu, fallback, exact_refits)`, filled in
     /// after the search. `None` for a run that never used the GPU.
     pub fit: Option<(u64, u64, u64)>,
+    /// #290: calibrated dispatch values and the per-stage route ledger,
+    /// filled in when the search returns.
+    pub dispatch: Option<crate::dispatch::DispatchReport>,
     /// #112: `Some(true)` for full rows, `Some(false)` for an explicit
     /// `--sample-rows` sample, `None` when the source was a CSV or unknown.
     pub full_rows: Option<bool>,
@@ -46,6 +57,9 @@ pub struct Manifest {
     pub sampled_rows: Option<usize>,
     /// #112: the guard's estimate that justified the decision.
     pub estimate_bytes: Option<u64>,
+    /// #294: the resolved projected read (hash, column list and header
+    /// indices), or `None` when the run loaded every column.
+    pub projection: Option<ProjectionRecord>,
 }
 
 impl Manifest {
@@ -106,6 +120,9 @@ impl Manifest {
                 gpu, fallback, refits
             ));
         }
+        if let Some(dispatch) = &self.dispatch {
+            out.push_str(&format!("  \"dispatch\":{},\n", dispatch.manifest_json()));
+        }
         out.push_str(&format!(
             "  \"resume\":{{\"from\":{},\"backend_change\":{}}},\n",
             self.resumed_from
@@ -121,6 +138,19 @@ impl Manifest {
                 None => "null".to_string(),
             }
         ));
+        match &self.projection {
+            Some(p) => {
+                let cols: Vec<String> = p.columns.iter().map(|c| jstr(c)).collect();
+                let idx: Vec<String> = p.indices.iter().map(|i| i.to_string()).collect();
+                out.push_str(&format!(
+                    "  \"projection\":{{\"hash\":{},\"columns\":[{}],\"indices\":[{}]}},\n",
+                    jstr(&p.hash),
+                    cols.join(","),
+                    idx.join(",")
+                ));
+            }
+            None => out.push_str("  \"projection\":null,\n"),
+        }
         let phase_json: Vec<String> = phases
             .iter()
             .map(|(name, secs)| format!("{}:{:.6}", jstr(name), secs))
@@ -187,9 +217,11 @@ pub fn collect(
         resumed_from,
         backend_change,
         fit: None,
+        dispatch: None,
         full_rows,
         sampled_rows,
         estimate_bytes,
+        projection: None,
     }
 }
 

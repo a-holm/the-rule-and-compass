@@ -29,31 +29,39 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
 (#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
-on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
-constants and the exact CPU `f64` log-loss judges the proposal, scores every
-candidate and refits every finalist), and the exact correlation objective with
+on the binary label for `log_loss` (#234; the device proposes the constants
+and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
+and since #289 the search also scores log-loss, Brier and the three hinge forms
+with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
+surrogate, not the SVM hinge), and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
-arm; the correlation *scorer* remains CPU-side under the #236 gate;
+arm; the correlation *scorer* is native on the device since #287;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
-the same arm fits the exact integer rank polish on the device (fit-only: the
-fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
-reflected model is rejected and a proposal is judged on the exact oriented
-score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
-exact `f64` median and `--metric interquartile` with the middle-50 % window mean
-of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232), and
-`--metric maximum` fits the Chebyshev objective by **exact bisection on the
-error level** per constant (fit-only, from 512 training rows — the measured
-cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+the same arm fits the exact integer rank polish on the device; the same exact
+integer sums also **score** every candidate on the device from 4 096 training
+rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
+is the same stage under `1 - rho`, so a reflected model is rejected and a
+proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
+`--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
+native scoring from 4 096 training rows — the measured crossover of the batched
+selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
+objective by **exact bisection on the error level** per constant (from 512
+training rows — the measured cost-model floor, #227) and is scored natively by
+the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
 `--metric log_loss`, a rank metric, `--metric median`, `--metric
 interquartile`, `--metric maximum` or a CPU strategy.
+Dispatch is planned per stage, not per run: a calibrated cost model returns
+`device`, `cpu` or `split` plus a machine reason, with hysteresis at the
+crossover and a route ledger in `--json`/`--run-manifest`. Structural and
+arithmetic refusals are a cause set, never a timing test. See
+[`docs/dispatch.md`](docs/dispatch.md).
 Every arm falls back to the default LM path when it cannot prove a safe result,
 and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
@@ -385,7 +393,12 @@ atomically instead of streaming it. See
   61.71 GiB that produced a 577k-row sample. A store that does not fit is
   refused; sampling is explicit via `--sample-rows N` (mutually exclusive with
   `--force`, and still budget-guarded) and is recorded as `full_rows=false` in
-  the preparation block, manifest and dev log. `rcsr
+  the preparation block, manifest and dev log. When a store is read with
+  `--vars` and `--time`, the default **projects the read** to those variables,
+  targets, `--weight`, `--time` and `--group-by`: only those blocks are read,
+  the guard charges only them, and the resolved hash and column list go into
+  `--run-manifest` (`--no-project` restores the full-column load for an A/B
+  run). `rcsr
   import` writes a versioned `.rcsb` store (format v2: per-column
   `f64`/`i64`/`u32` dtypes, 4-byte dictionary codes, nanosecond-safe i64 time);
   v1 stores still load. See [`docs/data-format.md`](docs/data-format.md).
@@ -412,13 +425,23 @@ atomically instead of streaming it. See
   deviation) with the documented zero-volume/zero-trade and gap policies, the
   `mtf` group emits all 36 multi-timeframe columns
   (`mtf_<1h|4h|1d>_<leaf>`), joined only after the higher bar has closed with
-  explicit `bar_age` staleness, the `price_action` group adds the continuous
+  explicit `bar_age` staleness (the same resample and causal join dispatch to
+  the device under `--features cuda` and `--gpu on`), the engine-tail kernels
+  cover return/MA parameters, `don20`/`don96`, stochastic, ATR/ADX/DI,
+  Bollinger and the registered exotic statistics with `O(n)` blocked extrema
+  and one shared gap policy (`r16`, `r96` and `don96` no longer fall through
+  the compact guard), the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
   masks, and the `cross` group adds the complete #273 BTC/ETH benchmark
   context, equal-weight market state, breadth, dispersion, average-correlation
-  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. The
+  proxy, ex-self relative returns and `[-1,1]` PIT cross-sectional ranks. On
+  the CUDA path one device `(time,symbol,row)` permutation serves every rank
+  column, with non-members and NaN keyed last. The
+  fused flow and price-action device producers materialise their twelve and
+  eleven derived columns from one base pass per family, with a declared
+  `bitwise`/`1e-12` tier per column (`feature_registry.parity_tier`). The
   default financial feature set is registered in `rcsr schema`
   (`feature_registry`): every available column has a tested producer, and
   registered-but-unavailable derivative columns fail closed with the missing
@@ -429,13 +452,16 @@ atomically instead of streaming it. See
   mapping for every name shared by several groups. The CPU path is always
   available; a per-family cost model
 
-  decides CPU vs GPU and records the reason, GPU builds upload the source
-  columns once and report the GPU column share, and the 3.9M-row measurement
+  decides CPU vs GPU and records the reason, GPU builds read only the required
+  source blocks into a bounded pinned ring and copy them straight to the device
+  (no full `Table`), report the GPU column share, and the 3.9M-row measurement
   keeps only the families that actually beat the CPU on the GPU. On the
   16.1M-row OHLCV panel the GPU feature phase is **1.49x** the CPU (72.1 % of
   columns dispatched, zero fallbacks) while end-to-end wall is decided by the
   append write; the output checksum is computed while the blocks stream, so a
-  multi-gigabyte store is never read twice. See
+  multi-gigabyte store is never read twice. GPU output blocks share a 64 MiB
+  arena and a pinned chunked D2H copy, and cost model v2 charges the measured
+  `BW_write` separately from kernel and transfer time. See
   [`docs/ohlcv.md`](docs/ohlcv.md#incremental-enrichment-rcsr-enrich-issue-200).
 * **Point-in-time panels**: `rcsr panel membership|build|audit` ranks coins by
   trailing liquidity **as of** each rebalance, keeps delisted names while they
@@ -518,7 +544,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
-     [--group-by col] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
      [--allow-lockbox]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
@@ -528,7 +554,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--null-runs N] [--null-block N] [--baseline-samples N] [--bootstrap-error N] [--cv mode] [--cv-k K]
      [--stability B] [--eval-expr expr]
      [--units name=unit,..] [--require-dimensions]
-     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--no-fit]
+     [--fit-iters N] [--fit-strategy exact|auto|linear|varpro|stream|gpu] [--fit-report] [--fit-rows N] [--fit-fallback-max N] [--no-fit]
      [--no-dedup] [--no-simd] [--predictor-samples N]
      [--pipeline-depth N] [--variation auto|node|postfix]
      [--no-front-parents]
@@ -725,9 +751,10 @@ influence on the fit or the error.
 rcsr --data d.csv --target y --vars x --weight w --metric squared
 ```
 
-`absolute`, `squared`, `signed`, `log_squashed`, `correlation` and
-`correlation_signed` become weighted means (weighted Pearson for the
-correlations); `aic`, `aicc` and `bic`
+`absolute`, `squared`, `signed`, `log_squashed`, `log_loss`, `brier`, the
+three hinge forms, `correlation` and `correlation_signed` become weighted means
+(weighted Pearson for the correlations; the weighted classification midpoint
+and class counts use positive-weight rows only); `aic`, `aicc` and `bic`
 use the weighted RSS and the number of positive-weight rows as `n`. A weight of
 2 is exactly a duplicated row because the normalisation is `Σwᵢ·lossᵢ / Σwᵢ`,
 not division by the row count. The fitter solves the weighted least-squares
@@ -735,7 +762,7 @@ problem (`sqrt(w)` on every residual), and the standard errors use the weighted
 `JᵀWJ` with `dof = #positive weights − k`.
 
 Metrics with no standard weighted form (`median`, `maximum`, `interquartile`,
-`slope`, `rank_correlation`, `auc`, `log_loss`, `hinge`) **refuse** `--weight`
+`slope`, `rank_correlation`, `auc`) **refuse** `--weight`
 with a usage error that lists the supported ones: weights are never silently
 ignored. The text report says
 
@@ -954,27 +981,30 @@ separable, and the historical LM path for everything else. `varpro`, `stream`
 an exact CPU verifier, which fits candidates with at most 20 constants on the
 device — least squares for the squared/AIC family, IRLS for `log_squashed`
 (#229), L1 IRLS with true-MAE acceptance for `absolute` (#222), Fisher scoring
-on the binary label for `log_loss` (#234, **fit-only**: the device proposes the
-constants and the exact CPU `f64` log-loss judges the proposal, scores every
-candidate and refits every finalist), and the exact correlation objective with
+on the binary label for `log_loss` (#234; the device proposes the constants
+and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
+and since #289 the search also scores log-loss, Brier and the three hinge forms
+with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
+surrogate, not the SVM hinge), and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
-arm; the correlation *scorer* remains CPU-side under the #236 gate;
+arm; the correlation *scorer* is native on the device since #287;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
 forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
-the same arm fits the exact integer rank polish on the device (fit-only: the
-fitness and the finalist refit stay on the CPU, because native rank scoring is
-still open); `rank_correlation_signed` is the same stage under `1 - rho`, so a
-reflected model is rejected and a proposal is judged on the exact oriented
-score, never on SSE or `|rho|` (#231); `--metric median` does the same with the
-exact `f64` median and `--metric interquartile` with the middle-50 % window mean
-of `|r|` (`--fit-strategy gpu` only, fit-only, and only from 4 096 training rows
-— the measured crossover of the batched selection, #226 and #232), and
-`--metric maximum` fits the Chebyshev objective by **exact bisection on the
-error level** per constant (fit-only, from 512 training rows — the measured
-cost-model floor, #227). An explicit `gpu` with a metric that has no device fit
+the same arm fits the exact integer rank polish on the device; the same exact
+integer sums also **score** every candidate on the device from 4 096 training
+rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
+is the same stage under `1 - rho`, so a reflected model is rejected and a
+proposal is judged on the exact oriented score, never on SSE or `|rho|` (#231);
+`--metric median` does the same with the exact `f64` median and
+`--metric interquartile` with the middle-50 % window mean of `|r|` (fit and
+native scoring from 4 096 training rows — the measured crossover of the batched
+selection, #226, #232 and #288), and `--metric maximum` fits the Chebyshev
+objective by **exact bisection on the error level** per constant (from 512
+training rows — the measured cost-model floor, #227) and is scored natively by
+the #287 maximum reducer. An explicit `gpu` with a metric that has no device fit
 objective is a usage error, because the kernel would otherwise fit a different
 loss; use `--metric squared`, `--metric log_squashed`, `--metric absolute`,
 `--metric log_loss`, a rank metric, `--metric median`, `--metric
@@ -1086,21 +1116,40 @@ device must exist (exit 2 otherwise), `--no-gpu`/`--cpu` forces the CPU, and
 with the backend, device, available threads and training rows/columns, and
 `--json` records `backend`, `backend_reason` and `device`.
 
-The kernel ranks candidates by **squared error**, so only `--metric squared` is
-scored on the device. Every other metric — including the default `absolute` —
-keeps the CPU evaluator, prints `# gpu: off (metric is not scored natively on
-the GPU)` and records that cause in `backend_reason`; a device run is never
-ranked by a substitute loss. Native device scoring for the other objectives is
-tracked in #236–#238.
+The kernel scores the configured metric natively through the #287
+`Metric -> ScoreDispatch` table. The objective kernel covers `squared`,
+`absolute`, `log_squashed`, `signed`, `maximum`, `correlation`,
+`correlation_signed`, `aic`/`aicc`/`bic` and the classification family
+(`log_loss`, `brier`, `hinge*`, #289). The exact `f64` order-statistic/rank
+batch entry point (#288) covers `median`, `interquartile`, `rank_correlation`,
+`rank_correlation_signed` and `auc` from 4 096 training rows (`auc` also needs a
+two-valued target). Every other metric, and the order/rank metrics below their
+floor, keep the CPU evaluator, print the *named* reason and record it in
+`backend_reason`; a device run is never ranked by a substitute loss.
 
-Cross-backend runs are **not bit-identical**: GPU fitness is `f32`, so it can
-change the search trajectory. Reported metrics, constants and diagnostics are
-always rebuilt on the CPU in exact `f64`; use `--cpu` for a byte-identical
-reproduction. A metric may use the GPU only when the kernel computes its
-objective itself: `squared` and `log_squashed` do (mean `ln(1 + r²)`, #229);
-every other metric is scored on the CPU, so no run is ever ranked by a proxy
-loss (#236). A GPU run also reports a measured `gpu` block (allocation, H2D,
-launch, sync, D2H, wall, throughput, kernel-time duty, quality per GPU-hour).
+Cross-backend runs are **not bit-identical**: objective-kernel fitness is `f32`,
+so it can change the search trajectory. The #288 statistics are exact `f64` and
+match the CPU bit for bit for the same prediction vector (interquartile to
+`1e-12` relative), but the prediction itself may round differently on the two
+devices. Reported metrics, constants and diagnostics are always rebuilt on the
+CPU in exact `f64`; use `--cpu` for a byte-identical reproduction. A metric may
+use the GPU only when the score table names a native scorer for it, so no run is
+ever ranked by a proxy loss (#236). Native scoring returns `f64` plus a status; a
+non-finite prediction is `+inf` on both CPU and device, never a finite sentinel
+(#287, #288). A GPU run also reports a
+measured `gpu` block (allocation, H2D, launch, sync, D2H, wall, throughput,
+evaluator-window kernel duty, quality per GPU-hour) and a run-scoped
+`gpu.ledger`: exclusive stage seconds, device-busy as the **union** of device
+intervals over run wall (never their sum), fit/eval/fallback seconds with
+labelled causes, fit kernel versus CPU-fallback time, and
+numerator/denominator/units/scope on every derived ratio. `Σ stage_s +
+unaccounted_s = wall_s` within 1 %; `gpu.duty_cycle` is explicitly the evaluator
+window, while `gpu.ledger.duty_run` is the run-level headline. The packed batch
+path allocates a persistent device arena once, stages host bytes in a <=64 MiB
+pinned ring and copies on `S_h2d`/`S_d2h` with event dependencies, so `alloc_s`
+is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the labelled blocking fallback
+(#285). See
+[`docs/gpu-backend.md`](docs/gpu-backend.md#measuring-the-full-gpu-path-issue-118).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See
 [`docs/gpu-backend.md`](docs/gpu-backend.md).
