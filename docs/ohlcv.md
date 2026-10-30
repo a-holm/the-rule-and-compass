@@ -131,6 +131,12 @@ a one-thread-per-base-row gather over that index. The CPU guard
 is `NaN` for every value leaf while `bar_age` stays finite and exact. A partial
 or current higher bucket is never visible.
 
+Bucket buffers are sized on the host from each symbol's hour span (capped at its
+row count), which bounds the `1h`, `4h` and `1d` bucket counts for any holes. The
+device accepts only timeframes that are a multiple of 3600 s. If the device path
+still fails, `enrich` prints one stderr warning naming the stage and return code
+and computes the 36 columns on the CPU; the output bytes are unchanged.
+
 `tests/mtf_gpu.rs` pins the complete 36-column CPU/GPU parity (bitwise for every
 leaf except `vol`, whose `sqrt` is within `1e-12`), a missing bucket for
 `1h`/`4h`/`1d`, a partial trailing bucket, prefix replay at ~20 cuts and symbol

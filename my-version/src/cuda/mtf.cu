@@ -568,9 +568,9 @@ RcMtf *rc_mtf_create(const long long *times, const double *open,
                      const double *high, const double *low,
                      const double *close, int n,
                      const int *seg_start, const int *seg_len, int nseg,
-                     int step)
+                     int step, int max_buckets)
 {
-    if (n <= 0 || nseg <= 0 || nseg > n) return NULL;
+    if (n <= 0 || nseg <= 0 || nseg > n || max_buckets <= 0) return NULL;
     RcMtf *c = (RcMtf *)calloc(1, sizeof(RcMtf));
     if (!c) return NULL;
     c->n = n;
@@ -578,12 +578,7 @@ RcMtf *rc_mtf_create(const long long *times, const double *open,
     c->step = step;
     c->prepared_tf = -1;
 
-    int ratio = (step > 0) ? (int)(3600 / step) : 1;
-    if (ratio < 1) ratio = 1;
-    long long max_b = (long long)n / ratio + (long long)nseg + 2;
-    if (max_b > n) max_b = n;
-    if (max_b < 1) max_b = 1;
-    c->max_buckets = (int)max_b;
+    c->max_buckets = max_buckets > n ? n : max_buckets;
 
     int ok = 1;
     size_t rows = (size_t)n;
@@ -697,6 +692,11 @@ void rc_mtf_destroy(RcMtf *c)
     free(c);
 }
 
+int rc_mtf_total_buckets(RcMtf *c)
+{
+    return c ? c->total_buckets : -1;
+}
+
 void rc_mtf_last_stats(RcMtf *c, RcMtfStats *out)
 {
     if (c && out) *out = c->last;
@@ -707,6 +707,7 @@ void rc_mtf_last_stats(RcMtf *c, RcMtfStats *out)
 int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
 {
     if (!c || tf_seconds <= 0) return 1;
+    if (tf_seconds < 3600 || tf_seconds % 3600 != 0) return 6;
     stats_begin(c);
     const int threads = 256;
     int nb = blocks_for(c->n, threads);
