@@ -45,31 +45,21 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236 / #229: the CUDA evaluator accumulates one objective. A metric whose
-/// objective the kernel does not compute must never be handed to it, or a
-/// slope/absolute/rank run is silently ranked by MSE. `squared` and
-/// `log_squashed` (native since #229) are the two exceptions.
+/// #236 / #229 / #287 / #288: a 64-row sample is below every measured native
+/// scoring floor, so the exact order/rank family keeps the CPU here, and a
+/// metric the table refuses is never handed to the evaluator at any size.
 #[test]
-fn non_native_metrics_never_use_the_gpu_evaluator() {
+fn metrics_without_an_admitted_scorer_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
     let metrics = [
-        Metric::Correlation,
-        Metric::CorrelationSigned,
         Metric::Median,
-        Metric::Maximum,
-        Metric::Signed,
         Metric::RankCorrelation,
         Metric::RankCorrelationSigned,
         Metric::Interquartile,
         Metric::Auc,
-        Metric::LogLoss,
-        Metric::Hinge,
         Metric::Slope,
         Metric::ImplicitDerivative,
         Metric::ImplicitResidual,
-        Metric::Aic,
-        Metric::Aicc,
-        Metric::Bic,
     ];
     for metric in metrics {
         let cfg = Config {
@@ -82,10 +72,44 @@ fn non_native_metrics_never_use_the_gpu_evaluator() {
             Backend::Cpu,
             "{metric:?} must not be scored by a GPU evaluator without its objective"
         );
-        assert_eq!(
-            rcsr::fit::DeviceLoss::for_metric(metric),
-            None,
-            "{metric:?} has no native device objective"
+        match rcsr::metrics::ScoreStat::for_metric(metric) {
+            Some(stat) => assert!(
+                s.len() < stat.min_rows(),
+                "{metric:?} is on the CPU here only because of its row floor"
+            ),
+            None => assert!(
+                rcsr::metrics::score_refusal(metric).is_some(),
+                "{metric:?} must carry a named score refusal"
+            ),
+        }
+    }
+}
+
+/// #287: every native score objective is in the table, independent of whether
+/// this build has a CUDA device. The device-side arithmetic is covered by the
+/// `src/gpu.rs` tests.
+#[test]
+fn native_score_objectives_are_table_driven() {
+    for metric in [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Maximum,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
+    ] {
+        assert!(
+            rcsr::metrics::native_score_objective(metric).is_some(),
+            "{metric:?} must have a native score objective"
         );
     }
 }
@@ -103,7 +127,8 @@ fn log_squashed_has_a_native_objective() {
         Some(rcsr::fit::DeviceLoss::LogSquashed)
     );
     // The information criteria fit by least squares and stay on the squared
-    // objective; they are still gated off the evaluator (parameter-aware).
+    // *fit* objective; their native score is the separate AIC-family reducer
+    // (#287).
     assert_eq!(
         rcsr::fit::fit_loss(Metric::Aic),
         Some(rcsr::fit::DeviceLoss::Squared)
@@ -239,6 +264,29 @@ fn assert_fit_ledger(g: &rcsr::search::GpuRunStats) {
         "fallback causes must add up to the total: {:?}",
         g
     );
+    // #284: the same counters and the raw kernel/fallback seconds are in the
+    // run ledger, which must also close and never report duty > 1.
+    assert_eq!(g.ledger.admitted() as usize, g.fit_attempts, "{:?}", g.ledger);
+    assert_eq!(g.ledger.device_fits() as usize, g.fit_gpu, "{:?}", g.ledger);
+    assert_eq!(g.ledger.fallback_fits() as usize, g.fit_fallback, "{:?}", g.ledger);
+    assert_eq!(
+        g.ledger.fallback_by_cause(),
+        &g.fit_fallback_by_cause,
+        "the ledger must carry every labelled cause"
+    );
+    assert!(g.ledger.wall_s() > 0.0);
+    assert!(
+        g.ledger.closure_residual().value.abs() < 0.01,
+        "run ledger does not close: {:?}",
+        g.ledger
+    );
+    assert!(g.ledger.duty_run().value <= 1.0);
+    assert!(g.ledger.device_busy_s() <= g.ledger.device_busy_sum_s() + 1e-12);
+    if g.fit_gpu > 0 {
+        assert!(g.ledger.fit_kernel_s() > 0.0, "a device fit must be recorded");
+        assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
+        assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+    }
 }
 
 #[test]
@@ -863,13 +911,14 @@ fn bench_end_to_end() {
             .map(|s| s.error)
             .fold(f64::INFINITY, f64::min);
         eprintln!(
-            "arm={} metric={} N={} evals={} wall={:.2}s best={:.6e}",
+            "arm={} metric={} N={} evals={} wall={:.2}s best={:.6e} archive_hash={:016x}",
             name,
             metric.name(),
             n,
             base.generations * base.islands * base.pop,
             wall,
-            best
+            best,
+            out.archive.hash()
         );
         // Per-generation archive best, so a quality regression can be located
         // in the trajectory rather than only at the end.
@@ -905,12 +954,36 @@ fn bench_end_to_end() {
                 causes,
                 g.fit_refits
             );
+            // #284: a CUDA fit run must leave a fit record in the run ledger,
+            // with kernel seconds from raw device events and any CPU fallback
+            // seconds measured separately.
+            if g.fit_gpu > 0 {
+                assert!(
+                    g.ledger.fit_kernel_s() > 0.0,
+                    "a device fit must record fit kernel seconds: {:?}",
+                    g.ledger
+                );
+                assert_eq!(g.ledger.device_fits(), g.fit_gpu as u64);
+                assert_eq!(g.ledger.fallback_fits(), g.fit_fallback as u64);
+                assert_eq!(
+                    g.ledger.admitted() as usize,
+                    g.fit_attempts,
+                    "the ledger must count every admitted fit once"
+                );
+                assert!(g.ledger.fit_host_s() >= g.ledger.fit_kernel_s());
+                assert!(g.ledger.fit_host_s() >= g.ledger.fit_fallback_s());
+            }
             eprintln!(
-                "  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s duty={:.1}%",
+"  time: fit_host={:.2}s ({:.1}% of wall) kernel={:.2}s fallback={:.2}s bounded={}/{} workers={} duty={:.1}% run_duty={:.1}%",
                 g.fit_host_ms / 1000.0,
                 100.0 * (g.fit_host_ms / 1000.0) / wall,
                 g.fit_ms / 1000.0,
-                100.0 * g.accounting.duty_cycle()
+                g.fit_fallback_ms / 1000.0,
+                g.fit_fallback_bounded,
+                g.fit_fallback_max,
+                g.fit_fallback_workers,
+                100.0 * g.accounting.duty_cycle(),
+                100.0 * g.ledger.duty_run().value
             );
         }
         runs.push((name, wall, history, out));

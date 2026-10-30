@@ -47,6 +47,9 @@ pub struct Manifest {
     /// #169: batched-GPU fit ledger `(gpu, fallback, exact_refits)`, filled in
     /// after the search. `None` for a run that never used the GPU.
     pub fit: Option<(u64, u64, u64)>,
+    /// #290: calibrated dispatch values and the per-stage route ledger,
+    /// filled in when the search returns.
+    pub dispatch: Option<crate::dispatch::DispatchReport>,
     /// #112: `Some(true)` for full rows, `Some(false)` for an explicit
     /// `--sample-rows` sample, `None` when the source was a CSV or unknown.
     pub full_rows: Option<bool>,
@@ -118,6 +121,9 @@ impl Manifest {
                 "  \"fit\":{{\"gpu\":{},\"fallback\":{},\"refits\":{}}},\n",
                 gpu, fallback, refits
             ));
+        }
+        if let Some(dispatch) = &self.dispatch {
+            out.push_str(&format!("  \"dispatch\":{},\n", dispatch.manifest_json()));
         }
         out.push_str(&format!(
             "  \"resume\":{{\"from\":{},\"backend_change\":{}}},\n",
@@ -222,6 +228,7 @@ pub fn collect(
         resumed_from,
         backend_change,
         fit: None,
+        dispatch: None,
         full_rows,
         sampled_rows,
         estimate_bytes,

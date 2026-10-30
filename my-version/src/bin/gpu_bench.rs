@@ -15,6 +15,7 @@ fn main() {
     let mut target = "y".to_string();
     let mut vars: Vec<String> = vec!["x".to_string()];
     let mut batch = 4000usize;
+    let mut reps = 25usize;
     let mut depth = 4usize;
     let mut seed = 1u32;
     let mut ops: Vec<Op> = Op::default_set();
@@ -46,6 +47,10 @@ fn main() {
                 i += 1;
                 batch = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(batch);
             }
+            "--reps" => {
+                i += 1;
+                reps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(reps);
+            }
             "--depth" => {
                 i += 1;
                 depth = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(depth);
@@ -56,7 +61,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S]"
+                    "rcsr-gpu-bench [--data file] [--target y] [--vars a,b] [--batch N] [--depth D] [--seed S] [--reps R]"
                 );
                 return;
             }
@@ -122,7 +127,7 @@ fn main() {
     // the full evaluator path (alloc/upload/launch/sync/download), not the
     // kernel event alone.
     let _ = ev.eval_population(&population);
-    let reps = 25;
+    let warm_arena = ev.arena_report();
     let before = ev.stats();
     let t_gpu = std::time::Instant::now();
     let mut gpu_err = Vec::new();
@@ -132,6 +137,7 @@ fn main() {
     }
     let wall = t_gpu.elapsed().as_secs_f64();
     let gpu_stats = ev.stats().since(&before);
+    let arena = ev.arena_report();
     let ms = wall * 1000.0 / reps as f64;
 
     // CPU reference: same batch, f64 tree walk.
@@ -257,6 +263,25 @@ fn main() {
         host * 1e3,
         gpu_stats.wall_s * 1e3,
     );
+    println!(
+        "arena            : {} (pinned {} B, alloc calls {} -> steady {}, overlapped uploads {}, batches {}){}",
+        if arena.async_copy {
+            "async pinned H2D/D2H"
+        } else {
+            "synchronous fallback"
+        },
+        arena.pinned_bytes,
+        arena.alloc_calls,
+        arena.steady_alloc_calls,
+        arena.overlapped_uploads,
+        arena.batches,
+        if arena.reason.is_empty() {
+            String::new()
+        } else {
+            format!("; reason: {}", arena.reason)
+        }
+    );
+    let _ = warm_arena;
     println!(
         "decomposition    : C windows {:>6.2}% + host {:>5.2}% = {:>6.2}% of wall (residual {:+.2}%); H2D {} B, D2H {} B per {} batches",
         100.0 * gpu_stats.window_s() / gpu_stats.wall_s.max(1e-12),

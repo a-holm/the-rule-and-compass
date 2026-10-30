@@ -264,7 +264,10 @@ because that loop has neither.
 | `archive` | the final `size`, `best_error` and `hash` |
 | `json` | where the result JSON went (`null` = stdout) |
 | `peak_rss_bytes` | the process high-water mark from `/proc/self/status` `VmHWM` (`null` off Linux) |
-| `gpu_wall_s`, `device_hours` | measured GPU full-path wall and `gpu_wall_s / 3600` |
+| `gpu_wall_s`, `device_hours` | measured evaluator full-path wall and `gpu_wall_s / 3600` (evaluator-window scope, not the run) |
+| `run_wall_s`, `device_busy_s`, `duty_run` | #284 run ledger: run wall, **union** of device intervals, and their ratio |
+| `unaccounted_s` | `run_wall_s − Σ stage_s`; >1 % of wall is a telemetry defect |
+| `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
 | `events`, `bytes`, `dropped` | log bookkeeping **before** this event; `dropped` counts events lost to the byte cap |
 | `end` | UTC end time |
 

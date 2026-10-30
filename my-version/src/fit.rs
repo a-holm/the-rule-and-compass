@@ -32,9 +32,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, exact_metric_score, fit_batch_verified, gate_proposal, is_squared_family,
-    maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus, BatchedFitter,
-    ProposalGate, VerifiedBatch,
+    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable, gate_proposal,
+    is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
+    BatchedFitter, ProposalGate, VerifiedBatch,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;
@@ -148,17 +148,19 @@ impl FitStrategy {
 /// objective. The discriminants are the `metric` argument of
 /// `rc_eval`/`rc_pool_eval`/`rc_fit_batch` in `src/cuda/eval.cu`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeviceLoss {
+pub enum FitObjective {
     /// `Σ w·r²`.
     Squared,
     /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
     LogSquashed,
-    /// #224: `1 − |ρ|`. A **fit-only** objective: the evaluator still has no
-    /// native correlation scorer, so neither [`DeviceLoss::for_metric`] nor
-    /// [`fit_loss`] maps it. It is reachable through the fit kernel's direct
-    /// batch API, not through the search dispatch.
+    /// #224: `1 − |ρ|`. A **fit-only** objective: scoring is the separate
+    /// [`crate::metrics::ScoreObjective::Correlation`] table (#287), so
+    /// [`DeviceLoss::for_metric`] and [`fit_loss`] do not map it. Reachable
+    /// through the fit kernel's direct batch API, not through the search fit
+    /// dispatch.
     Correlation,
-    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`].
+    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`];
+    /// native scoring is [`crate::metrics::ScoreObjective::CorrelationSigned`].
     CorrelationSigned,
     /// #222: `Σ w·|r|`, minimised by per-row IRLS weights `1/max(|r|, 1e-6)`
     /// with true-`|r|` acceptance. Both the evaluator and the batched fit use
@@ -174,7 +176,12 @@ pub enum DeviceLoss {
     Logistic,
 }
 
-impl DeviceLoss {
+/// Backwards-compatible name for the fit objective. New code should say
+/// [`FitObjective`]: the scoring decision lives in
+/// [`crate::metrics::ScoreObjective`] and is independent of this enum (#287).
+pub type DeviceLoss = FitObjective;
+
+impl FitObjective {
     /// The `metric` code the CUDA entry points take.
     pub fn code(self) -> i32 {
         match self {
@@ -187,8 +194,10 @@ impl DeviceLoss {
         }
     }
 
-    /// Whether the **evaluator** entry points (`rc_eval`, `rc_pool_eval`) can
-    /// accumulate this objective. `false` for every fit-only code.
+    /// Whether the legacy f32 evaluator entry points (`rc_eval`, `rc_pool_eval`)
+    /// can accumulate this objective. Scoring itself is now driven by
+    /// [`crate::metrics::ScoreObjective`] (#287); this flag only labels the
+    /// fit-only arms.
     pub fn scores_on_device(self) -> bool {
         match self {
             DeviceLoss::Squared | DeviceLoss::LogSquashed | DeviceLoss::Absolute => true,
@@ -196,12 +205,13 @@ impl DeviceLoss {
         }
     }
 
-    /// The device objective for a metric the **evaluator** can rank, or `None`
-    /// when it cannot.
+    /// The fit objective for a metric that shares the squared/log/absolute
+    /// family, or `None` otherwise.
     ///
-    /// #234: `Logistic` is deliberately absent — a `log_loss` run scores every
-    /// candidate on the exact CPU metric and only its constants come from the
-    /// device (see [`fit_loss`] and [`fit_only_loss`]).
+    /// #234/#287: `Logistic` is deliberately absent — a `log_loss` run scores
+    /// every candidate on the exact CPU metric and only its constants come from
+    /// the device. Scoring is decided separately by
+    /// [`crate::metrics::score_dispatch`].
     pub fn for_metric(metric: Metric) -> Option<Self> {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
@@ -233,13 +243,17 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
 /// `f64`; `None` when the metric is scored natively on the device or has no
 /// device fit objective at all.
 ///
-/// `log_loss` is the first metric in this class whose fit is the batched LM
-/// kernel's own objective (rank and median are fit-only polish arms), so the
-/// predicate names the split once and the search's gate, its scoring path and
-/// its fit dispatch all read it.
+/// `log_loss` was the first metric in this class whose fit is the batched LM
+/// kernel's own objective. #289 gives it (and Brier/hinge) a native scorer, so
+/// the predicate now returns `None` for it; the split still names itself once
+/// and the search's gate, scoring path and fit dispatch all read it.
 pub fn fit_only_loss(metric: Metric) -> Option<DeviceLoss> {
     let loss = fit_loss(metric)?;
-    if loss.scores_on_device() {
+    // #289: a metric is fit-only only when the evaluator has no native
+    // **score** objective either. `log_loss` used to be the example; it now
+    // has a native per-row scorer (`ScoreObjective::LogLoss`), so it is no
+    // longer fit-only and the split stays a single predicate.
+    if loss.scores_on_device() || crate::metrics::ScoreObjective::for_metric(metric).is_some() {
         None
     } else {
         Some(loss)
@@ -303,10 +317,10 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
 ///
 /// This is deliberately **not** [`fit_loss`]: the batched LM kernel does not
 /// minimise Spearman's rho, the rank stage does. It is also not
-/// [`DeviceLoss::for_metric`]: the evaluator cannot score rho yet, so a run
+/// [`DeviceLoss::for_metric`]: the fit dispatch has no rho LM objective, so a run
 /// using this arm keeps every fitness value on the CPU. Callers use this
 /// predicate for the fit dispatch; the *scoring* gate remains
-/// [`DeviceLoss::for_metric`].
+/// [`crate::metrics::ScoreObjective`] instead.
 pub fn rank_fit_only(metric: Metric) -> Option<bool> {
     rank_metric_signed(metric)
 }
@@ -373,7 +387,7 @@ impl OrderStat {
 /// device selects the exact median of `|pred − y|` (a segmented sort of the
 /// residual bits) and never accumulates an SSE. The evaluator cannot score a
 /// median, so this predicate selects the fit stage only; the *scoring* gate
-/// remains [`DeviceLoss::for_metric`] and every fitness value stays CPU `f64`.
+/// remains [`crate::metrics::score_dispatch`] and every fitness value stays CPU `f64`.
 pub fn median_fit_only(metric: Metric) -> bool {
     metric == Metric::Median
 }
@@ -398,6 +412,32 @@ pub fn interquartile_fit_only(metric: Metric) -> bool {
 /// gate cannot disagree about which metrics it covers.
 pub fn order_stat_fit_only(metric: Metric) -> bool {
     median_fit_only(metric) || interquartile_fit_only(metric)
+}
+
+/// #290: route an arm-specific measured cost pair through the common dispatch
+/// model. The old helpers answered `n >= floor && gpu_s < cpu_s`; that boolean
+/// is now a zero-hysteresis [`crate::dispatch::Dispatcher`] decision, so the
+/// arm gates and the generic model cannot drift apart. Zero launch and zero
+/// transfer preserve the arm model exactly; the floor is expressed as a named
+/// `too_few_rows` refusal instead of a bare comparison.
+fn modelled_gpu_worthwhile(
+    n: usize,
+    p: usize,
+    sweeps: usize,
+    cpu_s: f64,
+    gpu_s: f64,
+    min_rows: usize,
+) -> bool {
+    let mut calibration = crate::dispatch::Calibration::default();
+    calibration.hysteresis = 0.0;
+    calibration.launch_s = 0.0;
+    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
+    let workload = crate::dispatch::Workload::fit(1, n, p, sweeps)
+        .with_costs(cpu_s, gpu_s)
+        .with_min_rows(min_rows)
+        .with_bytes(0);
+    dispatcher.plan(crate::dispatch::Stage::Fit, &workload).route
+        == crate::dispatch::Route::Device
 }
 
 /// #226: rows below which the device median polish is not worth its per-call
@@ -479,7 +519,8 @@ pub fn median_fit_cost(n: usize, p: usize, sweeps: usize) -> MedianFitCost {
 /// #226: whether the device median polish is predicted to be faster than the
 /// CPU polish for a sample of `n` rows and `p` constants.
 pub fn median_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= MEDIAN_GPU_MIN_ROWS && median_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = median_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(n, p, sweeps, cost.cpu_s, cost.gpu_s, MEDIAN_GPU_MIN_ROWS)
 }
 
 // --- #232: interquartile arm -------------------------------------------------
@@ -565,7 +606,15 @@ pub fn interquartile_fit_cost(n: usize, p: usize, sweeps: usize) -> Interquartil
 /// #232: whether the device interquartile polish is predicted to be faster
 /// than the exact CPU arm for a sample of `n` rows and `p` constants.
 pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= INTERQUARTILE_GPU_MIN_ROWS && interquartile_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = interquartile_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(
+        n,
+        p,
+        sweeps,
+        cost.cpu_s,
+        cost.gpu_s,
+        INTERQUARTILE_GPU_MIN_ROWS,
+    )
 }
 
 /// #227: `true` when `--fit-strategy gpu` can fit `maximum` on the device
@@ -576,7 +625,7 @@ pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bo
 /// not a [`fit_loss`]: the device reduces the exact `max |r|` (an order-free
 /// integer max over the `|r|` bit patterns) and drives the bisection on the
 /// error level, and the CPU scores every candidate with the configured
-/// maximum. The *scoring* gate remains [`DeviceLoss::for_metric`], so a
+/// maximum. The *scoring* gate is [`crate::metrics::score_dispatch`] (#287), so a
 /// `--metric maximum` run reports the `cpu` backend with that reason.
 ///
 /// A **weighted** maximum is refused: `weights_supported` excludes `Maximum`
@@ -677,7 +726,8 @@ pub fn maximum_fit_cost(n: usize, p: usize, sweeps: usize) -> MaximumFitCost {
 /// #227: whether the device maximum-error polish is predicted to be faster
 /// than the CPU polish for a sample of `n` rows and `p` constants.
 pub fn maximum_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bool {
-    n >= MAXIMUM_GPU_MIN_ROWS && maximum_fit_cost(n, p, sweeps).prefers_gpu()
+    let cost = maximum_fit_cost(n, p, sweeps);
+    modelled_gpu_worthwhile(n, p, sweeps, cost.cpu_s, cost.gpu_s, MAXIMUM_GPU_MIN_ROWS)
 }
 
 /// #116: the largest design matrix (`rows × constants`) the linear arm will
@@ -2922,7 +2972,17 @@ pub fn fit_weighted_metric(
         LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / (1.0 + r * r)
         }),
-        Auc | LogLoss | Hinge => logistic_irls(tree, x, y, w, iters, metric),
+        // #289: Brier and the SVM hinge forms have exact **scores** but no
+        // exact least-squares/IRLS weight on the CPU. The logistic IRLS step is
+        // a warm start and the configured metric decides whether it is kept, so
+        // the arm never claims to minimise a different objective: the returned
+        // value is always `metric_score` of the configured metric.
+        Auc
+        | LogLoss
+        | Brier
+        | Hinge
+        | HingeOrdinary
+        | HingeSquared => logistic_irls(tree, x, y, w, iters, metric),
         // #224: correlation has an exact objective, an analytic gradient and a
         // structural gauge handler; it never falls back to a squared fit.
         Correlation | CorrelationSigned => {
@@ -3134,6 +3194,66 @@ pub fn classification_signs(y: &[f64]) -> Vec<f64> {
         .into_iter()
         .map(|l| 2.0 * l - 1.0)
         .collect()
+}
+
+/// #289: the label sign under the **weighted** midpoint rule.
+///
+/// The midpoint is taken over rows with `w > 0` only, matching
+/// [`crate::metrics::score_weighted`]'s weighted classification branch: a
+/// zero-weight row is invisible, so a wild or masked target in it cannot move
+/// the label of a row that counts. Masked rows get `-1`, which no scorer or
+/// fitter reads because it skips `w = 0` before the row.
+pub fn classification_signs_weighted(y: &[f64], w: &[f64]) -> Vec<f64> {
+    if w.is_empty() {
+        return classification_signs(y);
+    }
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (&v, &wi) in y.iter().zip(w) {
+        if wi > 0.0 {
+            if !v.is_finite() {
+                // A positive-weight non-finite target is invalid, not a label.
+                // NaN signs make the device reject the row instead of silently
+                // assigning it to a class the CPU scorer refuses.
+                return vec![f64::NAN; y.len()];
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    let mid = 0.5 * (lo + hi);
+    y.iter()
+        .zip(w)
+        .map(|(&v, &wi)| if wi > 0.0 && v > mid { 1.0 } else { -1.0 })
+        .collect()
+}
+
+/// #289: `(positives, negatives)` among rows with `w > 0`.
+pub fn class_counts_weighted(y: &[f64], w: &[f64]) -> (usize, usize) {
+    if !w.is_empty()
+        && y.iter()
+            .zip(w)
+            .any(|(&v, &wi)| wi > 0.0 && !v.is_finite())
+    {
+        // No valid labels: the caller labels this sample `single_class` and
+        // keeps the exact CPU arm rather than fitting a NaN sign.
+        return (0, 0);
+    }
+    let signs = classification_signs_weighted(y, w);
+    let pos = if w.is_empty() {
+        signs.iter().filter(|&&t| t > 0.0).count()
+    } else {
+        signs
+            .iter()
+            .zip(w)
+            .filter(|(&t, &wi)| wi > 0.0 && t > 0.0)
+            .count()
+    };
+    let total = if w.is_empty() {
+        y.len()
+    } else {
+        w.iter().filter(|&&v| v > 0.0).count()
+    };
+    (pos, total - pos)
 }
 
 /// #234: `(positives, negatives)` under the [`classification_signs`] rule.
