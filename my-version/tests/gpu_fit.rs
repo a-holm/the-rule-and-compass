@@ -45,13 +45,11 @@ fn gpu_config(seed: u32) -> Config {
     }
 }
 
-/// #236 / #287 / #289: the CUDA evaluator scores only metrics that the
-/// dispatch table maps to a native `ScoreObjective`. A refused metric must
-/// never be handed to it, or a slope/rank run is silently ranked by MSE.
-/// `log_loss`, `brier` and the hinge forms are native since #289, so they are
-/// asserted in the included list below instead.
+/// #236 / #229 / #287 / #288: a 64-row sample is below every measured native
+/// scoring floor, so the exact order/rank family keeps the CPU here, and a
+/// metric the table refuses is never handed to the evaluator at any size.
 #[test]
-fn refused_metrics_never_use_the_gpu_evaluator() {
+fn metrics_without_an_admitted_scorer_never_use_the_gpu_evaluator() {
     let s = sample(64, 7);
     let metrics = [
         Metric::Median,
@@ -74,10 +72,16 @@ fn refused_metrics_never_use_the_gpu_evaluator() {
             Backend::Cpu,
             "{metric:?} must not be scored by a GPU evaluator without its objective"
         );
-        assert!(
-            rcsr::metrics::score_refusal(metric).is_some(),
-            "{metric:?} must carry a named score refusal"
-        );
+        match rcsr::metrics::ScoreStat::for_metric(metric) {
+            Some(stat) => assert!(
+                s.len() < stat.min_rows(),
+                "{metric:?} is on the CPU here only because of its row floor"
+            ),
+            None => assert!(
+                rcsr::metrics::score_refusal(metric).is_some(),
+                "{metric:?} must carry a named score refusal"
+            ),
+        }
     }
 }
 

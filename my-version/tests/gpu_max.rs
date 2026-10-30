@@ -298,7 +298,9 @@ fn no_fit_is_a_true_noop_for_the_maximum_gpu_arm() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
     }
-    let train = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS + 32, 7);
+    // Below the #288 scoring floor: `--no-fit` leaves neither a fit arm nor a
+    // native scorer, so the exact CPU maximum is the only arm.
+    let train = sample(rcsr::fit::MAXIMUM_GPU_MIN_ROWS - 32, 7);
     let test = sample(200, 8);
     let base = Config {
         fit_iters: 0,

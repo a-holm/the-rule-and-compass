@@ -3680,6 +3680,11 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
     if (c->d_cols64) { cudaFree(c->d_cols64); c->d_cols64 = 0; }
     if (c->d_y64) { cudaFree(c->d_y64); c->d_y64 = 0; }
     if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    /* #288: the rank stage caches B from the previous target. Re-uploading
+       exact rows invalidates it, or a scorer called after this would rank the
+       new predictions against the old target. */
+    if (c->d_rank_b) { cudaFree(c->d_rank_b); c->d_rank_b = 0; }
+    c->rank_ready = 0;
     size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
     size_t yb = sizeof(double) * (size_t)c->n;
     if (rc_alloc((void **)&c->d_cols64, cb) != 0) return -1;

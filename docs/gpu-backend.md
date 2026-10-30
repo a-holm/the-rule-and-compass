@@ -401,10 +401,11 @@ Each generation then runs as:
    generation, all islands included;
 3. selection, migration and restart decisions consume the returned fitness.
 
-The GPU never produces a number a user reads. The kernel computes one
+The GPU never produces a number a user reads. The objective kernel computes one
 **configured score objective**; the returned value is already the metric value
 (the mean, the RSS + AIC penalty, the maximum or `1 − ρ`), so the search never
-divides a raw sum by the row count. The reported numbers are still rebuilt by
+divides a raw sum by the row count. The exact order/rank statistics (#288) come
+back from the batch entry point as the statistic itself. The reported numbers are still rebuilt by
 the CPU in `f64` at the end.
 
 #287 replaced the old three-entry loss gate with a total
@@ -422,6 +423,11 @@ squared error:
 | `correlation` | `1 − |ρ|` | two-pass centred moment, cached `ȳ, S_yy` |
 | `correlation_signed` | `1 − ρ` | same moment, signed |
 | `aic`, `aicc`, `bic` | RSS + penalty | one pass; `k` per candidate |
+| `median` | median of `|r|` (even `n`: two-middle mean) | exact `f64` batch scorer, #288 (≥ 4096 rows) |
+| `interquartile` | mean of `|r|` on ranks `[⌊n/4⌋, ⌊3n/4⌋)` | exact `f64` batch scorer, #288 (≥ 4096 rows) |
+| `rank_correlation` | `1 − |ρ_s|` from exact integer ranks | exact `f64` batch scorer, #288 (≥ 4096 rows) |
+| `rank_correlation_signed` | `1 − ρ_s` from exact integer ranks | exact `f64` batch scorer, #288 (≥ 4096 rows) |
+| `auc` | `1 − U/(n₊n₋)` from exact integer ranks | exact `f64` batch scorer, #288 (≥ 4096 rows, two-valued target) |
 | `log_loss` | mean `max(−u,0)+log1p(exp(−|u|))` | stable softplus, `u=t·p` (#289) |
 | `brier` | mean `(σ(p) − l)²` | proper Brier on the probability (#289) |
 | `hinge` | mean `1 − t·(2σ(p) − 1)` | the bounded sigmoid **surrogate** (#289) |
@@ -437,10 +443,12 @@ never the old finite `1e30/n`. `score_batch`/`score_pool` return `f64` values
 plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
 
-`median`, `interquartile`, `rank_correlation` and
-`rank_correlation_signed` are named refusals until #288; `auc` likewise needs
-the exact rank scorer with labels (#288); `slope` and the implicit metrics
-remain CPU. Their named reason is printed and recorded in `backend_reason`.
+`median`, `interquartile`, `rank_correlation`, `rank_correlation_signed` and
+`auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
+by `GpuEvaluator::score_stat_batch` over flattened plans on the exact `f64` forward
+pass, from the measured 4 096-row floor (see the #288 section below). `slope`
+and the implicit metrics remain CPU. Their named reason is printed and recorded
+in `backend_reason`, and so is the row floor for an `Exact` metric.
 `log_loss`, `brier` and the three hinge forms are native since #289 — see
 [Classification fitness](#classification-fitness-issue-289) below. Their
 fitness, the label sign and (for the classification family) the per-row
@@ -448,7 +456,7 @@ weights live on the device; every reported number is still the exact CPU
 rebuild.
 
 The GPU path is used for single-output, full-sample runs whose metric has a
-native score objective. Multi-output (`--target y1,y2`), a refused metric and
+native score objective or an exact order/rank statistic. Multi-output (`--target y1,y2`), a refused metric and
 `--predictor-samples` keep the CPU evaluator, because they need more than one
 prediction per row, a different objective, or a different set of rows every
 generation. `--weight` is admitted for the classification objectives (the
@@ -456,32 +464,33 @@ device carries the weight vector, #289) and still refused for the regression
 objectives, whose weighted parity is a separate change; the reason is printed in
 the one-line note.
 
-The exception is the **fit** stage: `--fit-strategy gpu` moves the constants of
-a rank (`rank_correlation` / `rank_correlation_signed`), median or interquartile
-run on the device — the exact rank stage of
+The **fit** stage is a separate decision. `--fit-strategy gpu` moves the
+constants of a rank (`rank_correlation` / `rank_correlation_signed`), median,
+interquartile or maximum run on the device — the exact rank stage of
 [#230](#exact-rank-correlation-fitting-issue-230), the exact median polish of
-[#226](#median-absolute-error-fitting-issue-226) and the middle-50 % window
-polish of
-[#232](#interquartile-absolute-error-fitting-issue-232) — but their **fitness is
-still the CPU objective** and the backend stays `cpu` with the score table's
-named refusal (`rank_* needs the exact rank scorer (#288)`, or the median /
-interquartile order-statistic refusal). `GpuSearch`'s
-`native_metric` is false for these arms, so every candidate is scored by the CPU
-evaluator exactly as before; only the `gpu.fit` counters (and the device field)
-record the device use. The median and interquartile arms additionally need at
-least [`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 and
-[`INTERQUARTILE_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows,
-the measured crossovers below which the CPU polish is cheaper; a smaller sample
-keeps the CPU arm and records that reason.
+[#226](#median-absolute-error-fitting-issue-226), the middle-50 % window polish
+of [#232](#interquartile-absolute-error-fitting-issue-232) and the exact
+minimum-error polish of #227. Median, interquartile and the rank family are
+**scored** natively too (#288), so for those metrics the backend is `gpu` and
+the order/rank statistic is the fitness, not an SSE proxy; `maximum` is scored by
+the #287 objective kernel. Below the 4 096-row scoring floor the run keeps the
+exact CPU statistic (and can still use the device fit-only arm); that case
+reports `cpu` with `backend_reason = "order/rank scoring: the sample is below
+the 4096-row device floor"`, and `GpuSearch::native_metric`/`native_stat` are
+inactive. The sort-based arms need at least
+[`MEDIAN_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 4 096 training rows
+(median, interquartile, rank, AUC) and the maximum fit arm
+[`MAXIMUM_GPU_MIN_ROWS`](../my-version/src/fit.rs) = 512, the measured
+crossovers below which the CPU statistic is cheaper.
 
 Fallback and the flags:
 
 * With neither flag, a CUDA build with a usable device selects the GPU when the
-  metric has a native score objective (the #287 table above). Every other metric
-  is scored on the CPU and prints the table's named refusal
-  (for example `# gpu: off (rank_correlation needs the exact rank scorer
-  (#288))`) once; the resource line and the `--json` `backend` both say `cpu`
-  and `backend_reason` carries the same cause.
+  #287 table names a native scorer for the metric (subject to the row floor and
+  the binary-target rule for AUC). Every other metric is scored on the CPU and
+  prints the table's named reason (for example `# gpu: off (slope needs a
+  cross-row first-difference pass)`) once; the resource line and the `--json`
+  `backend` both say `cpu` and `backend_reason` carries the same cause.
 * A build without the feature prints
   `# gpu: unavailable (built without --features cuda); using the CPU`; a CUDA
   build with no usable device prints the same line with the probe's reason.
@@ -494,6 +503,106 @@ Fallback and the flags:
 * Any CUDA error during a batch prints the same `# gpu: unavailable (...)`
   note, re-scores the pending generation on the CPU and disables the GPU for the
   rest of the run. There is no panic and no stale result.
+
+### Exact order-statistic and rank scoring (issue #288)
+
+The fit arms of #226/#227/#230/#232 already computed an exact device statistic;
+#288 exposes it as a **scoring entry point over arbitrary candidates** and adds
+the dispatch gate that admits those metrics to the search.
+
+**Entry point.** `GpuEvaluator::score_stat_batch(plans, constants, stat)` takes one
+[`GpuFitPlan`](../my-version/src/fit.rs) and one constant vector per candidate,
+runs the exact `f64` forward pass from the resident rows, and returns one
+`Option<f64>` per candidate for a [`ScoreStat`](../my-version/src/gpu.rs):
+
+| `ScoreStat` | device work | exactness contract |
+|---|---|---|
+| `Median` | segmented sort of the `|r|` bit patterns, then the middle pick (even `n` averages the two middles) | bit-identical to `metrics::median_abs` |
+| `Interquartile` | the same sort, mean of ranks `[⌊n/4⌋, ⌊3n/4⌋)` (all rows below `n = 4`) | fixed-order tree mean, `1e-12` relative |
+| `Maximum` | integer max on the `|r|` bits plus the lowest maximiser | bit-identical, order-free |
+| `RankCorrelation` | exact integer rank sums of #230, then `1 − |ρ|` | bit-identical to the exact `RankTarget` statistic |
+| `RankCorrelationSigned` | the same sums under `1 − ρ` | bit-identical, orientation preserved |
+| `Auc` | the same integer sums read as the Mann–Whitney `U` | bit-identical to `metrics::auc` for the same prediction vector |
+
+The return value is tagged: `Some(None)` is a candidate whose prediction was not
+finite and maps to `+inf` exactly like the CPU scorer; `None` is a whole-call
+decline (allocation, launch, bad shape, or an AUC target that is not two-valued)
+and sends the batch to the exact CPU path. No candidate can be left with a
+fabricated finite value.
+
+**Why AUC is exact without a label kernel.** For a two-valued target the cached
+doubled centred ranks `B` are `nneg` on the positives and `−npos` on the
+negatives, so `Σ_pos A = Σ A_i B_i / n` exactly and
+
+```text
+U   = (Σ_pos A + npos·nneg) / 2
+AUC = U / (npos·nneg) = 1 − error
+```
+
+`Σ_pos A` and `npos·nneg` are exact integers, so `2U = Σ_pos A + npos·nneg` is
+exact; `U` itself may be a half-integer when a tied positive/negative pair
+contributes one half (`2U` odd, e.g. a constant prediction over an odd
+`npos·nneg`). Both the integer and the half-integer are exact in `f64`; the only
+rounding is the same single division and subtraction `metrics::auc` performs,
+and the CPU's rank sum is exact for `n < 2^53`. The class sizes come from the
+same exact `f64` target uploaded by `set_fit_data`; `binary_class_sizes`
+verifies the two-run rank shape instead of assuming it, so a three-valued target
+is refused. All-equal targets and constant predictions are exactly `0.5`
+(chance).
+
+**Determinism and waves.** The rank sums are exact `i128` additions, so they do
+not depend on reduction order. The sort statistics depend only on the multiset
+of residuals; ties share one integer and `−0.0` canonicalises to `+0.0` exactly
+like the CPU's `==`. A call is split into device waves by candidate count only
+(`RANK_WAVE_BYTES` is 512 MB, i.e. 64 B/row, so a 2.46 M-row wave holds a few
+candidates); a candidate's value is identical alone, in a batch of 7 and in a
+batch of 447. A test pins batch composition and repetition bit for bit.
+
+**Dispatch gate.** The #287 table `metrics::score_dispatch` is the only
+metric-to-statistic table. `median`, `interquartile`, `rank_correlation`,
+`rank_correlation_signed` and `auc` are `ScoreDispatch::Exact(ScoreStat)` rows;
+`ScoreStat::for_metric` reads that row and nothing else. `maximum` is a
+`ScoreDispatch::Native` objective row (#287), so the search ranks it with the
+objective kernel at any size; `ScoreStat::Maximum` stays as the exact `f64`
+entry of `score_stat_batch` for direct callers and the parity tests. `gpu_blocker`
+names every refusal:
+
+* no scorer for the metric: the table's own reason (for example `slope needs a
+  cross-row first-difference pass`);
+* sample below the measured floor: `order/rank scoring: the sample is below the
+  4096-row device floor`;
+* AUC with a target that is not two-valued: `auc needs a two-valued target`;
+* weighted rows: `weighted rows need a native classification scorer`.
+
+When admitted, `GpuSearch::evaluate_pending_stat` flattens each pending tree with
+`gpu_fit_plan_reason`, scores the whole generation through `score_stat_batch`, and
+runs the bounded CPU fallback pool for trees the flattening cannot represent.
+The flat postfix and overlap-pipeline paths score compiled programs through the
+objective kernel, so they are disabled for these metrics: the run stays on the
+tree scorer rather than being ranked by SSE. A failed device batch returns an
+error, the evaluator is dropped and the generation is re-scored on the CPU, as
+for every other device failure.
+
+**Measurements.** The reproducible paired bench is
+`cargo test --release --features cuda --lib bench_score_batch -- --ignored
+--nocapture` (`RCSR_BENCH_N`, `RCSR_BENCH_P` override the sample/candidates).
+On the RTX 3060 at `N = 100 000`, `P = 8`, one wave and a 6.4 MB wave charge:
+
+| statistic | device s/row/candidate | one-thread exact CPU s/row/candidate |
+|---|---:|---:|
+| `median` | 7.6e-9 | 1.13e-8 (rank-sum reference) |
+| `rank_correlation` | 1.29e-8 (includes the first-call rank prepare) | 1.13e-8 |
+| `rank_correlation_signed` | 9.3e-9 | 1.13e-8 |
+
+Against the search's **8-worker** CPU scorer (ideal ≈ `1.4e-9 s/row`) the
+sort-based path is ≈1× or slower at this size, as report
+`01-native-scoring.md` §5 predicted (≈4.5 s each at `N = 2.456 M`, `P = 447`,
+where a wave holds three candidates). The production radix histogram/select path
+is the follow-up that removes the `2N` sort buffer and the 64 B/row wave; this
+change is the correctness entry point and the dispatch gate, so the run-level
+gain for rank/AUC runs is device residency, not a claimed speed-up. The
+`N = 2.456 M`, `P = 447` cell is reproducible with `RCSR_BENCH_N=2456306
+RCSR_BENCH_P=447` on a device with enough memory.
 
 ### Reported backend and the startup summary
 
@@ -1897,6 +2006,7 @@ substitute for either.
 | Maximum end-to-end (`rcsr --metric maximum --fit-strategy gpu`) | RTX 3060, three seeds, 20k rows (`--fit-iters 8`), 5 generations, pop 60 | **measured on three seeds** — 1.75–4.0× end-to-end (9.38/3.72/8.48 s exact vs 2.36/2.12/2.89 s device), best front error 3.79/3.91/3.66 vs 3.90/3.63/3.42 (trajectory noise, not a quality claim); fit fallbacks 8.6–10.2 %, all `non_finite`/`unsupported_plan`/`ill_conditioned`, zero `maximum_declined`; the fitness is still CPU, so Amdahl caps the gain |
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
+| Exact order/rank **scoring** entry point (#288): median/IQR/maximum/rank/AUC bit-identical to the CPU for the same prediction vector, AUC integer identity and chance cases, non-binary AUC refusal, `+inf` for non-finite predictions, batch-composition/repeat determinism, gate admission and named row-floor refusals | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` `score_batch_*` and `auc_*` tests, `src/search.rs` gate tests) | **verified** (see the #288 section) |
 | `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 | `absolute` paired fit stage and end-to-end quality | RTX 3060, `bench_batched_fit_absolute` and `bench_end_to_end` (`RCSR_BENCH_METRIC=absolute`) | **measured on one workload** — 32.4–35.7× fit stage, no-worse 64/64 at `p=4,8`, 3.55× end-to-end, 6.0 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 
@@ -2072,13 +2182,15 @@ arms, and it is a bit-exact statement about the integer sums, tested on the CPU
   are still declined to the exact CPU arm.
 
 **MSE can never rank.** `GpuSearch::native_metric` is `false` for the rank
-family: `evaluate_pending` compiles no program, so screening and fitness are the
-CPU rank score; the reported `backend` stays `cpu` with the named refusal
-`rank_* needs the exact rank scorer (#288)`. The device's
-squared LM is only the *start* of the polish. A test pins the gate direction
+family, and the run is scored through the exact batch entry point
+(`native_stat`, #288): the same integer statistic that decides the polish also
+scores every candidate (see the #288 section), and the squared LM is only the
+*start* of the polish. A test pins the gate direction
 (`a_signed_rank_proposal_is_accepted_even_when_it_costs_sse`): a proposal that is
 much worse in SSE but perfect in signed ρ is accepted, which an SSE (or `|ρ|`)
-gate would reject.
+gate would reject. `--metric rank_*` below the 4 096-row scoring floor reports
+`cpu` with the named floor reason and scores on the CPU; the fit-only arm may
+still run there.
 
 **`--no-fit`.** `fit_iters = 0` never builds the evaluator (the arm is not
 offered), and `rank_fit_batch(…, 0, …)` returns the incoming constants without a
@@ -2215,12 +2327,13 @@ of ~1.7× and inside the measured never-worse regime — and it is a row count,
 never a timing measurement, so a run is reproducible. `median_fit_cost(n, p,
 sweeps)` exposes the model and a unit test pins the floor and its monotonicity.
 
-**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
-device, single-output unweighted full-sample data, `--fit-iters > 0` and
-`n ≥ 4 096`. It is **fit-only**: the evaluator has no native median scorer, so
-every fitness value is the CPU median, the backend stays `cpu`, and the device
-use is recorded in `gpu.fit` (with `median_declined` among the labelled
-causes). Native median scoring on the device is open; the interquartile arm is
+**When it is used.** The **scoring** arm is the exact device median from
+`n ≥ 4 096` under the same single-output/unweighted/full-sample gates (#288), so
+the backend is `gpu` and the fitness is the configured median. The **fit** polish
+additionally needs `--fit-strategy gpu` and `--fit-iters > 0`; when the fit arm
+is declined, `median_declined` is one of the labelled causes and the exact CPU
+arm refits. Below the scoring floor the exact CPU median runs and records the
+floor reason. The interquartile arm is
 [#232](#interquartile-absolute-error-fitting-issue-232) below.
 
 ## Interquartile absolute error fitting (issue #232)
@@ -2352,12 +2465,12 @@ guarantee is per candidate: the gate never accepts a worse window mean. The
 does not feed the evaluator accounting; the device-time share is the fit stage's
 `fit_ms / wall` (0.23 s / 4.25 s in the 50 000-row cell).
 
-**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
-device, single-output unweighted full-sample data, `--fit-iters > 0` and
-`n ≥ 4 096`. It is **fit-only**: the evaluator has no native interquartile
-scorer, so every fitness value is the CPU window mean, the backend stays `cpu`,
-and the device use is recorded in `gpu.fit` (with `interquartile_declined` among
-the labelled causes).
+**When it is used.** The exact window mean **scores** the population on the
+device from `n ≥ 4 096` (#288), so the backend is `gpu` and the fitness is the
+configured statistic. The **fit** polish additionally needs `--fit-strategy gpu`
+and `--fit-iters > 0`; a declined polish is labelled `interquartile_declined`
+and refit by the exact CPU arm. Below the scoring floor the CPU window mean runs
+with the named floor reason.
 
 ## Maximum absolute error fitting (issue #227)
 
@@ -2503,9 +2616,10 @@ indicative), with best front error 3.90 / 3.63 / 3.42 against 3.79 / 3.91 /
 3.66 — the fit is kept monotone per candidate, but the search trajectory
 differs, so this is not a quality claim. Fallback share is
 8.6–10.2 %, entirely `non_finite`, `unsupported_plan` and `ill_conditioned`;
-zero `maximum_declined` after the mixed-`p` batch fix (below). Because the arm is
-**fit-only**, the fitness evaluation stays on the CPU and Amdahl caps the
-end-to-end gain.
+zero `maximum_declined` after the mixed-`p` batch fix (below). This measurement
+predates #288's native maximum scoring, which removes the CPU fitness pass and
+raises the end-to-end share the arm can recover; the fit stage numbers are
+otherwise unchanged.
 
 **Mixed constant counts.** The driver sends one level/interval vector per
 constant of **each** candidate (`plan.order`), not one per slot of the batch's
@@ -2516,13 +2630,12 @@ in device use. Two tests pin it — a driver test that polishes a `p = 1, 2, 3`
 batch and compares it bit for bit with three single-candidate runs, and a device
 test that requires `status == 0` for every candidate of a mixed batch.
 
-**When it is used.** Only with `--fit-strategy gpu`, a CUDA build, a usable
-device, single-output unweighted full-sample data (a **weighted** maximum has no
-defined objective — `weights_supported` excludes `maximum` — so it is never
-fitted on the device), `--fit-iters > 0` and `n ≥ 512`. It is **fit-only**: the
-evaluator has no native maximum scorer, so every fitness value is the CPU
-maximum, the backend stays `cpu`, and the device use is recorded in `gpu.fit`
-(with `maximum_declined` among the labelled causes). Lawson IRLS on the weighted
+**When it is used.** The **fit** bisection needs `--fit-strategy gpu`, a CUDA build,
+a usable device, single-output unweighted full-sample data (a **weighted**
+maximum has no defined objective — `weights_supported` excludes `maximum` — so it
+is never fitted on the device), `--fit-iters > 0` and `n ≥ 512`. Scoring is
+native through the #287 maximum reducer; a declined call is labelled
+`maximum_declined` and refit by the exact CPU arm. Lawson IRLS on the weighted
 assembly (`minimax-bias.md` §2.3) and native maximum scoring remain open; the
 bisection is the research note's `R1`, which the note recommends first.
 

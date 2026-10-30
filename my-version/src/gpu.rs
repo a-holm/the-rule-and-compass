@@ -1048,6 +1048,108 @@ fn opcode_name(op: u32) -> &'static str {
         .unwrap_or("OP_UNKNOWN")
 }
 
+pub use crate::metrics::ScoreStat;
+
+/// #288: the binary class sizes of `y` under the metric's label rule, or
+/// `None` when `y` is not two-valued.
+///
+/// The engine's classification metrics label a row positive when
+/// `y > (min + max)/2` ([`crate::metrics::auc`]). For a two-valued target that
+/// is exactly "the larger value"; the target's exact doubled centred ranks
+/// then have only two values, `nneg` on the positives and `−npos` on the
+/// negatives. This helper verifies that structure instead of assuming it, so a
+/// multi-valued target can never be scored with a made-up label mask. A
+/// single-valued target returns `Some((0, 0))` — chance, exactly like the CPU.
+fn binary_class_sizes(y: &[f64]) -> Option<(usize, usize)> {
+    let target = crate::metrics::RankTarget::new(y)?;
+    let n = y.len();
+    let mut npos = 0usize;
+    let mut nneg = 0usize;
+    for &b in target.ranks() {
+        if b > 0 {
+            npos += 1;
+        } else if b < 0 {
+            nneg += 1;
+        }
+    }
+    if npos == 0 && nneg == 0 {
+        return Some((0, 0));
+    }
+    if npos == 0 || nneg == 0 || npos + nneg != n {
+        return None;
+    }
+    for &b in target.ranks() {
+        let want = if b > 0 {
+            nneg as i64
+        } else if b < 0 {
+            -(npos as i64)
+        } else {
+            return None;
+        };
+        if b != want {
+            return None;
+        }
+    }
+    Some((npos, nneg))
+}
+
+/// #288: the exact `1 − AUC` (the configured metric) from the integer rank
+/// sums.
+///
+/// With `A_i = 2r_i − (n+1)` the device returns `Σ A_i B_i`, where a
+/// two-valued target's `B` is `nneg` on the positives and `−npos` on the
+/// negatives. Hence `Σ_pos A_i = Σ A_i B_i / n` exactly, and
+///
+/// ```text
+/// U     = (Σ_pos A_i + npos·nneg) / 2
+/// AUC   = U / (npos·nneg)
+/// error = 1 − AUC
+/// ```
+///
+/// Both numerator and denominator are exact integers, so this performs the
+/// same single `f64` division and subtraction as [`crate::metrics::auc`] and
+/// returns the same bits for the same prediction vector (the CPU's rank sum is
+/// exact for any realistic `n < 2^53`). A single-class target is exactly `0.5`
+/// (chance), like the CPU. `None` means "decline": the target's rank sums do
+/// not have the two-class shape this derivation requires.
+fn auc_error_from_rank_sums(
+    sums: crate::metrics::RankSums,
+    n: usize,
+    classes: (usize, usize),
+) -> Option<f64> {
+    let (npos, nneg) = classes;
+    if n == 0 || npos.checked_add(nneg)? > n {
+        return None;
+    }
+    if npos == 0 || nneg == 0 {
+        // A single-class target is chance, exactly like the CPU (0.5 error).
+        return Some(0.5);
+    }
+    let pairs = (npos as i128) * (nneg as i128);
+    // `Σ B² = npos·nneg·n` is a fingerprint of the two-run target B; if it
+    // does not match, the cached ranks are not the label mask and AUC would be
+    // wrong. Declining sends the run to the CPU, never to a fabricated value.
+    if sums.bb != pairs * n as i128 {
+        return None;
+    }
+    let n_i = n as i128;
+    if sums.ab % n_i != 0 {
+        return None;
+    }
+    let pos_a = sums.ab / n_i;
+    // `U` need not be an integer: with average ranks a tied positive/negative
+    // pair contributes exactly one half, so `2U` may be odd (a constant
+    // prediction on an odd `npos·nneg` gives `U = npos·nneg/2`). Both the
+    // integer and the half-integer are exact in f64, so the division below is
+    // still the CPU's single correctly-rounded operation.
+    let two_u = pos_a + pairs;
+    let auc = (two_u as f64 / 2.0) / pairs as f64;
+    // The same two operations as `metrics::score(.., Metric::Auc)`:
+    // `1.0 - auc`. Keeping them here (rather than returning AUC) is what makes
+    // the value bit-identical to the configured error.
+    Some(1.0 - auc)
+}
+
 /// A resident GPU evaluator: the dataset is uploaded once, then many batches of
 /// candidates can be scored without further host↔device traffic for the data.
 pub struct GpuEvaluator {
@@ -1071,6 +1173,12 @@ pub struct GpuEvaluator {
     /// #229: the legacy SSE objective. The search's native scoring path uses
     /// [`crate::metrics::ScoreObjective`] via `score_pool` (#287).
     loss: crate::fit::DeviceLoss,
+    /// #288: the target's binary class sizes, cached from the exact `f64`
+    /// target in [`Self::set_fit_data`]. `Some((0, 0))` is a single-class
+    /// target (AUC is chance); `None` means the target is not two-valued, so a
+    /// native AUC score is declined rather than computed from a wrong label
+    /// mask. Unused by the order and rank-correlation statistics.
+    target_classes: Option<(usize, usize)>,
 }
 
 impl GpuEvaluator {
@@ -1090,6 +1198,7 @@ impl GpuEvaluator {
                 run_start: std::time::Instant::now(),
                 ledger: crate::gpu_stats::RunLedger::new(),
                 loss: crate::fit::DeviceLoss::Squared,
+                target_classes: None,
             })
         }
     }
@@ -1119,7 +1228,25 @@ impl GpuEvaluator {
     /// same weights) it will verify the proposals on.
     pub fn set_fit_data(&mut self, cols: &[f64], y: &[f64], w: &[f64]) -> bool {
         let wp = if w.is_empty() { std::ptr::null() } else { w.as_ptr() };
-        unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 }
+        let ok = unsafe { rc_set_fit_data(self.ctx, cols.as_ptr(), y.as_ptr(), wp) == 0 };
+        if ok && y.len() as u64 == self.n_rows {
+            // #288: cache the binary class sizes from the same exact `f64`
+            // target the rank stage caches `B` from, so a native AUC uses one
+            // label rule (the midpoint over the observed extremes) for the
+            // whole run. A multi-valued target declines instead of guessing.
+            self.target_classes = binary_class_sizes(y);
+        } else if ok {
+            self.target_classes = None;
+        }
+        ok
+    }
+
+    /// #288: the target class sizes a native AUC would use, or `None` when the
+    /// exact target staged in [`Self::set_fit_data`] is not two-valued.
+    /// Test-only: the search sets the target once and never reads it back.
+    #[cfg(test)]
+    pub(crate) fn auc_classes(&self) -> Option<(usize, usize)> {
+        self.target_classes
     }
 
     /// #234/#289: upload the per-row label sign `t = 2·l − 1`, with `l` from
@@ -2442,6 +2569,95 @@ impl GpuEvaluator {
             };
         }
         Some(out)
+    }
+
+    /// #288: score a batch of **arbitrary candidates** with one exact
+    /// order-statistic or rank statistic.
+    ///
+    /// `plans[k]` is candidate `k`'s flattened program and `constants[k]` its
+    /// constant values in slot order. The device predicts every row in exact
+    /// `f64`, then computes the configured statistic:
+    ///
+    /// * `Median` / `Interquartile`: the exact order statistic of `|r|` used by
+    ///   the fit arms (#226/#232);
+    /// * `Maximum`: the exact order-free `max |r|` scan (#227);
+    /// * `RankCorrelation` / `RankCorrelationSigned`: the exact integer rank
+    ///   sums of #230 mapped to `1 − |ρ|` / `1 − ρ`;
+    /// * `Auc`: the same integer sums interpreted as the Mann–Whitney `U`
+    ///   statistic and reported as `1 − AUC` ([`auc_error_from_rank_sums`]).
+    ///
+    /// Returns `None` when the device declines the call as a whole (bad
+    /// shape, allocation or launch failure, or an AUC target that is not
+    /// two-valued). A candidate whose prediction is not finite is returned as
+    /// `Some(None)`, which the search maps to `+inf` — exactly what the CPU
+    /// scorer does, never a finite sentinel. The split into waves is by
+    /// candidate only; every value is independent of the batch composition.
+    pub(crate) fn score_stat_batch(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        constants: &[Vec<f64>],
+        stat: ScoreStat,
+    ) -> Option<Vec<Option<f64>>> {
+        if plans.is_empty() || plans.len() != constants.len() {
+            return None;
+        }
+        if self.n_rows < 2 {
+            return None;
+        }
+        let n = self.n_rows as usize;
+        let trials: Vec<Vec<Vec<f64>>> = constants.iter().map(|c| vec![c.clone()]).collect();
+        let per_set = |v: Vec<Vec<Option<f64>>>| -> Option<Vec<Option<f64>>> {
+            if v.len() != plans.len() {
+                return None;
+            }
+            Some(v.into_iter().map(|mut t| t.drain(..).next().flatten()).collect())
+        };
+        match stat {
+            ScoreStat::Median | ScoreStat::Interquartile => {
+                let want = crate::fit::OrderStat::for_metric(stat.metric())
+                    .expect("an order statistic maps to an OrderStat");
+                per_set(self.order_stat_score_trials(plans, &trials, want)?)
+            }
+            ScoreStat::Maximum => {
+                let raw = self.max_score_trials(plans, &trials)?;
+                if raw.len() != plans.len() {
+                    return None;
+                }
+                Some(
+                    raw.into_iter()
+                        .map(|mut t| t.drain(..).next().flatten().map(|s| s.value))
+                        .collect(),
+                )
+            }
+            ScoreStat::RankCorrelation | ScoreStat::RankCorrelationSigned => {
+                let signed = stat == ScoreStat::RankCorrelationSigned;
+                let sums = self.rank_score_trials(plans, &trials)?;
+                Some(
+                    sums.into_iter()
+                        .map(|mut t| {
+                            t.drain(..).next().flatten().map(|s| {
+                                crate::metrics::score_rank_sums(Some(s), signed)
+                            })
+                        })
+                        .collect(),
+                )
+            }
+            ScoreStat::Auc => {
+                let classes = self.target_classes?;
+                let sums = self.rank_score_trials(plans, &trials)?;
+                let mut out = Vec::with_capacity(sums.len());
+                for mut t in sums {
+                    match t.drain(..).next().flatten() {
+                        // A non-finite prediction is unusable, like the CPU.
+                        None => out.push(None),
+                        // A target that is not the two-class shape this
+                        // derivation proves: decline the whole call.
+                        Some(s) => out.push(Some(auc_error_from_rank_sums(s, n, classes)?)),
+                    }
+                }
+                Some(out)
+            }
+        }
     }
 
     /// #227: the exact level-interval test for one coordinate per candidate.
@@ -6415,6 +6631,229 @@ mod rank_tests {
         );
     }
 
+    /// #288: one batch entry point scores every exact order/rank statistic,
+    /// bit-identically to the CPU for the same `f64` prediction vector.
+    #[test]
+    fn score_batch_matches_the_cpu_for_every_statistic() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let target = RankTarget::new(&f.y).unwrap();
+        for t in [linear(), tied(), flat()] {
+            let p = plan(&t);
+            let pred = cpu_pred(&f, &t);
+            let constants = vec![p.c0.clone()];
+            for stat in [ScoreStat::Median, ScoreStat::Maximum] {
+                let got = ev
+                    .score_stat_batch(&[&p], &constants, stat)
+                    .expect("device stat call")[0]
+                    .expect("a finite segment");
+                let want = crate::metrics::score(&pred, &f.y, stat.metric());
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{} differs: {got} vs {want}",
+                    stat.name()
+                );
+            }
+            // The interquartile mean is T2: a fixed 256-thread tree reduction
+            // against the CPU's left-to-right mean, so it agrees to f64
+            // rounding rather than bit for bit (the fit arm's documented
+            // contract, 1e-12 relative).
+            let got = ev
+                .score_stat_batch(&[&p], &constants, ScoreStat::Interquartile)
+                .expect("device stat call")[0]
+                .expect("a finite segment");
+            let want = crate::metrics::score(&pred, &f.y, Metric::Interquartile);
+            assert!(
+                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
+                "interquartile differs: {got} vs {want}"
+            );
+            for (stat, signed) in [
+                (ScoreStat::RankCorrelation, false),
+                (ScoreStat::RankCorrelationSigned, true),
+            ] {
+                let got = ev
+                    .score_stat_batch(&[&p], &constants, stat)
+                    .expect("device rank call")[0]
+                    .expect("a finite segment");
+                let want = target.score(&pred, signed);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{} differs: {got} vs {want}",
+                    stat.name()
+                );
+            }
+        }
+    }
+
+    /// #288: AUC is the exact integer rank (Mann–Whitney) statistic: it is
+    /// bit-identical to the CPU for the same prediction vector, all-equal
+    /// targets are chance, and a tied pair contributes exactly one half.
+    #[test]
+    fn score_batch_auc_is_exact_and_matches_the_cpu() {
+        let mut f = fixture(90);
+        // Two-valued target: every third row positive. The midpoint rule then
+        // labels exactly these rows, and the rank stage's B is the label mask.
+        for (i, y) in f.y.iter_mut().enumerate() {
+            *y = if i % 3 == 0 { 1.0 } else { -1.0 };
+        }
+        f.y32 = f.y.iter().map(|&v| v as f32).collect();
+        let Some(mut ev) = evaluator(&f) else { return };
+        let (npos, nneg) = ev.auc_classes().expect("a two-valued target");
+        assert_eq!(npos + nneg, f.n);
+        assert_eq!(npos, f.n.div_ceil(3));
+        for t in [linear(), tied(), flat()] {
+            let p = plan(&t);
+            let pred = cpu_pred(&f, &t);
+            let got = ev
+                .score_stat_batch(&[&p], &[p.c0.clone()], ScoreStat::Auc)
+                .expect("device AUC call")[0]
+                .expect("a finite segment");
+            let want = crate::metrics::score(&pred, &f.y, Metric::Auc);
+            assert_eq!(got.to_bits(), want.to_bits(), "AUC differs: {got} vs {want}");
+        }
+        // One positive and one negative with the same prediction: the pair is
+        // a tie, so U = 1/2 and the error 1 − AUC = 1/2 exactly.
+        let tie = node(Op::Mul, vec![constant(0.0), input(0)]);
+        let p = plan(&tie);
+        let got = ev.score_stat_batch(&[&p], &[p.c0.clone()], ScoreStat::Auc).unwrap()[0].unwrap();
+        assert_eq!(got, 0.5, "a constant prediction must be exactly chance");
+        // A single-class target has no positive/negative pair: chance, never
+        // 0/0.
+        let mut one = fixture(24);
+        one.y.iter_mut().for_each(|y| *y = 2.0);
+        one.y32 = one.y.iter().map(|&v| v as f32).collect();
+        let Some(mut ev1) = evaluator(&one) else { return };
+        let p = plan(&linear());
+        assert_eq!(ev1.auc_classes(), Some((0, 0)));
+        let got = ev1
+            .score_stat_batch(&[&p], &[p.c0.clone()], ScoreStat::Auc)
+            .expect("single-class AUC")[0]
+            .expect("chance");
+        assert_eq!(got, 0.5);
+    }
+
+    /// #288: ties make `U` a half-integer, not only an integer. A constant
+/// prediction over an odd `npos·nneg` is the smallest case: every pair is a
+/// tie and `1 − AUC` is exactly `0.5`, matching the CPU bit for bit.
+#[test]
+fn auc_handles_an_odd_number_of_positive_negative_pairs() {
+    let y = [1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, -1.0];
+    let pred = vec![0.0; y.len()];
+    let target = RankTarget::new(&y).expect("finite target");
+    let classes = binary_class_sizes(&y).expect("two classes");
+    assert_eq!(classes, (3, 5));
+    let got = auc_error_from_rank_sums(
+        target.sums(&pred).expect("cpu sums"),
+        y.len(),
+        classes,
+    )
+    .expect("the odd pair count is valid");
+    assert_eq!(got, 0.5);
+    assert_eq!(
+        got.to_bits(),
+        crate::metrics::score(&pred, &y, Metric::Auc).to_bits()
+    );
+}
+
+/// #288: the label rule is verified, not assumed. A target with three
+    /// distinct values or a non-finite row has no two-class rank shape, so a
+    /// native AUC declines instead of scoring a fabricated label mask.
+    #[test]
+    fn auc_declines_a_target_that_is_not_binary() {
+        assert_eq!(binary_class_sizes(&[0.0, 1.0]), Some((1, 1)));
+        assert_eq!(binary_class_sizes(&[1.0, 1.0]), Some((0, 0)));
+        assert_eq!(binary_class_sizes(&[0.0, 1.0, 2.0]), None);
+        assert_eq!(binary_class_sizes(&[0.0, f64::NAN]), None);
+        let mut f = fixture(24);
+        for (i, y) in f.y.iter_mut().enumerate() {
+            *y = [0.0, 1.0, 2.0][i % 3];
+        }
+        f.y32 = f.y.iter().map(|&v| v as f32).collect();
+        let Some(mut ev) = evaluator(&f) else { return };
+        assert_eq!(ev.auc_classes(), None);
+        let p = plan(&linear());
+        assert_eq!(
+            ev.score_stat_batch(&[&p], &[p.c0.clone()], ScoreStat::Auc),
+            None,
+            "a three-valued target must decline the native AUC"
+        );
+    }
+
+    /// #288: batch composition and repetition cannot change a statistic, and a
+    /// constant prediction is exactly `1.0` for the rank family (never NaN).
+    #[test]
+    fn score_batch_is_batch_composition_independent() {
+        let f = fixture(80);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let trees = [linear(), tied(), flat()];
+        let plans: Vec<_> = trees.iter().map(plan).collect();
+        let constants: Vec<_> = plans.iter().map(|p| p.c0.clone()).collect();
+        for stat in [
+            ScoreStat::Median,
+            ScoreStat::Interquartile,
+            ScoreStat::Maximum,
+            ScoreStat::RankCorrelation,
+            ScoreStat::RankCorrelationSigned,
+        ] {
+            let alone = ev
+                .score_stat_batch(&[&plans[0]], &constants[..1], stat)
+                .expect("single call");
+            let batched = ev
+                .score_stat_batch(&plans.iter().collect::<Vec<_>>(), &constants, stat)
+                .expect("batched call");
+            let again = ev
+                .score_stat_batch(&plans.iter().collect::<Vec<_>>(), &constants, stat)
+                .expect("repeat call");
+            assert_eq!(
+                alone[0].map(f64::to_bits),
+                batched[0].map(f64::to_bits),
+                "{} changed with batch composition",
+                stat.name()
+            );
+            assert_eq!(
+                batched.iter().map(|v| v.map(f64::to_bits)).collect::<Vec<_>>(),
+                again.iter().map(|v| v.map(f64::to_bits)).collect::<Vec<_>>(),
+                "{} is not deterministic",
+                stat.name()
+            );
+            if stat.is_rank() {
+                // flat() is a constant prediction: rho is 0 by the CPU rule.
+                let flat = batched[2].expect("a finite segment");
+                assert_eq!(flat, 1.0);
+            }
+        }
+    }
+
+    /// #288: a non-finite prediction is `None` (the caller's `+inf`) for every
+    /// statistic, exactly like the CPU scorer; never a finite sentinel.
+    #[test]
+    fn score_batch_non_finite_predictions_are_unusable() {
+        let f = fixture(24);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let bad = node(
+            Op::Ln,
+            vec![node(
+                Op::Mul,
+                vec![constant(-1.0), node(Op::Add, vec![input(0), constant(1.0)])],
+            )],
+        );
+        let p = plan(&bad);
+        let pred = cpu_pred(&f, &bad);
+        assert!(pred.iter().any(|v| !v.is_finite()), "the fixture is non-finite");
+        for stat in [
+            ScoreStat::Median,
+            ScoreStat::Interquartile,
+            ScoreStat::Maximum,
+            ScoreStat::RankCorrelation,
+            ScoreStat::RankCorrelationSigned,
+        ] {
+            let got = ev.score_stat_batch(&[&p], &[p.c0.clone()], stat).expect("a call");
+            assert_eq!(got, vec![None], "{} fabricated a finite value", stat.name());
+        }
+    }
+
     /// A tree whose prediction is not finite is reported, not scored: the
     /// caller refits it on the CPU and labels the fallback.
     #[test]
@@ -6434,6 +6873,112 @@ mod rank_tests {
         assert!(res[0][0].is_none(), "a non-finite prediction must not be scored");
         let target = RankTarget::new(&f.y).unwrap();
         assert_eq!(score_of(res[0][0], &target, false), f64::INFINITY);
+    }
+}
+
+/// #288: paired sort-based scoring measurement.
+///
+/// Run with
+/// `cargo test --release --features cuda --lib bench_score_batch -- --ignored --nocapture`.
+/// `RCSR_BENCH_N` (default 100 000) and `RCSR_BENCH_P` (default 8) override the
+/// sample and candidate count. Prints ns/row for the exact CPU rank statistic,
+/// the device rank/median/AUC scorer, the wave count and the device temp bytes
+/// implied by `RANK_WAVE_BYTES`. The 2.456 M-row, `P = 447` cell of the issue is
+/// reproducible with `RCSR_BENCH_N=2456306 RCSR_BENCH_P=447` on a device with
+/// enough memory; it is kept out of the default suite because a wave allocates
+/// `64 B/row`.
+#[cfg(test)]
+mod score_batch_bench {
+    use super::*;
+    use crate::fit::gpu_fit_plan_reason;
+    use crate::metrics::RankTarget;
+
+    fn fixture(n: usize) -> (Vec<f32>, Vec<f64>, usize, Vec<f32>, Vec<f64>, Vec<Vec<f64>>) {
+        let nv = 2;
+        let (mut c32, mut c64) = (vec![0.0f32; nv * n], vec![0.0f64; nv * n]);
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for i in 0..n {
+            let t = -3.0 + 6.0 * i as f64 / (n - 1) as f64;
+            let v = 1.7 * (0.9 * t).sin() + 0.4 * t - 0.2;
+            x.push(vec![t, 0.5 * t]);
+            y.push(v);
+            c32[i] = t as f32;
+            c32[n + i] = (0.5 * t) as f32;
+            c64[i] = t;
+            c64[n + i] = 0.5 * t;
+        }
+        let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+        (c32, c64, nv, y32, y, x)
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_score_batch() {
+        let n: usize = std::env::var("RCSR_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let p: usize = std::env::var("RCSR_BENCH_P")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let (c32, c64, nv, y32, y, x) = fixture(n);
+        let Some(mut ev) = GpuEvaluator::new(&c32, n, nv, &y32) else {
+            eprintln!("skipping GPU measurement: no usable CUDA device");
+            return;
+        };
+        assert!(ev.set_fit_data(&c64, &y, &[]), "f64 data upload");
+        let tree = crate::expr::node(
+            Op::Add,
+            vec![
+                crate::expr::node(
+                    Op::Mul,
+                    vec![crate::expr::constant(0.8), crate::expr::input(0)],
+                ),
+                crate::expr::constant(0.1),
+            ],
+        );
+        let plan = gpu_fit_plan_reason(&tree).expect("an eligible plan");
+        let constants: Vec<Vec<f64>> = (0..p)
+            .map(|k| {
+                let mut c = plan.c0.clone();
+                c[0] *= 1.0 + 0.001 * (k as f64 + 1.0);
+                c
+            })
+            .collect();
+        let refs: Vec<&crate::fit::GpuFitPlan> = (0..p).map(|_| &plan).collect();
+        let pred: Vec<f64> = x.iter().map(|r| crate::expr::eval(&tree, r)).collect();
+        let target = RankTarget::new(&y).expect("finite target");
+        let cpu_start = std::time::Instant::now();
+        for _ in 0..p {
+            let _ = target.sums(&pred).expect("cpu sums");
+        }
+        let cpu_s = cpu_start.elapsed().as_secs_f64();
+        let per_seg = (n as u64).saturating_mul(64).saturating_add(1 << 20);
+        let wave_sets = (GpuEvaluator::RANK_WAVE_BYTES / per_seg.max(1)).max(1) as usize;
+        for stat in [
+            ScoreStat::Median,
+            ScoreStat::RankCorrelation,
+            ScoreStat::RankCorrelationSigned,
+        ] {
+            let start = std::time::Instant::now();
+            let out = ev
+                .score_stat_batch(&refs, &constants, stat)
+                .expect("the device scored the batch");
+            let s = start.elapsed().as_secs_f64();
+            assert_eq!(out.len(), p);
+            eprintln!(
+                "{}: N={n} P={p} device={:.3} ms ({:.3e} s/row/cand) cpu_rank={:.3} ms ({:.3e} s/row/cand) waves={} wave_charge~{:.1} MB",
+                stat.name(),
+                s * 1000.0,
+                s / (n as f64 * p as f64),
+                cpu_s * 1000.0,
+                cpu_s / (n as f64 * p as f64),
+                p.div_ceil(wave_sets),
+                (n as f64 * 64.0 * p.min(wave_sets) as f64) / (1024.0 * 1024.0)
+            );
+        }
     }
 }
 

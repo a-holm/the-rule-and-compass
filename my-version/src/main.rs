@@ -435,22 +435,24 @@ SEARCH:
                              scores log_loss natively on the device), or — for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
-                             (#230; fit-only, the fitness stays on the CPU), with
-                             rank_correlation_signed scored as 1-rho so a
-                             reflected model is rejected and nothing is judged
-                             on SSE or |rho| (#231);
+                             (#230), with rank_correlation_signed scored as
+                             1-rho so a reflected model is rejected and nothing
+                             is judged on SSE or |rho| (#231);
                              for median, the exact f64 median polish (segmented
                              sort of the residual bits, first-improver ladder,
-                             #226; fit-only, and only for >= 4096 training
-                             rows, the measured crossover) and for
-                             interquartile the same sort averaging ranks
-                             [n/4, 3n/4) of |r| (#232; fit-only, same row
+                             #226; only for >= 4096 training rows, the measured
+                             crossover) and for interquartile the same sort
+                             averaging ranks [n/4, 3n/4) of |r| (#232; same row
                              floor); for maximum (Chebyshev), the exact
                              one-dimensional minimiser per constant by
                              bisection on the error level (at most 32 rounds,
-                             no step ladder and no optimiser, #227; fit-only,
-                             from >= 512 training rows, the measured cost-model
-                             floor). Without a batch backend it uses the exact
+                             no step ladder and no optimiser, #227; from
+                             >= 512 training rows, the measured cost-model
+                             floor). median, interquartile, rank_correlation(_signed)
+                             and auc also score every candidate natively from
+                             4096 rows (#288) and maximum through the #287
+                             objective kernel, so the fitness is the
+                             configured objective, never a proxy. Without a batch backend it uses the exact
                              CPU arms (never a no-op).
                              The device refuses any other metric instead of
                              substituting an objective: use
@@ -503,16 +505,21 @@ SEARCH:
                              --features cuda or no device is present. Without
                              --gpu/--cpu, a CUDA build with a usable device uses
                              the GPU automatically when the #287 score table
-                             names a native objective: squared, absolute,
+                             names a native scorer: squared, absolute,
                              log_squashed, signed, maximum, correlation,
-                             correlation_signed and aic/aicc/bic. Every other
+                             correlation_signed, aic/aicc/bic and the
+                             classification family through the objective
+                             kernel, and median, interquartile,
+                             rank_correlation, rank_correlation_signed and auc
+                             through the exact f64 order-statistic/rank batch
+                             scorer (#288) from 4096 rows (a two-valued target
+                             for AUC); those statistics are bit-identical to
+                             the CPU for the same prediction vector. Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be
                              fitted on the device (the rank, median,
-                             interquartile and log_loss arms are fit-only
-                             because no native score exists yet; maximum fits
-                             and scores natively).
+                             interquartile, maximum and log_loss arms).
                              Reported errors stay CPU f64. Cross-backend runs
                              are not bit-identical because f32 fitness can
                              change the trajectory. JSON reports the measured

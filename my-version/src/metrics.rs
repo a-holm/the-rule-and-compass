@@ -423,6 +423,9 @@ impl ScoreObjective {
 pub enum ScoreDispatch {
     /// A native one-pass/two-pass statistic.
     Native(ScoreObjective),
+    /// #288: an exact `f64` order-statistic or rank statistic scored through
+    /// the plan batch entry point (flattened plans, sorted residual bits).
+    Exact(ScoreStat),
     /// No native scorer in this issue; the name says why.
     Refused(&'static str),
 }
@@ -432,16 +435,125 @@ impl ScoreDispatch {
     pub fn objective(self) -> Option<ScoreObjective> {
         match self {
             ScoreDispatch::Native(o) => Some(o),
-            ScoreDispatch::Refused(_) => None,
+            ScoreDispatch::Exact(_) | ScoreDispatch::Refused(_) => None,
+        }
+    }
+
+    /// #288: the exact order/rank statistic, or `None`.
+    pub fn stat(self) -> Option<ScoreStat> {
+        match self {
+            ScoreDispatch::Exact(s) => Some(s),
+            ScoreDispatch::Native(_) | ScoreDispatch::Refused(_) => None,
         }
     }
 
     /// The refusal reason, or `None` for a native metric.
     pub fn refusal(self) -> Option<&'static str> {
         match self {
-            ScoreDispatch::Native(_) => None,
+            ScoreDispatch::Native(_) | ScoreDispatch::Exact(_) => None,
             ScoreDispatch::Refused(reason) => Some(reason),
         }
+    }
+}
+
+/// #288: an exact order-statistic or rank statistic the device can score
+/// natively.
+///
+/// This is the **scoring** counterpart of [`crate::fit::DeviceLoss`] and
+/// [`crate::fit::OrderStat`]: it names the statistic a batch of *arbitrary*
+/// candidates is ranked on, not the objective a fit arm moves constants
+/// against. Every member is computed from the exact `f64` forward pass over the
+/// resident rows, so a value depends only on the candidate's prediction vector
+/// and the target, never on the batch it was scored in, the wave split, or the
+/// number of islands.
+///
+/// The statistics split into two families:
+///
+/// * **order** — `median`, `interquartile` and `maximum` of `|pred − y|`. The
+///   first two are the segmented sort/pick already used by the fit arms; the
+///   maximum is the order-free integer max scan. All three are bit-identical to
+///   the CPU statistic for the same prediction vector.
+/// * **rank** — `rank_correlation(_signed)` and `auc`. Both are exact integer
+///   sums over average ranks (`A_i = 2r_i − (n+1)`); the only floating-point
+///   operations are the final divide (and square root for rho), so ties share
+///   one integer and `−0.0`/`+0.0` are one tie exactly like the CPU's `==`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreStat {
+    /// Median of `|pred − y|`; even `n` averages the two middle values.
+    Median,
+    /// Mean of `|pred − y|` over the sorted ranks `[⌊n/4⌋, ⌊3n/4⌋)`.
+    Interquartile,
+    /// Exact `max |pred − y|` (lowest-row tie, order-free).
+    Maximum,
+    /// `1 − |ρ_s|` from exact integer rank sums.
+    RankCorrelation,
+    /// `1 − ρ_s` from exact integer rank sums.
+    RankCorrelationSigned,
+    /// `1 − AUC`, the rank (Mann–Whitney U) form of the area under the ROC.
+    Auc,
+}
+
+impl ScoreStat {
+    /// The exact statistic the [`score_dispatch`] table names for a metric, or
+    /// `None` when the table scores it with the objective kernel or refuses it.
+    pub fn for_metric(metric: Metric) -> Option<Self> {
+        score_dispatch(metric).stat()
+    }
+
+    /// The configured CPU metric this statistic is the definition of.
+    pub fn metric(self) -> Metric {
+        match self {
+            ScoreStat::Median => Metric::Median,
+            ScoreStat::Interquartile => Metric::Interquartile,
+            ScoreStat::Maximum => Metric::Maximum,
+            ScoreStat::RankCorrelation => Metric::RankCorrelation,
+            ScoreStat::RankCorrelationSigned => Metric::RankCorrelationSigned,
+            ScoreStat::Auc => Metric::Auc,
+        }
+    }
+
+    /// Stable name for the ledger, the schema text and the fallback reason.
+    pub fn name(self) -> &'static str {
+        self.metric().name()
+    }
+
+    /// The measured minimum training-row count below which the exact CPU
+    /// statistic is cheaper than the device launch and sort.
+    ///
+    /// The sort-based statistics reuse the fit arms' measured floor
+    /// ([`crate::fit::MEDIAN_GPU_MIN_ROWS`] = 4096 rows); the order-free
+    /// maximum uses its own 512-row floor
+    /// ([`crate::fit::MAXIMUM_GPU_MIN_ROWS`]). The rank family is sort-based
+    /// too, so it shares 4096. Below the floor the run keeps the CPU scorer and
+    /// records this reason; the device may still fit constants through the
+    /// fit-only arm.
+    pub fn min_rows(self) -> usize {
+        match self {
+            ScoreStat::Maximum => crate::fit::MAXIMUM_GPU_MIN_ROWS,
+            ScoreStat::Median
+            | ScoreStat::Interquartile
+            | ScoreStat::RankCorrelation
+            | ScoreStat::RankCorrelationSigned
+            | ScoreStat::Auc => crate::fit::MEDIAN_GPU_MIN_ROWS,
+        }
+    }
+
+    /// The `'static` refusal used when the sample is below [`Self::min_rows`].
+    pub fn small_sample_reason(self) -> &'static str {
+        match self {
+            ScoreStat::Maximum => {
+                "maximum scoring: the sample is below the 512-row device floor"
+            }
+            _ => "order/rank scoring: the sample is below the 4096-row device floor",
+        }
+    }
+
+    /// True for the two Spearman statistics.
+    pub fn is_rank(self) -> bool {
+        matches!(
+            self,
+            ScoreStat::RankCorrelation | ScoreStat::RankCorrelationSigned
+        )
     }
 }
 
@@ -471,18 +583,10 @@ pub fn score_dispatch(m: Metric) -> ScoreDispatch {
         Hinge => ScoreDispatch::Native(O::HingeSigmoid),
         HingeOrdinary => ScoreDispatch::Native(O::HingeOrdinary),
         HingeSquared => ScoreDispatch::Native(O::HingeSquared),
-        Median => ScoreDispatch::Refused(
-            "median needs the exact order-statistic scorer (#288)",
-        ),
-        Interquartile => ScoreDispatch::Refused(
-            "interquartile needs the exact order-statistic scorer (#288)",
-        ),
-        RankCorrelation => ScoreDispatch::Refused(
-            "rank_correlation needs the exact rank scorer (#288)",
-        ),
-        RankCorrelationSigned => ScoreDispatch::Refused(
-            "rank_correlation_signed needs the exact rank scorer (#288)",
-        ),
+        Median => ScoreDispatch::Exact(ScoreStat::Median),
+        Interquartile => ScoreDispatch::Exact(ScoreStat::Interquartile),
+        RankCorrelation => ScoreDispatch::Exact(ScoreStat::RankCorrelation),
+        RankCorrelationSigned => ScoreDispatch::Exact(ScoreStat::RankCorrelationSigned),
         Slope => ScoreDispatch::Refused(
             "slope needs a cross-row first-difference pass",
         ),
@@ -492,9 +596,7 @@ pub fn score_dispatch(m: Metric) -> ScoreDispatch {
         ImplicitResidual => ScoreDispatch::Refused(
             "implicit_residual needs implicit samples on the device",
         ),
-        Auc => ScoreDispatch::Refused(
-            "auc needs the exact rank scorer with labels (#288)",
-        ),
+        Auc => ScoreDispatch::Exact(ScoreStat::Auc),
     }
 }
 
@@ -2183,6 +2285,12 @@ mod tests {
                     assert_eq!(ScoreObjective::from_code(o.code()), Some(o));
                     assert!(score_refusal(*metric).is_none());
                 }
+                ScoreDispatch::Exact(s) => {
+                    assert_eq!(s.metric(), *metric);
+                    assert_eq!(ScoreStat::for_metric(*metric), Some(s));
+                    assert!(native_score_objective(*metric).is_none());
+                    assert!(score_refusal(*metric).is_none());
+                }
                 ScoreDispatch::Refused(reason) => {
                     assert!(!reason.is_empty(), "{} has an empty refusal", metric.name());
                     assert!(reason.contains(metric.name()) || metric.name().contains("implicit"),
@@ -2217,12 +2325,22 @@ mod tests {
                 "bic",
             ]
         );
+        let exact: Vec<&str> = Metric::all()
+            .iter()
+            .filter(|m| ScoreStat::for_metric(**m).is_some())
+            .map(|m| m.name())
+            .collect();
+        assert_eq!(
+            exact,
+            ["median", "rank_correlation", "rank_correlation_signed", "interquartile", "auc"]
+        );
         // An unhandled metric must be a hard failure, never an MSE fallback.
         assert_eq!(
             score_refusal(Metric::Slope).unwrap(),
             "slope needs a cross-row first-difference pass"
         );
         assert_eq!(score_dispatch(Metric::Auc).objective(), None);
+        assert_eq!(score_dispatch(Metric::Maximum).stat(), None);
     }
 
     /// T1/T2 parity between the native reducer and the historical CPU metric,
