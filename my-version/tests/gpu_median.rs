@@ -114,7 +114,12 @@ fn median_gpu_scoring_respects_the_measured_row_floor() {
         metric: Metric::Median,
         ..Default::default()
     };
-    assert_eq!(search::effective_backend(&cfg, &big), Backend::Gpu);
+    let expected = if cfg!(feature = "cuda") {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), expected);
 }
 
 /// #226: the cost model keeps a small sample on the exact CPU median arm and

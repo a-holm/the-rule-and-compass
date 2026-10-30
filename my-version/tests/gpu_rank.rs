@@ -124,7 +124,12 @@ fn rank_gpu_scoring_respects_the_measured_row_floor() {
             metric,
             ..Default::default()
         };
-        assert_eq!(search::effective_backend(&cfg, &big), Backend::Gpu);
+        let expected = if cfg!(feature = "cuda") {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), expected);
     }
 }
 

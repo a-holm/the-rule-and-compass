@@ -2332,7 +2332,7 @@ mod tests {
             .collect();
         assert_eq!(
             exact,
-            ["median", "interquartile", "rank_correlation", "rank_correlation_signed", "auc"]
+            ["median", "rank_correlation", "rank_correlation_signed", "interquartile", "auc"]
         );
         // An unhandled metric must be a hard failure, never an MSE fallback.
         assert_eq!(

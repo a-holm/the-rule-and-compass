@@ -134,7 +134,12 @@ fn interquartile_gpu_scoring_respects_the_measured_row_floor() {
         metric: Metric::Interquartile,
         ..Default::default()
     };
-    assert_eq!(search::effective_backend(&cfg, &big), Backend::Gpu);
+    let expected = if cfg!(feature = "cuda") {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), expected);
 }
 
 /// #232: the cost model keeps a small sample on the exact CPU interquartile

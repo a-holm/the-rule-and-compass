@@ -163,6 +163,7 @@ fn a_metric_outside_the_table_keeps_its_named_refusal() {
         ..Default::default()
     };
     assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+    #[cfg(feature = "cuda")]
     assert_eq!(
         search::backend_blocker_reason(&cfg, &s),
         rcsr::metrics::score_refusal(Metric::Slope)
