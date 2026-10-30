@@ -35,6 +35,10 @@ Roadmap work is tracked as GitHub issues labelled `roadmap`:
 gh issue list --label roadmap --limit 100
 ```
 
+## Hung runs
+
+Run long jobs under `scripts/stall-watch.sh -- <command>`: on a stall it writes all thread backtraces to `<log>.stacks.txt` and never kills anything. Dump a live process with `scripts/stacks.sh <pid>` (the process needs `RCSR_ATTACHABLE=1`). Details: the debugging section of [`docs/issue-workflow.md`](docs/issue-workflow.md).
+
 ## Non-negotiables
 
 * Every non-trivial change starts from a GitHub issue. No issue, no work.
