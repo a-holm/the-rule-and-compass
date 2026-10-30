@@ -28,7 +28,9 @@ pub struct ProjectionRecord {
 pub struct Manifest {
     pub version: String,
     pub start_utc: String,
+    /// #256: the commit the binary was built from (recorded by `build.rs`).
     pub commit: String,
+    /// #256: work tree state when `build.rs` last ran.
     pub dirty: bool,
     pub exe_path: String,
     pub exe_sha256: String,
@@ -82,9 +84,11 @@ impl Manifest {
             self.dirty
         ));
         out.push_str(&format!(
-            "  \"binary\":{{\"path\":{},\"sha256\":{}}},\n",
+            "  \"binary\":{{\"path\":{},\"sha256\":{},\"build_commit\":{},\"build_dirty\":{}}},\n",
             jstr(&self.exe_path),
-            jstr(&self.exe_sha256)
+            jstr(&self.exe_sha256),
+            jstr(&self.commit),
+            self.dirty
         ));
         out.push_str(&format!(
             "  \"data\":{{\"path\":{},\"sha256\":{},\"full_rows\":{},\"sampled_rows\":{},\
@@ -164,7 +168,7 @@ impl Manifest {
         }
         let phase_json: Vec<String> = phases
             .iter()
-            .map(|(name, secs)| format!("{}:{:.6}", jstr(name), secs))
+            .map(|(name, secs)| format!("{}:{}", jstr(name), secs))
             .collect();
         out.push_str(&format!(
             "  \"phases_seconds\":{{{}}}\n}}\n",
@@ -201,8 +205,8 @@ pub fn collect(
 ) -> Manifest {
     let exe = std::env::current_exe().unwrap_or_default();
     let exe_path = exe.to_string_lossy().into_owned();
-    let exe_sha256 = sha256_file(&exe).unwrap_or_else(|_| "unknown".to_string());
-    let (commit, dirty) = git_info();
+    let exe_sha256 = crate::provenance::exe_sha256();
+    let (commit, dirty) = build_info();
     let data_sha256 = if data_path == "-" || data_path.is_empty() {
         None
     } else {
@@ -241,7 +245,15 @@ pub fn collect(
 ///
 /// Returns one human-readable line per check; any `FAIL` line means the caller
 /// must exit non-zero.
-pub fn verify(path: impl AsRef<Path>, data_override: Option<&str>) -> Result<Vec<String>, String> {
+///
+/// `binary_override` names the executable to check instead of the running one
+/// (#256): the preserved binary of a finished run can be verified by a newer
+/// `rcsr`.
+pub fn verify(
+    path: impl AsRef<Path>,
+    data_override: Option<&str>,
+    binary_override: Option<&str>,
+) -> Result<Vec<String>, String> {
     let path = path.as_ref();
     let text = std::fs::read_to_string(path)
         .map_err(|e| format!("cannot read manifest '{}': {}", path.display(), e))?;
@@ -251,8 +263,10 @@ pub fn verify(path: impl AsRef<Path>, data_override: Option<&str>) -> Result<Vec
     let binary = object(&text, "binary")
         .ok_or_else(|| format!("manifest '{}' has no 'binary' object", path.display()))?;
     let saved_exe = string_field(binary, "sha256").unwrap_or_else(|| "unknown".to_string());
-    let exe = std::env::current_exe().unwrap_or_default();
-    let now_exe = sha256_file(&exe).unwrap_or_else(|_| "unknown".to_string());
+    let now_exe = match binary_override {
+        Some(file) => sha256_file(Path::new(file)).unwrap_or_else(|_| "unknown".to_string()),
+        None => crate::provenance::exe_sha256(),
+    };
     if saved_exe == now_exe {
         lines.push(format!("PASS binary sha256 {}", now_exe));
     } else {
@@ -264,8 +278,12 @@ pub fn verify(path: impl AsRef<Path>, data_override: Option<&str>) -> Result<Vec
     }
 
     let saved_commit = string_field(&text, "commit").unwrap_or_else(|| "unknown".to_string());
-    let (now_commit, _) = git_info();
-    if saved_commit == "unknown" || now_commit == "unknown" || saved_commit == now_commit {
+    let (now_commit, _) = build_info();
+    if binary_override.is_some() {
+        // The commit is a label compiled into the binary; the SHA-256 above is
+        // what proves the given file is the one that ran.
+        lines.push(format!("PASS commit {} (build-time label; identity is the binary sha256)", saved_commit));
+    } else if saved_commit == "unknown" || now_commit == "unknown" || saved_commit == now_commit {
         lines.push(format!("PASS commit {}", saved_commit));
     } else {
         failed = true;
@@ -328,27 +346,16 @@ pub fn verify(path: impl AsRef<Path>, data_override: Option<&str>) -> Result<Vec
     }
 }
 
-/// `(commit, dirty)` for the current directory. `"unknown"` outside git.
-pub fn git_info() -> (String, bool) {
-    let commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown".to_string());
-    let dirty = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
-    (commit, dirty)
+/// `(commit, dirty)` of the tree this binary was built from. Both come from
+/// `build.rs` (#256); no `git` process runs at run time.
+pub fn build_info() -> (String, bool) {
+    (
+        crate::provenance::BUILD_COMMIT.to_string(),
+        crate::provenance::build_dirty(),
+    )
 }
 
-fn device_info(backend: &str) -> (String, String, String) {
+pub(crate) fn device_info(backend: &str) -> (String, String, String) {
     if backend != "gpu" {
         return ("cpu".to_string(), "n/a".to_string(), "n/a".to_string());
     }

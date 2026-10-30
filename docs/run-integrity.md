@@ -30,9 +30,9 @@ timings. It contains:
 | field | meaning |
 |---|---|
 | `tool`, `version` | engine name and crate version |
-| `start_utc`, `end_utc`, `completed` | UTC timestamps; `end_utc` is `null` until the run finishes |
-| `commit`, `dirty` | `git rev-parse HEAD` and whether the work tree had uncommitted files |
-| `binary.path`, `binary.sha256` | the actual `current_exe` and its SHA-256 (two CUDA-linked binaries at the same commit can differ) |
+| `start_utc`, `end_utc`, `completed` | UTC timestamps; `start_utc` is the process start (before the data is read and hashed) and `end_utc` the end of the process work, after baselines and diagnostics (#256); `end_utc` is `null` until the run finishes |
+| `commit`, `dirty` | #256: the commit the binary was built from, recorded by `build.rs` when the binary is built (`RCSR_BUILD_COMMIT` overrides it for a source export), never by a runtime `git` call; `dirty` is the work-tree state when the build script last ran. The binary SHA-256 is the identity; the commit is a label. |
+| `binary.path`, `binary.sha256`, `binary.build_commit` | the actual `current_exe`, its SHA-256 (two CUDA-linked binaries at the same commit can differ) and the commit compiled into it |
 | `data.path`, `data.sha256` | raw data file and its SHA-256 (`null` for stdin) |
 | `data.full_rows`, `data.sampled_rows` | #112: `true`/`null` for a full load, `false`/`N` for an explicit `--sample-rows N` sample, `null`/`null` for a CSV |
 | `data.estimate_bytes` | #112: the memory estimate that justified the load decision (`null` for a CSV) |
@@ -41,13 +41,16 @@ timings. It contains:
 | `backend`, `device` | `cpu`/`gpu`, device name, driver version and CUDA version |
 | `dispatch` | #290: the calibrated `r_eval`/`r_fit`/`bw`/`launch` values, probe wall time, source and band, plus the per-stage route ledger (`route`, `reason`, `calls`, `candidates`, `predicted_s`, `actual_s`, `bytes`, `switches`) |
 | `resume.from`, `resume.backend_change` | checkpoint path and an allowed backend change, if any |
-| `phases_seconds` | `data_prepare`, `search`, `total` |
+| `phases_seconds` | `data_prepare`, `search`, `baselines`, `diagnostics`, `report`, `total`. `total` is exactly `timing.total_seconds` of the result JSON: the one runtime of the process (#256). `search` is `elapsed_seconds`. |
 
 `rcsr verify-manifest <path>` re-checks the manifest against the **current**
 environment:
 
-* the SHA-256 of the running `rcsr` binary;
-* the current git commit;
+* the SHA-256 of the running `rcsr` binary, or of the file named by
+  `--binary <file>` (#256: the preserved binary of a finished run; the commit
+  line then reports the manifest's build-time label and the SHA-256 is the
+  proof);
+* the commit compiled into the running binary (no `git` call);
 * the data file named in the manifest (or `--data <file>`) by SHA-256;
 * the canonical configuration text by recomputing its hash.
 
@@ -144,12 +147,30 @@ run (the "10-hour run"):
    `nvidia-smi`) is still an outside-the-engine job, and `run_end` records the
    process peak RSS and measured device-hours.
 3. **Resume** on the same backend with `--resume` when the wall-clock budget
-   ends; the log is truncated per run, so a resumed run gets its own file.
+   ends (a `time_budget` stop is not terminal, and `--time-budget` may be set
+   again); the log is truncated per run, so a resumed run gets its own file.
+   The checkpoint records the build identity; `--resume` refuses a different
+   binary, commit, device, driver or thread count unless `--allow-build-change`
+   is given.
 4. **Explain** the finished run with `rcsr dev-report runs/<label>.dev.ndjson`:
    phase table, fit vs evaluation share, fallback causes, convergence, archive
    growth and a ranked bottleneck list. Use `--dev-log-level full` when the
    per-generation detail is needed (`full` keeps every generation).
 5. **Verify** with `rcsr verify-manifest runs/<label>.manifest.json`.
+
+## What the result fields measure (#256)
+
+| field | scope |
+|---|---|
+| `timing.total_seconds` | the runtime: the whole process from argument parsing to the end of the report phase. `prep + search + baselines + diagnostics + report + unaccounted_seconds = total_seconds`. |
+| `elapsed_seconds`, `timing.search_seconds` | the search phase only |
+| `gpu.eval_kernel_duty` | kernel seconds over the evaluator window (`gpu.eval_window_s`); it says nothing about the rest of the run |
+| `gpu.ledger.duty_run` | device-busy union over the run wall |
+| `gpu.device_seconds_incl_fit` | evaluator full-path wall plus fit kernel seconds |
+| `gpu.device_fraction_of_run`, `gpu.eval_fraction_of_run` | the above over `timing.total_seconds`, as value, numerator, denominator, units, scope |
+| `gpu.batches_per_s` | evaluator batches per evaluator second. It is not a generation rate. |
+| `gpu.quality_per_gpu_hour` | decades of error reduction against the constant-mean baseline per evaluator-window hour; both errors are MSE (the baseline is the training-row variance). `null` for any metric but squared. |
+| `converged_early`, `stop_reason` | see [`convergence.md`](convergence.md): a time-budget stop is not convergence |
 
 ## Acceptance checks
 
@@ -158,6 +179,11 @@ The integration branch runs the tests that pin this behaviour:
 * `tests/checkpoint.rs`: backend/config-hash round trip, backend-mismatch
   refusal and override, injected partial write leaving the previous generation
   intact, `.prev` retention;
+* `tests/report_integrity.rs` (#256): the manifest carries the build-time
+  commit and the process start; `manifest.total == timing.total_seconds`;
+  `verify-manifest --binary` passes on a copied binary; a time-budget stop is
+  resumable and adds generations; the exit checkpoint's final archive hash
+  equals the reported one;
 * `tests/manifest.rs`: manifest pass, stale binary hash, changed data and
   changed config all fail the verifier; `--json-out` is one atomic JSON object
   and never streams to stdout.
