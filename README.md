@@ -172,6 +172,10 @@ because `test_k` lies inside `train_{k+1}`. Pass `--device-pnl` to recompute
 each test block through the fused f64 long-only reduction (`src/trading_gpu.rs`
 plus the CUDA kernel `src/cuda/pnl.cu`) and report it with cash and
 buy-and-hold benchmarks; the scalar evaluator stays the reported authority.
+Every window also lists the long-only controls (cash, buy-and-hold, constant
+long/flat from the training mean, matched-exposure random long seeded by
+`--control-seed`) with exposure, turnover, beta and excess over cash; see
+`src/baselines.rs`.
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
