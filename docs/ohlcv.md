@@ -146,6 +146,27 @@ a measured guard, not a speed-up claim: the 16M paired measurement is still
 missing, and the 1.05M fixture has only two symbol segments, so the
 one-thread-per-segment leaf/join passes underutilise the device.
 
+### Device MTF as-of join and `bar_age` (`--features cuda`)
+
+`src/cuda/pit.cu` (issue #302) also joins higher-timeframe bars onto base rows
+with the monotone merge used for membership; `src/panel_pit.rs` is the CPU
+reference and mirrors `ohlcv::join_causal`. A higher bar `h` is visible to a row
+at `t` when `h.time + tf <= t`, so a bar closing exactly at `t` is visible and
+the forming bar is not. Per row:
+
+* `bar_age = t - (h.time + tf)` in seconds; `NaN` only when no bar is visible. A
+  stale bucket keeps a finite `bar_age`.
+* `fresh` is 1 when the visible bar is exactly the previous expected bucket
+  (`floor(t/tf)*tf - tf`). A row that is not fresh yields `NaN` value leaves, so
+  a missing bucket is never bridged by an older one.
+* `lookahead_violations` counts any row whose leaf was not yet closed. A column
+  shifted one bar into the future is reported, with the same count as
+  `ohlcv::lookahead_violations`.
+
+The result is bit-identical to the CPU reference at any block and chunk size, and
+any prefix of the timeline equals the full run truncated (`tests/panel_gpu.rs`,
+`tests/panel_pit.rs`).
+
 ### Device panel preparation: duplicates, 15m → 1h and gaps (`--features cuda`)
 
 `src/panel_prep.rs` is the exact CPU reference and `src/panel_prep_gpu.rs` /

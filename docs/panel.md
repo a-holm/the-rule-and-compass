@@ -72,6 +72,49 @@ symbol-major block and never parses text or decides units.
 A 4.78M-row decoded block hashes identically on CPU and device, cold and warm.
 The CPU parse/inflate path and `rcsr prep` output are unchanged by this seam.
 
+### Device PIT as-of joins (`--features cuda`)
+
+`src/panel_pit.rs` is the exact CPU reference and `src/panel_pit_gpu.rs` /
+`src/cuda/pit.cu` the device merge (issue #302). The membership **decisions**
+(ranking, ADV tie-breaks, `member`) stay on the CPU in `build_membership`; the
+device only maps every base row to the decision in force. It consumes a decoded
+symbol-major block: base times, a caller chain id (migration) per row and a
+sorted decision list per symbol.
+
+* A decision is visible to a row when `as_of <= t`. A row at `as_of` sees it; a
+  row one second before does not. This is `partition_point(|r| r.as_of <= t)` of
+  `panel::build_panel_with_step`, including last-wins on equal `as_of`.
+* One thread owns a chunk of consecutive rows: one binary search for the first
+  row, then a monotone cursor. The result does not depend on the chunk size or
+  the launch block size.
+* Per row: the decision index (`-1` if none), `member_asof`, `keep`
+  (`member = 1`), `gap = max(0, (t[i] - t[i-1]) / step - 1)` only between two
+  adjacent kept rows of one segment and one input chain, and a `chain_id`
+  counted from 1 inside each segment. `member = 0`, a missing decision, a
+  listing/delisting (segment change) and a migration (input chain change) start
+  a new chain, and nothing bridges them. `chain_id` is the value to put in
+  `PrepBar.chain` of the #301 prep pass.
+* Kept rows are compacted with an exclusive prefix sum. No atomic touches an
+  output.
+* `lookahead_violations` re-checks `as_of <= t` (and the leaf range) for any
+  leaf index column. The join's own count is 0; a column shifted one decision
+  into the future is reported.
+
+`tests/panel_pit.rs` (CPU) pins the reference against
+`panel::build_panel_with_step` on boundary fixtures and a random block;
+`tests/panel_gpu.rs` pins device/CPU byte identity, cold/warm, block and chunk
+size invariance, and prefix replay at 20 cuts (all rows with `ts <= T` equal
+the full run truncated). Production `rcsr panel build` still uses the CPU path;
+wiring changes no CPU byte and is part of #259.
+
+Measured on a 4.78M-row block of 40 symbols (`pit_paired_4_78m_row_join_measurement`,
+`--ignored`): the membership join (560 decisions) takes the CPU reference 0.19 s
+(25 M rows/s, 3.94 dependent key loads per row) and the device pass 0.025 s
+(188 M rows/s, 1.02 loads per row). The 1h MTF join (2.0M higher bars) takes the
+CPU 0.43 s (11 M rows/s, 15.7 loads per row) and the device 0.029 s (167 M
+rows/s, 1.48 loads per row). The download is 0.12 s, so the device join pays when
+the block is already resident.
+
 ### Cross-sections use the same PIT rule
 
 `rcsr enrich --features cross` computes equal-weight market state, breadth,
