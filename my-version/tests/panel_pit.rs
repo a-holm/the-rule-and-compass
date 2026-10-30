@@ -191,7 +191,7 @@ fn membership_exclusion_and_chain_reset_do_not_bridge_a_gap() {
     assert_eq!(out.chain_id[r - 9], out.chain_id[0]);
 
     // Feeding the chain ids to the #301 prep keeps the gap tag at 0 at the
-    // reset; a single constant chain would bridge two hours.
+    // reset; a single constant chain would bridge two missing hours.
     let feed = |ids: bool| {
         let bars: Vec<PrepBar> = out
             .kept_rows
@@ -212,7 +212,7 @@ fn membership_exclusion_and_chain_reset_do_not_bridge_a_gap() {
         o.buckets.iter().find(|b| b.time == 6 * hour).unwrap().gap
     };
     assert_eq!(gap_at_6(&with_ids), 0);
-    assert_eq!(gap_at_6(&without), 1);
+    assert_eq!(gap_at_6(&without), 2);
 }
 
 #[test]
