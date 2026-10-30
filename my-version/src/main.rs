@@ -6109,12 +6109,13 @@ fn run_eval(
         metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
     };
     let train_error = score(&prepared.train);
-    let fold_errors: Vec<f64> = prepared.fold_samples.iter().map(score).collect();
-    let test_error = if fold_errors.is_empty() {
-        f64::INFINITY
+    // One test block leaves `fold_samples` empty (#133): score the test block.
+    let fold_errors: Vec<f64> = if prepared.fold_samples.is_empty() {
+        vec![score(&prepared.test)]
     } else {
-        fold_errors.iter().sum::<f64>() / fold_errors.len() as f64
+        prepared.fold_samples.iter().map(score).collect()
     };
+    let test_error = fold_errors.iter().sum::<f64>() / fold_errors.len() as f64;
 
     match format {
         Format::Json => {
