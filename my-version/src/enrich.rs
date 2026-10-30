@@ -6818,7 +6818,7 @@ fn enrich_inner(
                 step,
                 &mtf_wanted,
             ) {
-                Some((columns, stats)) => {
+                Ok((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
                             t.write_values(&values)?;
@@ -6830,7 +6830,13 @@ fn enrich_inner(
                     side_h2d_seconds += stats.h2d_s;
                     side_d2h_seconds += stats.d2h_s;
                 }
-                None => gpu_fallback += mtf_wanted.len(),
+                Err(e) => {
+                    eprintln!(
+                        "warning: device MTF failed ({e}); computing {} columns on the CPU",
+                        mtf_wanted.len()
+                    );
+                    gpu_fallback += mtf_wanted.len();
+                }
             }
             for name in &mtf_wanted {
                 gpu_names.remove(name);
