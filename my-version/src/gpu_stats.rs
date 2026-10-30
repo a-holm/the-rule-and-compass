@@ -139,6 +139,20 @@ pub struct Interval {
     pub end_s: f64,
 }
 
+/// #334: allocator activity of the persistent fit and score regions. Counters
+/// are totals for the run, copied from the device context.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FitAlloc {
+    /// Device and pinned allocate and free calls, cold and steady.
+    pub alloc_calls: u64,
+    /// Growths to a new high-water mark.
+    pub growths: u64,
+    /// Allocator calls after the first successful batch of the same kind.
+    pub steady_alloc_calls: u64,
+    /// Fit and score batches that went through the regions.
+    pub batches: u64,
+}
+
 /// #284: run-scoped telemetry. Stage seconds are exclusive main-thread windows;
 /// device intervals are used only for the union. The two measures may differ
 /// (device work can overlap host work), which is why the ledger reports both.
@@ -176,6 +190,8 @@ pub struct RunLedger {
     eval_fallback_s: f64,
     /// Finalist refits performed.
     refits: u64,
+    /// #334: allocator activity of the fit and score regions.
+    fit_alloc: FitAlloc,
 }
 
 impl RunLedger {
@@ -270,6 +286,16 @@ impl RunLedger {
         }
     }
 
+    /// #334: store the fit/score allocator counters of one device context. The
+    /// counters are totals, so this replaces rather than adds.
+    pub fn set_fit_alloc(&mut self, alloc: FitAlloc) {
+        self.fit_alloc = alloc;
+    }
+
+    pub fn fit_alloc(&self) -> FitAlloc {
+        self.fit_alloc
+    }
+
     pub fn record_eval_fallback(&mut self, programs: u64, seconds: f64) {
         self.eval_fallback_programs += programs;
         if seconds.is_finite() && seconds > 0.0 {
@@ -306,6 +332,10 @@ impl RunLedger {
         self.fallback_fits += other.fallback_fits;
         self.eval_fallback_programs += other.eval_fallback_programs;
         self.eval_fallback_s += other.eval_fallback_s;
+        self.fit_alloc.alloc_calls += other.fit_alloc.alloc_calls;
+        self.fit_alloc.growths += other.fit_alloc.growths;
+        self.fit_alloc.steady_alloc_calls += other.fit_alloc.steady_alloc_calls;
+        self.fit_alloc.batches += other.fit_alloc.batches;
         for (name, count) in &other.fallback_by_cause {
             *self.fallback_by_cause.entry(name.clone()).or_default() += *count;
         }
