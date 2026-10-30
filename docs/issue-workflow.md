@@ -170,6 +170,21 @@ git commit -m "feat(metrics): add median, max, rank-correlation and AIC metrics
 Refs #12"
 ```
 
+### Debugging a hung run
+
+The machine runs Yama `ptrace_scope=1`: only a parent may trace its children. Do not change the system setting. Instead, `rcsr`, `rcsr-bench` and every test binary opt in to being traced when `RCSR_ATTACHABLE=1` is set (`src/attach.rs`).
+
+```sh
+# dump all thread backtraces of a pid; exit 0 = gdb, 3 = eu-stack, 4 = /proc table only
+RCSR_ATTACHABLE=1 ./target/release/rcsr ... &
+scripts/stacks.sh <pid> [out-file]
+
+# wrap a long run: dumps stacks once per stalled process, never kills anything
+$L scripts/stall-watch.sh -i 60 -m 10 -l /path/to/log -- bash -c "cargo test --release ..."
+```
+
+`stall-watch.sh` sets `RCSR_ATTACHABLE=1` for the command. It samples CPU ticks and I/O counters of the command and its descendants under a `target/` directory every `-i` seconds. After `-m` minutes without change it writes the backtraces to `<log>.stacks.txt` and keeps waiting. Without the variable, `stacks.sh` exits 4 and prints the `/proc` table. Check the watchdog with `scripts/tests/stall_watch.sh` (needs `cargo build --release --example hung`).
+
 ---
 
 ## 4. Opening the pull request
