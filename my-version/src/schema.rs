@@ -196,6 +196,7 @@ pub fn json() -> String {
 {{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--device-pnl\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"recompute each test block through the fused f64 long-only reduction (CUDA kernel when available, identical canonical CPU segments otherwise) and report it with cash and buy-and-hold benchmarks; the scalar evaluator remains the authority\"}},\
+{{\"name\":\"--control-seed\",\"type\":\"integer\",\"default\":\"0\",\"description\":\"seed of the matched-exposure random-long control; every walkforward window reports cash, buy-and-hold, constant long/flat and matched-exposure random long with exposure, turnover, beta and excess over cash\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}],\

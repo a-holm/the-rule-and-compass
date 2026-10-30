@@ -170,6 +170,9 @@ pub struct EvalSpec {
     /// CPU canonical path otherwise) and report it beside the scalar evaluator.
     /// The scalar evaluator remains the reported authority.
     pub device_pnl: bool,
+    /// #310: seed of the matched-exposure random-long control. Recorded in the
+    /// report; the same seed reproduces the same control.
+    pub control_seed: u64,
     /// #306: threshold | band | dp. `dp` keeps the threshold book and adds the
     /// hindsight bound; it is never reported as the strategy's P&L.
     pub policy: Policy,
@@ -269,6 +272,9 @@ pub struct WindowResult {
     pub metrics: Metrics,
     /// #304: fused canonical/device long-only P&L for this test block.
     pub device_pnl: Option<DevicePnlCheck>,
+    /// #310: cash, buy-and-hold, constant and matched-exposure random long for
+    /// this test block, priced on the same rows with the same costs.
+    pub controls: Option<crate::baselines::ControlSet>,
     /// #306: band/cooldown carry check when the band policy was selected.
     pub band: Option<BandCheck>,
     /// #306: exact hindsight DP bound when the dp policy was selected.
@@ -741,6 +747,10 @@ struct WindowData {
     validation_scores: Vec<Vec<f64>>,
     test_rows: Vec<RowBase>,
     test_scores: Vec<Vec<f64>>,
+    /// Sum and count of the finite training-interval targets (#310 constant
+    /// control).
+    train_target_sum: f64,
+    train_target_n: u64,
     dropped: usize,
 }
 
@@ -785,6 +795,8 @@ impl Accum {
                 validation_scores: vec![Vec::new(); candidates],
                 test_rows: Vec::new(),
                 test_scores: vec![Vec::new(); candidates],
+                train_target_sum: 0.0,
+                train_target_n: 0,
                 dropped: 0,
             });
         }
@@ -958,6 +970,15 @@ impl Accum {
                 spec.band_width,
                 spec.min_hold,
                 spec.device_pnl,
+                Some(ControlInput {
+                    seed: spec.control_seed,
+                    train_mean: if d.train_target_n == 0 {
+                        f64::NAN
+                    } else {
+                        d.train_target_sum / d.train_target_n as f64
+                    },
+                    check_device: spec.device_pnl,
+                }),
             );
             // Pooled path: carry each group's position across the seam unless
             // the caller asked for the historical flat reset.
@@ -973,6 +994,7 @@ impl Accum {
                     spec.band_width,
                     spec.min_hold,
                     false,
+                    None,
                 )
             } else {
                 evaluate_window(
@@ -986,6 +1008,7 @@ impl Accum {
                     spec.band_width,
                     spec.min_hold,
                     false,
+                    None,
                 )
             };
             if !spec.pool_reset_flat {
@@ -1022,6 +1045,7 @@ impl Accum {
                 inferred_period_seconds: inferred_dt,
                 metrics: ev.metrics,
                 device_pnl: ev.device,
+                controls: ev.controls,
                 band: ev.band,
                 hindsight_bound: ev.hindsight_bound,
                 band_selection,
@@ -1122,6 +1146,10 @@ fn push_scores(
         let in_train = t >= d.window.train_start && t < d.window.train_end;
         let in_test = t >= d.window.test_start && t < d.window.test_end;
         if in_train {
+            if target.is_finite() {
+                d.train_target_sum += target;
+                d.train_target_n += 1;
+            }
             if d.validation_start.map_or(false, |s| t >= s) {
                 d.validation_rows.push(RowBase {
                     time: t,
@@ -1325,6 +1353,15 @@ struct WindowEval {
     device: Option<DevicePnlCheck>,
     band: Option<BandCheck>,
     hindsight_bound: Option<HindsightBound>,
+    controls: Option<crate::baselines::ControlSet>,
+}
+
+/// #310: what the control ladder needs beyond the test rows.
+struct ControlInput {
+    seed: u64,
+    /// Mean finite training target; `NaN` when there is none.
+    train_mean: f64,
+    check_device: bool,
 }
 
 /// One timestamp's `(sum, count)` cross-section.
@@ -1440,6 +1477,7 @@ fn evaluate_window(
     band_width: f64,
     min_hold: usize,
     device_pnl: bool,
+    control_input: Option<ControlInput>,
 ) -> WindowEval {
     assert_eq!(rows.len(), scores.len());
     // #305: one shared mask, score and target both finite. `position_for`
@@ -1674,6 +1712,8 @@ fn evaluate_window(
 
     // Equal-weight the groups present at each timestamp. Times are sorted so the
     // return series has the same order as the Python reference.
+    let ord_positions: Vec<f64> = order.iter().map(|&i| positions[i]).collect();
+    let group_order = order.clone();
     let mut time_order = order;
     time_order.sort_by(|&a, &b| {
         let ra = &rows[valid[a]];
@@ -1690,6 +1730,35 @@ fn evaluate_window(
     }
     let (returns, gross_returns) = cross.series();
 
+    // #310: the control ladder on the same rows, the same cost and the same
+    // equal-weight period aggregation. Every control starts flat, like the
+    // #304 reduction; the strategy's carried seam is not applied to controls.
+    let controls = control_input.map(|c| {
+        let period_series = |ord_net: &[f64]| -> Vec<f64> {
+            let mut by_index = vec![0.0f64; n];
+            for (k, &i) in group_order.iter().enumerate() {
+                by_index[i] = ord_net[k];
+            }
+            let mut cs = CrossSection::default();
+            for &i in &time_order {
+                cs.add(rows[valid[i]].time, by_index[i], 0.0);
+            }
+            cs.series().0
+        };
+        crate::baselines::evaluate_controls(
+            &ord_positions,
+            &ord_returns,
+            &ord_groups,
+            cost_side,
+            c.train_mean,
+            c.seed,
+            ppy,
+            c.check_device,
+            &period_series,
+        )
+        .unwrap_or_else(|e| panic!("control ladder failed: {}", e))
+    });
+
     let metrics = summarize(&returns, &gross_returns, &stats, ppy);
     WindowEval {
         metrics,
@@ -1701,6 +1770,7 @@ fn evaluate_window(
         device,
         band,
         hindsight_bound,
+        controls,
     }
 }
 
@@ -1936,6 +2006,47 @@ fn device_pnl_json(d: &DevicePnlCheck) -> String {
     )
 }
 
+/// #310: the control ladder as JSON.
+fn controls_json(c: &crate::baselines::ControlSet) -> String {
+    let rows: Vec<String> = c
+        .rows
+        .iter()
+        .map(|r| {
+            format!(
+                "{{\"control\":{},\"totals\":{},\"exposure\":{},\"turnover\":{},\
+                 \"beta\":{},\"excess_over_cash\":{},\"sharpe\":{},\
+                 \"mean_return\":{},\"periods\":{}}}",
+                jstr(r.kind.as_str()),
+                pnl_totals_json(&r.totals),
+                jnum(r.exposure),
+                jnum(r.turnover),
+                jnum(r.beta),
+                jnum(r.excess_over_cash),
+                jnum(r.sharpe),
+                jnum(r.mean_return),
+                r.periods
+            )
+        })
+        .collect();
+    let device = c.device.as_ref().map_or("null".to_string(), |d| {
+        format!(
+            "{{\"backend\":{},\"max_abs_delta\":{},\"counts_equal\":{}}}",
+            jstr(&d.backend),
+            jnum(d.max_abs_delta),
+            d.counts_equal
+        )
+    });
+    format!(
+        "{{\"seed\":{},\"constant_side\":{},\"train_mean\":{},\
+         \"beta_benchmark\":\"buy_and_hold\",\"controls\":[{}],\"device\":{}}}",
+        c.seed,
+        jstr(if c.constant_long { "long" } else { "flat" }),
+        jnum(c.train_mean),
+        rows.join(","),
+        device
+    )
+}
+
 fn band_check_json(b: &BandCheck) -> String {
     format!(
         "{{\"band_width\":{},\"min_hold\":{},\"carry\":{},\"groups\":{},\
@@ -2023,7 +2134,7 @@ impl WindowResult {
              \"candidate\":{},\"validation_error\":{},\"threshold\":{},\
              \"threshold_source\":{},\"train_rows\":{},\"validation_rows\":{},\
              \"test_rows\":{},\"dropped_rows\":{},\"inferred_period_seconds\":{},\
-             \"metrics\":{},\"device_pnl\":{},\"band\":{},\"hindsight_bound\":{},\
+             \"metrics\":{},\"device_pnl\":{},\"controls\":{},\"band\":{},\"hindsight_bound\":{},\
              \"band_selection\":{}}}",
             jstr(&self.window.label),
             jnum(self.window.train_start),
@@ -2045,6 +2156,9 @@ impl WindowResult {
             self.device_pnl
                 .as_ref()
                 .map_or("null".to_string(), device_pnl_json),
+            self.controls
+                .as_ref()
+                .map_or("null".to_string(), controls_json),
             self.band
                 .as_ref()
                 .map_or("null".to_string(), band_check_json),
@@ -2338,6 +2452,37 @@ impl Report {
                 w.metrics.trades
             ));
         }
+        s.push_str("\n## Controls (long-only, per window)\n\n");
+        s.push_str(
+            "Each control is priced on the window's valid test rows with the same cost, starts flat and pays its final exit. Beta is on the buy-and-hold period series. Cash Sharpe is n/a (zero variance).\n\n\
+             | window | control | net | cost | exposure | turnover | beta | excess over cash | Sharpe | entries |\n\
+             |---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+        );
+        for w in &self.windows {
+            if let Some(c) = &w.controls {
+                for r in &c.rows {
+                    s.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        w.window.label,
+                        r.kind.as_str(),
+                        md_num(r.totals.net),
+                        md_num(r.totals.cost),
+                        md_num(r.exposure),
+                        md_num(r.turnover),
+                        md_num(r.beta),
+                        md_num(r.excess_over_cash),
+                        md_num(r.sharpe),
+                        r.totals.entries
+                    ));
+                }
+            }
+        }
+        if let Some(c) = self.windows.first().and_then(|w| w.controls.as_ref()) {
+            s.push_str(&format!(
+                "\nMatched-exposure seed {}; the constant control is long iff the training mean target is positive.\n",
+                c.seed
+            ));
+        }
         s.push_str("\n## Pooled\n\n");
         s.push_str(
             "| Sharpe | CAGR | max DD | turnover | exposure | hit | break-even | trades | entries | rows | periods |\n\
@@ -2426,6 +2571,23 @@ impl Report {
                 w.metrics.break_even_hit_rate,
                 w.metrics.trades
             ));
+        }
+        for w in &self.windows {
+            if let Some(c) = &w.controls {
+                let cell = |k: crate::baselines::ControlKind| {
+                    let r = c.get(k);
+                    format!("{}={:.6}", k.as_str(), r.totals.net)
+                };
+                s.push_str(&format!(
+                    "controls {:<20} net: {}  {}  {}  {}  (seed {})\n",
+                    w.window.label,
+                    cell(crate::baselines::ControlKind::Cash),
+                    cell(crate::baselines::ControlKind::BuyAndHold),
+                    cell(crate::baselines::ControlKind::Constant),
+                    cell(crate::baselines::ControlKind::MatchedRandomLong),
+                    c.seed
+                ));
+            }
         }
         let p = &self.pooled;
         s.push_str(&format!(

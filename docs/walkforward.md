@@ -230,6 +230,38 @@ The JSON gains a `device_pnl` object per window and a report-level summary with
 `max_abs_net_delta`. `backend` is `cuda` when the kernel ran and
 `cpu-canonical` on a non-CUDA build or when no device is available.
 
+## Long-only controls
+
+Every report lists four controls per window, in `controls` (JSON) and the
+`## Controls` table (Markdown). They use the window's valid test rows, the same
+per-side cost and the same equal-weight period aggregation as the strategy.
+Each control starts flat and pays its final exit, like the fused reduction.
+Positions are `{0, 1}`; there is no short or dollar-neutral control.
+
+| control | positions |
+|---|---|
+| `cash` | `p = 0`: net 0, cost 0, Sharpe `NaN` (zero variance) |
+| `buy_and_hold` | `p = 1`: one entry and one charged exit per group, `net = sum(r) - 2s * groups` |
+| `constant` | one fixed side for the block: long iff the mean finite training target is strictly positive, else flat |
+| `matched_exposure_random_long` | the strategy's own long and flat runs, with the order of the long runs and of the flat runs shuffled inside each group |
+
+The matched control preserves long rows, entries, exits and final exits exactly
+for every group. Its shuffle is a Fisher-Yates driven by a counter-based RNG,
+`draw(seed, group, stream, index)`, so a group's result does not depend on the
+other groups. `--control-seed <n>` (default 0) is recorded as `controls.seed`;
+the same seed gives the same report.
+
+Beside each control: `exposure`, `turnover` (`sum |position change|`), `beta`
+(on the buy-and-hold period series, from the #307 beta/alpha monoid),
+`excess_over_cash` (`net - cash net`), annualised `sharpe` and `mean_return`.
+Values are CPU `f64`. With `--device-pnl` the four position vectors are also
+priced in one device batch (the canonical CPU reduction on non-CUDA builds) and
+`controls.device` records `backend`, `max_abs_delta` and `counts_equal`. The
+matched permutation itself is generated on the host.
+
+The full CPU ladder harness (mean, OLS, kNN, top-tercile) is #266 and is not
+part of this report.
+
 ## Metrics
 
 Per window and pooled:

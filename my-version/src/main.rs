@@ -7635,6 +7635,13 @@ OPTIONS:
                              CUDA kernel when built with --features cuda) and
                              report it with cash and buy-and-hold benchmarks.
                              The scalar evaluator remains the reported authority
+  --control-seed <n>         seed of the matched-exposure random-long control
+                             (default 0). Every report lists the long-only
+                             controls per window: cash, buy-and-hold, constant
+                             long/flat (side fixed from the training mean) and
+                             matched-exposure random long, each with exposure,
+                             turnover, beta and excess over cash. With
+                             --device-pnl they are cross-checked on the device
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
@@ -7678,6 +7685,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
     let mut device_pnl = false;
+    let mut control_seed = rcsr::baselines::DEFAULT_CONTROL_SEED;
     let mut band_select = false;
     let mut json = false;
     let mut out: Option<String> = None;
@@ -7814,6 +7822,17 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--control-seed" => {
+                let src = need(args, i + 1, "--control-seed");
+                control_seed = match src.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("error: --control-seed needs a non-negative integer, got '{}'", src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                i += 1;
+            }
             "--select-band" => band_select = true,
             "--json" => json = true,
             "--out" => {
@@ -7989,6 +8008,7 @@ fn run_walkforward(args: &[String]) -> ! {
         pool_reset_flat,
         allow_lockbox,
         device_pnl,
+        control_seed,
         policy,
         band_width,
         min_hold,
