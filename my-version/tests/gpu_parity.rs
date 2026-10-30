@@ -402,8 +402,6 @@ struct Shared {
     cpu: Report,
     gpu_out: String,
     gpu_cold: Report,
-    /// Columns the cold GPU run legitimately left on the CPU (known device-context bug).
-    expected_fallback: usize,
 }
 
 const SYMBOLS: usize = 24;
@@ -441,10 +439,7 @@ fn shared() -> &'static Shared {
         for pl in &gpu_cold.plans {
             eprintln!("[parity]   plan {} rows {} cols {} gpu {} cpu {} backend {} reason {}", pl.group, pl.rows, pl.cols, pl.gpu_cols, pl.cpu_cols, pl.backend, pl.reason);
         }
-        let mtf_ok = mtf_device_ok(&rows);
-        let expected_fallback = if mtf_ok { 0 } else { enrich::mtf_names().len() };
-        eprintln!("[parity] device MTF context accepts the fixture: {mtf_ok} (expected fallback {expected_fallback})");
-        Shared { dir, rows, src, src_small_groups, names, cpu_out, cpu, gpu_out, gpu_cold, expected_fallback }
+        Shared { dir, rows, src, src_small_groups, names, cpu_out, cpu, gpu_out, gpu_cold }
     })
 }
 
@@ -557,9 +552,9 @@ fn device_columns_match_the_cpu_at_their_declared_tier() {
     let (cpu, gpu) = (&s.cpu, &s.gpu_cold);
 
     assert_eq!(gpu.backend, "gpu");
-    assert_eq!(gpu.gpu_fallback, s.expected_fallback, "fallbacks: {:?}", gpu.plans);
-    assert_eq!(gpu.cpu_columns, s.expected_fallback, "columns left on the CPU under --gpu on: {:?}", gpu.plans);
-    assert_eq!(gpu.gpu_columns + s.expected_fallback, gpu.features.len());
+    assert_eq!(gpu.gpu_fallback, 0, "fallbacks: {:?}", gpu.plans);
+    assert_eq!(gpu.cpu_columns, 0, "columns left on the CPU under --gpu on: {:?}", gpu.plans);
+    assert_eq!(gpu.gpu_columns, gpu.features.len());
     assert!(gpu.gpu_kernel_seconds > 0.0 && gpu.gpu_transfer_bytes > 0);
     for n in &s.names {
         assert!(cpu.features.iter().any(|f| &f.name == n), "device column '{n}' was not materialised");
@@ -653,31 +648,31 @@ fn known_bugs_are_documented_and_registered() {
 }
 
 #[test]
-#[ignore = "bug: amihud96 GPU differs from CPU beyond 1e-12 (rel 9.929e-1, first row 42074 CPU 0.171 GPU 85.46) and is not prefix-causal"]
+#[ignore = "bug #355: amihud96 GPU differs from CPU beyond 1e-12 (rel 9.929e-1, first row 42074 CPU 0.171 GPU 85.46) and is not prefix-causal"]
 fn bug_amihud96() {
     assert_known_bug_column("amihud96");
 }
 
 #[test]
-#[ignore = "bug: xs_rank_amihud96 ranks differ (13 rows, max abs 6.087e-1); follows amihud96"]
+#[ignore = "bug #355: xs_rank_amihud96 ranks differ (13 rows, max abs 6.087e-1); follows amihud96"]
 fn bug_xs_rank_amihud96() {
     assert_known_bug_column("xs_rank_amihud96");
 }
 
 #[test]
-#[ignore = "bug: ma96 NaN mask differs (1243 rows): CPU finite, GPU NaN around a NaN close"]
+#[ignore = "bug #356: ma96 NaN mask differs (1243 rows): CPU finite, GPU NaN around a NaN close"]
 fn bug_ma96() {
     assert_known_bug_column("ma96");
 }
 
 #[test]
-#[ignore = "bug: ma672 NaN mask differs (8731 rows): CPU finite, GPU NaN around a NaN close"]
+#[ignore = "bug #356: ma672 NaN mask differs (8731 rows): CPU finite, GPU NaN around a NaN close"]
 fn bug_ma672() {
     assert_known_bug_column("ma672");
 }
 
 #[test]
-#[ignore = "bug: ou_hl96 differs by 1.3e-7 relative; exceeds the 1e-12 tier (#298 accepted 1e-6)"]
+#[ignore = "bug #357: ou_hl96 differs by 1.3e-7 relative; exceeds the 1e-12 tier (#298 accepted 1e-6)"]
 fn bug_ou_hl96() {
     assert_known_bug_column("ou_hl96");
 }
@@ -722,7 +717,7 @@ fn chunk_rows_and_store_grouping_do_not_change_a_byte() {
         let bad = diff_hashes(&base, &hashes(&r));
         eprintln!("[parity] {label}: {:.1}s, {} differing columns", t.elapsed().as_secs_f64(), bad.len());
         assert!(bad.is_empty(), "{label} changed {} columns: {:?}", bad.len(), bad);
-        assert_eq!(r.gpu_fallback, s.expected_fallback, "{label}");
+        assert_eq!(r.gpu_fallback, 0, "{label}");
         std::fs::remove_file(&out).ok();
     }
 }
@@ -746,8 +741,7 @@ fn mtf_device_ok(rows: &[Row]) -> bool {
 }
 
 #[test]
-#[ignore = "bug #351: rcsr::mtf_gpu::compute returns None (silent CPU fallback) for one 20,979-row symbol with periodic 1-bar holes; 7,992 rows or fewer succeed"]
-fn bug_mtf_device_context_rejects_a_long_holey_symbol() {
+fn mtf_device_context_accepts_a_long_holey_symbol() {
     if !have_device() {
         return;
     }
@@ -840,7 +834,7 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical_and_the_canary_fails() {
         let out = p(&s.dir, "prefix-out.rcsb");
         write_fixture(&src, &sub, 65_536);
         let r = enrich::build(&options(&src, &out, &s.names, GpuMode::On, 65_536)).unwrap();
-        assert!(r.gpu_fallback <= s.expected_fallback, "cut {k}");
+        assert_eq!(r.gpu_fallback, 0, "cut {k}");
         for (name, col) in &full {
             let pre = read_column(&out, name);
             if let Err(row) = prefix_equal(col, &kept, &pre) {
@@ -1146,11 +1140,8 @@ fn large_store_parity_at_the_declared_tiers() {
                 "[large] gpu: {} columns ({} on device, {} fallback), wall {:.1}s, feature {:.1}s, kernel {:.2}s, d2h {:.2}s",
                 r.features.len(), r.gpu_columns, r.gpu_fallback, r.total_seconds, r.feature_seconds, r.gpu_kernel_seconds, r.gpu_d2h_seconds
             );
-            // Only the MTF family may fall back (#351, bug_mtf_device_context_rejects_a_long_holey_symbol).
-            let allowed = if r.gpu_fallback == 0 { 0 } else { enrich::mtf_names().len() };
-            assert_eq!(r.gpu_fallback, allowed, "{:?}", r.plans);
-            assert_eq!(r.cpu_columns, allowed, "{:?}", r.plans);
-            eprintln!("[large] gpu fallback columns: {}", r.gpu_fallback);
+            assert_eq!(r.gpu_fallback, 0, "{:?}", r.plans);
+            assert_eq!(r.cpu_columns, 0, "{:?}", r.plans);
             save("gpu", &r);
             let mut again = options(&store_path, &p(&work, "gpu2.rcsb"), &names, GpuMode::On, store::DEFAULT_GROUP_ROWS);
             again.dry_run = true;
