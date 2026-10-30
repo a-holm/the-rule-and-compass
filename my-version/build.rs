@@ -48,7 +48,70 @@ fn fail(lines: &[String]) -> ! {
     panic!("CUDA backend build failed (see the error above)");
 }
 
+/// Output of a `git` command run in the crate directory, or `None` when git is
+/// missing, the directory is not a work tree or the command fails.
+fn git(args: &[&str]) -> Option<String> {
+    let dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+    let out = Command::new("git").args(args).current_dir(dir).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// #256: record the commit this binary is built from, at build time. A runtime
+/// `git rev-parse` names whatever tree the process happens to run in.
+/// `RCSR_BUILD_COMMIT` overrides it for builds from an exported source tree.
+fn record_build_commit() {
+    println!("cargo:rerun-if-env-changed=RCSR_BUILD_COMMIT");
+    let commit = std::env::var("RCSR_BUILD_COMMIT")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .or_else(|| git(&["rev-parse", "HEAD"]))
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = git(&["status", "--porcelain"]).is_some();
+    println!("cargo:rustc-env=RCSR_BUILD_COMMIT={}", commit);
+    println!("cargo:rustc-env=RCSR_BUILD_DIRTY={}", dirty);
+    let dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let mut watch = vec!["HEAD".to_string(), "packed-refs".to_string()];
+    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+        watch.push(branch);
+    }
+    for name in watch {
+        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+            let path = std::path::Path::new(&dir).join(path);
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+}
+
+/// True when `so` is newer than every CUDA source and was built with the same
+/// compiler settings (`stamp`), so a commit-only rebuild does not run nvcc.
+fn cuda_library_fresh(so: &str, stamp_path: &str, stamp: &str) -> bool {
+    let Ok(built) = std::fs::metadata(so).and_then(|m| m.modified()) else {
+        return false;
+    };
+    if std::fs::read_to_string(stamp_path).ok().as_deref() != Some(stamp) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir("src/cuda") else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        e.metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t <= built)
+            .unwrap_or(false)
+    })
+}
+
 fn main() {
+    record_build_commit();
     println!("cargo:rerun-if-changed=src/cuda/eval.cu");
     println!("cargo:rerun-if-changed=src/cuda/enrich.cu");
     println!("cargo:rerun-if-changed=src/cuda/tail.cu");
@@ -133,6 +196,15 @@ fn main() {
         }
     }
 
+    let stamp_path = format!("{}/nvcc.stamp", out);
+    let stamp = format!("{} {} {} {}", nvcc, arch.name(), unified, detected_text);
+    if cuda_library_fresh(&so, &stamp_path, &stamp) {
+        println!("cargo:rustc-link-search=native={}", out);
+        println!("cargo:rustc-link-lib=dylib=rcsrcuda");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out);
+        return;
+    }
+
     let arch_flag = format!("-arch={}", arch.name());
     let mut cmd = Command::new(&nvcc);
     // `-fmad=false` keeps multiply-add association identical to the Rust f64
@@ -188,6 +260,7 @@ fn main() {
         fail(&lines);
     }
 
+    let _ = std::fs::write(&stamp_path, &stamp);
     println!("cargo:rustc-link-search=native={}", out);
     println!("cargo:rustc-link-lib=dylib=rcsrcuda");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", out);

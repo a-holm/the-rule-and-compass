@@ -93,11 +93,19 @@ fi
     printf '\n'
 } | tee "$CMD"
 
+# #256: keep the exact binary beside the run, named by its SHA-256, so the
+# manifest stays verifiable after the build directory changes:
+#   rcsr verify-manifest "$MANIFEST" --binary "$OUT_DIR/rcsr-<sha256>"
+RCSR_BIN="$(command -v rcsr)"
+RCSR_SHA="$(sha256sum "$RCSR_BIN" | cut -d' ' -f1)"
+PRESERVED="$OUT_DIR/rcsr-$RCSR_SHA"
+[ -e "$PRESERVED" ] || cp -p "$RCSR_BIN" "$PRESERVED"
+
 # stderr carries the human log and --progress NDJSON; keep it, never /dev/null.
 if ! rcsr "${ARGS[@]}" 2> >(tee "$LOG" >&2); then
     echo "error: rcsr failed; see $LOG" >&2
     exit 1
 fi
 echo "# result: $RESULT"
-echo "# manifest: $MANIFEST (verify with: rcsr verify-manifest $MANIFEST)"
+echo "# manifest: $MANIFEST (verify with: rcsr verify-manifest $MANIFEST --binary $PRESERVED)"
 echo "# dev-log: $DEV_LOG (summarise with: rcsr dev-report $DEV_LOG)"
