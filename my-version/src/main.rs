@@ -4049,6 +4049,7 @@ fn main() {
             format,
             quiet,
             search_start,
+            json_out.as_deref(),
         );
         std::process::exit(EXIT_OK);
     }
@@ -6073,6 +6074,7 @@ fn run_eval(
     format: Format,
     quiet: bool,
     started: std::time::Instant,
+    json_out: Option<&str>,
 ) {
     let mut tree = match expr::parse(src, vars) {
         Ok(t) => t,
@@ -6120,7 +6122,7 @@ fn run_eval(
     match format {
         Format::Json => {
             let folds: Vec<String> = fold_errors.iter().map(|e| jnum(*e)).collect();
-            println!(
+            let result_json = format!(
                 "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
                 jstr(VERSION),
                 jstr(metric.name()),
@@ -6137,6 +6139,14 @@ fn run_eval(
                 jnum(test_error),
                 folds.join(",")
             );
+            if let Some(path) = json_out {
+                if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            } else {
+                println!("{}", result_json);
+            }
         }
         Format::Ndjson => println!(
             "{{\"event\":\"eval\",\"metric\":{},\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{}}}",

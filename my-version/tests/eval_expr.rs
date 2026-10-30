@@ -39,3 +39,27 @@ fn eval_expr_reports_the_test_error_with_one_fold() {
         other => panic!("fold_errors: {other:?}"),
     }
 }
+
+#[test]
+fn eval_expr_json_out_writes_the_result_file() {
+    let data = sine();
+    let dir = std::env::temp_dir().join(format!("rcsr-eval-json-out-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("eval.json");
+    let path_s = path.to_str().unwrap();
+    let mut args = eval_args(&data);
+    args.push("--json-out");
+    args.push(path_s);
+    let out = rcsr(&args);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("\"mode\":\"eval-expr\""),
+        "the result goes to the file, not stdout"
+    );
+    let text = std::fs::read_to_string(&path).expect("result file written");
+    let doc = Json::parse(text.trim()).expect("valid json");
+    assert_eq!(doc.get("mode").and_then(|v| v.as_str()), Some("eval-expr"));
+    let test = doc.get("eval").and_then(|e| e.get("test_error")).and_then(|v| v.as_f64());
+    assert!((test.expect("test_error") - 3.621871760723742e-7).abs() < 1e-18);
+    let _ = std::fs::remove_dir_all(&dir);
+}
