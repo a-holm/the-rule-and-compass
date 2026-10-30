@@ -673,11 +673,14 @@ all kernels; it does not make the cost model claim a win. `--no-gpu`/`--cpu`
 forces the reference path. A CPU-only build ignores the GPU arms entirely, and a
 CUDA build with no device falls back with the reason in every plan row.
 
-The CUDA kernels live in `src/cuda/enrich.cu` (enrichment) and
-`src/cuda/features.cu` (fused flow / price-action, #297). Elementwise families use one
-thread per row; rolling sums/standard deviations, Donchian, Wilder/EMA scans and
-labels run one thread per symbol segment in the same operation order as the CPU,
-with `-fmad=false` so multiply-add association is identical. Cross-sectional
+The CUDA kernels live in `src/cuda/enrich.cu` (resident context and the original
+elementwise/scan families), `src/cuda/features.cu` (fused flow / price-action,
+#297) and `src/cuda/tail.cu` (the parameterised engine tail, #298). Elementwise
+families use one thread per row; rolling sums/standard deviations, Wilder/EMA
+scans and labels run one thread per symbol segment in the same operation order
+as the CPU, with `-fmad=false` so multiply-add association is identical.
+Rolling extrema in the tail use a blocked prefix-suffix pass instead of the old
+`O(n*w)` loop. Cross-sectional
 ranks use a stable segmented radix sort with the CPU's `(time, symbol, row)` tie
 order. All accumulation is f64. The report records `gpu_columns`,
 `cpu_columns`, `gpu_share`, `fallback`, kernel, D2H, staging-write seconds,
@@ -700,8 +703,10 @@ The auto plan sends `returns` and `calendar` to the GPU. Rolling sum/std,
 Donchian, lags, candle and the Wilder/RSI families stay on the CPU with
 `estimated GPU time is not below CPU`: their one-thread-per-segment kernels are
 slower on this part, and the ten-column `lags` family does not repay the
-resident-upload cost. `atr14`/`natr14`/`rsi14` are still #125 names with no GPU
-kernel and record that reason.
+resident-upload cost. At the time of that run `atr14`/`natr14`/`rsi14` were
+#125 names with no GPU kernel and recorded that reason; the #298 tail kernels
+below now register them, while the per-family context term can still keep a
+single family on the CPU with that reason recorded.
 
 A real `--features returns` run including the 4.0 GB append measured 84.3 s
 (CPU) and 99.4 s (GPU) wall in one pair; the append write varied between 13.0 s
@@ -840,6 +845,50 @@ The pinned block cuts D2H by **2.7x** and the whole feature phase by about
 model now exposes. No 16.1M full-catalogue paired run is claimed here: the
 64 MiB arena forbids batching at that width, so that arm keeps the per-column
 staging path and its 180–300 s write floor.
+
+### Engine tail kernels (#298)
+
+`src/cuda/tail.cu` owns the parameterised tail of the engine catalogue. The
+kernels reuse the same resident context but take raw device pointers, so the
+`RcEnrich` layout has one owner (`enrich.cu`). Registration lives in
+`src/enrich.rs::gpu_supports`; `src/enrich_gpu.rs` is the Rust binding and
+`rcsr schema` publishes the tier under `gpu_feature_parity.engine_tail`.
+
+| group | columns | device producer | tier |
+|---|---|---|---|
+| returns / MA | `r16 r96 r192 r672 ret1 ret5 ma96 ma672 ma_slope672` | `rc_enrich_ret`, `rc_enrich_ma`, `rc_enrich_ma_slope` | bitwise (log excepted: `1e-12`) |
+| extrema | `don20 don96 stoch_k stoch_d close_pos20` | blocked van Herk/Gil–Werman prefix-suffix (`O(n)`) | bitwise |
+| ATR / ADX / DI | `atr14 natr14 atr50 batr gapatr volrat adx14 di_plus di_minus di_diff14` | run-serial Wilder recurrence | `1e-12` |
+| Bollinger | `bb20_z bb20_bw bb50 bb50_bw bb96 bb_width96` | rolling mean/std per segment | `1e-12` |
+| exotic | `rmean5 rstd5 ou_hl96 acf1 vr4 rskew96 jump_share semivar_asym cusum_abs_z` | causal prefix rings | `1e-6` (log-derived chain, near-unit AR coefficient) |
+| calendar | `tod_sin tod_cos` | integer bar-of-day phase | bitwise |
+
+The extrema kernel computes the prefix and suffix extrema of blocks of exactly
+the window width and combines one of each. It records window validity before
+masking, so a non-finite bar makes the whole window `NaN`; CUDA's
+`fmax(NaN, x) == x` cannot bridge an invalid bar. A window whose span is not
+contiguous is `NaN` for every family, and Wilder/EMA state restarts after the
+hole.
+
+Measured on the RTX 3060, one million rows, `w=96` (cells counted as rows times
+window, the old cost model's convention): the blocked kernel took **4.58 ms =
+20,961 M cells/s**; the old `O(n*w)` loop took **2,976 ms = 32.3 M cells/s**.
+That is a **650x** kernel improvement. The planner now charges
+`RollingExtrema` at a conservative **180 M rows/s** (measured 218 M rows/s).
+Registration is separate from the auto decision: a two-column `donchian` family
+can still record an `estimated GPU time is not below CPU` reason at 16M rows
+because cost model v2 charges the one-time context per family; `--gpu on` forces
+it and `r16`/`r96`/`don96` are never rejected by the compact guard. `don96` keeps the compact centred convention (`-0.5`) while `don20` and
+`close_pos20` return the uncentred close position. The CPU `donchian` now uses
+the same strict high/low validity as the device kernel.
+
+The compact guard in `gpu_supports` used to route every compact name to the
+reference pass before the kernel table, which made `r16`, `r96` and `don96`
+report `false` despite exact producers. Those three, plus the tail names whose
+compact and standalone formulas agree, now dispatch; the remaining compact
+names (for example `cmf20`, `mfi14`, `body1`) stay on the CPU because their
+producer is the compact reference itself or belongs to the flow/price-action
+family.
 
 ### Measured enrichment (2026-10-21)
 

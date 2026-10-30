@@ -1857,7 +1857,9 @@ impl OpClass {
             OpClass::Calendar => 300_000_000.0,
             OpClass::RollingSum => 100_000_000.0,
             OpClass::RollingStd => 60_000_000.0,
-            OpClass::RollingExtrema => 8_000_000.0,
+            // #298 blocked extrema: 4.58 ms for 1M rows at w=96 on the RTX
+            // 3060 (218M rows/s). 180M is the conservative planner figure.
+            OpClass::RollingExtrema => 180_000_000.0,
             OpClass::WilderScan => 8_000_000.0,
             OpClass::Rank => 40_000_000.0,
             OpClass::Join => 250_000_000.0,
@@ -2005,11 +2007,47 @@ pub fn gpu_supports(name: &str) -> bool {
         return true;
     }
     if is_compact(name)
-        && !matches!(name, "clv1" | "dow_sin" | "dow_cos" | "macd_hist")
+        && !matches!(
+            name,
+            // #298: exact tail kernels. The compact pass remains the CPU
+            // reference for every name not listed here.
+            "clv1"
+                | "dow_sin"
+                | "dow_cos"
+                | "macd_hist"
+                | "r16"
+                | "r96"
+                | "r672"
+                | "ma96"
+                | "ma672"
+                | "ma_slope672"
+                | "natr14"
+                | "adx14"
+                | "di_diff14"
+                | "bb96"
+                | "bb_width96"
+                | "batr"
+                | "gapatr"
+                | "volrat"
+                | "don96"
+                | "ou_hl96"
+                | "acf1"
+                | "vr4"
+                | "rskew96"
+                | "jump_share"
+                | "semivar_asym"
+                | "cusum_abs_z"
+                | "tod_sin"
+                | "tod_cos"
+                | "vol16"
+                | "vol96"
+                | "vol_z96"
+                | "rsi14"
+        )
     {
         // The compact profile is computed by one CPU reference pass. Only the
-        // compact names whose arithmetic is already bit-identical to a
-        // registered kernel (clv1, weekday calendar, macd_hist) may dispatch.
+        // compact names whose arithmetic has an exact registered kernel may
+        // dispatch; the rest stay on the reference path.
         return false;
     }
     if name.starts_with("xs_rank_") {
@@ -2020,18 +2058,24 @@ pub fn gpu_supports(name: &str) -> bool {
         // #296: the complete MTF family has a device resample + causal join.
         return true;
     }
+    if name == "ret1" || name == "ret5" {
+        return true;
+    }
+    if name == "ma_slope672" {
+        return true;
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
-        if (1..=120).contains(&k) {
+        if k > 0 {
             return true;
         }
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        if ma_names().iter().any(|n| n == &format!("ma{}", w)) {
+        if w > 0 {
             return true;
         }
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
-        if vol_names().iter().any(|n| n == &format!("vol{}", w)) {
+        if w > 0 {
             return true;
         }
     }
@@ -2049,7 +2093,12 @@ pub fn gpu_supports(name: &str) -> bool {
         name,
         "bb20_bw"
             | "bb50_bw"
+            | "bb_width96"
+            | "bb20_z"
+            | "bb50"
+            | "bb96"
             | "vz96"
+            | "vol_z96"
             | "range1"
             | "clv1"
             | "dow_sin"
@@ -2060,6 +2109,8 @@ pub fn gpu_supports(name: &str) -> bool {
             | "month_cos"
             | "dom_sin"
             | "dom_cos"
+            | "tod_sin"
+            | "tod_cos"
             | "ema8"
             | "ema20"
             | "ema50"
@@ -2069,8 +2120,30 @@ pub fn gpu_supports(name: &str) -> bool {
             | "macd_sig"
             | "macd_hist"
             | "rsi6"
+            | "rsi14"
             | "rsi28"
+            | "atr14"
+            | "natr14"
             | "atr50"
+            | "batr"
+            | "gapatr"
+            | "volrat"
+            | "stoch_k"
+            | "stoch_d"
+            | "adx14"
+            | "di_plus"
+            | "di_minus"
+            | "di_diff14"
+            | "rmean5"
+            | "rstd5"
+            | "close_pos20"
+            | "ou_hl96"
+            | "acf1"
+            | "vr4"
+            | "rskew96"
+            | "jump_share"
+            | "semivar_asym"
+            | "cusum_abs_z"
     )
 }
 
@@ -3021,23 +3094,20 @@ fn clv1(s: &Series) -> Vec<f64> {
 }
 
 fn donchian(s: &Series, w: usize) -> Vec<f64> {
-    let mut out = vec![f64::NAN; s.len()];
-    for i in 0..s.len() {
-        if !contig(&s.times, i, w, s.step) {
-            continue;
-        }
-        let lo = i + 1 - w;
-        let mut hi = f64::NEG_INFINITY;
-        let mut low = f64::INFINITY;
-        for j in lo..=i {
-            hi = hi.max(s.high[j]);
-            low = low.min(s.low[j]);
-        }
-        if hi > low && low.is_finite() {
-            out[i] = (s.close[i] - low) / (hi - low);
-        }
-    }
-    out
+    // Same strict window policy as the device extrema: a non-finite high or
+    // low anywhere in the window makes the channel missing. This is bit-exact
+    // with the blocked prefix-suffix kernel.
+    let hi = rolling_max(&s.high, w, &s.times, s.step);
+    let lo = rolling_min(&s.low, w, &s.times, s.step);
+    (0..s.len())
+        .map(|i| {
+            if hi[i] > lo[i] && lo[i].is_finite() {
+                (s.close[i] - lo[i]) / (hi[i] - lo[i])
+            } else {
+                f64::NAN
+            }
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -5901,6 +5971,15 @@ fn market_state_pass(
 /// Dispatch one registered catalogue name to its CUDA kernel.
 #[cfg(feature = "cuda")]
 fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec<f64>> {
+    if name == "ret1" {
+        return gpu.ret(1);
+    }
+    if name == "ret5" {
+        return gpu.ret(5);
+    }
+    if name == "ma_slope672" {
+        return gpu.ma_slope(672, 672);
+    }
     if let Some(k) = name.strip_prefix('r').and_then(|s| s.parse::<usize>().ok()) {
         return gpu.ret(k);
     }
@@ -5913,13 +5992,20 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
     if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.lag(k);
     }
+    if name == "don96" {
+        return gpu.donchian_centred(96);
+    }
     if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.donchian(w);
     }
     match name {
         "bb20_bw" => gpu.bb_width(20),
         "bb50_bw" => gpu.bb_width(50),
-        "vz96" => gpu.vz(96),
+        "bb_width96" => gpu.bb_width(96),
+        "bb20_z" => gpu.bb_z(20, 0),
+        "bb50" => gpu.bb_z(50, 1),
+        "bb96" => gpu.bb_z(96, 1),
+        "vz96" | "vol_z96" => gpu.vz(96),
         "range1" => gpu.range(),
         "clv1" => gpu.clv(),
         "dow_sin" => gpu.calendar(0),
@@ -5930,6 +6016,8 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         "month_cos" => gpu.calendar(5),
         "dom_sin" => gpu.calendar(6),
         "dom_cos" => gpu.calendar(7),
+        "tod_sin" => gpu.tod(true),
+        "tod_cos" => gpu.tod(false),
         "ema8" => gpu.ema(8),
         "ema20" => gpu.ema(20),
         "ema50" => gpu.ema(50),
@@ -5937,7 +6025,29 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         "ema200" => gpu.ema(200),
         "rsi6" => gpu.rsi_py(6),
         "rsi28" => gpu.rsi_py(28),
-        "atr50" => gpu.atr_py(50),
+        "rsi14" => gpu.rsi_py(14),
+        "atr14" => gpu.atr(14, 3),
+        "natr14" => gpu.atr(14, 1),
+        "atr50" => gpu.atr(50, 2),
+        "batr" => gpu.batr(),
+        "gapatr" => gpu.gapatr(),
+        "volrat" => gpu.volrat(),
+        "stoch_k" => gpu.stoch(0),
+        "stoch_d" => gpu.stoch(1),
+        "adx14" => gpu.adx(0),
+        "di_plus" => gpu.adx(1),
+        "di_minus" => gpu.adx(2),
+        "di_diff14" => gpu.adx(3),
+        "rmean5" => gpu.exotic(0),
+        "rstd5" => gpu.exotic(1),
+        "close_pos20" => gpu.exotic(2),
+        "ou_hl96" => gpu.exotic(3),
+        "acf1" => gpu.exotic(4),
+        "vr4" => gpu.exotic(5),
+        "rskew96" => gpu.exotic(6),
+        "jump_share" => gpu.exotic(7),
+        "semivar_asym" => gpu.exotic(8),
+        "cusum_abs_z" => gpu.exotic(9),
         _ => None,
     }
 }
@@ -5958,6 +6068,10 @@ fn gpu_batch_op(name: &str) -> Option<crate::enrich_gpu::BatchOp> {
     }
     if let Some(k) = name.strip_prefix("lag_r1_").and_then(|s| s.parse::<usize>().ok()) {
         return Some(BatchOp::lag(k));
+    }
+    if name == "don96" {
+        // The centred compact form is not the generic donchian batch op.
+        return None;
     }
     if let Some(w) = name.strip_prefix("don").and_then(|s| s.parse::<usize>().ok()) {
         return Some(BatchOp::donchian(w));

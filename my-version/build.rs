@@ -51,6 +51,7 @@ fn fail(lines: &[String]) -> ! {
 fn main() {
     println!("cargo:rerun-if-changed=src/cuda/eval.cu");
     println!("cargo:rerun-if-changed=src/cuda/enrich.cu");
+    println!("cargo:rerun-if-changed=src/cuda/tail.cu");
     println!("cargo:rerun-if-changed=src/cuda/mtf.cu");
     println!("cargo:rerun-if-changed=src/cuda/features.cu");
     println!("cargo:rerun-if-changed=src/cuda/enrich_common.h");
@@ -144,6 +145,7 @@ fn main() {
         so.as_str(),
         "src/cuda/eval.cu",
         "src/cuda/enrich.cu",
+        "src/cuda/tail.cu",
         "src/cuda/mtf.cu",
         "src/cuda/features.cu",
         "-lcudart",
