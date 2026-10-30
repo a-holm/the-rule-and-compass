@@ -103,6 +103,7 @@ Every record:
 | `data train <rows> <hash>` | fingerprint of the training sample. |
 | `data test <rows> <hash>` | fingerprint of the test sample. |
 | `error_kind <f32_proxy\|f64\|unknown>` | #256: what the `sol` and `ind` errors are. A GPU search stores `f32_proxy` (optimistic by up to a few `1e-7` relative); a CPU search stores `f64`. |
+| `target_spec <sha256>` | #345: sha256 of the declared target spec of the writing run. Absent without a spec. `--resume` refuses a different value, or a missing one on either side, with exit 2 naming both hashes. |
 | `build <field> <value>` | #256: the process that wrote the file: `version`, `commit` (recorded when the binary was built), `binary_sha256`, `device`, `driver`, `threads`. `--resume` refuses a mismatch unless `--allow-build-change` is given. A checkpoint without `build` records loads and is not checked. There is no timestamp, so a prefix run reproduces an earlier checkpoint byte for byte (apart from `config generations`). |
 | `archive_hash <hex>` | #256: `Archive::hash` of the `sol` members, verified on load. |
 | `archive <members> <cap>` | number of Pareto members and the archive capacity. |
@@ -258,6 +259,7 @@ Limits:
 | checkpoint cannot be read, is truncated, has a bad version/op index/arity, or has a duplicate/missing record | `3` (input) |
 | data fingerprint mismatch | `3` (input) |
 | saved `backend` differs and `--allow-backend-change` was not given | `3` (input) |
+| saved `target_spec` differs from this run's spec (or one side has none) | `2` (usage) |
 | saved `build` identity (binary, commit, version, device, driver, threads) differs and `--allow-build-change` was not given | `3` (input) |
 | `--resume` contradicts a saved search setting; `--save-every` without `--save`; invalid flag value | `2` (usage) |
 | checkpoint cannot be written | `3` (input) |

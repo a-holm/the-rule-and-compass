@@ -199,6 +199,9 @@ pub struct Checkpoint {
     /// #256: the process that wrote the checkpoint. `None` for a file written
     /// before the identity was recorded.
     pub identity: Option<BuildIdentity>,
+    /// #345: sha256 of the declared target spec the run used, or `None` for a
+    /// run without one. A resume must present the same spec.
+    pub target_spec: Option<String>,
 }
 
 /// The operators in [`Op::index`] order. The array index is exactly
@@ -515,6 +518,12 @@ pub fn hash_config_text(text: &str) -> u64 {
 impl Checkpoint {
     /// Serialise the checkpoint to the versioned text format.
     pub fn to_text(&self) -> String {
+        self.to_text_for(self.target_spec.as_deref())
+    }
+
+    /// [`Checkpoint::to_text`] recording `target_spec` (the sha256 of the
+    /// declared target spec of the writing run) instead of the stored one.
+    pub fn to_text_for(&self, target_spec: Option<&str>) -> String {
         let mut out = String::new();
         writeln!(out, "{}", FORMAT_LINE).unwrap();
         write_config(&self.config, &mut out);
@@ -538,6 +547,9 @@ impl Checkpoint {
             writeln!(out, "build device {}", id.device).unwrap();
             writeln!(out, "build driver {}", id.driver).unwrap();
             writeln!(out, "build threads {}", id.threads).unwrap();
+        }
+        if let Some(sha) = target_spec {
+            writeln!(out, "target_spec {}", sha).unwrap();
         }
         writeln!(out, "archive_hash {:016x}", self.archive.hash()).unwrap();
         writeln!(out, "archive {} {}", self.archive.items.len(), self.archive.cap).unwrap();
@@ -641,6 +653,7 @@ impl Checkpoint {
         let mut error_kind: Option<ErrorKind> = None;
         let mut stored_archive_hash: Option<u64> = None;
         let mut build_fields: BTreeMap<String, String> = BTreeMap::new();
+        let mut target_spec: Option<String> = None;
         let mut final_header: Option<(usize, usize, u64)> = None;
         let mut final_sols: Vec<Sol> = Vec::new();
 
@@ -777,6 +790,12 @@ impl Checkpoint {
                     {
                         return Err(format!("line {}: duplicate build field '{}'", lineno, key));
                     }
+                }
+                "target_spec" => {
+                    let v = parts
+                        .get(1)
+                        .ok_or_else(|| format!("line {}: target_spec has no value", lineno))?;
+                    set_once(&mut target_spec, v.to_string(), "target_spec", lineno)?;
                 }
                 "final" => {
                     let members = parse_num::<usize>(&parts, 1, lineno, "final members")?;
@@ -1045,6 +1064,7 @@ impl Checkpoint {
             })
         };
         Ok(Checkpoint {
+            target_spec,
             config,
             backend,
             config_hash: computed_hash,
@@ -1083,6 +1103,19 @@ impl Checkpoint {
     /// The previous good generation is retained as `<path>.prev`.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), String> {
         self.save_with_fault(path, crate::atomic::Fault::None)
+    }
+
+    /// [`Checkpoint::save`] recording the target spec sha256 of the running
+    /// process (#345).
+    pub fn save_for(
+        &self,
+        path: impl AsRef<Path>,
+        target_spec: Option<&str>,
+    ) -> Result<(), String> {
+        let path = path.as_ref();
+        let text = self.to_text_for(target_spec);
+        crate::atomic::write_atomic(path, text.as_bytes(), crate::atomic::Fault::None)
+            .map_err(|e| format!("cannot write checkpoint '{}': {}", path.display(), e))
     }
 
     /// [`Checkpoint::save`] with a deliberate fault, for the crash-safety test.
@@ -1137,6 +1170,21 @@ impl Checkpoint {
              resume under a different binary, device or thread count (the trajectory \
              may differ)",
             diff.join("; ")
+        ))
+    }
+
+    /// #345: refuse a resume under a different declared target spec. `current`
+    /// is the sha256 of this run's spec, or `None` without one. Both hashes
+    /// are named; an absent spec reads as `none`.
+    pub fn check_target_spec(&self, current: Option<&str>) -> Result<(), String> {
+        if self.target_spec.as_deref() == current {
+            return Ok(());
+        }
+        Err(format!(
+            "checkpoint target spec mismatch: saved sha256 {}, this run {}; refusing to \
+             resume a search under a different target spec",
+            self.target_spec.as_deref().unwrap_or("none"),
+            current.unwrap_or("none")
         ))
     }
 
