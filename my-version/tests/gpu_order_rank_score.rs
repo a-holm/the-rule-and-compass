@@ -3,7 +3,7 @@
 //! These integration tests pin the production path, not just the device entry
 //! point:
 //!
-//! * from the measured row floors, `median`, `interquartile`, `maximum`,
+//! * from the measured row floor, `median`, `interquartile`,
 //!   `rank_correlation`, `rank_correlation_signed` and `auc` score the whole
 //!   population on the device, so `--no-fit` still uses the exact statistic
 //!   (the constants are untouched, but the fitness is not a CPU fallback);
@@ -109,10 +109,11 @@ fn no_fit_scores_order_and_rank_metrics_on_the_device() {
     }
 }
 
-/// #288: maximum has its own, lower 512-row floor.
+/// #287: maximum is an objective-kernel row of the table, so it scores on the
+/// device without the order/rank floor and its archive is still exact.
 #[cfg(feature = "cuda")]
 #[test]
-fn maximum_scores_natively_from_its_own_floor() {
+fn maximum_scores_natively_through_the_objective_kernel() {
     if !device_available() {
         eprintln!("skipping GPU test: no usable CUDA device");
         return;
@@ -164,6 +165,10 @@ fn a_metric_outside_the_table_keeps_its_named_refusal() {
     assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
     assert_eq!(
         search::backend_blocker_reason(&cfg, &s),
-        Some("metric is not scored natively on the GPU")
+        rcsr::metrics::score_refusal(Metric::Slope)
+    );
+    assert_eq!(
+        rcsr::metrics::score_refusal(Metric::Slope),
+        Some("slope needs a cross-row first-difference pass")
     );
 }

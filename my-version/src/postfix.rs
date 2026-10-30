@@ -216,19 +216,35 @@ impl Arena {
     }
 
     /// Device evaluation of the whole arena in one upload and one launch.
-    /// Returns the mean squared error the search uses (SSE / rows).
+    ///
+    /// #287: the returned value is the configured native score objective, not
+    /// a squared-error surrogate. The kernel already computes the mean,
+    /// maximum, correlation or AIC penalty, so there is no host division by
+    /// the row count and a non-finite prediction is `+inf` by status.
     pub fn evaluate(
         &mut self,
         ev: &mut gpu::GpuEvaluator,
-        n_rows: usize,
+        objective: crate::metrics::ScoreObjective,
     ) -> Result<(), String> {
-        let (sse, ms) = ev.eval_arena(&self.words, self.islands * self.pop, self.width);
-        if ms < 0.0 || sse.len() != self.islands * self.pop {
+        let batch = ev.score_arena(
+            &self.words,
+            self.islands * self.pop,
+            self.width,
+            objective,
+        );
+        if batch.ms < 0.0 || !batch.is_consistent() || batch.values.len() != self.err.len() {
             return Err("CUDA pool evaluation failed".to_string());
         }
-        let n = n_rows.max(1) as f64;
-        for (e, s) in self.err.iter_mut().zip(sse) {
-            *e = if s.is_finite() { s as f64 / n } else { f64::INFINITY };
+        for (e, (value, status)) in self
+            .err
+            .iter_mut()
+            .zip(batch.values.iter().zip(batch.status.iter()))
+        {
+            *e = if status.is_ok() {
+                *value
+            } else {
+                f64::INFINITY
+            };
         }
         Ok(())
     }

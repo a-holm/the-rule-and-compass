@@ -126,6 +126,13 @@ pub const MAX_EVENT_BYTES: usize = 8 * 1024;
 
 /// A finite number as a JSON token; a non-finite one becomes `null` rather than
 /// the invalid `NaN`/`inf` that `format!("{}", f64)` would produce.
+fn opt_num(v: Option<f64>) -> String {
+    match v {
+        Some(v) if v.is_finite() => num(v),
+        _ => "null".to_string(),
+    }
+}
+
 pub fn num(v: f64) -> String {
     if v.is_finite() {
         let mut s = format!("{}", v);
@@ -705,8 +712,20 @@ pub struct RunEnd {
     pub peak_rss_bytes: Option<u64>,
     /// GPU full-path wall for the whole run.
     pub gpu_wall_s: Option<f64>,
-    /// `gpu_wall_s / 3600`, the device-hours this run consumed.
+    /// `gpu_wall_s / 3600`, the evaluator-window device-hours.
     pub device_hours: Option<f64>,
+    /// #284: run wall from the ledger.
+    pub run_wall_s: Option<f64>,
+    /// #284: union of device intervals over the run.
+    pub device_busy_s: Option<f64>,
+    /// #284: `device_busy_s / run_wall_s`.
+    pub duty_run: Option<f64>,
+    /// #284: wall not attributed to an exclusive stage.
+    pub unaccounted_s: Option<f64>,
+    /// #284: fit kernel seconds from raw device events.
+    pub fit_kernel_s: Option<f64>,
+    /// #284: exact CPU fit-fallback seconds.
+    pub fit_fallback_s: Option<f64>,
     /// Log bookkeeping: events written, bytes, events dropped by the cap.
     pub events: u64,
     pub bytes: u64,
@@ -720,6 +739,8 @@ pub fn run_end_json(r: &RunEnd) -> String {
         "{{\"schema\":\"{}\",\"v\":{},\"event\":\"run_end\",\"generations\":{},\"stop\":{},\
          \"wall\":{},\"search\":{},\"archive\":{{\"size\":{},\"best_error\":{},\"hash\":{}}},\
          \"json\":{},\"peak_rss_bytes\":{},\"gpu_wall_s\":{},\"device_hours\":{},\
+         \"run_wall_s\":{},\"device_busy_s\":{},\"duty_run\":{},\"unaccounted_s\":{},\
+         \"fit_kernel_s\":{},\"fit_fallback_s\":{},\
          \"events\":{},\"bytes\":{},\"dropped\":{},\"end\":{}}}",
         SCHEMA,
         VERSION,
@@ -743,6 +764,12 @@ pub fn run_end_json(r: &RunEnd) -> String {
             Some(v) => num(v),
             None => "null".to_string(),
         },
+        opt_num(r.run_wall_s),
+        opt_num(r.device_busy_s),
+        opt_num(r.duty_run),
+        opt_num(r.unaccounted_s),
+        opt_num(r.fit_kernel_s),
+        opt_num(r.fit_fallback_s),
         r.events,
         r.bytes,
         r.dropped,

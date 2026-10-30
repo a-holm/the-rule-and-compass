@@ -54,8 +54,19 @@ pub enum Metric {
     Auc,
     /// Mean logistic (cross-entropy) loss (classification).
     LogLoss,
-    /// Mean hinge loss (classification).
+    /// Mean Brier score `(σ(p) − l)²` (classification).
+    Brier,
+    /// Mean **bounded sigmoid** hinge surrogate `2σ(−t·p)` (classification).
+    ///
+    /// This is the historical `hinge` metric, not the SVM hinge: it is smooth,
+    /// bounded in `(0, 2)` and never exactly zero, so it has no finite optimum
+    /// on separable data. [`Metric::HingeOrdinary`] and
+    /// [`Metric::HingeSquared`] are the separate SVM forms.
     Hinge,
+    /// Mean ordinary (SVM) hinge `max(0, 1 − t·p)` (classification).
+    HingeOrdinary,
+    /// Mean squared hinge `max(0, 1 − t·p)²` (classification).
+    HingeSquared,
     /// Mean absolute error of the first difference: how well slopes match.
     Slope,
     /// Mean distance from each point to the candidate's zero level set,
@@ -92,7 +103,10 @@ impl Metric {
             ImplicitResidual,
             Auc,
             LogLoss,
+            Brier,
             Hinge,
+            HingeOrdinary,
+            HingeSquared,
             Aic,
             Aicc,
             Bic,
@@ -121,7 +135,10 @@ impl Metric {
             "interquartile" | "iqr" | "iqmae" => Interquartile,
             "auc" | "roc" => Auc,
             "log_loss" | "logloss" | "cross_entropy" => LogLoss,
-            "hinge" => Hinge,
+            "brier" | "brier_score" => Brier,
+            "hinge" | "hinge_sigmoid" | "hinge_logistic" => Hinge,
+            "hinge_ordinary" | "hinge_linear" | "hinge_svm" => HingeOrdinary,
+            "hinge_squared" | "squared_hinge" => HingeSquared,
             "slope" | "derivative" => Slope,
             "implicit" | "implicit_derivative" | "implicit_deriv" | "level_set"
             | "levelset" => ImplicitDerivative,
@@ -158,7 +175,10 @@ impl Metric {
             Interquartile => "interquartile",
             Auc => "auc",
             LogLoss => "log_loss",
+            Brier => "brier",
             Hinge => "hinge",
+            HingeOrdinary => "hinge_ordinary",
+            HingeSquared => "hinge_squared",
             Slope => "slope",
             ImplicitDerivative => "implicit",
             ImplicitResidual => "implicit_residual",
@@ -174,7 +194,15 @@ impl Metric {
     /// ([`classification_target_error`]) rather than silently collapsed to
     /// `positive = {largest class}`.
     pub fn is_classification(self) -> bool {
-        matches!(self, Metric::Auc | Metric::LogLoss | Metric::Hinge)
+        matches!(
+            self,
+            Metric::Auc
+                | Metric::LogLoss
+                | Metric::Brier
+                | Metric::Hinge
+                | Metric::HingeOrdinary
+                | Metric::HingeSquared
+        )
     }
 
     /// True for metrics that depend on the number of fitted constants.
@@ -207,6 +235,607 @@ impl Metric {
     /// how the search fits constants (see [`crate::implicit::fit`]).
     pub fn is_implicit_derivative(self) -> bool {
         self == Metric::ImplicitDerivative
+    }
+}
+
+/// #287: the device/native scoring statistic for a metric.
+///
+/// This is deliberately **not** [`crate::fit::DeviceLoss`]: fitting and scoring
+/// are separate decisions. `log_loss` has a device *fit* objective and, since
+/// #289, a native *score*; a metric may have a native score while its constants
+/// still fit by a warm-start objective (Brier and the hinge forms). The
+/// discriminants are the `kind` argument of `rc_score_batch`/`rc_pool_score` in
+/// `src/cuda/eval.cu` (`RC_SCORE_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreObjective {
+    /// Mean `r²`.
+    Squared,
+    /// Mean `|r|`.
+    Absolute,
+    /// Mean `ln(1 + r²)`.
+    LogSquashed,
+    /// `|mean r|`.
+    Signed,
+    /// `max |r|`, with the lowest-row tie broken on the `|r|` bit pattern.
+    Maximum,
+    /// `1 − |ρ|`, two-pass centred moments.
+    Correlation,
+    /// `1 − ρ`, two-pass centred moments.
+    CorrelationSigned,
+    /// `n·ln(RSS/n) + 2k`.
+    Aic,
+    /// Small-sample-corrected AIC.
+    Aicc,
+    /// `n·ln(RSS/n) + k·ln n`.
+    Bic,
+    /// #289: mean stable softplus `max(−u, 0) + log1p(exp(−|u|))`, `u = t·p`.
+    LogLoss,
+    /// #289: mean `(σ(p) − l)²`.
+    Brier,
+    /// #289: the historical bounded sigmoid hinge surrogate `2σ(−u)`.
+    HingeSigmoid,
+    /// #289: `max(0, 1 − u)`.
+    HingeOrdinary,
+    /// #289: `max(0, 1 − u)²`.
+    HingeSquared,
+}
+
+impl ScoreObjective {
+    /// The `RC_SCORE_*` code the CUDA scoring entry points take.
+    ///
+    /// The regression block is 0–9 (#287); classification is 10–14 (#289) so a
+    /// fit code (0–5 in `DeviceLoss`) and a score code can never be confused,
+    /// and every code in this enum has its own kernel branch.
+    pub fn code(self) -> i32 {
+        match self {
+            ScoreObjective::Squared => 0,
+            ScoreObjective::Absolute => 1,
+            ScoreObjective::LogSquashed => 2,
+            ScoreObjective::Signed => 3,
+            ScoreObjective::Maximum => 4,
+            ScoreObjective::Correlation => 5,
+            ScoreObjective::CorrelationSigned => 6,
+            ScoreObjective::Aic => 7,
+            ScoreObjective::Aicc => 8,
+            ScoreObjective::Bic => 9,
+            ScoreObjective::LogLoss => 10,
+            ScoreObjective::Brier => 11,
+            ScoreObjective::HingeSigmoid => 12,
+            ScoreObjective::HingeOrdinary => 13,
+            ScoreObjective::HingeSquared => 14,
+        }
+    }
+
+    /// Inverse of [`Self::code`], used when a status report is read back.
+    pub fn from_code(code: i32) -> Option<Self> {
+        Some(match code {
+            0 => ScoreObjective::Squared,
+            1 => ScoreObjective::Absolute,
+            2 => ScoreObjective::LogSquashed,
+            3 => ScoreObjective::Signed,
+            4 => ScoreObjective::Maximum,
+            5 => ScoreObjective::Correlation,
+            6 => ScoreObjective::CorrelationSigned,
+            7 => ScoreObjective::Aic,
+            8 => ScoreObjective::Aicc,
+            9 => ScoreObjective::Bic,
+            10 => ScoreObjective::LogLoss,
+            11 => ScoreObjective::Brier,
+            12 => ScoreObjective::HingeSigmoid,
+            13 => ScoreObjective::HingeOrdinary,
+            14 => ScoreObjective::HingeSquared,
+            _ => return None,
+        })
+    }
+
+    /// A stable name for reports and schema output.
+    pub fn name(self) -> &'static str {
+        match self {
+            ScoreObjective::Squared => "squared",
+            ScoreObjective::Absolute => "absolute",
+            ScoreObjective::LogSquashed => "log_squashed",
+            ScoreObjective::Signed => "signed",
+            ScoreObjective::Maximum => "maximum",
+            ScoreObjective::Correlation => "correlation",
+            ScoreObjective::CorrelationSigned => "correlation_signed",
+            ScoreObjective::Aic => "aic",
+            ScoreObjective::Aicc => "aicc",
+            ScoreObjective::Bic => "bic",
+            ScoreObjective::LogLoss => "log_loss",
+            ScoreObjective::Brier => "brier",
+            ScoreObjective::HingeSigmoid => "hinge",
+            ScoreObjective::HingeOrdinary => "hinge_ordinary",
+            ScoreObjective::HingeSquared => "hinge_squared",
+        }
+    }
+
+    /// The metric this objective scores.
+    pub fn metric(self) -> Metric {
+        match self {
+            ScoreObjective::Squared => Metric::Squared,
+            ScoreObjective::Absolute => Metric::Absolute,
+            ScoreObjective::LogSquashed => Metric::LogSquashed,
+            ScoreObjective::Signed => Metric::Signed,
+            ScoreObjective::Maximum => Metric::Maximum,
+            ScoreObjective::Correlation => Metric::Correlation,
+            ScoreObjective::CorrelationSigned => Metric::CorrelationSigned,
+            ScoreObjective::Aic => Metric::Aic,
+            ScoreObjective::Aicc => Metric::Aicc,
+            ScoreObjective::Bic => Metric::Bic,
+            ScoreObjective::LogLoss => Metric::LogLoss,
+            ScoreObjective::Brier => Metric::Brier,
+            ScoreObjective::HingeSigmoid => Metric::Hinge,
+            ScoreObjective::HingeOrdinary => Metric::HingeOrdinary,
+            ScoreObjective::HingeSquared => Metric::HingeSquared,
+        }
+    }
+
+    /// The native scoring objective for a classification metric, or `None`.
+    ///
+    /// `auc` deliberately returns `None`: it is a rank statistic with its own
+    /// segmented-sort stage (#288), not a per-row loss.
+    pub fn for_metric(metric: Metric) -> Option<Self> {
+        match metric {
+            Metric::LogLoss => Some(ScoreObjective::LogLoss),
+            Metric::Brier => Some(ScoreObjective::Brier),
+            Metric::Hinge => Some(ScoreObjective::HingeSigmoid),
+            Metric::HingeOrdinary => Some(ScoreObjective::HingeOrdinary),
+            Metric::HingeSquared => Some(ScoreObjective::HingeSquared),
+            _ => None,
+        }
+    }
+
+    /// True when the objective is parameter-aware and needs `k`.
+    pub fn needs_constants(self) -> bool {
+        matches!(
+            self,
+            ScoreObjective::Aic | ScoreObjective::Aicc | ScoreObjective::Bic
+        )
+    }
+
+    /// True when the scorer accumulates a two-pass centred moment.
+    pub fn is_correlation(self) -> bool {
+        matches!(
+            self,
+            ScoreObjective::Correlation | ScoreObjective::CorrelationSigned
+        )
+    }
+
+    /// True for the label-aware classification row losses (#289).
+    pub fn is_classification(self) -> bool {
+        matches!(
+            self,
+            ScoreObjective::LogLoss
+                | ScoreObjective::Brier
+                | ScoreObjective::HingeSigmoid
+                | ScoreObjective::HingeOrdinary
+                | ScoreObjective::HingeSquared
+        )
+    }
+}
+
+/// #287: one row of the score dispatch table.
+///
+/// Every [`Metric`] maps here exactly once. `Native` means a device kernel
+/// computes the configured statistic; `Refused` carries a named, user-facing
+/// reason instead of silently substituting squared error (the #236 defect).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreDispatch {
+    /// A native one-pass/two-pass statistic.
+    Native(ScoreObjective),
+    /// #288: an exact `f64` order-statistic or rank statistic scored through
+    /// the plan batch entry point (flattened plans, sorted residual bits).
+    Exact(ScoreStat),
+    /// No native scorer in this issue; the name says why.
+    Refused(&'static str),
+}
+
+impl ScoreDispatch {
+    /// The native objective, or `None` when the metric is refused.
+    pub fn objective(self) -> Option<ScoreObjective> {
+        match self {
+            ScoreDispatch::Native(o) => Some(o),
+            ScoreDispatch::Exact(_) | ScoreDispatch::Refused(_) => None,
+        }
+    }
+
+    /// #288: the exact order/rank statistic, or `None`.
+    pub fn stat(self) -> Option<ScoreStat> {
+        match self {
+            ScoreDispatch::Exact(s) => Some(s),
+            ScoreDispatch::Native(_) | ScoreDispatch::Refused(_) => None,
+        }
+    }
+
+    /// The refusal reason, or `None` for a native metric.
+    pub fn refusal(self) -> Option<&'static str> {
+        match self {
+            ScoreDispatch::Native(_) | ScoreDispatch::Exact(_) => None,
+            ScoreDispatch::Refused(reason) => Some(reason),
+        }
+    }
+}
+
+/// #288: an exact order-statistic or rank statistic the device can score
+/// natively.
+///
+/// This is the **scoring** counterpart of [`crate::fit::DeviceLoss`] and
+/// [`crate::fit::OrderStat`]: it names the statistic a batch of *arbitrary*
+/// candidates is ranked on, not the objective a fit arm moves constants
+/// against. Every member is computed from the exact `f64` forward pass over the
+/// resident rows, so a value depends only on the candidate's prediction vector
+/// and the target, never on the batch it was scored in, the wave split, or the
+/// number of islands.
+///
+/// The statistics split into two families:
+///
+/// * **order** — `median`, `interquartile` and `maximum` of `|pred − y|`. The
+///   first two are the segmented sort/pick already used by the fit arms; the
+///   maximum is the order-free integer max scan. All three are bit-identical to
+///   the CPU statistic for the same prediction vector.
+/// * **rank** — `rank_correlation(_signed)` and `auc`. Both are exact integer
+///   sums over average ranks (`A_i = 2r_i − (n+1)`); the only floating-point
+///   operations are the final divide (and square root for rho), so ties share
+///   one integer and `−0.0`/`+0.0` are one tie exactly like the CPU's `==`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreStat {
+    /// Median of `|pred − y|`; even `n` averages the two middle values.
+    Median,
+    /// Mean of `|pred − y|` over the sorted ranks `[⌊n/4⌋, ⌊3n/4⌋)`.
+    Interquartile,
+    /// Exact `max |pred − y|` (lowest-row tie, order-free).
+    Maximum,
+    /// `1 − |ρ_s|` from exact integer rank sums.
+    RankCorrelation,
+    /// `1 − ρ_s` from exact integer rank sums.
+    RankCorrelationSigned,
+    /// `1 − AUC`, the rank (Mann–Whitney U) form of the area under the ROC.
+    Auc,
+}
+
+impl ScoreStat {
+    /// The exact statistic the [`score_dispatch`] table names for a metric, or
+    /// `None` when the table scores it with the objective kernel or refuses it.
+    pub fn for_metric(metric: Metric) -> Option<Self> {
+        score_dispatch(metric).stat()
+    }
+
+    /// The configured CPU metric this statistic is the definition of.
+    pub fn metric(self) -> Metric {
+        match self {
+            ScoreStat::Median => Metric::Median,
+            ScoreStat::Interquartile => Metric::Interquartile,
+            ScoreStat::Maximum => Metric::Maximum,
+            ScoreStat::RankCorrelation => Metric::RankCorrelation,
+            ScoreStat::RankCorrelationSigned => Metric::RankCorrelationSigned,
+            ScoreStat::Auc => Metric::Auc,
+        }
+    }
+
+    /// Stable name for the ledger, the schema text and the fallback reason.
+    pub fn name(self) -> &'static str {
+        self.metric().name()
+    }
+
+    /// The measured minimum training-row count below which the exact CPU
+    /// statistic is cheaper than the device launch and sort.
+    ///
+    /// The sort-based statistics reuse the fit arms' measured floor
+    /// ([`crate::fit::MEDIAN_GPU_MIN_ROWS`] = 4096 rows); the order-free
+    /// maximum uses its own 512-row floor
+    /// ([`crate::fit::MAXIMUM_GPU_MIN_ROWS`]). The rank family is sort-based
+    /// too, so it shares 4096. Below the floor the run keeps the CPU scorer and
+    /// records this reason; the device may still fit constants through the
+    /// fit-only arm.
+    pub fn min_rows(self) -> usize {
+        match self {
+            ScoreStat::Maximum => crate::fit::MAXIMUM_GPU_MIN_ROWS,
+            ScoreStat::Median
+            | ScoreStat::Interquartile
+            | ScoreStat::RankCorrelation
+            | ScoreStat::RankCorrelationSigned
+            | ScoreStat::Auc => crate::fit::MEDIAN_GPU_MIN_ROWS,
+        }
+    }
+
+    /// The `'static` refusal used when the sample is below [`Self::min_rows`].
+    pub fn small_sample_reason(self) -> &'static str {
+        match self {
+            ScoreStat::Maximum => {
+                "maximum scoring: the sample is below the 512-row device floor"
+            }
+            _ => "order/rank scoring: the sample is below the 4096-row device floor",
+        }
+    }
+
+    /// True for the two Spearman statistics.
+    pub fn is_rank(self) -> bool {
+        matches!(
+            self,
+            ScoreStat::RankCorrelation | ScoreStat::RankCorrelationSigned
+        )
+    }
+}
+
+/// #287: the total `Metric -> ScoreDispatch` table.
+///
+/// The match is exhaustive, so adding a `Metric` without deciding how it is
+/// scored is a compile error rather than a silent fallback. The table is the
+/// only scoring gate: [`crate::search::gpu_blocker`], the CUDA entry points and
+/// this module all read it.
+pub fn score_dispatch(m: Metric) -> ScoreDispatch {
+    use Metric::*;
+    use ScoreObjective as O;
+    match m {
+        Squared => ScoreDispatch::Native(O::Squared),
+        Absolute => ScoreDispatch::Native(O::Absolute),
+        LogSquashed => ScoreDispatch::Native(O::LogSquashed),
+        Signed => ScoreDispatch::Native(O::Signed),
+        Maximum => ScoreDispatch::Native(O::Maximum),
+        Correlation => ScoreDispatch::Native(O::Correlation),
+        CorrelationSigned => ScoreDispatch::Native(O::CorrelationSigned),
+        Aic => ScoreDispatch::Native(O::Aic),
+        Aicc => ScoreDispatch::Native(O::Aicc),
+        Bic => ScoreDispatch::Native(O::Bic),
+        // #289: the label-aware classification family.
+        LogLoss => ScoreDispatch::Native(O::LogLoss),
+        Brier => ScoreDispatch::Native(O::Brier),
+        Hinge => ScoreDispatch::Native(O::HingeSigmoid),
+        HingeOrdinary => ScoreDispatch::Native(O::HingeOrdinary),
+        HingeSquared => ScoreDispatch::Native(O::HingeSquared),
+        Median => ScoreDispatch::Exact(ScoreStat::Median),
+        Interquartile => ScoreDispatch::Exact(ScoreStat::Interquartile),
+        RankCorrelation => ScoreDispatch::Exact(ScoreStat::RankCorrelation),
+        RankCorrelationSigned => ScoreDispatch::Exact(ScoreStat::RankCorrelationSigned),
+        Slope => ScoreDispatch::Refused(
+            "slope needs a cross-row first-difference pass",
+        ),
+        ImplicitDerivative => ScoreDispatch::Refused(
+            "implicit needs an expression-tree gradient pass",
+        ),
+        ImplicitResidual => ScoreDispatch::Refused(
+            "implicit_residual needs implicit samples on the device",
+        ),
+        Auc => ScoreDispatch::Exact(ScoreStat::Auc),
+    }
+}
+
+/// #287: the native scoring objective for a metric, or `None` when refused.
+pub fn native_score_objective(m: Metric) -> Option<ScoreObjective> {
+    score_dispatch(m).objective()
+}
+
+/// #287: the named reason a metric has no native scorer, or `None`.
+pub fn score_refusal(m: Metric) -> Option<&'static str> {
+    score_dispatch(m).refusal()
+}
+
+/// #287: a per-candidate scoring status, mirrored by the CUDA ABI.
+///
+/// `Ok` is `0`; `NonFinite` is `2` (the existing order-statistic/maximum ABI);
+/// the CPU-only labels use higher values. A non-`Ok` status always carries
+/// `value = +inf`.
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScoreStatus {
+    /// A finite (or explicitly `-inf`, for a perfect AIC fit) score.
+    Ok = 0,
+    /// A prediction was not finite (or exceeded the device's hard magnitude).
+    NonFinite = 2,
+    /// Lengths disagreed or an input weight was negative/non-finite.
+    Invalid = 3,
+    /// Every row was masked by a zero weight.
+    AllZeroWeight = 4,
+    /// The device launch failed; the caller must fall back to the CPU.
+    DeviceError = 5,
+}
+
+impl ScoreStatus {
+    /// The wire code for the CUDA status array.
+    pub fn code(self) -> i32 {
+        self as i32
+    }
+
+    /// Decode a device status; unknown values are a device failure.
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => ScoreStatus::Ok,
+            2 => ScoreStatus::NonFinite,
+            3 => ScoreStatus::Invalid,
+            4 => ScoreStatus::AllZeroWeight,
+            _ => ScoreStatus::DeviceError,
+        }
+    }
+
+    /// True when `value` is usable.
+    pub fn is_ok(self) -> bool {
+        self == ScoreStatus::Ok
+    }
+}
+
+/// #287: the CPU reference result of a native reduction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NativeScore {
+    /// The metric value; `+inf` for every non-`Ok` status.
+    pub value: f64,
+    /// Why the value is unusable, if it is.
+    pub status: ScoreStatus,
+    /// Lowest maximiser row for [`ScoreObjective::Maximum`].
+    pub maximum_row: Option<usize>,
+}
+
+impl NativeScore {
+    fn ok(value: f64) -> Self {
+        NativeScore {
+            value,
+            status: ScoreStatus::Ok,
+            maximum_row: None,
+        }
+    }
+
+    fn invalid(status: ScoreStatus) -> Self {
+        NativeScore {
+            value: f64::INFINITY,
+            status,
+            maximum_row: None,
+        }
+    }
+}
+
+/// #287: CPU reference for a native score objective, without weights.
+///
+/// This is the exact `f64` reducer the CUDA kernel mirrors. It exists so the
+/// statistic can be tested independently of the general metric dispatcher and
+/// so a device readback can be compared against the same formula given the same
+/// (f32-rounded) prediction vector.
+pub fn score_native(pred: &[f64], y: &[f64], objective: ScoreObjective, k: usize) -> NativeScore {
+    score_native_weighted(pred, y, &[], objective, k)
+}
+
+/// #287: CPU reference for a native score objective with optional weights.
+///
+/// Zero-weight rows are masked **before** any prediction is read, exactly like
+/// [`score_weighted`]. A non-finite prediction in a masked row is therefore
+/// invisible. `maximum` has no weighted form and refuses weights.
+///
+/// #289: the classification objectives read `pred` as a **logit**, derive the
+/// label `l = [y > weighted midpoint]` and accumulate the configured row loss.
+/// The midpoint is taken over positive-weight rows, matching
+/// [`score_weighted`]'s weighted classification branch.
+pub fn score_native_weighted(
+    pred: &[f64],
+    y: &[f64],
+    w: &[f64],
+    objective: ScoreObjective,
+    k: usize,
+) -> NativeScore {
+    let n = pred.len();
+    if n == 0 || y.len() != n || (!w.is_empty() && w.len() != n) {
+        return NativeScore::invalid(ScoreStatus::Invalid);
+    }
+    let weighted = !w.is_empty();
+    if weighted {
+        if objective == ScoreObjective::Maximum {
+            return NativeScore::invalid(ScoreStatus::Invalid);
+        }
+        let mut total = 0.0;
+        for &wi in w {
+            if !wi.is_finite() || wi < 0.0 {
+                return NativeScore::invalid(ScoreStatus::Invalid);
+            }
+            total += wi;
+        }
+        if !(total > 0.0) {
+            return NativeScore::invalid(ScoreStatus::AllZeroWeight);
+        }
+    }
+    for (i, &p) in pred.iter().enumerate() {
+        if (!weighted || w[i] > 0.0) && !p.is_finite() {
+            return NativeScore::invalid(ScoreStatus::NonFinite);
+        }
+    }
+    // Masked rows have a zero residual, so no `w * loss` product can become
+    // `0 * inf = NaN`.
+    let active = |i: usize| !weighted || w[i] > 0.0;
+    let weight = |i: usize| if weighted { w[i] } else { 1.0 };
+    let denom = if weighted {
+        w.iter().sum::<f64>()
+    } else {
+        n as f64
+    };
+
+    // #289: the label-aware objectives are not functions of `pred - y`.
+    if objective.is_classification() {
+        let labels = if weighted {
+            match binary_labels_weighted(y, w) {
+                Some(labels) => labels,
+                None => return NativeScore::invalid(ScoreStatus::NonFinite),
+            }
+        } else {
+            binary_labels(y)
+        };
+        let mut sum = 0.0;
+        for i in 0..n {
+            if active(i) {
+                sum += weight(i) * classification_row_loss(pred[i], labels[i], objective);
+            }
+        }
+        return NativeScore::ok(sum / denom);
+    }
+
+    match objective {
+        ScoreObjective::Maximum => {
+            let mut best_bits = 0u64;
+            let mut best_row = 0usize;
+            for i in 0..n {
+                let key = (pred[i] - y[i]).abs().to_bits();
+                if key > best_bits {
+                    best_bits = key;
+                    best_row = i;
+                }
+            }
+            NativeScore {
+                value: f64::from_bits(best_bits),
+                status: ScoreStatus::Ok,
+                maximum_row: Some(best_row),
+            }
+        }
+        ScoreObjective::Correlation | ScoreObjective::CorrelationSigned => {
+            let rho = if weighted {
+                weighted_correlation(pred, y, w)
+            } else {
+                correlation(pred, y)
+            };
+            NativeScore::ok(if objective == ScoreObjective::Correlation {
+                1.0 - rho.abs()
+            } else {
+                1.0 - rho
+            })
+        }
+        ScoreObjective::Signed => {
+            let mut sum = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    sum += weight(i) * (pred[i] - y[i]);
+                }
+            }
+            NativeScore::ok((sum / denom).abs())
+        }
+        ScoreObjective::Aic | ScoreObjective::Aicc | ScoreObjective::Bic => {
+            let mut rss = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    let r = pred[i] - y[i];
+                    rss += weight(i) * r * r;
+                }
+            }
+            let rows = if weighted {
+                w.iter().filter(|&&wi| wi > 0.0).count()
+            } else {
+                n
+            };
+            NativeScore::ok(match objective {
+                ScoreObjective::Aic => aic(rows, rss, k),
+                ScoreObjective::Aicc => aicc(rows, rss, k),
+                _ => bic(rows, rss, k),
+            })
+        }
+        objective => {
+            let mut sum = 0.0;
+            for i in 0..n {
+                if active(i) {
+                    let r = pred[i] - y[i];
+                    let loss = match objective {
+                        ScoreObjective::Squared => r * r,
+                        ScoreObjective::Absolute => r.abs(),
+                        ScoreObjective::LogSquashed => (1.0 + r * r).ln(),
+                        _ => unreachable!("maximum, correlation and classification are handled above"),
+                    };
+                    sum += weight(i) * loss;
+                }
+            }
+            NativeScore::ok(sum / denom)
+        }
     }
 }
 
@@ -255,7 +884,10 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
         }
         Metric::Auc => 1.0 - auc(pred, y),
         Metric::LogLoss => log_loss(pred, y),
+        Metric::Brier => brier(pred, y),
         Metric::Hinge => hinge(pred, y),
+        Metric::HingeOrdinary => hinge_ordinary(pred, y),
+        Metric::HingeSquared => hinge_squared(pred, y),
         Metric::Aic => aic(n, rss(&resid), k),
         Metric::Aicc => aicc(n, rss(&resid), k),
         Metric::Bic => bic(n, rss(&resid), k),
@@ -271,9 +903,11 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
 /// every other metric rather than silently ignoring the weights.
 ///
 /// Supported: `absolute`, `squared`, `correlation`, `correlation_signed`,
-/// `signed`, `log_squashed`, `implicit`, `implicit_residual`, `aic`, `aicc` and
-/// `bic`. The order-statistic, classification, rank and first-difference metrics
-/// have no standard weighted definition (see `docs/weights.md`).
+/// `signed`, `log_squashed`, `log_loss`, `brier`, the three hinge forms,
+/// `implicit`, `implicit_residual`, `aic`, `aicc` and `bic`. The order-statistic,
+/// rank and first-difference metrics have no standard weighted definition (see
+/// `docs/weights.md`); `auc` is a rank statistic and needs its own class-count
+/// definition, so it stays unweighted here.
 pub fn weights_supported(m: Metric) -> bool {
     matches!(
         m,
@@ -283,6 +917,11 @@ pub fn weights_supported(m: Metric) -> bool {
             | Metric::CorrelationSigned
             | Metric::Signed
             | Metric::LogSquashed
+            | Metric::LogLoss
+            | Metric::Brier
+            | Metric::Hinge
+            | Metric::HingeOrdinary
+            | Metric::HingeSquared
             | Metric::ImplicitDerivative
             | Metric::ImplicitResidual
             | Metric::Aic
@@ -300,8 +939,16 @@ pub fn weighted_metric_names() -> &'static [&'static str] {
         "correlation_signed",
         "signed",
         "log_squashed",
+        // `Metric::all` presents the implicit family before the
+        // classification family; keep this list in the same order so the
+        // "supported" test and the CLI text cannot drift.
         "implicit",
         "implicit_residual",
+        "log_loss",
+        "brier",
+        "hinge",
+        "hinge_ordinary",
+        "hinge_squared",
         "aic",
         "aicc",
         "bic",
@@ -357,6 +1004,26 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
         if w[i] > 0.0 && !p.is_finite() {
             return f64::INFINITY;
         }
+    }
+    // #289: the weighted classification family. A zero-weight row is skipped
+    // **before** its prediction or label is read, so a masked `NaN`/infinite
+    // branch cannot poison the loss, and the midpoint is taken over the
+    // positive-weight rows only. `auc` has no per-row weighted form here.
+    if m.is_classification() {
+        let Some(objective) = ScoreObjective::for_metric(m) else {
+            return f64::INFINITY;
+        };
+        let Some(labels) = binary_labels_weighted(y, w) else {
+            return f64::INFINITY;
+        };
+        let mut acc = 0.0;
+        for ((&p, &l), &wi) in pred.iter().zip(&labels).zip(w) {
+            if wi <= 0.0 {
+                continue;
+            }
+            acc += wi * classification_row_loss(p, l, objective);
+        }
+        return acc / total;
     }
     // A masked row's residual is forced to zero so that no `wᵢ * loss`
     // product can become `0 * inf = NaN`; the row then contributes nothing.
@@ -836,6 +1503,34 @@ pub fn classification_target_error(y: &[f64]) -> Option<String> {
     ))
 }
 
+/// #289: the midpoint labels of the **positive-weight** rows.
+///
+/// A zero-weight row is invisible, exactly as it is to the fitter and to every
+/// other weighted metric: changing its target (even to `±inf` or `NaN`) cannot
+/// move the midpoint. `None` means a positive-weight target is non-finite.
+fn binary_labels_weighted(y: &[f64], w: &[f64]) -> Option<Vec<f64>> {
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for (&v, &wi) in y.iter().zip(w) {
+        if wi > 0.0 {
+            if !v.is_finite() {
+                return None;
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+    }
+    if !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    let mid = 0.5 * (lo + hi);
+    Some(
+        y.iter()
+            .zip(w)
+            .map(|(&v, &wi)| if wi > 0.0 && v > mid { 1.0 } else { 0.0 })
+            .collect(),
+    )
+}
+
 fn sigmoid(x: f64) -> f64 {
     // Numerically stable logistic.
     if x >= 0.0 {
@@ -843,6 +1538,41 @@ fn sigmoid(x: f64) -> f64 {
     } else {
         let e = x.exp();
         e / (1.0 + e)
+    }
+}
+
+/// #289: the Lin–Lin–Weng softplus `ln(1 + exp(−u))`, the exact stable form of
+/// the logistic loss. It never overflows and is exact for small `|u|`, where
+/// the naive `ln(1 + exp(−u))` cancels.
+fn softplus_neg(u: f64) -> f64 {
+    let a = u.abs();
+    (-u).max(0.0) + (-a).exp().ln_1p()
+}
+
+/// #289: one row of a classification metric, with `p` the logit and `l ∈ {0,1}`.
+fn classification_row_loss(p: f64, l: f64, objective: ScoreObjective) -> f64 {
+    let t = 2.0 * l - 1.0;
+    let u = t * p;
+    match objective {
+        ScoreObjective::LogLoss => softplus_neg(u),
+        ScoreObjective::Brier => {
+            let d = sigmoid(p) - l;
+            d * d
+        }
+        ScoreObjective::HingeSigmoid => {
+            // The historical `1 − t·(2σ(p) − 1)`, kept in this exact form so the
+            // pre-#289 `hinge` numbers do not move.
+            let s = 2.0 * sigmoid(p) - 1.0;
+            (1.0 - t * s).max(0.0)
+        }
+        ScoreObjective::HingeOrdinary => (1.0 - u).max(0.0),
+        ScoreObjective::HingeSquared => {
+            let h = (1.0 - u).max(0.0);
+            h * h
+        }
+        // Only the five classification objectives reach this function; a
+        // regression objective here is a dispatch bug, not a number.
+        _ => f64::NAN,
     }
 }
 
@@ -872,21 +1602,47 @@ pub fn auc(pred: &[f64], y: &[f64]) -> f64 {
 }
 
 /// Mean logistic loss, treating the prediction as a logit.
+///
+/// #289: evaluated as the stable softplus `max(−u, 0) + ln(1 + exp(−|u|))` with
+/// `u = t·p`. It is exactly the binary cross-entropy for every finite logit and
+/// needs no arbitrary probability clamp, so the CPU reference and the device
+/// scorer agree at `|p| = 10⁶` as well as near `p = 0`.
 pub fn log_loss(pred: &[f64], y: &[f64]) -> f64 {
     if pred.len() != y.len() || pred.is_empty() {
         return f64::INFINITY;
     }
     let labels = binary_labels(y);
-    let eps = 1e-12;
     let mut acc = 0.0;
     for (p, l) in pred.iter().zip(&labels) {
-        let q = sigmoid(*p).clamp(eps, 1.0 - eps);
-        acc += -(l * q.ln() + (1.0 - l) * (1.0 - q).ln());
+        acc += classification_row_loss(*p, *l, ScoreObjective::LogLoss);
     }
     acc / pred.len() as f64
 }
 
-/// Mean hinge loss, treating the prediction as a logit mapped to `(-1, 1)`.
+/// Mean Brier score `(σ(p) − l)²`, treating the prediction as a logit.
+///
+/// This is a **proper** scoring rule on the probability `σ(p)`, not a squared
+/// error on the raw logit. It is bounded in `[0, 1]` and its constant-model
+/// optimum is `p* = ln(n₊/n₋)` for log-loss but the probability `σ(p*) = n₊/n`
+/// for Brier.
+pub fn brier(pred: &[f64], y: &[f64]) -> f64 {
+    if pred.len() != y.len() || pred.is_empty() {
+        return f64::INFINITY;
+    }
+    let labels = binary_labels(y);
+    let mut acc = 0.0;
+    for (p, l) in pred.iter().zip(&labels) {
+        acc += classification_row_loss(*p, *l, ScoreObjective::Brier);
+    }
+    acc / pred.len() as f64
+}
+
+/// Mean **bounded sigmoid** hinge surrogate, `2σ(−t·p)` on the signed margin.
+///
+/// This is the historical `hinge` metric. It is *not* the SVM hinge: it is
+/// smooth and bounded in `(0, 2)`, never exactly zero, and it applies the
+/// logistic link twice when the model output is already a probability. Use
+/// [`hinge_ordinary`] or [`hinge_squared`] for the linear-margin forms.
 pub fn hinge(pred: &[f64], y: &[f64]) -> f64 {
     if pred.len() != y.len() || pred.is_empty() {
         return f64::INFINITY;
@@ -894,9 +1650,33 @@ pub fn hinge(pred: &[f64], y: &[f64]) -> f64 {
     let labels = binary_labels(y);
     let mut acc = 0.0;
     for (p, l) in pred.iter().zip(&labels) {
-        let t = 2.0 * l - 1.0;
-        let s = 2.0 * sigmoid(*p) - 1.0;
-        acc += (1.0 - t * s).max(0.0);
+        acc += classification_row_loss(*p, *l, ScoreObjective::HingeSigmoid);
+    }
+    acc / pred.len() as f64
+}
+
+/// Mean ordinary (SVM) hinge `max(0, 1 − t·p)` on the signed margin.
+pub fn hinge_ordinary(pred: &[f64], y: &[f64]) -> f64 {
+    if pred.len() != y.len() || pred.is_empty() {
+        return f64::INFINITY;
+    }
+    let labels = binary_labels(y);
+    let mut acc = 0.0;
+    for (p, l) in pred.iter().zip(&labels) {
+        acc += classification_row_loss(*p, *l, ScoreObjective::HingeOrdinary);
+    }
+    acc / pred.len() as f64
+}
+
+/// Mean squared hinge `max(0, 1 − t·p)²` on the signed margin.
+pub fn hinge_squared(pred: &[f64], y: &[f64]) -> f64 {
+    if pred.len() != y.len() || pred.is_empty() {
+        return f64::INFINITY;
+    }
+    let labels = binary_labels(y);
+    let mut acc = 0.0;
+    for (p, l) in pred.iter().zip(&labels) {
+        acc += classification_row_loss(*p, *l, ScoreObjective::HingeSquared);
     }
     acc / pred.len() as f64
 }
@@ -944,7 +1724,10 @@ mod tests {
             Metric::LogSquashed,
             Metric::Auc,
             Metric::LogLoss,
+            Metric::Brier,
             Metric::Hinge,
+            Metric::HingeOrdinary,
+            Metric::HingeSquared,
             Metric::Median,
             Metric::Maximum,
             Metric::Correlation,
@@ -1105,6 +1888,93 @@ mod tests {
         assert!(approx(auc(&pred[..2], &one_class), 0.5, 1e-12));
     }
 
+    /// #289: the three hinge forms are different functions, and only the
+    /// historical one is the bounded sigmoid surrogate.
+    #[test]
+    fn hinge_forms_are_distinct_and_match_their_definitions() {
+        // y = [0, 1]; predictions are logits.
+        let y = [0.0, 1.0];
+        let p = [0.0, 0.0];
+        // At p = 0: surrogate = 2σ(0) - 0? 1-t*0 = 1 for both rows -> 1.
+        assert!(approx(hinge(&p, &y), 1.0, 1e-12));
+        // Ordinary hinge at u = 0 is 1 for both rows too.
+        assert!(approx(hinge_ordinary(&p, &y), 1.0, 1e-12));
+        assert!(approx(hinge_squared(&p, &y), 1.0, 1e-12));
+        // Correct margins: surrogate is never zero; ordinary/squared are.
+        let good = [-30.0, 30.0];
+        assert!(hinge(&good, &y) > 0.0, "the surrogate has no finite optimum");
+        assert!(approx(hinge_ordinary(&good, &y), 0.0, 1e-12));
+        assert!(approx(hinge_squared(&good, &y), 0.0, 1e-12));
+        // A margin inside the ordinary hinge's active set: u = 0.5 gives 0.5
+        // and 0.25 for the linear and squared forms.
+        let half = [-0.5, 0.5];
+        assert!(approx(hinge_ordinary(&half, &y), 0.5, 1e-12));
+        assert!(approx(hinge_squared(&half, &y), 0.25, 1e-12));
+        // The ordinary hinge has a kink; squared is C1. Both must be finite at
+        // the kink u = 1 instead of relying on a compiler branch.
+        let kink = [-1.0, 1.0];
+        assert!(approx(hinge_ordinary(&kink, &y), 0.0, 1e-12));
+        assert!(approx(hinge_squared(&kink, &y), 0.0, 1e-12));
+        // Every classification metric is in the classification family.
+        for m in [
+            Metric::Auc,
+            Metric::LogLoss,
+            Metric::Brier,
+            Metric::Hinge,
+            Metric::HingeOrdinary,
+            Metric::HingeSquared,
+        ] {
+            assert!(m.is_classification(), "{}", m.name());
+        }
+    }
+
+    /// #289: log-loss is the stable softplus, so an extreme logit gives the
+    /// analytic value instead of a clamped constant.
+    #[test]
+    fn log_loss_is_the_stable_softplus_at_extreme_logits() {
+        let y = [0.0, 1.0];
+        // Correct, confident rows: loss ~ exp(-1e6) = 0.
+        assert_eq!(log_loss(&[-1e6, 1e6], &y), 0.0);
+        // Wrong, confident rows: loss is the margin itself, not a 1e-12 clamp.
+        let wrong = log_loss(&[1e6, -1e6], &y);
+        assert!(approx(wrong, 1e6, 1e-6), "{wrong}");
+        // At p = 0 the value is ln 2.
+        assert!(approx(log_loss(&[0.0, 0.0], &y), 2.0f64.ln(), 1e-15));
+    }
+
+    /// #289 §6.1: the constant-model optima in probability/logit space.
+    #[test]
+    fn constant_model_optima_for_log_loss_and_brier() {
+        // 3 positives, 1 negative.
+        let y = [1.0, 1.0, 1.0, 0.0];
+        let want_logit = (3.0f64 / 1.0).ln();
+        let want_p = 3.0 / 4.0;
+        let at = |b: f64| [b; 4];
+        // Log-loss is minimised at b* = ln(n+/n-).
+        let best = log_loss(&at(want_logit), &y);
+        for d in [-0.25, -0.01, 0.01, 0.25] {
+            assert!(
+                log_loss(&at(want_logit + d), &y) >= best - 1e-15,
+                "log-loss moved at {d}"
+            );
+        }
+        // Brier's probability optimum is n+/n = sigma(b*), so the same logit
+        // minimises it too; its raw-logit squared error does not.
+        let best_brier = brier(&at(want_logit), &y);
+        for d in [-0.25, -0.01, 0.01, 0.25] {
+            assert!(
+                brier(&at(want_logit + d), &y) >= best_brier - 1e-15,
+                "brier moved at {d}"
+            );
+        }
+        // Brier is bounded in [0, 1]; its value at the optimum is the
+        // irreducible variance p(1-p).
+        assert!(approx(best_brier, want_p * (1.0 - want_p), 1e-12));
+        // A single class is still scoreable (it is a degenerate but valid
+        // distribution); the *fit* is what refuses it.
+        assert!(brier(&[0.0, 0.0], &[0.0, 0.0]).is_finite());
+    }
+
     #[test]
     fn information_criteria_metrics() {
         // residuals 1,1 -> rss 2, n 2. AIC = 2 ln(1) + 2k = 2k.
@@ -1172,10 +2042,96 @@ mod tests {
         assert_eq!(supported, weighted_metric_names());
         assert!(!weights_supported(Metric::Median));
         assert!(!weights_supported(Metric::Auc));
+        for m in [
+            Metric::LogLoss,
+            Metric::Brier,
+            Metric::Hinge,
+            Metric::HingeOrdinary,
+            Metric::HingeSquared,
+        ] {
+            assert!(weights_supported(m), "{} must accept weights", m.name());
+        }
         assert_eq!(
             score_weighted(&[1.0, 2.0], &[1.0, 2.0], &[1.0, 1.0], Metric::Median, 0),
             f64::INFINITY,
             "an unsupported metric must refuse weights, not ignore them"
+        );
+    }
+
+    /// #289: every weighted classification metric is exactly the score of the
+    /// table with the heavier row duplicated, and zero-weight rows vanish.
+    #[test]
+    fn weighted_classification_is_duplicate_row_parity() {
+        let y = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+        let p = [-1.5, 0.3, 2.2, -0.4, 0.8, 0.1];
+        let w = [1.0, 2.0, 1.0, 3.0, 1.0, 1.0];
+        let mut dup_p = Vec::new();
+        let mut dup_y = Vec::new();
+        for i in 0..p.len() {
+            for _ in 0..w[i] as usize {
+                dup_p.push(p[i]);
+                dup_y.push(y[i]);
+            }
+        }
+        for m in [
+            Metric::LogLoss,
+            Metric::Brier,
+            Metric::Hinge,
+            Metric::HingeOrdinary,
+            Metric::HingeSquared,
+        ] {
+            let weighted = score_weighted(&p, &y, &w, m, 0);
+            let duplicated = score(&dup_p, &dup_y, m);
+            assert!(
+                approx(weighted, duplicated, 1e-12),
+                "{}: weighted {weighted} vs duplicated {duplicated}",
+                m.name()
+            );
+        }
+        // Scaling every weight is a no-op (Σw normalisation).
+        let scaled: Vec<f64> = w.iter().map(|v| v * 7.5).collect();
+        for m in [Metric::LogLoss, Metric::Brier, Metric::Hinge] {
+            assert!(approx(
+                score_weighted(&p, &y, &w, m, 0),
+                score_weighted(&p, &y, &scaled, m, 0),
+                1e-12
+            ));
+        }
+    }
+
+    /// #289: a zero-weight row is invisible even when its prediction or target
+    /// is non-finite, and cannot move the class midpoint.
+    #[test]
+    fn zero_weight_classification_rows_are_invisible() {
+        let y = [0.0, 1.0, 0.0, 1.0];
+        let p = [0.2, -0.4, 0.9, 1.3];
+        let w = [1.0, 1.0, 0.0, 1.0];
+        for m in [
+            Metric::LogLoss,
+            Metric::Brier,
+            Metric::Hinge,
+            Metric::HingeOrdinary,
+            Metric::HingeSquared,
+        ] {
+            let base = score_weighted(&p, &y, &w, m, 0);
+            // A masked row with a NaN prediction, a NaN target, an infinite
+            // target and a completely different value contributes nothing.
+            let bad_p = [0.2, -0.4, f64::NAN, 1.3];
+            let bad_y = [0.0, 1.0, f64::NAN, 1.0];
+            let inf_y = [0.0, 1.0, f64::INFINITY, 1.0];
+            assert_eq!(score_weighted(&bad_p, &y, &w, m, 0).to_bits(), base.to_bits());
+            assert_eq!(score_weighted(&p, &bad_y, &w, m, 0).to_bits(), base.to_bits());
+            assert_eq!(score_weighted(&p, &inf_y, &w, m, 0).to_bits(), base.to_bits());
+        }
+        // A positive-weight non-finite target or prediction is invalid.
+        let w_bad = [1.0, 1.0, 1.0, 1.0];
+        assert_eq!(
+            score_weighted(&p, &[0.0, 1.0, f64::NAN, 1.0], &w_bad, Metric::LogLoss, 0),
+            f64::INFINITY
+        );
+        assert_eq!(
+            score_weighted(&[0.2, f64::NAN, 0.9, 1.3], &y, &w_bad, Metric::Brier, 0),
+            f64::INFINITY
         );
     }
 
@@ -1311,5 +2267,300 @@ mod tests {
             RankSums::between(&centred_ranks_doubled(&scaled).unwrap(), &rb).unwrap(),
             forward
         );
+    }
+
+    // --- #287: the score-objective table and native reductions ----------
+
+    /// Every metric appears exactly once and every refusal is named. The match
+    /// in `score_dispatch` is exhaustive, so an unhandled metric cannot compile;
+    /// this test additionally pins the coverage and the native family.
+    #[test]
+    fn score_table_covers_every_metric_and_names_every_refusal() {
+        let mut seen = std::collections::BTreeSet::new();
+        for metric in Metric::all() {
+            assert!(seen.insert(metric.name()), "duplicate table row: {}", metric.name());
+            match score_dispatch(*metric) {
+                ScoreDispatch::Native(o) => {
+                    assert_eq!(o, native_score_objective(*metric).unwrap());
+                    assert_eq!(ScoreObjective::from_code(o.code()), Some(o));
+                    assert!(score_refusal(*metric).is_none());
+                }
+                ScoreDispatch::Exact(s) => {
+                    assert_eq!(s.metric(), *metric);
+                    assert_eq!(ScoreStat::for_metric(*metric), Some(s));
+                    assert!(native_score_objective(*metric).is_none());
+                    assert!(score_refusal(*metric).is_none());
+                }
+                ScoreDispatch::Refused(reason) => {
+                    assert!(!reason.is_empty(), "{} has an empty refusal", metric.name());
+                    assert!(reason.contains(metric.name()) || metric.name().contains("implicit"),
+                        "{} refusal must name the metric: {reason}", metric.name());
+                    assert!(native_score_objective(*metric).is_none());
+                }
+            }
+        }
+        assert_eq!(seen.len(), Metric::all().len());
+        let native: Vec<&str> = Metric::all()
+            .iter()
+            .filter(|m| native_score_objective(**m).is_some())
+            .map(|m| m.name())
+            .collect();
+        assert_eq!(
+            native,
+            [
+                "absolute",
+                "squared",
+                "correlation",
+                "correlation_signed",
+                "maximum",
+                "signed",
+                "log_squashed",
+                "log_loss",
+                "brier",
+                "hinge",
+                "hinge_ordinary",
+                "hinge_squared",
+                "aic",
+                "aicc",
+                "bic",
+            ]
+        );
+        let exact: Vec<&str> = Metric::all()
+            .iter()
+            .filter(|m| ScoreStat::for_metric(**m).is_some())
+            .map(|m| m.name())
+            .collect();
+        assert_eq!(
+            exact,
+            ["median", "interquartile", "rank_correlation", "rank_correlation_signed", "auc"]
+        );
+        // An unhandled metric must be a hard failure, never an MSE fallback.
+        assert_eq!(
+            score_refusal(Metric::Slope).unwrap(),
+            "slope needs a cross-row first-difference pass"
+        );
+        assert_eq!(score_dispatch(Metric::Auc).objective(), None);
+        assert_eq!(score_dispatch(Metric::Maximum).stat(), None);
+    }
+
+    /// T1/T2 parity between the native reducer and the historical CPU metric,
+    /// on exactly the fixtures named by #287.
+    #[test]
+    fn native_reductions_match_the_cpu_metric() {
+        let fixtures: &[(&[f64], &[f64])] = &[
+            (&[0.0, 3.0, 0.0], &[1.0, 1.0, 3.0]), // residuals -1, 2, -3
+            (&[0.0, 0.0, 0.0, 0.0], &[3.0, 1.0, -2.0, -4.0]), // |r| 3,1,2,4
+            (&[4.0], &[4.0]),                      // n = 1
+            (&[0.0, 0.0], &[1.0, 1.0]),
+        ];
+        for (pred, y) in fixtures {
+            for m in Metric::all() {
+                let Some(o) = native_score_objective(*m) else {
+                    continue;
+                };
+                let got = score_native(pred, y, o, 2);
+                assert_eq!(got.status, ScoreStatus::Ok, "{}", o.name());
+                let want = score_with_constants(pred, y, *m, 2);
+                if o == ScoreObjective::Maximum {
+                    assert_eq!(got.value.to_bits(), want.to_bits(), "maximum must be bit-exact");
+                } else if want.is_infinite() {
+                    assert_eq!(got.value, want, "{}", o.name());
+                } else {
+                    let rel = (got.value - want).abs() / (1.0 + want.abs());
+                    assert!(
+                        rel <= 1e-12,
+                        "{} {pred:?}/{y:?}: native {} vs cpu {} (relative {rel:e})",
+                        o.name(),
+                        got.value,
+                        want
+                    );
+                }
+            }
+        }
+    }
+
+    /// #287: correlation absolute `ρ` error ≤ 1e-9, including the near-perfect
+    /// case where a relative score tolerance would be meaningless.
+    #[test]
+    fn native_correlation_matches_the_pearson_path_and_the_constant_rule() {
+        let y: Vec<f64> = (0..97).map(|i| (i as f64 * 0.37).sin() * 4.0 + 10.0).collect();
+        let near: Vec<f64> = y.iter().map(|v| v + 1e-12).collect();
+        for (signed, m) in [
+            (false, Metric::Correlation),
+            (true, Metric::CorrelationSigned),
+        ] {
+            let o = native_score_objective(m).unwrap();
+            let got = score_native(&near, &y, o, 0);
+            let want = score_with_constants(&near, &y, m, 0);
+            let want_rho = correlation(&near, &y);
+            let got_rho = 1.0 - (if signed { got.value } else { got.value });
+            assert!((got_rho - want_rho).abs() <= 1e-9,
+                "rho error on signed={signed}: got {got_rho} want {want_rho}");
+            assert!((got.value - want).abs() <= 1e-9, "score error");
+            assert!(got_rho.is_finite());
+        }
+        // Constant prediction: CPU rule is rho = 0 -> score 1.0, never NaN.
+        for pred in [vec![3.0; y.len()], vec![-0.0; y.len()]] {
+            let got = score_native(&pred, &y, ScoreObjective::Correlation, 0);
+            assert_eq!(got.status, ScoreStatus::Ok);
+            assert_eq!(got.value, 1.0);
+            let signed = score_native(&pred, &y, ScoreObjective::CorrelationSigned, 0);
+            assert_eq!(signed.value, 1.0);
+        }
+        // Zero variance target is also rho = 0.
+        let flat = vec![7.0; 40];
+        let p: Vec<f64> = (0..40).map(|i| i as f64).collect();
+        assert_eq!(score_native(&p, &flat, ScoreObjective::Correlation, 0).value, 1.0);
+    }
+
+    /// Maximum is an integer comparison on the `|r|` bit patterns; the first
+    /// (lowest-index) row wins a tie and `-0.0` canonicalises to `+0.0`.
+    #[test]
+    fn native_maximum_is_bit_exact_and_breaks_ties_on_the_lowest_row() {
+        let pred = [0.0, 3.0, -3.0, 1.0, 3.0, -0.0];
+        let y = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let got = score_native(&pred, &y, ScoreObjective::Maximum, 0);
+        assert_eq!(got.value.to_bits(), 3.0f64.to_bits());
+        assert_eq!(got.maximum_row, Some(1), "lowest row among |r| = 3");
+        // Large magnitudes compare by bits exactly like `f64::max`.
+        let huge = [1e300, -1e300, 1e-300];
+        let z = [0.0; 3];
+        let got = score_native(&huge, &z, ScoreObjective::Maximum, 0);
+        assert_eq!(got.value, 1e300);
+        assert_eq!(got.maximum_row, Some(0));
+        // Signed zeros are a tie at +0, and the lowest row wins.
+        let zeros = [-0.0, 0.0];
+        let got = score_native(&zeros, &z[..2], ScoreObjective::Maximum, 0);
+        assert_eq!(got.value.to_bits(), 0.0f64.to_bits());
+        assert_eq!(got.maximum_row, Some(0));
+    }
+
+    /// Non-finite predictions yield `+inf` with a status, never a finite
+    /// `1e30/n`-style score. Zero-weight masked rows are invisible.
+    #[test]
+    fn native_non_finite_and_zero_weight_statuses() {
+        let y = [1.0, 2.0];
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            for o in [
+                ScoreObjective::Squared,
+                ScoreObjective::Absolute,
+                ScoreObjective::LogSquashed,
+                ScoreObjective::Signed,
+                ScoreObjective::Maximum,
+                ScoreObjective::Correlation,
+                ScoreObjective::CorrelationSigned,
+                ScoreObjective::Aic,
+                ScoreObjective::Aicc,
+                ScoreObjective::Bic,
+                ScoreObjective::LogLoss,
+                ScoreObjective::Brier,
+                ScoreObjective::HingeSigmoid,
+                ScoreObjective::HingeOrdinary,
+                ScoreObjective::HingeSquared,
+            ] {
+                let got = score_native(&[bad, 1.0], &y, o, 1);
+                assert_eq!(got.status, ScoreStatus::NonFinite, "{}", o.name());
+                assert_eq!(got.value, f64::INFINITY, "{}", o.name());
+                assert!(got.value.is_infinite(), "never a finite sentinel");
+            }
+        }
+        // The same bad row is masked away by weight 0.
+        let got = score_native_weighted(
+            &[f64::NAN, 800.0],
+            &y,
+            &[0.0, 1.0],
+            ScoreObjective::Squared,
+            0,
+        );
+        assert_eq!(got.status, ScoreStatus::Ok);
+        assert_eq!(got.value, (800.0 - 2.0) * (800.0 - 2.0));
+        // All masked is a labelled refusal, not a divide by zero.
+        let all_zero = score_native_weighted(&[1.0, 2.0], &y, &[0.0, 0.0], ScoreObjective::Squared, 0);
+        assert_eq!(all_zero.status, ScoreStatus::AllZeroWeight);
+        assert_eq!(all_zero.value, f64::INFINITY);
+        // Weighted parity with the existing weighted path.
+        let p = [0.0, 3.0, 0.0];
+        let target = [1.0, 1.0, 3.0];
+        let w = [1.0, 2.0, 1.0];
+        for m in [
+            Metric::Absolute,
+            Metric::Squared,
+            Metric::Signed,
+            Metric::LogSquashed,
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+            Metric::Aic,
+            Metric::Aicc,
+            Metric::Bic,
+        ] {
+            let o = native_score_objective(m).unwrap();
+            let got = score_native_weighted(&p, &target, &w, o, 2);
+            let want = score_weighted(&p, &target, &w, m, 2);
+            assert_eq!(got.status, ScoreStatus::Ok, "{}", m.name());
+            if want.is_infinite() {
+                assert_eq!(got.value, want, "{}", m.name());
+            } else {
+                assert!(
+                    (got.value - want).abs() <= 1e-12 * (1.0 + want.abs()),
+                    "{}: {} vs {}",
+                    m.name(),
+                    got.value,
+                    want
+                );
+            }
+        }
+    }
+
+    /// A batch is just independent reducers: the same candidate must produce
+    /// the same bits alone and in a larger composition, on repeated runs.
+    #[test]
+    fn native_reductions_are_composition_and_order_stable() {
+        let y = lcg(257, 91, 3.0);
+        let pred: Vec<f64> = y.iter().map(|v| v * 0.5 + (v * 7.0).cos()).collect();
+        for o in [
+            ScoreObjective::Squared,
+            ScoreObjective::Absolute,
+            ScoreObjective::LogSquashed,
+            ScoreObjective::Signed,
+            ScoreObjective::Maximum,
+            ScoreObjective::Correlation,
+            ScoreObjective::CorrelationSigned,
+            ScoreObjective::Aic,
+            ScoreObjective::Aicc,
+            ScoreObjective::Bic,
+        ] {
+            let alone = score_native(&pred, &y, o, 3);
+            let again = score_native(&pred, &y, o, 3);
+            assert_eq!(alone.value.to_bits(), again.value.to_bits(), "{}", o.name());
+            // Composition is a host-side concept, but ensure no hidden
+            // whole-batch state changes the reducer: run other candidates
+            // first, then this one, and compare.
+            let _ = score_native(&y, &pred, o, 3);
+            let composed = score_native(&pred, &y, o, 3);
+            assert_eq!(alone.value.to_bits(), composed.value.to_bits(), "{}", o.name());
+            assert_eq!(alone.maximum_row, composed.maximum_row, "{}", o.name());
+        }
+    }
+
+    /// `rho = 1 - 1e-12`, `1e30`, subnormals and signed zeros must not trip a
+    /// magnitude sentinel or lose the finite result.
+    #[test]
+    fn native_edge_fixtures_are_finite_and_exact_where_required() {
+        let z = [0.0; 3];
+        // 1e30 residuals are finite in f64 and must stay finite.
+        let p = [1e30, -1e30, 0.0];
+        let sq = score_native(&p, &z, ScoreObjective::Squared, 0);
+        assert!(sq.value.is_finite() && sq.value > 0.0);
+        let abs = score_native(&p, &z, ScoreObjective::Absolute, 0);
+        assert!(abs.value.is_finite());
+        // Subnormals survive the same reduction.
+        let tiny = [f64::MIN_POSITIVE / 4.0, 0.0, 0.0];
+        let got = score_native(&tiny, &z, ScoreObjective::Absolute, 0);
+        assert_eq!(got.value.to_bits(), (tiny[0] / 3.0).to_bits());
+        // Perfect correlation fixture.
+        let y = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let p: Vec<f64> = y.iter().map(|v| v * 2.0 + 3.0).collect();
+        let rho = 1.0 - score_native(&p, &y, ScoreObjective::Correlation, 0).value;
+        assert!((rho - 1.0).abs() <= 1e-9, "rho = {rho}");
     }
 }
