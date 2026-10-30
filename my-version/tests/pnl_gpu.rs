@@ -1706,7 +1706,8 @@ mod device_conformance {
 
     #[test]
     fn device_cash_and_buy_and_hold_are_bit_identical_alone_padded_and_across_chunks_and_threads() {
-        use rcsr::baselines::{control_positions, device_totals, position_totals, POSITION_THRESHOLD};
+        use rcsr::baselines::{control_positions, device_totals, position_totals};
+        const POSITION_THRESHOLD: f64 = 0.5;
         if !device_available() {
             eprintln!("skipped: no CUDA device");
             return;
