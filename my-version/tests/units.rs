@@ -547,9 +547,57 @@ fn mask_timing(src: &str) -> String {
     out
 }
 
+/// Remove the top-level `dispatch` field added in #290 before comparing the
+/// units golden. That golden is a units snapshot, not a dispatch snapshot, and
+/// the new field is covered by the dispatch and run-manifest tests.
+fn strip_dispatch(src: &str) -> String {
+    const KEY: &str = "\"dispatch\":";
+    let Some(i) = src.find(KEY) else {
+        return src.to_string();
+    };
+    let bytes = src.as_bytes();
+    let mut end = i + KEY.len();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (off, ch) in src[end..].char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end += off + ch.len_utf8();
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut start = i;
+    if start > 0 && bytes[start - 1] == b',' {
+        start -= 1;
+    } else if end < bytes.len() && bytes[end] == b',' {
+        end += 1;
+    }
+    let mut out = String::with_capacity(src.len());
+    out.push_str(&src[..start]);
+    out.push_str(&src[end..]);
+    out
+}
+
 /// Mask the k-NN baseline's `seconds` field added in #132.
-fn mask_seconds(src: &str) -> String {
-    let key = "\"seconds\":";
+fn mask_seconds(src: &str) -> String {    let key = "\"seconds\":";
     let mut out = String::with_capacity(src.len());
     let mut rest = &src[..];
     while let Some(i) = rest.find(key) {
@@ -601,7 +649,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
+    let got = strip_dispatch(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_json.stdout"));
     assert_eq!(got, want, "--json changed");
     assert!(
@@ -614,7 +662,7 @@ fn layer1_no_units_output_is_byte_identical_to_pre_change() {
     let out = rcsr_stdin(&args, table);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty());
-    let got = mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8"));
+    let got = strip_dispatch(&mask_elapsed(std::str::from_utf8(&out.stdout).expect("utf-8")));
     let want = mask_elapsed(include_str!("fixtures/units_layer1_ndjson.stdout"));
     assert_eq!(got, want, "--ndjson changed");
     assert!(

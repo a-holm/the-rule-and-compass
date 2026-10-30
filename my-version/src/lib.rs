@@ -10,14 +10,23 @@ pub mod column;
 pub mod complexity;
 pub mod data;
 pub mod diagnostics;
+pub mod dispatch; // #290: per-stage CPU/GPU cost model and route ledger
 pub mod enrich; // #200: append-only OHLCV feature enrichment
 #[cfg(feature = "cuda")]
-mod enrich_gpu; // #200: resident CUDA enrichment kernels
+pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
+#[cfg(feature = "cuda")]
+pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
+#[cfg(feature = "cuda")]
+pub mod mtf_gpu; // #296: device MTF resample and causal join
+#[cfg(feature = "cuda")]
+pub mod panel_prep_gpu; // #301: fused device duplicate/resample/gap pass
+pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
 pub mod features;
+pub mod features_gpu; // #297: fused flow / price-action device producers
 pub mod fit;
 pub mod genome;
 #[cfg(feature = "cuda")]
@@ -49,6 +58,7 @@ pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
+pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, constant, matched-exposure random long)
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;

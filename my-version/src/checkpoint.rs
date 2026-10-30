@@ -1043,6 +1043,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
         "fit_rows",      // #116: missing means 0 (off)
+        "fit_fallback_max", // #255: missing means the default bound
         "qd_bins",       // #120
         "qd_cell_cap",   // #120
         "qd_cvt",        // #120
@@ -1301,6 +1302,14 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             qd_control
         ));
     }
+    // #255: absent means the default bound, matching checkpoints written
+    // before the fallback batch was bounded and parallel.
+    let fit_fallback_max = match fields.get("fit_fallback_max") {
+        None => crate::search::DEFAULT_FIT_FALLBACK_MAX,
+        Some(raw) => raw
+            .parse::<usize>()
+            .map_err(|_| format!("bad config value for 'fit_fallback_max': '{}'", raw))?,
+    };
     // #122: absent means auto, matching checkpoints written before the flat
     // postfix engine existed.
     let variation = match fields.get("variation").map(|s| s.as_str()) {
@@ -1331,6 +1340,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         predictor_samples,
         fit_samples, // #85
         fit_rows,     // #116
+        fit_fallback_max, // #255
         // #116: a disk row source is a path choice, not saved search state.
         fit_stream_source: None,
         front_parents, // #76
@@ -1391,6 +1401,7 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
+    writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
     // #122: absent means auto (the historical path for every old checkpoint).
     writeln!(out, "config variation {}", cfg.variation.as_str()).unwrap();
     writeln!(out, "config dedup {}", cfg.dedup).unwrap();

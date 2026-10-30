@@ -4,10 +4,12 @@
 //! crate-private fit plans and the raw rank-stage hook). These integration
 //! tests pin the search contract:
 //!
-//! * `rank_correlation`/`rank_correlation_signed` may use the GPU **fit** arm
-//!   only when `--fit-strategy gpu` is requested; it is a fit-only arm: the
-//!   backend stays `cpu`, the fitness is scored by the CPU evaluator, and the
+//! * the exact integer rank statistic also **scores** the population on the
+//!   device from `MEDIAN_GPU_MIN_ROWS` (#288), so the backend is `gpu` there;
+//!   below the floor the exact CPU rank score runs with a named reason. The
 //!   population is never ranked by MSE;
+//! * `--fit-strategy gpu` additionally moves constants through the exact rank
+//!   polish (fit-only below the scoring floor);
 //! * reported errors are the exact CPU metric of the stored tree;
 //! * fixed seed/device is deterministic, and `--no-fit` is a true no-op;
 //! * every fallback is labelled and the ledger adds up.
@@ -80,11 +82,11 @@ fn describe(out: &Outcome) -> Vec<(u64, usize, String)> {
         .collect()
 }
 
-/// #230: the rank family is offered to the fit arm only when the user asked
-/// for the GPU fit strategy. Scoring stays on the CPU in every case, so the
-/// backend itself is reported as `cpu` even though the fit arm uses the device.
+/// #288: below the measured scoring floor the exact CPU rank score runs (the
+/// fit-only arm may still use the device); above it the exact integer statistic
+/// scores the population and the backend is `gpu`.
 #[test]
-fn rank_gpu_fit_is_opt_in_and_never_the_default() {
+fn rank_gpu_scoring_respects_the_measured_row_floor() {
     let s = sample(96, 3);
     for metric in [Metric::RankCorrelation, Metric::RankCorrelationSigned] {
         // Default strategy (`exact`): the CPU, regardless of `--gpu`.
@@ -94,9 +96,9 @@ fn rank_gpu_fit_is_opt_in_and_never_the_default() {
             ..Default::default()
         };
         assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
-        // `--fit-strategy gpu` with fitting enabled offers the fit arm, but the
-        // evaluator has no native rank scorer yet, so the reported backend is
-        // still the CPU (native rank evaluation is open, #230).
+        // `--fit-strategy gpu` with fitting enabled offers the fit arm; below
+        // the scoring floor the exact CPU rank score remains, so the reported
+        // backend is still the CPU.
         let cfg = Config {
             gpu: true,
             metric,
@@ -105,7 +107,7 @@ fn rank_gpu_fit_is_opt_in_and_never_the_default() {
             ..Default::default()
         };
         assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
-        // `--no-fit` has nothing to fit, so it stays on the CPU.
+        // `--no-fit` below the floor leaves nothing for the device.
         let cfg = Config {
             gpu: true,
             metric,
@@ -114,6 +116,20 @@ fn rank_gpu_fit_is_opt_in_and_never_the_default() {
             ..Default::default()
         };
         assert_eq!(search::effective_backend(&cfg, &s), Backend::Cpu);
+        // At or above the floor the exact device statistic scores the run even
+        // with the default `exact` fit strategy (#288).
+        let big = sample(rcsr::fit::MEDIAN_GPU_MIN_ROWS + 32, 3);
+        let cfg = Config {
+            gpu: true,
+            metric,
+            ..Default::default()
+        };
+        let expected = if cfg!(feature = "cuda") {
+        Backend::Gpu
+    } else {
+        Backend::Cpu
+    };
+    assert_eq!(search::effective_backend(&cfg, &big), expected);
     }
 }
 

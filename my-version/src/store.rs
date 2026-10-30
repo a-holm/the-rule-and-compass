@@ -258,6 +258,233 @@ pub struct ColumnInfo {
     pub levels: Vec<String>,
 }
 
+/// One resolved column of a [`Projection`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionColumn {
+    /// Header index in the store (the identity the file uses).
+    pub index: usize,
+    pub name: String,
+    pub dtype: DType,
+    /// Bytes per value cell. Both readable value dtypes are 8 bytes.
+    pub width: u64,
+}
+
+/// A resolved *read* projection (issue #294, policy #260/#265).
+///
+/// The projection is the only thing the projected reader and the device
+/// transport consult. It is resolved by exact column name against the store
+/// header, so a typo is a hard error rather than a silently dropped column.
+/// The canonical order is header order; the hash is FNV-1a 64 over
+/// `index:name:dtype;` in that order, which makes two requests for the same
+/// columns hash identically regardless of the order they were named in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Projection {
+    columns: Vec<ProjectionColumn>,
+    hash: u64,
+}
+
+impl Projection {
+    /// Resolve `names` against `store`'s header.
+    ///
+    /// Every name must exist exactly once and must carry a numeric value block
+    /// (`f64` or the exact `i64` time column). A dictionary-only column has no
+    /// value block, so it cannot feed a numeric feature kernel; that is refused
+    /// here instead of surfacing as a NaN column later.
+    pub fn resolve(store: &FileStore, names: &[&str]) -> Result<Self, String> {
+        let header = store.header();
+        let mut chosen: Vec<usize> = Vec::with_capacity(names.len());
+        for name in names {
+            let index = header.column_index(name).ok_or_else(|| {
+                format!(
+                    "{}: projection column '{}' is not in the store ({} columns); \
+                     refusing to drop it silently",
+                    store.path(),
+                    name,
+                    header.n_cols
+                )
+            })?;
+            if !chosen.contains(&index) {
+                chosen.push(index);
+            }
+        }
+        if chosen.is_empty() {
+            return Err(format!("{}: empty projection", store.path()));
+        }
+        Self::from_indices(store, &chosen)
+    }
+
+    /// Resolve names that must all carry a numeric value block. The device
+    /// transport uses this form: dictionary/text columns cannot feed arithmetic.
+    pub fn resolve_numeric(store: &FileStore, names: &[&str]) -> Result<Self, String> {
+        let p = Self::resolve(store, names)?;
+        for c in p.columns() {
+            if c.width == 0 {
+                return Err(format!(
+                    "{}: projection column '{}' is a dictionary/text column with no numeric \
+                     value block; it cannot feed a numeric kernel",
+                    store.path(),
+                    c.name
+                ));
+            }
+        }
+        Ok(p)
+    }
+
+    /// Resolve owned names; convenience for call sites that build a `Vec<String>`.
+    pub fn resolve_owned(store: &FileStore, names: &[String]) -> Result<Self, String> {
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        Self::resolve(store, &refs)
+    }
+
+    /// Resolve an explicit index vector (the form #260 resolves once per run).
+    pub fn from_indices(store: &FileStore, indices: &[usize]) -> Result<Self, String> {
+        let header = store.header();
+        let mut columns: Vec<ProjectionColumn> = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let info = header.column(index).ok_or_else(|| {
+                format!(
+                    "{}: projection index {} is out of range ({} columns)",
+                    store.path(),
+                    index,
+                    header.n_cols
+                )
+            })?;
+            if !columns.iter().any(|c| c.index == index) {
+                columns.push(ProjectionColumn {
+                    index,
+                    name: info.name,
+                    dtype: info.dtype,
+                    width: if info.dtype == DType::U32 { 0 } else { 8 },
+                });
+            }
+        }
+        if columns.is_empty() {
+            return Err(format!("{}: empty projection", store.path()));
+        }
+        columns.sort_by_key(|c| c.index);
+        let mut text = String::new();
+        for c in &columns {
+            text.push_str(&format!("{}:{}:{};", c.index, c.name, c.dtype.name()));
+        }
+        Ok(Projection {
+            columns,
+            hash: fnv1a_64(text.as_bytes()),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
+    pub fn columns(&self) -> &[ProjectionColumn] {
+        &self.columns
+    }
+
+    pub fn indices(&self) -> Vec<usize> {
+        self.columns.iter().map(|c| c.index).collect()
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+
+    /// FNV-1a 64 over the canonical `index:name:dtype;` text.
+    pub fn hash(&self) -> u64 {
+        self.hash
+    }
+
+    pub fn hash_hex(&self) -> String {
+        format!("{:016x}", self.hash)
+    }
+
+    /// Bytes per row of the projected layout (`f64`/`i64` values only).
+    pub fn row_bytes(&self) -> u64 {
+        self.columns.iter().map(|c| c.width).sum()
+    }
+
+    /// Bytes for one group of `len` rows.
+    pub fn group_bytes(&self, len: usize) -> u64 {
+        self.row_bytes().saturating_mul(len as u64)
+    }
+
+    /// Canonical text; used in reports/manifests.
+    pub fn canonical_text(&self) -> String {
+        self.columns
+            .iter()
+            .map(|c| format!("{}:{}:{}", c.index, c.name, c.dtype.name()))
+            .collect::<Vec<_>>()
+            .join(";")
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Statistics from one projected group read. Incremented at the `pread` site.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProjectedReadStats {
+    pub groups: usize,
+    pub columns: usize,
+    pub value_bytes: u64,
+}
+
+/// Reusable column-major buffer for [`FileStore::read_group_projected`].
+#[derive(Debug, Default)]
+pub struct ProjectedGroup {
+    len: usize,
+    columns: usize,
+    values: Vec<f64>,
+    int_scratch: Vec<i64>,
+    byte_scratch: Vec<u8>,
+}
+
+impl ProjectedGroup {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn n_columns(&self) -> usize {
+        self.columns
+    }
+
+    /// One column of the group, in projection order.
+    pub fn col(&self, c: usize) -> &[f64] {
+        let lo = c * self.len;
+        &self.values[lo..lo + self.len]
+    }
+
+    pub fn col_mut(&mut self, c: usize) -> &mut [f64] {
+        let lo = c * self.len;
+        let hi = lo + self.len;
+        &mut self.values[lo..hi]
+    }
+
+    fn prepare(&mut self, len: usize, columns: usize) {
+        self.len = len;
+        self.columns = columns;
+        self.values.resize(len * columns, f64::NAN);
+        self.int_scratch.resize(len, 0);
+    }
+}
+
 /// A healthy store on disk: header plus an open file handle.
 #[derive(Debug)]
 pub struct FileStore {
@@ -318,6 +545,20 @@ impl FileStore {
 
     pub fn header(&self) -> &Header {
         &self.header
+    }
+
+    /// A second handle to the same store, for the projected reader thread.
+    pub fn try_clone(&self) -> Result<Self, String> {
+        let file = self
+            .file
+            .try_clone()
+            .map_err(|e| format!("{}: {}", self.path, e))?;
+        Ok(FileStore {
+            file,
+            header: self.header.clone(),
+            data_start: self.data_start,
+            path: self.path.clone(),
+        })
     }
 
     pub fn path(&self) -> &str {
@@ -568,6 +809,245 @@ impl FileStore {
         }
         Ok(out)
     }
+
+    /// Read one group of only the projected columns into reusable storage.
+    ///
+    /// The buffer is column-major in projection order with `len` values per
+    /// column: `values[c * len + row]`. Only the selected blocks are `pread`;
+    /// no other column of the store is touched.
+    pub fn read_group_projected(
+        &self,
+        group: usize,
+        projection: &Projection,
+        out: &mut ProjectedGroup,
+    ) -> Result<ProjectedReadStats, String> {
+        let len = self.header.group_len(group);
+        out.prepare(len, projection.len());
+        let mut stats = self.read_group_projected_into(
+            group,
+            projection,
+            &mut out.values,
+            &mut out.int_scratch,
+            &mut out.byte_scratch,
+        )?;
+        stats.groups = 1;
+        Ok(stats)
+    }
+
+    /// [`FileStore::read_group_projected`] into a caller-owned `f64` slice.
+    ///
+    /// The slice must hold at least `projection.len() * group_len` values and
+    /// be 8-byte aligned. This is the pinned-ring seam: the CUDA transport
+    /// passes its pinned slot to this function and uploads the same bytes
+    /// asynchronously, so there is never a second host copy.
+    pub fn read_group_projected_into(
+        &self,
+        group: usize,
+        projection: &Projection,
+        out: &mut [f64],
+        int_scratch: &mut Vec<i64>,
+        byte_scratch: &mut Vec<u8>,
+    ) -> Result<ProjectedReadStats, String> {
+        if group >= self.header.n_groups() {
+            return Err(format!(
+                "{}: group {} is out of range ({} groups)",
+                self.path,
+                group,
+                self.header.n_groups()
+            ));
+        }
+        let len = self.header.group_len(group);
+        let need = projection.len().saturating_mul(len);
+        if out.len() < need {
+            return Err(format!(
+                "{}: projected group {} needs {} values but the buffer holds {}",
+                self.path,
+                group,
+                need,
+                out.len()
+            ));
+        }
+        int_scratch.resize(len, 0);
+        for (c, col) in projection.columns().iter().enumerate() {
+            let lo = c * len;
+            let hi = lo + len;
+            let meta = &self.header.columns[col.index];
+            let off = self.data_start + meta.offsets[group];
+            match meta.dtype {
+                DType::F64 => {
+                    read_f64_block(&self.file, &self.path, off, &mut out[lo..hi], byte_scratch)?
+                }
+                DType::I64 => {
+                    read_i64_block(&self.file, &self.path, off, int_scratch, byte_scratch)?;
+                    for (dst, &v) in out[lo..hi].iter_mut().zip(int_scratch.iter()) {
+                        *dst = if v == i64::MIN { f64::NAN } else { v as f64 };
+                    }
+                }
+                DType::U32 => {
+                    // A dictionary column has no value block: the resident
+                    // Table reads its codes separately (`to_table_projected`).
+                    for v in &mut out[lo..hi] {
+                        *v = f64::NAN;
+                    }
+                }
+            }
+        }
+        Ok(ProjectedReadStats {
+            groups: 1,
+            columns: projection.len(),
+            value_bytes: (need as u64).saturating_mul(8),
+        })
+    }
+
+    /// Raw-byte projected group read, for the pinned upload ring.
+    ///
+    /// The bytes are copied straight from the store into `out` with one
+    /// `pread` per column; `f64` stays `f64` and the time column stays `i64`.
+    /// The caller must provide `out.len() >= projection.group_bytes(len)`.
+    pub fn read_group_projected_raw_into(
+        &self,
+        group: usize,
+        projection: &Projection,
+        out: &mut [u8],
+    ) -> Result<ProjectedReadStats, String> {
+        use std::os::unix::fs::FileExt;
+        if group >= self.header.n_groups() {
+            return Err(format!(
+                "{}: group {} is out of range ({} groups)",
+                self.path,
+                group,
+                self.header.n_groups()
+            ));
+        }
+        let len = self.header.group_len(group);
+        let need = projection.group_bytes(len) as usize;
+        if out.len() < need {
+            return Err(format!(
+                "{}: projected group {} needs {} bytes but the buffer holds {}",
+                self.path,
+                group,
+                need,
+                out.len()
+            ));
+        }
+        let mut at = 0usize;
+        for col in projection.columns() {
+            let bytes = len * col.width as usize;
+            if bytes == 0 {
+                // Dictionary/text block: no value bytes to upload.
+                continue;
+            }
+            let meta = &self.header.columns[col.index];
+            let off = self.data_start + meta.offsets[group];
+            self.file
+                .read_exact_at(&mut out[at..at + bytes], off)
+                .map_err(|e| {
+                    format!(
+                        "{}: reading {} bytes of '{}' at offset {}: {}",
+                        self.path, bytes, col.name, off, e
+                    )
+                })?;
+            at += bytes;
+        }
+        Ok(ProjectedReadStats {
+            groups: 1,
+            columns: projection.len(),
+            value_bytes: need as u64,
+        })
+    }
+
+    /// Materialise only the projected columns into a resident [`Table`].
+    ///
+    /// The result has exactly `projection.len()` columns in projection order.
+    /// It is the narrow counterpart of [`FileStore::to_table`] used by the
+    /// 20-variable path; it never allocates a full-table image.
+    pub fn to_table_projected(&self, projection: &Projection) -> Result<Table, String> {
+        let n = self.header.n_rows;
+        let mut values: Vec<Vec<f64>> = projection
+            .columns()
+            .iter()
+            .map(|c| {
+                if c.width == 0 {
+                    Vec::new()
+                } else {
+                    let mut v = Vec::with_capacity(n);
+                    v.resize(n, f64::NAN);
+                    v
+                }
+            })
+            .collect();
+        let mut ints: Vec<Option<Vec<i64>>> = projection
+            .columns()
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::I64 {
+                    let mut v = Vec::with_capacity(n);
+                    v.resize(n, i64::MIN);
+                    Some(v)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut codes: Vec<Option<Vec<u32>>> = projection
+            .columns()
+            .iter()
+            .map(|c| {
+                if c.dtype == DType::U32 {
+                    Some(Vec::with_capacity(n))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut group = ProjectedGroup::new();
+        for g in 0..self.header.n_groups() {
+            self.read_group_projected(g, projection, &mut group)?;
+            let base = g * self.header.group_rows;
+            for (c, col) in projection.columns().iter().enumerate() {
+                let len = group.len();
+                if col.width > 0 {
+                    let dst = &mut values[c];
+                    dst[base..base + len].copy_from_slice(group.col(c));
+                }
+                if col.dtype == DType::I64 {
+                    if let Some(dst_ints) = ints[c].as_mut() {
+                        let exact = self.read_i64(g, col.index)?;
+                        dst_ints[base..base + len].copy_from_slice(&exact);
+                    }
+                }
+                if col.dtype == DType::U32 {
+                    if let Some(dst_codes) = codes[c].as_mut() {
+                        dst_codes.extend(self.read_codes(g, col.index)?);
+                    }
+                }
+            }
+        }
+        let names = projection.names();
+        let numeric: Vec<bool> = projection
+            .columns()
+            .iter()
+            .map(|c| c.dtype != DType::U32)
+            .collect();
+        let columns = names
+            .iter()
+            .enumerate()
+            .map(|(c, _)| Column {
+                values: std::mem::take(&mut values[c]),
+                ints: ints[c].take(),
+                dict: codes[c].take().map(|codes| DictColumn {
+                    codes,
+                    levels: self
+                        .header
+                        .levels(projection.columns()[c].index)
+                        .map(|l| l.to_vec())
+                        .unwrap_or_default(),
+                }),
+            })
+            .collect();
+        Ok(Table::from_parts(names, numeric, columns, n, 0))
+    }
+
 
     /// Load the whole store into the resident column-major image. This is the
     /// exact bridge for fixtures that fit: from here every path is identical to

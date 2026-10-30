@@ -320,8 +320,8 @@ fn cuda_build_defaults_to_gpu_when_a_device_is_available() {
     );
 }
 
-/// #236: the CUDA evaluator accumulates squared error, so a non-squared metric
-/// stays on the CPU — visibly. `--metric slope --gpu` must print the labelled
+/// #236/#287: a metric with no native score objective stays on the CPU —
+/// visibly, with the score table's named refusal. `--metric slope --gpu` must print the labelled
 /// reason, must not claim the device in the resource line or JSON, and must
 /// return exactly the `--no-gpu` run: the CPU evaluator is the only one in both
 /// runs, so any difference would mean the gate is leaking somewhere else.
@@ -358,11 +358,13 @@ fn non_squared_metric_on_gpu_prints_the_reason_and_matches_the_cpu() {
     );
     assert!(stdout.contains("\"backend\":\"cpu\""), "json: {stdout}");
     assert!(
-        stdout.contains("\"backend_reason\":\"metric is not scored natively on the GPU\""),
-        "the fallback must carry its labelled cause, json: {stdout}"
+        stdout.contains(
+            "\"backend_reason\":\"slope needs a cross-row first-difference pass\""
+        ),
+        "the fallback must carry its named cause, json: {stdout}"
     );
     assert!(
-        stderr.contains("# gpu: off (metric is not scored natively on the GPU)"),
+        stderr.contains("# gpu: off (slope needs a cross-row first-difference pass)"),
         "the reason must be printed once, got: {stderr}"
     );
     assert!(
@@ -653,6 +655,22 @@ fn gpu_run_reports_measured_accounting_not_occupancy() {
     );
     assert!((0.0..=1.0).contains(&a.duty_cycle()));
     assert!(a.quality_per_gpu_hour(1.0, 10.0).is_some());
+    // #284: the run ledger closes to its own wall and the run duty is the
+    // interval union, not an evaluator-window ratio.
+    let l = &g.ledger;
+    assert!(l.wall_s() > 0.0);
+    assert!(
+        l.closure_residual().value.abs() < 0.01,
+        "run ledger must close within 1%: stages {} + unaccounted {} vs wall {}",
+        l.stage_sum_s(),
+        l.unaccounted_s(),
+        l.wall_s()
+    );
+    assert!(l.device_busy_s() <= l.device_busy_sum_s() + 1e-12);
+    assert!((0.0..=1.0).contains(&l.duty_run().value));
+    assert!((0.0..=1.0).contains(&l.eval_kernel_duty().value));
+    assert!((0.0..=1.0).contains(&l.fit_kernel_duty().value));
+    assert!(!l.intervals().is_empty(), "the evaluator must record a device interval");
     // #131 must still be present alongside the accounting.
     assert!(
         !g.generations.is_empty(),
