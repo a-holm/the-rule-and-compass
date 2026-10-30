@@ -37,8 +37,6 @@ const TOL: f64 = 1e-12;
 /// entry is `(name, measured fixture result)`. They are excluded from the main
 /// gate and asserted by `known_parity_bugs_stay_ignored`.
 const KNOWN_BUGS: &[(&str, &str)] = &[
-    ("amihud96", "flow, tier 1e-12: max rel 9.929e-1 (abs 1.635e2), first row 42074 CPU 0.171 GPU 85.46; also not prefix-causal (row 42074 GPU 85.46 full vs 4.137 after removing later rows)"),
-    ("xs_rank_amihud96", "bitwise: 13 bit mismatches, max abs 6.087e-1; ranks of the device amihud96"),
     ("ma96", "bitwise: 1243 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 188882)"),
     ("ma672", "bitwise: 8731 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 189458)"),
     ("ou_hl96", "tier 1e-12: max rel 1.314e-7 (abs 1.382e-7); #298 accepted 1e-6, no matching tier"),
@@ -648,14 +646,12 @@ fn known_bugs_are_documented_and_registered() {
 }
 
 #[test]
-#[ignore = "bug #355: amihud96 GPU differs from CPU beyond 1e-12 (rel 9.929e-1, first row 42074 CPU 0.171 GPU 85.46) and is not prefix-causal"]
-fn bug_amihud96() {
+fn amihud96_matches_the_cpu_and_ignores_the_previous_symbol() {
     assert_known_bug_column("amihud96");
 }
 
 #[test]
-#[ignore = "bug #355: xs_rank_amihud96 ranks differ (13 rows, max abs 6.087e-1); follows amihud96"]
-fn bug_xs_rank_amihud96() {
+fn xs_rank_amihud96_is_bit_identical_to_the_cpu() {
     assert_known_bug_column("xs_rank_amihud96");
 }
 

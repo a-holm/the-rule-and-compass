@@ -237,7 +237,7 @@ __global__ void k_flow_base(RcEnrich *c, double *f)
         per_trade[i] = NAN;
     }
 
-    bool lr_ok = i > 0 && !rc_gap(c, i) && isfinite(cl) &&
+    bool lr_ok = !rc_seg_start(c, i) && !rc_gap(c, i) && isfinite(cl) &&
                  isfinite(c->d_close[i - 1]) && cl > 0.0 &&
                  c->d_close[i - 1] > 0.0;
     /* The Amihud plane stores the per-bar |log return| / quote volume: the
