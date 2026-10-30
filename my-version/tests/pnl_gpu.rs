@@ -1420,3 +1420,336 @@ fn select_band_json_carries_the_provenance_fields() {
     }
     assert!(json.contains("\"scored_by\":\"cpu_f64\""));
 }
+
+// ---------------------------------------------------------------------------
+// #311: conformance and chunk/thread invariance harness
+// ---------------------------------------------------------------------------
+
+use rcsr::risk::{risk_stats, Drawdown, RiskAccumulator, CANONICAL_SEGMENT};
+
+fn long_run_data(n: usize) -> (Vec<f64>, Vec<f64>, Vec<u64>) {
+    let mut scores = Vec::with_capacity(n);
+    let mut returns = Vec::with_capacity(n);
+    let mut groups = Vec::with_capacity(n);
+    for i in 0..n {
+        scores.push(((i * 37) % 101) as f64 / 50.0 - 1.0);
+        returns.push(((i * 13) % 29) as f64 / 1000.0 - 0.0135);
+        groups.push((i / 9_001) as u64);
+    }
+    (scores, returns, groups)
+}
+
+#[test]
+fn flattened_timestamp_order_invents_trades_and_interleaved_groups_are_rejected() {
+    // Constructed equivalent of the pinned 456 vs 352 artefact (the 2019-window
+    // panel is not in the repo). Symbol A is always long, B is always flat, 100
+    // timestamps. Per-symbol grouping: 1 entry. Flattened (t, symbol) order read
+    // as ONE series: A, B, A, B, ... flips the position on every row.
+    let t = 100usize;
+    let mut scores = Vec::new();
+    let mut returns = Vec::new();
+    for i in 0..t {
+        scores.push(1.0);
+        scores.push(-1.0);
+        returns.push(0.001 * (i % 3) as f64);
+        returns.push(0.001 * (i % 5) as f64);
+    }
+    let params = PnlParams {
+        threshold: 0.0,
+        per_side_bps: 10.0,
+        ..PnlParams::default()
+    };
+
+    let flat_one_group = reduce(&scores, &returns, &vec![0u64; 2 * t], &params).unwrap();
+    assert_eq!(flat_one_group.strategy.entries, t as u64, "boundary diffing");
+
+    // Symbol-major order, one group per symbol: the true trade count.
+    let mut s_major = Vec::new();
+    let mut r_major = Vec::new();
+    let mut g_major = Vec::new();
+    for sym in 0..2usize {
+        for i in 0..t {
+            s_major.push(scores[2 * i + sym]);
+            r_major.push(returns[2 * i + sym]);
+            g_major.push(sym as u64);
+        }
+    }
+    let grouped = reduce(&s_major, &r_major, &g_major, &params).unwrap();
+    assert_eq!(grouped.strategy.entries, 1);
+    assert_eq!(grouped.strategy.trades, 1, "the final exit is not a position change");
+    assert_eq!(grouped.strategy.final_exits, 1);
+    assert!(flat_one_group.strategy.trades > grouped.strategy.trades);
+    assert_eq!(flat_one_group.strategy.trades, 2 * t as u64);
+
+    // Two groups equal two separate runs (bitwise on the additive totals).
+    let a = reduce(&s_major[..t], &r_major[..t], &g_major[..t], &params).unwrap();
+    let b = reduce(&s_major[t..], &r_major[t..], &g_major[t..], &params).unwrap();
+    assert_eq!(grouped.strategy.trades, a.strategy.trades + b.strategy.trades);
+    assert!(
+        (grouped.strategy.net - (a.strategy.net + b.strategy.net)).abs() <= 1e-12,
+        "grouped {} vs separate {}",
+        grouped.strategy.net,
+        a.strategy.net + b.strategy.net
+    );
+
+    // Interleaved group ids (flattened order with real ids) are a hard error.
+    let g_inter: Vec<u64> = (0..2 * t).map(|i| (i % 2) as u64).collect();
+    let err = reduce(&scores, &returns, &g_inter, &params).unwrap_err();
+    assert!(err.contains("reappears"), "{err}");
+}
+
+#[test]
+fn six_nan_targets_in_845928_rows_change_exactly_six_rows() {
+    // Scale-matched stand-in for the pinned cell (the 845,928-row panel is not
+    // in the repo): the shared mask drops exactly the six NaN-target rows, the
+    // score-only mask keeps them.
+    let n = 845_928usize;
+    let scores: Vec<f64> = (0..n).map(|i| ((i * 31) % 1009) as f64 / 500.0 - 1.0).collect();
+    let mut targets: Vec<f64> = (0..n).map(|i| ((i * 7) % 53) as f64 / 1000.0 - 0.02).collect();
+    for k in 0..6 {
+        targets[1 + k * 140_987] = f64::NAN;
+    }
+    let shared = ValidMask::from_finites(&scores, &targets);
+    let score_only = ValidMask::from_scores(&scores);
+    assert_eq!(shared.valid_count(), n - 6);
+    assert_eq!(score_only.valid_count(), n);
+    assert_eq!(shared.dropped_count(), 6);
+    let dropped: Vec<usize> = (0..n).filter(|&i| !shared.is_valid(i)).collect();
+    assert_eq!(dropped, (0..6).map(|k| 1 + k * 140_987).collect::<Vec<_>>());
+}
+
+#[test]
+fn p_and_l_reduction_is_bit_identical_at_every_chunk_and_segment_size() {
+    let n = 200_000usize;
+    let (scores, returns, groups) = long_run_data(n);
+    let params = PnlParams::default();
+    let base = reduce(&scores, &returns, &groups, &params).unwrap();
+    for chunk in [4_096usize, 65_536, 1_000_003] {
+        let got = reduce_chunked(&scores, &returns, &groups, &params, chunk).unwrap();
+        assert_eq!(base.strategy.bits(), got.strategy.bits(), "chunk {chunk}");
+        assert_eq!(base.buy_and_hold.bits(), got.buy_and_hold.bits());
+        assert_eq!(base.cash.bits(), got.cash.bits());
+    }
+}
+
+#[test]
+fn band_cooldown_and_dp_scans_are_bit_identical_at_4k_and_64k_chunks() {
+    let n = 200_000usize;
+    let (scores, returns, groups) = long_run_data(n);
+    let side = 0.001;
+    let band = BandParams::new(0.0, 0.1, 1).unwrap();
+    let hold = BandParams::new(0.0, 0.1, 3).unwrap();
+    let b0 = band_scan(&scores, &returns, &groups, &band, side, n).unwrap();
+    let c0 = cooldown_scan(&scores, &returns, &groups, &hold, side, n).unwrap();
+    let d0 = dp_scan(&returns, &groups, side, n).unwrap();
+    for chunk in [4_096usize, 65_536] {
+        let b = band_scan(&scores, &returns, &groups, &band, side, chunk).unwrap();
+        assert_eq!(b0.positions, b.positions, "band chunk {chunk}");
+        assert_eq!(b0.net().to_bits(), b.net().to_bits(), "band net chunk {chunk}");
+        for (x, y) in b0.carries.iter().zip(&b.carries) {
+            assert_eq!(x.bits(), y.bits(), "band carry chunk {chunk}");
+        }
+        let c = cooldown_scan(&scores, &returns, &groups, &hold, side, chunk).unwrap();
+        assert_eq!(c0.net().to_bits(), c.net().to_bits(), "cooldown net chunk {chunk}");
+        for (x, y) in c0.carries.iter().zip(&c.carries) {
+            assert_eq!(x.bits(), y.bits(), "cooldown carry chunk {chunk}");
+        }
+        let d = dp_scan(&returns, &groups, side, chunk).unwrap();
+        assert_eq!(d0.bound(side).to_bits(), d.bound(side).to_bits(), "dp chunk {chunk}");
+        for (x, y) in d0.carries.iter().zip(&d.carries) {
+            assert_eq!(x.bits(), y.bits(), "dp carry chunk {chunk}");
+        }
+    }
+}
+
+#[test]
+fn rule_net_never_exceeds_dp_at_200_thresholds_and_bands() {
+    let n = 3_000usize;
+    let (scores, returns, groups) = scan_data(n);
+    let side = 0.001;
+    let dp = dp_bound(&returns, &groups, side).unwrap();
+    for k in 0..200usize {
+        let theta = -0.9 + 1.8 * k as f64 / 199.0;
+        let beta = 0.2 * (k % 7) as f64 / 6.0;
+        let params = BandParams::new(theta, beta, 1).unwrap();
+        let net = band_scan(&scores, &returns, &groups, &params, side, 4_096)
+            .unwrap()
+            .net();
+        assert!(net <= dp + 1e-12, "k {k} theta {theta} beta {beta}: {net} > {dp}");
+    }
+}
+
+fn serial_max_drawdown(returns: &[f64]) -> f64 {
+    let (mut equity, mut peak, mut worst) = (1.0f64, 1.0f64, 0.0f64);
+    for &r in returns {
+        equity *= 1.0 + r;
+        peak = peak.max(equity);
+        worst = worst.min(equity / peak - 1.0);
+    }
+    worst
+}
+
+#[test]
+fn drawdown_monoid_matches_serial_to_1e12_for_any_split() {
+    let n = 100_000usize;
+    let (scores, returns, groups) = long_run_data(n);
+    let terms = rcsr::trading_gpu::row_terms(&scores, &returns, &groups, &PnlParams::default())
+        .unwrap();
+    let net: Vec<f64> = terms.iter().map(|t| t.net).collect();
+    let want = serial_max_drawdown(&net);
+    assert!(want < 0.0, "fixture must have a drawdown");
+
+    let mut whole = Drawdown::identity();
+    for &x in &net {
+        whole.push(x);
+    }
+    assert!((whole.max_drawdown() - want).abs() <= 1e-12, "{} vs {want}", whole.max_drawdown());
+
+    for chunk in [1_000usize, CANONICAL_SEGMENT, 65_536] {
+        let mut acc = Drawdown::identity();
+        for part in net.chunks(chunk) {
+            let mut d = Drawdown::identity();
+            for &x in part {
+                d.push(x);
+            }
+            acc = Drawdown::merge(&acc, &d);
+        }
+        assert!(
+            (acc.max_drawdown() - want).abs() <= 1e-12,
+            "chunk {chunk}: {} vs {want}",
+            acc.max_drawdown()
+        );
+    }
+}
+
+#[test]
+fn risk_stats_are_bit_identical_at_4k_and_64k_chunks() {
+    let n = 200_000usize;
+    let (scores, returns, groups) = long_run_data(n);
+    let terms = rcsr::trading_gpu::row_terms(&scores, &returns, &groups, &PnlParams::default())
+        .unwrap();
+    let net: Vec<f64> = terms.iter().map(|t| t.net).collect();
+    let ppy = 8760.0;
+    let whole = risk_stats(&net, ppy, 0.0);
+    for chunk in [4_096usize, 65_536, 777] {
+        let mut acc = RiskAccumulator::new(0.0);
+        for part in net.chunks(chunk) {
+            acc.push_chunk(part);
+        }
+        assert_eq!(acc.finish(ppy), whole, "chunk {chunk}");
+    }
+}
+
+#[test]
+fn negative_position_vectors_are_a_hard_error_in_default_mode() {
+    for bad in [[-1.0], [-0.0001], [2.0], [f64::NAN]] {
+        assert!(check_long_only(&bad).is_err(), "{bad:?}");
+    }
+    assert!(check_long_only(&[0.0, 1.0, 1.0, 0.0]).is_ok());
+    // Every score, including very negative and non-finite ones, maps to 0/1.
+    let params = PnlParams::default();
+    let terms = rcsr::trading_gpu::row_terms(
+        &[-1e300, f64::NAN, f64::NEG_INFINITY, 1.0],
+        &[0.0; 4],
+        &[0; 4],
+        &params,
+    )
+    .unwrap();
+    let pos: Vec<f64> = terms.iter().map(|t| t.position).collect();
+    assert_eq!(pos, vec![0.0, 0.0, 0.0, 1.0]);
+}
+
+#[cfg(feature = "cuda")]
+mod device_conformance {
+    use super::*;
+    use rcsr::trading_gpu::{device_available, reduce_device, reduce_device_batch};
+
+    #[test]
+    fn every_padded_candidate_equals_its_own_alone_run_at_every_thread_and_chunk() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 70_000usize;
+        let (_, returns, groups) = long_run_data(n);
+        let params = PnlParams { segment_rows: 64, ..PnlParams::default() };
+        let cands: Vec<Vec<f64>> = (0..MAX_TILE_CANDIDATES)
+            .map(|k| {
+                (0..n)
+                    .map(|i| (((i * (31 + 2 * k)) % 1009) as f64 / 500.0 - 1.0) as f32 as f64)
+                    .collect()
+            })
+            .collect();
+        let alone: Vec<_> = cands
+            .iter()
+            .map(|s| reduce_device(s, &returns, &groups, &params, 256, 65_536).unwrap())
+            .collect();
+        for threads in [128usize, 256, 512] {
+            for chunk in [4_096usize, 65_536] {
+                // Full tile, then a partial (padded) tile of 3 candidates.
+                for count in [MAX_TILE_CANDIDATES, 3] {
+                    let refs: Vec<&[f64]> = cands[..count].iter().map(|v| v.as_slice()).collect();
+                    let th = vec![0.0; count];
+                    let got = reduce_device_batch(&refs, &returns, &groups, &th, &params, threads, chunk)
+                        .unwrap();
+                    for (k, g) in got.iter().enumerate() {
+                        assert_eq!(
+                            alone[k].strategy.bits(),
+                            g.strategy.bits(),
+                            "cand {k} count {count} threads {threads} chunk {chunk}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_cash_and_buy_and_hold_are_bit_identical_alone_padded_and_across_chunks_and_threads() {
+        use rcsr::baselines::{control_positions, device_totals, position_totals};
+        const POSITION_THRESHOLD: f64 = 0.5;
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 70_000usize;
+        let (scores, returns, groups) = long_run_data(n);
+        let params = PnlParams { segment_rows: 64, ..PnlParams::default() };
+        let strat: Vec<f64> = scores.iter().map(|&s| if s > 0.0 { 1.0 } else { 0.0 }).collect();
+        // Cash, buy-and-hold, constant, matched exposure.
+        let books = control_positions(&strat, &groups, true, 7).unwrap();
+        let cpu: Vec<_> = books
+            .iter()
+            .map(|b| position_totals(b, &returns, &groups, &params).unwrap())
+            .collect();
+
+        let via_entry = device_totals(&books, &returns, &groups, &params).expect("device");
+        for (k, (c, d)) in cpu.iter().zip(&via_entry).enumerate() {
+            assert_eq!(c.bits(), d.bits(), "control {k} entry point");
+        }
+
+        for threads in [128usize, 256, 512] {
+            for chunk in [4_096usize, 65_536] {
+                // Alone: each control as a one-candidate tile.
+                for (k, b) in books.iter().enumerate() {
+                    let got = reduce_device_batch(
+                        &[b.as_slice()], &returns, &groups, &[POSITION_THRESHOLD], &params, threads, chunk,
+                    )
+                    .unwrap();
+                    assert_eq!(cpu[k].bits(), got[0].strategy.bits(), "alone {k} t{threads} c{chunk}");
+                }
+                // Padded: the four controls plus filler books in a full tile.
+                let mut tile: Vec<&[f64]> = books.iter().map(|b| b.as_slice()).collect();
+                while tile.len() < MAX_TILE_CANDIDATES {
+                    tile.push(books[3].as_slice());
+                }
+                let th = vec![POSITION_THRESHOLD; tile.len()];
+                let got = reduce_device_batch(&tile, &returns, &groups, &th, &params, threads, chunk)
+                    .unwrap();
+                for k in 0..4 {
+                    assert_eq!(cpu[k].bits(), got[k].strategy.bits(), "padded {k} t{threads} c{chunk}");
+                }
+            }
+        }
+    }
+}
