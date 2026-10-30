@@ -123,6 +123,10 @@ front carries `train_error`, `validation_error`, `test_error` and
 carries `validation_rows`. If you ask for `--select-by validation` without a
 slice, `rcsr` exits 2 instead of quietly falling back to train.
 
+The lockbox guard checks fit-train, validation and test rows: a validation slice
+that overlaps 2026H2 is refused like a test block unless `--allow-lockbox` is
+given.
+
 With a time column the validation cut sits on a timestamp boundary: rows that
 share the timestamp of the first validation row move into the validation slice,
 so no timestamp straddles fit-train and validation (the slice can be larger than

@@ -201,7 +201,7 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --smooth-centred <k>       the old centred window. Reads future bars and is
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
-  --allow-lockbox            permit train/test rows in 2026H2 (declared final test only)
+  --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
   --target-spec <file>       declared target spec (rcsr-target-spec/1 JSON; default
                              <data stem>.targets.json when it has an entry for the
                              target). The engine then: refuses a label whose
@@ -635,6 +635,7 @@ CHECKPOINTS:
                              settings win; --generations may only be raised.
                              Training and test data must match the saved
                              fingerprint; a mismatch is refused (exit 3).
+                             The target spec sha256 must match too (exit 2).
                              The saved backend (cpu/gpu) must also match; a
                              mismatch is refused unless overridden below
   --allow-backend-change     resume a checkpoint on a different backend
@@ -3911,6 +3912,7 @@ fn main() {
         }
         _ => None,
     };
+    let target_sha: Option<String> = target_active.as_ref().map(|a| a.spec.sha256());
     let target_spec_json = target_active
         .as_ref()
         .map(|a| a.json())
@@ -4159,6 +4161,10 @@ fn main() {
     // state, otherwise every saved error and population would be meaningless.
     let mut backend_change: Option<(String, String)> = None;
     if let Some(cp) = &resume_checkpoint {
+        if let Err(e) = cp.check_target_spec(target_sha.as_deref()) {
+            eprintln!("error: {}", e);
+            std::process::exit(EXIT_USAGE);
+        }
         if let Err(e) = cp.check_data(&prepared.train, &prepared.test) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
@@ -4667,7 +4673,7 @@ fn main() {
             save_every,
             &seeds,
             |cp| {
-                if let Err(e) = cp.save(&path) {
+                if let Err(e) = cp.save_for(&path, target_sha.as_deref()) {
                     eprintln!("error: {}", e);
                     std::process::exit(EXIT_INPUT);
                 }

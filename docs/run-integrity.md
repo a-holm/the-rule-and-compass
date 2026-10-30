@@ -151,7 +151,10 @@ run (the "10-hour run"):
    again); the log is truncated per run, so a resumed run gets its own file.
    The checkpoint records the build identity; `--resume` refuses a different
    binary, commit, device, driver or thread count unless `--allow-build-change`
-   is given.
+   is given. A run with a target spec also records the spec sha256;
+   `--resume` with a different spec (or with none, or onto a checkpoint
+   written without one) is refused with exit 2 and a message naming both
+   hashes, before the data fingerprint is compared.
 4. **Explain** the finished run with `rcsr dev-report runs/<label>.dev.ndjson`:
    phase table, fit vs evaluation share, fallback causes, convergence, archive
    growth and a ranked bottleneck list. Use `--dev-log-level full` when the
