@@ -1045,6 +1045,43 @@ names (for example `cmf20`, `mfi14`, `body1`) stay on the CPU because their
 producer is the compact reference itself or belongs to the flow/price-action
 family.
 
+### Parity and batch-invariance harness (#303)
+
+`tests/gpu_parity.rs` is the single gate for every device-registered enrichment column. The column set is `default_registry()` filtered by `gpu_supports`, never a hand list. Each column declares one tier in the registry (`parity_tier`, also in `rcsr schema`):
+
+| tier | check |
+|---|---|
+| `bitwise` | SHA-256 of the raw f64 bytes is equal, no bit differs, NaN/Inf masks equal |
+| `1e-12` | NaN/Inf masks equal and `\|a-b\| <= 1e-12 * (1 + max(\|a\|,\|b\|))` |
+
+`1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the two fails `every_device_column_declares_exactly_one_tier`.
+
+The fixture has 24 symbols x 21,000 bars (476,730 rows) with holes, a 5 h and a 32 h outage (stale 1h/4h and 1d buckets), a NaN close, zero volume, `H == L`, tied returns, PIT non-member rows and fewer than 20 members before bar 3,000.
+
+```sh
+# Whole harness: ~9 minutes on an RTX 3060; one test at a time under the machine lock
+cd my-version && RCSR_CUDA_ARCH=sm_86 cargo test --release --features cuda --test gpu_parity -- --nocapture
+# Quick iteration (smaller fixture), one test by name
+RCSR_PARITY_PER_SYMBOL=6000 cargo test --release --features cuda --test gpu_parity device_columns_match -- --nocapture
+# Per-column numbers
+RCSR_PARITY_VERBOSE=1 ...
+# Known parity bugs (ignored, each asserts its column at its tier)
+cargo test --release --features cuda --test gpu_parity bug_ -- --ignored
+```
+
+What the tests check: every column at its tier (`device_columns_match_the_cpu_at_their_declared_tier`, with a per-family table); cold vs warm store SHA-256; `--chunk-rows` 1 and 4,096 against 65,536 and an 8,191-row store layout (symbol batching); prefix replay at 20 cuts with a future-shift canary; panel prep (#301) and PIT as-of joins (#302) CPU vs device, cold/warm, block sizes, prefix replay and canary; the MTF family on a size its context accepts. `enrich::set_gpu_floor_for_tests(0)` lowers the 1,000,000-row `--gpu on` floor for this binary only.
+
+Large store (not in git): `/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb` (16,113,108 rows). Each arm is its own invocation so no lock hold covers both.
+
+```sh
+export RCSR_PARITY_STORE=/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb RCSR_PARITY_WORK=/mnt/lager/tmp/eureqa-gates/parity-large
+for arm in cpu gpu compare; do
+  RCSR_PARITY_ARM=$arm cargo test --release --features cuda --test gpu_parity large_store -- --ignored --nocapture
+done
+```
+
+The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical per-column hashes. On 2026-10-30 the `cpu` arm finished (298 columns, 2579 s wall, 1603 s feature phase, 1.2 GB peak RSS); the `gpu` arm hung in the projected ring (the reader thread waits for a free slot that is never returned) and was killed, so the 16.1M CPU/GPU comparison is not yet recorded.
+
 ### Measured enrichment (2026-10-21)
 
 Machine: AMD/Intel 8-thread host, 31 GiB RAM, RTX 3060 (12 GiB), ext4 on
