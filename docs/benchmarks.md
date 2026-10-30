@@ -350,8 +350,8 @@ with one wall clock and exclusive main-thread stages:
 | `eval_fallback.programs/seconds` | evaluator CPU-fallback work |
 | `quality_per_gpu_hour` | decades per run wall-hour, with like-unit errors and full provenance |
 
-The older `gpu.duty_cycle` remains the evaluator-window kernel fraction
-(`duty_scope = "evaluator_window"`). It is not the run-level number; use
+`gpu.eval_kernel_duty` (formerly `gpu.duty_cycle`) is the evaluator-window kernel
+fraction (scope `evaluator_window`, window `gpu.eval_window_s`). It is not the run-level number; use
 `gpu.ledger.duty_run` for “how busy was the device during the run?”. A GPU run
 answers `Σ stage_s + unaccounted_s = wall_s` within 1 %; a CPU run still reports
 `"gpu": null`.

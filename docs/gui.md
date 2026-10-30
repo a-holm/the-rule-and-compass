@@ -591,13 +591,15 @@ at startup. Nothing about the flag list is hard-coded in the GUI.
 tool version seed metric target variables train_rows test_rows
 split { mode rows train_rows test_rows folds[] gap groups_total
         groups_train groups_test lags series history_rows notes[] }
-generations_run converged_early elapsed_seconds
+generations_run converged_early stop_reason elapsed_seconds
 timing { prep_seconds search_seconds baselines_seconds diagnostics_seconds
-         report_seconds total_seconds gpu_seconds }
+         report_seconds unaccounted_seconds total_seconds gpu_seconds }
 gpu { kernel_s launch_s sync_s alloc_s h2d_s d2h_s transfer_s window_s
       host_s accounted_s wall_s idle_s residual_fraction h2d_bytes d2h_bytes batches
       failed_batches programs evals row_evals evals_per_s row_evals_per_s
-      generations_per_s duty_cycle duty_source sm_occupancy occupancy_source
+      batches_per_s eval_kernel_duty eval_window_s device_seconds_incl_fit
+      device_fraction_of_run eval_fraction_of_run process_total_s
+      sm_occupancy occupancy_source
       quality_per_gpu_hour generations[ { generation programs fallbacks
       opcodes{} } ] } | null
 null_control { runs best[] min median p_value verdict } | null

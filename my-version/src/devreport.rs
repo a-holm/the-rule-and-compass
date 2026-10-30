@@ -40,6 +40,8 @@ pub struct GenPoint {
     pub eval: f64,
     pub select: f64,
     pub archive: f64,
+    /// #256: the constant-fit stage window (absent in older logs: 0).
+    pub fit: f64,
     pub fit_cpu: f64,
     pub eval_cpu: f64,
     pub best: f64,
@@ -118,6 +120,7 @@ fn peel_generation(ev: &Json) -> GenPoint {
         eval: ph("eval"),
         select: ph("select"),
         archive: ph("archive"),
+        fit: ph("fit"),
         fit_cpu: ph("fit_cpu"),
         eval_cpu: ph("eval_cpu"),
         best: f(err.and_then(|e| e.get("best"))),
@@ -358,6 +361,7 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
     let mut eval = 0.0;
     let mut select = 0.0;
     let mut archive = 0.0;
+    let mut fit = 0.0;
     let mut duties = Vec::new();
     let mut causes: Vec<(String, usize)> = Vec::new();
     for p in &a.points {
@@ -367,6 +371,7 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         eval += clean(p.eval);
         select += clean(p.select);
         archive += clean(p.archive);
+        fit += clean(p.fit);
         a.fit_cpu += clean(p.fit_cpu);
         a.eval_cpu += clean(p.eval_cpu);
         a.attempts += p.attempts;
@@ -406,6 +411,7 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
         ("prep", prep),
         ("select", select),
         ("archive", archive),
+        ("fit", fit),
     ];
     if !duties.is_empty() {
         a.gpu_duty_mean = Some(duties.iter().sum::<f64>() / duties.len() as f64);
@@ -445,10 +451,11 @@ pub fn analyse(path: &str, events: &[Json], skipped: usize) -> Analysis {
     // Ranked, disjoint wall windows.
     let mut ranked: Vec<(&'static str, f64, &'static str)> = vec![
         ("search", search, "island variation: selection, crossover, mutation, fitting, scoring"),
-        ("eval", eval, "the batched evaluator call and its CPU fallback rescore"),
+        ("eval", eval, "the batched evaluator call and its CPU fallback rescore (fit is its own phase)"),
         ("prep", prep, "per-generation sample draws and the carried-population refit"),
         ("select", select, "screened successive-halving promotion and population selection"),
         ("archive", archive, "Pareto insertions and the best/quantile bookkeeping"),
+        ("fit", fit, "constant fitting: the GPU fit call, the exact CPU fallback and write-back"),
     ];
     ranked.sort_by(|x, y| y.1.total_cmp(&x.1));
     let wall = if a.gen_wall > 0.0 { a.gen_wall } else { 1.0 };
@@ -713,6 +720,7 @@ pub fn render(a: &Analysis) -> String {
                 "eval" => p.eval,
                 "prep" => p.prep,
                 "select" => p.select,
+                "fit" => p.fit,
                 _ => p.archive,
             })
             .collect();
@@ -810,7 +818,7 @@ pub fn render(a: &Analysis) -> String {
         out.push_str(&format!("| fitted on the GPU | {} |\n", a.fit_gpu));
         out.push_str(&format!("| CPU fallback | {} |\n", a.fit_fallback));
         out.push_str(&format!("| CPU fallback seconds | {:.4} |\n", a.fallback_s));
-        out.push_str(&format!("| fallback workers | {} |\n\n", a.fallback_workers));
+        out.push_str(&format!("| evaluator fallback workers | {} |\n\n", a.fallback_workers));
         if !a.fallback_causes.is_empty() {
             out.push_str("| cause | candidates |\n|---|---:|\n");
             for (cause, count) in &a.fallback_causes {
@@ -990,6 +998,7 @@ mod tests {
             eval_s: 0.004,
             select_s: 0.0005,
             archive_s: 0.0005,
+            fit_s: 0.001,
             fit_cpu_s: fit_cpu,
             eval_cpu_s: eval_cpu,
             best_error: 1.0 / gen as f64,

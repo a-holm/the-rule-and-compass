@@ -21,7 +21,7 @@ rcsr --data examples/line.csv --target y --vars x \
 | option | meaning |
 |---|---|
 | `--save <file>` | write a checkpoint on exit and every `--save-every` generations |
-| `--save-every <N>` | generation interval for `--save` (default `25`, requires `--save`) |
+| `--save-every <N>` | generation interval for `--save` (default `25`, requires `--save`). A checkpoint is also written when 15 minutes of wall time have passed since the last one (#256; `RCSR_CHECKPOINT_INTERVAL_S` overrides the 900 s). |
 | `--resume <file>` | continue from a checkpoint, refusing a data or backend mismatch |
 | `--allow-backend-change` | permit a CPU↔GPU resume, recorded on stderr and in the run manifest |
 
@@ -97,13 +97,18 @@ Every record:
 | `backend <cpu\|gpu\|unknown>` | evaluator that produced the state (#140). New checkpoints always write `cpu` or `gpu`; `unknown` only appears when reading a checkpoint from before this record existed. |
 | `config_hash <hex>` | FNV-1a 64-bit hash of the canonical `config` lines, excluding the `generations` budget (resuming may raise it). The loader recomputes it and refuses a checkpoint whose configuration text does not agree. |
 | `generations <n>` | completed generations (the next generation to run). |
-| `stopped_early <bool>` | the saved run had already converged, hit its patience limit or its time budget. Resuming it does not run more generations. |
+| `stopped_early <bool>` | the saved run declared itself finished: it reached the solved floor or its patience limit. Resuming it does not run more generations. A time-budget stop is **not** terminal (#256): it is saved with `stopped_early false`, so `--resume` continues it and `--time-budget` may be set again. |
 | `best_prev <f64>` | lowest error seen so far, used by the patience comparison. |
 | `no_improve <n>` | consecutive generations without improvement. |
 | `data train <rows> <hash>` | fingerprint of the training sample. |
 | `data test <rows> <hash>` | fingerprint of the test sample. |
+| `error_kind <f32_proxy\|f64\|unknown>` | #256: what the `sol` and `ind` errors are. A GPU search stores `f32_proxy` (optimistic by up to a few `1e-7` relative); a CPU search stores `f64`. |
+| `build <field> <value>` | #256: the process that wrote the file: `version`, `commit` (recorded when the binary was built), `binary_sha256`, `device`, `driver`, `threads`. `--resume` refuses a mismatch unless `--allow-build-change` is given. A checkpoint without `build` records loads and is not checked. There is no timestamp, so a prefix run reproduces an earlier checkpoint byte for byte (apart from `config generations`). |
+| `archive_hash <hex>` | #256: `Archive::hash` of the `sol` members, verified on load. |
 | `archive <members> <cap>` | number of Pareto members and the archive capacity. |
-| `sol <complexity> <cost> <error> <tree>` | one archive member. |
+| `sol <complexity> <cost> <error> <tree>` | one archive member (the search archive, with `error_kind` errors). |
+| `final <members> <cap> <hash>` | #256: header of the post-refit archive. Present only in the exit checkpoint. `<hash>` is the `Archive::hash` the run reports (`archive_hash` in the dev log, `hash` in `run_end`); the loader verifies it. |
+| `fsol <complexity> <cost> <error> <tree>` | #256: one post-refit member, in reported order, with the exact CPU `f64` errors of the result. A resume ignores the block and continues from `sol`. |
 | `island <i> <stagnant>` | per-island stagnation counter. |
 | `rng <i\|main> <idx> <624 words>` | exact MT19937 state (state array and next index). `main` is the RNG that built the initial populations. |
 | `ind <i> <error> <complexity> <tree>` | one population member, in population order. |
@@ -228,13 +233,14 @@ The guarantee holds because the checkpoint carries all of the trajectory state:
 
 Limits:
 
-* **Wall-clock budgets are not reproducible.** A saved time budget is still
-  enforced, but the clock is measured from the moment the resumed process
-  starts, not from the original start. Two runs with the same checkpoint and
-  `--time-budget` can therefore stop at different generations, and a run that
-  stopped because of the budget is saved with `stopped_early true` (resuming it
-  does not run more generations). For bit-identical comparisons, leave
-  `--time-budget` unset.
+* **Wall-clock budgets are not reproducible.** The budget is a limit of one
+  process: the clock starts when the resumed process starts. Two runs with the
+  same checkpoint and `--time-budget` can therefore stop at different
+  generations. A run that stopped because of the budget is resumable (#256):
+  the generation in progress finishes, the checkpoint is saved with
+  `stopped_early false`, and `--resume` adds generations. `--time-budget` is
+  not part of the saved search settings, so a resume may set a new budget. For
+  bit-identical comparisons, leave `--time-budget` unset.
 * Checkpoints are taken only at generation boundaries. Killing the process in
   the middle of a generation loses that generation; the last completed
   generation is intact.
@@ -252,6 +258,7 @@ Limits:
 | checkpoint cannot be read, is truncated, has a bad version/op index/arity, or has a duplicate/missing record | `3` (input) |
 | data fingerprint mismatch | `3` (input) |
 | saved `backend` differs and `--allow-backend-change` was not given | `3` (input) |
+| saved `build` identity (binary, commit, version, device, driver, threads) differs and `--allow-build-change` was not given | `3` (input) |
 | `--resume` contradicts a saved search setting; `--save-every` without `--save`; invalid flag value | `2` (usage) |
 | checkpoint cannot be written | `3` (input) |
 
