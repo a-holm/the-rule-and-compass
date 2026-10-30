@@ -6,13 +6,23 @@
 //! and conflicting duplicates, listing/delisting/migration/membership chain
 //! resets, prefix replay and block-size invariance.
 //!
+//! #302 adds the PIT membership / MTF as-of joins (`pit_*` tests): boundary
+//! fixtures, `bar_age`, chain resets, prefix replay at 20 cuts, the
+//! future-shift canary, cold/warm and CPU/GPU byte identity, and block and chunk
+//! size invariance.
+//!
 //! The 4.78 M-row decoded block is hashed CPU vs device, cold and warm. The
 //! device tests skip on a CUDA build with no device.
 
 #![cfg(feature = "cuda")]
 
 use rcsr::panel_prep::{prepare as cpu_prepare, PrepBar, PrepOutput, PrepSegment};
+use rcsr::panel_pit::{self, PitBlock, PitParams};
+use rcsr::panel_pit_gpu::{self, PitGpu};
 use rcsr::panel_prep_gpu::{self, PrepGpu};
+
+#[path = "common/pit.rs"]
+mod pit;
 
 fn q(t: i64, p: f64, volume: f64) -> PrepBar {
     PrepBar::new(t, p, p + 1.0, p - 1.0, p + 0.25).with_flow(volume, volume * 2.0, volume / 10.0)
@@ -529,4 +539,237 @@ fn nan_is_a_gap_not_zero_and_negative_zero_is_a_conflict() {
     assert_eq!(cpu.conflicts.len(), 1);
     assert!(!cpu.buckets[2].traded, "zero-volume bucket kept with traded=false");
     assert_eq!(cpu.buckets.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// #302: PIT membership / MTF as-of joins
+// ---------------------------------------------------------------------------
+
+fn pit_gpu(block: &PitBlock, p: PitParams) -> rcsr::panel_pit::PitOutput {
+    let (out, _) = panel_pit_gpu::join(block, p).expect("device join");
+    out
+}
+
+fn pit_cases() -> Vec<(&'static str, PitBlock, PitParams)> {
+    vec![
+        ("membership", pit::membership_block(31, 7, 5000), PitParams::membership(900)),
+        ("mtf1h", pit::mtf_block(32, 7, 5000, 3600), PitParams::mtf(3600, 900)),
+        ("mtf4h", pit::mtf_block(33, 7, 5000, 14_400), PitParams::mtf(14_400, 900)),
+        ("mtf1d", pit::mtf_block(34, 7, 5000, 86_400), PitParams::mtf(86_400, 900)),
+    ]
+}
+
+#[test]
+fn pit_boundaries_and_chain_resets_match_the_cpu_reference() {
+    if !would_use_gpu() {
+        return;
+    }
+    // Decisions at 1000 (member), 2000 (excluded), 3000 (member again); rows one
+    // second before, at and after each; a migration chain change at 3500.
+    let times = [999i64, 1000, 1001, 1999, 2000, 2001, 2999, 3000, 3001, 3500, 3501];
+    let mut block = PitBlock {
+        times: times.to_vec(),
+        chain: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+        segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 11, leaf_start: 0, leaf_len: 3 }],
+        keys: vec![1000, 2000, 3000],
+        member: vec![1, 0, 1],
+    };
+    let p = PitParams::membership(1);
+    let cpu = panel_pit::join(&block, p).unwrap();
+    let gpu = pit_gpu(&block, p);
+    pit::assert_same("boundary", &cpu, &gpu);
+    assert_eq!(gpu.found[0], 0);
+    assert_eq!(gpu.leaf[1], 0);
+    assert_eq!(gpu.keep.iter().map(|v| *v as u32).sum::<u32>(), 7);
+    assert_eq!(gpu.gap[7], 0, "the first row after member=0 starts a new chain");
+    assert_eq!(gpu.gap[9], 0, "a migration chain change is not bridged");
+    assert_ne!(gpu.chain_id[9], gpu.chain_id[8]);
+
+    // MTF exactly at t and one second before; bar_age finite on a stale bucket.
+    block = PitBlock {
+        times: vec![3599, 3600, 7199, 7200, 14_400],
+        chain: vec![0; 5],
+        segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 5, leaf_start: 0, leaf_len: 2 }],
+        keys: vec![0, 3600],
+        member: vec![1, 1],
+    };
+    let p = PitParams::mtf(3600, 900);
+    let cpu = panel_pit::join(&block, p).unwrap();
+    let gpu = pit_gpu(&block, p);
+    pit::assert_same("mtf boundary", &cpu, &gpu);
+    assert_eq!(gpu.leaf, vec![-1, 0, 0, 1, 1]);
+    assert!(gpu.age[0].is_nan());
+    assert_eq!(gpu.age[1], 0.0);
+    assert_eq!(gpu.fresh[2], 1);
+    assert_eq!(gpu.fresh[4], 0, "the 2h-old bucket is stale");
+    assert!(gpu.age[4].is_finite() && gpu.age[4] == 7200.0);
+}
+
+#[test]
+fn pit_device_equals_cpu_reference_bitwise() {
+    if !would_use_gpu() {
+        return;
+    }
+    for (name, block, p) in pit_cases() {
+        let cpu = panel_pit::join(&block, p).unwrap();
+        let gpu = pit_gpu(&block, p);
+        pit::assert_same(name, &cpu, &gpu);
+        assert_eq!(gpu.lookahead_violations, 0, "{name}");
+    }
+}
+
+#[test]
+fn pit_block_and_chunk_size_do_not_change_the_bytes() {
+    if !would_use_gpu() {
+        return;
+    }
+    for (name, block, p) in pit_cases() {
+        let want = pit::digest(&panel_pit::join(&block, p).unwrap());
+        let mut gpu = PitGpu::new(&block).unwrap();
+        for threads in [32usize, 64, 96, 128, 256, 512, 1024] {
+            for chunk in [1usize, 7, 64, 256, 4096, 1 << 20] {
+                assert!(gpu.run_with(p, threads, chunk), "{name} {threads}x{chunk}");
+                let out = gpu.output().unwrap();
+                assert_eq!(pit::digest(&out), want, "{name}: threads {threads} chunk {chunk}");
+            }
+        }
+    }
+}
+
+#[test]
+fn pit_prefix_replay_at_twenty_cuts_on_the_device() {
+    if !would_use_gpu() {
+        return;
+    }
+    for (name, block, p) in pit_cases() {
+        let full = pit_gpu(&block, p);
+        let lo = *block.times.iter().min().unwrap();
+        let hi = *block.times.iter().max().unwrap();
+        for k in 0..20 {
+            let cut = lo + (hi - lo) * (k + 1) / 21;
+            let pre_block = pit::prefix(&block, cut, p.delay);
+            if pre_block.times.is_empty() {
+                continue;
+            }
+            let pre = pit_gpu(&pre_block, p);
+            pit::assert_prefix_equal(&format!("{name} cut {k}"), &block, &full, &pre_block, &pre);
+            let cpu_pre = panel_pit::join(&pre_block, p).unwrap();
+            pit::assert_same(&format!("{name} cut {k} cpu"), &cpu_pre, &pre);
+        }
+    }
+}
+
+#[test]
+fn pit_future_shifted_column_fails_the_device_check() {
+    if !would_use_gpu() {
+        return;
+    }
+    for (name, block, p) in pit_cases() {
+        let mut gpu = PitGpu::new(&block).unwrap();
+        assert!(gpu.run(p));
+        let out = gpu.output().unwrap();
+        assert_eq!(out.lookahead_violations, 0, "{name}");
+        assert_eq!(gpu.lookahead_violations(&out.leaf, p.delay), Some(0), "{name}");
+        let mut shifted = out.leaf.clone();
+        for s in &block.segments {
+            let le = (s.leaf_start + s.leaf_len) as i32;
+            for r in s.start as usize..(s.start + s.len) as usize {
+                if shifted[r] >= 0 && shifted[r] + 1 < le {
+                    shifted[r] += 1;
+                }
+            }
+        }
+        let cpu_bad = panel_pit::lookahead_violations(&block, &shifted, p.delay);
+        let gpu_bad = gpu.lookahead_violations(&shifted, p.delay).unwrap();
+        assert!(gpu_bad > 0, "{name}: shifted column must be reported");
+        assert_eq!(gpu_bad, cpu_bad, "{name}");
+    }
+}
+
+#[test]
+fn pit_cold_warm_and_cpu_gpu_digests_are_equal() {
+    if !would_use_gpu() {
+        return;
+    }
+    let block = pit::membership_block(41, 12, 20_000);
+    let p = PitParams::membership(900);
+    let cpu = pit::digest(&panel_pit::join(&block, p).unwrap());
+    let cold = pit::digest(&pit_gpu(&block, p));
+    let warm = pit::digest(&pit_gpu(&block, p));
+    let mut resident = PitGpu::new(&block).unwrap();
+    assert!(resident.run(p));
+    let first = pit::digest(&resident.output().unwrap());
+    assert!(resident.run(p));
+    let second = pit::digest(&resident.output().unwrap());
+    assert_eq!([cold, warm, first, second], [cpu; 4]);
+}
+
+#[test]
+fn pit_loads_are_a_merge_not_a_search_per_row() {
+    if !would_use_gpu() {
+        return;
+    }
+    let block = pit::membership_block(51, 4, 20_000);
+    let mut gpu = PitGpu::new(&block).unwrap();
+    assert!(gpu.run(PitParams::membership(900)));
+    let n = block.times.len() as u64;
+    // One search per chunk plus about one comparison per row and leaf.
+    let leaves = block.keys.len() as u64;
+    assert!(gpu.loads() <= 2 * n + leaves + 64 * (n / 256 + 4), "loads {}", gpu.loads());
+}
+
+/// Paired 4.78 M-row join, CPU reference vs device. Run with
+/// `cargo test --release --features cuda --test panel_gpu pit_paired -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn pit_paired_4_78m_row_join_measurement() {
+    if !would_use_gpu() {
+        return;
+    }
+    for (name, block, p) in [
+        ("membership", pit::membership_block(61, 40, 119_500), PitParams::membership(900)),
+        ("mtf1h", pit::mtf_block(62, 40, 119_500, 3600), PitParams::mtf(3600, 900)),
+    ] {
+        let n = block.times.len();
+        assert_eq!(n, 4_780_000);
+        // CPU dependent loads: binary-search probes of `partition_point`.
+        let mut cpu_loads = 0u64;
+        for s in &block.segments {
+            let m = s.leaf_len as usize;
+            let keys = &block.keys[s.leaf_start as usize..(s.leaf_start + s.leaf_len) as usize];
+            for r in s.start as usize..(s.start + s.len) as usize {
+                let t = block.times[r];
+                let (mut lo, mut hi) = (0usize, m);
+                while lo < hi {
+                    let mid = (lo + hi) / 2;
+                    cpu_loads += 1;
+                    if keys[mid] + p.delay <= t {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let cpu = panel_pit::join(&block, p).unwrap();
+        let cpu_s = t0.elapsed().as_secs_f64();
+        let mut gpu = PitGpu::new(&block).unwrap();
+        let t1 = std::time::Instant::now();
+        assert!(gpu.run(p));
+        let run_s = t1.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        let out = gpu.output().unwrap();
+        let down_s = t2.elapsed().as_secs_f64();
+        pit::assert_same(name, &cpu, &out);
+        println!(
+            "{name}: rows {n} leaves {} cpu {cpu_s:.3}s ({:.1} M rows/s) device pass {run_s:.4}s ({:.1} M rows/s) download {down_s:.3}s cpu_loads {cpu_loads} ({:.2}/row) device_loads {} ({:.2}/row)",
+            block.keys.len(),
+            n as f64 / cpu_s / 1e6,
+            n as f64 / run_s / 1e6,
+            cpu_loads as f64 / n as f64,
+            gpu.loads(),
+            gpu.loads() as f64 / n as f64,
+        );
+    }
 }
