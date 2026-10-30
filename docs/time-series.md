@@ -93,6 +93,11 @@ test rows, also recorded without a spec), `validation_purge_seconds`,
 `purged_rows.test_boundary`, `purged_rows.validation_boundary` and
 `purge_source`. The text header prints the same facts on a `# purge:` line.
 
+The 2026H2 lockbox check covers the fit rows, the validation slice and the test
+blocks alike: a validation slice that overlaps the lockbox is refused with the
+message shape and exit code of a test block (`validation split: N row(s) ...
+overlap the lockbox`), unless `--allow-lockbox` declares a final test.
+
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the
 training error, and `--folds` blocks look suspiciously similar at the boundary.
@@ -161,6 +166,12 @@ symmetric clip and a scale that ends at or before the decision time
 | `D13a` | `return_column` or the target in `--vars` | none |
 | `D13b` | a scale window that ends after the decision time | none |
 | `D13c` | a structural term | `--allow-target-structure` (diagnostic replays) |
+
+The spec sha256 is written into every checkpoint. `--resume` under a different
+spec, or under none, is refused with exit 2 and a message naming both hashes,
+even when the purge removes the same rows and the data fingerprints agree. A
+spec's `note` (for example a survivorship or point-in-time statement) is echoed
+in `run.json` as `target_spec.note`; the engine adds no statement of its own.
 
 A construction column in `--vars` without a structural term runs and is recorded
 in `target_spec.check.construction_in_vars`. Under the override the run prints a

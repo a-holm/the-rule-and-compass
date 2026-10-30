@@ -114,9 +114,9 @@ fn print_summary(tag: &str, j: &Json) {
 fn rung_checks(j: &Json) {
     let t = |name: &str| num(j, &["baselines", "target_structure", "rungs", name, "test_error"]);
     assert!((t("zero_param") - 0.104_582_698).abs() <= 1e-8, "{}", t("zero_param"));
-    // The affine rung is fitted on fit-train only, so it stays close to the
-    // zero-parameter rung out of sample.
-    assert!((t("affine") - t("zero_param")).abs() <= 1e-4, "{}", t("affine"));
+    // Train-only fit. An OLS fit on the test block gives 0.104_553, which is
+    // not an out-of-sample number.
+    assert!((t("affine") - 0.104_592_271).abs() <= 1e-6, "{}", t("affine"));
     assert!((t("binned20") - 0.104_662).abs() <= 1e-5, "{}", t("binned20"));
     assert!((t("construction_ols") - 0.105_127).abs() <= 2e-6, "{}", t("construction_ols"));
     for m in members(j) {
@@ -166,4 +166,21 @@ fn e1b_e2_e3_verdict_noise_and_identification_with_a_validation_slice() {
     assert_eq!(at(r6, &["gates", "identified"]), &Json::Bool(false));
     println!("E3 r6 involved {:?} rank {:?}", at(r6, &["constant_errors", "involved"]), at(r6, &["constant_errors", "rank"]));
     assert_eq!(at(r6, &["constant_errors", "ill_conditioned"]), &Json::Bool(true));
+    // The seed text is in original units, so the engine wraps each input in
+    // `x * std + mean` and the tree has 12 constants, not the 5 of the audit
+    // (the search folds the wrappers into the printed law). The 5-constant
+    // shape with `involved: [0, 4]` is pinned in `fit.rs`
+    // (`printed_r6_law_with_its_five_constants_involves_the_bias_and_the_offset`).
+    assert_eq!(num(r6, &["constant_errors", "rank"]), 5.0);
+    let involved = match at(r6, &["constant_errors", "involved"]) {
+        Json::Arr(a) => a.len(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(involved, 12);
+
+    // Presentation rule: negative validation return-space R2 means not presentable.
+    for m in members(&j) {
+        let r2 = num(m, &["return_space", "validation", "r2_vs_zero"]);
+        assert_eq!(at(m, &["presentable"]), &Json::Bool(!(r2 < 0.0)), "rank {}", num(m, &["rank"]));
+    }
 }

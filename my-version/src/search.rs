@@ -3978,6 +3978,7 @@ fn snapshot(
         identity: Some(crate::provenance::BuildIdentity::current(
             backend == Backend::Gpu,
         )),
+        target_spec: None,
     }
 }
 
