@@ -3181,6 +3181,25 @@ fn select_population(candidates: &mut Vec<Ind>, pop: usize) {
     candidates.truncate(pop);
 }
 
+/// The canonical front of a scored candidate set (#330). Epsilon-dominance is
+/// not transitive, so arrival order would decide membership. The candidates are
+/// first put in the canonical `(cost, error, structural hash)` order, which
+/// makes the insertion sequence, and so the front, a function of the set.
+fn canonical_front(cap: usize, mut scored: Vec<Sol>) -> Archive {
+    scored.sort_by(|a, b| {
+        a.cost
+            .total_cmp(&b.cost)
+            .then(a.error.total_cmp(&b.error))
+            .then(expr::structural_hash(&a.tree).cmp(&expr::structural_hash(&b.tree)))
+    });
+    let mut out = Archive::new(cap);
+    for sol in scored {
+        out.try_insert(sol);
+    }
+    out.canonicalize();
+    out
+}
+
 /// Rebuild an archive from its members and the final populations, scoring every
 /// expression on the **full** training sample. Used only when the generations
 /// ran on subsets, so the returned front and every error derived from it are
@@ -3264,22 +3283,25 @@ fn full_data_archive(
     if refits > 0 {
         refit_s = refit_start.elapsed().as_secs_f64();
     }
-    let mut out = Archive::new(archive.cap);
-    for tree in unique {
-        // #15: combined error on a multi-output sample; #25: a rejected
-        // candidate must not sneak back in on the full-data rebuild.
-        let error = if cfg.accepts_dimensions(&tree) {
-            score_tree(&tree, train, cfg) // #27
-        } else {
-            f64::INFINITY
-        };
-        out.try_insert(Sol {
-            complexity: expr::complexity(&tree),
-            cost: cfg.complexity_model.complexity(&tree),
-            tree,
-            error,
-        });
-    }
+    let scored: Vec<Sol> = unique
+        .into_iter()
+        .map(|tree| {
+            // #15: combined error on a multi-output sample; #25: a rejected
+            // candidate must not sneak back in on the full-data rebuild.
+            let error = if cfg.accepts_dimensions(&tree) {
+                score_tree(&tree, train, cfg) // #27
+            } else {
+                f64::INFINITY
+            };
+            Sol {
+                complexity: expr::complexity(&tree),
+                cost: cfg.complexity_model.complexity(&tree),
+                tree,
+                error,
+            }
+        })
+        .collect();
+    let out = canonical_front(archive.cap, scored);
     (out, refits, refit_s)
 }
 
@@ -7486,6 +7508,97 @@ mod tests {
         let scored = Ind::evaluated(tree, &data, &cfg);
         assert_eq!(reused.error.to_bits(), scored.error.to_bits());
         assert!(reused.error.is_infinite());
+    }
+
+    fn perms3<T: Clone>(v: &[T; 3]) -> Vec<[T; 3]> {
+        [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+            .iter()
+            .map(|p| [v[p[0]].clone(), v[p[1]].clone(), v[p[2]].clone()])
+            .collect()
+    }
+
+    fn fake_sol(cost: f64, error: f64, k: f64) -> Sol {
+        Sol {
+            tree: node(Op::Add, vec![input(0), constant(k)]),
+            error,
+            complexity: cost as usize,
+            cost,
+        }
+    }
+
+    fn item_bits(a: &Archive) -> Vec<(u64, u64, u64)> {
+        a.items
+            .iter()
+            .map(|s| (s.cost.to_bits(), s.error.to_bits(), expr::structural_hash(&s.tree)))
+            .collect()
+    }
+
+    /// #330: a non-transitive epsilon-dominance triple gives one front for all
+    /// six arrival orders on the rebuild path, while plain insertion does not.
+    #[test]
+    fn rebuild_front_is_order_independent_for_a_non_transitive_triple() {
+        // a dominates b and b dominates c, but a does not dominate c.
+        let triple = [
+            fake_sol(1.0, 1.000_003_0, 1.0),
+            fake_sol(2.0, 1.000_001_5, 2.0),
+            fake_sol(3.0, 1.000_000_0, 3.0),
+        ];
+        let mut inserted = std::collections::BTreeSet::new();
+        let mut rebuilt: Option<(Vec<(u64, u64, u64)>, u64)> = None;
+        for order in perms3(&triple) {
+            let mut plain = Archive::new(100);
+            for s in order.iter().cloned() {
+                plain.try_insert(s);
+            }
+            inserted.insert(item_bits(&plain));
+            let front = canonical_front(100, order.to_vec());
+            let got = (item_bits(&front), front.hash());
+            match &rebuilt {
+                None => rebuilt = Some(got),
+                Some(first) => assert_eq!(first, &got),
+            }
+        }
+        assert!(inserted.len() > 1, "the triple must expose the order dependence");
+        assert_eq!(rebuilt.unwrap().0.len(), 2);
+    }
+
+    /// #330: `full_data_archive` returns the same canonical archive hash for
+    /// forward and reverse member order.
+    #[test]
+    fn full_data_archive_hash_is_independent_of_member_order() {
+        let s = sample();
+        let cfg = Config::default();
+        let view = EvalSample::new(&s, &cfg);
+        let trees = vec![
+            input(0),
+            node(Op::Add, vec![input(0), constant(0.0)]),
+            node(Op::Mul, vec![input(0), constant(2.0)]),
+            node(Op::Sin, vec![input(0)]),
+            node(Op::Add, vec![input(1), constant(0.25)]),
+            node(Op::Sub, vec![input(0), node(Op::Mul, vec![input(1), constant(1e-9)])]),
+        ];
+        let build = |order: &[Node]| {
+            let mut a = Archive::new(100);
+            for t in order {
+                a.items.push(Sol {
+                    tree: t.clone(),
+                    error: 0.0,
+                    complexity: expr::complexity(t),
+                    cost: cfg.complexity_model.complexity(t),
+                });
+            }
+            full_data_archive(&a, &[], &view, &cfg, false).0
+        };
+        let forward = build(&trees);
+        let rev: Vec<Node> = trees.iter().rev().cloned().collect();
+        let reverse = build(&rev);
+        assert!(!forward.items.is_empty());
+        assert_eq!(item_bits(&forward), item_bits(&reverse));
+        assert_eq!(forward.hash(), reverse.hash());
+        let mut again = Archive::new(forward.cap);
+        again.items = forward.items.clone();
+        again.canonicalize();
+        assert_eq!(item_bits(&again), item_bits(&forward), "already canonical");
     }
 
     /// #77: a child identical to a parent must be caught by the dedup set, not
