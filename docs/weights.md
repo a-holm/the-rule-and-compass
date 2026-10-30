@@ -55,7 +55,24 @@ unweighted path is unchanged and still rejects any non-finite prediction.
 | `correlation_signed` | `1 − r_w`, weighted Pearson `r_w` (direction preserved) |
 | `implicit` | `Σ wᵢ·(|f(pᵢ)| / ||∇f(pᵢ)||) / Σ wᵢ` |
 | `implicit_residual` | `Σ wᵢ·|f(pᵢ)| / Σ wᵢ` |
+| `log_loss` | `Σ wᵢ·[max(−uᵢ,0) + log1p(exp(−|uᵢ|))] / Σ wᵢ`, `uᵢ = tᵢ·pᵢ` |
+| `brier` | `Σ wᵢ·(σ(pᵢ) − lᵢ)² / Σ wᵢ` |
+| `hinge` | `Σ wᵢ·2σ(−uᵢ) / Σ wᵢ` (the bounded sigmoid surrogate) |
+| `hinge_ordinary` | `Σ wᵢ·max(0, 1 − uᵢ) / Σ wᵢ` |
+| `hinge_squared` | `Σ wᵢ·max(0, 1 − uᵢ)² / Σ wᵢ` |
 | `aic`, `aicc`, `bic` | weighted RSS, `n = number of rows with wᵢ > 0` |
+
+For the classification family the label is still the midpoint rule `lᵢ = [yᵢ >
+(min y + max y)/2]`, but **the midpoint and the class counts are taken over the
+positive-weight rows only**. A zero-weight row is invisible, so a wild, missing
+or `±∞` target in it cannot relabel a row that counts. The prediction is the
+model output read as a **logit** `pᵢ`; `σ` is the stable logistic and
+`tᵢ = 2lᵢ − 1`. These are frequency weights like every other weighted mean: a
+weight of 2 is exactly a duplicated row (the tests assert the equivalence to
+`1e-12`). To use a class-balance prior, give the positive and negative rows
+different weights yourself; the engine does not silently rebalance the
+objective, so a weighted log-loss remains an estimate of the weighted
+distribution and not a calibrated probability under the original prior.
 
 The weighted Pearson correlation uses weighted means and weighted covariance:
 
@@ -75,11 +92,8 @@ r_w = cov(a,b) / sqrt(cov(a,a)·cov(b,b))
   unambiguous weighted difference, and duplicating a row changes the adjacency.
 * `rank_correlation`, `rank_correlation_signed` and `auc` depend on ranks or on
   class counts; a weighted rank/ROC needs a separate definition for ties and
-  class prevalence.
-* `log_loss` and `hinge` are classification metrics. A weighted mean is
-  conceivable, but the class labels (midpoint threshold) and calibration are
-  defined unweighted here, so the engine refuses rather than half-applying the
-  weights.
+  class prevalence. `auc` therefore keeps the usage error even though
+  `log_loss`, `brier` and the hinge forms are weighted.
 
 `--metric aic`, `aicc` and `bic` use the weighted residual sum of squares
 `Σ wᵢ·eᵢ²` and the number of **positive-weight** rows as `n`, so a zero-weight
@@ -117,6 +131,19 @@ The weights are treated as **frequency weights** here. That matches the
 "weight 2 = two copies" interpretation; if you use weights as measurement
 precision rather than replication, the degrees of freedom are a modelling
 choice, not a theorem.
+
+## Weights on the CUDA evaluator
+
+The device evaluator carries the per-row weight vector and the classification
+label sign, uploaded once per sample (#289). A classification run therefore
+keeps its weights when the search is scored on the device: the kernel returns
+`Σ wᵢ·lossᵢ`, the host divides by `Σw`, and the zero-weight skip happens
+**before the program runs**, so a masked row with an undefined branch is never
+evaluated. The device value is the search fitness only; every reported number
+is the exact CPU `f64` rebuild of the same weighted mean. The weighted
+**regression** kernels are not part of #289: a weighted `squared`, `absolute`
+or `log_squashed` run still keeps the CPU evaluator, and the backend note names
+the reason rather than dropping the weights.
 
 ## What else is weighted, and what is not
 

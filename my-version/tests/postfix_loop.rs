@@ -76,6 +76,35 @@ fn postfix_path_is_deterministic_and_bounded() {
     assert!(!a.archive.items.is_empty());
 }
 
+/// #287: the flat arena path must score the configured objective, not SSE.
+/// Every reported archive error is the exact CPU metric of the stored tree,
+/// and the run stays on the GPU for a native non-squared metric.
+#[test]
+fn postfix_path_scores_the_configured_native_metric() {
+    if !rcsr::backend::probe().available() {
+        return;
+    }
+    let data = sample(160);
+    for metric in [Metric::Maximum, Metric::Correlation, Metric::Signed] {
+        let c = Config {
+            metric,
+            ..cfg(VariationMode::Postfix, 1, 4096, 2)
+        };
+        let out = run(&c, &data, &data);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{metric:?}");
+        assert!(!out.archive.items.is_empty(), "{metric:?}");
+        for item in &out.archive.items {
+            assert_eq!(
+                item.error.to_bits(),
+                search::eval_error(&item.tree, &data, metric).to_bits(),
+                "{metric:?}: reported archive error is not the configured metric"
+            );
+        }
+        let again = run(&c, &data, &data);
+        assert_eq!(describe(&out), describe(&again), "{metric:?} is deterministic");
+    }
+}
+
 #[test]
 fn four_islands_are_deterministic_and_independent_of_island_count() {
     let data = sample(200);
