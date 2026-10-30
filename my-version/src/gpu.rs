@@ -5617,6 +5617,90 @@ mod fit_tests {
         assert_eq!(again[0].sse.to_bits(), res.sse.to_bits());
     }
 
+    fn repeat_count(default: usize) -> usize {
+        std::env::var("RCSR_REPEAT_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn fit_bits(out: &GpuFitOutput) -> Vec<u64> {
+        let mut bits: Vec<u64> = out.c.iter().map(|v| v.to_bits()).collect();
+        bits.push(out.sse.to_bits());
+        bits
+    }
+
+    /// #359: one evaluator, `set_fit_data` interleaved with batches of different
+    /// sizes. Every repeat must reproduce the first run bit for bit.
+    #[test]
+    fn correlation_fit_is_bit_stable_over_repeats() {
+        let n = 600usize;
+        let (x, y) = corr_fixture(n);
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        let tree = corr_model();
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("correlation plan");
+        let mut reference: Option<Vec<u64>> = None;
+        let mut failures = 0usize;
+        let repeats = repeat_count(500);
+        for i in 0..repeats {
+            assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+            let width = 1 + i % 5;
+            let plans: Vec<&crate::fit::GpuFitPlan> = (0..width).map(|_| &plan).collect();
+            let (out, _) = ev.fit_batch(&plans, 8, crate::fit::DeviceLoss::Correlation);
+            assert_eq!(out.len(), width);
+            for o in &out {
+                let bits = fit_bits(o);
+                match &reference {
+                    None => reference = Some(bits),
+                    Some(r) => {
+                        if *r != bits {
+                            failures += 1;
+                            eprintln!("repeat {i}: bits differ {bits:?} vs {r:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(failures, 0, "{failures} of {repeats} repeats differed");
+    }
+
+    /// #359: the original two-fit test body, fresh evaluator each repeat.
+    #[test]
+    fn correlation_fit_fresh_evaluator_is_bit_stable() {
+        let n = 600usize;
+        let (x, y) = corr_fixture(n);
+        let (cols, y32) = cols_from(&x, &y);
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<_>>();
+        let plan = crate::fit::gpu_fit_plan(&corr_model()).expect("correlation plan");
+        let mut failures = 0usize;
+        let repeats = repeat_count(200);
+        for i in 0..repeats {
+            let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+                Some(ev) => ev,
+                None => {
+                    eprintln!("skipping GPU test: no usable CUDA device");
+                    return;
+                }
+            };
+            assert!(ev.set_fit_data(&cols64, &y, &[]));
+            let (a, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Correlation);
+            let (b, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Correlation);
+            if fit_bits(&a[0]) != fit_bits(&b[0]) {
+                failures += 1;
+                eprintln!("repeat {i}: {:?} vs {:?}", fit_bits(&a[0]), fit_bits(&b[0]));
+            }
+        }
+        assert_eq!(failures, 0, "{failures} of {repeats} repeats differed");
+    }
+
     #[test]
     fn gpu_correlation_reports_degenerate_and_non_finite() {
         let n = 200usize;
