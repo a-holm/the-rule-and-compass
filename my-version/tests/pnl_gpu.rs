@@ -779,6 +779,7 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         threshold_quantile: 0.0,
         threshold_fixed: None,
         device_pnl: false,
+        control_seed: 0,
         policy: walkforward::Policy::Threshold,
         band_width: 0.0,
         min_hold: 1,

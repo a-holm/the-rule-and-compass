@@ -125,6 +125,12 @@ Residual degrees of freedom: 28.
 | least-squares line | 0.000000 | 0.000000 | yes |
 | k-nearest-neighbour (k=5) | 0.043817 | 0.110412 | yes |
 
+These are error baselines for `fit` reports. The `walkforward` report has its
+own long-only P&L ladder per window: cash, buy-and-hold, constant long/flat and
+matched-exposure random long, each with exposure, turnover, beta and excess over
+cash (see [`walkforward.md`](walkforward.md#long-only-controls)). The mean, OLS
+and kNN rungs of that ladder belong to #266.
+
 ## Null control
 
 _Not run. Add `--null-runs 19` (or more) to compare the real fit

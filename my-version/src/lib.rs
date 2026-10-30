@@ -58,6 +58,7 @@ pub mod search;
 pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
+pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, constant, matched-exposure random long)
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
