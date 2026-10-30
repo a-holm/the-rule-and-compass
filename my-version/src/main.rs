@@ -156,9 +156,22 @@ INPUT:
                              (0 = off). The test block is never used to choose
                              a candidate.
   --select-by train|validation|aicc
-                             criterion used to rank/report candidates (default
-                             validation when a slice exists, otherwise train).
-                             test_error is scoring-only, never a criterion.
+                             display order of the candidates (default validation
+                             when a slice exists, otherwise train). The selected
+                             member comes from the validation gates, not from
+                             this order. test_error is scoring-only, never a
+                             criterion.
+  --require-validation       refuse (exit 2) when there is no validation slice
+  --equivalence-z <z>        z for the validation gates: a member is supported
+                             when it improves on the last supported entry by
+                             more than z standard errors of the paired loss
+                             differential (default 1.0, must be > 0)
+  --noise-lag <n|auto>       Bartlett lag, in timestamps, of the Driscoll-Kraay
+                             standard error (default auto: the larger of the
+                             label horizon in steps minus one and the
+                             Newey-West rule of thumb). Random splits use lag 0.
+                             The gates run on time-ordered runs and when a
+                             --target-spec is in force; see docs/overfitting.md
 
 ROW WEIGHTS:
   --weight <col>             per-row weight column: finite, >= 0, at least one
@@ -1032,6 +1045,9 @@ struct ValidationHv {
     reference_error: f64,
     hypervolume: f64,
     points: usize,
+    /// Complexity span of the points the hypervolume integrates.
+    complexity_min: Option<f64>,
+    complexity_max: Option<f64>,
 }
 
 fn validation_hypervolume(rows: &[Row], prepared: &data::Prepared) -> ValidationHv {
@@ -1073,17 +1089,31 @@ fn validation_hypervolume(rows: &[Row], prepared: &data::Prepared) -> Validation
         reference_error,
         hypervolume: qd::fixed_reference_hypervolume(&points, reference_error),
         points: points.len(),
+        complexity_min: points.iter().map(|p| p.0).reduce(f64::min),
+        complexity_max: points.iter().map(|p| p.0).reduce(f64::max),
     }
 }
 
 fn validation_hv_json(v: &ValidationHv) -> String {
     format!(
-        "{{\"sample\":\"{}\",\"reference_error\":{},\"hypervolume\":{},\"points\":{}}}",
+        "{{\"sample\":\"{}\",\"reference_error\":{},\"hypervolume\":{},\"points\":{},\"complexity_min\":{},\"complexity_max\":{}}}",
         v.sample,
         jnum(v.reference_error),
         jnum(v.hypervolume),
-        v.points
+        v.points,
+        v.complexity_min.map(jnum).unwrap_or_else(|| "null".to_string()),
+        v.complexity_max.map(jnum).unwrap_or_else(|| "null".to_string())
     )
+}
+
+/// The phase timings with the gate seconds added when the gates ran (#257).
+fn timing_json_g(t: &PhaseTimings, gates: Option<f64>) -> String {
+    let mut out = t.json();
+    if let Some(g) = gates {
+        out.pop();
+        out.push_str(&format!(",\"gates_seconds\":{}}}", jnum(g)));
+    }
+    out
 }
 
 /// #120: QD coverage in the human-readable log.
@@ -1542,6 +1572,9 @@ struct Row {
     /// Fraction of `--stability` resamples that selected this same form.
     stability: Option<f64>,
     expression: String,
+    /// #257: gate members of the pareto JSON (leading comma); empty when the
+    /// gates did not run.
+    gate_json: String,
 }
 
 /// Cross-validation summary (issue #19).
@@ -1707,6 +1740,9 @@ fn main() {
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
+    let mut require_validation = false;
+    let mut equivalence_z = rcsr::gate_run::DEFAULT_Z;
+    let mut noise_lag_arg: Option<String> = None;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -1950,6 +1986,25 @@ fn main() {
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
+            "--require-validation" => require_validation = true,
+            "--equivalence-z" => {
+                let v = val!();
+                match v.parse::<f64>() {
+                    Ok(z) if z.is_finite() && z > 0.0 => equivalence_z = z,
+                    _ => {
+                        eprintln!("error: --equivalence-z must be a number > 0, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
+            "--noise-lag" => {
+                let v = val!();
+                if v != "auto" && v.parse::<usize>().is_err() {
+                    eprintln!("error: --noise-lag must be a non-negative integer or 'auto', got '{}'", v);
+                    std::process::exit(EXIT_USAGE);
+                }
+                noise_lag_arg = Some(v);
+            }
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -2863,6 +2918,7 @@ fn main() {
             (cv_mode.is_some(), "--cv"),
             (null_runs > 0, "--null-runs"),
             (validation_frac > 0.0 || select_by_arg.is_some(), "--validation-frac/--select-by"),
+            (require_validation, "--require-validation"),
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
             (stability_runs > 0, "--stability"),
@@ -3683,6 +3739,35 @@ fn main() {
         .as_ref()
         .map(|a| a.rung_json())
         .unwrap_or_else(|| "null".to_string());
+
+    // #257: the validation gates run on time-ordered runs, with a target spec,
+    // or when a validation slice is required.
+    if require_validation && prepared.validation.is_none() {
+        eprintln!(
+            "error: --require-validation: no validation slice; add --validation-frac <f> \
+             (the gates select a member only from a validation slice)"
+        );
+        std::process::exit(EXIT_USAGE);
+    }
+    let time_ordered = matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+        || time_col.is_some();
+    let gates_active = time_ordered || target_active.is_some() || require_validation;
+    let gate_opts = rcsr::gate_run::Options {
+        metric: cfg.metric,
+        z: equivalence_z,
+        alpha: rcsr::gate_run::DEFAULT_ALPHA,
+        noise_lag: match noise_lag_arg.as_deref() {
+            Some("auto") | None => None,
+            Some(n) => n.parse::<usize>().ok(),
+        },
+        time_ordered,
+    };
+    if gates_active && time_ordered && prepared.validation.is_none() {
+        eprintln!(
+            "warning: time-ordered run without a validation slice: no member is selected \
+             (verdict unvalidated); add --validation-frac <f>"
+        );
+    }
 
     if stream_store_candidate {
         let resolved = (|| -> Result<fit::StoreSpec, String> {
@@ -4590,6 +4675,21 @@ fn main() {
     // A dedicated RNG stream so bootstrap resampling never perturbs the search
     // or the permutation control.
     let mut boot_rng = Mt::new(cfg.seed ^ 0xB007_57AA);
+    // #257: Driscoll-Kraay constant errors on fit-train keys and lag.
+    let gate_train_keys: Option<(Vec<f64>, usize)> = if gates_active {
+        let keys: Vec<f64> = match (time_ordered, prepared.keys.as_ref()) {
+            (true, Some(k)) => k.train.clone(),
+            _ => (0..prepared.train.len()).map(|i| i as f64).collect(),
+        };
+        let (lag, _) = rcsr::gate_run::lag_for(
+            &keys,
+            &gate_opts,
+            target_active.as_ref().map(|a| &a.spec),
+        );
+        Some((keys, lag))
+    } else {
+        None
+    };
     let mut rows: Vec<Row> = sorted
         .iter()
         .enumerate()
@@ -4682,7 +4782,16 @@ fn main() {
                 fold_errors,
                 // Parameter uncertainty at the fitted solution (issue #22):
                 // reuse the fitter's Jacobian on the training rows.
-                constant_errors: if prepared.train.w.is_empty() {
+                constant_errors: if let Some((keys, lag)) = &gate_train_keys {
+                    fit::constant_errors_robust(
+                        &s.tree,
+                        &prepared.train.x,
+                        &prepared.train.y,
+                        &prepared.train.w,
+                        keys,
+                        *lag,
+                    )
+                } else if prepared.train.w.is_empty() {
                     fit::constant_errors(&s.tree, &prepared.train.x, &prepared.train.y)
                 } else {
                     fit::constant_errors_weighted(
@@ -4698,6 +4807,7 @@ fn main() {
                 shape: stability::shape(&expr::simplify(&s.tree)),
                 stability: None,
                 expression: expr::to_string(&den, &vars),
+                gate_json: String::new(),
             }
         })
         .collect();
@@ -4726,6 +4836,44 @@ fn main() {
             );
         }
     }
+    // #257: validation gates on the archive members (archive order).
+    let gate_out: Option<rcsr::gate_run::Output> = if gates_active {
+        let facts: Vec<rcsr::gate_run::MemberFacts> = sorted
+            .iter()
+            .zip(&rows)
+            .enumerate()
+            .map(|(k, (s, r))| rcsr::gate_run::MemberFacts {
+                archive_rank: k + 1,
+                cost: s.cost,
+                tree: &s.tree,
+                expression: &r.expression,
+                identified: r.constant_errors.as_ref().map_or(true, |c| c.identified()),
+                practically_identified: r
+                    .constant_errors
+                    .as_ref()
+                    .and_then(|c| c.practically_identified()),
+            })
+            .collect();
+        let out = rcsr::gate_run::run(
+            &prepared,
+            target_active.as_ref().map(|a| &a.spec),
+            &facts,
+            &gate_opts,
+        );
+        for (r, j) in rows.iter_mut().zip(&out.member_json) {
+            r.gate_json = j.clone();
+        }
+        if format == Format::Text && !quiet {
+            for line in &out.text {
+                eprintln!("{}", line);
+            }
+        }
+        Some(out)
+    } else {
+        None
+    };
+    let gate_seconds = gate_out.as_ref().map(|g| g.seconds);
+    let gate_selected_archive_rank = gate_out.as_ref().and_then(|g| g.report.selected_rank);
     // #111: selection. Reorder the front by the chosen criterion and renumber
     // the display rank; the archive rank is kept for reports that need the
     // underlying search order. `test_error` is never a criterion. With no
@@ -4977,7 +5125,9 @@ fn main() {
             select_by,
         ),
         ReportKind::Sensitivity => {
-            let selected = if select_by.is_some() {
+            let selected = if let Some(ar) = gate_selected_archive_rank {
+                full_rows.iter().find(|r| r.archive_rank == ar)
+            } else if select_by.is_some() {
                 full_rows.first()
             } else {
                 full_rows.iter().min_by(|a, b| {
@@ -5029,6 +5179,25 @@ fn main() {
     // truncation or selection reordering, from the full archive this run
     // produced.
     let validation_hv = validation_hypervolume(&rows, &prepared);
+    let gate_mean_validation = gate_out
+        .as_ref()
+        .map(|g| g.mean_validation_json.clone())
+        .unwrap_or_default();
+    let gate_linear_validation = gate_out
+        .as_ref()
+        .map(|g| g.linear_validation_json.clone())
+        .unwrap_or_default();
+    let gate_rung_json = match gate_out.as_ref().and_then(|g| g.structure_json.as_ref()) {
+        Some(extra) if target_rung_json.ends_with('}') => {
+            let mut o = target_rung_json.clone();
+            o.pop();
+            o.push_str(extra);
+            o.push('}');
+            o
+        }
+        _ => target_rung_json.clone(),
+    };
+    let gate_top_json = gate_out.as_ref().map(|g| g.top_json.clone()).unwrap_or_default();
 
     if top > 0 && rows.len() > top {
         rows.truncate(top);
@@ -5131,11 +5300,13 @@ fn main() {
                 }
                 qd_text(outcome.qd.as_ref());
                 eprintln!(
-                    "# validation hv ({}): {:.6} (ref error {}, {} front points; fixed reference, comparable across arms)",
+                    "# validation hv ({}): {:.6} (ref error {}, {} front points; fixed reference; complexity span {}..{}, compare only runs with the same span)",
                     validation_hv.sample,
                     validation_hv.hypervolume,
                     jnum(validation_hv.reference_error),
-                    validation_hv.points
+                    validation_hv.points,
+                    validation_hv.complexity_min.map(jnum).unwrap_or_else(|| "null".to_string()),
+                    validation_hv.complexity_max.map(jnum).unwrap_or_else(|| "null".to_string())
                 );
             }
             for r in &rows {
@@ -5469,6 +5640,7 @@ fn main() {
                     } else {
                         String::new()
                     };
+                    let dimensions = format!("{}{}", dimensions, r.gate_json);
                     // Only a run that actually has a selection criterion gains
                     // the new fields; an ordinary run stays byte-identical.
                     let selection_json = if select_by.is_some() {
@@ -5494,7 +5666,7 @@ fn main() {
                         jnum(r.overfit),
                         r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                         bootstrap_json(&r.bootstrap),
-                        constant_errors_json(&r.constant_errors),
+                        constant_errors_json_g(&r.constant_errors, gates_active),
                         dimensions,
                         r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                         jstr(&r.expression)
@@ -5518,16 +5690,18 @@ fn main() {
                 None => "null".to_string(),
             };
             let baselines_json = format!(
-                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
+                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
+                gate_mean_validation,
                 jnum(baselines.linear.train_error),
                 jnum(baselines.linear.test_error),
+                gate_linear_validation,
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
                 jnum(baselines.knn.test_error),
                 baselines.knn_json_extra(), // #69
-                target_rung_json
+                gate_rung_json
             );
             let resid_json = match &best_resid {
                 Some(rt) => format!(
@@ -5710,7 +5884,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -5734,7 +5908,7 @@ fn main() {
                 // #18: the four convergence numbers.
                 outcome.convergence.json(),
                 jnum(elapsed),
-                timing.json(),
+                timing_json_g(&timing, gate_seconds),
                 gpu_json(
                     &outcome.gpu,
                     gpu_best_error(&outcome),
@@ -5750,6 +5924,7 @@ fn main() {
                 cv_json,
                 stability_json,
                 validation_hv_json(&validation_hv),
+                gate_top_json,
                 qd_json(outcome.qd.as_ref()),
                 seeds_json.join(","),
                 pareto.join(",")
@@ -5806,6 +5981,7 @@ fn main() {
                 } else {
                     String::new()
                 };
+                let dimensions = format!("{}{}", dimensions, r.gate_json);
                 let selection_json = if select_by.is_some() {
                     format!(
                         "\"archive_rank\":{},\"validation_error\":{},",
@@ -5829,7 +6005,7 @@ fn main() {
                     jnum(r.overfit),
                     r.fold_errors.iter().map(|e| jnum(*e)).collect::<Vec<_>>().join(","),
                     bootstrap_json(&r.bootstrap),
-                    constant_errors_json(&r.constant_errors),
+                    constant_errors_json_g(&r.constant_errors, gates_active),
                     dimensions,
                     r.stability.map(jnum).unwrap_or_else(|| "null".to_string()),
                     jstr(&r.expression)
@@ -5850,17 +6026,19 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
+                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
                 jstr(cfg.metric.name()),
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
+                gate_mean_validation,
                 jnum(baselines.linear.train_error),
                 jnum(baselines.linear.test_error),
+                gate_linear_validation,
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
                 jnum(baselines.knn.test_error),
                 baselines.knn_json_extra(), // #69
-                target_rung_json
+                gate_rung_json
             );
             if let Some(cv) = &cv {
                 println!(
@@ -5967,7 +6145,7 @@ fn main() {
                 // #18: the final reading also closes the NDJSON stream.
                 outcome.convergence.json(),
                 jnum(elapsed),
-                timing.json(),
+                timing_json_g(&timing, gate_seconds),
                 gpu_json(
                     &outcome.gpu,
                     gpu_best_error(&outcome),
@@ -7740,6 +7918,33 @@ fn constant_errors_json(ce: &Option<fit::ConstantErrors>) -> String {
             )
         }
         None => "null".to_string(),
+    }
+}
+
+/// As [`constant_errors_json`], plus the #257 identification fields when the
+/// gates ran.
+fn constant_errors_json_g(ce: &Option<fit::ConstantErrors>, gates: bool) -> String {
+    let base = constant_errors_json(ce);
+    match (gates, ce) {
+        (true, Some(c)) => {
+            let list = |v: &[f64]| v.iter().map(|x| jnum(*x)).collect::<Vec<_>>().join(",");
+            let robust = |v: &Option<Vec<f64>>| match v {
+                Some(v) => format!("[{}]", list(v)),
+                None => "null".to_string(),
+            };
+            let mut out = base;
+            out.pop();
+            out.push_str(&format!(
+                ",\"rank\":{},\"condition_index\":{},\"involved\":[{}],\"std_errors_robust\":{},\"relative_robust\":{}}}",
+                c.rank,
+                jnum(c.condition_index),
+                c.involved.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(","),
+                robust(&c.std_errors_robust),
+                robust(&c.relative_robust)
+            ));
+            out
+        }
+        _ => base,
     }
 }
 
