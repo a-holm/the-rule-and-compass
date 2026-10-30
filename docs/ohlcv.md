@@ -915,6 +915,71 @@ model now exposes. No 16.1M full-catalogue paired run is claimed here: the
 64 MiB arena forbids batching at that width, so that arm keeps the per-column
 staging path and its 180–300 s write floor.
 
+### Device benchmark joins, beta and cross means (#299)
+
+`src/bench_gpu.rs` and `src/cuda/bench.cu` move the benchmark family and the
+per-timestamp cross means to the device. Registration lives in
+`src/enrich.rs::gpu_supports`; `rcsr schema` publishes the tiers under
+`gpu_feature_parity.benchmark`; `tests/bench_gpu.rs` is the parity suite.
+
+**Benchmark columns (30).** The 13 BTC and 13 ETH columns of #273, the legacy
+`cross_ret1` / `cross_beta20`, and the compact `rel_btc96` / `beta384`. The
+benchmark symbol is a small sorted `(time, value)` array (eight planes: `r1 r16
+r20 r96 r672 vol20 vol96 volume`) that the CPU already derives; it is uploaded
+once. Each base row binary-searches its own timestamp for **exact equality**, so a
+missing benchmark bar is `NaN`, never the previous value. Tied benchmark
+timestamps are resolved by the CPU map (the last row wins) before upload, so the
+device sees strictly increasing times. Own k-bar returns use the CPU gate
+(series-local, contiguous, `close > 0`). Beta sums its window in ascending order
+with the CPU's `cov/var` and `[-5,5]` clip (`beta384` clips the covariance to
+`+-0.05` first), one thread per row, no atomics. A symbol that is the benchmark
+itself gets `1.0` once its window is complete, as on the CPU.
+
+| columns | tier | why |
+|---|---|---|
+| `btc_*`, `eth_*` returns and vols, `cross_ret1` | `bitwise` | gather of host-computed values |
+| `rel_*`, `rel_btc96` | `1e-12` | uses the asset's own `log` (CUDA `log`, not host libm) |
+| `beta_*`, `cross_beta20`, `beta384` | `1e-12` | same `log`; window order and masks identical to the CPU |
+
+**Cross means (13).** `mkt_r16 mkt_ew_ret16 breadth mkt_breadth dispersion
+mkt_dispersion rel_mkt16 mkt_r96 rel_mkt96 mkt_vol96 mkt_ew_ret1 avg_corr
+btc_volume_share`. One thread per timestamp group walks the group in the CPU's
+`(time, symbol, row)` order (the permutation #295 builds), so the sums use the
+CPU addition order and the same `member_asof <= t` mask and 20-member floor. For
+an identical source column the kernels are bit-for-bit equal to the CPU
+(`tests/bench_gpu.rs` asserts `to_bits` equality). The sources (`r1 r16 r96
+vol96`) are themselves `1e-12` columns when the device produced them, so those
+market columns are declared `1e-12`; `btc_volume_share` reads raw volume only and
+is `bitwise`. `avg_corr` keeps the CPU per-segment prefix-sum form (one thread per
+segment) and then reuses the group-mean kernel.
+
+**Dispatch.** The benchmark family is planned as the `join` class with the
+measured rates 0.36 M cells/s (CPU, per-row map lookup) and 100 M cells/s
+(device kernel + D2H). The previous 40 M cells/s CPU figure was not measured and
+made the planner reject the device; with the measured rate `--gpu auto`
+dispatches the family above the 1M-row floor. The cross means follow `--gpu`:
+`on`, or `auto` above the 1M-row floor. A device failure falls back to the CPU
+loop for that block and is counted in `gpu_fallback`.
+
+**Measured (RTX 3060, 16,113,108 rows, 109 symbols, `panel15m.rcsb`).**
+
+| family | CPU | GPU | note |
+|---|---:|---:|---|
+| 28 benchmark columns incl. 7 beta | feature phase **1250.6 s** | **38.6 s** (kernel 1.16 s, D2H 2.62 s, H2D 0.08 s) | **32.4x**; 28/28 on device, 0 fallbacks; CPU is the per-row `BTreeMap` lookup in the beta window |
+| 10 cross-mean columns | xs 22.55 s | xs 19.41 s | 1.16x; kernel 0.31 s, 3.8 GB moved; context build dominates |
+| 15 lookup-only columns | feature phase **451.1 s** | **18.5 s** (kernel 0.016 s) | 24.3x; the CPU map lookup is 0.54 M cells/s, the device time is the temp-store write |
+
+The 28-column pair has 15 `bitwise` columns with identical SHA-256 and 13
+`1e-12` columns (`rel_*`, `beta_*`) with a maximum absolute difference of
+**2.665e-15** (`beta_btc_60`) and identical NaN masks. All ten cross-mean hashes
+are identical on this input. Columns per second on the device arm: 28 columns /
+38.6 s = 0.73 columns/s end to end, of which the temp-store write is the
+dominant term; the kernels alone run 28 columns in 1.16 s. The removed CPU work
+is 1250.6 s of map lookups.
+
+At 1.06M rows (24 symbols, `tests/bench_gpu.rs`) the family took CPU 27.7 s vs
+device 3.5 s.
+
 ### Engine tail kernels (#298)
 
 `src/cuda/tail.cu` owns the parameterised tail of the engine catalogue. The

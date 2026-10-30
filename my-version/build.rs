@@ -54,6 +54,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda/tail.cu");
     println!("cargo:rerun-if-changed=src/cuda/mtf.cu");
     println!("cargo:rerun-if-changed=src/cuda/features.cu");
+    println!("cargo:rerun-if-changed=src/cuda/bench.cu");
     println!("cargo:rerun-if-changed=src/cuda/enrich_common.h");
     println!("cargo:rerun-if-changed=src/cuda/prep.cu");
     println!("cargo:rerun-if-changed=src/cuda/pnl.cu");
@@ -150,6 +151,7 @@ fn main() {
         "src/cuda/tail.cu",
         "src/cuda/mtf.cu",
         "src/cuda/features.cu",
+        "src/cuda/bench.cu",
         "src/cuda/prep.cu",
         "src/cuda/pnl.cu",
         "-lcudart",

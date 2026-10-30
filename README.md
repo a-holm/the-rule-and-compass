@@ -430,7 +430,13 @@ atomically instead of streaming it. See
   cover return/MA parameters, `don20`/`don96`, stochastic, ATR/ADX/DI,
   Bollinger and the registered exotic statistics with `O(n)` blocked extrema
   and one shared gap policy (`r16`, `r96` and `don96` no longer fall through
-  the compact guard), the `price_action` group adds the continuous
+  the compact guard), the benchmark family (`btc_*`, `eth_*`, `rel_*`,
+  `beta_*`, `cross_ret1`, `cross_beta20`, `beta384`) joins the BTC and ETH
+  series by exact timestamp on the device and the per-timestamp market means
+  (`mkt_*`, `breadth`, `dispersion`, `rel_mkt*`, `avg_corr`,
+  `btc_volume_share`) run one thread per timestamp in the CPU addition order
+  (`--features cuda`, tiers per column in `rcsr schema` `gpu_feature_parity`),
+  the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
   `batr` is shared with `compact`) with strict zero-range/zero-volume and gap
