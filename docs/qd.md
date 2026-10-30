@@ -102,7 +102,7 @@ Text output adds two lines:
 
 ```text
 # qd (cvt): 12/19 reachable cells occupied (63.2%), 31 entries, best error 1.145..., entropy 2.31/2.94 bits, qd-score 3.812, hypervolume 0.7143 (self-normalised diagnostic)
-# validation hv (test): 4.201337 (ref error 0.912, 9 front points; fixed reference, comparable across arms)
+# validation hv (test): 4.201337 (ref error 0.912, 9 front points; fixed reference; complexity span 1..9, compare only runs with the same span)
 ```
 
 `--json` adds a `qd` object and a top-level `validation_hv` object:
@@ -115,7 +115,8 @@ Text output adds two lines:
       "occupancy_entropy_normalized":0.784,"qd_score":3.812,
       "descriptor_fallbacks":0,"hypervolume":0.7143,"evaluations":12000},
 "validation_hv":{"sample":"test","reference_error":0.912,
-                 "hypervolume":4.201337,"points":9}
+                 "hypervolume":4.201337,"points":9,
+                 "complexity_min":1,"complexity_max":9}
 ```
 
 ### What the coverage numbers mean
@@ -166,7 +167,10 @@ over the cost-sorted front, where `e_i` is the best error at or below `c_i` and
 `e_ref` is the **variance of that sample's target** — a data constant, identical
 for every arm of the same split. Because neither axis is rescaled by the arm's
 own extremes, `validation_hv` is comparable across baseline, passive, policy,
-uniform-cell and random-descriptor arms. It is emitted for single-output runs;
+uniform-cell and random-descriptor arms **that reach the same complexity span**:
+the integral covers the cost range the front reaches, so a front that reaches a
+higher cost adds area whatever its error. `complexity_min` and `complexity_max`
+state the span; compare arms only when the spans match. It is emitted for single-output runs;
 the multi-output JSON keeps its existing shape (the QD descriptor is not
 accumulated there either).
 

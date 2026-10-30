@@ -548,7 +548,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
-     [--validation-frac f] [--select-by train|validation|aicc]
+     [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
+     [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
@@ -644,9 +645,17 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   a lucky pooled number.
 * `--validation-frac f` holds out the last `f` of the training period as a
   chronological validation slice (with a `--gap` purge either side) and
-  `--select-by train|validation|aicc` chooses the ranking criterion; the test
+  `--select-by train|validation|aicc` chooses the display order; the test
   block is a scoring-only lockbox and is never used to select. See
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
+* Time-ordered runs, runs with a target spec and runs with `--require-validation`
+  run the **validation gates** (section 3.10b of `docs/overfitting.md`): a
+  noise-scaled supported front on the validation slice (`--equivalence-z`,
+  `--noise-lag`), per-member comparisons against the mean, linear and
+  target-structure rungs, a structural identification flag, and a verdict
+  `signal | no_signal | unvalidated | not_gated`. Without a validation slice the
+  verdict is `unvalidated` and nothing is selected; `--require-validation`
+  refuses such a run (exit 2).
 * Normalisation statistics are computed from the **training rows only**; the
   test set never influences the model's input scaling.
 * A split whose training **or** test rows fall inside the crypto 2026H2 lockbox

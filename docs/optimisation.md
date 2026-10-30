@@ -1329,3 +1329,7 @@ row tiling and CUDA graphs. The status of the GPU path in this repository is in
 22. NVIDIA. *DGX Spark hardware guide.*
 23. Chips and Cheese. *Analyzing NVIDIA GB10's GPU.*
 24. NVIDIA. *RTX Blackwell GPU architecture whitepaper.*
+
+## Structural identification of reported constants (#257)
+
+The CPU `constant_errors` report (not the GPU fit kernel) tests the rank of the correlation-scaled Gram matrix of the Jacobian by cyclic Jacobi eigendecomposition. A member with `rank < k` has `ill_conditioned: true` and `null` standard errors for the constants that carry the lost direction (`involved`). Runs with the validation gates add `rank`, `condition_index`, `involved`, `std_errors_robust` and `relative_robust`. The GPU fit's `ill_conditioned` label (hi/lo 1e4) is a separate kernel gate. See `docs/overfitting.md` section 3.10.

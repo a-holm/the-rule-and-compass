@@ -446,10 +446,39 @@ elimination with partial pivoting. The errors are only defined when `n > k`;
 with no residual degrees of freedom (or no constants at all) the field is
 `null` rather than a made-up number.
 
+**Structural identification.** The pivot ratio is not a singular value, so it misses an exact alias that rounding hides (for example `c0 + c1/(c2 + exp(x1)) + c3*(c4 - x2)`, where `c0` and `c4` trade off). A cyclic Jacobi eigendecomposition of the scaled matrix gives `rank = #{lambda_i > 1e-8 * lambda_max}` (condition index above 1e4 is a lost rank) and `condition_index = sqrt(lambda_max / lambda_min)`. The constants that carry a lost direction (Belsley variance-decomposition proportion at least 0.5) are `involved`. A rank-deficient model has `ill_conditioned: true` and a `null` standard error for each involved constant. Full-rank errors are unchanged. Runs with the validation gates add `rank`, `condition_index`, `involved`, `std_errors_robust` and `relative_robust` to `constant_errors`. The robust errors use the Driscoll-Kraay sandwich `(JᵀJ)⁻¹ Ω (JᵀJ)⁻¹`; `practically_identified` is true when every robust relative error is at most 1 and is a flag only. A structurally unidentified member stays in the front, labelled, and is never supported or selected.
+
 ```sh
 rcsr --data data.csv --target y --vars x1,x2
 # constant errors (rank 5): 1.013675±1.33e-7 (rel 1.31e-7), 2.495876±1.33e-7 (rel 5.32e-8) | dof=28
 ```
+
+### 3.10b Validation gates — implemented
+
+A Pareto front lists models; it does not say whether any of them beats a trivial reference. The validation gates answer that on the validation slice, after the search. The search, the in-search archive and its hash do not change. The gates run on time-ordered runs (`--split temporal|temporal-group`, `--time`), whenever a target spec is in force, and with `--require-validation`. Test errors are scoring-only: they never enter a gate.
+
+**Noise.** For two models scored on the same validation rows, `d_i = loss_ref,i - loss_model,i`. The standard error of `mean(d)` is Driscoll-Kraay: per-row influences are summed within each timestamp, then combined across timestamps with Bartlett weights up to a lag `L`. This is valid for cross-correlated panels where the iid standard error is too small. `L` is `--noise-lag`, else the larger of the label horizon in timestamps minus one (from the target spec) and `floor(4 (T/100)^(2/9))`. A random split uses one key per row and `L = 0`. Row losses exist for `squared`, `absolute`, `log_squashed`, `log_loss` and `hinge`; `aic`, `aicc` and `bic` use the squared row loss. Other metrics report `not_gated` and keep the old behaviour.
+
+**Reference rungs.** With a target spec that has a structural term (see `docs/time-series.md` section 2b), `baselines.target_structure.rungs` holds four rungs fitted on fit-train only: `zero_param` (`S`, 0 parameters), `affine` (`a + b*S`, 2), `binned20` (train mean of `y` in 20 equal-count bins of `S`, edges from train, 20) and `construction_ols` (`y` on the scale column, 2). Each reports train, validation and test error. The references compared on every member are `mean`, `linear` and, with a structure, `zero_param` and `affine`.
+
+**Supported front.** The identified members with a finite validation loss are ordered by `(cost, validation loss, structural hash, expression)`. Starting from the reference `R` (`affine` with a structure, else `mean`), a member is *supported* when `mean(loss_last - loss_member) > z * SE`, with `z = --equivalence-z` (default 1). The member then becomes `last`. An unsupported member carries `not_better_than` (the entry that blocked it, `delta`, `se`). This is `Archive::canonicalize()` with "strictly improves" replaced by "improves by more than z standard errors".
+
+**Verdict.** `selection.verdict` is one of:
+
+| verdict | meaning | `selected_rank` |
+|---|---|---|
+| `signal` | the top supported member beats `R` by more than `z_null` standard errors | its archive rank |
+| `no_signal` | no member is supported, or the top one fails `delta > z_null * SE` | null |
+| `unvalidated` | no validation slice | null |
+| `not_gated` | the metric has no per-row loss | null |
+
+`z_null = Phi^-1(1 - 0.05 / K)`, a one-sided Bonferroni threshold over the `K` eligible members. On `no_signal` the text names the reference as the model to quote; the front is still printed with its labels. Formal inference over many trials (deflated Sharpe, PBO, SPA) is not part of a single run.
+
+**Without a slice.** A time-ordered run without `--validation-frac` prints one warning, reports `unvalidated` and selects nothing; the front is a menu. `--require-validation` turns this into a refusal (exit 2).
+
+**Per-member flags.** Every member reports `comparisons.validation` and `comparisons.test` against each reference (`delta`, `se`, `better|equivalent|worse` at `z`) and the flags `beats_mean_test`, `beats_zero_param_test`, `beats_mean_validation`, `beats_zero_param_validation` (null without a structure) and `validated` (the member is the selected one). With a target spec, `return_space` reports for each slice the correlation of `r_hat = c + m*g*y_hat` with `r` and `R2 = 1 - SSE/SS0` against the zero return forecast, using `TargetSpec::return_from_target`. Rows at a clip bound are excluded because the label only bounds the return there.
+
+**Shuffled test.** Permuting the targets of the test block changes `comparisons.test` only. `selection`, `noise` and every `gates` object are byte-identical.
 
 ### 3.11 Stability selection — implemented
 
