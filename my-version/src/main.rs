@@ -864,7 +864,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -891,6 +891,10 @@ fn ledger_json(
         l.device_fits(),
         l.fallback_fits(),
         causes,
+        l.fit_alloc().alloc_calls,
+        l.fit_alloc().growths,
+        l.fit_alloc().steady_alloc_calls,
+        l.fit_alloc().batches,
         l.eval_fallback_programs(),
         jnum(l.eval_fallback_s()),
         ratio_json(Some(&quality))
@@ -9727,6 +9731,7 @@ mod tests {
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",
             "\"fallback_by_cause\":{\"non_finite\":2}",
+            "\"alloc\":{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":0,\"growths\":0,\"steady_alloc_calls\":0,\"batches\":0}",
             "\"units\":\"fraction\"",
             "\"scope\":\"run\"",
             "\"quality_per_gpu_hour\":",

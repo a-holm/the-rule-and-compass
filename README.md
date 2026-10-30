@@ -1178,7 +1178,9 @@ not generations (#256). The packed batch
 path allocates a persistent device arena once, stages host bytes in a <=64 MiB
 pinned ring and copies on `S_h2d`/`S_d2h` with event dependencies, so `alloc_s`
 is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the labelled blocking fallback
-(#285). See
+(#285). The fit, rank, order-statistic and maximum batches use persistent device and
+pinned regions grown at the high-water mark and one event synchronisation per
+batch; `gpu.ledger.fit.alloc.steady_alloc_calls` is 0 in steady state (#334). See
 [`docs/gpu-backend.md`](docs/gpu-backend.md#measuring-the-full-gpu-path-issue-118).
 `sm_occupancy` is `null` unless measured separately with `ncu`; `nvidia-smi`
 sampled utilisation is not occupancy. See

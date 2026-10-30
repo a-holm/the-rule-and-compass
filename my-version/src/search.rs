@@ -1476,6 +1476,13 @@ impl GpuSearch {
         let mut ledger = self.ev.ledger().clone();
         ledger.set_eval_window(self.ev.stats().wall_s);
         ledger.absorb(&self.ledger);
+        let arena = self.ev.arena_report();
+        ledger.set_fit_alloc(crate::gpu_stats::FitAlloc {
+            alloc_calls: arena.fit_alloc_calls,
+            growths: arena.fit_growths,
+            steady_alloc_calls: arena.fit_steady_alloc_calls,
+            batches: arena.fit_batches,
+        });
         ledger.record_fit(
             self.fit_host_ms / 1000.0,
             self.fit_ms / 1000.0,
