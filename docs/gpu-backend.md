@@ -1901,9 +1901,12 @@ The `--json`/NDJSON `gpu` block contains:
 `kernel_s`, `launch_s`, `sync_s`, `alloc_s`, `h2d_s`, `d2h_s`, `transfer_s`,
 `window_s`, `host_s`, `accounted_s`, `wall_s`, `idle_s`, `residual_fraction`, `h2d_bytes`,
 `d2h_bytes`, `batches`, `failed_batches`, `programs`, `evals`, `row_evals`,
-`evals_per_s`, `row_evals_per_s`, `batches_per_s`, `duty_cycle` (explicitly the
-**evaluator-window** kernel fraction; `duty_scope` says so), `duty_source`,
-`run_wall_s`, `device_busy_s`, `duty_run`, `ledger`, `sm_occupancy`,
+`evals_per_s`, `row_evals_per_s`, `batches_per_s` (evaluator batches per
+evaluator second, not generations), `eval_kernel_duty` (the **evaluator-window**
+kernel fraction as a value with numerator, denominator, units and scope),
+`eval_window_s`, `device_seconds_incl_fit` (evaluator wall plus fit kernel
+seconds), `device_fraction_of_run` and `eval_fraction_of_run` (over
+`timing.total_seconds`), `process_total_s`, `run_wall_s`, `device_busy_s`, `duty_run`, `ledger`, `sm_occupancy`,
 `occupancy_source`, `quality_per_gpu_hour`, `quality_per_gpu_hour_run`,
 `quality_scope`, and the #131
 per-generation `generations` opcode/fallback report. A CPU run reports
@@ -1941,7 +1944,10 @@ Definitions that matter:
   divided by an MSE best. It is reported only for `--metric squared`; every
   other metric reports `null` rather than a mixed-unit ratio. The ledger form
   carries its numerator, denominator,
-  units (`decades_per_gpu_hour`) and scope (`run`). A throughput gain is not a
+  units (`decades_per_gpu_hour`) and scope (`run`). The baseline is the
+  constant-mean MSE of the training rows, `Σ(y−ȳ)²/n`. `gpu.quality_per_gpu_hour`
+  divides by the evaluator window (`gpu.eval_window_s`); `quality_per_gpu_hour_run`
+  and `gpu.ledger.quality_per_gpu_hour` divide by the run wall. A throughput gain is not a
   search gain: compare quality at matched cumulative evaluations and paired
   seeds.
 * **`sm_occupancy` is `null`** with `occupancy_source: "ncu (not run)"`.

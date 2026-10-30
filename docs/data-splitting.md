@@ -81,6 +81,19 @@ rows, in time order:   [ 0 ......................... n-1 ]
 Concretely, with 100 rows, `--test-frac 0.25 --gap 5`: rows 0–74 train, rows
 75–79 dropped, rows 80–99 test.
 
+### Purge by time with a target spec
+
+`--gap` counts rows. On a panel of 100 symbols `--gap 2` is 0.02 hours, so it
+cannot purge a label that looks one hour ahead. With a target spec
+(`--target-spec`, see `docs/time-series.md` §2b) the engine purges by time: it
+drops every training row whose stamp is closer than `entry_offset_seconds +
+delay_seconds + horizon_seconds` to any test stamp, and every fit row that close
+to a validation stamp, for every split mode and on the global time axis. The
+counts and the realised minimum distances are in `split`
+(`purged_rows`, `purge_seconds`, `validation_purge_seconds`). `--gap` applies on
+top. Without a spec no row is dropped, and the realised distances are still
+recorded.
+
 ### Validation slice and the test lockbox
 
 The test block answers one question: how well does the chosen law generalise?

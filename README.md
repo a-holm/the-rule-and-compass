@@ -131,6 +131,9 @@ cargo run --release -- --data examples/line.csv --target y --vars x \
 #   1  complexity=5   k_constants=2   train_err=0.000000      test_err=0.000000      y = ((2 * x) + 1)
 ```
 
+With one test block `test_err` is the error on that block; `--json-out FILE`
+writes the JSON result to the file.
+
 A syntax error names the offending column:
 `--eval-expr "2 * (x + )"` fails with
 `expected a number, variable, function or '(' (column 10)` and exit code 2.
@@ -346,7 +349,12 @@ rcsr --data examples/line.csv --target y --vars x \
 ```
 
 `--save-every <N>` sets the interval (default 25 generations); a checkpoint is
-always written on exit. Saves are crash-safe: temp file, `fsync`, atomic rename,
+also written after 15 minutes of wall time without one, and always on exit. The
+exit checkpoint carries the exact f64 post-refit archive and its `archive_hash`
+beside the search archive (labelled `error_kind`). A `--time-budget` stop is
+resumable: `--resume` continues it and may set a new budget. The checkpoint
+records version, build commit, binary SHA-256, device, driver and threads;
+`--resume` refuses a mismatch unless `--allow-build-change` is given. Saves are crash-safe: temp file, `fsync`, atomic rename,
 with the previous good generation kept as `run.rcsr.prev`. Saving does not
 consume randomness, so it cannot change the result. The saved search settings
 win on resume; only the generation budget may be raised, and data that does not
@@ -357,11 +365,12 @@ unless `--allow-backend-change` is explicit. See
 determinism guarantee and its limits.
 
 `--run-manifest <path>` records the evidence needed to reproduce a long run:
-commit and dirty state, the SHA-256 of the running binary, the data file
+the commit recorded when the binary was built, the SHA-256 of the running binary, the data file
 checksum and sample fingerprints, the resolved configuration, seed, backend,
-device/driver/CUDA, UTC start/end and phase timings. `rcsr verify-manifest`
-re-checks it against the current binary, commit, data and config and exits
-non-zero on any mismatch. `--json-out <path>` publishes the final JSON result
+device/driver/CUDA, process UTC start/end and phase timings; `total` equals
+`timing.total_seconds` in the result JSON. `rcsr verify-manifest` re-checks it
+against the current binary (or `--binary <file>` for a preserved one), data and
+config and exits non-zero on any mismatch. `--json-out <path>` publishes the final JSON result
 atomically instead of streaming it. See
 [`docs/run-integrity.md`](docs/run-integrity.md).
 
@@ -552,7 +561,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
      [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc]
-     [--allow-lockbox]
+     [--allow-lockbox] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -569,7 +578,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--gpu] [--no-gpu|--cpu] [--qd] [--qd-cells N] [--qd-cell-cap N]
      [--qd-cvt] [--qd-policy] [--qd-uniform] [--qd-random]
      [--time-budget seconds] [--save file] [--save-every N] [--resume file]
-     [--allow-backend-change] [--run-manifest file] [--json-out file]
+     [--allow-backend-change] [--allow-build-change] [--run-manifest file] [--json-out file]
      [--format text|json|ndjson] [--json] [--ndjson] [--progress]
      [--dev-log-level summary|full] [--dev-log file.ndjson] [--no-dev-log]
      [--dev-log-every N] [--dev-log-max-bytes size]
@@ -681,6 +690,8 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train or test rows in the 2026H2 crypto lockbox (declared final test only) |
+| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
+| `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1149,8 +1160,12 @@ evaluator-window kernel duty, quality per GPU-hour) and a run-scoped
 intervals over run wall (never their sum), fit/eval/fallback seconds with
 labelled causes, fit kernel versus CPU-fallback time, and
 numerator/denominator/units/scope on every derived ratio. `Σ stage_s +
-unaccounted_s = wall_s` within 1 %; `gpu.duty_cycle` is explicitly the evaluator
-window, while `gpu.ledger.duty_run` is the run-level headline. The packed batch
+unaccounted_s = wall_s` within 1 %; `gpu.eval_kernel_duty` (with `gpu.eval_window_s`) is explicitly the evaluator
+window, while `gpu.ledger.duty_run` is the run-level headline. `gpu.device_seconds_incl_fit`,
+`gpu.device_fraction_of_run` and `gpu.eval_fraction_of_run` give the device
+seconds including the fit kernels and their share of `timing.total_seconds`,
+the one runtime of the process; `gpu.batches_per_s` counts evaluator batches,
+not generations (#256). The packed batch
 path allocates a persistent device arena once, stages host bytes in a <=64 MiB
 pinned ring and copies on `S_h2d`/`S_d2h` with event dependencies, so `alloc_s`
 is ~0 in steady state; `RCSR_GPU_SYNC=1` forces the labelled blocking fallback

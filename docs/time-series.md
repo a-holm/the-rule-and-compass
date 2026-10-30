@@ -79,6 +79,20 @@ forecaster would have had. The leak is the **label** crossing the boundary.
 When in doubt, use the conservative `h + lookback` and check whether the extra
 rows cost you the result.
 
+With a declared target spec (§2b) the engine derives the purge from the label
+window instead: `required_purge_seconds = entry_offset_seconds + delay_seconds +
+horizon_seconds`. After the split and the validation carve it drops every
+training row (fit and validation) whose stamp is less than that many seconds
+from any test stamp, then every fit row that close to a validation stamp. The
+time axis is global, so cross-symbol overlap on a panel and misaligned
+`temporal-group` series are covered, and the rule holds for every split mode.
+`--gap` still applies on top. It needs a `--time` column holding epoch seconds
+(exit 2 otherwise). `split` in `run.json` records `required_purge_seconds`,
+`purge_seconds` (the smallest stamp distance between retained training rows and
+test rows, also recorded without a spec), `validation_purge_seconds`,
+`purged_rows.test_boundary`, `purged_rows.validation_boundary` and
+`purge_source`. The text header prints the same facts on a `# purge:` line.
+
 **What fails.** Without the purge, the last training row and first test row
 share most of their label window. The test error is then a near-copy of the
 training error, and `--folds` blocks look suspiciously similar at the boundary.
@@ -107,6 +121,62 @@ puts it. Add the purge rows to the expressions yourself, or use a positional
 split.
 
 **Verify.** `tests/selection.rs::selection_overrides_a_temporal_spec_and_says_so`.
+
+---
+
+## 2b. Target structure: the label must not encode a column
+
+**Check.** Declare how the label was built in a target spec
+(`--target-spec FILE`, or `<data stem>.targets.json` beside the data; contract
+`rcsr-target-spec/1`, see `rcsr schema`). For a forward return `r` the label is
+
+```text
+T = clip((r - c) / (m * g), lo, hi)
+```
+
+with offset `c`, multiplier `m`, a scale `g` (a constant or a column such as a
+volatility estimate) and an optional clip. The prediction at zero return,
+`m0 = T(r = 0) = clip(-c / (m * g), lo, hi)`, is a function of `g` alone. When
+`g` is a column and `c != 0` (or the clip is asymmetric), a model scores by
+recovering `g` from volatility proxies and never forecasts a return. The engine
+calls this a structural term and refuses the run with exit 5 (`D13c`), also when
+the scale column is left out of `--vars`: other volatility columns recover most
+of it.
+
+| measured on the compact pinned cell | share of the rung's gain recovered without the scale column in `--vars` |
+|---|---|
+| `parkinson96` | 92 % (Spearman 0.981 with `vol96`) |
+| `natr14` | 69 % |
+| `vol16` | 54 % |
+| `bb_width96` | 50 % |
+| `vol_z2880` | 49 % |
+
+Preferred target: the raw log return (`offset 0`, constant scale 1, no clip),
+cost charged outside the label. Allowed: a gross vol-scaled return with a
+symmetric clip and a scale that ends at or before the decision time
+(`scale.ends_at_offset_seconds <= entry_offset_seconds + delay_seconds`).
+
+| detector | refuses | override |
+|---|---|---|
+| `D13a` | `return_column` or the target in `--vars` | none |
+| `D13b` | a scale window that ends after the decision time | none |
+| `D13c` | a structural term | `--allow-target-structure` (diagnostic replays) |
+
+A construction column in `--vars` without a structural term runs and is recorded
+in `target_spec.check.construction_in_vars`. Under the override the run prints a
+`# WARNING` line, records `check.status = "overridden"` and a proxy table
+(Spearman correlation of each input with the scale column on a 65,536-row
+stride sample of training rows, top five).
+
+Every run with a spec prints and records the zero-parameter rung
+`baselines.target_structure`: the error of `m0` on the training rows, the
+validation slice and the test blocks, in the run metric. For the raw return this
+is the zero forecast, the out-of-sample benchmark of Gu, Kelly and Xiu (RFS
+2020, eq. 19). `TargetSpec::return_from_target` maps a label-space value back to
+a return for tools that report return-space metrics.
+
+**Verify.** `cargo test --release target::`, `tests/target_spec.rs`; the golden
+cell test `tests/target_golden.rs` (ignored; needs `RCSR_COMPACT_CELL`).
 
 ---
 
@@ -229,7 +299,10 @@ rcsr --data d.csv --target y --vars x1,x2 --eval-expr 'the_chosen_expression' \
 ```
 
 `--eval-expr` does not search; it parses the formula, scores it on the selected
-test rows, and reports train/test error.
+test rows, and reports train/test error. With a single test block the test error
+is the error on that block (`fold_errors` has one entry); `--json-out FILE`
+writes the result object to the file. With a target spec the result also carries
+`target_spec` and `target_structure`.
 
 **What fails.** Tuning until `test_error` is small and then quoting that same
 number is selection on the test set. The lockbox is the only defence left; if

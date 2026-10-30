@@ -381,9 +381,8 @@ impl Config {
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
         compare!(dedup, "dedup");
-        if self.time_budget.map(f64::to_bits) != other.time_budget.map(f64::to_bits) {
-            diff.push("time_budget");
-        }
+        // #256: `time_budget` is a per-process limit, not search state; a resumed
+        // run may set a new one.
         compare!(patience, "patience");
         compare!(predictor_samples, "predictor_samples");
         compare!(fit_samples, "fit_samples"); // #85
@@ -1530,6 +1529,9 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             native: batch.map(|b| b.native).unwrap_or(0),
             lowered: batch.map(|b| b.lowered).unwrap_or(0),
             fallbacks: batch.map(|b| b.fallbacks).unwrap_or(0),
+            fit_host_s: self.fit_host_ms / 1000.0,
+            fit_fallback_s: self.fit_fallback_ms / 1000.0,
+            fit_fallback_workers: self.fit_fallback_workers,
         }
     }
 
@@ -3734,6 +3736,11 @@ pub struct Outcome {
     pub archive: Archive,
     pub test_errors: Vec<f64>,
     pub generations: usize,
+    /// #256: true only when the engine declared the run finished early (the
+    /// `solved` or `patience` stop) **and** the final `percent_converged` is at
+    /// least [`crate::progress_stats::CONVERGED_THRESHOLD`]. A `time_budget`
+    /// stop is never convergence; read [`Outcome::stop_reason`] for why the
+    /// loop ended.
     pub converged_early: bool,
     /// The seeds that were accepted, in command-line order. Empty when the run
     /// was not seeded.
@@ -3775,6 +3782,21 @@ pub struct Outcome {
     /// by the development log's `run_end` event; it is not printed, so the
     /// default output is unchanged.
     pub stop_reason: &'static str,
+}
+
+/// #256: the reported `converged_early`. `stopped` is the loop-control flag
+/// (`solved`, `patience` or a terminal checkpoint); it stays separate so those
+/// stops remain terminal in a checkpoint even when the run did not converge.
+fn reported_converged_early(stopped: bool, convergence: &Convergence) -> bool {
+    stopped && convergence.percent_converged >= crate::progress_stats::CONVERGED_THRESHOLD
+}
+
+impl Outcome {
+    /// #256: the loop ended before the generation budget ran out, for any
+    /// reason (`solved`, `patience`, `time_budget`, `already_stopped`).
+    pub fn stopped_early(&self) -> bool {
+        self.stop_reason != "generations"
+    }
 }
 
 /// Run a search once, from a fresh start.
@@ -3860,6 +3882,25 @@ pub fn run_resumable_seeded(
 
 type CheckpointFn<'a> = &'a mut dyn FnMut(&Checkpoint);
 
+/// #256: a checkpoint is also taken when this many wall seconds have passed
+/// since the last one, so a run whose generations take minutes does not lose
+/// hours to a crash between two `--save-every` boundaries. `RCSR_CHECKPOINT_INTERVAL_S`
+/// overrides it (the tests use a tiny value).
+const CHECKPOINT_MAX_INTERVAL_S: f64 = 900.0;
+
+fn checkpoint_interval_s() -> f64 {
+    std::env::var("RCSR_CHECKPOINT_INTERVAL_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(CHECKPOINT_MAX_INTERVAL_S)
+}
+
+/// Whether a boundary checkpoint is due after `gens_done` generations.
+fn checkpoint_due(save_every: usize, gens_done: usize, since_last: f64, interval_s: f64) -> bool {
+    save_every > 0 && (gens_done % save_every == 0 || since_last >= interval_s)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn snapshot(
     cfg: &Config,
@@ -3875,6 +3916,7 @@ fn snapshot(
     main_rng: &Mt,
     train: &Sample,
     test: &Sample,
+    final_archive: Option<&Archive>,
 ) -> Checkpoint {
     let (words, idx) = main_rng.state();
     Checkpoint {
@@ -3904,6 +3946,16 @@ fn snapshot(
             .collect(),
         stagnant: stagnant.to_vec(),
         main_rng: Mt::from_state(*words, idx),
+        // #256: the search state is f32 proxy fitness on the GPU. The refit
+        // archive the run reports travels beside it, not instead of it.
+        error_kind: crate::checkpoint::ErrorKind::for_backend(backend),
+        final_archive: final_archive.map(|a| Archive {
+            items: a.items.clone(),
+            cap: a.cap,
+        }),
+        identity: Some(crate::provenance::BuildIdentity::current(
+            backend == Backend::Gpu,
+        )),
     }
 }
 
@@ -4136,6 +4188,11 @@ pub struct GpuSnapshot {
     pub native: usize,
     pub lowered: usize,
     pub fallbacks: usize,
+    /// #256: whole fit stage wall (device call, CPU fallback, write-back).
+    pub fit_host_s: f64,
+    /// #256: exact CPU fit-fallback wall, a subset of `fit_host_s`.
+    pub fit_fallback_s: f64,
+    pub fit_fallback_workers: usize,
 }
 
 impl GpuSnapshot {
@@ -4159,6 +4216,9 @@ impl GpuSnapshot {
             native: self.native,
             lowered: self.lowered,
             fallbacks: self.fallbacks,
+            fit_host_s: (self.fit_host_s - earlier.fit_host_s).max(0.0),
+            fit_fallback_s: (self.fit_fallback_s - earlier.fit_fallback_s).max(0.0),
+            fit_fallback_workers: self.fit_fallback_workers.max(earlier.fit_fallback_workers),
         }
     }
 }
@@ -4169,6 +4229,22 @@ fn stage_lap(mark: &mut std::time::Instant) -> f64 {
     let d = now.duration_since(*mark).as_secs_f64();
     *mark = now;
     d
+}
+
+/// #256: take `fit_s` seconds of fit-stage wall out of the windows it ran in,
+/// in the given order (`[eval, prep, search]`), never below zero. Returns the
+/// reduced windows and the fit seconds actually placed, so the windows plus the
+/// fit phase still add up to what they added up to before.
+fn split_fit_window(mut windows: [f64; 3], fit_s: f64) -> ([f64; 3], f64) {
+    let mut placed = 0.0;
+    let mut remaining = if fit_s.is_finite() { fit_s.max(0.0) } else { 0.0 };
+    for w in windows.iter_mut() {
+        let take = remaining.min(*w);
+        *w -= take;
+        placed += take;
+        remaining -= take;
+    }
+    (windows, placed)
 }
 
 /// #211: read the clock and reset the mark. A no-op (0.0) with no log attached.
@@ -4249,6 +4325,9 @@ fn dev_generation(
                     .iter()
                     .map(|(k, v)| (k.clone(), *v))
                     .collect(),
+                host_seconds: g.fit_host_s,
+                fallback_seconds: g.fit_fallback_s,
+                fallback_workers: g.fit_fallback_workers,
             },
             g.fallback_s,
             g.fallback_workers,
@@ -4274,18 +4353,27 @@ fn dev_generation(
         fallback_s: g.fallback_s,
         fallback_workers: g.fallback_workers,
     });
+    // #256: the GPU fit stage runs inside the evaluator window (and, with
+    // screening, inside the carried-refit and island windows). It is its own
+    // phase, taken out of those windows in that order, so the phases still sum
+    // to the generation wall and `eval` is evaluation alone.
+    let (windows, fit_s) = split_fit_window([phases[2], phases[0], phases[1]], fit.host_seconds);
     crate::devlog::GenRecord {
         generation,
         total_generations: cfg.generations,
         t,
         wall_s: phases.iter().sum(),
-        prep_s: phases[0],
-        search_s: phases[1],
-        eval_s: phases[2],
+        prep_s: windows[1],
+        search_s: windows[2],
+        eval_s: windows[0],
         select_s: phases[3],
         archive_s: phases[4],
-        fit_cpu_s: GenCounters::seconds(counters, |c| &c.fit_ns),
-        eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns),
+        fit_s,
+        // Island-thread fitting plus the exact CPU fallback fits, which run on
+        // the pool and are otherwise invisible to the counters (wall seconds).
+        fit_cpu_s: GenCounters::seconds(counters, |c| &c.fit_ns) + fit.fallback_seconds,
+        // Candidate scoring plus the evaluator's CPU fallback pool (wall).
+        eval_cpu_s: GenCounters::seconds(counters, |c| &c.eval_ns) + fallback_s,
         best_error,
         p05: q(0.05),
         p25: q(0.25),
@@ -4369,6 +4457,8 @@ fn run_postfix_search(
         t0.elapsed().as_secs_f64(),
     );
     let mut eval_stage_total = 0.0f64;
+    let mut last_save = std::time::Instant::now();
+    let save_interval_s = checkpoint_interval_s();
     // #211: why the loop ends, for the development log's run_end event.
     let mut stop_reason: &'static str = if converged_early {
         "already_stopped"
@@ -4475,12 +4565,12 @@ fn run_postfix_search(
             fit_fallback_workers: 0,
         });
 
-        if let Some(budget) = cfg.time_budget {
-            if t0.elapsed().as_secs_f64() >= budget {
-                converged_early = true;
-                stop_reason = "time_budget"; // #211
-            }
-        }
+        // #256: a time-budget stop is not convergence and not terminal. The
+        // generation completes (progress event, bookkeeping, checkpoint) and
+        // the loop ends after it.
+        let budget_hit = cfg
+            .time_budget
+            .map_or(false, |budget| t0.elapsed().as_secs_f64() >= budget);
 
         let convergence = progress_stats.observe(gens_done, gen_best, &archive);
         if let Some(report) = &cfg.progress {
@@ -4610,7 +4700,8 @@ fn run_postfix_search(
             }
         }
 
-        if save_every > 0 && gens_done % save_every == 0 {
+        if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
+            last_save = std::time::Instant::now();
             let trees = next
                 .to_trees()
                 .ok_or_else(|| "postfix pool could not be decoded for a checkpoint".to_string())?;
@@ -4644,12 +4735,17 @@ fn run_postfix_search(
                 &main_rng,
                 train,
                 test,
+                None,
             );
             emit(&mut on_checkpoint, &cp);
         }
 
         pool = next;
         if converged_early {
+            break;
+        }
+        if budget_hit {
+            stop_reason = "time_budget"; // #211
             break;
         }
     }
@@ -4668,7 +4764,9 @@ fn run_postfix_search(
         );
     }
 
-    if on_checkpoint.is_some() {
+    // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
+    // carries the archive the run reports.
+    let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let trees = pool
             .to_trees()
             .ok_or_else(|| "postfix pool could not be decoded for the final checkpoint".to_string())?;
@@ -4702,9 +4800,12 @@ fn run_postfix_search(
             &main_rng,
             train,
             test,
+            None,
         );
-        emit(&mut on_checkpoint, &cp);
-    }
+        Some(cp)
+    } else {
+        None
+    };
 
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
@@ -4732,6 +4833,13 @@ fn run_postfix_search(
         .collect();
     let mut final_archive = Archive::new(final_archive.cap);
     final_archive.items = sorted;
+    if let Some(mut cp) = pending_cp {
+        cp.final_archive = Some(Archive {
+            items: final_archive.items.clone(),
+            cap: final_archive.cap,
+        });
+        emit(&mut on_checkpoint, &cp);
+    }
 
     let best = final_archive
         .items
@@ -4760,7 +4868,7 @@ fn run_postfix_search(
         archive: final_archive,
         test_errors,
         generations: gens_done,
-        converged_early,
+        converged_early: reported_converged_early(converged_early, &convergence),
         seeds: Vec::new(),
         convergence,
         fit_samples: 0,
@@ -5463,6 +5571,8 @@ fn run_search(
     );
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables, unused_assignments))]
     let mut eval_stage_total = 0.0f64;
+    let mut last_save = std::time::Instant::now();
+    let save_interval_s = checkpoint_interval_s();
     if !converged_early {
         for gen in gens_done..cfg.generations {
             gens_done = gen + 1;
@@ -5813,13 +5923,12 @@ fn run_search(
             run_ledger.record_stage(crate::gpu_stats::Stage::Archive, stage_archive);
             eval_stage_total += stage_eval;
 
-            if let Some(budget) = cfg.time_budget {
-                if t0.elapsed().as_secs_f64() >= budget {
-                    converged_early = true;
-                    stop_reason = "time_budget"; // #211
-                    break;
-                }
-            }
+            // #256: a time-budget stop is not convergence and not terminal.
+            // The generation finishes (progress event, bookkeeping, migration,
+            // checkpoint) and the loop ends after it.
+            let budget_hit = cfg
+                .time_budget
+                .map_or(false, |budget| t0.elapsed().as_secs_f64() >= budget);
 
             // #18: convergence is a pure reading of the archive; O(front size).
             let convergence = progress_stats.observe(gens_done, gen_best, &archive);
@@ -6115,7 +6224,8 @@ fn run_search(
 
             // A checkpoint is taken only at a generation boundary: all of the
             // generation's work, including migration and restarts, is done.
-            if save_every > 0 && gens_done % save_every == 0 {
+            if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
+                last_save = std::time::Instant::now();
                 let backend = if defer_gpu || gpu_used {
                     Backend::Gpu
                 } else {
@@ -6135,8 +6245,14 @@ fn run_search(
                     &rng,
                     train,
                     test,
+                    None,
                 );
                 emit(&mut on_checkpoint, &cp);
+            }
+
+            if budget_hit {
+                stop_reason = "time_budget"; // #211
+                break;
             }
         }
     }
@@ -6173,10 +6289,11 @@ fn run_search(
         }
     }
 
-    // Write on exit (including a run that stopped early) before the final
-    // full-data archive rebuild, so the saved archive is the search archive at
-    // the last completed generation.
-    if on_checkpoint.is_some() {
+    // Capture the exit state before the final full-data archive rebuild: the
+    // saved search archive is the one at the last completed generation. It is
+    // emitted after the rebuild (#256) so it also carries the archive the run
+    // reports.
+    let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let backend = if (defer_gpu && !fit_only_device) || gpu_used {
             Backend::Gpu
         } else {
@@ -6196,9 +6313,12 @@ fn run_search(
             &rng,
             train,
             test,
+            None,
         );
-        emit(&mut on_checkpoint, &cp);
-    }
+        Some(cp)
+    } else {
+        None
+    };
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
@@ -6244,6 +6364,13 @@ fn run_search(
         .collect();
     let mut final_archive = Archive::new(archive.cap);
     final_archive.items = sorted;
+    if let Some(mut cp) = pending_cp {
+        cp.final_archive = Some(Archive {
+            items: final_archive.items.clone(),
+            cap: final_archive.cap,
+        });
+        emit(&mut on_checkpoint, &cp);
+    }
 
     // #18: the last in-loop reading describes the final generation. If no
     // generation ran (a resumed run that had already converged, or a zero
@@ -6307,7 +6434,7 @@ fn run_search(
         archive: final_archive,
         test_errors,
         generations: gens_done,
-        converged_early,
+        converged_early: reported_converged_early(converged_early, &convergence),
         seeds: seed_results,
         // #18: the four convergence numbers for the final --json output.
         convergence,
@@ -6349,6 +6476,21 @@ fn run_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #256: the fit stage leaves the eval window first, then prep, then
+    /// search, and the phases keep their total.
+    #[test]
+    fn the_fit_window_is_taken_out_of_eval_first() {
+        let (w, fit) = split_fit_window([5.5, 0.5, 1.0], 5.0);
+        assert_eq!(fit, 5.0);
+        assert_eq!(w, [0.5, 0.5, 1.0]);
+        let (w, fit) = split_fit_window([5.5, 0.5, 1.0], 6.25);
+        assert_eq!(fit, 6.25);
+        assert_eq!(w, [0.0, 0.0, 0.75]);
+        let (w, fit) = split_fit_window([1.0, 1.0, 1.0], 10.0);
+        assert_eq!((w, fit), ([0.0, 0.0, 0.0], 3.0));
+        assert_eq!(split_fit_window([1.0, 2.0, 3.0], f64::NAN).1, 0.0);
+    }
     use crate::expr::{constant, input, node, Op};
 
     /// `y = x0` on a small grid, two inputs.

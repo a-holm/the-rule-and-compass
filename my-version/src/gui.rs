@@ -786,6 +786,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--seed-file", "seed files are not parsed by the server"),
     ("--function", "building-block definitions are not parsed by the server"),
     ("--allow-backend-change", "the GUI does not resume checkpoints"),
+    ("--allow-build-change", "the GUI does not resume checkpoints"),
     ("--run-manifest", "the server owns the response stream; use the CLI to write a manifest"),
     ("--json-out", "the server owns the response stream; use the CLI to write a result file"),
     ("--out", "the server owns the response stream; use the CLI to write the Pareto TSV"),
@@ -1316,6 +1317,8 @@ impl RunPlan {
             exclude,
             time: time_spec,
             allow_lockbox: raw.allow_lockbox,
+            purge_seconds: None,
+            scale_column: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

@@ -47,6 +47,7 @@ pub mod pareto;
 pub mod postfix;
 pub mod panel; // #145: point-in-time membership and panel
 pub mod parse;
+pub mod provenance; // #256: build-time commit, binary hash, device identity
 pub mod pipeline; // #119: bounded producer/scorer overlap
 pub mod prep; // #123: raw archives -> column store
 pub mod progress_stats;
@@ -60,6 +61,7 @@ pub mod selection; // #111: select on train/validation, never the test lockbox
 pub mod stability;
 pub mod store;
 pub mod baselines; // #310: long-only baseline ladder (cash, buy-and-hold, constant, matched-exposure random long)
+pub mod target; // #254: declared target spec
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;

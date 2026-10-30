@@ -186,6 +186,28 @@ fn run_long_writes_manifest_result_and_live_log() {
     );
     assert!(String::from_utf8_lossy(&verify.stdout).contains("PASS"));
 
+    // #256: the launcher keeps the exact binary beside the run, named by its
+    // SHA-256, and the manifest verifies against it.
+    let sha = rcsr::manifest::sha256_file(rcsr).expect("hash the binary");
+    let preserved = out.join(format!("rcsr-{sha}"));
+    assert!(preserved.exists(), "missing {}", preserved.display());
+    let verify = Command::new(rcsr)
+        .args([
+            "verify-manifest",
+            manifest.to_str().unwrap(),
+            "--data",
+            csv.to_str().unwrap(),
+            "--binary",
+            preserved.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run verifier with --binary");
+    assert!(
+        verify.status.success(),
+        "preserved-binary verification failed: {}",
+        String::from_utf8_lossy(&verify.stdout)
+    );
+
     let _ = fs::remove_dir_all(dir);
 }
 
