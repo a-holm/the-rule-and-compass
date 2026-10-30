@@ -1613,6 +1613,9 @@ pub struct SplitReport {
     pub lockbox_train: crate::lockbox::Overlap,
     /// Rows in the test side inside the lockbox (must be 0 unless overridden).
     pub lockbox_test: crate::lockbox::Overlap,
+    /// #345: rows in the validation slice inside the lockbox (must be 0 unless
+    /// overridden).
+    pub lockbox_validation: crate::lockbox::Overlap,
     /// Rows dropped by `--exclude` before splitting (issue #3).
     pub excluded_rows: usize,
     /// Rows matching both selections; they are assigned to training (#3).
@@ -2698,7 +2701,7 @@ fn prepare_full_targets_weighted_inner(
 
     // #145: the search trains and scores on these rows, so both sides must be
     // clear of the lockbox unless the caller declared a final test.
-    check_split_lockbox(filtered, spec, &train_idx, &fold_idx, &mut report)?;
+    check_split_lockbox(filtered, spec, &train_idx, &validation_idx, &fold_idx, &mut report)?;
 
     let n = filtered.len();
     // Used columns: every input, then every target (one target in the
@@ -3880,7 +3883,7 @@ fn build_split(
     Ok((train, fold_idx, report))
 }
 
-/// #145: refuse a split whose training or test rows fall inside the 2026H2
+/// #145: refuse a split whose training, validation or test rows fall inside the 2026H2
 /// lockbox. This is the guard behind `rcsr run` (the default search command),
 /// not only `walkforward`. A dataset without a time column cannot be checked;
 /// neither can a numeric time column that is not Unix seconds (a row index or a
@@ -3890,6 +3893,7 @@ fn check_split_lockbox(
     t: &Table,
     spec: &SplitSpec,
     train: &[usize],
+    validation: &[usize],
     folds: &[Vec<usize>],
     report: &mut SplitReport,
 ) -> Result<(), String> {
@@ -3908,6 +3912,7 @@ fn check_split_lockbox(
             .collect()
     };
     let train_times = times(train);
+    let validation_times = times(validation);
     let test_idx: Vec<usize> = folds.iter().flatten().copied().collect();
     let test_times = times(&test_idx);
     let extent = |v: &[i64]| -> Option<(f64, f64)> {
@@ -3917,7 +3922,11 @@ fn check_split_lockbox(
             .zip(v.iter().copied().max())
             .map(|(a, b)| (a as f64, b as f64))
     };
-    let span = extent(&train_times).into_iter().chain(extent(&test_times)).fold(
+    let span = extent(&train_times)
+        .into_iter()
+        .chain(extent(&validation_times))
+        .chain(extent(&test_times))
+        .fold(
         (f64::INFINITY, f64::NEG_INFINITY),
         |(lo, hi), (a, b)| (lo.min(a), hi.max(b)),
     );
@@ -3935,6 +3944,7 @@ fn check_split_lockbox(
     }
     let guard = crate::lockbox::Guard::new(spec.allow_lockbox, None);
     report.lockbox_train = guard.check_times("training split", &train_times)?;
+    report.lockbox_validation = guard.check_times("validation split", &validation_times)?;
     report.lockbox_test = guard.check_times("test split", &test_times)?;
     Ok(())
 }

@@ -354,7 +354,7 @@ exit checkpoint carries the exact f64 post-refit archive and its `archive_hash`
 beside the search archive (labelled `error_kind`). A `--time-budget` stop is
 resumable: `--resume` continues it and may set a new budget. The checkpoint
 records version, build commit, binary SHA-256, device, driver and threads;
-`--resume` refuses a mismatch unless `--allow-build-change` is given. Saves are crash-safe: temp file, `fsync`, atomic rename,
+`--resume` refuses a mismatch unless `--allow-build-change` is given. It also refuses a different target spec (sha256 recorded in the checkpoint), exit 2. Saves are crash-safe: temp file, `fsync`, atomic rename,
 with the previous good generation kept as `run.rcsr.prev`. Saving does not
 consume randomness, so it cannot change the result. The saved search settings
 win on resume; only the generation budget may be raised, and data that does not
@@ -701,7 +701,7 @@ run:
 | `--smooth k` | `k`-wide **trailing** moving average per column (row `i` reads only itself and earlier rows); edges shrink |
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
-| `--allow-lockbox` | permit train or test rows in the 2026H2 crypto lockbox (declared final test only) |
+| `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |

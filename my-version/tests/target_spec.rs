@@ -656,3 +656,157 @@ fn audit_runs_the_target_structure_detector() {
     ]);
     assert_eq!(code(&out), 0, "{}{}", stderr(&out), String::from_utf8_lossy(&out.stdout));
 }
+
+// ---------------------------------------------------------------------------
+// #345: provenance hardening
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_spec_note_reaches_run_json() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", &grid(900, 80, 1), false);
+    let note = "survivor-biased universe, not point-in-time; \"quoted\"";
+    let text = Spec::gross("yg")
+        .json()
+        .replace("\"note\":null", &format!("\"note\":\"{}\"", note.replace('"', "\\\"")));
+    assert!(text.contains("survivor-biased"), "fixture must carry the note");
+    let spec = dir.join("noted.json");
+    std::fs::write(&spec, text).unwrap();
+    let out = run(&data, spec.to_str().unwrap(), "yg", "x", &[]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let j = json(&out);
+    assert_eq!(at(&j, &["target_spec", "note"]).as_str(), Some(note));
+}
+
+/// Daily epoch rows: fit rows end before the lockbox, the validation slice
+/// (last 20% of the training period) sits inside it, the test block follows it.
+fn lockbox_validation_csv(dir: &std::path::Path) -> String {
+    let l = rcsr::lockbox::Lockbox::crypto_2026h2();
+    let day = 86_400i64;
+    let mut text = String::from("t,x,y\n");
+    for i in 0..100i64 {
+        let t = if i < 56 {
+            l.start - (56 - i) * day
+        } else if i < 70 {
+            l.start + (i - 56) * day
+        } else {
+            l.end + (i - 70) * day
+        };
+        text.push_str(&format!("{},{},{}\n", t, (i as f64).sin(), (i as f64 * 0.3).cos()));
+    }
+    let p = dir.join("lockbox_validation.csv");
+    std::fs::write(&p, text).unwrap();
+    p.to_string_lossy().into_owned()
+}
+
+fn lockbox_run(data: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", data, "--target", "y", "--vars", "x", "--time", "t", "--cpu", "--no-dev-log",
+        "--seed", "1", "--generations", "1", "--pop", "8", "--quiet", "--json",
+    ];
+    args.extend_from_slice(extra);
+    rcsr(&args)
+}
+
+#[test]
+fn a_validation_slice_in_the_lockbox_is_refused_like_a_test_block() {
+    let dir = scratch();
+    let data = lockbox_validation_csv(&dir);
+    let l = rcsr::lockbox::Lockbox::crypto_2026h2();
+
+    // Reference: a test block that overlaps the lockbox.
+    let block = lockbox_run(&data, &["--train-select", &format!("t < {}", l.start), "--test-select", &format!("t >= {}", l.start)]);
+    assert_eq!(code(&block), 3, "{}", stderr(&block));
+    assert!(stderr(&block).contains("test split: "), "{}", stderr(&block));
+
+    let out = lockbox_run(&data, &["--test-frac", "0.3", "--validation-frac", "0.2"]);
+    assert_eq!(code(&out), code(&block), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(
+        err.contains("validation split: 14 row(s) in [")
+            && err.contains(") overlap the lockbox [")
+            && err.contains("--allow-lockbox"),
+        "{err}"
+    );
+    assert!(!err.contains("training split") && !err.contains("test split: "), "{err}");
+
+    let allowed = lockbox_run(
+        &data,
+        &["--test-frac", "0.3", "--validation-frac", "0.2", "--allow-lockbox"],
+    );
+    assert_eq!(code(&allowed), 0, "{}", stderr(&allowed));
+
+    // Without a validation slice the same rows are fit rows, refused as such.
+    let none = lockbox_run(&data, &["--test-frac", "0.3"]);
+    assert_eq!(code(&none), 3, "{}", stderr(&none));
+}
+
+fn resume_args<'a>(data: &'a str, spec: Option<&'a str>, cp: &'a str, sel: &'a [String; 4]) -> Vec<&'a str> {
+    let mut a = vec![
+        "--data", data, "--target", "yg", "--vars", "x", "--time", "t", "--cpu", "--no-dev-log",
+        "--seed", "1", "--generations", "2", "--pop", "8", "--metric", "squared", "--json",
+        "--quiet", "--resume", cp,
+    ];
+    if let Some(s) = spec {
+        a.extend(["--target-spec", s]);
+    }
+    a.extend(sel.iter().map(|s| s.as_str()));
+    a
+}
+
+#[test]
+fn resume_with_a_different_target_spec_is_refused_naming_both_hashes() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", &grid(900, 120, 1), false);
+    let a = Spec::gross("yg").write(&dir, "a.json");
+    let b = Spec {
+        entry: 3600.0,
+        ..Spec::gross("yg")
+    }
+    .write(&dir, "b.json");
+    let cp = dir.join("cp.txt").to_string_lossy().into_owned();
+    let sel = select(T0 + 900 * 60, T0 + 900 * 90);
+
+    let saved = run(&data, &a, "yg", "x", &with_select(&sel, &["--save", &cp]));
+    assert_eq!(code(&saved), 0, "{}", stderr(&saved));
+    let sha_a = at(&json(&saved), &["target_spec", "sha256"]).as_str().unwrap().to_string();
+    let other = run(&data, &b, "yg", "x", &with_select(&sel, &[]));
+    assert_eq!(code(&other), 0, "{}", stderr(&other));
+    let sha_b = at(&json(&other), &["target_spec", "sha256"]).as_str().unwrap().to_string();
+    assert_ne!(sha_a, sha_b);
+    let text = std::fs::read_to_string(&cp).unwrap();
+    assert!(text.contains(&format!("\ntarget_spec {sha_a}\n")), "{text}");
+
+    // The purge differs (4500 s vs 7200 s) but removes no row: the data
+    // fingerprints are equal, so only the explicit spec check can refuse.
+    let refused = rcsr(&resume_args(&data, Some(&b), &cp, &sel));
+    assert_eq!(code(&refused), 2, "{}", stderr(&refused));
+    let err = stderr(&refused);
+    assert!(err.contains(&sha_a) && err.contains(&sha_b), "{err}");
+    assert!(err.contains("target spec mismatch"), "{err}");
+
+    let dropped = rcsr(&resume_args(&data, None, &cp, &sel));
+    assert_eq!(code(&dropped), 2, "{}", stderr(&dropped));
+    assert!(stderr(&dropped).contains(&sha_a) && stderr(&dropped).contains("none"), "{}", stderr(&dropped));
+
+    let same = rcsr(&resume_args(&data, Some(&a), &cp, &sel));
+    assert_eq!(code(&same), 0, "{}", stderr(&same));
+}
+
+#[test]
+fn a_run_without_a_spec_writes_no_target_spec_record() {
+    let dir = scratch();
+    let data = write_csv(&dir, "d.csv", &grid(900, 120, 1), false);
+    let cp = dir.join("cp.txt").to_string_lossy().into_owned();
+    let out = rcsr(&[
+        "--data", &data, "--target", "yg", "--vars", "x", "--time", "t", "--cpu", "--no-dev-log",
+        "--seed", "1", "--generations", "2", "--pop", "8", "--json", "--quiet", "--save", &cp,
+    ]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(!std::fs::read_to_string(&cp).unwrap().contains("target_spec"));
+    let again = rcsr(&[
+        "--data", &data, "--target", "yg", "--vars", "x", "--time", "t", "--cpu", "--no-dev-log",
+        "--seed", "1", "--generations", "2", "--pop", "8", "--json", "--quiet", "--resume", &cp,
+    ]);
+    assert_eq!(code(&again), 0, "{}", stderr(&again));
+}
