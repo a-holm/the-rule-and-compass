@@ -2449,3 +2449,141 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Zero-parameter target-structure rung (#254)
+// ---------------------------------------------------------------------------
+
+/// The label a zero return would produce, scored like the null baselines.
+///
+/// `params` is always 0: the prediction is the declared target's null
+/// prediction `m0 = T(r = 0)`, a function of the scale column only.
+#[derive(Clone, Debug)]
+pub struct TargetStructureRung {
+    pub formula: String,
+    pub params: usize,
+    pub train_error: f64,
+    pub validation_error: Option<f64>,
+    pub test_error: f64,
+    /// Rows skipped because the null prediction was not finite (for example a
+    /// missing or non-positive scale value), summed over train, validation and
+    /// test.
+    pub rows_nonfinite: usize,
+}
+
+fn rung_score(
+    spec: &crate::target::TargetSpec,
+    s: &Sample,
+    scale: &[f64],
+    metric: Metric,
+    skipped: &mut usize,
+) -> f64 {
+    let mut pred = Vec::with_capacity(s.y.len());
+    let mut y = Vec::with_capacity(s.y.len());
+    let mut w = Vec::new();
+    for i in 0..s.y.len() {
+        let m0 = spec.null_prediction(scale.get(i).copied().unwrap_or(f64::NAN));
+        if !m0.is_finite() {
+            *skipped += 1;
+            continue;
+        }
+        pred.push(m0);
+        y.push(s.y[i]);
+        if !s.w.is_empty() {
+            w.push(s.w[i]);
+        }
+    }
+    if pred.is_empty() {
+        return f64::NAN;
+    }
+    metrics::score_weighted(&pred, &y, &w, metric, 0)
+}
+
+/// Score the spec's null prediction on the prepared rows: the training rows,
+/// the validation slice and the test blocks (their mean, as for a searched
+/// model). `None` for a multi-output run or when the scale values were not
+/// collected for a column scale.
+pub fn target_structure_rung(
+    spec: &crate::target::TargetSpec,
+    prepared: &crate::data::Prepared,
+    metric: Metric,
+) -> Option<TargetStructureRung> {
+    if !prepared.train.ys.is_empty() {
+        return None;
+    }
+    let column = spec.scale_column().is_some();
+    let empty: Vec<f64> = Vec::new();
+    let (train_g, val_g, test_g): (&[f64], Option<&[f64]>, &[f64]) = match &prepared.target_scale {
+        Some(ts) => (&ts.train, ts.validation.as_deref(), &ts.test),
+        None if column => return None,
+        None => (&empty, None, &empty),
+    };
+    let mut skipped = 0usize;
+    let train_error = rung_score(spec, &prepared.train, train_g, metric, &mut skipped);
+    let validation_error = match (&prepared.validation, val_g) {
+        (Some(v), Some(g)) => Some(rung_score(spec, v, g, metric, &mut skipped)),
+        (Some(v), None) if !column => Some(rung_score(spec, v, &empty, metric, &mut skipped)),
+        _ => None,
+    };
+    let test_error = if prepared.fold_samples.is_empty() {
+        rung_score(spec, &prepared.test, test_g, metric, &mut skipped)
+    } else {
+        let mut at = 0usize;
+        let mut errs = Vec::with_capacity(prepared.fold_samples.len());
+        for f in &prepared.fold_samples {
+            let end = (at + f.y.len()).min(test_g.len());
+            errs.push(rung_score(spec, f, &test_g[at.min(end)..end], metric, &mut skipped));
+            at += f.y.len();
+        }
+        errs.iter().sum::<f64>() / errs.len() as f64
+    };
+    Some(TargetStructureRung {
+        formula: spec.null_formula(),
+        params: 0,
+        train_error,
+        validation_error,
+        test_error,
+        rows_nonfinite: skipped,
+    })
+}
+
+impl TargetStructureRung {
+    /// The JSON object shared by `run.json`, the NDJSON `baselines` event and
+    /// the `--eval-expr` result.
+    pub fn json(&self) -> String {
+        use crate::devlog::{num, text};
+        format!(
+            "{{\"formula\":{},\"params\":{},\"train_error\":{},\"validation_error\":{},\"test_error\":{},\"rows_nonfinite\":{}}}",
+            text(&self.formula),
+            self.params,
+            num(self.train_error),
+            self.validation_error.map(num).unwrap_or_else(|| "null".into()),
+            num(self.test_error),
+            self.rows_nonfinite
+        )
+    }
+}
+
+#[cfg(test)]
+mod target_rung_tests {
+    use super::*;
+    use crate::target::parse_file;
+
+    #[test]
+    fn rung_is_the_hand_computed_mse_and_skips_bad_scale_rows() {
+        let spec = parse_file(include_str!("../tests/fixtures/targets/compact_15m_100.targets.json"))
+            .unwrap()
+            .remove(0);
+        let s = Sample {
+            x: vec![vec![0.0]; 6],
+            y: vec![0.0; 6],
+            w: Vec::new(),
+            ys: Vec::new(),
+        };
+        let g = [0.001, 0.002, 0.004, 0.005, f64::NAN, -1.0];
+        let mut skipped = 0;
+        let e = rung_score(&spec, &s, &g, Metric::Squared, &mut skipped);
+        assert!((e - 541.0 / 14400.0).abs() <= 1e-15, "{e}");
+        assert_eq!(skipped, 2);
+    }
+}

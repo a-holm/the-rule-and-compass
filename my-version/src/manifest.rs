@@ -57,6 +57,8 @@ pub struct Manifest {
     /// #294: the resolved projected read (hash, column list and header
     /// indices), or `None` when the run loaded every column.
     pub projection: Option<ProjectionRecord>,
+    /// #254: the declared target spec `(source, path, sha256)`, or `None`.
+    pub target_spec: Option<(String, String, String)>,
 }
 
 impl Manifest {
@@ -145,6 +147,15 @@ impl Manifest {
             }
             None => out.push_str("  \"projection\":null,\n"),
         }
+        match &self.target_spec {
+            Some((source, path, sha)) => out.push_str(&format!(
+                "  \"target_spec\":{{\"source\":{},\"path\":{},\"sha256\":{}}},\n",
+                jstr(source),
+                jstr(path),
+                jstr(sha)
+            )),
+            None => out.push_str("  \"target_spec\":null,\n"),
+        }
         let phase_json: Vec<String> = phases
             .iter()
             .map(|(name, secs)| format!("{}:{:.6}", jstr(name), secs))
@@ -215,6 +226,7 @@ pub fn collect(
         sampled_rows,
         estimate_bytes,
         projection: None,
+        target_spec: None,
     }
 }
 

@@ -21,7 +21,9 @@ use rcsr::metrics::{self, Metric};
 use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
-use rcsr::{backend, data, diagnostics, leakage, multi, qd, search, stability, store, walkforward};
+use rcsr::{
+    backend, data, diagnostics, leakage, multi, qd, search, stability, store, target, walkforward,
+};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -98,6 +100,7 @@ USAGE:
   rcsr enrich --data <store.rcsb|CSV> --out <store.rcsb> --features <list> [options]
   rcsr walkforward --data <store.rcsb> --target <col> --expr <formula> ...
   rcsr audit --data <file> --target <col> [--time <col>] [--horizon N] [--json]
+             [--target-spec <file>]
   rcsr verify-manifest <manifest.json> [--data <file>]
   rcsr dev-report <log.ndjson>
                               summarise the development log rcsr writes by
@@ -184,6 +187,18 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/test rows in 2026H2 (declared final test only)
+  --target-spec <file>       declared target spec (rcsr-target-spec/1 JSON; default
+                             <data stem>.targets.json when it has an entry for the
+                             target). The engine then: refuses a label whose
+                             prediction at zero return depends on a column
+                             (D13c, exit 5), the future return as an input (D13a)
+                             and a look-ahead scale (D13b); purges training rows
+                             within the label end offset of every validation and
+                             test row (needs an epoch-seconds --time); prints the
+                             zero-parameter rung baselines.target_structure
+  --allow-target-structure   run a D13c target anyway for a diagnostic replay: warns,
+                             records check.status=overridden and a proxy table.
+                             D13a and D13b have no override
                              (it reads the next bar; otherwise refused)
   --center <how>             subtract mean (default), median, min, max or none
   --scale <how>              divide by std (default), iqr, range or none
@@ -1513,6 +1528,9 @@ fn main() {
     let mut allow_interpolate = false;
     // #145: a search may not train or score inside 2026H2 by default.
     let mut allow_lockbox = false;
+    // #254: declared target spec and the structural-term override.
+    let mut target_spec_path: Option<String> = None;
+    let mut allow_target_structure = false;
     let mut center = data::Center::Mean;
     let mut scale = data::Scale::Std;
     let mut filter_src: Option<String> = None;
@@ -1752,6 +1770,8 @@ fn main() {
             },
             "--allow-interpolate" => allow_interpolate = true,
             "--allow-lockbox" => allow_lockbox = true,
+            "--target-spec" => target_spec_path = Some(val!()),
+            "--allow-target-structure" => allow_target_structure = true,
             "--center" => {
                 let v = val!();
                 match data::Center::parse(&v) {
@@ -2670,6 +2690,36 @@ fn main() {
         }
     }
 
+    // #254: the declared target spec, resolved before any row is read. D13 runs
+    // here when the inputs are named; otherwise right after they are resolved.
+    let mut target_resolved: Option<target::Resolved> = if multi_output {
+        if target_spec_path.is_some() {
+            eprintln!("error: --target-spec is not supported with multiple targets (--target y1,y2)");
+            std::process::exit(EXIT_USAGE);
+        }
+        None
+    } else {
+        match target::resolve(&data_path, target_spec_path.as_deref(), &target_names[0]) {
+            Ok(r) => r,
+            Err(target::ResolveError::Usage(e)) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+            Err(target::ResolveError::Input(e)) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    };
+    if allow_target_structure && target_resolved.is_none() {
+        eprintln!("error: --allow-target-structure needs a target spec (--target-spec or <data>.targets.json)");
+        std::process::exit(EXIT_USAGE);
+    }
+    let mut target_check: Option<target::Check> = None;
+    if let (Some(r), false) = (&target_resolved, vars.is_empty()) {
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+    }
+
     // #71/#112: the guard and the backing choice happen before any resident
     // Table or search sample is built. A CSV estimate uses the table's shape
     // (rows x columns) once the text has been read, never `33 x file size`.
@@ -2796,6 +2846,9 @@ fn main() {
                     }
                     if let Some(g) = group_name.as_deref() {
                         pnames.push(g.to_string());
+                    }
+                    if let Some(c) = target_resolved.as_ref().and_then(|r| r.spec.scale_column()) {
+                        pnames.push(c.to_string());
                     }
                     pnames.sort();
                     pnames.dedup();
@@ -3082,6 +3135,9 @@ fn main() {
         eprintln!("error: no input variables");
         std::process::exit(EXIT_INPUT);
     }
+    if let (Some(r), None) = (&target_resolved, &target_check) {
+        target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
+    }
 
     let known_vars: Vec<usize> = vars.iter().filter_map(|v| table.index_of(v).ok()).collect();
     let exclusion = |a: Option<usize>, b: Option<usize>| -> Vec<usize> {
@@ -3336,6 +3392,11 @@ fn main() {
             tz,
         },
         allow_lockbox,
+        purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
+        scale_column: target_resolved
+            .as_ref()
+            .and_then(|r| r.spec.scale_column())
+            .map(str::to_string),
     };
     let prep = data::PrepSpec {
         fill,
@@ -3393,10 +3454,44 @@ fn main() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {}", e);
-            std::process::exit(EXIT_INPUT);
+            std::process::exit(if e.starts_with("target spec") {
+                EXIT_USAGE
+            } else {
+                EXIT_INPUT
+            });
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+
+    // #254: the zero-parameter rung and, under the override, the proxy table.
+    let target_active: Option<target::Active> = match (target_resolved.take(), target_check.take()) {
+        (Some(r), Some(mut check)) => {
+            if check.status == "overridden" {
+                if let Some(col) = r.spec.scale_column() {
+                    check.proxies = Some(target::proxy_table(&prepared, &vars, col, 5));
+                }
+            }
+            let rung = diagnostics::target_structure_rung(&r.spec, &prepared, cfg.metric);
+            let purge_line = target::purge_line(&r.spec, &prepared.report);
+            Some(target::Active {
+                spec: r.spec,
+                source: r.source,
+                file_sha256: r.file_sha256,
+                check,
+                rung,
+                purge_line,
+            })
+        }
+        _ => None,
+    };
+    let target_spec_json = target_active
+        .as_ref()
+        .map(|a| a.json())
+        .unwrap_or_else(|| "null".to_string());
+    let target_rung_json = target_active
+        .as_ref()
+        .map(|a| a.rung_json())
+        .unwrap_or_else(|| "null".to_string());
 
     if stream_store_candidate {
         let resolved = (|| -> Result<fit::StoreSpec, String> {
@@ -3727,6 +3822,13 @@ fn main() {
                 indices: p.indices(),
             });
         }
+        if let Some(a) = &target_active {
+            m.target_spec = Some((
+                a.source.name().to_string(),
+                a.source.path().to_string(),
+                a.spec.sha256(),
+            ));
+        }
         if let Err(e) = m.write(path, None, &[("data_prepare", data_prepare_secs)]) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
@@ -3762,6 +3864,16 @@ fn main() {
     );
     for n in &notes {
         eprintln!("# {}", n);
+    }
+    if let Some(a) = &target_active {
+        if format == Format::Text && !quiet {
+            for line in a.text_lines() {
+                eprintln!("{}", line);
+            }
+        }
+        if let Some(w) = a.warning_line() {
+            eprintln!("{}", w);
+        }
     }
     if format == Format::Text {
         for line in prepared.prep.text_lines(outlier_iqr, smooth) {
@@ -4050,6 +4162,7 @@ fn main() {
             quiet,
             search_start,
             json_out.as_deref(),
+            target_active.as_ref(),
         );
         std::process::exit(EXIT_OK);
     }
@@ -5052,7 +5165,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -5074,7 +5187,8 @@ fn main() {
                 lag_report.lags,
                 lag_report.series,
                 lag_report.history_rows,
-                notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(",")
+                notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
+                target::split_purge_json(&prepared.report)
             );
             let seeds_json: Vec<String> = seed_rows
                 .iter()
@@ -5148,7 +5262,7 @@ fn main() {
                 None => "null".to_string(),
             };
             let baselines_json = format!(
-                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
+                "{{\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
                 jnum(baselines.linear.train_error),
@@ -5156,7 +5270,8 @@ fn main() {
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
                 jnum(baselines.knn.test_error),
-                baselines.knn_json_extra() // #69
+                baselines.knn_json_extra(), // #69
+                target_rung_json
             );
             let resid_json = match &best_resid {
                 Some(rt) => format!(
@@ -5339,7 +5454,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -5356,6 +5471,7 @@ fn main() {
                 prepared.train.len(),
                 prepared.test.len(),
                 split_json,
+                target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
                 outcome.converged_early,
@@ -5476,7 +5592,7 @@ fn main() {
                 );
             }
             println!(
-                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}}}}",
+                "{{\"event\":\"baselines\",\"metric\":{},\"mean\":{{\"train_error\":{},\"test_error\":{}}},\"linear\":{{\"train_error\":{},\"test_error\":{}}},\"knn\":{{\"k\":{},\"train_error\":{},\"test_error\":{},{}}},\"target_structure\":{}}}",
                 jstr(cfg.metric.name()),
                 jnum(baselines.mean.train_error),
                 jnum(baselines.mean.test_error),
@@ -5485,7 +5601,8 @@ fn main() {
                 baselines.knn_k,
                 jnum(baselines.knn.train_error),
                 jnum(baselines.knn.test_error),
-                baselines.knn_json_extra() // #69
+                baselines.knn_json_extra(), // #69
+                target_rung_json
             );
             if let Some(cv) = &cv {
                 println!(
@@ -6056,6 +6173,24 @@ fn normalise_inputs(n: &expr::Node, means: &[f64], stds: &[f64]) -> expr::Node {
     }
 }
 
+/// #254: run the D13 detectors on a declared target; exit 5 on a finding that
+/// is not overridden.
+fn enforce_target_check(
+    spec: &target::TargetSpec,
+    vars: &[String],
+    allow_structure: bool,
+) -> target::Check {
+    match target::check(spec, vars, allow_structure) {
+        Ok(check) => check,
+        Err(report) => {
+            if let Err(failure) = report.result() {
+                eprintln!("error: {}", failure);
+            }
+            std::process::exit(EXIT_LEAKAGE);
+        }
+    }
+}
+
 /// `--eval-expr`: score a user-written formula instead of searching.
 ///
 /// The formula is written in **original units** (the same form a search run
@@ -6075,6 +6210,7 @@ fn run_eval(
     quiet: bool,
     started: std::time::Instant,
     json_out: Option<&str>,
+    target_active: Option<&target::Active>,
 ) {
     let mut tree = match expr::parse(src, vars) {
         Ok(t) => t,
@@ -6123,7 +6259,7 @@ fn run_eval(
         Format::Json => {
             let folds: Vec<String> = fold_errors.iter().map(|e| jnum(*e)).collect();
             let result_json = format!(
-                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}}}}",
+                "{{\"tool\":\"rcsr\",\"version\":{},\"mode\":\"eval-expr\",\"metric\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"train_rows\":{},\"test_rows\":{},\"preparation\":{},\"eval\":{{\"expression\":{},\"complexity\":{},\"k_constants\":{},\"train_error\":{},\"test_error\":{},\"fold_errors\":[{}]}},\"target_spec\":{},\"target_structure\":{}}}",
                 jstr(VERSION),
                 jstr(metric.name()),
                 jstr(target),
@@ -6137,7 +6273,13 @@ fn run_eval(
                 k,
                 jnum(train_error),
                 jnum(test_error),
-                folds.join(",")
+                folds.join(","),
+                target_active
+                    .map(|a| a.json())
+                    .unwrap_or_else(|| "null".to_string()),
+                target_active
+                    .map(|a| a.rung_json())
+                    .unwrap_or_else(|| "null".to_string())
             );
             if let Some(path) = json_out {
                 if let Err(e) = rcsr::atomic::write_text_atomic(path, &result_json) {
@@ -8216,6 +8358,7 @@ fn run_audit(args: &[String]) -> ! {
     let mut resample_small = 15usize;
     let mut resample_large = 60usize;
     let mut session_gap: Option<f64> = None;
+    let mut target_spec: Option<String> = None;
     let mut i = 0usize;
     while i < args.len() {
         let a = args[i].as_str();
@@ -8253,6 +8396,7 @@ fn run_audit(args: &[String]) -> ! {
                 }
             }
             "--report" => report_path = Some(take(&mut i)),
+            "--target-spec" => target_spec = Some(take(&mut i)),
             "--join-on" => join_on = Some(take(&mut i)),
             "--bars" => bars_path = Some(take(&mut i)),
             "--universe" => universe_path = Some(take(&mut i)),
@@ -8384,6 +8528,33 @@ fn run_audit(args: &[String]) -> ! {
     // D5 differential learner is already part of audit_panel; run it explicitly
     // as well so its count is visible even when no name canary exists.
     report.merge(leakage::differential_suite(&panel, &target, horizon));
+
+    // #254: D13 on a declared target, against the probed inputs.
+    if let Some(spec_path) = target_spec.as_deref() {
+        match target::resolve(&path, Some(spec_path), &target) {
+            Ok(Some(r)) => {
+                let probed: Vec<String> = if vars.is_empty() {
+                    names
+                        .iter()
+                        .filter(|n| **n != target)
+                        .map(|n| n.to_string())
+                        .collect()
+                } else {
+                    vars.clone()
+                };
+                report.merge(leakage::target_structure(&r.spec, &probed));
+            }
+            Ok(None) => {}
+            Err(target::ResolveError::Usage(e)) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+            Err(target::ResolveError::Input(e)) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
 
     // D10: a repeated key on the probe side would multiply joined rows.
     if let Some(col) = &join_on {

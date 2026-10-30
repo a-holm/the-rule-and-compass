@@ -1316,6 +1316,8 @@ impl RunPlan {
             exclude,
             time: time_spec,
             allow_lockbox: raw.allow_lockbox,
+            purge_seconds: None,
+            scale_column: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {
