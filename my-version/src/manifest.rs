@@ -15,6 +15,14 @@ use crate::checkpoint::{
 use crate::search::Config;
 use std::path::Path;
 
+/// A resolved read projection recorded in the manifest (issue #294).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionRecord {
+    pub hash: String,
+    pub columns: Vec<String>,
+    pub indices: Vec<usize>,
+}
+
 /// The facts collected once, before the search starts.
 #[derive(Clone)]
 pub struct Manifest {
@@ -46,6 +54,9 @@ pub struct Manifest {
     pub sampled_rows: Option<usize>,
     /// #112: the guard's estimate that justified the decision.
     pub estimate_bytes: Option<u64>,
+    /// #294: the resolved projected read (hash, column list and header
+    /// indices), or `None` when the run loaded every column.
+    pub projection: Option<ProjectionRecord>,
 }
 
 impl Manifest {
@@ -121,6 +132,19 @@ impl Manifest {
                 None => "null".to_string(),
             }
         ));
+        match &self.projection {
+            Some(p) => {
+                let cols: Vec<String> = p.columns.iter().map(|c| jstr(c)).collect();
+                let idx: Vec<String> = p.indices.iter().map(|i| i.to_string()).collect();
+                out.push_str(&format!(
+                    "  \"projection\":{{\"hash\":{},\"columns\":[{}],\"indices\":[{}]}},\n",
+                    jstr(&p.hash),
+                    cols.join(","),
+                    idx.join(",")
+                ));
+            }
+            None => out.push_str("  \"projection\":null,\n"),
+        }
         let phase_json: Vec<String> = phases
             .iter()
             .map(|(name, secs)| format!("{}:{:.6}", jstr(name), secs))
@@ -190,6 +214,7 @@ pub fn collect(
         full_rows,
         sampled_rows,
         estimate_bytes,
+        projection: None,
     }
 }
 

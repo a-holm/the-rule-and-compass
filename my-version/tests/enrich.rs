@@ -500,6 +500,79 @@ fn cost_model_keeps_small_stores_on_the_cpu_and_names_the_reason() {
 }
 
 #[test]
+fn cost_model_v2_charges_the_measured_write_and_a_slow_disk_flips_the_verdict() {
+    let mut counts = std::collections::BTreeMap::new();
+    counts.insert("returns", (120usize, OpClass::Elementwise));
+    let mut supported = std::collections::BTreeMap::new();
+    supported.insert("returns", 120usize);
+    let rows = 3_900_000usize;
+    let fast = enrich::plan_groups_with_write_bw(
+        &counts,
+        &supported,
+        rows,
+        GpuMode::Auto,
+        true,
+        enrich::GPU_WRITE_BYTES_PER_SECOND,
+    );
+    assert!(
+        fast[0].gpu_ms < fast[0].cpu_ms,
+        "measured 222 MB/s keeps returns on the GPU"
+    );
+    // A disk that writes 5 MB/s makes the same family's output write dominate.
+    let slow = enrich::plan_groups_with_write_bw(
+        &counts,
+        &supported,
+        rows,
+        GpuMode::Auto,
+        true,
+        5_000_000.0,
+    );
+    assert!(
+        slow[0].gpu_ms > fast[0].gpu_ms,
+        "the write term must change the estimate"
+    );
+    assert_eq!(slow[0].backend, "cpu");
+    if enrich::gpu_kernels_compiled() {
+        assert!(slow[0].reason.contains("not below"));
+    }
+    // The default entry point still uses the measured filesystem constant.
+    let default = enrich::plan_groups(&counts, &supported, rows, GpuMode::Auto, true);
+    assert_eq!(default[0].gpu_ms, fast[0].gpu_ms);
+}
+
+#[test]
+fn output_stage_is_bounded_at_64_mib_for_any_column_count() {
+    let wide = rcsr::memory::enrich_output_stage_bytes(16_000_000, 358);
+    assert_eq!(
+        wide,
+        rcsr::memory::GPU_OUTPUT_ARENA_BYTES + rcsr::memory::ENRICH_TEMP_WRITE_CHUNK_BYTES
+    );
+    let narrow = rcsr::memory::enrich_output_stage_bytes(1_000, 2);
+    assert_eq!(
+        narrow,
+        1_000 * 2 * 8 + rcsr::memory::ENRICH_TEMP_WRITE_CHUNK_BYTES
+    );
+}
+
+/// #300 measurement: calibrate `--write-bw` for the filesystem that will hold
+/// the temp feature files and the output store. Ignored because it writes
+/// scratch bytes; run it explicitly.
+#[test]
+#[ignore]
+fn measure_write_bandwidth_on_a_filesystem() {
+    let dir = std::env::var("RCSR_BW_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let bps = enrich::measure_write_bandwidth(&dir, 128 * 1024 * 1024).unwrap();
+    eprintln!(
+        "# write bandwidth {}: {:.1} MB/s",
+        dir.display(),
+        bps / 1e6
+    );
+    assert!(bps > 10_000_000.0, "implausibly slow durable write");
+}
+
+#[test]
 fn dry_run_writes_nothing() {
     let dir = tmp_dir("dry");
     let src = dir.join("in.rcsb").to_string_lossy().into_owned();

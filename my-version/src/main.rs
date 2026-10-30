@@ -217,6 +217,10 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
+  --no-project               load every store column. The default projects the
+                             read to --vars, targets, --weight, --time and
+                             --group-by when a .rcsb store is read with --vars
+                             and --time; --no-project is the A/B escape hatch.
   --gap <rows|time>          embargo: rows dropped between train and test to stop
                              autocorrelation leaking the future (default 0).
                              A suffixed value (90m, 1.5h, 30s, 2d) is wall time,
@@ -1524,6 +1528,7 @@ fn main() {
     // #140: run integrity flags.
     let mut allow_backend_change = false;
     let mut run_manifest_path: Option<String> = None;
+    let mut no_project = false;
     let mut json_out: Option<String> = None;
     // #211: the engine-level development log. It is **on by default** at
     // `summary` level, which is what replaces the old external run monitor.
@@ -2061,6 +2066,7 @@ fn main() {
             "--resume" => resume_path = Some(val!()),
             "--allow-backend-change" => allow_backend_change = true,
             "--run-manifest" => run_manifest_path = Some(val!()),
+            "--no-project" => no_project = true,
             // #211: the development log. It is on by default; `--no-dev-log`
             // turns it off, `--dev-log` picks the path, `--dev-log-level`
             // picks the detail, `--dev-log-every` the cadence and
@@ -2689,6 +2695,9 @@ fn main() {
     let mut store_memory_estimate: Option<memory::MemoryEstimate> = None;
     let mut store_full_rows: Option<bool> = None;
     let mut store_sample_rows: Option<usize> = None;
+    // #294: the resolved read projection used by this run, recorded in the
+    // manifest. `None` means the historical full-column load.
+    let mut store_projection: Option<store::Projection> = None;
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -2756,9 +2765,48 @@ fn main() {
                 ) || outlier_iqr.is_some()
                     || smooth > 0
                     || smooth_centred;
+                // #294: project the read when the caller named the split
+                // columns and the table shape is fully determined by names.
+                // Filters, dtype expansion and sampling still need the whole
+                // header, so they keep the full-column path.
+                let group_like_present = fs.header().names().iter().any(|n| {
+                    matches!(
+                        n.to_ascii_lowercase().as_str(),
+                        "symbol" | "ticker" | "asset" | "pair" | "group" | "code"
+                    )
+                });
+                let may_project = !no_project
+                    && !vars.is_empty()
+                    && time_name.is_some()
+                    && !(group_name.is_none() && group_like_present)
+                    && dtype_src.is_none()
+                    && filter_src.is_none()
+                    && exclude_src.is_none()
+                    && train_select_src.is_none()
+                    && test_select_src.is_none()
+                    && sample_rows.is_none();
+                if may_project {
+                    let mut pnames: Vec<String> = vars.clone();
+                    pnames.extend(target_names.iter().cloned());
+                    if let Some(w) = weight_name.as_deref() {
+                        pnames.push(w.to_string());
+                    }
+                    if let Some(t) = time_name.as_deref() {
+                        pnames.push(t.to_string());
+                    }
+                    if let Some(g) = group_name.as_deref() {
+                        pnames.push(g.to_string());
+                    }
+                    pnames.sort();
+                    pnames.dedup();
+                    if let Ok(p) = store::Projection::resolve_owned(&fs, &pnames) {
+                        store_projection = Some(p);
+                    }
+                }
                 let mem_opts = memory::EstimateOptions {
                     used_cols,
                     scan_cols,
+                    projection: store_projection.as_ref().map(|p| p.indices()),
                     gpu: cfg.gpu,
                     gpu_fit: cfg.gpu && cfg.fit_iters > 0 && cfg.fit_strategy.defers_to_gpu(),
                     mutable_prep,
@@ -2775,7 +2823,10 @@ fn main() {
                     store_resident = true;
                     store_memory_estimate = Some(estimate);
                     store_full_rows = Some(true);
-                    fs.to_table()
+                    match &store_projection {
+                        Some(p) => fs.to_table_projected(p),
+                        None => fs.to_table(),
+                    }
                 } else if let Some(requested) = sample_rows {
                     // Sampling is explicit. Never let `--sample-rows` be a
                     // quieter way to exceed the budget: a request that covers
@@ -2795,7 +2846,10 @@ fn main() {
                         store_resident = true;
                         store_memory_estimate = Some(estimate);
                         store_full_rows = Some(true);
-                        fs.to_table()
+                        match &store_projection {
+                            Some(p) => fs.to_table_projected(p),
+                            None => fs.to_table(),
+                        }
                     } else {
                         let sampled = estimate.with_sampled_rows(n, &fs.memory_shape(), &mem_opts);
                         if sampled.total_bytes > limit && !force {
@@ -3665,6 +3719,14 @@ fn main() {
             store_sample_rows,
             store_memory_estimate.map(|m| m.total_bytes),
         );
+        let mut m = m;
+        if let Some(p) = &store_projection {
+            m.projection = Some(manifest::ProjectionRecord {
+                hash: p.hash_hex(),
+                columns: p.names(),
+                indices: p.indices(),
+            });
+        }
         if let Err(e) = m.write(path, None, &[("data_prepare", data_prepare_secs)]) {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
@@ -7413,20 +7475,21 @@ fn refuse_store_for_memory(
     );
     eprintln!("  estimate basis: store header dtypes + row groups + used columns");
     eprintln!(
-        "    storage {} + directory/group {} + search {} + fit {} + fixed {} + slack {} \
+        "    storage {} + directory/group {} + search {} + fit {} + ring {} + fixed {} + slack {} \
          = {}{}",
         human_bytes(estimate.storage_bytes),
         human_bytes(estimate.directory_bytes.saturating_add(estimate.group_buffer_bytes)),
         human_bytes(estimate.search_bytes),
         human_bytes(estimate.fit_copy_bytes),
+        human_bytes(estimate.ring_bytes),
         human_bytes(estimate.fixed_bytes),
         human_bytes(estimate.slack_bytes),
         human_bytes(estimate.total_bytes),
         if estimate.saturated { " (at least)" } else { "" }
     );
     eprintln!(
-        "    projection: {} search + {} scan used column(s) of {}",
-        estimate.used_cols, estimate.scan_cols, estimate.cols
+        "    projection: {} search + {} scan used column(s) of {} ({} projected read)",
+        estimate.used_cols, estimate.scan_cols, estimate.cols, estimate.projected_cols
     );
     eprintln!(
         "  memory budget is {} ({} bytes; set it with --max-memory)",

@@ -143,6 +143,45 @@ and is the cheapest first check on a rented Spark; it does not measure native
 native run.
 
 
+## Projected transport (#294)
+
+A wide store is a **read policy** problem before it is a device problem. When
+`--data` is a `.rcsb` store and `--vars` and `--time` are given, the search
+loads only the variables, targets, `--weight`, `--time` and `--group-by`
+columns. `--no-project` restores the full-column load for an A/B run. Filters,
+`--dtype` expansion and `--sample-rows` also keep the full path because they
+need the whole header.
+
+`Projection` resolves exact column names against the header, refuses a missing
+or dictionary-only name instead of dropping it, stores header indices in header
+order, and hashes `index:name:dtype;` with FNV-1a 64. The hash and the exact
+column list are written to `--run-manifest` as `projection.{hash,columns,indices}`.
+`--json` for `rcsr enrich` carries the same pair for its device read.
+
+The device path does not build a `Table` at all. `ProjectedRing` owns two or
+three `cudaHostAlloc` slots capped at 64 MB total, plus one reader thread that
+`pread`s the projected blocks straight into the pinned slot. The main thread
+enqueues one `cudaMemcpyAsync` per projected column on a copy stream and runs
+the next group's segment-id and elementwise feature tile (`r*`, `lag_r1_*`,
+`range1`, `clv1`, calendar) on a compute stream. A copy event guards slot reuse;
+a compute event guards the slot's device writes. The only stream
+synchronisation is the final join after the last group. A group larger than the
+cap is refused with its byte count rather than silently shrinking the
+projection.
+
+`rcsr enrich --gpu on` uses this transport by default. It reads only
+`ts/open/high/low/close` plus optional `volume/quote_volume`; the transport
+upload is measured in `gpu.transfer_bytes`. On a store that cannot be projected
+(e.g. a text-only field required as a numeric kernel input) the historical
+whole-column upload is used and reported, never silently.
+
+Measured on the RTX 3060 with the 6 400-row fixture: a 3-slot 7-column ring is
+constant across 100 groups, tiled `r1/r5/lag/range/clv/calendar` columns are
+bit-identical to the whole-column kernels, and the copy/compute event windows
+overlap (`tests/gpu_ring.rs`). `RCSR_NO_PROJECTED_UPLOAD=1` forces the
+historical whole-column upload for a paired run; it is a measurement escape
+hatch, not a supported production mode.
+
 ## How it works
 
 **Bytecode.** Each expression is compiled once into a compact postfix program of

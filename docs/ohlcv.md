@@ -113,6 +113,92 @@ The registry (`rcsr schema`) marks all 36 `available:true` with
 test id; `tests/enrich.rs` pins hand-built higher-bar values, NaN/gap behaviour,
 the future-shift failure and prefix replay.
 
+### Device MTF resample and causal join (`--features cuda`)
+
+`src/mtf_gpu.rs` and `src/cuda/mtf.cu` move the same contract to the device.
+Base rows are bucketised with `floor(t/tf)` per symbol; a deterministic
+exclusive scan of the new-bucket flags gives one thread per bucket, which folds
+its contiguous input rows in order (`open=first`, `high=max`, `low=min`,
+`close=last`). No empty bucket is emitted: a missing hour simply leaves a hole
+in the higher series, exactly like the CPU.
+
+The eleven value leaves are evaluated on the smaller higher series with the
+CPU's sequential arithmetic and the same prefix-subtraction order, including
+the Wilder ATR/RSI seeds and gap resets. One monotone cursor per symbol then
+produces the last-closed join index once per timeframe; each requested leaf is
+a one-thread-per-base-row gather over that index. The CPU guard
+`higher.time == bucket_start(base.time) - tf` is preserved, so a stale bucket
+is `NaN` for every value leaf while `bar_age` stays finite and exact. A partial
+or current higher bucket is never visible.
+
+`tests/mtf_gpu.rs` pins the complete 36-column CPU/GPU parity (bitwise for every
+leaf except `vol`, whose `sqrt` is within `1e-12`), a missing bucket for
+`1h`/`4h`/`1d`, a partial trailing bucket, prefix replay at ~20 cuts and symbol
+batch/chunk-size invariance. `rcsr schema` reports the family under
+`gpu_feature_parity`; `rcsr enrich --help` documents the device path.
+
+**Dispatch guard.** On the paired 1.05M-row, two-symbol 15m fixture the MTF
+phase was CPU 5.08 s vs device 6.45 s (kernel 3.55 s, transfer 357 MB), so the
+device path is **opt-in** with `--gpu on` until a paired 16M-row run establishes
+the crossover. `--gpu auto` keeps the CPU reference for MTF and reports the
+reason in the plan; the cost model for the other families is unchanged. This is
+a measured guard, not a speed-up claim: the 16M paired measurement is still
+missing, and the 1.05M fixture has only two symbol segments, so the
+one-thread-per-segment leaf/join passes underutilise the device.
+
+### Device panel preparation: duplicates, 15m → 1h and gaps (`--features cuda`)
+
+`src/panel_prep.rs` is the exact CPU reference and `src/panel_prep_gpu.rs` /
+`src/cuda/prep.cu` the fused device pass (issue #301). The input is an
+**already decoded** symbol-major block; ZIP inflate, CSV parsing, unit decisions
+and validation stay on the CPU exactly as before. The device pass owns four
+operations in one block:
+
+1. **Stable sort by `(symbol, time)`** inside each contiguous symbol segment.
+   Equal timestamps therefore keep their pre-sort input order, which is the tie
+   order the CPU reference uses for duplicate aggregation.
+2. **Duplicate scan.** An equal-time run whose nine payload fields and
+   `complete`/`traded` flags are bit-identical collapses to one bar with
+   `dup_rows = run_len`; its flows are **not** summed. A differing run is folded
+   exactly once (`open=first`, `high=max`, `low=min`, `close=last`, flows
+   added left-to-right, `complete` AND, `traded` OR) and reported as
+   `DUPLICATE_CONFLICT`. The JUV 2022-03 four-copy month is the reference case:
+   a naive sum would quadruple its volume.
+3. **Complete-bucket fold.** A bucket is complete only when it holds the four
+   contiguous expected `in_step` instants (`cov15m == 4`). Otherwise it is
+   dropped, or emitted under `keep_partial` with `cov15m` 1–3 and
+   `PARTIAL_BUCKET`. Zero-volume buckets are kept with `traded=false`; `H == L`
+   is a valid complete bucket. Empty buckets are not manufactured.
+4. **Gap tags.** `gap = max(0, (t[i] - t[i-1]) / out_step - 1)` inside one
+   chain. The chain resets at a listing or delisting (segment change), a
+   migration and a `member=0` exclusion (caller-supplied chain id); no gap is
+   bridged by a feature.
+
+Timestamps stay `i64` UTC seconds throughout. Conflict offsets and bucket
+compaction are exclusive prefix sums, and no atomic touches an output, so the
+same block produces identical bytes at any launch block size. Prefix replay is
+also exact: rows at or before a cut depend only on earlier input.
+
+A bar's `dup_rows` is its equal-time run length; a bucket's `dup_rows` is the
+sum over its bars, so a clean hour is 4 and an hour of the four-copy JUV month is
+16 while its volume stays one copy's worth.
+
+Measured on a 4.78M-row decoded block (200 symbols, holes, partial hours,
+repeated and conflicting copies, `tests/panel_gpu.rs`): CPU reference 0.56-0.62 s;
+device pass 0.022-0.030 s; upload 0.11 s; download 0.03-0.08 s (inflate and
+parse excluded). The transfer dominates, so the device pass only pays when the
+block is already resident or fused with the following enrichment. Panel hashes
+are equal CPU vs device, cold vs warm and at block sizes 64/256/1024, for both
+`keep_partial` settings.
+
+`tests/panel_gpu.rs` pins CPU/device parity on mixed fixtures (identical and
+conflicting duplicates, missing and partial buckets, zero volume, `H == L`),
+the four chain resets, the JUV/AUD-like repeated-month case, conflict ordering,
+NaN gaps, bit-different zero copies, prefix replay at twenty cuts and
+block-size invariance. The production `prep` path still sums identical
+duplicates (#259 is open); wiring this policy into `rcsr prep` is not part of
+this seam. The pass does not touch parse or inflate.
+
 ## Corporate actions
 
 `adjust(actions, bars)` returns an `AdjustedSeries` with three parallel views:
@@ -265,7 +351,9 @@ contains every engine name with `family`, `warmup`, `available` and its exact
 `formula`, plus `shared_names` mapping every cross-group name to its one
 canonical producer. `feature_registry` contains one object per default-set
 column with `name`, `family`, `timeframe`, `warmup`, `available`, `derived`,
-`formula`, `formula_sha256`, `source`, `pit` and, when unavailable, `reason`.
+`parity_tier`, `formula`, `formula_sha256`, `source`, `pit` and, when
+unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
+`reference` (CPU-only reference in this change).
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
@@ -397,9 +485,10 @@ different member's market state `NaN`.
 
 Ranks (`xs_rank_r1 r16 r20 vol20 amihud96`, plus the legacy `cs_rank_r60`) are
 `2*(rank-1)/(n-1)-1` in `[-1,1]`. They use finite PIT members only, require
-`N>=20`, and break ties by symbol name then row order. `xs_rank_amihud96`
-inherits the #270 Amihud input requirement (`quote_volume`); a missing raw
-field fails closed naming both the rank and the field.
+`N>=20`, and break ties by symbol name then row order. `-0.0` and `+0.0` are one
+value for that tie order. `xs_rank_amihud96` inherits the #270 Amihud input
+requirement (`quote_volume`); a missing raw field fails closed naming both the
+rank and the field.
 
 Point-in-time membership is a row filter, not a survivor universe. When the
 store carries `member_asof`, only rows with `member_asof <= t` enter a
@@ -503,11 +592,24 @@ prints the nominal warm-up, the observed `NaN` count and the first finite row.
 that truncating the store never changes an earlier value.
 
 `xs_rank_*` ranks each timestamp across PIT symbols, ignores non-finite source
-values, breaks ties by symbol name then row order, maps the rank to `[-1,1]`,
-and returns `NaN` when fewer than 20 finite members are present. The pass holds
-one source column, the time column, a row permutation and the rank column
-(about 32 B/row), never the whole panel.
+values and non-members, breaks ties by symbol name then row order, maps the rank
+to `[-1,1]`, and returns `NaN` when fewer than 20 finite members are present.
+`-0.0` and `+0.0` are one tie. The pass holds one source column, the time column,
+a row permutation and the rank column (about 32 B/row), never the whole panel.
 `rcsr enrich` refuses the pass when that exceeds the detected hard memory limit.
+On the CUDA path the `(time, symbol, row)` permutation, timestamp group ids and
+segment offsets are built once on the device and reused by every rank column;
+each column is a stable segmented sort by `(value, symbol, row)` with invalid
+and non-member rows keyed last, so no per-column host sort runs.
+
+Measured on 4 M rows, 100 symbols, PIT panel with non-members (NVIDIA GeForce RTX 3060, `cargo test
+--release --features cuda --test enrich_gpu measure_cross_section_stage --
+--ignored --nocapture`): the four `xs` rank columns take `xs_seconds` 4.02 s
+with `--gpu off` and 1.75 s with `--gpu on`. The `cross` family takes 12.6 s and
+8.4 s of a 235 s run. Equal-weight market state, breadth, dispersion and
+`avg_corr` stay on the CPU in their original addition order, so their bits are
+unchanged; the residual stage is under 4 % of the run, so a device port is
+declined until a larger share is measured.
 
 ### `py15m` parity
 
@@ -523,6 +625,83 @@ pilot's `panel_15m_rich.csv`, preceded by 1,000 rows of pre-roll in
 a gap is not bridged, and the first true range is `high - low` instead of
 NumPy's `np.roll` wrap-around that reads the last close.
 
+### Fused flow and price-action device producers (#297)
+
+The `flow` registry family has **17** columns: the five raw flow inputs
+(`volume quote_volume trades taker_buy_base taker_buy_quote`), the ten
+`FLOW_NAMES`, and the two engine columns `cmf20` and `vwap20_dev`. The fused
+device producer materialises the **twelve derived** columns (the ten
+`FLOW_NAMES` plus `cmf20`/`vwap20_dev`); the five raw inputs are pass-through
+store columns. `price_action` materialises **eleven** columns. The formulas are
+exactly those in the two tables above; there is no second definition.
+
+The device split is a **base pass plus consumers**:
+
+| family | base kernels (once per run) | consumers |
+|---|---|---|
+| flow | elementwise `vwap`/per-trade/Amihud/OBV-step/CVD-net/CMF value; cumulative OBV+CVD | one per output column |
+| price_action | elementwise geometry (`clv`, `body`, range, validity, true range) + Wilder ATR14 | one per output column |
+
+The elementwise flow base reads `trades` and `taker_buy_base` **once**,
+independent of the requested column count; `EnrichGpu::base_reads()` counts the
+optional raw columns consumed by that pass and the test
+`fused_flow_reads_optional_raw_columns_once` pins it at two for a twelve-column
+request. `EnrichGpu::base_passes()` reports four base launches for the two
+families instead of one pass per column (the ~6-vs-21 pass reduction of
+`04-feature-enrich.md` §3.7).
+
+Gap and missing-column policy is the CPU policy, not a near-copy:
+
+* the device context carries a raw-column **presence bitset** and `d_run_id`;
+  an absent optional column is uploaded as `NaN` and every consumer emits
+  `NaN`, never `0`;
+* `gap(i) = i>0 && same segment && run_id differs`, so a symbol boundary and an
+  internal outage behave exactly like the per-symbol `gap_mask`; `gap[0]` is
+  false, OBV/CVD restart at a gap, and Wilder state restarts at a gap;
+* rolling consumers stage a tile of the source plane in shared memory and one
+  thread builds the running prefix in CPU order, so `rmean_py`/`rstd_py`/
+  `rmean_strict` keep their exact addition order while global accesses stay
+  coalesced; two-bar geometry runs one thread per row.
+
+Parity tiers are declared per column in `feature_registry.parity_tier`:
+
+| tier | columns |
+|---|---|
+| `bitwise` | `vwap`, `taker_ratio96`, `taker_imb16`, `zero_ret_share96`, `obv_z96`, `cvd_proxy`, `vwap_dev96`, `cmf20`, `vwap20_dev`, and all eleven `price_action` columns |
+| `1e-12` | `trade_intensity96`, `avg_trade_size96`, `amihud96` (each takes a logarithm) |
+| `reference` | every other registered column (CPU reference; no device claim in #297) |
+| `unavailable` | the reserved derivative columns |
+
+`zero_ret_share96` stays `bitwise` even though its definition mentions
+`ln(C_t/C_{t-1}) == 0`: the kernel tests the exact close ratio instead of a
+rounded logarithm, which is equivalent because a ratio that is not `1.0` cannot
+round to a zero logarithm.
+
+The parity fixture (2 symbols x 500,000 rows, 15 m, gaps, zero volume, zero
+trades and `H == L`) reports **21 of 23 columns bit-identical**, zero NaN-mask
+mismatches and max absolute difference **8.882e-16** for the two logarithmic
+columns. Repeated GPU runs and `--chunk-rows` 1/65,536 hash identically, and
+truncating the store leaves every earlier row bit-identical
+(`fused_gpu_is_prefix_causal`), so no future bar enters a value.
+
+**Measured cost model.** `features_gpu::{FLOW_COST, PRICE_ACTION_COST}` are
+kernel-time constants measured on a 1,000,075-row, 109-symbol fixture (the
+segment-parallel consumers only fill the device at a realistic symbol count):
+
+| family | base ms/Mrow | per column ms/Mrow | total, 12/11 columns | wall incl. D2H |
+|---|---:|---:|---:|---:|
+| flow | 11.4 | 3.3 | 51.2 ms/Mrow | 99.6 ms/Mrow |
+| price_action | 8.8 | 2.5 | 36.7 ms/Mrow | 64.6 ms/Mrow |
+
+The wall figure is download-bound: per-column `cudaMemcpy` measured
+~2.1-3.8 GB/s, which is the output-path problem of #300. Kernel time is what
+`plan_groups` costs. A fused family is not dispatched by `--gpu auto` below
+**32 symbol segments** (`FUSED_MIN_SEGMENTS`); `--gpu on` still forces it, which
+is how the two-symbol parity fixture exercises every kernel. At 16 M rows and
+109 symbols the measured rate projects to ~1.4 s for the 23 columns, in line
+with the ~1.5 s candle+price-action / ~2 s flow estimate in
+`04-feature-enrich.md` §6.
+
 ### Determinism and the cost model
 
 `--chunk-rows` changes only read/compute batching; the arithmetic and output
@@ -531,14 +710,29 @@ every chunk size (tested). Cross-sectional ties are resolved by symbol and row
 order.
 
 The CPU path is always present. `plan_groups` estimates CPU time and GPU time
-(kernel + two transfers + the one-time resident upload) per family from rows,
+(kernel + transfers + the one-time resident upload) per family from rows,
 output columns and operation class (elementwise, calendar trig, rolling
-sum/std/extrema, Wilder scan, segmented rank, join). A family is dispatched to
-the GPU only when a device is usable, the store has at least one million rows,
-an exact kernel is registered for those columns, and the estimated GPU time is
-*strictly* lower than the CPU time. The context and source columns are uploaded
-once per run; a second family does not re-upload `time/open/high/low/close/
-volume/quote_volume`.
+sum/std/extrema, Wilder scan, segmented rank, join). Cost model v2 (#300) adds
+the output write explicitly:
+
+```text
+gpu_s = fixed + context(n) + h2d/BW_h2d + cells/rate_kernel
+      + d2h/BW_d2h + write_bytes/BW_write
+```
+
+`BW_write` is measured, not assumed. On the shared ext4 store a 512 MiB
+`dd conv=fdatasync` measured **222 MB/s** (2026-10-23); the same disk measured
+about **62 MB/s** for a 1.96 GB feature-staging pass while hashing per column,
+which is why the report prints raw `write_s` next to `d2h_s` and `kernel_s`.
+`--write-bw <MB/s>` overrides the planner constant for another filesystem, and
+`tests/enrich.rs::measure_write_bandwidth_on_a_filesystem` re-measures it
+(`RCSR_BW_DIR=<dir> cargo test --release --test enrich measure_write_bandwidth
+-- --ignored --nocapture`). A family is dispatched to the GPU only when a device
+is usable, the store has at least one million rows, an exact kernel is
+registered for those columns, and the estimated GPU time is *strictly* lower
+than the CPU time. The context and source columns are uploaded once per run; a
+second family does not re-upload `time/open/high/low/close/volume/
+quote_volume`.
 
 `--gpu auto` (the default) applies the cost model. `--gpu on` *forces* every
 registered kernel above the row floor, which is how the parity fixture exercises
@@ -546,14 +740,21 @@ all kernels; it does not make the cost model claim a win. `--no-gpu`/`--cpu`
 forces the reference path. A CPU-only build ignores the GPU arms entirely, and a
 CUDA build with no device falls back with the reason in every plan row.
 
-The CUDA kernels live in `src/cuda/enrich.cu`. Elementwise families use one
-thread per row; rolling sums/standard deviations, Donchian, Wilder/EMA scans and
-labels run one thread per symbol segment in the same operation order as the CPU,
-with `-fmad=false` so multiply-add association is identical. Cross-sectional
-ranks use a stable segmented radix sort with the CPU's `(time, symbol, row)` tie
-order. All accumulation is f64. The report records `gpu_columns`,
-`cpu_columns`, `gpu_share`, `fallback`, kernel seconds and transfer bytes in both
-the text log and the JSON sidecar.
+The CUDA kernels live in `src/cuda/enrich.cu` (resident context and the original
+elementwise/scan families), `src/cuda/features.cu` (fused flow / price-action,
+#297) and `src/cuda/tail.cu` (the parameterised engine tail, #298). Elementwise
+families use one thread per row; rolling sums/standard deviations, Wilder/EMA
+scans and labels run one thread per symbol segment in the same operation order
+as the CPU, with `-fmad=false` so multiply-add association is identical.
+Rolling extrema in the tail use a blocked prefix-suffix pass instead of the old
+`O(n*w)` loop. Cross-sectional
+ranks build one device `(time, symbol, row)` permutation per run, then use a
+stable segmented radix sort by `(value, symbol, row)` for each column; PIT
+non-members and non-finite values are keyed last and `-0`/`+0` share the CPU
+tie order. All accumulation is f64. The report records `gpu_columns`,
+`cpu_columns`, `gpu_share`, `fallback`, kernel, D2H, staging-write seconds,
+transfer bytes and the charged `write_bw` in both the text log and the JSON
+sidecar.
 
 ### GPU enrichment measurement (2026-10-21)
 
@@ -571,8 +772,10 @@ The auto plan sends `returns` and `calendar` to the GPU. Rolling sum/std,
 Donchian, lags, candle and the Wilder/RSI families stay on the CPU with
 `estimated GPU time is not below CPU`: their one-thread-per-segment kernels are
 slower on this part, and the ten-column `lags` family does not repay the
-resident-upload cost. `atr14`/`natr14`/`rsi14` are still #125 names with no GPU
-kernel and record that reason.
+resident-upload cost. At the time of that run `atr14`/`natr14`/`rsi14` were
+#125 names with no GPU kernel and recorded that reason; the #298 tail kernels
+below now register them, while the per-family context term can still keep a
+single family on the CPU with that reason recorded.
 
 A real `--features returns` run including the 4.0 GB append measured 84.3 s
 (CPU) and 99.4 s (GPU) wall in one pair; the append write varied between 13.0 s
@@ -677,6 +880,84 @@ feature phase, same machine and load class):
 On the 16.1M-row cell the CPU arm went from 1408.5 s to 900.7 s (23:30 -> 15:01)
 with the **same output SHA-256** (`a4c99c95...`): the 27.26 GB second read
 disappeared and the bytes did not change.
+
+### Batched output arc and pinned chunked D2H (#300)
+
+The GPU output path no longer allocates one host `Vec` and issues one download
+per feature column. `EnrichGpu::batch` takes a block of feature descriptors,
+launches the kernels back-to-back into one device arena, and copies the whole
+block out with a single pinned `cudaMemcpy2DAsync` per row chunk (4 MiB chunks;
+source and destination pitch are one full column). The host then writes the
+columns sequentially to their temp files, preserving the exact per-column bytes,
+hashes and output order.
+
+The arena and its pinned mirror are capped at **64 MiB**
+(`GPU_OUTPUT_ARENA_BYTES`). A block whose columns do not fit — at 16.1M rows one
+`f64` column is 128 MiB, so even one column exceeds the cap — falls back to the
+per-column staging path with the reason recorded. `RCSR_ENRICH_GPU_BATCH=0`
+selects the per-column path for an A/B measurement. The report now carries
+`gpu.kernel_s`, `gpu.d2h_s`, `gpu.write_s`, `gpu.transfer_bytes` and the
+`write_bw` charged by the planner, separately.
+
+Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
+--dry-run` (same input, same 118 dispatched columns, alternating order, two runs
+each):
+
+| path | feature phase (mean) | kernel | D2H | staging write |
+|---|---:|---:|---:|---:|
+| batched arena | **33.75 s** | 0.23 s | **0.31 s** | 31.68 s |
+| per-column | 34.40 s | 0.22 s | 0.84 s | 31.60 s |
+
+The pinned block cuts D2H by **2.7x** and the whole feature phase by about
+**2 %**; it is write-bound, not transfer-bound. The 1.96 GB of temp output took
+31.6 s (about 62 MB/s including per-column SHA-256), which is the floor the cost
+model now exposes. No 16.1M full-catalogue paired run is claimed here: the
+64 MiB arena forbids batching at that width, so that arm keeps the per-column
+staging path and its 180–300 s write floor.
+
+### Engine tail kernels (#298)
+
+`src/cuda/tail.cu` owns the parameterised tail of the engine catalogue. The
+kernels reuse the same resident context but take raw device pointers, so the
+`RcEnrich` layout has one owner (`enrich.cu`). Registration lives in
+`src/enrich.rs::gpu_supports`; `src/enrich_gpu.rs` is the Rust binding and
+`rcsr schema` publishes the tier under `gpu_feature_parity.engine_tail`.
+
+| group | columns | device producer | tier |
+|---|---|---|---|
+| returns / MA | `r16 r96 r192 r672 ret1 ret5 ma96 ma672 ma_slope672` | `rc_enrich_ret`, `rc_enrich_ma`, `rc_enrich_ma_slope` | bitwise (log excepted: `1e-12`) |
+| extrema | `don20 don96 stoch_k stoch_d close_pos20` | blocked van Herk/Gil–Werman prefix-suffix (`O(n)`) | bitwise |
+| ATR / ADX / DI | `atr14 natr14 atr50 batr gapatr volrat adx14 di_plus di_minus di_diff14` | run-serial Wilder recurrence | `1e-12` |
+| Bollinger | `bb20_z bb20_bw bb50 bb50_bw bb96 bb_width96` | rolling mean/std per segment | `1e-12` |
+| exotic | `rmean5 rstd5 ou_hl96 acf1 vr4 rskew96 jump_share semivar_asym cusum_abs_z` | causal prefix rings | `1e-6` (log-derived chain, near-unit AR coefficient) |
+| calendar | `tod_sin tod_cos` | integer bar-of-day phase | bitwise |
+
+The extrema kernel computes the prefix and suffix extrema of blocks of exactly
+the window width and combines one of each. It records window validity before
+masking, so a non-finite bar makes the whole window `NaN`; CUDA's
+`fmax(NaN, x) == x` cannot bridge an invalid bar. A window whose span is not
+contiguous is `NaN` for every family, and Wilder/EMA state restarts after the
+hole.
+
+Measured on the RTX 3060, one million rows, `w=96` (cells counted as rows times
+window, the old cost model's convention): the blocked kernel took **4.58 ms =
+20,961 M cells/s**; the old `O(n*w)` loop took **2,976 ms = 32.3 M cells/s**.
+That is a **650x** kernel improvement. The planner now charges
+`RollingExtrema` at a conservative **180 M rows/s** (measured 218 M rows/s).
+Registration is separate from the auto decision: a two-column `donchian` family
+can still record an `estimated GPU time is not below CPU` reason at 16M rows
+because cost model v2 charges the one-time context per family; `--gpu on` forces
+it and `r16`/`r96`/`don96` are never rejected by the compact guard. `don96` keeps the compact centred convention (`-0.5`) while `don20` and
+`close_pos20` return the uncentred close position. The CPU `donchian` now uses
+the same strict high/low validity as the device kernel.
+
+The compact guard in `gpu_supports` used to route every compact name to the
+reference pass before the kernel table, which made `r16`, `r96` and `don96`
+report `false` despite exact producers. Those three, plus the tail names whose
+compact and standalone formulas agree, now dispatch; the remaining compact
+names (for example `cmf20`, `mfi14`, `body1`) stay on the CPU because their
+producer is the compact reference itself or belongs to the flow/price-action
+family.
 
 ### Measured enrichment (2026-10-21)
 
