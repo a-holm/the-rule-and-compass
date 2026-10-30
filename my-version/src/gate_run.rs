@@ -154,6 +154,29 @@ fn pick(p: &RungPredictions, which: usize) -> &Vec<f64> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Presentation {
+    Presentable,
+    NegativeReturnR2,
+}
+
+impl Presentation {
+    fn reason_json(self) -> &'static str {
+        match self {
+            Presentation::Presentable => "null",
+            Presentation::NegativeReturnR2 => "\"negative_return_r2_on_validation\"",
+        }
+    }
+}
+
+/// `None` (no return-space score) and NaN do not withhold a member.
+fn presentation_of(r2_vs_zero: Option<f64>) -> Presentation {
+    match r2_vs_zero {
+        Some(r2) if r2 < 0.0 => Presentation::NegativeReturnR2,
+        _ => Presentation::Presentable,
+    }
+}
+
 /// Weighted Pearson correlation and `1 - SSE/SS0` of `r_hat` against `r`.
 fn return_space(
     spec: &TargetSpec,
@@ -402,6 +425,17 @@ pub fn run(
         .map(|m| predict_kept(m.tree, &prepared.test, &test_view.kept))
         .collect();
     let hashes: Vec<u64> = members.iter().map(|m| expr::structural_hash(m.tree)).collect();
+    // Presentation rule: a negative return-space R2 against the zero return on
+    // the selection sample (validation) withholds the member from selection.
+    // The test block never takes part.
+    let presentation: Vec<Presentation> = members
+        .iter()
+        .enumerate()
+        .map(|(i, _)| match (spec, &val_view) {
+            (Some(sp), Some(v)) => presentation_of(return_space(sp, &val_preds[i], v).map(|r| r.3)),
+            _ => Presentation::Presentable,
+        })
+        .collect();
     let inputs: Vec<MemberInput> = members
         .iter()
         .enumerate()
@@ -411,6 +445,7 @@ pub fn run(
             hash: hashes[i],
             expression: m.expression,
             identified: m.identified,
+            presentable: presentation[i] == Presentation::Presentable,
             val_pred: &val_preds[i],
             test_pred: &test_preds[i],
         })
@@ -471,7 +506,7 @@ pub fn run(
                 "null".to_string()
             };
             format!(
-                ",\"gates\":{{\"archive_rank\":{},\"identified\":{},\"practically_identified\":{},\"supported\":{},\"not_better_than\":{}}},\"comparisons\":{{\"validation\":{},\"test\":{}}},\"beats_mean_test\":{},\"beats_zero_param_test\":{},\"beats_mean_validation\":{},\"beats_zero_param_validation\":{},\"validated\":{},\"return_space\":{}",
+                ",\"gates\":{{\"archive_rank\":{},\"identified\":{},\"practically_identified\":{},\"supported\":{},\"not_better_than\":{}}},\"comparisons\":{{\"validation\":{},\"test\":{}}},\"beats_mean_test\":{},\"beats_zero_param_test\":{},\"beats_mean_validation\":{},\"beats_zero_param_validation\":{},\"validated\":{},\"presentable\":{},\"presentable_reason\":{},\"return_space\":{}",
                 m.archive_rank,
                 g.identified,
                 m.practically_identified.map(|b| b.to_string()).unwrap_or_else(|| "null".to_string()),
@@ -484,6 +519,8 @@ pub fn run(
                 beats(&g.validation, "mean"),
                 zp(&g.validation),
                 selected == Some(m.archive_rank),
+                presentation[i] == Presentation::Presentable,
+                presentation[i].reason_json(),
                 return_space_json
             )
         })
@@ -648,6 +685,18 @@ pub fn run(
             unidentified.join(", ")
         ));
     }
+    let withheld: Vec<String> = members
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| presentation[*i] != Presentation::Presentable)
+        .map(|(_, m)| format!("rank {}", m.archive_rank))
+        .collect();
+    if !withheld.is_empty() {
+        lines.push(format!(
+            "# not presentable (negative return-space R2 on validation, never selected): {}",
+            withheld.join(", ")
+        ));
+    }
     lines.push(match report.verdict {
         Verdict::Signal => {
             let r = report.selected_rank.unwrap_or(0);
@@ -682,3 +731,89 @@ pub fn run(
 }
 
 use target_structure::BINS;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOURLY: &str = include_str!("../tests/fixtures/targets/hourly_all.targets.json");
+
+    /// `y1h`: `r = 0.002 + 6 * vol96 * t`, clip +-1.
+    fn spec() -> TargetSpec {
+        crate::target::parse_file(HOURLY).unwrap().remove(0)
+    }
+
+    fn view(y: &[f64], g: &[f64], w: &[f64]) -> View {
+        View {
+            kept: (0..y.len()).collect(),
+            y: y.to_vec(),
+            w: w.to_vec(),
+            g: g.to_vec(),
+            keys: (0..y.len()).map(|i| i as f64).collect(),
+        }
+    }
+
+    // Rows (g, y, pred) -> (r, r_hat), r = 0.002 + 6 g t:
+    //   (0.010, 0.5, 0.3)   -> ( 0.032,  0.020)
+    //   (0.020, -0.5, -0.25) -> (-0.058, -0.028)
+    //   (0.010, 1.0, 0.0)   clipped, excluded
+    //   (0.005, 0.1, -0.4)  -> ( 0.005, -0.010)
+    //   (0.000, 0.2, 0.1)   non-positive scale, excluded
+    fn rows() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        (
+            vec![0.5, -0.5, 1.0, 0.1, 0.2],
+            vec![0.010, 0.020, 0.010, 0.005, 0.0],
+            vec![0.3, -0.25, 0.0, -0.4, 0.1],
+        )
+    }
+
+    #[test]
+    fn return_space_matches_hand_computed_values_and_skips_clipped_rows() {
+        let (y, g, pred) = rows();
+        let v = view(&y, &g, &[]);
+        let (n, clipped, corr, r2) = return_space(&spec(), &pred, &v).unwrap();
+        assert_eq!((n, clipped), (3, 1));
+        // means -0.007 and -0.006; Saa 0.004266, Sbb 0.001176, Sab 0.002088
+        let want_corr = 0.002088 / (0.004266f64 * 0.001176).sqrt();
+        // SSE 0.001269, SS0 0.004413
+        let want_r2 = 1.0 - 0.001269 / 0.004413;
+        assert!((corr - want_corr).abs() <= 1e-12, "{corr} {want_corr}");
+        assert!((r2 - want_r2).abs() <= 1e-12, "{r2} {want_r2}");
+        assert!((r2 - 0.712_440_5).abs() <= 1e-6);
+    }
+
+    #[test]
+    fn return_space_honours_row_weights() {
+        let (y, g, pred) = rows();
+        // Weight 2 on the first row, 0 on the last (also invalid): r values
+        // 0.032 (x2), -0.058, 0.005; r_hat 0.020 (x2), -0.028, -0.010.
+        let v = view(&y, &g, &[2.0, 1.0, 1.0, 1.0, 0.0]);
+        let (n, clipped, _, r2) = return_space(&spec(), &pred, &v).unwrap();
+        assert_eq!((n, clipped), (3, 1));
+        let sse = 2.0 * 0.012f64.powi(2) + 0.030f64.powi(2) + 0.015f64.powi(2);
+        let ss0 = 2.0 * 0.032f64.powi(2) + 0.058f64.powi(2) + 0.005f64.powi(2);
+        assert!((r2 - (1.0 - sse / ss0)).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn perfect_prediction_has_unit_corr_and_r2() {
+        let (y, g, _) = rows();
+        let v = view(&y, &g, &[]);
+        let (_, _, corr, r2) = return_space(&spec(), &y, &v).unwrap();
+        assert!((corr - 1.0).abs() <= 1e-12 && (r2 - 1.0).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn negative_return_r2_withholds_the_member() {
+        let (y, g, _) = rows();
+        let flipped: Vec<f64> = y.iter().map(|t| -t).collect();
+        let v = view(&y, &g, &[]);
+        let (_, _, _, r2) = return_space(&spec(), &flipped, &v).unwrap();
+        // SSE 0.018036 against SS0 0.004413.
+        assert!((r2 - (1.0 - 0.018036 / 0.004413)).abs() <= 1e-9, "{r2}");
+        assert_eq!(presentation_of(Some(r2)), Presentation::NegativeReturnR2);
+        assert_eq!(presentation_of(Some(0.0)), Presentation::Presentable);
+        assert_eq!(presentation_of(Some(f64::NAN)), Presentation::Presentable);
+        assert_eq!(presentation_of(None), Presentation::Presentable);
+    }
+}
