@@ -85,6 +85,14 @@ valid members. A symbol whose last bar is before the panel end therefore
 cannot enter a later breadth, dispersion or rank value. See
 [`ohlcv.md`](ohlcv.md#cross-asset-breadth-and-rank-family-273).
 
+Under `--features cuda` the market columns (`mkt_*`, `breadth`, `dispersion`,
+`rel_mkt*`, `avg_corr`, `btc_volume_share`) reduce each timestamp group on the
+device in the same `(time, symbol, row)` order, with the same `member_asof <= t`
+mask and the same 20-member floor, so a pre-listing or post-delisting row is
+excluded exactly as on the CPU. The benchmark joins use exact timestamp
+equality; a missing benchmark bar is `NaN`
+([`ohlcv.md`](ohlcv.md#device-benchmark-joins-beta-and-cross-means-299)).
+
 ## Resumable builds
 
 A full hourly rebuild from 25,000 monthly archives is longer than one short
