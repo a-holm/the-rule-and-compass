@@ -123,6 +123,9 @@ cargo run --release -- --data examples/line.csv --target y --vars x \
 #   1  complexity=5   k_constants=2   train_err=0.000000      test_err=0.000000      y = ((2 * x) + 1)
 ```
 
+With one test block `test_err` is the error on that block; `--json-out FILE`
+writes the JSON result to the file.
+
 A syntax error names the offending column:
 `--eval-expr "2 * (x + )"` fails with
 `expected a number, variable, function or '(' (column 10)` and exit code 2.
@@ -663,6 +666,8 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train or test rows in the 2026H2 crypto lockbox (declared final test only) |
+| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
+| `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
