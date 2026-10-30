@@ -49,6 +49,29 @@ Migrations are applied before membership with the verified
 tolerance of the declared `k`, prices are divided by `k`, base volume is
 multiplied by `k`, and the overlap is removed. A wrong `k` is a hard error.
 
+### Device duplicate scan, resample and gap tags (`--features cuda`)
+
+The base panel is a byte contract, so the device form of the 15m → 1h step in
+`src/panel_prep_gpu.rs` / `src/cuda/prep.cu` implements the same policy as the
+CPU reference `src/panel_prep.rs` (issue #301). It consumes an already decoded
+symbol-major block and never parses text or decides units.
+
+* Duplicates are found after a **stable** sort by `(symbol, time)`. Identical
+  copies collapse with `dup_rows = run_len`; differing copies are aggregated
+  once at that instant and listed as `DUPLICATE_CONFLICT`. The conflict list is
+  ordered by `(symbol, time)` and compacted by an exclusive prefix sum, never an
+  atomic.
+* An hourly bucket is complete only at `cov15m == 4` contiguous 15m instants.
+  Partial buckets are dropped, or kept with `cov15m` 1–3 and a
+  `PARTIAL_BUCKET` flag. Zero-volume buckets remain with `traded=false`.
+* `gap` is `max(0, (t[i] - t[i-1]) / 3600 - 1)` within a chain. Listing,
+  delisting, migration and `member=0` reset the chain; no gap is bridged.
+* `i64` UTC seconds, exact OHLC/flow order and block-size-independent output are
+  enforced by `tests/panel_gpu.rs`.
+
+A 4.78M-row decoded block hashes identically on CPU and device, cold and warm.
+The CPU parse/inflate path and `rcsr prep` output are unchanged by this seam.
+
 ### Cross-sections use the same PIT rule
 
 `rcsr enrich --features cross` computes equal-weight market state, breadth,

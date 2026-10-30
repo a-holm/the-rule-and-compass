@@ -146,6 +146,59 @@ a measured guard, not a speed-up claim: the 16M paired measurement is still
 missing, and the 1.05M fixture has only two symbol segments, so the
 one-thread-per-segment leaf/join passes underutilise the device.
 
+### Device panel preparation: duplicates, 15m → 1h and gaps (`--features cuda`)
+
+`src/panel_prep.rs` is the exact CPU reference and `src/panel_prep_gpu.rs` /
+`src/cuda/prep.cu` the fused device pass (issue #301). The input is an
+**already decoded** symbol-major block; ZIP inflate, CSV parsing, unit decisions
+and validation stay on the CPU exactly as before. The device pass owns four
+operations in one block:
+
+1. **Stable sort by `(symbol, time)`** inside each contiguous symbol segment.
+   Equal timestamps therefore keep their pre-sort input order, which is the tie
+   order the CPU reference uses for duplicate aggregation.
+2. **Duplicate scan.** An equal-time run whose nine payload fields and
+   `complete`/`traded` flags are bit-identical collapses to one bar with
+   `dup_rows = run_len`; its flows are **not** summed. A differing run is folded
+   exactly once (`open=first`, `high=max`, `low=min`, `close=last`, flows
+   added left-to-right, `complete` AND, `traded` OR) and reported as
+   `DUPLICATE_CONFLICT`. The JUV 2022-03 four-copy month is the reference case:
+   a naive sum would quadruple its volume.
+3. **Complete-bucket fold.** A bucket is complete only when it holds the four
+   contiguous expected `in_step` instants (`cov15m == 4`). Otherwise it is
+   dropped, or emitted under `keep_partial` with `cov15m` 1–3 and
+   `PARTIAL_BUCKET`. Zero-volume buckets are kept with `traded=false`; `H == L`
+   is a valid complete bucket. Empty buckets are not manufactured.
+4. **Gap tags.** `gap = max(0, (t[i] - t[i-1]) / out_step - 1)` inside one
+   chain. The chain resets at a listing or delisting (segment change), a
+   migration and a `member=0` exclusion (caller-supplied chain id); no gap is
+   bridged by a feature.
+
+Timestamps stay `i64` UTC seconds throughout. Conflict offsets and bucket
+compaction are exclusive prefix sums, and no atomic touches an output, so the
+same block produces identical bytes at any launch block size. Prefix replay is
+also exact: rows at or before a cut depend only on earlier input.
+
+A bar's `dup_rows` is its equal-time run length; a bucket's `dup_rows` is the
+sum over its bars, so a clean hour is 4 and an hour of the four-copy JUV month is
+16 while its volume stays one copy's worth.
+
+Measured on a 4.78M-row decoded block (200 symbols, holes, partial hours,
+repeated and conflicting copies, `tests/panel_gpu.rs`): CPU reference 0.56-0.62 s;
+device pass 0.022-0.030 s; upload 0.11 s; download 0.03-0.08 s (inflate and
+parse excluded). The transfer dominates, so the device pass only pays when the
+block is already resident or fused with the following enrichment. Panel hashes
+are equal CPU vs device, cold vs warm and at block sizes 64/256/1024, for both
+`keep_partial` settings.
+
+`tests/panel_gpu.rs` pins CPU/device parity on mixed fixtures (identical and
+conflicting duplicates, missing and partial buckets, zero volume, `H == L`),
+the four chain resets, the JUV/AUD-like repeated-month case, conflict ordering,
+NaN gaps, bit-different zero copies, prefix replay at twenty cuts and
+block-size invariance. The production `prep` path still sums identical
+duplicates (#259 is open); wiring this policy into `rcsr prep` is not part of
+this seam. The pass does not touch parse or inflate.
+
 ## Corporate actions
 
 `adjust(actions, bars)` returns an `AdjustedSeries` with three parallel views:
