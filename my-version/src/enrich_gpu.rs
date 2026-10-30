@@ -460,8 +460,10 @@ impl EnrichGpu {
                 }
                 None => break,
             };
-            dests.clear();
+            let slot = job.slot;
+            let len = job.len;
             let at = job.group * group_rows;
+            dests.clear();
             for source in sources {
                 let (ptr, off) = match source.destination {
                     DeviceColumn::Time => (
@@ -482,21 +484,21 @@ impl EnrichGpu {
             if upload_error.is_some() {
                 break;
             }
-            if let Err(e) = ring.upload(&job, &dests) {
+            if let Err(e) = ring.upload(job, &dests) {
                 upload_error = Some(e);
                 break;
             }
-            if let Err(e) = ring.compute_begin(job.slot) {
+            if let Err(e) = ring.compute_begin(slot) {
                 upload_error = Some(e);
                 break;
             }
-            if let Err(e) = ring.launch_seg_id(ctx as *mut c_void, at, job.len) {
+            if let Err(e) = ring.launch_seg_id(ctx as *mut c_void, at, len) {
                 upload_error = Some(e);
                 break;
             }
             for (feature, out) in &tiles {
                 if let Err(e) =
-                    ring.launch_feature(ctx as *mut c_void, *feature, at, job.len, *out)
+                    ring.launch_feature(ctx as *mut c_void, *feature, at, len, *out)
                 {
                     upload_error = Some(e);
                     break;
@@ -505,7 +507,7 @@ impl EnrichGpu {
             if upload_error.is_some() {
                 break;
             }
-            if let Err(e) = ring.compute_end(job.slot) {
+            if let Err(e) = ring.compute_end(slot) {
                 upload_error = Some(e);
                 break;
             }

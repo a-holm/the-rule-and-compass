@@ -170,6 +170,19 @@ synchronisation is the final join after the last group. A group larger than the
 cap is refused with its byte count rather than silently shrinking the
 projection.
 
+The reader and the main thread share one slot state. A filled group owns its
+slot until it is uploaded or dropped, the reader only ever waits for a free
+slot, and `finish` or drop cancels the reader instead of draining it, so no
+early exit can leave either thread waiting on the other (#352). Every wait for
+the reader is bounded: `max(60 s, one slot at 1 MiB/s)` by default, or
+`RCSR_RING_WAIT_MS`. When a wait expires, the transport fails with the ring
+state (reader step and group, free slots, groups sent and received), `enrich`
+prints one `# enrich: projected transport failed: ...` line and uses the
+whole-column upload. A reader that does not exit within the bound after
+cancellation is detached and its pinned slots stay allocated, so a stuck read
+cannot hold the process. `RCSR_TEST_RING_STALL_GROUP=<g>` is a test hook that
+stalls the reader before group `g`.
+
 `rcsr enrich --gpu on` uses this transport by default. It reads only
 `ts/open/high/low/close` plus optional `volume/quote_volume`; the transport
 upload is measured in `gpu.transfer_bytes`. On a store that cannot be projected
