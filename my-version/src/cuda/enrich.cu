@@ -1958,6 +1958,13 @@ int rc_ring_slots(void *v)
     return r ? r->slots : 0;
 }
 
+/* The rc_ring_* status calls return 0, -1 for a bad argument, or the
+   positive cudaError_t of the failing CUDA call (named by rc_ring_error_name). */
+const char *rc_ring_error_name(int code)
+{
+    return cudaGetErrorName((cudaError_t)code);
+}
+
 /* Enqueue one async H2D copy per projected column, then mark the slot's copy
    event. The caller may immediately enqueue compute that waits on it. */
 int rc_ring_upload(void *v, int slot, void *const *dev_ptrs, const size_t *dev_offsets,
@@ -1971,11 +1978,10 @@ int rc_ring_upload(void *v, int slot, void *const *dev_ptrs, const size_t *dev_o
         char *src = (char *)r->host[slot] + host_offsets[i];
         cudaError_t e = cudaMemcpyAsync(dst, src, bytes[i], cudaMemcpyHostToDevice,
                                         r->copy_stream);
-        if (e != cudaSuccess) { r->failed = 1; return -1; }
+        if (e != cudaSuccess) { r->failed = 1; return (int)e; }
     }
-    if (cudaEventRecord(r->copy_done[slot], r->copy_stream) != cudaSuccess) {
-        r->failed = 1; return -1;
-    }
+    cudaError_t e = cudaEventRecord(r->copy_done[slot], r->copy_stream);
+    if (e != cudaSuccess) { r->failed = 1; return (int)e; }
     r->copy_count += 1;
     return 0;
 }
@@ -1984,9 +1990,8 @@ int rc_ring_compute_begin(void *v, int slot)
 {
     RcRing *r = (RcRing *)v;
     if (!r || slot < 0 || slot >= r->slots) return -1;
-    if (cudaStreamWaitEvent(r->compute_stream, r->copy_done[slot], 0) != cudaSuccess) {
-        r->failed = 1; return -1;
-    }
+    cudaError_t e = cudaStreamWaitEvent(r->compute_stream, r->copy_done[slot], 0);
+    if (e != cudaSuccess) { r->failed = 1; return (int)e; }
     return 0;
 }
 
@@ -1994,20 +1999,22 @@ int rc_ring_compute_end(void *v, int slot)
 {
     RcRing *r = (RcRing *)v;
     if (!r || slot < 0 || slot >= r->slots) return -1;
-    if (cudaEventRecord(r->compute_done[slot], r->compute_stream) != cudaSuccess) {
-        r->failed = 1; return -1;
-    }
+    cudaError_t e = cudaEventRecord(r->compute_done[slot], r->compute_stream);
+    if (e != cudaSuccess) { r->failed = 1; return (int)e; }
     r->compute_count += 1;
     return 0;
 }
 
 /* Wait until the copy that reads this pinned slot has completed, so the reader
-   can reuse it. This is an event wait, not a stream-wide synchronisation. */
+   can reuse it. This is an event wait, not a stream-wide synchronisation. A
+   slot's first wait sees a never-recorded event, which is already complete.
+   copy_stream never waits on another stream, so this cannot wait on the host. */
 int rc_ring_wait_copy(void *v, int slot)
 {
     RcRing *r = (RcRing *)v;
     if (!r || slot < 0 || slot >= r->slots) return -1;
-    return cudaEventSynchronize(r->copy_done[slot]) == cudaSuccess ? 0 : -1;
+    cudaError_t e = cudaEventSynchronize(r->copy_done[slot]);
+    return e == cudaSuccess ? 0 : (int)e;
 }
 
 int rc_ring_wait_slot(void *v, int slot)
@@ -2049,9 +2056,14 @@ int rc_ring_launch_seg_id(void *rv, void *cv, int start, int len)
     if (!r || !c || len <= 0) return -1;
     int threads = 256;
     int blocks = (len + threads - 1) / threads;
+    /* cudaGetLastError also reports an earlier call's error on this thread,
+       e.g. an optional tile output whose allocation failed and was skipped.
+       Clear it so only this launch decides the result. */
+    (void)cudaGetLastError();
     k_seg_id_tile<<<blocks, threads, 0, r->compute_stream>>>(
         c->d_seg_start, c->d_seg_len, c->nseg, start, len, c->d_seg_id);
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    cudaError_t e = cudaGetLastError();
+    return e == cudaSuccess ? 0 : (int)e;
 }
 
 int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
@@ -2063,6 +2075,7 @@ int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
     int threads = 256;
     int blocks = (len + threads - 1) / threads;
     cudaStream_t s = r->compute_stream;
+    (void)cudaGetLastError();
     switch (kind) {
     case 0:
         k_ret_tile<<<blocks, threads, 0, s>>>(c->d_times, c->d_close, c->d_seg_id,
@@ -2086,7 +2099,8 @@ int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
     default:
         return -1;
     }
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+    cudaError_t e = cudaGetLastError();
+    return e == cudaSuccess ? 0 : (int)e;
 }
 
 /* An RcEnrich that owns the device arrays but has not uploaded the source
