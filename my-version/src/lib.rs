@@ -44,6 +44,10 @@ pub mod manifest;
 pub mod memory;
 pub mod metrics;
 pub mod multi;
+pub mod noise; // #257: Driscoll-Kraay paired-loss noise
+pub mod gates; // #257: noise-scaled supported front and verdict
+pub mod gate_run; // #257: gates glue for the CLI report
+pub mod target_structure; // #257: affine, binned and OLS rungs on the declared structure
 pub mod ohlcv;
 pub mod pareto;
 #[cfg(feature = "cuda")]

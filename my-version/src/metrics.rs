@@ -1464,7 +1464,7 @@ pub fn correlation(a: &[f64], b: &[f64]) -> f64 {
 /// Split the target into two classes at its midpoint. The engine normalises the
 /// target, so an absolute 0.5 threshold would be wrong; the midpoint of the two
 /// observed extremes is invariant under the affine normalisation.
-fn binary_labels(y: &[f64]) -> Vec<f64> {
+pub fn binary_labels(y: &[f64]) -> Vec<f64> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for &v in y {
         lo = lo.min(v);
@@ -1508,7 +1508,7 @@ pub fn classification_target_error(y: &[f64]) -> Option<String> {
 /// A zero-weight row is invisible, exactly as it is to the fitter and to every
 /// other weighted metric: changing its target (even to `±inf` or `NaN`) cannot
 /// move the midpoint. `None` means a positive-weight target is non-finite.
-fn binary_labels_weighted(y: &[f64], w: &[f64]) -> Option<Vec<f64>> {
+pub fn binary_labels_weighted(y: &[f64], w: &[f64]) -> Option<Vec<f64>> {
     let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
     for (&v, &wi) in y.iter().zip(w) {
         if wi > 0.0 {
@@ -1550,7 +1550,7 @@ fn softplus_neg(u: f64) -> f64 {
 }
 
 /// #289: one row of a classification metric, with `p` the logit and `l ∈ {0,1}`.
-fn classification_row_loss(p: f64, l: f64, objective: ScoreObjective) -> f64 {
+pub fn classification_row_loss(p: f64, l: f64, objective: ScoreObjective) -> f64 {
     let t = 2.0 * l - 1.0;
     let u = t * p;
     match objective {

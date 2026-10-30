@@ -3532,8 +3532,152 @@ pub struct ConstantErrors {
     pub relative: Vec<f64>,
     /// Residual degrees of freedom `n - k`.
     pub dof: usize,
-    /// `JᵀJ` is (near-)singular: the constants are not separately determined.
+    /// `JᵀJ` is (near-)singular, or the Jacobian has lost rank: the constants
+    /// are not separately determined.
     pub ill_conditioned: bool,
+    /// #257: rank of the correlation-scaled Gram matrix of the Jacobian
+    /// (eigenvalues above `IDENTIFICATION_TAU` times the largest).
+    pub rank: usize,
+    /// #257: `sqrt(lambda_max / lambda_min)` of that matrix; infinite when
+    /// `lambda_min <= 0`.
+    pub condition_index: f64,
+    /// #257: constants that carry a rank-loss direction (Belsley variance
+    /// decomposition proportion at least `VDP_INVOLVED`); their errors are
+    /// infinite.
+    pub involved: Vec<usize>,
+    /// #257: Driscoll-Kraay sandwich standard errors, when requested.
+    pub std_errors_robust: Option<Vec<f64>>,
+    pub relative_robust: Option<Vec<f64>>,
+}
+
+impl ConstantErrors {
+    /// Every constant is separately determined: the Jacobian has full rank.
+    pub fn identified(&self) -> bool {
+        self.rank == self.values.len()
+    }
+
+    /// Practical identification: every robust relative error is at most 1.
+    /// `None` without robust errors.
+    pub fn practically_identified(&self) -> Option<bool> {
+        self.relative_robust
+            .as_ref()
+            .map(|r| r.iter().all(|v| *v <= 1.0))
+    }
+}
+
+/// A Gram eigenvalue at or below this fraction of the largest is a lost rank
+/// (condition index above 1e4).
+pub const IDENTIFICATION_TAU: f64 = 1e-8;
+/// Belsley variance-decomposition proportion that attributes a rank-loss
+/// direction to a constant.
+pub const VDP_INVOLVED: f64 = 0.5;
+
+/// Eigen-decomposition of a symmetric matrix by cyclic Jacobi sweeps over
+/// `p < q` in row-major order (at most 64 sweeps; stops when the off-diagonal
+/// sum of squares is below `1e-30 * trace^2`). Returns the eigenvalues in
+/// descending order and the eigenvectors as `v[row][column]`, column `l`
+/// belonging to eigenvalue `l`. Deterministic.
+pub fn jacobi_eigen_sym(a: &[Vec<f64>]) -> (Vec<f64>, Vec<Vec<f64>>) {
+    let k = a.len();
+    let mut m: Vec<Vec<f64>> = a.to_vec();
+    let mut v = vec![vec![0.0; k]; k];
+    for i in 0..k {
+        v[i][i] = 1.0;
+    }
+    let trace: f64 = (0..k).map(|i| m[i][i]).sum();
+    for _ in 0..64 {
+        let mut off = 0.0;
+        for p in 0..k {
+            for q in (p + 1)..k {
+                off += m[p][q] * m[p][q];
+            }
+        }
+        if off <= 1e-30 * trace * trace {
+            break;
+        }
+        for p in 0..k {
+            for q in (p + 1)..k {
+                let apq = m[p][q];
+                if apq == 0.0 {
+                    continue;
+                }
+                let theta = (m[q][q] - m[p][p]) / (2.0 * apq);
+                let t = if theta.abs() > 1e150 {
+                    0.5 / theta
+                } else {
+                    theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt())
+                };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for r in 0..k {
+                    let (arp, arq) = (m[r][p], m[r][q]);
+                    m[r][p] = c * arp - s * arq;
+                    m[r][q] = s * arp + c * arq;
+                }
+                for r in 0..k {
+                    let (apr, aqr) = (m[p][r], m[q][r]);
+                    m[p][r] = c * apr - s * aqr;
+                    m[q][r] = s * apr + c * aqr;
+                }
+                for r in 0..k {
+                    let (vrp, vrq) = (v[r][p], v[r][q]);
+                    v[r][p] = c * vrp - s * vrq;
+                    v[r][q] = s * vrp + c * vrq;
+                }
+            }
+        }
+    }
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&x, &y| m[y][y].total_cmp(&m[x][x]).then(x.cmp(&y)));
+    let vals = order.iter().map(|&i| m[i][i]).collect();
+    let vecs = (0..k)
+        .map(|r| order.iter().map(|&l| v[r][l]).collect())
+        .collect();
+    (vals, vecs)
+}
+
+struct Ident {
+    rank: usize,
+    condition_index: f64,
+    involved: Vec<usize>,
+    /// Pseudo-inverse of the scaled Gram over the kept directions: the finite
+    /// errors of the uninvolved constants of a rank-deficient model.
+    pinv: Vec<Vec<f64>>,
+}
+
+fn identification(corr: &[Vec<f64>]) -> Ident {
+    let k = corr.len();
+    let (vals, vecs) = jacobi_eigen_sym(corr);
+    let lmax = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let lmin = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let lost = |l: f64| !(l > IDENTIFICATION_TAU * lmax);
+    let rank = vals.iter().filter(|&&l| !lost(l)).count();
+    let condition_index = if lmin > 0.0 && lmax > 0.0 {
+        (lmax / lmin).sqrt()
+    } else {
+        f64::INFINITY
+    };
+    let floor = f64::EPSILON * lmax;
+    let mut involved = Vec::new();
+    for j in 0..k {
+        let phi: Vec<f64> = (0..k).map(|l| vecs[j][l] * vecs[j][l] / vals[l].max(floor)).collect();
+        let total: f64 = phi.iter().sum();
+        if total > 0.0 && (0..k).any(|l| lost(vals[l]) && phi[l] / total >= VDP_INVOLVED) {
+            involved.push(j);
+        }
+    }
+    let mut pinv = vec![vec![0.0; k]; k];
+    for l in 0..k {
+        if lost(vals[l]) {
+            continue;
+        }
+        for a in 0..k {
+            for b in 0..k {
+                pinv[a][b] += vecs[a][l] * vecs[b][l] / vals[l];
+            }
+        }
+    }
+    Ident { rank, condition_index, involved, pinv }
 }
 
 /// Compute each fitted constant's standard error at `tree`'s current values.
@@ -3556,6 +3700,33 @@ pub fn constant_errors_weighted(
     y: &[f64],
     w: &[f64],
 ) -> Option<ConstantErrors> {
+    constant_errors_core(tree, x, y, w, None)
+}
+
+/// As [`constant_errors_weighted`], plus Driscoll-Kraay sandwich errors
+/// `(JᵀJ)⁻¹ Ω (JᵀJ)⁻¹`, with `Ω` built from per-timestamp sums of
+/// `wᵢ Jᵢ rᵢ` (`keys` has one time key per row) and Bartlett lag `lag`.
+pub fn constant_errors_robust(
+    tree: &Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    keys: &[f64],
+    lag: usize,
+) -> Option<ConstantErrors> {
+    if keys.len() != x.len().min(y.len()) {
+        return None;
+    }
+    constant_errors_core(tree, x, y, w, Some((keys, lag)))
+}
+
+fn constant_errors_core(
+    tree: &Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    robust: Option<(&[f64], usize)>,
+) -> Option<ConstantErrors> {
     if !w.is_empty() && w.len() != x.len().min(y.len()) {
         return None;
     }
@@ -3576,6 +3747,11 @@ pub fn constant_errors_weighted(
             c[f.cslot[i] as usize] = f.val[i];
         }
     }
+    let key_index = robust.map(|(keys, _)| crate::noise::KeyIndex::new(keys));
+    let mut group_sums = key_index
+        .as_ref()
+        .map(|ix| vec![0.0; ix.groups * k])
+        .unwrap_or_default();
     let mut v = vec![0.0; f.op.len()];
     let mut adj = vec![0.0; f.op.len()];
     let mut grad = vec![0.0; k];
@@ -3604,6 +3780,12 @@ pub fn constant_errors_weighted(
                 jtj[i][j] += sw * gi * grad[j];
             }
         }
+        if let Some(ix) = &key_index {
+            let g = ix.group[row_i];
+            for j in 0..k {
+                group_sums[g * k + j] += sw * grad[j] * r;
+            }
+        }
         rss += sw * r * r;
     }
     for i in 0..k {
@@ -3616,12 +3798,16 @@ pub fn constant_errors_weighted(
     // independently of each constant's magnitude. A constant with no gradient
     // at all (e.g. inside an untaken branch) is never determined.
     let mut scale = vec![0.0; k];
+    let mut flat: Vec<usize> = Vec::new();
     for i in 0..k {
         if jtj[i][i] > 0.0 && jtj[i][i].is_finite() {
             scale[i] = jtj[i][i].sqrt();
         } else {
-            return Some(unidentified(c, dof));
+            flat.push(i);
         }
+    }
+    if !flat.is_empty() {
+        return Some(unidentified(c, dof, flat, None));
     }
     let mut corr = vec![vec![0.0; k]; k];
     for i in 0..k {
@@ -3629,20 +3815,30 @@ pub fn constant_errors_weighted(
             corr[i][j] = jtj[i][j] / (scale[i] * scale[j]);
         }
     }
+    let ident = identification(&corr);
     let (inv, pivot_ratio) = match invert(&corr, k) {
         Some(r) => r,
-        None => return Some(unidentified(c, dof)),
+        // An exact singularity: a rank-deficient model still reports the
+        // pseudo-inverse errors of its uninvolved constants.
+        None if ident.rank < k => (ident.pinv.clone(), 0.0),
+        None => return Some(unidentified(c, dof, (0..k).collect(), Some(ident))),
     };
     // Below this pivot ratio the columns of `J` are nearly collinear: the
     // constants can trade off and the standard errors are not meaningful.
     const ILL_CONDITIONED: f64 = 1e-12;
-    let ill_conditioned = pivot_ratio < ILL_CONDITIONED;
+    let identified = ident.rank == k;
+    // A rank-deficient model has no usable inverse; its uninvolved constants
+    // take their errors from the pseudo-inverse over the kept directions.
+    let inv = if identified { inv } else { ident.pinv.clone() };
+    let ill_conditioned = pivot_ratio < ILL_CONDITIONED || !identified;
     let sigma2 = rss / dof as f64;
     let mut std_errors = vec![0.0; k];
     let mut relative = vec![0.0; k];
     for i in 0..k {
         let cov_ii = sigma2 * inv[i][i] / (scale[i] * scale[i]);
-        let se = if cov_ii >= 0.0 {
+        let se = if ident.involved.contains(&i) {
+            f64::INFINITY
+        } else if cov_ii >= 0.0 {
             cov_ii.sqrt()
         } else {
             f64::INFINITY
@@ -3654,24 +3850,66 @@ pub fn constant_errors_weighted(
             se / c[i].abs()
         };
     }
+    let (std_errors_robust, relative_robust) = match (&key_index, robust) {
+        (Some(ix), Some((_, lag))) => {
+            let omega = crate::noise::dk_cov_from_group_sums(&group_sums, ix.groups, k, lag);
+            // cov = D^-1 inv D^-1 Omega D^-1 inv D^-1 in scaled coordinates.
+            let os: Vec<Vec<f64>> = (0..k)
+                .map(|a| (0..k).map(|b| omega[a][b] / (scale[a] * scale[b])).collect())
+                .collect();
+            let mut se = vec![0.0; k];
+            let mut rel = vec![0.0; k];
+            for i in 0..k {
+                let mut acc = 0.0;
+                for a in 0..k {
+                    for b in 0..k {
+                        acc += inv[i][a] * os[a][b] * inv[b][i];
+                    }
+                }
+                let cov_ii = acc / (scale[i] * scale[i]);
+                se[i] = if ident.involved.contains(&i) || !(cov_ii >= 0.0) {
+                    f64::INFINITY
+                } else {
+                    cov_ii.sqrt()
+                };
+                rel[i] = if c[i] == 0.0 { f64::INFINITY } else { se[i] / c[i].abs() };
+            }
+            (Some(se), Some(rel))
+        }
+        _ => (None, None),
+    };
     Some(ConstantErrors {
         values: c,
         std_errors,
         relative,
         dof,
         ill_conditioned,
+        rank: ident.rank,
+        condition_index: ident.condition_index,
+        involved: ident.involved,
+        std_errors_robust,
+        relative_robust,
     })
 }
 
 /// Fallback for an unidentified system: values kept, every error infinite.
-fn unidentified(values: Vec<f64>, dof: usize) -> ConstantErrors {
+fn unidentified(values: Vec<f64>, dof: usize, involved: Vec<usize>, ident: Option<Ident>) -> ConstantErrors {
     let k = values.len();
+    let (rank, condition_index) = match ident {
+        Some(i) => (i.rank, i.condition_index),
+        None => (k - involved.len(), f64::INFINITY),
+    };
     ConstantErrors {
         values,
         std_errors: vec![f64::INFINITY; k],
         relative: vec![f64::INFINITY; k],
         dof,
         ill_conditioned: true,
+        rank,
+        condition_index,
+        involved,
+        std_errors_robust: None,
+        relative_robust: None,
     }
 }
 
@@ -5128,5 +5366,158 @@ mod tests {
         let ca: Vec<u64> = fitted_constants(&lm).iter().map(|v| v.to_bits()).collect();
         let cb: Vec<u64> = fitted_constants(&linear).iter().map(|v| v.to_bits()).collect();
         assert_eq!(ca, cb);
+    }
+
+    // ---- #257: structural identification and robust errors ----
+
+    fn wiggle(i: usize, salt: f64) -> f64 {
+        ((i as f64 + 1.0) * 12.9898 + salt).sin() * 0.5
+    }
+
+    fn spread_rows(n: usize, cols: usize) -> Vec<Vec<f64>> {
+        (0..n)
+            .map(|i| (0..cols).map(|c| (i as f64) * 0.1 + wiggle(i, c as f64 * 3.0) + c as f64).collect())
+            .collect()
+    }
+
+    #[test]
+    fn exact_alias_of_two_offsets_is_rank_deficient() {
+        // c0 + c1*(c2 + x): c0 and c1*c2 trade off exactly.
+        let x = spread_rows(40, 1);
+        let y: Vec<f64> = x.iter().enumerate().map(|(i, r)| 0.3 + 2.0 * (0.5 + r[0]) + 0.05 * wiggle(i, 1.0)).collect();
+        let tree = node(
+            Op::Add,
+            vec![constant(0.3), node(Op::Mul, vec![constant(2.0), node(Op::Add, vec![constant(0.5), input(0)])])],
+        );
+        let e = constant_errors(&tree, &x, &y).expect("errors");
+        assert_eq!(e.rank, 2);
+        assert_eq!(e.involved, vec![0, 2]);
+        assert!(e.std_errors[0].is_infinite() && e.std_errors[2].is_infinite());
+        assert!(e.std_errors[1].is_finite());
+        assert!(e.ill_conditioned);
+        assert!(!e.identified());
+    }
+
+    #[test]
+    fn rank_six_shape_is_flagged() {
+        // c0 + c1/(c2 + exp(x1)) + c3*(c4 - x2): c0 and c4 alias.
+        let x = spread_rows(60, 2);
+        let tree = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        constant(0.2),
+                        node(Op::Div, vec![constant(1.5), node(Op::Add, vec![constant(2.0), node(Op::Exp, vec![input(0)])])]),
+                    ],
+                ),
+                node(Op::Mul, vec![constant(0.7), node(Op::Sub, vec![constant(0.4), input(1)])]),
+            ],
+        );
+        let y: Vec<f64> = x.iter().enumerate().map(|(i, r)| 0.1 * r[1] + 0.02 * wiggle(i, 2.0)).collect();
+        let e = constant_errors(&tree, &x, &y).expect("errors");
+        assert_eq!(e.rank, 4, "{e:?}");
+        assert_eq!(e.involved, vec![0, 4]);
+        assert!(e.ill_conditioned);
+        assert!(e.std_errors[0].is_infinite() && e.std_errors[4].is_infinite());
+    }
+
+    #[test]
+    fn near_collinear_but_identified_reports_condition_index() {
+        let rho: f64 = 1.0 - 1e-6;
+        let s = (1.0 - rho * rho).sqrt();
+        let x = vec![vec![1.0, rho], vec![0.0, s], vec![0.0, 0.0]];
+        let y = vec![1.0, 2.0, 3.0];
+        let tree = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), node(Op::Mul, vec![constant(1.0), input(1)])],
+        );
+        let e = constant_errors(&tree, &x, &y).expect("errors");
+        assert!(e.identified() && e.involved.is_empty());
+        let dot: f64 = x.iter().map(|r| r[0] * r[1]).sum();
+        let n0: f64 = x.iter().map(|r| r[0] * r[0]).sum();
+        let n1: f64 = x.iter().map(|r| r[1] * r[1]).sum();
+        let r = dot / (n0 * n1).sqrt();
+        let want = ((1.0 + r) / (1.0 - r)).sqrt();
+        assert!(((e.condition_index - want) / want).abs() < 1e-9, "{} {}", e.condition_index, want);
+        assert!((e.condition_index - 1414.2132).abs() < 1e-3, "{}", e.condition_index);
+    }
+
+    #[test]
+    fn jacobi_eigen_matches_closed_form_2x2_and_is_deterministic() {
+        let a = vec![vec![2.0, 1.0], vec![1.0, 2.0]];
+        let (vals, vecs) = jacobi_eigen_sym(&a);
+        assert!((vals[0] - 3.0).abs() < 1e-14 && (vals[1] - 1.0).abs() < 1e-14);
+        let norm: f64 = vecs[0][0] * vecs[0][0] + vecs[1][0] * vecs[1][0];
+        assert!((norm - 1.0).abs() < 1e-14);
+        let b = vec![vec![4.0, 1.0, 0.5], vec![1.0, 3.0, 0.2], vec![0.5, 0.2, 1.0]];
+        let (v1, e1) = jacobi_eigen_sym(&b);
+        let (v2, e2) = jacobi_eigen_sym(&b);
+        for (p, q) in v1.iter().zip(&v2) {
+            assert_eq!(p.to_bits(), q.to_bits());
+        }
+        for (r1, r2) in e1.iter().zip(&e2) {
+            for (p, q) in r1.iter().zip(r2) {
+                assert_eq!(p.to_bits(), q.to_bits());
+            }
+        }
+        let trace: f64 = v1.iter().sum();
+        assert!((trace - 8.0).abs() < 1e-13);
+    }
+
+    #[test]
+    fn full_rank_std_errors_are_bit_identical() {
+        // Reference: the Gauss-Jordan route the function has always used.
+        let x = rows(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]);
+        let noise = [0.01, -0.015, 0.008, -0.012, 0.02, -0.005, 0.006, -0.02, 0.011, -0.003];
+        let y: Vec<f64> = x.iter().zip(noise).map(|(r, e)| 2.0 * r[0] + 1.0 + e).collect();
+        let (a, b) = (1.9, 1.1);
+        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(a), input(0)]), constant(b)]);
+        let e = constant_errors(&tree, &x, &y).expect("errors");
+        let mut jtj = vec![vec![0.0; 2]; 2];
+        let mut rss = 0.0;
+        for (r, t) in x.iter().zip(&y) {
+            let g = [r[0], 1.0];
+            for i in 0..2 {
+                for j in 0..=i {
+                    jtj[i][j] += g[i] * g[j];
+                }
+            }
+            let res = a * r[0] + b - t;
+            rss += res * res;
+        }
+        jtj[0][1] = jtj[1][0];
+        let sc = [jtj[0][0].sqrt(), jtj[1][1].sqrt()];
+        let corr: Vec<Vec<f64>> = (0..2).map(|i| (0..2).map(|j| jtj[i][j] / (sc[i] * sc[j])).collect()).collect();
+        let (inv, _) = invert(&corr, 2).unwrap();
+        let sigma2 = rss / (y.len() - 2) as f64;
+        for i in 0..2 {
+            let want = (sigma2 * inv[i][i] / (sc[i] * sc[i])).sqrt();
+            assert_eq!(e.std_errors[i].to_bits(), want.to_bits());
+        }
+        assert!(e.identified() && !e.ill_conditioned);
+    }
+
+    #[test]
+    fn duplicating_rows_within_a_timestamp_keeps_robust_se() {
+        let n = 30;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![i as f64 * 0.3 + wiggle(i, 0.0)]).collect();
+        let y: Vec<f64> = x.iter().enumerate().map(|(i, r)| 2.0 * r[0] + 1.0 + 0.3 * wiggle(i, 5.0)).collect();
+        let keys: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let tree = node(Op::Add, vec![node(Op::Mul, vec![constant(2.0), input(0)]), constant(1.0)]);
+        let single = constant_errors_robust(&tree, &x, &y, &[], &keys, 2).unwrap();
+        let x2: Vec<Vec<f64>> = x.iter().flat_map(|r| [r.clone(), r.clone()]).collect();
+        let y2: Vec<f64> = y.iter().flat_map(|v| [*v, *v]).collect();
+        let k2: Vec<f64> = keys.iter().flat_map(|v| [*v, *v]).collect();
+        let double = constant_errors_robust(&tree, &x2, &y2, &[], &k2, 2).unwrap();
+        let (r1, r2) = (single.std_errors_robust.unwrap(), double.std_errors_robust.unwrap());
+        for i in 0..2 {
+            assert!(((r1[i] - r2[i]) / r1[i]).abs() < 1e-12, "{} {}", r1[i], r2[i]);
+            // iid: sigma^2 uses n - k, so the exact factor is sqrt((n-k)/(2n-k)).
+            let factor = (((n - 2) as f64) / ((2 * n - 2) as f64)).sqrt();
+            let want = single.std_errors[i] * factor;
+            assert!(((double.std_errors[i] - want) / want).abs() < 1e-12);
+        }
     }
 }

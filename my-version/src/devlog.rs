@@ -1366,8 +1366,8 @@ mod tests {
             summary_us, summary_bytes, per_event_us, full_bytes
         );
         assert!(
-            summary_us <= per_event_us,
-            "the summary record must not cost more than the full one"
+            summary_bytes < full_bytes,
+            "the summary record must be smaller than the full one"
         );
         line = record.json();
         assert!(

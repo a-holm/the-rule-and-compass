@@ -329,3 +329,15 @@ independently measured total wall. The fields are defined in
 `# elapsed:` line and JSON `elapsed_seconds` remain the **search** phase for
 compatibility; the total is the number to quote for runtime.
 
+
+## Validation gates in `run.json` (#257)
+
+Runs that are time-ordered, have a target spec or pass `--require-validation` add these fields. A random-split run without a spec has none of them. `docs/overfitting.md` section 3.10b defines the quantities.
+
+* `selection`: `criterion` (`validation_gates`), `sample`, `test_role` (`scoring_only`), `verdict` (`signal`, `no_signal`, `unvalidated`, `not_gated`), `selected_rank` and `selected_expression` (null unless `signal`; the rank is the archive rank), `reference`, `z`, `z_null`, `alpha`, `eligible`, `supported_ranks`, and `validation` with `rows`, `timestamps`, `time_min`, `time_max` and `purge_seconds_effective`.
+* `noise`: `estimator` (`driscoll_kraay_bartlett` or `iid`), `lag`, `lag_source` (`flag`, `horizon`, `rule_of_thumb`, `iid`), `rows`, `timestamps`, `design_effect`, `effective_n` of the paired differential between the reference and the selected (else best) member. Null when the verdict is `unvalidated` or `not_gated`.
+* `baselines.mean.validation_error` and `baselines.linear.validation_error` when a slice exists; `baselines.target_structure` gains `source`, `columns`, `fit_rows`, `non_finite_rows` and `rungs` (`zero_param`, `affine`, `binned20`, `construction_ols`, each with `params`, `train_error`, `validation_error`, `test_error`).
+* Each `pareto` member: `gates` (`archive_rank`, `identified`, `practically_identified`, `supported`, `not_better_than`), `comparisons.validation` and `comparisons.test` (per reference: `delta`, `se`, `verdict`), `beats_mean_test`, `beats_zero_param_test`, `beats_mean_validation`, `beats_zero_param_validation`, `validated`, `return_space` (per slice: `rows`, `clipped_rows`, `corr`, `r2_vs_zero`), and in `constant_errors`: `rank`, `condition_index`, `involved`, `std_errors_robust`, `relative_robust`.
+* `timing.gates_seconds`.
+
+In every run `validation_hv` carries `complexity_min` and `complexity_max`, and a structurally unidentified member has `constant_errors.ill_conditioned: true` and `null` standard errors for its involved constants.

@@ -1669,6 +1669,18 @@ pub struct Prepared {
     /// #254: raw values of [`SplitSpec::scale_column`] for the prepared rows,
     /// aligned with the samples. `None` unless the column was requested.
     pub target_scale: Option<TargetScale>,
+    /// #257: raw time keys of the prepared rows, aligned with the samples.
+    /// `None` without a time column.
+    pub keys: Option<RowKeys>,
+}
+
+/// Time keys of the prepared rows (#257). Equal keys are one timestamp.
+#[derive(Clone, Debug, Default)]
+pub struct RowKeys {
+    pub train: Vec<f64>,
+    pub validation: Option<Vec<f64>>,
+    /// The pooled test block, in the order of [`Prepared::test`].
+    pub test: Vec<f64>,
 }
 
 /// Raw scale-column values of the prepared rows (#254).
@@ -2595,8 +2607,8 @@ fn prepare_full_targets_weighted_inner(
         if !(spec.validation_frac < 1.0) {
             return Err("--validation-frac must be in (0, 1)".to_string());
         }
-        let order: Vec<usize> = if let Some(tc) = spec.time_col {
-            let keys = time_keys(filtered, tc);
+        let order_keys = spec.time_col.map(|tc| time_keys(filtered, tc));
+        let order: Vec<usize> = if let Some(keys) = &order_keys {
             let mut v = train_idx.clone();
             v.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
             v
@@ -2610,7 +2622,14 @@ fn prepare_full_targets_weighted_inner(
         if m >= 2 {
             let want = ((m as f64) * spec.validation_frac).round() as usize;
             let vn = want.clamp(1, m - 1);
-            let cut = m - vn;
+            let mut cut = m - vn;
+            // #257: a timestamp never straddles fit-train and validation.
+            if let Some(keys) = &order_keys {
+                while cut > 0 && keys.cmp(order[cut - 1], order[cut]) == std::cmp::Ordering::Equal {
+                    cut -= 1;
+                }
+            }
+            let vn = m - cut;
             let gap = spec.gap.min(cut.saturating_sub(1));
             let fit_cut = cut - gap;
             validation_idx = order[cut..].to_vec();
@@ -3177,8 +3196,22 @@ fn prepare_full_targets_weighted_inner(
         None => None,
     };
 
+    let keys = spec.time_col.map(|tc| {
+        let all = time_keys(filtered, tc).to_f64();
+        let pick = |idx: &[usize]| -> Vec<f64> { idx.iter().map(|&i| all[i]).collect() };
+        RowKeys {
+            train: pick(&train_idx),
+            validation: if validation_idx.is_empty() {
+                None
+            } else {
+                Some(pick(&validation_idx))
+            },
+            test: pick(&test_idx),
+        }
+    });
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
+        keys,
         target_scale,
         train,
         validation,
