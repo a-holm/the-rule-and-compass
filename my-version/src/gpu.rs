@@ -562,6 +562,10 @@ struct RawCtx {
     _private: [u8; 0],
 }
 
+/// #284: kernel span kinds read through `rc_last_span`.
+pub(crate) const SPAN_EVAL: i32 = 0;
+pub(crate) const SPAN_FIT: i32 = 1;
+
 /// #118: the C-side ledger for one batch, in milliseconds. The host windows are
 /// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
 /// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
@@ -804,6 +808,8 @@ extern "C" {
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
+    /* #284: last kernel span by event timestamps (0 evaluator, 1 fit). */
+    fn rc_last_span(ctx: *mut RawCtx, which: i32, start_ms: *mut f64, now_ms: *mut f64) -> i32;
     #[cfg(test)]
     fn rc_predict(
         ctx: *mut RawCtx,
@@ -2146,11 +2152,29 @@ impl GpuEvaluator {
             // #284: the evaluator's device interval is the raw kernel window,
             // not the host envelope. Place it on the run clock using the
             // measured outer wall; a failed batch keeps its interval too.
-            let end_s = self.run_start.elapsed().as_secs_f64();
-            let start_s = (end_s - wall_s).max(0.0);
-            self.ledger
-                .record_eval_kernel(0, start_s, raw.kernel_ms.max(0.0) / 1e3);
+            let kernel_s = raw.kernel_ms.max(0.0) / 1e3;
+            match self.take_span_start_s(SPAN_EVAL) {
+                Some(start_s) => self.ledger.record_eval_kernel_event(0, start_s, kernel_s),
+                None => {
+                    let end_s = self.run_start.elapsed().as_secs_f64();
+                    let start_s = (end_s - wall_s).max(0.0);
+                    self.ledger.record_eval_kernel(0, start_s, kernel_s);
+                }
+            }
         }
+    }
+
+    /// #284: the start of the last kernel span of kind `which` on the run clock,
+    /// from CUDA event timestamps. `None` when the events are unavailable, and
+    /// the caller then keeps the host envelope.
+    pub(crate) fn take_span_start_s(&mut self, which: i32) -> Option<f64> {
+        let (mut start_ms, mut now_ms) = (0.0f64, 0.0f64);
+        let ok = unsafe { rc_last_span(self.ctx, which, &mut start_ms, &mut now_ms) };
+        if ok != 1 {
+            return None;
+        }
+        let age_s = ((now_ms - start_ms) / 1e3).max(0.0);
+        Some((self.run_start.elapsed().as_secs_f64() - age_s).max(0.0))
     }
 
     /// #284: place this evaluator's device intervals on the caller's run clock.
@@ -3570,6 +3594,114 @@ mod tests {
                         want.value
                     );
                 }
+            }
+        }
+    }
+
+    /// Weighted regression scoring: every native regression objective with a
+    /// weighted form matches `metrics::score_weighted` on the same f32-rounded
+    /// predictions, at the unweighted tiers (1e-12 relative, 1e-9 for the
+    /// correlation family), for uniform, non-uniform and zero-heavy weights.
+    /// All-zero weights are status 4, a weighted maximum launch is refused, and
+    /// clearing the weights restores the unweighted scores.
+    #[test]
+    fn weighted_regression_scores_match_the_cpu_weighted_score() {
+        use crate::metrics::{score_native_weighted, score_weighted, Metric};
+
+        let (cols, n, nv, y, trees) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+        let objectives = [
+            (Metric::Squared, ScoreObjective::Squared),
+            (Metric::Absolute, ScoreObjective::Absolute),
+            (Metric::LogSquashed, ScoreObjective::LogSquashed),
+            (Metric::Signed, ScoreObjective::Signed),
+            (Metric::Correlation, ScoreObjective::Correlation),
+            (Metric::CorrelationSigned, ScoreObjective::CorrelationSigned),
+            (Metric::Aic, ScoreObjective::Aic),
+            (Metric::Aicc, ScoreObjective::Aicc),
+            (Metric::Bic, ScoreObjective::Bic),
+        ];
+        let uniform = vec![1.0f64; n];
+        let ramp: Vec<f64> = (0..n).map(|i| 0.25 + (i % 9) as f64 * 0.5).collect();
+        let zeros: Vec<f64> = (0..n)
+            .map(|i| if i % 3 == 0 { 0.0 } else { 1.0 + (i % 4) as f64 * 0.25 })
+            .collect();
+        let scaled: Vec<f64> = ramp.iter().map(|w| w * 1000.0).collect();
+        let pcount = vec![2i32; trees.len()];
+        for (label, w) in [
+            ("uniform", &uniform),
+            ("non-uniform", &ramp),
+            ("zero weights", &zeros),
+            ("scaled", &scaled),
+        ] {
+            assert!(ev.set_score_weights(w), "{label}: weights uploaded");
+            for (metric, objective) in objectives {
+                let batch = ev.score_batch(prog, offsets, objective, &pcount);
+                assert!(batch.ms >= 0.0, "{label} {}: launch", objective.name());
+                for k in 0..trees.len() {
+                    let rows: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+                    let want = score_weighted(&rows, &y64, w, metric, 2);
+                    let native = score_native_weighted(&rows, &y64, w, objective, 2);
+                    assert!(
+                        (native.value - want).abs() <= 1e-14 * (1.0 + want.abs()),
+                        "{label} {} slot {k}: reducers agree",
+                        metric.name()
+                    );
+                    let got = batch.values[k];
+                    assert_eq!(batch.status[k], ScoreStatus::Ok, "{label} {} slot {k}", metric.name());
+                    let tol = if objective.is_correlation() {
+                        1e-9
+                    } else {
+                        1e-12 * (1.0 + want.abs())
+                    };
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "{label} {} slot {k}: GPU {got} vs CPU {want} (tol {tol:e})",
+                        metric.name()
+                    );
+                }
+            }
+        }
+
+        let none = vec![0.0f64; n];
+        assert!(ev.set_score_weights(&none));
+        for (metric, objective) in objectives {
+            let batch = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(batch.ms >= 0.0, "all-zero {}: launch", objective.name());
+            for k in 0..trees.len() {
+                assert_eq!(batch.status[k], ScoreStatus::AllZeroWeight, "all-zero {} slot {k}", metric.name());
+                assert_eq!(batch.values[k], f64::INFINITY, "all-zero {} slot {k}", metric.name());
+            }
+        }
+
+        assert!(ev.set_score_weights(&ramp));
+        let refused = ev.score_batch(prog, offsets, ScoreObjective::Maximum, &pcount);
+        assert!(refused.ms < 0.0, "a weighted maximum launch is refused");
+
+        assert!(ev.set_score_weights(&[]));
+        for (metric, objective) in objectives {
+            let batch = ev.score_batch(prog, offsets, objective, &pcount);
+            for k in 0..trees.len() {
+                let rows: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+                let want = score_native_weighted(&rows, &y64, &[], objective, 2).value;
+                let tol = if objective.is_correlation() {
+                    1e-9
+                } else {
+                    1e-12 * (1.0 + want.abs())
+                };
+                assert!(
+                    (batch.values[k] - want).abs() <= tol,
+                    "cleared {} slot {k}: GPU {} vs CPU {want}",
+                    metric.name(),
+                    batch.values[k]
+                );
             }
         }
     }
@@ -9386,6 +9518,11 @@ mod carry_tests {
         let pcount = vec![2i32; pop.len()];
         let parts = partitions(d.n);
         for objective in KINDS {
+            if objective == ScoreObjective::Maximum && !weights.is_empty() {
+                let weighted = ev.score_batch(prog, offsets, objective, &pcount);
+                assert!(weighted.ms < 0.0, "{case}: a weighted maximum launch is refused");
+                continue;
+            }
             let want = ev.score_batch(prog, offsets, objective, &pcount);
             assert!(want.ms >= 0.0, "{case} {}: resident launch", objective.name());
             assert_ne!(want.status[4], ScoreStatus::Ok, "{case} {}: the NaN candidate is unusable", objective.name());

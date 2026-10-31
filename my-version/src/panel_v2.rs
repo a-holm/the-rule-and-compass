@@ -1898,8 +1898,9 @@ fn v2_block(
     let mut s = String::from("{");
     let _ = write!(
         s,
-        "\"panel_version\":2,\"columns\":[{}],\"derivatives\":{{\"available\":false,\"source\":null}},",
-        PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(",")
+        "\"panel_version\":2,\"columns\":[{}],\"derivatives\":{},",
+        PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+        crate::derivatives::manifest_json(None)
     );
     let _ = write!(
         s,

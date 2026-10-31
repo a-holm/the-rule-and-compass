@@ -275,6 +275,8 @@ after a gap rather than carrying state across an outage.
 by trailing volatility when requested, and drop labels whose window spans a gap.
 The builder reports warm-up, gap and stride row counts.
 
+`rcsr::labels` is the long-only label builder (`build(bars, spec, funding)`): `fwd`, `y`, `long_net`, action `{0,+1}`, the long-side triple barrier with `t1`, exit return, `m_net` and `m_barrier`, uniqueness weights and a report with the purge, `effective_n_hours` and a label hash. Its definitions are in [`time-series.md`](time-series.md#3b-long-only-labels-and-their-purge). The `fwd:` label above is the older single-column form: it subtracts the round trip before dividing by the trailing standard deviation, has no `sqrt(h)` factor, floor or clip, and has the GPU kernel (`gpu.label`); the long-only builder has no GPU kernel. `rcsr enrich` and `rcsr prep` refuse `side=short`, `--side short` and `--allow-short`, and refuse a `fwd:` stride below the horizon for horizons of 4 h and longer without `--allow-overlap`.
+
 ## Streaming over `.rcsb`
 
 `for_each_bar_from_store(path, f)` reads a column store one row group at a time
@@ -374,7 +376,7 @@ expanded panel. It is the union of:
   `available:true` with a tested causal join;
 * the 45 `cross` columns (benchmark joins, market state, breadth, dispersion,
   average correlation, ranks), which are `available:true`;
-* the reserved derivative columns, which are the only `available:false` entries
+* the ten reserved derivative columns, which are the only `available:false` entries
   and carry an explicit dependency.
 
 `rcsr schema` prints two machine-readable inventories. `engine_catalogue`
@@ -389,6 +391,15 @@ Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
 the only way a requested column is omitted.
+
+### Derivatives family (reserved, gated)
+
+The ten derivative columns are `family=derivatives`, `available:false`, `source:null`: `funding_rate`, `funding_carry_24h`, `basis_bps`, `oi`, `oi_chg_1h`, `oi_chg_24h`, `ls_ratio`, `taker_buy_sell_ratio`, `liq_long`, `liq_short`. Each registry entry also carries `required_source`, `publication_lag`, `required_raw_field` and `flip_condition`. No funding, open-interest, basis or liquidation data exists locally and `rcsr` does not download any.
+
+* A request for one of these names, or for the group `derivatives`, is refused with the missing raw field. It never writes zeros, an empty column or a forward-filled value.
+* A name that is not in the list (`funding_rate_8h`) is an unknown feature.
+* A column can become available only through `derivatives::verify`, which reads a local snapshot CSV (`field,symbol,publish_time,value`; `field` is the raw vendor field, `publish_time` is when the value became known). The snapshot must cover every panel symbol on at least 99% of the days for every required field, and its rows must pass the PIT join check. No command line flag enables this path; the registry and the panel manifest stay `available:false` by default.
+* Join rules (`derivatives::column`): a bar at `t` sees only rows with `publish_time <= t`, otherwise `NaN`. A value older than two cadences is `NaN`. `funding_carry_24h` is the sum of the three latest published payments. `oi_chg_*` compares two known snapshots. `basis_bps = (mark / spot - 1) * 1e4` needs both legs at the same timestamp; one missing leg is `NaN`, never a splice from another bar. `liq_long` and `liq_short` have no join and stay unavailable.
 
 Every engine formula has one name and one definition. The cross-group names are
 registered explicitly, not left to group order:
