@@ -1435,6 +1435,7 @@ pub struct PanelOptions {
     /// Share of the cross-section missing at one hour that makes it a venue outage.
     pub outage_share: f64,
     pub outage_min_symbols: usize,
+    pub gpu: GpuMode,
 }
 
 impl PanelOptions {
@@ -1451,6 +1452,7 @@ impl PanelOptions {
             jump_factor: 5.0,
             outage_share: 0.5,
             outage_min_symbols: 3,
+            gpu: GpuMode::Auto,
         }
     }
 }
@@ -1782,6 +1784,7 @@ pub struct PanelSummary {
     pub gaps: usize,
     pub listings: usize,
     pub manifest: String,
+    pub route: DeviceRoute,
 }
 
 /// P4/P5: assemble the time-major panel and write the store and manifest.
@@ -1849,6 +1852,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         gaps: panel.gaps,
         listings: asm.listings.values().map(|c| *c as usize).sum(),
         manifest: manifest_path,
+        route: DeviceRoute::new(opts.gpu),
     })
 }
 
