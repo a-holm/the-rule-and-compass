@@ -861,7 +861,7 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
     }
     let resid: Vec<f64> = pred.iter().zip(y).map(|(p, t)| p - t).collect();
     match m {
-        Metric::Absolute => mean_abs(&resid),
+        Metric::Absolute | Metric::ImplicitResidual => mean_abs(&resid),
         Metric::Squared => mean_sq(&resid),
         Metric::Correlation => 1.0 - correlation(pred, y).abs(),
         Metric::CorrelationSigned => 1.0 - correlation(pred, y),
@@ -891,11 +891,11 @@ pub fn score_with_constants(pred: &[f64], y: &[f64], m: Metric, k: usize) -> f64
         Metric::Aic => aic(n, rss(&resid), k),
         Metric::Aicc => aicc(n, rss(&resid), k),
         Metric::Bic => bic(n, rss(&resid), k),
-        // Implicit metrics need the expression tree (for ∇f), not a prediction
-        // vector. [`crate::search::eval_error`] routes them to
-        // `crate::implicit::score` before this function is called; reaching
-        // here means the caller has no tree, which is unusable.
-        Metric::ImplicitDerivative | Metric::ImplicitResidual => f64::INFINITY,
+        // The level-set distance needs the expression tree (for ∇f), not a
+        // prediction vector. [`crate::search::eval_error`] routes it to
+        // `crate::implicit::score`; reaching here means the caller has no tree.
+        // `implicit_residual` is `absolute` on an implicit sample (target 0).
+        Metric::ImplicitDerivative => f64::INFINITY,
     }
 }
 
@@ -1034,7 +1034,7 @@ pub fn score_weighted(pred: &[f64], y: &[f64], w: &[f64], m: Metric, k: usize) -
         .map(|((p, t), &wi)| if wi > 0.0 { p - t } else { 0.0 })
         .collect();
     match m {
-        Metric::Absolute => resid
+        Metric::Absolute | Metric::ImplicitResidual => resid
             .iter()
             .zip(w)
             .map(|(e, wi)| wi * e.abs())
