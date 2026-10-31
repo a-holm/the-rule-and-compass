@@ -422,7 +422,7 @@ fn reference(sym: &[Row]) -> Vec<(&'static str, Vec<Option<f64>>)> {
 
     // ou_hl96: AR(1) of x = ln C - ln SMA96, centred in the window.
     let x: Vec<f64> = (0..n)
-        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { c[i].ln() - ma96[i].ln() } else { f64::NAN })
+        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { ((c[i] - ma96[i]) / ma96[i]).ln_1p() } else { f64::NAN })
         .collect();
     let xl = rlag(&x, &t);
     let cov = ref_cov(&x, &xl, 96, &t);
