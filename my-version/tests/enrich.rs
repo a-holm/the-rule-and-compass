@@ -1069,6 +1069,83 @@ fn flow_windows_are_gap_masked() {
     assert!(vwap.iter().all(|x| x.is_finite()), "raw vwap does not need a window");
 }
 
+/// A flow window never bridges a symbol listing segment: after a migration
+/// (next symbol starts on the very next bar) and after a delisting followed by
+/// a later listing, the first full window of every flow column is NaN, and the
+/// later values equal a standalone build of that symbol.
+#[test]
+fn flow_windows_never_bridge_a_listing_boundary() {
+    let names = [
+        "vwap_dev96",
+        "obv_z96",
+        "taker_ratio96",
+        "trade_intensity96",
+        "avg_trade_size96",
+        "amihud96",
+        "zero_ret_share96",
+        "cvd_proxy",
+    ];
+    let segment = |sym: &str, first_bar: i64, n: usize| {
+        let mut rows = flow_rows(n);
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.0 = (first_bar + i as i64) * 900;
+            r.1 = sym.to_string();
+        }
+        rows
+    };
+    let old = segment("OLD", 0, 200);
+    let new = segment("NEW", 200, 220);
+    let late = segment("LATE", 700, 200);
+    let mut all = old.clone();
+    all.extend(new.clone());
+    all.extend(late.clone());
+
+    let dir = tmp_dir("flow_boundary");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_flow_store(&src, &all, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+
+    let solo = |tag: &str, rows: &[(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)]| {
+        let d = tmp_dir(tag);
+        let s = d.join("in.rcsb").to_string_lossy().into_owned();
+        let o = d.join("out.rcsb").to_string_lossy().into_owned();
+        write_flow_store(&s, rows, false, 32);
+        enrich::build(&opts(&s, &o, "flow")).unwrap();
+        o
+    };
+    let solo_new = solo("flow_boundary_new", &new);
+    let solo_late = solo("flow_boundary_late", &late);
+
+    for name in names {
+        let v = column(&out, name);
+        let sn = column(&solo_new, name);
+        let sl = column(&solo_late, name);
+        for (start, len, solo_v, label) in [(200usize, 220usize, &sn, "NEW"), (420, 200, &sl, "LATE")] {
+            for i in 0..95 {
+                assert!(v[start + i].is_nan(), "{name} bridged into {label} at segment row {i}");
+            }
+            assert!(v[start + 95].is_finite(), "{name} must be finite on the first full {label} window");
+            for i in 0..len {
+                let (a, b) = (v[start + i], solo_v[i]);
+                assert!(
+                    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                    "{name} {label} row {i}: {a} differs from the standalone build {b}"
+                );
+            }
+        }
+    }
+    let imb = column(&out, "taker_imb16");
+    for start in [200usize, 420] {
+        for i in 0..15 {
+            assert!(imb[start + i].is_nan(), "taker_imb16 bridged into segment at {start} row {i}");
+        }
+        assert!(imb[start + 15].is_finite(), "taker_imb16 must be finite after its own window");
+    }
+    let vwap = column(&out, "vwap");
+    assert!(vwap.iter().all(|x| x.is_finite()), "raw vwap does not need a window");
+}
+
 /// The four flow names shared with the compact profile pass the compact
 /// regression fixture at abs/rel <= 1e-12.
 #[test]
