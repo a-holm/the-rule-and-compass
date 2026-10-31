@@ -62,6 +62,9 @@ pub struct Manifest {
     /// #294: the resolved projected read (hash, column list and header
     /// indices), or `None` when the run loaded every column.
     pub projection: Option<ProjectionRecord>,
+    /// #260: the `--project` view (id, seed, view index, columns by family)
+    /// as a JSON object, or `None` when no view was requested.
+    pub view: Option<String>,
     /// #254: the declared target spec `(source, path, sha256)`, or `None`.
     pub target_spec: Option<(String, String, String)>,
 }
@@ -157,6 +160,10 @@ impl Manifest {
             }
             None => out.push_str("  \"projection\":null,\n"),
         }
+        match &self.view {
+            Some(v) => out.push_str(&format!("  \"view\":{},\n", v)),
+            None => out.push_str("  \"view\":null,\n"),
+        }
         match &self.target_spec {
             Some((source, path, sha)) => out.push_str(&format!(
                 "  \"target_spec\":{{\"source\":{},\"path\":{},\"sha256\":{}}},\n",
@@ -237,6 +244,7 @@ pub fn collect(
         sampled_rows,
         estimate_bytes,
         projection: None,
+        view: None,
         target_spec: None,
     }
 }
