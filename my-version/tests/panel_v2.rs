@@ -351,7 +351,7 @@ fn the_panel_has_the_declared_columns_and_only_point_in_time_members() {
     let manifest = std::fs::read_to_string(format!("{}.manifest.json", out.display())).unwrap();
     assert!(manifest.contains("\"venue_outage_hours\":3"), "{manifest}");
     assert!(manifest.contains("\"max_gap\":960"));
-    assert!(manifest.contains("\"derivatives\":{\"available\":false,\"source\":null}"));
+    assert!(manifest.contains("\"derivatives\":{\"available\":false,\"source\":null,\"columns\":[]}"));
     assert!(manifest.contains("\"multi_listing_symbols\":[{\"symbol\":\"LUNAUSDT\",\"listings\":2}]"));
     assert!(manifest.contains("\"lockbox\":") && manifest.contains("\"rows\":0"));
     assert!(manifest.contains("\"rows_not_in_force\":0"));

@@ -28,6 +28,7 @@ pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod panel_v2; // #259: default hourly point-in-time panel (snapshot, base, build, validate)
 pub mod panel_append; // #260: schema sidecar and time-major family append
 pub mod registry; // #260: versioned feature registry, schema sidecar, views
+pub mod derivatives; // reserved, gated funding/OI/basis family
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
