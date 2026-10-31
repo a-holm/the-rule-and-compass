@@ -562,7 +562,9 @@ SEARCH:
                              through the exact f64 order-statistic/rank batch
                              scorer (#288) from 4096 rows (a two-valued target
                              for AUC); those statistics are bit-identical to
-                             the CPU for the same prediction vector. Every other
+                             the CPU for the same prediction vector (median and
+                             interquartile use a radix select from 4096 and
+                             65536 rows, rank and auc a sort). Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be

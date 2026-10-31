@@ -574,8 +574,8 @@ runs the exact `f64` forward pass from the resident rows, and returns one
 
 | `ScoreStat` | device work | exactness contract |
 |---|---|---|
-| `Median` | segmented sort of the `|r|` bit patterns, then the middle pick (even `n` averages the two middles) | bit-identical to `metrics::median_abs` |
-| `Interquartile` | the same sort, mean of ranks `[⌊n/4⌋, ⌊3n/4⌋)` (all rows below `n = 4`) | fixed-order tree mean, `1e-12` relative |
+| `Median` | radix select of the middle key(s) of the `|r|` bit patterns from 4 096 rows, segmented sort below; even `n` averages the two middles | bit-identical to `metrics::median_abs` |
+| `Interquartile` | ranks `[⌊n/4⌋, ⌊3n/4⌋)` (all rows below `n = 4`) added in ascending order by one thread; from 65 536 rows the window boundaries are selected and only the interior is sorted | bit-identical to `metrics::interquartile_mean_abs` |
 | `Maximum` | integer max on the `|r|` bits plus the lowest maximiser | bit-identical, order-free |
 | `RankCorrelation` | exact integer rank sums of #230, then `1 − |ρ|` | bit-identical to the exact `RankTarget` statistic |
 | `RankCorrelationSigned` | the same sums under `1 − ρ` | bit-identical, orientation preserved |
@@ -640,26 +640,117 @@ tree scorer rather than being ranked by SSE. A failed device batch returns an
 error, the evaluator is dropped and the generation is re-scored on the CPU, as
 for every other device failure.
 
-**Measurements.** The reproducible paired bench is
+**Measurements.** The reproducible paired bench for the rank statistics is
 `cargo test --release --features cuda --lib bench_score_batch -- --ignored
 --nocapture` (`RCSR_BENCH_N`, `RCSR_BENCH_P` override the sample/candidates).
 On the RTX 3060 at `N = 100 000`, `P = 8`, one wave and a 6.4 MB wave charge:
 
 | statistic | device s/row/candidate | one-thread exact CPU s/row/candidate |
 |---|---:|---:|
-| `median` | 7.6e-9 | 1.13e-8 (rank-sum reference) |
 | `rank_correlation` | 1.29e-8 (includes the first-call rank prepare) | 1.13e-8 |
 | `rank_correlation_signed` | 9.3e-9 | 1.13e-8 |
 
 Against the search's **8-worker** CPU scorer (ideal ≈ `1.4e-9 s/row`) the
-sort-based path is ≈1× or slower at this size, as report
-`01-native-scoring.md` §5 predicted (≈4.5 s each at `N = 2.456 M`, `P = 447`,
-where a wave holds three candidates). The production radix histogram/select path
-is the follow-up that removes the `2N` sort buffer and the 64 B/row wave; this
-change is the correctness entry point and the dispatch gate, so the run-level
-gain for rank/AUC runs is device residency, not a claimed speed-up. The
-`N = 2.456 M`, `P = 447` cell is reproducible with `RCSR_BENCH_N=2456306
-RCSR_BENCH_P=447` on a device with enough memory.
+sort-based rank path is ≈1× or slower at this size, as report
+`01-native-scoring.md` §5 predicted (≈4.5 s at `N = 2.456 M`, `P = 447`, where a
+wave holds three candidates). Rank correlation and AUC need the rank of every
+row; a selection returns the key at a rank, not the rank of every key, and
+refining every histogram bucket down to single keys is a full radix sort. They
+stay on the sort path. The `N = 2.456 M`, `P = 447` cell is reproducible with
+`RCSR_BENCH_N=2456306 RCSR_BENCH_P=447` on a device with enough memory.
+
+#### Radix select path for the order statistics
+
+CUB's `DeviceSegmentedRadixSort` runs one thread block per segment per digit
+pass, so `P` candidates use at most `P` blocks and every pass reads and writes
+every key. The median, the maximum and the interquartile window boundaries are
+one or two order statistics, so they do not need the sort.
+
+* **Key.** The bit pattern of `|pred − y|` in exact `f64`. The value is never
+  negative, so the unsigned bit order is the numeric order; `fabs` maps `−0.0`
+  to `+0.0` like the CPU's `f64::abs`, and subnormals and `f64::MAX` order as
+  plain bits. Both paths call one row-key function (`md_row_key`), so a
+  non-finite prediction or residual (and `|pred| > 1e30`) marks the segment
+  non-finite on both, which scores `+inf` like the CPU.
+* **Passes** (`src/cuda/radix_select.h`). Six 11-bit digits, high to low. Every
+  segment is spread over many blocks (grid `(segments, blocks per segment)`).
+  Pass 0 is fused into the prediction sweep; later passes read the key buffer
+  once and count, per rank, only keys that agree with the prefix fixed so far.
+  Lanes with the same digit merge into one shared atomic (`__match_any_sync`),
+  so the exponent bins of pass 0 do not serialise. A pick kernel per segment
+  scans the 2 048 bins, fixes the digit and the residual rank on the device and
+  clears the bins: 13 launches, no host round trip. Up to two ranks share one
+  read: `n/2 − 1` and `n/2` for an even median, `⌊n/4⌋` and `⌊3n/4⌋ − 1` for the
+  interquartile window.
+* **Interquartile mean.** The CPU adds the window left to right
+  (`iter().sum()`), and `f64` addition is not associative, so the sum needs the
+  window in ascending order; it is not an interpolated quantile. The window is
+  `a` copies of `s[lo]`, the interior keys `s[lo] < k < s[hi−1]` sorted, and
+  `b` copies of `s[hi−1]`. The select path counts `#{k ≤ s[lo]}`, copies only
+  the interior (at most `hi − lo − 2` keys), sorts that half with CUB and adds
+  the sequence in order. On both paths one thread adds while the other warps
+  stage the next tile in shared memory. Each add is a dependent `f64` add
+  (about 30 ns on the RTX 3060), the inherent cost of bit-identity; the #232 fit
+  ladder keeps its tree mean because it only compares trials.
+* **Determinism.** Counts are integer atomics, the pick is an integer scan and
+  the selected key is a function of the key multiset, so blocks per segment,
+  wave split and batch composition cannot change a value. The interior's copy
+  order varies from run to run; the sort removes it.
+* **Memory.** 8 B per row per segment for the median and the maximum (keys
+  only), 24 B for the interquartile mean, against the sort path's 64 B, so a
+  512 MB wave holds 8× (3×) more candidates. Every buffer comes from the
+  persistent fit/score region (`rc_fs_reserve`).
+* **Dispatch and fallback.** `gpu::order_stat_path(code, n)` returns the
+  measured path. A select call that fails as a whole (allocation, launch, an
+  internal consistency check reported as status 3, a statistic it does not
+  compute) is re-run on the sort path with the sort path's own wave shape. The
+  #232 tree mean is sort-only.
+
+`cargo test --release --features cuda --lib bench_order_select_crossover --
+--ignored --nocapture` (`RCSR_BENCH_NS`, `RCSR_BENCH_PS` override the grids)
+measures sort vs select vs the 8-worker CPU scorer (`std::thread::scope`, eval
+plus metric per candidate) on one affine candidate shape. RTX 3060, 8 CPU
+threads, best of three device runs, milliseconds:
+
+| `N` | `P` | median sort | median select | IQR sort | IQR select | max scan | max select | CPU8 median | CPU8 IQR |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 096 | 8 | 0.154 | 0.148 | 0.213 | 0.294 | 0.038 | 0.114 | 1.84 | 1.68 |
+| 4 096 | 128 | 0.720 | 0.413 | 0.803 | 0.746 | 0.083 | 0.263 | 17.6 | 14.6 |
+| 16 384 | 8 | 0.346 | 0.281 | 0.559 | 0.740 | 0.089 | 0.226 | 7.07 | 7.00 |
+| 16 384 | 128 | 2.34 | 0.731 | 3.33 | 2.45 | 0.227 | 0.791 | 52.3 | 63.6 |
+| 65 536 | 8 | 1.24 | 0.388 | 2.10 | 1.95 | 0.274 | 0.317 | 24.8 | 21.7 |
+| 65 536 | 128 | 9.51 | 2.69 | 12.0 | 9.13 | 0.716 | 2.70 | 246 | 258 |
+| 262 144 | 8 | 4.56 | 0.869 | 8.53 | 6.56 | 1.44 | 0.617 | 81.3 | 70.4 |
+| 262 144 | 128 | 45.0 | 10.6 | 64.2 | 38.3 | 2.79 | 9.92 | 1 184 | 1 298 |
+| 1 048 576 | 8 | 38.9 | 2.80 | 68.4 | 27.7 | 5.25 | 2.76 | 395 | 365 |
+| 1 048 576 | 128 | 374 | 44.9 | 662 | 235 | 11.4 | 42.8 | 5 605 | 5 281 |
+
+The CPU column varies by up to 40 % between runs on the shared desktop (an
+earlier run gave 3 955 ms and 3 892 ms at `N = 1 048 576`, `P = 128`). The
+rules that follow:
+
+* `median`: select from 4 096 rows (`ORDER_SELECT_MIN_ROWS`, the scoring floor).
+  It is faster in every cell, from 1.04× at 4 096 × 8 to 8.3× at
+  1 048 576 × 128, where it is 88-125× the 8-worker CPU.
+* `interquartile`: select from 65 536 rows (`IQR_SELECT_MIN_ROWS`), the
+  smallest `N` at which it is faster at both `P`. Below it, with few
+  candidates, the extra launches cost more than the half sort saves. At
+  1 048 576 × 128 it is 2.8× the exact sort path and 17-22× the 8-worker CPU.
+* `maximum`: the one-pass #227 scan stays. It is faster in 8 of 10 cells; the
+  select path wins only with `P = 8` from 262 144 rows, by under 3 ms, and the
+  search ranks `maximum` with the #287 objective kernel anyway. The select path
+  still computes rank `n − 1`, pinned bit for bit against the scan's CPU value.
+
+The large `N = 2.456 M`, `P = 447` comparison against the 8-worker CPU (#288
+T1) is the final full test, not part of this bench.
+
+Tests: `src/gpu_order_select_tests.rs` pins median, maximum and the
+interquartile mean bit for bit against the CPU on both paths for `n = 1..40` and
+around the bin and tile boundaries; 1, 2, 3, 7 and 64 blocks per segment at
+70 000 and 70 001 rows; batch composition, one segment per wave and repetition;
+an entirely tied multiset, `−0.0` residuals, subnormals and `±f64::MAX`;
+all-NaN and one-NaN predictions; the crossover on both sides of each threshold
+and the sort-path fallback.
 
 ### Reported backend and the startup summary
 
@@ -2263,6 +2354,7 @@ the CPU run apart from the backend labels.
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | Exact order/rank **scoring** entry point (#288): median/IQR/maximum/rank/AUC bit-identical to the CPU for the same prediction vector, AUC integer identity and chance cases, non-binary AUC refusal, `+inf` for non-finite predictions, batch-composition/repeat determinism, gate admission and named row-floor refusals | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` `score_batch_*` and `auc_*` tests, `src/search.rs` gate tests) | **verified** (see the #288 section) |
+| Radix select path for the median and the interquartile mean (#288): bit-identical to the sort path and the CPU on every size `n = 1..40` and around the bin/tile boundaries, independent of blocks per segment, wave split and batch composition, ties/`-0.0`/subnormal/`f64::MAX`, non-finite refusal, measured crossover and sort-path fallback | RTX 3060, `src/gpu_order_select_tests.rs` under `compute-sanitizer` memcheck and plain, `bench_order_select_crossover` | **verified** (see [the radix select path](#radix-select-path-for-the-order-statistics)) |
 | `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 | `absolute` paired fit stage and end-to-end quality | RTX 3060, `bench_batched_fit_absolute` and `bench_end_to_end` (`RCSR_BENCH_METRIC=absolute`) | **measured on one workload** — 32.4–35.7× fit stage, no-worse 64/64 at `p=4,8`, 3.55× end-to-end, 6.0 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 
@@ -2632,10 +2724,13 @@ keep row order), so the selected *set* is reproducible as well. Tests cover all
 tied residuals, an all-equal multiset, a top-boundary tie, a bottom-boundary
 tie, half the rows tied at the top, and `n = 2..9` (the `n < 4` fallback).
 
-**Exactness and the f32 boundary risk.** The window sum is a **fixed 256-thread
-tree reduction** over ranks `[lo, hi)` (`k_order_stat_pick`), because a
-single-thread left-to-right sum is bit-identical to the CPU but costs ~200 µs
-per trial at 154 000 rows. The consequence is stated exactly:
+**Exactness and the f32 boundary risk.** The fit ladder's window sum is a
+**fixed 256-thread tree reduction** over ranks `[lo, hi)` (`k_order_stat_pick`,
+`RC_OS_IQR_TREE`), because the ladder runs many trials per candidate and only
+compares them. The **scoring** entry point (#288) uses the bit-identical
+single-thread left-to-right sum instead (`RC_OS_IQR_EXACT`, see
+[the radix select path](#radix-select-path-for-the-order-statistics)). For the
+ladder the consequence is stated exactly:
 
 * the interquartile device score is deterministic (fixed window, fixed thread
   count, no float atomics) and agrees with `metrics::score_weighted` to
