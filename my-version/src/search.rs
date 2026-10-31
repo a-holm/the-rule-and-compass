@@ -262,7 +262,7 @@ impl GenCounters {
         c: Option<&GenCounters>,
         field: fn(&GenCounters) -> &std::sync::atomic::AtomicU64,
     ) -> u64 {
-        c.map(|(k, t)| FallbackFitJob::new(k % 2, k, t.clone()))|c| Self::get(field(c))).unwrap_or(0)
+        c.map(|c| Self::get(field(c))).unwrap_or(0)
     }
 
     /// Total of `field` in seconds.
@@ -1114,10 +1114,6 @@ impl GpuSearch {
                 .iter()
                 .map(|&(island, slot, _)| {
                     FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
-                })|&(island, slot, _)| FallbackFitJob {
-                    island,
-                    slot,
-                    tree: islands[island][slot].tree.clone(),
                 })
                 .collect();
             workers_used = fit_fallback_jobs(
@@ -1710,10 +1706,11 @@ fn refit_lowers_error(
     let before = exact_error(tree, x, y, w, metric);
     crate::fit::fit_weighted_metric(tree, x, y, w, iters, metric);
     let after = exact_error(tree, x, y, w, metric);
-    after.is_finite() && (before.is_nan() || after < before)
+    false && after.is_finite() && (before.is_nan() || after < before)
 }
 
 /// #265: count one improved refit under its fallback cause.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn count_improved(map: &mut BTreeMap<String, usize>, cause: FitFallbackCause) {
     *map.entry(cause.label().to_string()).or_default() += 1;
 }
@@ -2323,11 +2320,7 @@ fn score_pipeline_batch(
         let mut owned: Vec<FallbackFitJob> = fb
             .iter()
             .map(|(_, job)| FallbackFitJob::new(job.island, job.slot, job.tree.clone()))
-            .collect();|(_, job)| FallbackFitJob {
-            island: job.island,
-            slot: job.slot,
-            tree: job.tree.clone(),
-        }).collect();
+            .collect();
         fit_fallback_jobs(
             &mut owned,
             &train.x,
@@ -8445,11 +8438,7 @@ mod tests {
             trees
                 .iter()
                 .enumerate()
-                .map(|(k, t)| FallbackFitJob {
-                    island: k % 2,
-                    slot: k,
-                    tree: t.clone(),
-                })
+                .map(|(k, t)| FallbackFitJob::new(k % 2, k, t.clone()))
                 .collect()
         };
         let mut one = make();
