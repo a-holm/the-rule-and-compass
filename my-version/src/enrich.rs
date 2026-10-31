@@ -1510,6 +1510,7 @@ pub struct Options {
     /// Measured sequential write bandwidth used by cost model v2 (#300).
     pub write_bw: Option<f64>,
     pub allow_lockbox: bool,
+    pub allow_overlap: bool,
     pub dry_run: bool,
     pub json: bool,
 }
@@ -1534,6 +1535,7 @@ impl Default for Options {
             gpu: GpuMode::Auto,
             write_bw: None,
             allow_lockbox: false,
+            allow_overlap: false,
             dry_run: false,
             json: false,
         }
@@ -6546,6 +6548,7 @@ fn enrich_inner(
             )
         })?;
         let spec = LabelSpec::parse(spec_src, tf)?;
+        spec.check_overlap(tf, opts.allow_overlap)?;
         let base = format!("fwd{}", spec.horizon);
         let mut name = base.clone();
         let mut k = 2;
@@ -7837,6 +7840,14 @@ pub fn run(args: &[String]) -> ! {
             "--out" | "-o" => opts.out = Some(val!()),
             "--features" => opts.features.push(val!()),
             "--label" => opts.labels.push(val!()),
+            "--allow-overlap" => opts.allow_overlap = true,
+            "--allow-short" => fail(&crate::labels::refuse_allow_short()),
+            "--side" => {
+                let v = val!();
+                if let Err(e) = crate::labels::check_side(&v) {
+                    fail(&e);
+                }
+            }
             "--replace" => opts.replace = true,
             "--chunk-rows" => {
                 let v = val!();
@@ -7966,6 +7977,9 @@ INPUT / OUTPUT:
   --eth-data <store>      ETH benchmark store when --data does not contain it
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
+  --allow-overlap         permit a label stride below the horizon for horizons of
+                          4h and longer (labels overlap; use uniqueness weights)
+  --side long             the only side; --side short and --allow-short are refused
   --allow-lockbox         permit labelled rows in 2026H2 (final test only)
   --gpu [auto|on|off]     auto (default) dispatches a registered exact kernel
                           only when the cost model estimates it faster; on
