@@ -13,93 +13,94 @@ fn scripts_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts")
 }
 
+fn check_launcher_text(name: &str, text: &str, hash_marker: &str) {
+    // #211: the development log is on by default; a launcher names one log
+    // per run so windows never share `rcsr.dev.ndjson`.
+    for flag in ["--run-manifest", "--json-out", "--progress", "--dev-log"] {
+        assert!(text.contains(flag), "{name} does not pass {flag}");
+    }
+    assert!(
+        text.contains("--gpu") && text.contains("--cpu"),
+        "{name} must make the backend explicit"
+    );
+    assert!(
+        !text.contains("DEVNULL"),
+        "{name} redirects output to DEVNULL; keep a log instead"
+    );
+    assert!(
+        text.contains(hash_marker),
+        "{name} must derive the seed with a stable SHA-256"
+    );
+}
+
 #[test]
 fn every_tracked_launcher_publishes_a_verifiable_run() {
     let mut seen = 0;
     for entry in fs::read_dir(scripts_dir()).expect("read scripts/") {
         let path = entry.expect("dir entry").path();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if ext != "sh" && ext != "py" {
+        if path.file_name().and_then(|n| n.to_str()) != Some("run-long.sh") {
             continue;
         }
         seen += 1;
         let text = fs::read_to_string(&path).expect("read launcher");
         let name = path.file_name().unwrap().to_string_lossy();
-        // #211: the development log is on by default; a launcher names one log
-        // per run so windows never share `rcsr.dev.ndjson`.
-        for flag in ["--run-manifest", "--json-out", "--progress", "--dev-log"] {
-            assert!(text.contains(flag), "{name} does not pass {flag}");
-        }
-        assert!(
-            text.contains("--gpu") && text.contains("--cpu"),
-            "{name} must make the backend explicit"
-        );
-        assert!(
-            !text.contains("DEVNULL"),
-            "{name} redirects output to DEVNULL; keep a log instead"
-        );
-        if ext == "py" {
-            assert!(
-                !text.contains("hash("),
-                "{name} uses Python's salted hash(); derive the seed with SHA-256"
-            );
-            assert!(
-                text.contains("hashlib.sha256"),
-                "{name} must derive the seed with SHA-256"
-            );
-        }
-        if ext == "sh" {
-            assert!(
-                text.contains("sha256sum"),
-                "{name} must derive the seed with a stable hash"
-            );
-        }
+        check_launcher_text(&name, &text, "sha256sum");
     }
-    assert!(seen >= 2, "expected the tracked launcher examples, found {seen}");
+    assert!(seen == 1, "expected the tracked shell launcher, found {seen}");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/rcsr_launch.rs");
+    let text = fs::read_to_string(&source).expect("read rcsr-launch source");
+    check_launcher_text("rcsr_launch.rs", &text, "sha256_hex");
+}
+
+fn launch_dry_run(out: &Path, label: &str) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr-launch"))
+        .args([
+            "--data",
+            "unused.csv",
+            "--target",
+            "y",
+            "--vars",
+            "x",
+            "--backend",
+            "cpu",
+            "--seed",
+            "7",
+            "--out-dir",
+            out.to_str().unwrap(),
+            "--window",
+            &format!("{label},100,200"),
+            "--dry-run",
+        ])
+        .output()
+        .expect("run rcsr-launch");
+    assert!(output.status.success(), "{:?}", output);
+    String::from_utf8_lossy(&output.stdout).to_string()
 }
 
 #[test]
 fn the_seed_is_stable_across_processes() {
-    // Python's hash(label) changes between interpreters because it is salted.
-    // Two separate `--dry-run` invocations must produce the same seed, and a
-    // different label must produce a different one.
-    let py = Command::new("python3").arg("--version").output();
-    if py.is_err() {
-        eprintln!("python3 is unavailable; skipping the seed-stability check");
-        return;
-    }
+    // SHA-256("alpha:7") = 8855c828..., SHA-256("beta:7") = 98e9f534...; the
+    // seed is the first 8 hex digits mod 100000.
     let out = unique_dir("seed");
-    let run = |label: &str| {
-        let output = Command::new("python3")
-            .arg(scripts_dir().join("launch-windows.py"))
-            .args([
-                "--data",
-                "unused.csv",
-                "--target",
-                "y",
-                "--vars",
-                "x",
-                "--backend",
-                "cpu",
-                "--seed",
-                "7",
-                "--out-dir",
-                out.to_str().unwrap(),
-                "--window",
-                &format!("{label},100,200"),
-                "--dry-run",
-            ])
-            .output()
-            .expect("run launcher");
-        assert!(output.status.success(), "{:?}", output);
-        String::from_utf8_lossy(&output.stdout).to_string()
-    };
-    let a1 = run("alpha");
-    let a2 = run("alpha");
-    let b = run("beta");
+    let a1 = launch_dry_run(&out, "alpha");
+    let a2 = launch_dry_run(&out, "alpha");
+    let b = launch_dry_run(&out, "beta");
     assert_eq!(a1, a2, "the resolved seed changed between processes");
     assert_ne!(a1, b, "different labels must not share a seed");
-    assert!(a1.contains("resolved_seed="), "{a1}");
+    assert!(a1.contains("# resolved_seed=23176 label=alpha backend=cpu\n"), "{a1}");
+    assert!(b.contains("# resolved_seed=69492 label=beta backend=cpu\n"), "{b}");
+    assert!(
+        a1.contains(&format!(
+            "--seed 23176 --generations 1000000 --save {0}/alpha.ckpt",
+            out.display()
+        )),
+        "{a1}"
+    );
+    assert!(
+        a1.contains("--train-select 'ts >= 0 and ts < -86300' --test-select 'ts >= 100 and ts < 200'"),
+        "{a1}"
+    );
+    assert!(a1.trim_end().ends_with("--dev-log-level summary --cpu"), "{a1}");
     let _ = fs::remove_dir_all(out);
 }
 
@@ -221,4 +222,43 @@ fn unique_dir(tag: &str) -> PathBuf {
         n,
         tag
     ))
+}
+
+#[test]
+fn rss_sampler_records_csv_and_summary_for_a_child() {
+    let dir = unique_dir("rss");
+    fs::create_dir_all(&dir).expect("create temp dir");
+    let csv = dir.join("rss.csv");
+    let output = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
+        .args(["--csv", csv.to_str().unwrap(), "--interval", "0.02", "--", "sleep", "0.2"])
+        .output()
+        .expect("run rcsr-rss");
+    assert!(output.status.success(), "{:?}", output);
+    let text = fs::read_to_string(&csv).expect("read csv");
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("elapsed_s,vmrss_kib,vmhwm_kib,threads"));
+    assert!(lines.count() >= 2, "expected at least 2 samples: {text}");
+    let summary = String::from_utf8_lossy(&output.stdout);
+    for key in [
+        "command",
+        "csv",
+        "exit_code",
+        "interval_s",
+        "peak_rss_bytes",
+        "peak_rss_kib_sampled",
+        "peak_threads",
+        "peak_vmhwm_kib",
+        "samples",
+        "wall_s",
+    ] {
+        assert!(summary.contains(&format!("\"{key}\": ")), "missing {key}: {summary}");
+    }
+    assert!(summary.contains("\"exit_code\": 0"), "{summary}");
+
+    let failing = Command::new(env!("CARGO_BIN_EXE_rcsr-rss"))
+        .args(["--", "sh", "-c", "exit 3"])
+        .output()
+        .expect("run rcsr-rss");
+    assert_eq!(failing.status.code(), Some(3), "the child's status is propagated");
+    let _ = fs::remove_dir_all(dir);
 }

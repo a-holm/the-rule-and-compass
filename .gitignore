@@ -16,6 +16,5 @@ my-version/target/
 rcsr.dev.ndjson
 **.dev.ndjson
 
-# Python benchmark bytecode
-__pycache__/
-*.pyc
+# Run artifacts of the workshop (verksted/) are git-ignored; the workshop itself is tracked.
+verksted/**/output/

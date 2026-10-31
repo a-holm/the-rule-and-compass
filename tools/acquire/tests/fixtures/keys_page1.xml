@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>data.binance.vision</Name><Prefix>data/spot/monthly/klines/ETHUSDT/15m/</Prefix><Marker></Marker><MaxKeys>2</MaxKeys><IsTruncated>true</IsTruncated><Contents><Key>data/spot/monthly/klines/ETHUSDT/15m/ETHUSDT-15m-2017-08.zip</Key><Size>1</Size></Contents><Contents><Key>data/spot/monthly/klines/ETHUSDT/15m/ETHUSDT-15m-2017-08.zip.CHECKSUM</Key><Size>89</Size></Contents></ListBucketResult>

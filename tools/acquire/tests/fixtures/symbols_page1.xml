@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>data.binance.vision</Name><Prefix>data/spot/monthly/klines/</Prefix><Marker></Marker><NextMarker>data/spot/monthly/klines/1000SATSUSDT/</NextMarker><MaxKeys>2</MaxKeys><Delimiter>/</Delimiter><IsTruncated>true</IsTruncated><CommonPrefixes><Prefix>data/spot/monthly/klines/0GUSDT/</Prefix></CommonPrefixes><CommonPrefixes><Prefix>data/spot/monthly/klines/1000SATSUSDT/</Prefix></CommonPrefixes></ListBucketResult>

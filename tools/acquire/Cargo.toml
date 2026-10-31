@@ -1,0 +1,19 @@
+[package]
+name = "rcsr-acquire"
+version = "0.1.0"
+edition = "2021"
+description = "Binance Vision archive acquisition: list, fetch and verify, with curl as the transport"
+publish = false
+
+[lib]
+name = "rcsr_acquire"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rcsr-acquire"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3

@@ -1,0 +1,14 @@
+HTTP/2 200 
+content-type: application/zip
+content-length: 89
+accept-ranges: bytes
+date: Sat, 31 Oct 2026 00:56:36 GMT
+server: AmazonS3
+last-modified: Mon, 05 Oct 2026 11:13:54 GMT
+etag: "8bfefe8388dff21f0f85cd95296a5b9c"
+x-amz-server-side-encryption: AES256
+x-cache: Miss from cloudfront
+via: 1.1 ed0b1ae4224d4a858ec43080e17ab00c.cloudfront.net (CloudFront)
+x-amz-cf-pop: OSL50-P3
+x-amz-cf-id: fcAkFUTo_QaqyFjM8j6ISSikIPwMVF9yr7H3yGPYnYFRb2BxlIkFYA==
+

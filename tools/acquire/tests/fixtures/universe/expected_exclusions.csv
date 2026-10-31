@@ -1,0 +1,17 @@
+symbol,rule,detail
+1INCHDOWNUSDT,leveraged-token,base ends with DOWN
+AAPLBUSDT,tokenised-stock,base without trailing B is a listed equity ticker
+BTCBULLUSDT,leveraged-token,base ends with BULL
+DUSDT,tokenised-stock,single-letter equity base
+ETHDOWNUSDT,leveraged-token,base ends with DOWN
+ETHUPUSDT,leveraged-token,base ends with UP
+EURUSDT,stablecoin,base in stablecoins
+EURUSDT,fiat,base in fiat
+FOOUSDT,stablecoin,product tag stablecoin
+OILXUSDT,commodity-token,product tag tCommodities
+PAXGUSDT,commodity-token,base in commodities
+TSLABUSDT,tokenised-stock,product tag bStocks
+USDCUSDT,stablecoin,base in stablecoins
+USDSOLDUSDT,stablecoin,base in stablecoins
+USDSOLDUSDT,stablecoin-legacy,base in stablecoin_legacy
+币USDT,non-ascii,base has non-ASCII characters
