@@ -1,10 +1,10 @@
 //! #288: the radix select path of the exact order-statistic scorers.
 //!
-//! Every statistic the select path computes (median, maximum) must be the same
-//! bits as the segmented-sort path and as the CPU metric for the same `f64`
-//! prediction vector, whatever the launch partition, wave split or batch
-//! composition. The scoring interquartile mean is pinned bit for bit on the sort
-//! path. Device-dependent tests skip cleanly on a machine without CUDA.
+//! The median, the maximum and the scoring interquartile mean must be the same
+//! bits on the radix select path, on the segmented-sort path and in the CPU
+//! metric for the same `f64` prediction vector, whatever the launch partition,
+//! wave split or batch composition. Device-dependent tests skip cleanly on a
+//! machine without CUDA.
 
 use super::*;
 use crate::expr::{constant, input, node};
@@ -149,14 +149,14 @@ fn cpu_bits(f: &Fixture, t: &Node, cs: &[Vec<f64>], code: OrderCode) -> Vec<Opti
         .collect()
 }
 
-/// Every (statistic, path) pair this module pins: the select path computes
-/// the median and the maximum; the scoring interquartile mean is sort-only.
-const PAIRS: [(OrderCode, OrderPath); 5] = [
+/// Every (statistic, path) pair this module pins.
+const PAIRS: [(OrderCode, OrderPath); 6] = [
     (OrderCode::Median, OrderPath::Sort),
     (OrderCode::Median, OrderPath::Select),
     (OrderCode::Maximum, OrderPath::Sort),
     (OrderCode::Maximum, OrderPath::Select),
     (OrderCode::InterquartileExact, OrderPath::Sort),
+    (OrderCode::InterquartileExact, OrderPath::Select),
 ];
 
 fn assert_exact(f: &Fixture, ev: &mut GpuEvaluator, t: &Node, cs: &[Vec<f64>], what: &str) {
@@ -179,9 +179,9 @@ fn trial_constants() -> Vec<Vec<f64>> {
     ]
 }
 
-/// Median and maximum on both paths, and the scoring interquartile mean, are
-/// the CPU metric bit for bit at every small size (odd, even, `n < 4`, one
-/// row) and around the 2 048-bin and tile boundaries.
+/// Median, maximum and the scoring interquartile mean are the CPU metric bit
+/// for bit on both paths at every small size (odd, even, `n < 4`, one row) and
+/// around the 2 048-bin and staging-tile boundaries.
 #[test]
 fn both_paths_match_the_cpu_bit_for_bit_at_every_small_size() {
     let sizes = (1..=40usize).chain([63, 64, 65, 127, 128, 129, 255, 256, 257, 1000, 2049, 4095, 4096, 4097]);
@@ -203,7 +203,7 @@ fn the_select_value_does_not_depend_on_the_block_partition() {
         let t = affine();
         let p = plan(&t);
         let cs = trial_constants();
-        for code in [OrderCode::Median, OrderCode::Maximum] {
+        for code in [OrderCode::Median, OrderCode::Maximum, OrderCode::InterquartileExact] {
             let want = cpu_bits(&f, &t, &cs, code);
             assert_eq!(bits(&run(&mut ev, &p, &cs, code, OrderPath::Sort, 0)), want, "n={n} {code:?} sort");
             for blocks in [0, 1, 2, 3, 7, 64] {
@@ -211,8 +211,6 @@ fn the_select_value_does_not_depend_on_the_block_partition() {
                 assert_eq!(got, want, "n={n} {code:?} select with {blocks} blocks per segment");
             }
         }
-        let iqr = run(&mut ev, &p, &cs, OrderCode::InterquartileExact, OrderPath::Sort, 0);
-        assert_eq!(bits(&iqr), cpu_bits(&f, &t, &cs, OrderCode::InterquartileExact), "n={n} interquartile");
     }
 }
 
@@ -228,7 +226,7 @@ fn select_is_independent_of_batch_composition_and_waves() {
     let other = scaled();
     let q = plan(&other);
     let c = vec![0.8, -0.2];
-    for code in [OrderCode::Median, OrderCode::Maximum] {
+    for code in [OrderCode::Median, OrderCode::Maximum, OrderCode::InterquartileExact] {
         let sel = OrderPath::Select;
         let wave = GpuEvaluator::MEDIAN_WAVE_BYTES;
         let alone = run(&mut ev, &p, &[c.clone()], code, sel, 0)[0].expect("finite");
@@ -307,28 +305,31 @@ fn a_non_finite_prediction_is_refused_on_both_paths() {
 }
 
 /// The measured crossover picks the path, and the sort path answers whenever
-/// the select call fails as a whole (here: a statistic it does not compute).
+/// the select call fails as a whole (here: the #232 tree mean, which only the
+/// sort path computes).
 #[test]
 fn the_crossover_picks_the_path_and_the_sort_path_is_the_fallback() {
-    let at = ORDER_SELECT_MIN_ROWS;
-    for code in [OrderCode::Median, OrderCode::Maximum] {
+    let selectable = [
+        (OrderCode::Median, ORDER_SELECT_MIN_ROWS),
+        (OrderCode::Maximum, ORDER_SELECT_MIN_ROWS),
+        (OrderCode::InterquartileExact, IQR_SELECT_MIN_ROWS),
+    ];
+    for (code, at) in selectable {
+        assert_eq!(code.select_min_rows(), Some(at));
         assert_eq!(order_stat_path(code, at - 1), OrderPath::Sort);
         assert_eq!(order_stat_path(code, at), OrderPath::Select);
     }
-    for code in [OrderCode::InterquartileExact, OrderCode::InterquartileTree] {
-        assert!(!code.selectable());
-        assert_eq!(order_stat_path(code, at), OrderPath::Sort);
-        assert_eq!(order_stat_path(code, usize::MAX), OrderPath::Sort);
-    }
-    for n in [at - 1, at] {
-        let f = fixture(n);
-        let Some(mut ev) = evaluator(&f) else { return };
-        let t = affine();
-        let p = plan(&t);
-        let cs = trial_constants();
-        let trials = vec![cs.clone()];
-        let wave = GpuEvaluator::MEDIAN_WAVE_BYTES;
-        for code in [OrderCode::Median, OrderCode::Maximum] {
+    assert_eq!(OrderCode::InterquartileTree.select_min_rows(), None);
+    assert_eq!(order_stat_path(OrderCode::InterquartileTree, usize::MAX), OrderPath::Sort);
+    let wave = GpuEvaluator::MEDIAN_WAVE_BYTES;
+    let t = affine();
+    let p = plan(&t);
+    let cs = trial_constants();
+    let trials = vec![cs.clone()];
+    for (code, at) in selectable {
+        for n in [at - 1, at] {
+            let f = fixture(n);
+            let Some(mut ev) = evaluator(&f) else { return };
             let chosen = ev.order_code_score(&[&p], &trials, code, wave).expect("dispatched")[0].clone();
             let sort = run(&mut ev, &p, &cs, code, OrderPath::Sort, 0);
             let select = run(&mut ev, &p, &cs, code, OrderPath::Select, 0);
@@ -336,17 +337,20 @@ fn the_crossover_picks_the_path_and_the_sort_path_is_the_fallback() {
             assert_eq!(bits(&select), bits(&sort), "n={n} {code:?}");
             assert_eq!(bits(&sort), cpu_bits(&f, &t, &cs, code), "n={n} {code:?}");
         }
-        let code = OrderCode::InterquartileExact;
-        assert!(
-            ev.order_code_trials(&[&p], &trials, code, OrderPath::Select, wave, 0).is_none(),
-            "the select entry must refuse a window mean"
-        );
-        let fell_back = ev
-            .order_code_score_on(&[&p], &trials, code, OrderPath::Select, wave)
-            .expect("the sort path answered")[0]
-            .clone();
-        assert_eq!(bits(&fell_back), cpu_bits(&f, &t, &cs, code), "n={n} fallback");
     }
+    let f = fixture(ORDER_SELECT_MIN_ROWS);
+    let Some(mut ev) = evaluator(&f) else { return };
+    let code = OrderCode::InterquartileTree;
+    assert!(
+        ev.order_code_trials(&[&p], &trials, code, OrderPath::Select, wave, 0).is_none(),
+        "the select entry must refuse the tree mean"
+    );
+    let fell_back = ev
+        .order_code_score_on(&[&p], &trials, code, OrderPath::Select, wave)
+        .expect("the sort path answered")[0]
+        .clone();
+    let sort = run(&mut ev, &p, &cs, code, OrderPath::Sort, 0);
+    assert_eq!(bits(&fell_back), bits(&sort), "the fallback is the sort path's answer");
 }
 
 /// Paired measurement for the crossover: sort path vs select path vs the
@@ -386,6 +390,7 @@ fn bench_order_select_crossover() {
                 (OrderCode::Maximum, OrderPath::Select, "select"),
                 (OrderCode::InterquartileTree, OrderPath::Sort, "sort_tree"),
                 (OrderCode::InterquartileExact, OrderPath::Sort, "sort_exact"),
+                (OrderCode::InterquartileExact, OrderPath::Select, "select_exact"),
             ];
             for (code, path, label) in device.drain(..) {
                 let mut best = f64::INFINITY;

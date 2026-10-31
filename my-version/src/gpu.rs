@@ -1344,9 +1344,15 @@ pub(crate) const RANK_ROW_BYTES: u64 = 72;
 /// copy and the radix sort's alternate keys.
 pub(crate) const ORDER_ROW_BYTES: u64 = 64;
 
-/// #288: device bytes a radix-select segment holds per row: the keys only. The
-/// histograms and prefixes are per segment and fit the fixed 1 MiB charge.
+/// #288: device bytes a radix-select segment holds per row for the median and
+/// the maximum: the keys only. The histograms and prefixes are per segment and
+/// fit the fixed 1 MiB charge.
 pub(crate) const SELECT_ROW_BYTES: u64 = 8;
+
+/// #288: device bytes a radix-select segment holds per row for the
+/// interquartile mean: the keys, the interior keys of the half-size window,
+/// their sorted copy and the sort's alternate buffer.
+pub(crate) const SELECT_IQR_ROW_BYTES: u64 = 24;
 
 /// #288: the order statistic a device call computes. The discriminants are the
 /// `what` codes of `src/cuda/eval.cu` (`RC_OS_*`).
@@ -1375,11 +1381,16 @@ impl OrderCode {
         }
     }
 
-    /// One or two order statistics, which the radix select path computes. The
-    /// interquartile mean needs its whole window in ascending order, so only
-    /// the sort path computes it.
-    pub(crate) fn selectable(self) -> bool {
-        matches!(self, OrderCode::Median | OrderCode::Maximum)
+    /// Rows from which the radix select path is faster than the segmented
+    /// sort, measured by `bench_order_select_crossover` (`docs/gpu-backend.md`),
+    /// or `None` when only the sort path computes the statistic (the #232 tree
+    /// mean).
+    pub(crate) fn select_min_rows(self) -> Option<usize> {
+        match self {
+            OrderCode::Median | OrderCode::Maximum => Some(ORDER_SELECT_MIN_ROWS),
+            OrderCode::InterquartileExact => Some(IQR_SELECT_MIN_ROWS),
+            OrderCode::InterquartileTree => None,
+        }
     }
 }
 
@@ -1392,17 +1403,18 @@ pub(crate) enum OrderPath {
     Select,
 }
 
-/// #288: rows from which the radix select path is faster than the segmented
-/// sort, measured by `bench_order_select_crossover` (`docs/gpu-backend.md`).
+/// #288: the measured median/maximum crossover of the select path.
 pub(crate) const ORDER_SELECT_MIN_ROWS: usize = 4096;
+
+/// #288: the measured interquartile crossover of the select path.
+pub(crate) const IQR_SELECT_MIN_ROWS: usize = 65_536;
 
 /// #288: the measured path for `code` on `n` rows. Below the crossover, and for
 /// a statistic the select path does not compute, the sort path runs.
 pub(crate) fn order_stat_path(code: OrderCode, n: usize) -> OrderPath {
-    if code.selectable() && n >= ORDER_SELECT_MIN_ROWS {
-        OrderPath::Select
-    } else {
-        OrderPath::Sort
+    match code.select_min_rows() {
+        Some(min) if n >= min => OrderPath::Select,
+        _ => OrderPath::Sort,
     }
 }
 
@@ -2766,9 +2778,10 @@ impl GpuEvaluator {
             return None;
         }
         let kmax = plans.iter().map(|p| p.nconst).max()?;
-        let row_bytes = match path {
-            OrderPath::Sort => ORDER_ROW_BYTES,
-            OrderPath::Select => SELECT_ROW_BYTES,
+        let row_bytes = match (path, code) {
+            (OrderPath::Sort, _) => ORDER_ROW_BYTES,
+            (OrderPath::Select, OrderCode::InterquartileExact) => SELECT_IQR_ROW_BYTES,
+            (OrderPath::Select, _) => SELECT_ROW_BYTES,
         };
         let (wave_sets, chunk) = wave_shape(n, ntrials, wave_bytes, row_bytes);
         let mut out: Vec<Vec<Option<f64>>> = vec![vec![None; ntrials]; nsets];
@@ -3131,8 +3144,10 @@ impl GpuEvaluator {
     ///
     /// * `Median`: the exact middle order statistic of `|r|`, on the radix
     ///   select path from [`ORDER_SELECT_MIN_ROWS`] and the sort path below;
-    /// * `Interquartile`: the exact window mean of `|r|` on the sort path,
-    ///   added in ascending order like the CPU, so bit for bit;
+    /// * `Interquartile`: the exact window mean of `|r|`, added in ascending
+    ///   order like the CPU, so bit for bit; the select path selects the
+    ///   window boundaries and sorts only the interior from
+    ///   [`IQR_SELECT_MIN_ROWS`];
     /// * `Maximum`: the exact order-free `max |r|` scan (#227);
     /// * `RankCorrelation` / `RankCorrelationSigned`: the exact integer rank
     ///   sums of #230 mapped to `1 − |ρ|` / `1 − ρ`;
