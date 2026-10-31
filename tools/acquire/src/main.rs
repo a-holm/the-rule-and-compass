@@ -1,6 +1,6 @@
 use rcsr_acquire::calendar::{self, Month};
 use rcsr_acquire::transport::Curl;
-use rcsr_acquire::{fetch, json, listing, verify, DATA_URL, KLINES_PREFIX, LIST_URL};
+use rcsr_acquire::{fetch, json, listing, universe, verify, DATA_URL, KLINES_PREFIX, LIST_URL};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +18,8 @@ USAGE:
                       [--to <YYYY-MM>] [--out <dir>] [--jobs <n>] [--skip-404]
   rcsr-acquire verify --interval <iv> [--dir <dir>] [--symbols <A,B,..>] [--from <YYYY-MM>]
                       [--to <YYYY-MM>] [--snapshot <file>] [--through <YYYY-MM-DD>] [--jobs <n>]
+  rcsr-acquire universe --archive <file> [--products <prod.json>] [--equities <f1,f2,..>] [--config <file>]
+                      [--tickers <spot.json> --top-by-quote-volume <n>] [--out <dir>]
 
 list    Lists the archive bucket. Without --symbols it writes <out>/all_symbols_archive.txt.
         With --interval it also writes <out>/keys_<iv>.json, the months published per symbol.
@@ -32,6 +34,15 @@ verify  Fetches the .CHECKSUM sibling of every zip under <dir>/raw_<iv>/, compar
         not verified. `complete` is true only when all zips verify and coverage_last is at
         least --through.
 
+universe Filters the USDT symbols of an archive list to genuine crypto pairs. Every input is a file;
+        nothing is downloaded. Writes <out>/universe_all_usdt_pit.txt (sorted) and
+        <out>/symbol_exclusions.csv (symbol,rule,detail, one row per matched rule). --products is the
+        exchange product list (JSON with a \"data\" array of {s,tags}); a symbol listed there is not
+        checked by the equity name heuristic. --equities are NASDAQ-format ticker files. --config
+        replaces keys of the default rules (tools/acquire/universe-defaults.toml). With --tickers
+        (JSON array of {symbol,quoteVolume}) and --top-by-quote-volume N it also writes
+        <out>/universe_top_N_by_quote_volume.txt, the N kept symbols by quote volume.
+
 Defaults: --out and --dir are the current directory, --jobs is 4. Requests retry 3 times.
 Exit codes: 0 success, 1 failed requests or unverified zips, 2 usage error.
 ";
@@ -43,7 +54,8 @@ struct Args {
 
 const VALUE_FLAGS: &[&str] = &[
     "--out", "--dir", "--interval", "--symbols", "--symbols-file", "--from", "--to", "--jobs",
-    "--snapshot", "--through",
+    "--snapshot", "--through", "--archive", "--products", "--equities", "--config", "--tickers",
+    "--top-by-quote-volume",
 ];
 const SWITCHES: &[&str] = &["--skip-404"];
 
@@ -133,6 +145,7 @@ fn main() -> ExitCode {
         "list" => cmd_list(&args),
         "fetch" => cmd_fetch(&args),
         "verify" => cmd_verify(&args),
+        "universe" => cmd_universe(&args),
         other => Err(format!("unknown subcommand '{other}'")),
     });
     match result {
@@ -292,4 +305,34 @@ fn cmd_verify(args: &Args) -> Result<u8, String> {
     let verified = entries.iter().filter(|e| e.verified).count();
     println!("verified {verified}/{} -> {}", entries.len(), path.display());
     Ok(u8::from(entries.is_empty() || verified != entries.len()))
+}
+
+fn cmd_universe(args: &Args) -> Result<u8, String> {
+    let top = args
+        .get("--top-by-quote-volume")
+        .map(|v| v.parse::<usize>().ok().filter(|n| *n >= 1).ok_or(format!("invalid --top-by-quote-volume '{v}'")))
+        .transpose()?;
+    let cfg = universe::UniverseConfig {
+        archive: PathBuf::from(args.get("--archive").ok_or("--archive is required")?),
+        products: args.get("--products").map(PathBuf::from),
+        equities: args.get("--equities").map(|v| v.split(',').filter(|p| !p.is_empty()).map(PathBuf::from).collect()).unwrap_or_default(),
+        config: args.get("--config").map(PathBuf::from),
+        tickers: args.get("--tickers").map(PathBuf::from),
+        top,
+        out: args.path("--out"),
+    };
+    let s = universe::run(&cfg)?;
+    let rules: Vec<String> = s.by_rule.iter().map(|(r, n)| format!("{r} {n}")).collect();
+    println!(
+        "archive usdt {} kept {} excluded rows {} ({}) -> {}",
+        s.usdt,
+        s.kept,
+        s.by_rule.values().sum::<usize>(),
+        rules.join(", "),
+        cfg.out.display()
+    );
+    if let Some(f) = &s.top_file {
+        println!("top {} -> {}", s.top_count, f.display());
+    }
+    Ok(0)
 }
