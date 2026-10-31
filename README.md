@@ -180,10 +180,8 @@ long/flat from the training mean, matched-exposure random long seeded by
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
 strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
-semantics, metric definitions and the reference-agreement check against the
-Python evaluator, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
-the pinned 4M-row Python-vs-Rust benchmark protocol and the measured 10x
-evidence.
+semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
+the pinned 4M-row benchmark protocol and the measured wall time.
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),

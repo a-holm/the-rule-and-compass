@@ -271,7 +271,7 @@ cache because a splice changes a symbol's identity across two archives.
 
 For measurement, set `RCSR_PREP_RSS_LOG=1` to print `VmRSS` at assembly
 checkpoints, or run the harness
-`scripts/measure/prep_rss.py --csv rss.csv -- <rcsr prep ...>`; it samples
+`rcsr-rss --csv rss.csv -- <rcsr prep ...>`; it samples
 `/proc/<pid>/status` (`VmRSS`, `VmHWM`, `Threads`) and reports the peak in
 bytes alongside the child's wall time. The thread count shows the bounded
 worker phases versus the single-threaded assembly.

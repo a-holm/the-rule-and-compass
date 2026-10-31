@@ -15,7 +15,3 @@ my-version/target/
 # directory (including `cargo test`) writes this file.
 rcsr.dev.ndjson
 **.dev.ndjson
-
-# Python benchmark bytecode
-__pycache__/
-*.pyc
