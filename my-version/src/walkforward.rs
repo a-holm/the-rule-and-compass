@@ -182,6 +182,10 @@ pub struct EvalSpec {
     /// #306: minimum consecutive long rows before a band exit is allowed
     /// (>= 1; `1` is the plain band).
     pub min_hold: usize,
+    /// #306: run the band/cooldown and hindsight DP scans on the device. The
+    /// device result is bit-identical to the CPU scan; when the device refuses,
+    /// the CPU scan runs and the report names the reason.
+    pub gpu: bool,
     /// Reset every pool seam to flat (the historical behaviour). The default
     /// carries the ending position of one test block into the next, so pooled
     /// total variation includes `|p_end - q_start|`.
@@ -295,6 +299,10 @@ pub struct BandCheck {
     pub net: f64,
     /// Scalar evaluator's sum of per-row net returns.
     pub scalar_net: f64,
+    /// `cuda` when the device scan produced the carries, `cpu` otherwise.
+    pub backend: String,
+    /// Why `--gpu` fell back to the CPU scan; `None` without a fallback.
+    pub fallback_reason: Option<String>,
 }
 
 /// #306: the exact hindsight DP, labelled as a bound and not a strategy.
@@ -311,6 +319,30 @@ pub struct HindsightBound {
     pub groups: usize,
     /// `rule_net <= net` (with a 1e-12 absolute tolerance for summation order).
     pub rule_le_bound: bool,
+    /// `cuda` when the device scan produced the carries, `cpu` otherwise.
+    pub backend: String,
+    /// Why `--gpu` fell back to the CPU scan; `None` without a fallback.
+    pub fallback_reason: Option<String>,
+}
+
+/// Run a #306 scan on the device when asked, else (or on refusal) on the CPU.
+/// Returns the scan, the backend label and the fallback reason.
+fn scan_with_backend<T>(
+    gpu: bool,
+    what: &str,
+    device: impl FnOnce() -> Result<T, String>,
+    cpu: impl FnOnce() -> Result<T, String>,
+) -> (T, String, Option<String>) {
+    let fallback_reason = if gpu {
+        match device() {
+            Ok(scan) => return (scan, "cuda".to_string(), None),
+            Err(reason) => Some(reason),
+        }
+    } else {
+        None
+    };
+    let scan = cpu().unwrap_or_else(|e| panic!("{} failed: {}", what, e));
+    (scan, "cpu".to_string(), fallback_reason)
 }
 
 /// #304: one test block's fused long-only reduction, plus the two benchmarks.
@@ -359,6 +391,8 @@ pub struct Report {
     pub policy: Policy,
     pub band_width: f64,
     pub min_hold: usize,
+    /// #306: `--gpu` was set for the band/DP scans.
+    pub gpu: bool,
     pub validation_frac: f64,
     pub horizon: f64,
     pub embargo: f64,
@@ -969,6 +1003,7 @@ impl Accum {
                 spec.policy,
                 spec.band_width,
                 spec.min_hold,
+                spec.gpu,
                 spec.device_pnl,
                 Some(ControlInput {
                     seed: spec.control_seed,
@@ -993,6 +1028,7 @@ impl Accum {
                     spec.policy,
                     spec.band_width,
                     spec.min_hold,
+                    spec.gpu,
                     false,
                     None,
                 )
@@ -1007,6 +1043,7 @@ impl Accum {
                     spec.policy,
                     spec.band_width,
                     spec.min_hold,
+                    spec.gpu,
                     false,
                     None,
                 )
@@ -1113,6 +1150,7 @@ impl Accum {
             policy: spec.policy,
             band_width: spec.band_width,
             min_hold: spec.min_hold,
+            gpu: spec.gpu,
             validation_frac: spec.validation_frac,
             horizon: spec.horizon,
             embargo: spec.embargo_seconds(),
@@ -1476,6 +1514,7 @@ fn evaluate_window(
     policy: Policy,
     band_width: f64,
     min_hold: usize,
+    gpu: bool,
     device_pnl: bool,
     control_input: Option<ControlInput>,
 ) -> WindowEval {
@@ -1525,45 +1564,82 @@ fn evaluate_window(
     // #306: the band/cooldown book. `positions` are aligned with `order`;
     // `net` includes the final exit of every group. `dp` deliberately keeps
     // the threshold book: the DP is a bound, not a strategy.
-    let band_scan: Option<(Vec<f64>, f64, usize, String)> = if policy == Policy::Band {
+    type BandBook = (Vec<f64>, f64, usize, String, String, Option<String>);
+    let band_scan: Option<BandBook> = if policy == Policy::Band {
         let params = crate::trading_gpu::BandParams {
             threshold,
             band: band_width,
             min_hold,
         };
         if min_hold > 1 {
-            let scan = crate::trading_gpu::cooldown_scan(
-                &ord_scores,
-                &ord_returns,
-                &ord_groups,
-                &params,
-                cost_side,
-                65_536,
-            )
-            .unwrap_or_else(|e| panic!("cooldown scan failed: {}", e));
+            let (scan, backend, reason) = scan_with_backend(
+                gpu,
+                "cooldown scan",
+                || {
+                    crate::trading_gpu::cooldown_scan_device(
+                        &ord_scores,
+                        &ord_returns,
+                        &ord_groups,
+                        &params,
+                        cost_side,
+                        crate::trading_gpu::SCAN_THREADS,
+                        65_536,
+                    )
+                },
+                || {
+                    crate::trading_gpu::cooldown_scan(
+                        &ord_scores,
+                        &ord_returns,
+                        &ord_groups,
+                        &params,
+                        cost_side,
+                        65_536,
+                    )
+                },
+            );
             let net = scan.net();
             Some((
                 scan.positions,
                 net,
                 scan.carries.len(),
                 format!("cooldown-{}", min_hold),
+                backend,
+                reason,
             ))
         } else {
-            let scan = crate::trading_gpu::band_scan(
-                &ord_scores,
-                &ord_returns,
-                &ord_groups,
-                &params,
-                cost_side,
-                65_536,
-            )
-            .unwrap_or_else(|e| panic!("band scan failed: {}", e));
+            let (scan, backend, reason) = scan_with_backend(
+                gpu,
+                "band scan",
+                || {
+                    crate::trading_gpu::band_scan_device(
+                        &ord_scores,
+                        &ord_returns,
+                        &ord_groups,
+                        &params,
+                        cost_side,
+                        crate::trading_gpu::SCAN_THREADS,
+                        65_536,
+                    )
+                },
+                || {
+                    crate::trading_gpu::band_scan(
+                        &ord_scores,
+                        &ord_returns,
+                        &ord_groups,
+                        &params,
+                        cost_side,
+                        65_536,
+                    )
+                },
+            );
             let net = scan.net();
             Some((
                 scan.positions,
                 net,
                 scan.carries.len(),
                 "carry2".to_string(),
+                backend,
+                reason,
             ))
         }
     } else {
@@ -1573,7 +1649,7 @@ fn evaluate_window(
     for (k, &i) in order.iter().enumerate() {
         let row = &rows[valid[i]];
         let pos = match &band_scan {
-            Some((positions, _, _, _)) => positions[k],
+            Some((positions, ..)) => positions[k],
             // #305: strict `>` and a non-finite score is flat.
             None => trading_gpu::long_position(scores[valid[i]], threshold) as f64,
         };
@@ -1682,20 +1758,36 @@ fn evaluate_window(
     };
 
     let scalar_net = net.iter().sum::<f64>();
-    let band = band_scan.map(|(_, band_net, groups, carry)| BandCheck {
-        band_width,
-        min_hold,
-        carry,
-        groups,
-        net: band_net,
-        scalar_net,
-    });
+    let band = band_scan.map(
+        |(_, band_net, groups, carry, backend, fallback_reason)| BandCheck {
+            band_width,
+            min_hold,
+            carry,
+            groups,
+            net: band_net,
+            scalar_net,
+            backend,
+            fallback_reason,
+        },
+    );
 
     // #306: exact hindsight DP for the same rows and costs. It is reported as
     // a bound only; the threshold (or band) book above remains the strategy.
     let hindsight_bound = if policy == Policy::Dp {
-        let scan = crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536)
-            .unwrap_or_else(|e| panic!("hindsight DP scan failed: {}", e));
+        let (scan, backend, fallback_reason) = scan_with_backend(
+            gpu,
+            "hindsight DP scan",
+            || {
+                crate::trading_gpu::dp_scan_device(
+                    &ord_returns,
+                    &ord_groups,
+                    cost_side,
+                    crate::trading_gpu::SCAN_THREADS,
+                    65_536,
+                )
+            },
+            || crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536),
+        );
         let bound = scan.bound(cost_side);
         Some(HindsightBound {
             label: "hindsight_bound".to_string(),
@@ -1704,6 +1796,8 @@ fn evaluate_window(
             gap: bound - scalar_net,
             groups: scan.carries.len(),
             rule_le_bound: scalar_net <= bound + 1e-12,
+            backend,
+            fallback_reason,
         })
     } else {
         None
@@ -2050,27 +2144,33 @@ fn controls_json(c: &crate::baselines::ControlSet) -> String {
 fn band_check_json(b: &BandCheck) -> String {
     format!(
         "{{\"band_width\":{},\"min_hold\":{},\"carry\":{},\"groups\":{},\
-         \"net\":{},\"scalar_net\":{},\"net_delta\":{}}}",
+         \"net\":{},\"scalar_net\":{},\"net_delta\":{},\"backend\":{},\
+         \"fallback_reason\":{}}}",
         jnum(b.band_width),
         b.min_hold,
         jstr(&b.carry),
         b.groups,
         jnum(b.net),
         jnum(b.scalar_net),
-        jnum(b.net - b.scalar_net)
+        jnum(b.net - b.scalar_net),
+        jstr(&b.backend),
+        b.fallback_reason.as_deref().map_or("null".to_string(), jstr)
     )
 }
 
 fn hindsight_bound_json(h: &HindsightBound) -> String {
     format!(
         "{{\"label\":{},\"is_strategy\":false,\"net\":{},\"rule_net\":{},\
-         \"gap\":{},\"groups\":{},\"rule_le_bound\":{}}}",
+         \"gap\":{},\"groups\":{},\"rule_le_bound\":{},\"backend\":{},\
+         \"fallback_reason\":{}}}",
         jstr(&h.label),
         jnum(h.net),
         jnum(h.rule_net),
         jnum(h.gap),
         h.groups,
-        h.rule_le_bound
+        h.rule_le_bound,
+        jstr(&h.backend),
+        h.fallback_reason.as_deref().map_or("null".to_string(), jstr)
     )
 }
 
@@ -2225,7 +2325,7 @@ impl Report {
              \"charged_on\":\"|position change| per group; per-window metrics start flat, pooled carries the boundary\"}},\
              \"position_rule\":{},\
              \"policy\":{{\"name\":{},\"hindsight_bound\":{},\"band_width\":{},\
-             \"min_hold\":{},\"short\":false}},\
+             \"min_hold\":{},\"short\":false,\"gpu\":{}}},\
              \"threshold\":{{\"quantile\":{},\"fixed\":{},\
              \"method\":\"exact order-preserving radix select + linear interpolation (numpy type 7) in f64\",\
              \"sources\":[\"train_type7\",\"validation_type7\",\"fixed\"],\
@@ -2272,6 +2372,7 @@ impl Report {
             self.policy == Policy::Dp,
             jnum(self.band_width),
             self.min_hold,
+            self.gpu,
             jnum(self.threshold_quantile),
             self.threshold_fixed.map_or("null".to_string(), jnum),
             jstr(self

@@ -783,6 +783,7 @@ fn spec(expr: &str, windows: Vec<Window>) -> EvalSpec {
         policy: walkforward::Policy::Threshold,
         band_width: 0.0,
         min_hold: 1,
+        gpu: false,
         validation_frac: 0.0,
         periods_per_year: Some(4.0),
         candidates: Vec::new(),

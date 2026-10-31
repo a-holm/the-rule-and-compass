@@ -202,6 +202,7 @@ pub fn json() -> String {
 {{\"name\":\"--policy\",\"type\":\"enum\",\"default\":\"threshold\",\"description\":\"threshold | band | dp; band is a long-only no-trade band, dp keeps the threshold book and reports an exact hindsight bound (never a strategy P&L)\"}},\
 {{\"name\":\"--band\",\"type\":\"float\",\"default\":\"0\",\"description\":\"half-width beta of the no-trade band in score units; beta=0 with --policy band reproduces the threshold rule\"}},\
 {{\"name\":\"--min-hold\",\"type\":\"int\",\"default\":\"1\",\"description\":\"minimum consecutive long rows before a band exit\"}},\
+{{\"name\":\"--gpu\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"run the band/cooldown and hindsight DP scans on the CUDA device, bit-identical to the CPU scan; on refusal the CPU scan runs and band/hindsight_bound report backend=cpu with fallback_reason\"}},\
 {{\"name\":\"--validation-frac\",\"type\":\"float\",\"default\":\"0\",\"description\":\"trailing training fraction used to set the threshold\"}},\
 {{\"name\":\"--pool-reset-flat\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"reset positions at each pooled seam instead of carrying the boundary position\"}},\
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
