@@ -750,8 +750,10 @@ approximation. The pre-registered acceptance rules are:
 | rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
 | size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
 | ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
-| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+| `--fit-strategy exact` (the CPU arm when no device arm is admissible) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
 | `--fit-strategy gpu` (#169) | kernel p ≤ 16, nodes ≤ 96, squared/AIC metrics; median constant error ≤ 1e-5 and SSE relative ≤ 1e-8 vs CPU LM on well-conditioned fixtures; every ill-conditioned/non-finite/unsupported candidate falls back and is labelled; finalists refit in exact CPU f64 |
+
+With no `--fit-strategy`, or with `auto`, a run that qualifies resolves to the batched GPU LM with every candidate admitted (`docs/gpu-backend.md`, "Default fit arm"); every other run keeps `exact` (no flag) or the structural `auto`, so CPU-only runs are unchanged.
 
 Because the linear arm reaches the optimum in one solve instead of iterating,
 it **can** change the search trajectory (usually by fitting a linear candidate
@@ -859,7 +861,7 @@ complete (#226), `interquartile_declined` for the interquartile arm (#232) and
 
 | rule | tolerance / behaviour |
 |---|---|
-| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
+| `--fit-strategy exact` (the CPU arm when no device arm is admissible) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
 | linear objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
 | linear constants versus exact LM | relative difference `<= 1e-8` on affine tests |
 | VarPro objective versus exact LM | projected SSE `<=` LM SSE × `(1 + 1e-9)` on separable tests |

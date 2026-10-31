@@ -95,6 +95,10 @@ pub struct Config {
     /// affine in every constant and fall back to LM otherwise. Changing it
     /// changes the trajectory, so it is a saved search setting.
     pub fit_strategy: crate::fit::FitStrategy,
+    /// #223: which offspring the deferred GPU fit admits. A resolved default
+    /// or `auto` GPU arm admits every candidate with constants; an explicit
+    /// `gpu` arm keeps the screened fraction. Saved search state.
+    pub fit_admission: crate::fit::FitAdmission,
     /// #116: print one `# fit:` line with the arm counts. Reporting only; it is
     /// not saved in a checkpoint and is ignored by the search settings check.
     pub fit_report: bool,
@@ -321,6 +325,7 @@ impl Default for Config {
             init_depth: 3,
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
             time_budget: None,
@@ -384,6 +389,7 @@ impl Config {
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
+        compare!(fit_admission, "fit_admission");
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
@@ -1183,7 +1189,7 @@ impl GpuSearch {
             // The non-promoted offspring keep this screening score, so the
             // generation evaluates every candidate once and only survivors a
             // second time after the fit.
-            let wide = wide_admission(cfg.metric, train.len());
+            let wide = admits_all(cfg, train.len());
             // #393: with wide admission every candidate with constants is
             // fitted and scored once after the fit, so only the constant-free
             // ones need the screening score.
@@ -1615,6 +1621,7 @@ impl GpuSearch {
 fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
+            fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
             observed: Some(self.ev.alloc_report().observed()),
@@ -2608,6 +2615,69 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
     Some(crate::memory::device_plan(&workload, &info, &caps))
 }
 
+/// #223: resolve the fit arm of a run that did not name one (`Unset`) or named
+/// `auto`. Run once before generation 0, never on a resume. The CPU arm it
+/// keeps when the device is not admissible is the arm the request names, so a
+/// CPU-only run is unchanged.
+pub fn resolve_fit_strategy(
+    cfg: &Config,
+    train: &Sample,
+    request: crate::fit::FitRequest,
+) -> crate::fit::FitResolution {
+    let backend_ok = if effective_backend(cfg, train) == Backend::Gpu {
+        Ok(())
+    } else if !cfg.gpu {
+        Err("--cpu/--no-gpu".to_string())
+    } else if let Some(why) = backend_blocker_reason(cfg, train) {
+        Err(why.to_string())
+    } else if cfg!(feature = "cuda") {
+        Err("no usable CUDA device".to_string())
+    } else {
+        Err("built without --features cuda".to_string())
+    };
+    let memory_ok = fit_memory_check(cfg, train);
+    let cost_ok = fit_cost_check(cfg);
+    crate::fit::resolve_fit_arm(
+        request,
+        cfg.metric,
+        cfg.fit_iters,
+        backend_ok,
+        memory_ok,
+        cost_ok,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn fit_memory_check(cfg: &Config, train: &Sample) -> Result<(), String> {
+    let mut probe = cfg.clone();
+    probe.fit_strategy = crate::fit::FitStrategy::Gpu;
+    match device_plan_for(&probe, train) {
+        Some(plan) if plan.refusal.as_ref().map_or(false, |r| r.stage == "fit") => {
+            Err("device_memory".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fit_memory_check(_cfg: &Config, _train: &Sample) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn fit_cost_check(cfg: &Config) -> bool {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let full = crate::fit::gpu_fit_op_coverage(&cfg.ops, !expr::current_blocks().is_empty());
+    crate::fit::ls_gpu_fit_worthwhile(cfg.islands.max(1), cores, fallback_workers(), full)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fit_cost_check(_cfg: &Config) -> bool {
+    false
+}
+
 /// #293: why a device plan cannot run, or `None` when it can. A stat scorer
 /// routed to the CPU leaves the run without a device scorer.
 #[cfg(feature = "cuda")]
@@ -3280,6 +3350,13 @@ fn wide_admission(metric: Metric, train_rows: usize) -> bool {
     train_rows >= WIDE_ADMISSION_ROWS || crate::fit::admits_every_candidate(metric)
 }
 
+/// #223: true when this run's deferred fit admits every candidate with
+/// constants: wide rows, a gated metric or a resolved `All` admission.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn admits_all(cfg: &Config, train_rows: usize) -> bool {
+    wide_admission(cfg.metric, train_rows) || cfg.fit_admission == crate::fit::FitAdmission::All
+}
+
 /// #169: how many offspring of one island are admitted to the fitted LM batch.
 ///
 /// Below [`WIDE_ADMISSION_ROWS`] the fixed fraction `pop/4` is floored at 32 so
@@ -3729,7 +3806,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
     !screened
         && cfg.pipeline_depth > 0
         && defers_fit_to_gpu(cfg, true)
-        && train_rows >= WIDE_ADMISSION_ROWS
+        && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
         && cfg.fit_iters > 0
         && crate::fit::fit_loss(cfg.metric).is_some()
         && !crate::fit::device_fit_is_gated(cfg.metric)
@@ -4031,6 +4108,8 @@ pub struct GpuRunStats {
     pub fit_fallback_workers: usize,
     /// #255: configured per-generation fallback cap (`0` = unbounded).
     pub fit_fallback_max: usize,
+    /// #223: the admission the deferred fit ran under.
+    pub fit_admission: crate::fit::FitAdmission,
     /// #284: run-scoped stage/device ledger. `Default` is an empty ledger, so
     /// every existing fixture that builds `GpuRunStats` still compiles.
     pub ledger: crate::gpu_stats::RunLedger,
@@ -5172,6 +5251,7 @@ fn run_postfix_search(
     ledger.set_wall(t0.elapsed().as_secs_f64());
     stats.ledger = ledger;
     stats.fit_fallback_max = cfg.fit_fallback_max;
+    stats.fit_admission = cfg.fit_admission;
 
     Ok(Outcome {
         archive: final_archive,
@@ -6717,6 +6797,7 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+            s.fit_admission = cfg.fit_admission;
 // #284: absorb the device intervals and fit leaves, then add the
             // exclusive main-thread stages. Fit is a sub-window of the measured
             // eval window, so it is partitioned out exactly once.
@@ -6918,6 +6999,40 @@ mod tests {
         assert_eq!(admission_count(128, true), 128);
         assert_eq!(admission_count(256, true), 256);
         assert_eq!(admission_count(1, true), 1);
+    }
+
+    /// #223: a resolved `All` admission fits every candidate with constants at
+    /// any row count; the default and an explicit `gpu` arm stay screened.
+    #[test]
+    fn admit_all_admits_every_candidate_with_constants() {
+        let screened = Config { metric: Metric::Squared, ..Config::default() };
+        let all = Config { fit_admission: crate::fit::FitAdmission::All, ..screened.clone() };
+        for rows in [10, 1_500, 115_500, WIDE_ADMISSION_ROWS - 1] {
+            assert!(!admits_all(&screened, rows), "{rows}");
+            assert!(admits_all(&all, rows), "{rows}");
+        }
+        assert!(admits_all(&screened, WIDE_ADMISSION_ROWS));
+        assert_eq!(admission_count(256, admits_all(&screened, 1_500)), 64);
+        assert_eq!(admission_count(256, admits_all(&all, 1_500)), 256);
+    }
+
+    /// #223: with the CPU evaluator the resolver keeps the CPU arm the request
+    /// names and labels why.
+    #[test]
+    fn resolver_keeps_the_cpu_arm_without_a_device() {
+        use crate::fit::{FitRequest, FitStrategy};
+        let sample = Sample::new(vec![vec![1.0], vec![2.0]], vec![1.0, 2.0]);
+        let cpu = Config { metric: Metric::Squared, gpu: false, ..Config::default() };
+        let r = resolve_fit_strategy(&cpu, &sample, FitRequest::Unset);
+        assert_eq!((r.strategy, r.reason.as_str()), (FitStrategy::Exact, "--cpu/--no-gpu"));
+        let r = resolve_fit_strategy(&cpu, &sample, FitRequest::Auto);
+        assert_eq!((r.strategy, r.reason.as_str()), (FitStrategy::Auto, "--cpu/--no-gpu"));
+        let abs = Config { metric: Metric::Absolute, ..cpu.clone() };
+        let r = resolve_fit_strategy(&abs, &sample, FitRequest::Unset);
+        assert_eq!(r.reason, "metric_not_least_squares");
+        let nofit = Config { fit_iters: 0, ..cpu };
+        let r = resolve_fit_strategy(&nofit, &sample, FitRequest::Unset);
+        assert_eq!(r.reason, "no_fit");
     }
 
     /// #169: promotion is deterministic, per island, and ranks on the same

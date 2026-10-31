@@ -64,6 +64,8 @@ pub struct Manifest {
     pub projection: Option<ProjectionRecord>,
     /// #254: the declared target spec `(source, path, sha256)`, or `None`.
     pub target_spec: Option<(String, String, String)>,
+    /// #223: `(source, reason)` when the engine resolved the fit arm.
+    pub fit_resolution: Option<(String, String)>,
 }
 
 impl Manifest {
@@ -124,6 +126,14 @@ impl Manifest {
             out.push_str(&format!(
                 "  \"fit\":{{\"gpu\":{},\"fallback\":{},\"refits\":{}}},\n",
                 gpu, fallback, refits
+            ));
+        }
+        if let Some((source, reason)) = &self.fit_resolution {
+            out.push_str(&format!(
+                "  \"fit_resolution\":{{\"strategy\":{},\"source\":{},\"reason\":{}}},\n",
+                jstr(self.config.fit_strategy.name()),
+                jstr(source),
+                jstr(reason)
             ));
         }
         if let Some(dispatch) = &self.dispatch {
@@ -238,6 +248,7 @@ pub fn collect(
         estimate_bytes,
         projection: None,
         target_spec: None,
+        fit_resolution: None,
     }
 }
 

@@ -439,7 +439,17 @@ SEARCH:
                              maximum on the device with --fit-strategy gpu,
                              #226/#232/#227)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
-                             exact). `exact` is the historical CPU
+                             gpu where admissible, else exact). With no flag, or
+                             `auto`, the engine resolves the arm once: `gpu`
+                             admitting every candidate with constants for
+                             squared/aic/aicc/bic with fitting on, the GPU
+                             evaluator, device memory for the f64 fit rows and
+                             a run-level cost model that predicts a win; else
+                             `exact` (no flag) or the structural `auto`. Other
+                             resolutions are labelled with their reason on
+                             stderr, in --json (GPU runs), --run-manifest and
+                             the development log. A resume keeps the saved arm.
+                             `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
                              dispatches by structure: closed-form QR for trees
                              affine in every constant, variable projection for
@@ -1009,8 +1019,9 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
+        jstr(g.fit_admission.name()),
         g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
@@ -1529,6 +1540,7 @@ fn dev_run_start(
     every: usize,
     max_bytes: u64,
     resumed_from: Option<String>,
+    fit_resolution: Option<(String, String)>,
 ) -> rcsr::devlog::RunStart {
     let (commit, dirty) = manifest::build_info();
     let exe = std::env::current_exe().unwrap_or_default();
@@ -1575,6 +1587,7 @@ fn dev_run_start(
         every,
         max_bytes,
         resumed_from,
+        fit_resolution,
     }
 }
 
@@ -2740,6 +2753,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #223: the engine resolves the fit arm only when the person did not name
+    // one, or named `auto`. A resume keeps the saved arm.
+    let mut fit_request: Option<fit::FitRequest> = if !fit_strategy_set {
+        Some(fit::FitRequest::Unset)
+    } else if cfg.fit_strategy == fit::FitStrategy::Auto {
+        Some(fit::FitRequest::Auto)
+    } else {
+        None
+    };
     // #223 + #229 + #222: an explicit `--fit-strategy gpu` asks for the batched
     // GPU LM, which minimises squared error, log-squashed loss or mean absolute
     // error. Refuse a metric with no native device objective instead of
@@ -2989,6 +3011,7 @@ fn main() {
         }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
+        fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
@@ -3324,7 +3347,10 @@ fn main() {
                     scan_cols,
                     projection: store_projection.as_ref().map(|p| p.indices()),
                     gpu: cfg.gpu,
-                    gpu_fit: cfg.gpu && cfg.fit_iters > 0 && cfg.fit_strategy.defers_to_gpu(),
+                    gpu_fit: cfg.gpu
+                        && cfg.fit_iters > 0
+                        && (cfg.fit_strategy.defers_to_gpu()
+                            || (fit_request.is_some() && cfg.metric.is_least_squares())),
                     mutable_prep,
                     simd: cfg.simd,
                 };
@@ -4243,6 +4269,35 @@ fn main() {
     }
     let effective_backend = search::effective_backend(&cfg, &prepared.train);
 
+    // #223: resolve the fit arm once, before the memory plan and the run
+    // records. A CPU-only run keeps today's arm and prints nothing new.
+    let fit_resolution: Option<fit::FitResolution> = fit_request
+        .map(|request| search::resolve_fit_strategy(&cfg, &prepared.train, request));
+    if let Some(r) = &fit_resolution {
+        cfg.fit_strategy = r.strategy;
+        cfg.fit_admission = r.admission;
+        if !quiet && effective_backend == Backend::Gpu {
+            if r.strategy == fit::FitStrategy::Gpu {
+                eprintln!(
+                    "# gpu-fit: {} -> gpu ({}, admit {})",
+                    r.source,
+                    cfg.metric.name(),
+                    r.admission.name()
+                );
+            } else {
+                eprintln!(
+                    "# gpu-fit: {} -> {} ({})",
+                    r.source,
+                    r.strategy.name(),
+                    r.reason
+                );
+            }
+        }
+    }
+    let fit_provenance: Option<(String, String)> = fit_resolution
+        .as_ref()
+        .map(|r| (r.source.to_string(), r.reason.clone()));
+
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
     // population. A syntax error is a usage error and keeps the parser's
@@ -4342,6 +4397,7 @@ fn main() {
         );
         let mut m = m;
         m.start_utc = run_start_utc.clone();
+        m.fit_resolution = fit_provenance.clone();
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),
@@ -4634,6 +4690,7 @@ fn main() {
                         dev_every,
                         dev_log_max_bytes,
                         resume_path.clone(),
+                        fit_provenance.clone(),
                     );
                     sink.write(&rcsr::devlog::run_start_json(&info), true);
                     if !quiet {
@@ -6022,7 +6079,20 @@ fn main() {
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+            // #223: the resolution is reported when the device ran the search,
+            // so a CPU-backend run keeps the historical object.
+            let fit_provenance_json = match (&fit_provenance, outcome.backend.name()) {
+                (Some((source, reason)), "gpu") => format!(
+                    ",\"strategy_source\":{},\"strategy_reason\":{}",
+                    jstr(source),
+                    jstr(reason)
+                ),
+                _ => String::new(),
+            };
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact
+                && outcome.fit_rows == 0
+                && fit_provenance_json.is_empty()
+            {
                 // #116: the historical default JSON stays byte-identical; the
                 // portfolio fields appear when a non-default arm or fit-row
                 // screen is in use.
@@ -6033,12 +6103,13 @@ fn main() {
                 )
             } else {
                 format!(
-                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}}}",
                     jstr(cfg.metric.name()),
                     jnum(best_fit_loss),
                     jstr(cfg.fit_strategy.name()),
                     outcome.fit_rows,
-                    fit::fit_arm_counts_full().since(fit_before).gpu
+                    fit::fit_arm_counts_full().since(fit_before).gpu,
+                    fit_provenance_json
                 )
             };
             // #141: report the backend that actually guided the search, with

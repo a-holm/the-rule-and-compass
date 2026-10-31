@@ -40,7 +40,12 @@ arm; the correlation *scorer* is native on the device since #287;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+forced individually. With no `--fit-strategy`, or with `auto`, a run on the GPU
+evaluator with `squared`, `aic`, `aicc` or `bic`, fitting on, device memory for
+the f64 fit rows and a run-level cost model that predicts a win resolves to the
+batched kernel with every candidate with constants admitted; every other run
+keeps `exact` (no flag) or the structural `auto`, so CPU-only runs are
+unchanged, and each resolution is labelled with its reason. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device; the same exact
 integer sums also **score** every candidate on the device from 4 096 training
 rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
