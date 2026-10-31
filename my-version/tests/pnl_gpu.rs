@@ -1813,7 +1813,7 @@ mod device_band_dp {
 
     fn thread_counts() -> Vec<usize> {
         let max = band_dp_max_threads().expect("device block-size limit");
-        vec![1, 32, 256, max]
+        vec![1, 32, 128, 256, 512, max]
     }
 
     /// Non-dyadic returns, so a different summation order changes the bits,
