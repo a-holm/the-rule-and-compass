@@ -137,4 +137,4 @@ Outcomes:
 * A refused `eval` stage exits 2 under `--gpu`. Without `--gpu` the run keeps the CPU, `backend` is `cpu`, `backend_reason` starts with `device_memory` and the route ledger names `device_memory`.
 * A device allocation that still fails is reported as `device_memory: the device refused an allocation of N bytes ...`, never as "no usable CUDA device".
 
-`--json` reports the plan as `gpu.memory_plan` (mode, budget and its source, free and total bytes, required bytes, every term, rows, vars, candidates, L2 bytes, tile rows, routes and the refusal with its fixes). The test hooks `RCSR_TEST_GPU_TILE_ROWS` and `RCSR_TEST_GPU_PARTIALS_CAP_BYTES` override the tile height and the partials cap.
+`--json` reports the plan as `gpu.memory_plan` (mode, budget and its source, free and total bytes, required bytes, every term, rows, vars, candidates, L2 bytes, tile rows, routes, the refusal with its fixes, and `observed`, the device allocation ledger of the run). The test hooks `RCSR_TEST_GPU_TILE_ROWS` and `RCSR_TEST_GPU_PARTIALS_CAP_BYTES` override the tile height and the partials cap.

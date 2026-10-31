@@ -2812,3 +2812,11 @@ See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
 ## Device memory plan (#293)
 
 The run plans its device memory before the first allocation. `--gpu-memory <size>` lowers the budget below `min(10.5 GiB, free - 1 GiB)`. A stage that does not fit is refused with its bytes and the smallest fix: `--gpu` exits 2, a plain run keeps the CPU with `backend_reason` starting `device_memory`, and an explicit `--fit-strategy gpu` whose f64 fit rows do not fit exits 2. `gpu.memory_plan` in `--json` records the plan. A failed device allocation is reported as `device_memory` with the byte count. The terms, the decision order and the refusal text are in [`memory-model.md`](memory-model.md).
+
+### Device allocation ledger
+
+Every device allocation of an evaluator goes through one tagged wrapper. It counts requests, keeps the largest request and its tag, tracks live and peak live bytes, and refuses a request that would push the live bytes over the context budget (the plan budget) with the tag and the byte count. `gpu.memory_plan.observed` in `--json` reports `requests`, `max_request_bytes`, `max_request_tag`, `live_bytes`, `peak_live_bytes`, `refused` and `refused_tag`. A refused allocation is reported as `device_memory: the device refused an allocation of N bytes (tag T) for ...`.
+
+No production request scales with `P x N`. The n-scaled requests are the dataset (`cols`, `y`), its f64 twin (`cols_f64`, `y_f64`, `w_f64`), the label sign (`tsign`, `tsign_f64`), the rank target (`rank_b`) and the fit and score region (`fit_region`). `GpuEvaluator::predictions`, which writes `P x N` values, exists only in test builds, and `rc_predict` refuses an output above 64 MiB.
+
+The rank and order-statistic score calls split their trials into sub-waves, so one call stays inside 512 MiB (64 bytes per row and segment) even when six trials of one candidate exceed it. The fit and score region caps its growth slack at 512 MiB when the batch itself fits.

@@ -695,6 +695,34 @@ pub struct DeviceRefusal {
     pub fixes: Vec<String>,
 }
 
+/// The device allocation ledger of a finished run, reported next to the plan
+/// as `gpu.memory_plan.observed`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DeviceObserved {
+    pub requests: u64,
+    pub max_request_bytes: u64,
+    pub max_request_tag: String,
+    pub live_bytes: u64,
+    pub peak_live_bytes: u64,
+    pub refused: u64,
+    pub refused_tag: String,
+}
+
+impl DeviceObserved {
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"requests\":{},\"max_request_bytes\":{},\"max_request_tag\":{},\"live_bytes\":{},\"peak_live_bytes\":{},\"refused\":{},\"refused_tag\":{}}}",
+            self.requests,
+            self.max_request_bytes,
+            json_str(&self.max_request_tag),
+            self.live_bytes,
+            self.peak_live_bytes,
+            self.refused,
+            json_str(&self.refused_tag)
+        )
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevicePlan {
     pub workload: DeviceWorkload,
@@ -1088,6 +1116,11 @@ impl DevicePlan {
 
     /// `gpu.memory_plan` in the JSON output.
     pub fn to_json(&self) -> String {
+        self.to_json_observed(None)
+    }
+
+    /// [`Self::to_json`] with the device allocation ledger of the run.
+    pub fn to_json_observed(&self, observed: Option<&DeviceObserved>) -> String {
         let t = &self.terms;
         let refusal = match &self.refusal {
             None => "null".to_string(),
@@ -1101,7 +1134,7 @@ impl DevicePlan {
             ),
         };
         format!(
-            "{{\"mode\":{},\"budget_bytes\":{},\"budget_source\":{},\"free_bytes\":{},\"total_bytes\":{},\"reserve_bytes\":{},\"cap_bytes\":{},\"required_bytes\":{},\"saturated\":{},\"terms\":{{\"data_f32\":{},\"side_vectors\":{},\"fit_twin\":{},\"buffers\":{},\"stat_wave\":{},\"tile_arena\":{},\"tile_pinned\":{},\"partials\":{}}},\"rows\":{},\"vars\":{},\"candidates\":{},\"l2_bytes\":{},\"tile_rows\":{},\"waves\":{},\"wave_candidates\":{},\"fit_route\":{},\"fit_reason\":{},\"stat_route\":{},\"stat_reason\":{},\"refusal\":{}}}",
+            "{{\"mode\":{},\"budget_bytes\":{},\"budget_source\":{},\"free_bytes\":{},\"total_bytes\":{},\"reserve_bytes\":{},\"cap_bytes\":{},\"required_bytes\":{},\"saturated\":{},\"terms\":{{\"data_f32\":{},\"side_vectors\":{},\"fit_twin\":{},\"buffers\":{},\"stat_wave\":{},\"tile_arena\":{},\"tile_pinned\":{},\"partials\":{}}},\"rows\":{},\"vars\":{},\"candidates\":{},\"l2_bytes\":{},\"tile_rows\":{},\"waves\":{},\"wave_candidates\":{},\"fit_route\":{},\"fit_reason\":{},\"stat_route\":{},\"stat_reason\":{},\"refusal\":{},\"observed\":{}}}",
             json_str(self.mode.name()),
             self.budget,
             json_str(self.budget_source),
@@ -1130,7 +1163,8 @@ impl DevicePlan {
             json_str(self.fit_route.reason()),
             json_str(self.stat_route.name()),
             json_str(self.stat_route.reason()),
-            refusal
+            refusal,
+            observed.map(DeviceObserved::to_json).unwrap_or_else(|| "null".to_string())
         )
     }
 }

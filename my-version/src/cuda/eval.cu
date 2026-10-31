@@ -135,6 +135,19 @@ typedef struct RcArenaReport {
     unsigned long long fs_pinned_bytes;
 } RcArenaReport;
 
+#define RC_LEDGER_SLOTS 256
+/* #293: the device allocation ledger of one context. */
+typedef struct RcAllocReport {
+    unsigned long long requests, max_request_bytes, live_bytes, peak_live_bytes, refused;
+    char max_request_tag[32], refused_tag[32];
+} RcAllocReport;
+
+#define RC_PREDICT_CAP_BYTES (64ULL * 1024ULL * 1024ULL)
+/* #293 F1: the persistent fit/score region never asks for more than this in
+   one request when the batch itself fits, so its growth slack cannot push a
+   wave sized to the cap over it. */
+#define RC_FS_REQUEST_CAP (512ULL * 1024ULL * 1024ULL)
+
 struct RcCtx {
     float *d_cols;
     float *d_y;
@@ -266,18 +279,108 @@ struct RcCtx {
     unsigned long long overlapped_uploads;
     unsigned long long arena_batches;
     char sync_reason[96];
+    /* #293: the device allocation ledger. Every device allocation of this
+       context goes through `rc_dev_alloc`, which tags it, enforces `budget`
+       (0 = none) against `live_bytes` and keeps the largest request. */
+    unsigned long long budget;
+    unsigned long long led_requests;
+    unsigned long long led_max_request;
+    unsigned long long led_live;
+    unsigned long long led_peak;
+    unsigned long long led_refused;
+    char led_max_tag[32];
+    char led_refused_tag[32];
+    int led_n;
+    struct {
+        void *p;
+        size_t bytes;
+    } led[RC_LEDGER_SLOTS];
 };
 
 /* #285: the pinned ring is capped at 64 MiB. Two upload slots plus two
    download slots must fit inside it, so each direction can use at most half. */
 #define RC_PIN_BUDGET_BYTES (64u * 1024u * 1024u)
 
+/* #293: the last refused allocation of any context, by size and tag. Context
+   creation fails before a report can be read, so the refusal is also kept
+   here. */
+static size_t g_alloc_fail_bytes = 0;
+static char g_alloc_fail_tag[32] = "";
+
+static void rc_ledger_tag(char *dst, const char *tag)
+{
+    snprintf(dst, 32, "%s", tag ? tag : "");
+}
+
+static int rc_ledger_refuse(RcCtx *c, const char *tag, size_t bytes)
+{
+    c->led_refused++;
+    rc_ledger_tag(c->led_refused_tag, tag);
+    g_alloc_fail_bytes = bytes;
+    rc_ledger_tag(g_alloc_fail_tag, tag);
+    return (int)cudaErrorMemoryAllocation;
+}
+
+/* One device allocation. A request that would push the live total over the
+   context budget, or that finds the table full, is refused with its tag and
+   bytes. `managed` selects cudaMallocManaged in the unified build. */
+static int rc_dev_alloc_kind(RcCtx *c, const char *tag, void **p, size_t bytes, int managed)
+{
+    c->led_requests++;
+    if (bytes > c->led_max_request) {
+        c->led_max_request = bytes;
+        rc_ledger_tag(c->led_max_tag, tag);
+    }
+    if (c->led_n >= RC_LEDGER_SLOTS) return rc_ledger_refuse(c, tag, bytes);
+    if (c->budget && c->led_live + (unsigned long long)bytes > c->budget) {
+        return rc_ledger_refuse(c, tag, bytes);
+    }
+    int rc;
+#ifdef RCSR_UNIFIED
+    rc = managed ? (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal) : (int)cudaMalloc(p, bytes);
+#else
+    (void)managed;
+    rc = (int)cudaMalloc(p, bytes);
+#endif
+    if (rc != 0) {
+        g_alloc_fail_bytes = bytes;
+        rc_ledger_tag(g_alloc_fail_tag, tag);
+        return rc;
+    }
+    c->led[c->led_n].p = *p;
+    c->led[c->led_n].bytes = bytes;
+    c->led_n++;
+    c->led_live += bytes;
+    if (c->led_live > c->led_peak) c->led_peak = c->led_live;
+    return 0;
+}
+
+static int rc_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
+{
+    return rc_dev_alloc_kind(c, tag, p, bytes, 1);
+}
+
+static void rc_dev_free(RcCtx *c, void *p)
+{
+    if (!p) return;
+    for (int i = 0; i < c->led_n; ++i) {
+        if (c->led[i].p == p) {
+            c->led_live -= c->led[i].bytes;
+            c->led[i] = c->led[c->led_n - 1];
+            c->led_n--;
+            break;
+        }
+    }
+    cudaFree(p);
+}
+
+
 /* #285: an allocator call is part of the ledger. Before the first batch it is
    cold setup; afterwards it is a steady-state request and must stay zero on
    the hot path. */
-static int rc_arena_dev_alloc(RcCtx *c, void **p, size_t bytes)
+static int rc_arena_dev_alloc(RcCtx *c, const char *tag, void **p, size_t bytes)
 {
-    int rc = (int)cudaMalloc(p, bytes);
+    int rc = rc_dev_alloc_kind(c, tag, p, bytes, 0);
     if (rc == (int)cudaSuccess) {
         c->alloc_calls++;
         if (c->warm) c->steady_alloc_calls++;
@@ -288,7 +391,7 @@ static int rc_arena_dev_alloc(RcCtx *c, void **p, size_t bytes)
 static void rc_arena_dev_free(RcCtx *c, void *p)
 {
     if (!p) return;
-    cudaFree(p);
+    rc_dev_free(c, p);
     c->alloc_calls++;
     if (c->warm) c->steady_alloc_calls++;
 }
@@ -315,26 +418,26 @@ static int rc_arena_reserve(RcCtx *c, int nprog, size_t prog_words)
     unsigned int *p0 = 0, *p1 = 0, *o0 = 0, *o1 = 0;
     float *out = 0;
     int ok = 1;
-    if (rc_arena_dev_alloc(c, (void **)&p0, sizeof(unsigned int) * want_prog) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&p1, sizeof(unsigned int) * want_prog) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&o0, sizeof(unsigned int) * want_off) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&o1, sizeof(unsigned int) * want_off) != 0) ok = 0;
-    if (ok && rc_arena_dev_alloc(c, (void **)&out, sizeof(float) * want_out) != 0) ok = 0;
+    if (rc_arena_dev_alloc(c, "arena_prog", (void **)&p0, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_prog", (void **)&p1, sizeof(unsigned int) * want_prog) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_off", (void **)&o0, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_off", (void **)&o1, sizeof(unsigned int) * want_off) != 0) ok = 0;
+    if (ok && rc_arena_dev_alloc(c, "arena_out", (void **)&out, sizeof(float) * want_out) != 0) ok = 0;
     if (!ok) {
-        if (p0) cudaFree(p0);
-        if (p1) cudaFree(p1);
-        if (o0) cudaFree(o0);
-        if (o1) cudaFree(o1);
-        if (out) cudaFree(out);
+        if (p0) rc_dev_free(c, p0);
+        if (p1) rc_dev_free(c, p1);
+        if (o0) rc_dev_free(c, o0);
+        if (o1) rc_dev_free(c, o1);
+        if (out) rc_dev_free(c, out);
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "device arena allocation failed");
         return -1;
     }
-    if (c->arena_prog[0]) cudaFree(c->arena_prog[0]);
-    if (c->arena_prog[1]) cudaFree(c->arena_prog[1]);
-    if (c->arena_off[0]) cudaFree(c->arena_off[0]);
-    if (c->arena_off[1]) cudaFree(c->arena_off[1]);
-    if (c->arena_out) cudaFree(c->arena_out);
+    if (c->arena_prog[0]) rc_dev_free(c, c->arena_prog[0]);
+    if (c->arena_prog[1]) rc_dev_free(c, c->arena_prog[1]);
+    if (c->arena_off[0]) rc_dev_free(c, c->arena_off[0]);
+    if (c->arena_off[1]) rc_dev_free(c, c->arena_off[1]);
+    if (c->arena_out) rc_dev_free(c, c->arena_out);
     c->arena_prog[0] = p0;
     c->arena_prog[1] = p1;
     c->arena_off[0] = o0;
@@ -2691,14 +2794,7 @@ __global__ void hash_kernel(const unsigned int *__restrict__ prog,
  * Without the macro the dataset is copied once into plain device memory, which
  * is faster on a discrete GPU with its own VRAM (the RTX 3060 default).
  */
-static size_t g_alloc_fail_bytes = 0;
 #ifdef RCSR_UNIFIED
-static int rc_alloc(void **p, size_t bytes)
-{
-    int rc = (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
-    if (rc != 0) g_alloc_fail_bytes = bytes;
-    return rc;
-}
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
     memcpy(dst, src, bytes);
@@ -2708,12 +2804,6 @@ static void rc_download(void *dst, const void *src, size_t bytes)
     memcpy(dst, src, bytes);
 }
 #else
-static int rc_alloc(void **p, size_t bytes)
-{
-    int rc = (int)cudaMalloc(p, bytes);
-    if (rc != 0) g_alloc_fail_bytes = bytes;
-    return rc;
-}
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
     cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
@@ -2770,19 +2860,20 @@ static int rc_fs_reserve(RcCtx *c, int kind, size_t dev_bytes, size_t host_bytes
     if (host_bytes < 256) host_bytes = 256;
     if (dev_bytes > c->fs_dev_bytes) {
         if (c->fs_dev) {
-            cudaFree(c->fs_dev);
+            rc_dev_free(c, c->fs_dev);
             rc_fs_note(c, kind);
             c->fs_dev = 0;
             c->fs_dev_bytes = 0;
         }
         void *p = 0;
         size_t want = dev_bytes + dev_bytes / 4;
-        int rc = rc_alloc(&p, want);
+        if (want > RC_FS_REQUEST_CAP && dev_bytes <= RC_FS_REQUEST_CAP) want = RC_FS_REQUEST_CAP;
+        int rc = rc_dev_alloc(c, "fit_region", &p, want);
         if (rc != 0) {
             cudaGetLastError();
             want = dev_bytes;
             p = 0;
-            rc = rc_alloc(&p, want);
+            rc = rc_dev_alloc(c, "fit_region", &p, want);
         }
         if (rc != 0) {
             cudaGetLastError();
@@ -2867,7 +2958,7 @@ static int rc_fs_f64_twins(RcCtx *c)
 {
     if (c->d_cols64 && c->d_y64) return 0;
     if (!c->d_cols64) {
-        if (rc_alloc((void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
+        if (rc_dev_alloc(c, "cols_f64", (void **)&c->d_cols64, sizeof(double) * (size_t)c->n * (size_t)c->v) != 0) {
             c->d_cols64 = 0;
             return -1;
         }
@@ -2878,7 +2969,7 @@ static int rc_fs_f64_twins(RcCtx *c)
         cast_f32_to_f64_kernel<<<(int)blocks, threads, 0, c->s_fit>>>(c->d_cols, c->d_cols64, total);
     }
     if (!c->d_y64) {
-        if (rc_alloc((void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
+        if (rc_dev_alloc(c, "y_f64", (void **)&c->d_y64, sizeof(double) * (size_t)c->n) != 0) {
             c->d_y64 = 0;
             return -1;
         }
@@ -3140,7 +3231,8 @@ __global__ void k_rank_bb(const long long *__restrict__ b, int n,
 
 extern "C" {
 
-void *rc_create(const float *cols, int n, int v, const float *y)
+/* `budget` is the byte ceiling on live device allocations, 0 for none. */
+void *rc_create(const float *cols, int n, int v, const float *y, unsigned long long budget)
 {
     RcCtx *c = (RcCtx *)calloc(1, sizeof(RcCtx));
     if (!c) return 0;
@@ -3148,6 +3240,7 @@ void *rc_create(const float *cols, int n, int v, const float *y)
     c->v = v;
     c->nprog = 0;
     c->out_cap = 0;
+    c->budget = budget;
     c->async_copy = 1;
     c->sync_reason[0] = '\0';
 #ifdef RCSR_UNIFIED
@@ -3166,12 +3259,13 @@ void *rc_create(const float *cols, int n, int v, const float *y)
                  "RCSR_GPU_SYNC requests the synchronous copy path");
     }
     g_alloc_fail_bytes = 0;
+    g_alloc_fail_tag[0] = 0;
     size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
     size_t y_bytes = sizeof(float) * (size_t)n;
-    if (rc_alloc((void **)&c->d_cols, col_bytes) != 0 ||
-        rc_alloc((void **)&c->d_y, y_bytes) != 0) {
-        if (c->d_cols) cudaFree(c->d_cols);
-        if (c->d_y) cudaFree(c->d_y);
+    if (rc_dev_alloc(c, "cols", (void **)&c->d_cols, col_bytes) != 0 ||
+        rc_dev_alloc(c, "y", (void **)&c->d_y, y_bytes) != 0) {
+        if (c->d_cols) rc_dev_free(c, c->d_cols);
+        if (c->d_y) rc_dev_free(c, c->d_y);
         free(c);
         return 0;
     }
@@ -3229,23 +3323,23 @@ void rc_destroy(void *ctx)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return;
-    cudaFree(c->d_cols);
-    cudaFree(c->d_y);
-    if (c->d_cols64) cudaFree(c->d_cols64);
-    if (c->d_y64) cudaFree(c->d_y64);
-    if (c->d_w64) cudaFree(c->d_w64);
-    if (c->d_tsign) cudaFree(c->d_tsign);
-    if (c->d_tsign64) cudaFree(c->d_tsign64);
-    if (c->d_prog) cudaFree(c->d_prog);
-    if (c->d_off) cudaFree(c->d_off);
-    if (c->d_out) cudaFree(c->d_out);
-    if (c->d_score_out) cudaFree(c->d_score_out);
-    if (c->d_score_status) cudaFree(c->d_score_status);
-    if (c->d_pool[0]) cudaFree(c->d_pool[0]);
-    if (c->d_pool[1]) cudaFree(c->d_pool[1]);
-    if (c->d_hash) cudaFree(c->d_hash);
-    if (c->d_rank_b) cudaFree(c->d_rank_b);
-    if (c->fs_dev) cudaFree(c->fs_dev);
+    rc_dev_free(c, c->d_cols);
+    rc_dev_free(c, c->d_y);
+    if (c->d_cols64) rc_dev_free(c, c->d_cols64);
+    if (c->d_y64) rc_dev_free(c, c->d_y64);
+    if (c->d_w64) rc_dev_free(c, c->d_w64);
+    if (c->d_tsign) rc_dev_free(c, c->d_tsign);
+    if (c->d_tsign64) rc_dev_free(c, c->d_tsign64);
+    if (c->d_prog) rc_dev_free(c, c->d_prog);
+    if (c->d_off) rc_dev_free(c, c->d_off);
+    if (c->d_out) rc_dev_free(c, c->d_out);
+    if (c->d_score_out) rc_dev_free(c, c->d_score_out);
+    if (c->d_score_status) rc_dev_free(c, c->d_score_status);
+    if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
+    if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
+    if (c->d_hash) rc_dev_free(c, c->d_hash);
+    if (c->d_rank_b) rc_dev_free(c, c->d_rank_b);
+    if (c->fs_dev) rc_dev_free(c, c->fs_dev);
     if (c->fs_host) cudaFreeHost(c->fs_host);
     if (c->s_fit) {
         cudaStreamDestroy(c->s_fit);
@@ -3254,8 +3348,8 @@ void rc_destroy(void *ctx)
     }
     /* #285: arena, staging rings, streams and events. */
     for (int i = 0; i < 2; ++i) {
-        if (c->arena_prog[i]) cudaFree(c->arena_prog[i]);
-        if (c->arena_off[i]) cudaFree(c->arena_off[i]);
+        if (c->arena_prog[i]) rc_dev_free(c, c->arena_prog[i]);
+        if (c->arena_off[i]) rc_dev_free(c, c->arena_off[i]);
         if (c->h_up[i]) cudaFreeHost(c->h_up[i]);
         if (c->h_down[i]) cudaFreeHost(c->h_down[i]);
         if (c->ev_upload[i]) cudaEventDestroy(c->ev_upload[i]);
@@ -3263,7 +3357,7 @@ void rc_destroy(void *ctx)
         if (c->ev_up_free[i]) cudaEventDestroy(c->ev_up_free[i]);
         if (c->ev_down_free[i]) cudaEventDestroy(c->ev_down_free[i]);
     }
-    if (c->arena_out) cudaFree(c->arena_out);
+    if (c->arena_out) rc_dev_free(c, c->arena_out);
     if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
     if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
     if (c->s_eval) cudaStreamDestroy(c->s_eval);
@@ -3447,27 +3541,30 @@ int rc_predict(void *ctx, const unsigned int *prog, const unsigned int *off,
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || nprog <= 0) return -1;
+    /* P x N output: no production path may scale with it, and C cannot see
+       the Rust cfg(test) gate on the caller. */
+    if ((unsigned long long)nprog * (unsigned long long)c->n * 4ULL > RC_PREDICT_CAP_BYTES) return -1;
     if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1;
     int slot = c->arena_slot;
     /* #285: the upload may still be in flight on S_h2d. */
     if (c->arena_upload_async) cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
     size_t total = (size_t)nprog * (size_t)c->n;
     float *d_pred = 0;
-    if (cudaMalloc((void **)&d_pred, sizeof(float) * total) != 0) return -1;
+    if (rc_dev_alloc(c, "predict", (void **)&d_pred, sizeof(float) * total) != 0) return -1;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
     predict_kernel<<<nprog, threads>>>(c->d_cols, c->n, c->arena_prog[slot],
                                        c->arena_off[slot], d_pred);
     if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(d_pred);
+        rc_dev_free(c, d_pred);
         return -1;
     }
     if (cudaMemcpy(out, d_pred, sizeof(float) * total, cudaMemcpyDeviceToHost)
         != cudaSuccess) {
-        cudaFree(d_pred);
+        rc_dev_free(c, d_pred);
         return -1;
     }
-    cudaFree(d_pred);
+    rc_dev_free(c, d_pred);
     return 0;
 }
 
@@ -3527,18 +3624,18 @@ int rc_pool_reserve(void *ctx, int nprog, int width)
         c->stats.alloc_ms += rc_now_ms() - t;
         return 0;
     }
-    if (c->d_pool[0]) { cudaFree(c->d_pool[0]); c->d_pool[0] = 0; }
-    if (c->d_pool[1]) { cudaFree(c->d_pool[1]); c->d_pool[1] = 0; }
+    if (c->d_pool[0]) { rc_dev_free(c, c->d_pool[0]); c->d_pool[0] = 0; }
+    if (c->d_pool[1]) { rc_dev_free(c, c->d_pool[1]); c->d_pool[1] = 0; }
     size_t bytes = sizeof(unsigned int) * (size_t)nprog * (size_t)width;
-    if (rc_alloc((void **)&c->d_pool[0], bytes) != 0 ||
-        rc_alloc((void **)&c->d_pool[1], bytes) != 0) {
+    if (rc_dev_alloc(c, "pool", (void **)&c->d_pool[0], bytes) != 0 ||
+        rc_dev_alloc(c, "pool", (void **)&c->d_pool[1], bytes) != 0) {
         c->stats.failed = 1;
         c->stats.alloc_ms += rc_now_ms() - t;
         return -1;
     }
     if (c->hash_cap < nprog) {
-        if (c->d_hash) { cudaFree(c->d_hash); c->d_hash = 0; }
-        if (rc_alloc((void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
+        if (c->d_hash) { rc_dev_free(c, c->d_hash); c->d_hash = 0; }
+        if (rc_dev_alloc(c, "hash", (void **)&c->d_hash, sizeof(unsigned long long) * (size_t)nprog) != 0) {
             c->d_hash = 0;
             c->hash_cap = 0;
             c->stats.failed = 1;
@@ -3576,8 +3673,8 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     RcStats *st = &c->stats;
     double t = rc_now_ms();
     if (c->out_cap < nprog) {
-        if (c->d_out) cudaFree(c->d_out);
-        if (rc_alloc((void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
+        if (c->d_out) rc_dev_free(c, c->d_out);
+        if (rc_dev_alloc(c, "out", (void **)&c->d_out, sizeof(float) * (size_t)nprog) != 0) {
             c->d_out = 0;
             c->out_cap = 0;
             st->failed = 1;
@@ -3621,12 +3718,12 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
 static int rc_score_reserve(RcCtx *c, int nprog)
 {
     if (c->score_cap >= nprog) return 0;
-    if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
-    if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
-    if (rc_alloc((void **)&c->d_score_out, sizeof(double) * (size_t)nprog) != 0 ||
-        rc_alloc((void **)&c->d_score_status, sizeof(int) * (size_t)nprog) != 0) {
-        if (c->d_score_out) { cudaFree(c->d_score_out); c->d_score_out = 0; }
-        if (c->d_score_status) { cudaFree(c->d_score_status); c->d_score_status = 0; }
+    if (c->d_score_out) { rc_dev_free(c, c->d_score_out); c->d_score_out = 0; }
+    if (c->d_score_status) { rc_dev_free(c, c->d_score_status); c->d_score_status = 0; }
+    if (rc_dev_alloc(c, "score_out", (void **)&c->d_score_out, sizeof(double) * (size_t)nprog) != 0 ||
+        rc_dev_alloc(c, "score_status", (void **)&c->d_score_status, sizeof(int) * (size_t)nprog) != 0) {
+        if (c->d_score_out) { rc_dev_free(c, c->d_score_out); c->d_score_out = 0; }
+        if (c->d_score_status) { rc_dev_free(c, c->d_score_status); c->d_score_status = 0; }
         c->score_cap = 0;
         return -1;
     }
@@ -3889,31 +3986,32 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
 int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double *w)
 {
     g_alloc_fail_bytes = 0;
+    g_alloc_fail_tag[0] = 0;
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !cols || !y) return -1;
-    if (c->d_cols64) { cudaFree(c->d_cols64); c->d_cols64 = 0; }
-    if (c->d_y64) { cudaFree(c->d_y64); c->d_y64 = 0; }
-    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
+    if (c->d_y64) { rc_dev_free(c, c->d_y64); c->d_y64 = 0; }
+    if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
     /* #288: the rank stage caches B from the previous target. Re-uploading
        exact rows invalidates it, or a scorer called after this would rank the
        new predictions against the old target. */
-    if (c->d_rank_b) { cudaFree(c->d_rank_b); c->d_rank_b = 0; }
+    if (c->d_rank_b) { rc_dev_free(c, c->d_rank_b); c->d_rank_b = 0; }
     c->rank_ready = 0;
     size_t cb = sizeof(double) * (size_t)c->n * (size_t)c->v;
     size_t yb = sizeof(double) * (size_t)c->n;
-    if (rc_alloc((void **)&c->d_cols64, cb) != 0) return -1;
-    if (rc_alloc((void **)&c->d_y64, yb) != 0) {
-        cudaFree(c->d_cols64);
+    if (rc_dev_alloc(c, "cols_f64", (void **)&c->d_cols64, cb) != 0) return -1;
+    if (rc_dev_alloc(c, "y_f64", (void **)&c->d_y64, yb) != 0) {
+        rc_dev_free(c, c->d_cols64);
         c->d_cols64 = 0;
         return -1;
     }
     rc_upload(c->d_cols64, cols, cb);
     rc_upload(c->d_y64, y, yb);
     if (w) {
-        if (rc_alloc((void **)&c->d_w64, yb) != 0) {
-            cudaFree(c->d_cols64);
+        if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
+            rc_dev_free(c, c->d_cols64);
             c->d_cols64 = 0;
-            cudaFree(c->d_y64);
+            rc_dev_free(c, c->d_y64);
             c->d_y64 = 0;
             return -1;
         }
@@ -3944,16 +4042,16 @@ int rc_set_score_weights(void *ctx, const double *w)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
-    if (c->d_w64) { cudaFree(c->d_w64); c->d_w64 = 0; }
+    if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
     if (!w) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
-    if (rc_alloc((void **)&c->d_w64, yb) != 0) {
+    if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
         c->d_w64 = 0;
         return -1;
     }
     rc_upload(c->d_w64, w, yb);
     if (cudaGetLastError() != cudaSuccess) {
-        cudaFree(c->d_w64);
+        rc_dev_free(c, c->d_w64);
         c->d_w64 = 0;
         return -1;
     }
@@ -3964,8 +4062,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
-    if (c->d_tsign) { cudaFree(c->d_tsign); c->d_tsign = 0; }
-    if (c->d_tsign64) { cudaFree(c->d_tsign64); c->d_tsign64 = 0; }
+    if (c->d_tsign) { rc_dev_free(c, c->d_tsign); c->d_tsign = 0; }
+    if (c->d_tsign64) { rc_dev_free(c, c->d_tsign64); c->d_tsign64 = 0; }
     c->has_tsign = 0;
     if (!sign) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
@@ -3974,8 +4072,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
     if (!host) return -1;
     for (int i = 0; i < c->n; ++i) host[i] = (float)sign[i];
     int ok = 1;
-    if (rc_alloc((void **)&c->d_tsign64, yb) != 0) ok = 0;
-    if (ok && rc_alloc((void **)&c->d_tsign, yb32) != 0) ok = 0;
+    if (rc_dev_alloc(c, "tsign_f64", (void **)&c->d_tsign64, yb) != 0) ok = 0;
+    if (ok && rc_dev_alloc(c, "tsign", (void **)&c->d_tsign, yb32) != 0) ok = 0;
     if (ok) {
         rc_upload(c->d_tsign64, sign, yb);
         rc_upload(c->d_tsign, host, yb32);
@@ -3983,8 +4081,8 @@ int rc_set_fit_sign(void *ctx, const double *sign)
     }
     free(host);
     if (!ok) {
-        if (c->d_tsign) { cudaFree(c->d_tsign); c->d_tsign = 0; }
-        if (c->d_tsign64) { cudaFree(c->d_tsign64); c->d_tsign64 = 0; }
+        if (c->d_tsign) { rc_dev_free(c, c->d_tsign); c->d_tsign = 0; }
+        if (c->d_tsign64) { rc_dev_free(c, c->d_tsign64); c->d_tsign64 = 0; }
         return -1;
     }
     c->has_tsign = 1;
@@ -4223,7 +4321,7 @@ static int rc_rank_prepare(void *ctx)
         rc_fs_drain(c);
         return -1;
     }
-    if (rc_alloc((void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
+    if (rc_dev_alloc(c, "rank_b", (void **)&c->d_rank_b, sizeof(long long) * (size_t)c->n) != 0) {
         c->d_rank_b = 0;
         return -1;
     }
@@ -4258,7 +4356,7 @@ static int rc_rank_prepare(void *ctx)
         rc_fs_drain(c);
     }
     if (!ok) {
-        cudaFree(c->d_rank_b);
+        rc_dev_free(c, c->d_rank_b);
         c->d_rank_b = 0;
         return -1;
     }
@@ -4907,6 +5005,28 @@ int rc_device_memory(size_t *free_b, size_t *total_b, int *l2_bytes)
     if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0) != cudaSuccess) l2 = 0;
     *l2_bytes = l2;
     return 0;
+}
+
+/* #293: the device allocation ledger of one context. */
+int rc_alloc_report(void *ctx, RcAllocReport *out)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !out) return -1;
+    memset(out, 0, sizeof(*out));
+    out->requests = c->led_requests;
+    out->max_request_bytes = c->led_max_request;
+    out->live_bytes = c->led_live;
+    out->peak_live_bytes = c->led_peak;
+    out->refused = c->led_refused;
+    snprintf(out->max_request_tag, sizeof(out->max_request_tag), "%s", c->led_max_tag);
+    snprintf(out->refused_tag, sizeof(out->refused_tag), "%s", c->led_refused_tag);
+    return 0;
+}
+
+/* #293: tag of the most recent refused allocation, or an empty string. */
+const char *rc_last_alloc_failure_tag(void)
+{
+    return g_alloc_fail_tag;
 }
 
 /* #293: bytes of the most recent refused device allocation, or 0. */

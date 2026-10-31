@@ -668,6 +668,8 @@ impl GpuSearch {
         logistic_fit: bool,
         // #284: the run clock every device interval is placed on.
         run_start: std::time::Instant,
+        // #293: byte ceiling on the live device allocations (the plan budget).
+        budget: Option<u64>,
     ) -> Result<Self, String> {
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
@@ -691,7 +693,7 @@ impl GpuSearch {
             }
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
-        match crate::gpu::GpuEvaluator::new(&cols, n_rows, n_vars, &y) {
+        match crate::gpu::GpuEvaluator::with_budget(&cols, n_rows, n_vars, &y, budget) {
             Some(mut ev) => {
                 // #284: one clock for evaluator and fit intervals.
                 ev.set_run_start(run_start);
@@ -758,8 +760,9 @@ impl GpuSearch {
             }
             None => Err(match crate::gpu::last_alloc_failure() {
                 Some(bytes) => format!(
-                    "device_memory: the device refused an allocation of {} bytes for the resident rows ({})",
+                    "device_memory: the device refused an allocation of {} bytes{} for the resident rows ({})",
                     bytes,
+                    alloc_tag_note(),
                     crate::memory::human(bytes)
                 ),
                 None => format!(
@@ -1530,6 +1533,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
             ledger,
             memory_plan: self.memory_plan.clone(),
+            observed: Some(self.ev.alloc_report().observed()),
         }
     }
 
@@ -2542,10 +2546,21 @@ fn plan_blocker(plan: &crate::memory::DevicePlan) -> Option<String> {
 fn device_refusal(what: &str) -> String {
     match crate::gpu::last_alloc_failure() {
         Some(bytes) => format!(
-            "device_memory: the device refused an allocation of {} bytes for {}",
-            bytes, what
+            "device_memory: the device refused an allocation of {} bytes{} for {}",
+            bytes,
+            alloc_tag_note(),
+            what
         ),
         None => format!("the device refused {}", what),
+    }
+}
+
+/// ` (tag cols_f64)` for the most recent refused allocation, or nothing.
+#[cfg(feature = "cuda")]
+fn alloc_tag_note() -> String {
+    match crate::gpu::last_alloc_failure_tag() {
+        Some(tag) => format!(" (tag {})", tag),
+        None => String::new(),
     }
 }
 
@@ -3896,6 +3911,8 @@ pub struct GpuRunStats {
     pub ledger: crate::gpu_stats::RunLedger,
     /// #293: the device memory plan the run was built under.
     pub memory_plan: Option<crate::memory::DevicePlan>,
+    /// #293: the device allocation ledger at the end of the run.
+    pub observed: Option<crate::memory::DeviceObserved>,
 }
 
 pub struct Outcome {
@@ -5209,6 +5226,7 @@ fn run_search(
                         score,
                         logistic_fit,
                         t0,
+                        memory_plan.as_ref().map(|p| p.budget),
                     ),
                 };
                 match created {

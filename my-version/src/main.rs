@@ -1091,7 +1091,7 @@ fn gpu_json(
         ledger,
         g.memory_plan
             .as_ref()
-            .map(|p| p.to_json())
+            .map(|p| p.to_json_observed(g.observed.as_ref()))
             .unwrap_or_else(|| "null".to_string()),
         gens.join(","),
         totals,
