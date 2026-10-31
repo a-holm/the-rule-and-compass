@@ -70,7 +70,21 @@ symbol-major block and never parses text or decides units.
   enforced by `tests/panel_gpu.rs`.
 
 A 4.78M-row decoded block hashes identically on CPU and device, cold and warm.
-The CPU parse/inflate path and `rcsr prep` output are unchanged by this seam.
+The CPU parse/inflate path is unchanged by this seam.
+
+`rcsr panel base --gpu on|auto` runs this pass on the device. The decoded
+symbols of a wave (eight per `--jobs`) are concatenated into one block, one
+segment per symbol, and folded in one launch; the base rows, `cov15m`, `gap`,
+flags, `dup_rows` and the conflict ledger are built from the buckets exactly as
+on the CPU, so the store is byte-identical. `auto` takes the device from one
+million decoded rows per wave, `on` always, `off` and `--no-gpu` keep the CPU
+path and the manifest without a `backend` block. A wave that runs on the CPU
+under `auto` or `on` is named in `<out>.manifest.json`: the `backend` block
+lists the requested mode, the device, symbols and rows per route, launches,
+bytes moved and every fallback reason (`too_few_rows`, `no_device`, `launch`).
+Symbols served from the `--resume` cache run on neither route. The cache is
+valid for both. `tests/panel_v2.rs` pins CPU, device, warm and cross-cache store
+hashes and the ledger lines for `--require-full-bucket` and `--keep-partial`.
 
 ### Device PIT as-of joins (`--features cuda`)
 

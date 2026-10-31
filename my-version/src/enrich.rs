@@ -1480,7 +1480,7 @@ pub enum GpuMode {
 }
 
 impl GpuMode {
-    fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(GpuMode::Auto),
             "on" | "force" | "gpu" => Ok(GpuMode::On),
