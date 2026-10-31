@@ -6866,7 +6866,9 @@ fn enrich_inner(
                 Ok((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }
@@ -6929,7 +6931,9 @@ fn enrich_inner(
                 Some((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }

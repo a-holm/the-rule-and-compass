@@ -10,6 +10,7 @@ const ROWS: usize = 24_000;
 const FEATURES: &str = "r1,r5,ma20,vol20,rsi6,don20,macd,macd_sig,macd_hist,hour_sin";
 const CLOSE_EPS: f64 = 1e-9;
 const JSON_EPS: f64 = 5e-7;
+const MAX_OTHER_SHARE: f64 = 0.05;
 
 fn write_input(path: &str) {
     let mut text = String::from("ts,symbol,open,high,low,close,volume\n");
@@ -132,6 +133,12 @@ fn feature_phase_partition_closes_and_json_matches_the_report() {
         let got = object_field(&json, object, key);
         assert!((got - want).abs() <= JSON_EPS, "{object}.{key}: json {got} report {want}");
     }
+    let share = r.feature_other_seconds / r.feature_seconds;
+    eprintln!("feature_other share = {share:.6}");
+    assert!(
+        share <= MAX_OTHER_SHARE,
+        "unattributed host time is {share:.4} of the feature phase, bound {MAX_OTHER_SHARE}"
+    );
     let text = r.text_lines().join("\n");
     assert!(text.contains("feature_parts read="), "{text}");
     let _ = std::fs::remove_dir_all(&dir);
