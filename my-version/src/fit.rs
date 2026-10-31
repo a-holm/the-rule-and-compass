@@ -383,13 +383,18 @@ impl FitObjective {
 /// The information criteria fit by least squares and add their penalty when
 /// scoring, so they share the squared objective; `log_squashed` uses the
 /// robust arm; #222's `absolute` uses the L1/IRLS arm with true-`|r|`
-/// acceptance. Everything else returns `None` and keeps the exact CPU fit.
+/// acceptance; `signed` is the squared warm start of its projection arm.
+/// Everything else returns `None` and keeps the exact CPU fit.
 pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
     match metric {
         Metric::Aic | Metric::Aicc | Metric::Bic => Some(DeviceLoss::Squared),
         // #234: a native fit objective with no native fitness. The search
         // admits it as a fit-only arm; every score is the exact CPU log-loss.
         Metric::LogLoss => Some(DeviceLoss::Logistic),
+        // Warm start only: the CPU arm runs `fit_weighted`, then `signed_projection`,
+        // then the polish. The kernel replaces the first stage; the exact gate
+        // projects every proposal.
+        Metric::Signed => Some(DeviceLoss::Squared),
         m => DeviceLoss::for_metric(m),
     }
 }
@@ -457,12 +462,13 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
          absolute error, the logistic log-loss or the exact rank, median, \
-         interquartile and maximum objectives, but --metric {} has no device \
+         interquartile and maximum objectives, plus the squared warm start of the \
+         signed-bias projection, but --metric {} has no device \
          fit objective, so the GPU arms cannot fit it. Use --metric squared \
          (aic, aicc and bic also fit by least squares), --metric log_squashed, \
          --metric absolute, --metric log_loss, --metric rank_correlation or \
          rank_correlation_signed, --metric median, --metric interquartile, \
-         --metric maximum, or a CPU fit strategy: --fit-strategy exact, auto, \
+         --metric maximum, --metric signed, or a CPU fit strategy: --fit-strategy exact, auto, \
          linear, varpro or stream.",
         metric.name()
     ))

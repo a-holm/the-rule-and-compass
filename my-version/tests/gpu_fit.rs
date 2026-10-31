@@ -1556,3 +1556,59 @@ fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
     let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "gpu"]);
     assert!(!fitting.contains("strategy_source"), "an explicit arm is never resolved: {fitting}");
 }
+
+/// `--metric signed` with `--fit-strategy gpu` is accepted and defers: the
+/// device LM is the warm start, the exact `f64` gate projects every proposal,
+/// two runs are bit-identical, and every archive error is the exact CPU metric.
+/// `--fit-iters 0` runs no fit at all, so no constant moves.
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_gpu_fit_run_is_deterministic_and_exact() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    assert!(rcsr::fit::gpu_fit_metric_error(Metric::Signed).is_none());
+    let train = sample(240, 81);
+    let test = sample(60, 82);
+    let cfg = Config {
+        generations: 4,
+        metric: Metric::Signed,
+        ..gpu_config(83)
+    };
+    let a = search::run(&cfg, &train, &test);
+    let b = search::run(&cfg, &train, &test);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.test_errors, b.test_errors);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "the device warm start must run: {:?}", g);
+    // Wide admission fits candidates the screen did not select, so only the
+    // fit/fallback split is exact here.
+    assert_eq!(g.fit_attempts, g.fit_gpu + g.fit_fallback, "{:?}", g);
+    assert!(!a.archive.items.is_empty());
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Signed);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "archive row is not the exact CPU signed bias: {} vs {}",
+            s.error,
+            cpu
+        );
+    }
+
+    let off = Config {
+        fit_iters: 0,
+        ..cfg
+    };
+    let out = search::run(&off, &train, &test);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert_eq!(g.fit_attempts, 0, "no fit may be attempted: {:?}", g);
+    assert_eq!(g.fit_gpu, 0);
+    assert_eq!(g.fit_screened, 0, "admission must not run without a fit: {:?}", g);
+    for s in &out.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, Metric::Signed);
+        assert_eq!(s.error.to_bits(), cpu.to_bits());
+    }
+}
