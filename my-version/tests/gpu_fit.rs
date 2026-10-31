@@ -1675,7 +1675,7 @@ fn signed_bias_gpu_fit_run_is_deterministic_and_exact() {
     let b = search::run(&cfg, &train, &test);
     assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
     assert_eq!(a.test_errors, b.test_errors);
-    assert_eq!(a.backend, rcsr::backend::Kind::Gpu);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu, "{:?}", a.backend_reason);
     let g = a.gpu.as_ref().expect("a GPU report");
     assert!(g.fit_gpu > 0, "the device warm start must run: {:?}", g);
     // Wide admission fits candidates the screen did not select, so only the
