@@ -1617,6 +1617,7 @@ impl RunPlan {
                     y,
                     w: prepared.train.w.clone(),
                     ys: Vec::new(),
+                    pairs: None,
                 };
                 let out = search::run(&self.cfg, &shuffled, &shuffled);
                 let b = out
@@ -1844,7 +1845,7 @@ impl RunPlan {
         };
         let score = |s: &data::Sample| -> f64 {
             let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-            metrics::score_weighted(&pred, &s.y, &s.w, self.cfg.metric, k)
+            metrics::score_sample(&pred, s, self.cfg.metric, k)
         };
         let train_error = score(&prepared.train);
         let fold_errors: Vec<f64> = prepared.fold_samples.iter().map(score).collect();

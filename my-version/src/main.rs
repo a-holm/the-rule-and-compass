@@ -386,6 +386,12 @@ SEARCH:
                              absolute mean residual |mean(y-f)| (a weighted mean
                              with --weight); it has a documented degeneracy: its
                              optimum is a whole manifold at exactly 0.
+                             slope scores the mean absolute error of first
+                             differences over row pairs that are adjacent in the
+                             data order and in the same group (--group-by, or
+                             one group), whatever the split shuffles; fewer
+                             than 32 such training pairs is a usage error that
+                             points at --split temporal.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -2851,6 +2857,19 @@ fn main() {
         eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.metric == Metric::Slope {
+        for (present, flag) in [
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (cv_mode.is_some(), "--cv"),
+        ] {
+            if present {
+                eprintln!("error: --metric slope cannot be combined with {}", flag);
+                eprintln!("  slope differences rows that are adjacent in the data order; resampled or refolded rows have no such order");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
     if implicit_mode && bootstrap_resamples > 0 {
         eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
         eprintln!("  the bootstrap refits constants on |f|, not on the geometric residual");
@@ -3200,6 +3219,7 @@ fn main() {
             (require_validation, "--require-validation"),
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
+            (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -4074,6 +4094,19 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
     let prepared_s = run_start.elapsed().as_secs_f64();
+    if cfg.metric == Metric::Slope {
+        match prepared.require_slope_pairs() {
+            Ok(pairs) => notes.push(format!(
+                "slope: differencing {} adjacent-row pair(s) among {} training row(s)",
+                pairs,
+                prepared.train.len()
+            )),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
 
     // #254: the zero-parameter rung and, under the override, the proxy table.
     let target_active: Option<target::Active> = match (target_resolved.take(), target_check.take()) {
@@ -5485,6 +5518,7 @@ fn main() {
                 y,
                 w: prepared.train.w.clone(),
                 ys: Vec::new(),
+                pairs: None,
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -7072,7 +7106,7 @@ fn run_eval(
 
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-        metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
+        metrics::score_sample(&pred, s, metric, k)
     };
     let train_error = score(&prepared.train);
     // One test block leaves `fold_samples` empty (#133): score the test block.
@@ -10053,6 +10087,7 @@ mod tests {
             y: vec![0.0, 2.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         // SSE = 2, n = 2 -> MSE = 1.
         assert!((gpu_baseline_error(&train) - 1.0).abs() < 1e-12);

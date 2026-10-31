@@ -109,9 +109,11 @@ fn predict_kept(tree: &Node, s: &Sample, kept: &[usize]) -> Vec<f64> {
 fn score_finite(pred: &[f64], s: &Sample, metric: Metric) -> f64 {
     let mut p = Vec::with_capacity(pred.len());
     let mut y = Vec::with_capacity(pred.len());
+    let mut kept_rows = Vec::with_capacity(pred.len());
     let mut w = Vec::new();
     for (i, &v) in pred.iter().enumerate() {
         if v.is_finite() {
+            kept_rows.push(i);
             p.push(v);
             y.push(s.y[i]);
             if !s.w.is_empty() {
@@ -121,6 +123,20 @@ fn score_finite(pred: &[f64], s: &Sample, metric: Metric) -> f64 {
     }
     if p.is_empty() {
         return f64::NAN;
+    }
+    if let (Metric::Slope, Some(pairs)) = (metric, &s.pairs) {
+        let mut at = vec![u32::MAX; s.y.len()];
+        for (k, &i) in kept_rows.iter().enumerate() {
+            at[i] = k as u32;
+        }
+        let pairs: Vec<[u32; 2]> = pairs
+            .iter()
+            .filter_map(|&[a, b]| {
+                let (a, b) = (*at.get(a as usize)?, *at.get(b as usize)?);
+                (a != u32::MAX && b != u32::MAX).then_some([a, b])
+            })
+            .collect();
+        return metrics::score_slope_pairs(&p, &y, &pairs);
     }
     metrics::score_weighted(&p, &y, &w, metric, 0)
 }
@@ -735,6 +751,15 @@ use target_structure::BINS;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn score_finite_slope_keeps_only_listed_pairs_and_drops_nonfinite_rows() {
+        let mut s = Sample::new(vec![vec![0.0]; 5], vec![0.0, 10.0, 1.0, 20.0, 2.0]);
+        s.pairs = Some(vec![[0, 2], [2, 4], [1, 3]]);
+        let pred = [0.0, f64::NAN, 1.0, 20.0, 2.0];
+        // pair [1,3] has a dropped row; [0,2] and [2,4] are exact
+        assert_eq!(score_finite(&pred, &s, Metric::Slope), 0.0);
+    }
 
     const HOURLY: &str = include_str!("../tests/fixtures/targets/hourly_all.targets.json");
 
