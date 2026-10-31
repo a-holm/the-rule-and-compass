@@ -612,6 +612,8 @@ struct GpuSearch {
     fit_screened: usize,
     /// #169: CPU fallback counts labelled by cause.
     fit_fallback_by_cause: BTreeMap<String, usize>,
+    /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
+    fit_fallback_improved_by_cause: BTreeMap<String, usize>,
     /// #286: finite device answers grouped by label (`rank_deficient`,
     /// `recovered`, `no_improvement`, `start_unusable`,
     /// `recovered_skipped`). None of these is a CPU fallback.
@@ -797,6 +799,7 @@ impl GpuSearch {
                     fit_fallback: 0,
                     fit_screened: 0,
                     fit_fallback_by_cause: BTreeMap::new(),
+                    fit_fallback_improved_by_cause: BTreeMap::new(),
                     fit_status_by_label: BTreeMap::new(),
                     fit_ms: 0.0,
                     fit_host_ms: 0.0,
@@ -904,6 +907,12 @@ impl GpuSearch {
                 fallbacks.push((i, j, FitFallbackCause::SingleClass));
                 continue;
             }
+            if matches!(cfg.metric, Metric::Correlation | Metric::CorrelationSigned)
+                && crate::fit::is_affine_correlation_tree(&islands[i][j].tree)
+            {
+                fallbacks.push((i, j, FitFallbackCause::AffineClosedForm));
+                continue;
+            }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
                 _ if fit_loss.is_none()
                     && rank_loss.is_none()
@@ -923,6 +932,10 @@ impl GpuSearch {
                         cfg.fit_iters,
                     )
                     .with_min_rows(32 * plan.nconst);
+                    let workload = match fit_loss {
+                        Some(loss) => workload.with_objective(loss),
+                        None => workload,
+                    };
                     let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
                     if decision.route == crate::dispatch::Route::Device {
                         jobs.push((i, j, plan));
@@ -1109,10 +1122,8 @@ impl GpuSearch {
         if refit > 0 {
             let mut jobs: Vec<FallbackFitJob> = fallbacks[..refit]
                 .iter()
-                .map(|&(island, slot, _)| FallbackFitJob {
-                    island,
-                    slot,
-                    tree: islands[island][slot].tree.clone(),
+                .map(|&(island, slot, _)| {
+                    FallbackFitJob::new(island, slot, islands[island][slot].tree.clone())
                 })
                 .collect();
             workers_used = fit_fallback_jobs(
@@ -1124,6 +1135,11 @@ impl GpuSearch {
                 cfg.metric,
                 fallback_workers(),
             );
+            for (&(_, _, cause), job) in fallbacks[..refit].iter().zip(&jobs) {
+                if job.improved {
+                    self.note_fit_fallback_improved(generation, cause);
+                }
+            }
             for job in jobs {
                 islands[job.island][job.slot].tree = job.tree;
             }
@@ -1154,6 +1170,14 @@ impl GpuSearch {
             .fit_fallback_by_cause
             .entry(cause.label().to_string())
             .or_default() += 1;
+    }
+
+    /// #265: record that the CPU refit of a fallback of `cause` lowered the
+    /// exact error.
+    fn note_fit_fallback_improved(&mut self, generation: usize, cause: FitFallbackCause) {
+        count_improved(&mut self.fit_fallback_improved_by_cause, cause);
+        let stats = self.stats.entry(generation).or_default();
+        count_improved(&mut stats.fit_fallback_improved_by_cause, cause);
     }
 
     /// Score every pending (`error.is_nan()`) individual in every island in one
@@ -1606,6 +1630,7 @@ impl GpuSearch {
             self.fit_gpu as u64,
             self.fit_fallback as u64,
             self.fit_fallback_by_cause.clone(),
+            self.fit_fallback_improved_by_cause.clone(),
         );
         GpuRunStats {
             generations: self
@@ -1619,6 +1644,7 @@ impl GpuSearch {
             fit_fallback: self.fit_fallback,
             fit_screened: self.fit_screened,
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
+            fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fit_status_by_label: self.fit_status_by_label.clone(),
             fit_refits: 0,
             fit_ms: self.fit_ms,
@@ -1646,6 +1672,7 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             fit_gpu: self.fit_gpu,
             fit_fallback: self.fit_fallback,
             fit_fallback_by_cause: self.fit_fallback_by_cause.clone(),
+            fit_fallback_improved_by_cause: self.fit_fallback_improved_by_cause.clone(),
             fallback_s: batch.map(|b| b.fallback_seconds).unwrap_or(0.0),
             fallback_workers: batch.map(|b| b.fallback_workers).unwrap_or(0),
             programs: batch.map(|b| b.programs).unwrap_or(0),
@@ -1665,6 +1692,37 @@ fit_fallback_bounded: self.fit_fallback_bounded,
             .take()
             .expect("the fallback pool is taken at most once")
     }
+}
+
+/// The configured metric at the tree's current constants, in exact f64.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn exact_error(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metric) -> f64 {
+    let pred: Vec<f64> = x.iter().map(|row| expr::eval(tree, row)).collect();
+    score_weighted(&pred, y, w, metric, expr::count_constants(tree))
+}
+
+/// #265: run the exact CPU fit and report whether it lowered the exact error
+/// compared with the constants the tree held on entry (the device constants, or
+/// the incoming ones when the device produced none).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn refit_lowers_error(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> bool {
+    let before = exact_error(tree, x, y, w, metric);
+    crate::fit::fit_weighted_metric(tree, x, y, w, iters, metric);
+    let after = exact_error(tree, x, y, w, metric);
+    after.is_finite() && (before.is_nan() || after < before)
+}
+
+/// #265: count one improved refit under its fallback cause.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn count_improved(map: &mut BTreeMap<String, usize>, cause: FitFallbackCause) {
+    *map.entry(cause.label().to_string()).or_default() += 1;
 }
 
 /// #255: split a fallback batch into the part that is refit and the part held
@@ -1690,6 +1748,19 @@ struct FallbackFitJob {
     island: usize,
     slot: usize,
     tree: Node,
+    improved: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl FallbackFitJob {
+    fn new(island: usize, slot: usize, tree: Node) -> Self {
+        FallbackFitJob {
+            island,
+            slot,
+            tree,
+            improved: false,
+        }
+    }
 }
 
 /// #255: run the exact CPU fallback fits across at most `workers` scoped
@@ -1712,7 +1783,7 @@ fn fit_fallback_jobs(
     let workers = workers.max(1).min(jobs.len());
     if workers == 1 {
         for job in jobs.iter_mut() {
-            crate::fit::fit_weighted_metric(&mut job.tree, x, y, w, iters, metric);
+            job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
         }
         return 1;
     }
@@ -1725,7 +1796,7 @@ fn fit_fallback_jobs(
             scope.spawn(move || {
                 expr::set_blocks(blocks);
                 for job in chunk.iter_mut() {
-                    crate::fit::fit_weighted_metric(&mut job.tree, x, y, w, iters, metric);
+                    job.improved = refit_lowers_error(&mut job.tree, x, y, w, iters, metric);
                 }
             });
         }
@@ -2156,6 +2227,7 @@ fn score_pipeline_batch(
     // admission set), exactly as the synchronous `fit_pending` loop would.
     let mut plans: Vec<(usize, crate::fit::GpuFitPlan)> = Vec::new();
     let mut fallback_jobs: Vec<usize> = Vec::new();
+    let mut fallback_cause: BTreeMap<usize, FitFallbackCause> = BTreeMap::new();
     for (k, (_, _, tree)) in jobs.iter().enumerate() {
         match crate::fit::gpu_fit_plan_reason(tree) {
             Ok(plan) => plans.push((k, plan)),
@@ -2179,6 +2251,7 @@ fn score_pipeline_batch(
             Err(crate::fit::GpuFitReject::TooManyConstants) => FitFallbackCause::TooManyConstants,
             _ => FitFallbackCause::UnsupportedPlan,
         };
+        fallback_cause.insert(k, cause);
         g.note_fit_fallback(generation, cause);
         crate::fit::note_gpu_fit(false);
         results[i][j] = Some(PipelineResult {
@@ -2198,6 +2271,7 @@ fn score_pipeline_batch(
             for (k, _) in &plans {
                 fallback_jobs.push(*k);
                 let (i, j) = (jobs[*k].0, jobs[*k].1);
+                fallback_cause.insert(*k, FitFallbackCause::Launch);
                 g.note_fit_fallback(generation, FitFallbackCause::Launch);
                 crate::fit::note_gpu_fit(false);
                 results[i][j] = Some(PipelineResult {
@@ -2224,6 +2298,7 @@ fn score_pipeline_batch(
                     } else {
                         status_fallback_cause(res.status)
                     };
+                    fallback_cause.insert(*k, cause);
                     g.note_fit_fallback(generation, cause);
                     crate::fit::note_gpu_fit(false);
                     results[i][j] = Some(PipelineResult {
@@ -2247,23 +2322,15 @@ fn score_pipeline_batch(
                 .as_ref()
                 .is_some_and(|r| r.error.is_nan())
                 .then(|| {
-                    (
-                        k,
-                        FallbackFitJob {
-                            island: i,
-                            slot: j,
-                            tree: jobs[k].2.clone(),
-                        },
-                    )
+                    (k, FallbackFitJob::new(i, j, jobs[k].2.clone()))
                 })
         })
         .collect();
     if !fb.is_empty() {
-        let mut owned: Vec<FallbackFitJob> = fb.iter().map(|(_, job)| FallbackFitJob {
-            island: job.island,
-            slot: job.slot,
-            tree: job.tree.clone(),
-        }).collect();
+        let mut owned: Vec<FallbackFitJob> = fb
+            .iter()
+            .map(|(_, job)| FallbackFitJob::new(job.island, job.slot, job.tree.clone()))
+            .collect();
         fit_fallback_jobs(
             &mut owned,
             &train.x,
@@ -2274,6 +2341,13 @@ fn score_pipeline_batch(
             fallback_workers(),
         );
         for ((k, job), done) in fb.iter_mut().zip(owned) {
+            if done.improved {
+                let cause = fallback_cause
+                    .get(k)
+                    .copied()
+                    .unwrap_or(FitFallbackCause::UnsupportedPlan);
+                g.note_fit_fallback_improved(generation, cause);
+            }
             job.tree = done.tree.clone();
             jobs[*k].2 = done.tree;
             fitted.push((*k, None));
@@ -2341,6 +2415,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     // the reason, and no run can be silently ranked by MSE.
     if let Some(reason) = crate::metrics::score_refusal(cfg.metric) {
         return Some(reason);
+    }
+    if cfg.metric == crate::metrics::Metric::ImplicitResidual
+        && train.y.iter().any(|&v| v != 0.0)
+    {
+        return Some("implicit_residual needs an all-zero training target");
     }
     // #288: AUC needs exactly two distinct target values; the label rule is
     // the CPU midpoint rule, so any other target is refused, never collapsed.
@@ -3214,6 +3293,10 @@ pub enum FitFallbackCause {
     /// #393: `signed` only. No constant can move the mean, so the proposal has
     /// no justification on the bias; the exact CPU arm refits.
     NotIdentifiable,
+    /// A correlation tree that is affine in every constant has a global closed
+    /// form (weighted least squares). It is a route, not a failure: the CPU arm
+    /// solves it directly and the device never sees it.
+    AffineClosedForm,
     /// #227: the device maximum-error stage declined (allocation, launch or an
     /// inconsistent scan) and the exact CPU maximum arm took over.
     MaximumDeclined,
@@ -3226,7 +3309,7 @@ pub enum FitFallbackCause {
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 16] = [
+    pub const ALL: [FitFallbackCause; 17] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -3243,6 +3326,7 @@ impl FitFallbackCause {
         FitFallbackCause::DispatchCost,
         FitFallbackCause::Worse,
         FitFallbackCause::NotIdentifiable,
+        FitFallbackCause::AffineClosedForm,
     ];
 
     /// Stable JSON label.
@@ -3264,6 +3348,7 @@ impl FitFallbackCause {
             FitFallbackCause::DispatchCost => "dispatch_cost",
             FitFallbackCause::Worse => "worse",
             FitFallbackCause::NotIdentifiable => "not_identifiable",
+            FitFallbackCause::AffineClosedForm => "affine_closed_form",
         }
     }
 }
@@ -4088,6 +4173,8 @@ pub struct GpuGenStats {
     pub fit_screened: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
+    /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
+    pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
     /// #255: wall seconds this generation spent in the exact CPU fallback
     /// fits. A subset of the run's `fit.host_seconds`.
     pub fit_fallback_seconds: f64,
@@ -4114,6 +4201,8 @@ pub struct GpuRunStats {
     pub fit_screened: usize,
     /// #169: CPU fallback counts labelled by cause.
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
+    /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
+    pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
     /// #286: finite device answers by label; every entry is a non-fallback.
     pub fit_status_by_label: BTreeMap<String, usize>,
     /// #169: exact CPU f64 refits of finalists before reporting.
@@ -4594,6 +4683,8 @@ pub struct GpuSnapshot {
     pub fit_gpu: usize,
     pub fit_fallback: usize,
     pub fit_fallback_by_cause: BTreeMap<String, usize>,
+    /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
+    pub fit_fallback_improved_by_cause: BTreeMap<String, usize>,
     pub fallback_s: f64,
     pub fallback_workers: usize,
     pub programs: usize,
@@ -4616,12 +4707,19 @@ impl GpuSnapshot {
             *entry = entry.saturating_sub(*count);
         }
         causes.retain(|_, v| *v > 0);
+        let mut improved = self.fit_fallback_improved_by_cause.clone();
+        for (name, count) in &earlier.fit_fallback_improved_by_cause {
+            let entry = improved.entry(name.clone()).or_insert(0);
+            *entry = entry.saturating_sub(*count);
+        }
+        improved.retain(|_, v| *v > 0);
         GpuSnapshot {
             accounting: self.accounting.since(&earlier.accounting),
             fit_attempts: self.fit_attempts.saturating_sub(earlier.fit_attempts),
             fit_gpu: self.fit_gpu.saturating_sub(earlier.fit_gpu),
             fit_fallback: self.fit_fallback.saturating_sub(earlier.fit_fallback),
             fit_fallback_by_cause: causes,
+            fit_fallback_improved_by_cause: improved,
             fallback_s: (self.fallback_s - earlier.fallback_s).max(0.0),
             fallback_workers: self.fallback_workers.max(earlier.fallback_workers),
             programs: self.programs,
@@ -4734,6 +4832,11 @@ fn dev_generation(
                 refits,
                 fallback_by_cause: g
                     .fit_fallback_by_cause
+                    .iter()
+                    .map(|(k, v)| (k.clone(), *v))
+                    .collect(),
+                fallback_improved_by_cause: g
+                    .fit_fallback_improved_by_cause
                     .iter()
                     .map(|(k, v)| (k.clone(), *v))
                     .collect(),
@@ -4973,6 +5076,7 @@ fn run_postfix_search(
             fit_fallback: 0,
             fit_screened: 0,
             fit_fallback_by_cause: Default::default(),
+            fit_fallback_improved_by_cause: Default::default(),
             fit_fallback_seconds: 0.0,
             fit_fallback_bounded: 0,
             fit_fallback_workers: 0,
@@ -7295,6 +7399,41 @@ mod tests {
         assert!(!crate::fit::admits_every_candidate(Metric::LogLoss));
     }
 
+    /// #265: a forced fallback refit that lowers the exact error counts as
+    /// improved; one that starts at the optimum does not.
+    #[test]
+    fn fallback_refit_counts_only_a_lowered_error() {
+        let s = sample();
+        let line = |a: f64| node(Op::Mul, vec![constant(a), input(0)]);
+        let mut bad = line(0.25);
+        assert!(refit_lowers_error(&mut bad, &s.x, &s.y, &s.w, 8, Metric::Squared));
+        let mut exact = line(1.0);
+        assert!(!refit_lowers_error(&mut exact, &s.x, &s.y, &s.w, 8, Metric::Squared));
+    }
+
+    /// #265: improvements are tallied under the cause that sent the candidate
+    /// to the CPU arm, and a non-improving fallback adds nothing.
+    #[test]
+    fn improved_fallbacks_are_counted_per_cause() {
+        let s = sample();
+        let mut map = BTreeMap::new();
+        let runs = [
+            (FitFallbackCause::IllConditioned, 0.25),
+            (FitFallbackCause::IllConditioned, 1.0),
+            (FitFallbackCause::NonFinite, 0.5),
+            (FitFallbackCause::IllConditioned, -2.0),
+        ];
+        for (cause, start) in runs {
+            let mut t = node(Op::Mul, vec![constant(start), input(0)]);
+            if refit_lowers_error(&mut t, &s.x, &s.y, &s.w, 8, Metric::Squared) {
+                count_improved(&mut map, cause);
+            }
+        }
+        assert_eq!(map.get("ill_conditioned"), Some(&2));
+        assert_eq!(map.get("non_finite"), Some(&1));
+        assert_eq!(map.values().sum::<usize>(), 3);
+    }
+
     /// #169: every CPU fallback cause has a stable label, and both the plan
     /// rejection and the kernel status map into the documented set.
     #[test]
@@ -7320,6 +7459,7 @@ mod tests {
                 "dispatch_cost",
                 "worse",
                 "not_identifiable",
+                "affine_closed_form",
             ]
         );
         assert_eq!(
@@ -8320,11 +8460,7 @@ mod tests {
             trees
                 .iter()
                 .enumerate()
-                .map(|(k, t)| FallbackFitJob {
-                    island: k % 2,
-                    slot: k,
-                    tree: t.clone(),
-                })
+                .map(|(k, t)| FallbackFitJob::new(k % 2, k, t.clone()))
                 .collect()
         };
         let mut one = make();

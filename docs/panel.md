@@ -89,7 +89,7 @@ hashes and the ledger lines for `--require-full-bucket` and `--keep-partial`.
 ### Device PIT as-of joins (`--features cuda`)
 
 `src/panel_pit.rs` is the exact CPU reference and `src/panel_pit_gpu.rs` /
-`src/cuda/pit.cu` the device merge (issue #302). The membership **decisions**
+`src/cuda/pit.cu` the device merge. The membership **decisions**
 (ranking, ADV tie-breaks, `member`) stay on the CPU in `build_membership`; the
 device only maps every base row to the decision in force. It consumes a decoded
 symbol-major block: base times, a caller chain id (migration) per row and a
@@ -118,16 +118,26 @@ sorted decision list per symbol.
 `panel::build_panel_with_step` on boundary fixtures and a random block;
 `tests/panel_gpu.rs` pins device/CPU byte identity, cold/warm, block and chunk
 size invariance, and prefix replay at 20 cuts (all rows with `ts <= T` equal
-the full run truncated). Production `rcsr panel build` still uses the CPU path;
-wiring changes no CPU byte and is part of #259.
+the full run truncated).
+
+`rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every
+base bar against the membership decisions with this merge: one `PitBlock` with a
+segment per symbol, one launch, then the panel rows are built from `kept_rows`,
+`gap` and the decision `as_of`. The CPU route runs `panel_pit::join` on the same
+block, so the store is byte-identical on either route. `auto` takes the device from
+one million base rows, `on` always, `off` keeps the CPU join and the manifest
+without a `backend` block. A CPU join under `auto` or `on` is named in the `v2`
+block of `<out>.manifest.json`: the `backend` block lists the requested mode, the
+device, symbols and rows per route, launches, bytes moved and the fallback reason
+(`too_few_rows`, `no_device`, `launch`). `panel validate` always replays prefixes on
+the CPU. `tests/panel_v2.rs` pins the store SHA for `--gpu off` against `--gpu on`
+from a cold and a warm (`--resume`) base on a fixture with listings, delistings,
+relisting gaps and membership changes.
 
 Measured on a 4.78M-row block of 40 symbols (`pit_paired_4_78m_row_join_measurement`,
 `--ignored`): the membership join (560 decisions) takes the CPU reference 0.19 s
 (25 M rows/s, 3.94 dependent key loads per row) and the device pass 0.025 s
-(188 M rows/s, 1.02 loads per row). The 1h MTF join (2.0M higher bars) takes the
-CPU 0.43 s (11 M rows/s, 15.7 loads per row) and the device 0.029 s (167 M
-rows/s, 1.48 loads per row). The download is 0.12 s, so the device join pays when
-the block is already resident.
+(188 M rows/s, 1.02 loads per row).
 
 The device prep and PIT joins are gated by `tests/gpu_parity.rs` (CPU vs device SHA-256, cold/warm, block sizes, prefix replay at 20 cuts, future-shift canary). See "Parity and batch-invariance harness" in `docs/ohlcv.md`.
 

@@ -212,6 +212,7 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
 }
 
 /// The outcome of comparing one proposal with the starting constants.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Verdict {
     /// The proposal was accepted; carries its exact score of the metric.
     Accepted(f64),
@@ -1943,5 +1944,145 @@ mod tests {
         let again = maximum_finalist(&mut twice, &x, &y, &[], 8);
         assert!(again <= value, "{again} > {value}");
         assert!(again.is_finite());
+    }
+
+    // -- the correlation family through the exact gate ----------------------
+
+    fn corr_model() -> Node {
+        node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Mul,
+                    vec![
+                        constant(0.5),
+                        node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])]),
+                    ],
+                ),
+                constant(0.1),
+            ],
+        )
+    }
+
+    fn corr_rows(n: usize) -> (Vec<Vec<f64>>, Vec<f64>) {
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![-2.0 + 4.0 * i as f64 / (n - 1) as f64])
+            .collect();
+        let y: Vec<f64> = x.iter().map(|r| 3.0 * (0.8 * r[0]).sin() + 20.0).collect();
+        (x, y)
+    }
+
+    fn bits(c: &[f64]) -> Vec<u64> {
+        c.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// A proposal with a better correlation and a worse SSE is accepted for a
+    /// correlation metric and rejected for the squared metric.
+    #[test]
+    fn a_correlation_proposal_is_judged_on_1_minus_rho_not_sse() {
+        let (x, y) = corr_rows(40);
+        let start = corr_model();
+        let proposal = vec![1.0, 1.0, 0.0];
+        let mut trial = start.clone();
+        write_constants(&mut trial, &flatten(&start), &proposal);
+        let start_corr = metric_score(&start, &x, &y, &[], Metric::Correlation);
+        let proposal_corr = metric_score(&trial, &x, &y, &[], Metric::Correlation);
+        assert!(proposal_corr < start_corr);
+        assert!(
+            metric_score(&trial, &x, &y, &[], Metric::Squared)
+                > metric_score(&start, &x, &y, &[], Metric::Squared)
+        );
+        let mut tree = start.clone();
+        let verdict = gate_device_proposal(&mut tree, &proposal, &x, &y, &[], Metric::Correlation);
+        assert_eq!(verdict, Verdict::Accepted(proposal_corr));
+        assert_eq!(bits(&fitted(&tree)), bits(&proposal));
+        let mut squared = start.clone();
+        let verdict = gate_device_proposal(&mut squared, &proposal, &x, &y, &[], Metric::Squared);
+        assert_eq!(verdict, Verdict::Rejected);
+        assert_eq!(bits(&fitted(&squared)), bits(&fitted(&start)));
+    }
+
+    /// The reflected proposal costs nothing under `1 − |ρ|` but `2 − (1 − ρ)`
+    /// under `1 − ρ`, so only the signed gate rejects it.
+    #[test]
+    fn a_reflected_proposal_is_rejected_for_signed_correlation() {
+        let (x, y) = corr_rows(40);
+        let start = corr_model();
+        let mirrored = vec![-0.5, 1.0, 0.1];
+        let mut trial = start.clone();
+        write_constants(&mut trial, &flatten(&start), &mirrored);
+        let abs_start = metric_score(&start, &x, &y, &[], Metric::Correlation);
+        let abs_mirror = metric_score(&trial, &x, &y, &[], Metric::Correlation);
+        assert!((abs_start - abs_mirror).abs() < 1e-12);
+        let mut unsigned = start.clone();
+        assert!(matches!(
+            gate_device_proposal(&mut unsigned, &mirrored, &x, &y, &[], Metric::Correlation),
+            Verdict::Accepted(_)
+        ));
+        let mut signed = start.clone();
+        let verdict =
+            gate_device_proposal(&mut signed, &mirrored, &x, &y, &[], Metric::CorrelationSigned);
+        assert_eq!(verdict, Verdict::Rejected);
+        assert_eq!(bits(&fitted(&signed)), bits(&fitted(&start)));
+    }
+
+    /// A worse, non-finite or mis-sized proposal keeps the incoming constants
+    /// bit for bit, and the exact CPU refit from them is what the batch
+    /// reports.
+    #[test]
+    fn a_worse_device_correlation_proposal_is_refit_on_the_cpu() {
+        let (x, y) = corr_rows(41);
+        for (proposal, want) in [
+            (vec![f64::NAN, 1.0, 0.0], Verdict::NonFinite),
+            (vec![1.0, 1.0], Verdict::Rejected),
+        ] {
+            let mut tree = corr_model();
+            let verdict =
+                gate_device_proposal(&mut tree, &proposal, &x, &y, &[], Metric::CorrelationSigned);
+            assert_eq!(verdict, want);
+            assert_eq!(bits(&fitted(&tree)), bits(&fitted(&corr_model())));
+        }
+        for proposal in [None, Some(vec![f64::NAN, 1.0, 0.0]), Some(vec![9.0, 9.0, 9.0])] {
+            let mut gpu = vec![corr_model()];
+            let out = fit_batch_verified(
+                &Backend { proposal },
+                &mut gpu,
+                &x,
+                &y,
+                &[],
+                8,
+                Metric::CorrelationSigned,
+            );
+            let mut cpu = corr_model();
+            let reference =
+                fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::CorrelationSigned);
+            assert_eq!(out.score[0].to_bits(), reference.to_bits());
+            assert_eq!(bits(&fitted(&gpu[0])), bits(&fitted(&cpu)));
+        }
+    }
+
+    /// With zero iterations the exact CPU arm moves no constant, and a
+    /// proposal is still judged on the configured metric.
+    #[test]
+    fn no_fit_keeps_a_correlation_run_untouched() {
+        let (x, y) = corr_rows(30);
+        let mut tree = corr_model();
+        let before = fitted(&tree);
+        let start = metric_score(&tree, &x, &y, &[], Metric::CorrelationSigned);
+        let got = fit_weighted_metric(&mut tree, &x, &y, &[], 0, Metric::CorrelationSigned);
+        assert_eq!(got.to_bits(), start.to_bits());
+        assert_eq!(bits(&fitted(&tree)), bits(&before));
+        let mut trees = vec![tree];
+        let out = fit_batch_verified(
+            &ProposingBackend(vec![1.0, 1.0, 0.0]),
+            &mut trees,
+            &x,
+            &y,
+            &[],
+            0,
+            Metric::CorrelationSigned,
+        );
+        let exact = metric_score(&trees[0], &x, &y, &[], Metric::CorrelationSigned);
+        assert_eq!(out.score[0].to_bits(), exact.to_bits());
     }
 }

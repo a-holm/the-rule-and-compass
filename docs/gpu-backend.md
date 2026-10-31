@@ -220,9 +220,11 @@ in shared memory and written once per expression.
 
 **Branchless operators, matched semantics.** Division, `log`, `sqrt`, `tan` and
 `pow` use the *same* domain guards as the host evaluator, expressed as predicated
-selects rather than branches. Anything non-finite, or larger than a shared
-magnitude limit of 1e30, counts as a hard failure on **both** sides — so the
-GPU and CPU agree on which candidates are hopeless.
+selects rather than branches. The legacy f32 SSE evaluator (`eval_batch`,
+`eval_pool`) and its host reference `cpu_sse` count a non-finite prediction, or
+one above a shared magnitude limit of 1e30, as a hard failure on **both** sides.
+The native score paths use the rule in "Large predictions and overflowing
+residuals" instead.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
@@ -494,18 +496,29 @@ squared error:
 The device kernel uses a fixed reduction tree, ascending row order and no
 floating-point atomics, so the same candidate scores identical bits alone or in
 a batch of 7 or 447. `maximum` compares the IEEE-754 bits of `|r|` and breaks an
-exact tie on the lowest row. A non-finite prediction (or one above the same
-`1e30` hard-magnitude limit used elsewhere) returns **`+inf` with status 2**,
-never the old finite `1e30/n`. `score_batch`/`score_pool` return `f64` values
+exact tie on the lowest row. A non-finite prediction returns **`+inf` with
+status 2**, never the old finite `1e30/n`; a finite prediction of any magnitude
+is scored (see below). `score_batch`/`score_pool` return `f64` values
 plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
+
+**Large predictions and overflowing residuals.** The device follows the CPU scorer (`metrics::score_weighted`) exactly. There is no magnitude limit on the native score paths.
+
+* A prediction that is not finite on a row with positive weight scores `+inf` (status 2, `None` on the order-statistic paths). Nothing else does.
+* A finite prediction of any magnitude is scored. The f32 score kernels (`score_kernel`, `score_step`, the row-range and classification kernels) widen the f32 prediction to `f64` before the residual, so a residual cannot overflow there. A prediction that overflows the f32 range is `inf` in the kernel and is therefore `+inf`, because the f32 program cannot represent it. The CPU gives the same `+inf` when it scores those f32 rows.
+* The exact `f64` order-statistic paths (`median`, `maximum`, `interquartile`, sort and select) form `pred - y` in `f64`. A residual that overflows keys as `+inf`, the largest finite-or-infinite key, so the maximum is `+inf`, the median ignores it unless it is the middle key, and the interquartile mean is `+inf` only when the window holds it. A NaN residual (a NaN target) marks the segment non-finite.
+* The legacy f32 SSE evaluator (`eval_batch`, `eval_pool`, `cpu_sse`) keeps its 1e30 hard-failure limit. It serves the fit and test APIs, not scoring.
+
+`gpu::tests::large_finite_predictions_score_like_the_cpu`, `gpu::classification_parity_tests::large_finite_predictions_score_like_the_cpu` and `gpu::order_select_tests::large_predictions_and_overflowing_residuals_match_the_cpu` pin the rule for every native metric, with repeat bit identity.
 
 `median`, `interquartile`, `rank_correlation`, `rank_correlation_signed` and
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
 by `GpuEvaluator::score_stat_batch` over flattened plans on the exact `f64` forward
 pass, from the measured 4 096-row floor (see the #288 section below). `slope`
-and the implicit metrics remain CPU. Their named reason is printed and recorded
-in `backend_reason`, and so is the row floor for an `Exact` metric.
+and `implicit` remain CPU. `implicit_residual` is the `absolute` objective on the
+all-zero implicit target: it shares the `absolute` native scorer and the L1 IRLS
+device fit arm, and a run with a non-zero target is refused by name. The named reason of a
+refused metric is printed and recorded in `backend_reason`, and so is the row floor for an `Exact` metric.
 `log_loss`, `brier` and the three hinge forms are native since #289 — see
 [Classification fitness](#classification-fitness-issue-289) below. Their
 fitness, the label sign and (for the classification family) the per-row
@@ -675,8 +688,8 @@ one or two order statistics, so they do not need the sort.
   negative, so the unsigned bit order is the numeric order; `fabs` maps `−0.0`
   to `+0.0` like the CPU's `f64::abs`, and subnormals and `f64::MAX` order as
   plain bits. Both paths call one row-key function (`md_row_key`), so a
-  non-finite prediction or residual (and `|pred| > 1e30`) marks the segment
-  non-finite on both, which scores `+inf` like the CPU.
+  non-finite prediction or a NaN residual marks the segment non-finite on both,
+  which scores `+inf` like the CPU. A residual that overflows keys as `+inf`.
 * **Passes** (`src/cuda/radix_select.h`). Six 11-bit digits, high to low. Every
   segment is spread over many blocks (grid `(segments, blocks per segment)`).
   Pass 0 is fused into the prediction sweep; later passes read the key buffer
@@ -1946,6 +1959,15 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
+### Correlation arm
+
+`--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.
+
+* **Orientation.** `correlation_signed` has a genuine sign. The kernel refines two orientations from the same entry constants: the incoming scale sign, then its negation, which thread 0 writes to the shared scale slot after the restore barrier. The lower objective wins, a tie keeps the incoming orientation, and `--fit-iters 0` never flips. Status is the status of the kept orientation (`recovered`, `no_improvement`, `start_unusable`, `rank_deficient` keep their meaning). `correlation` has one orientation.
+* **Closed form.** A tree that is affine in every constant has a global optimum, the weighted least-squares fit (`correlation::fit`). Such a tree never reaches the device: it is routed to the exact CPU arm with the label `affine_closed_form`. This label is a route, not a failure.
+* **Exact gate.** Every proposal passes `fit::gate_device_proposal` on the configured metric. A worse or non-finite proposal restores the incoming constants and the CPU arm refits (`worse`, `non_finite`).
+* **Cost.** The dispatch model scales the calibrated fit rates by passes per candidate relative to one squared LM run: `correlation` 1 on both sides, `correlation_signed` 2 on the device (two orientations) and 3 on the CPU (three orientations tried).
+
 ## The DGX Spark path
 
 | | |
@@ -2173,7 +2195,7 @@ Definitions that matter:
   seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
   is a telemetry defect. `fit` separates raw device kernel seconds from the
   measured exact-CPU fallback and finalist-refit seconds, with
-  `fallback_by_cause`; `eval_fallback` does the same for the evaluator's CPU
+  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels; `gpu.fit` and each `gpu.generations[]` entry carry the same fields); `eval_fallback` does the same for the evaluator's CPU
   pool. Every derived value is
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
@@ -3088,3 +3110,7 @@ The rank and order-statistic score calls split their trials into sub-waves, so o
 ### Throughput at the wide-panel scale
 
 Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).
+
+## Panel build on the device
+
+`rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every base bar against the membership decisions with the monotone as-of merge of `src/cuda/pit.cu`, then derives the gap tags and chain starts. The planner is the one of `panel base`: `off` is always CPU, `auto` needs a usable device and at least 1M base rows, `on` needs a device. The block is one segment per symbol and one launch. The store is byte-identical on every route. A CPU join under `auto` or `on` is named in the `v2.backend` block of the panel manifest with its reason (`too_few_rows`, `no_device`, `launch`). The device buffers go through `src/cuda/alloc_guard.h`. `panel validate` replays prefixes on the CPU reference. MTF columns have their own device path in `src/cuda/mtf.cu`. See `docs/panel.md`.
