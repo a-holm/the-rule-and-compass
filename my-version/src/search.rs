@@ -7358,6 +7358,25 @@ mod tests {
         assert!(ind.complexity < before, "dead 0+ and 1* nodes carry no complexity");
     }
 
+    /// `--fit-strategy gpu --metric signed` is accepted and defers the fit: the
+    /// kernel is the squared warm start of the CPU arm.
+    #[test]
+    fn signed_defers_to_the_device_as_a_squared_warm_start() {
+        assert!(crate::fit::gpu_fit_metric_error(Metric::Signed).is_none());
+        assert_eq!(
+            crate::fit::fit_loss(Metric::Signed),
+            Some(crate::fit::DeviceLoss::Squared)
+        );
+        let cfg = Config {
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_iters: 8,
+            metric: Metric::Signed,
+            ..Default::default()
+        };
+        assert!(defers_fit_to_gpu(&cfg, true));
+        assert!(!defers_fit_to_gpu(&Config { fit_iters: 0, ..cfg }, true));
+    }
+
     /// #393: the metrics whose proposals need the exact gate defer without the
     /// ungated pipeline write-back, and are fitted for every candidate.
     #[test]

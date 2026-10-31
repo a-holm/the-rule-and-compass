@@ -521,6 +521,26 @@ pub fn sidecar_path(data_path: &str) -> Option<String> {
     Some(p.with_extension("targets.json").to_string_lossy().into_owned())
 }
 
+/// `<data>.labels.json`, written by `rcsr enrich` beside the store.
+pub fn label_sidecar_path(data_path: &str) -> Option<String> {
+    if data_path == "-" || data_path.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(data_path);
+    Some(p.with_extension("labels.json").to_string_lossy().into_owned())
+}
+
+/// The label report object of target column `column` in the label sidecar of
+/// `data_path`, or `None` without a sidecar or an entry.
+pub fn label_report_for(data_path: &str, column: &str) -> Option<String> {
+    let text = std::fs::read_to_string(label_sidecar_path(data_path)?).ok()?;
+    let head = format!("{{\"target\":{},\"report\":", crate::devlog::text(column));
+    text.lines().find_map(|l| {
+        let l = l.trim_end().trim_end_matches(',');
+        l.strip_prefix(&head)?.strip_suffix('}').map(str::to_string)
+    })
+}
+
 /// A resolved spec: the entry, where it came from and the file hash.
 pub struct Resolved {
     pub spec: TargetSpec,
@@ -704,6 +724,9 @@ pub struct Active {
     pub rung: Option<crate::diagnostics::TargetStructureRung>,
     /// Realised-purge facts for the `# purge:` line.
     pub purge_line: String,
+    /// Label production report (JSON object) of the target column, read from
+    /// `<data>.labels.json` when `rcsr enrich` wrote one.
+    pub label_report: Option<String>,
 }
 
 impl Active {
@@ -720,7 +743,7 @@ impl Active {
             None => "null".to_string(),
         };
         format!(
-            "{{\"schema\":{},\"source\":{},\"path\":{},\"sha256\":{},\"file_sha256\":{},{},{},\"check\":{{\"status\":{},\"construction_in_vars\":[{}],\"proxies\":{}}}}}",
+            "{{\"schema\":{},\"source\":{},\"path\":{},\"sha256\":{},\"file_sha256\":{},{},{},\"check\":{{\"status\":{},\"construction_in_vars\":[{}],\"proxies\":{}}},\"label_report\":{}}}",
             text(SCHEMA),
             text(self.source.name()),
             text(self.source.path()),
@@ -735,7 +758,8 @@ impl Active {
                 .map(|c| text(c))
                 .collect::<Vec<_>>()
                 .join(","),
-            proxies
+            proxies,
+            self.label_report.as_deref().unwrap_or("null")
         )
     }
 

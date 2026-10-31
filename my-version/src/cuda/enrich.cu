@@ -155,7 +155,7 @@ extern "C" unsigned long long rc_enrich_test_launch_hits(void)
 #define RC_LAUNCH_FAULT(site) rc_launch_fault(site)
 
 
-static int g_force_cub_fail = 0;
+static thread_local int g_force_cub_fail = 0;
 
 extern "C" void rc_enrich_test_force_cub_fail(int on)
 {

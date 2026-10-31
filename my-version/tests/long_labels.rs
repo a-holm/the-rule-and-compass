@@ -459,3 +459,81 @@ fn report_carries_the_diagnostics_and_a_stable_hash() {
     dearer.cost.fee_bps = 6.0;
     assert_ne!(build(&bars, &dearer, None).unwrap().label_hash(), r.label_hash);
 }
+
+#[test]
+fn spec_parses_and_refuses_what_it_cannot_label() {
+    let s = LongLabelSpec::parse("long:4h,name=a_4h,delay=1,fee=5,spread=2,slip=1,vol=48,floor=3,clip=2,up=1.5,down=0.5,stride=2", HOUR).unwrap();
+    assert_eq!((s.name.as_str(), s.horizon_bars, s.delay_bars, s.sigma_window, s.stride), ("a_4h", 4, 1, 48, 2));
+    assert_eq!((s.cost.fee_bps, s.cost.spread_bps, s.cost.slippage_bps), (5.0, 2.0, 1.0));
+    assert_eq!((s.sigma_floor_bps, s.clip, s.barrier_up, s.barrier_down), (3.0, 2.0, 1.5, 0.5));
+    assert_eq!(LongLabelSpec::parse("long:6", HOUR).unwrap().name, "h6");
+    for bad in ["long:90m", "long:4,side=short", "long:4,vol=1", "long:4,fee=-1", "long:4,x=1", "name=a", "long:4,name=A"] {
+        assert!(LongLabelSpec::parse(bad, HOUR).is_err(), "{bad}");
+    }
+    assert_eq!(labels::parse_column("lbl_a_4h_m_net"), Some(("a_4h", "m_net")));
+    assert_eq!(labels::parse_column("lbl_x_long_net"), Some(("x", "long_net")));
+    assert_eq!(labels::parse_column("fwd16"), None);
+    assert_eq!(labels::parse_column("lbl__y"), None);
+}
+
+#[test]
+fn top_moves_are_the_largest_absolute_forward_moves_with_stamps() {
+    let bars = wavy(300);
+    let l = build(&bars, &spec("y_2h", 2), None).unwrap();
+    let r = l.report();
+    assert_eq!(r.top_moves.len(), labels::TOP_MOVES);
+    let mut all: Vec<(f64, i64)> = (0..bars.len())
+        .filter(|&t| l.fwd[t].is_finite())
+        .map(|t| (l.fwd[t].abs(), bars[t].time))
+        .collect();
+    all.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
+    for (m, w) in r.top_moves.iter().zip(&all) {
+        assert_eq!(m.fwd.abs().to_bits(), w.0.to_bits());
+        assert_eq!(m.time, w.1);
+        assert!(m.symbol.is_none());
+    }
+    assert!(r.json().contains("\"top_abs_moves\":{\"n\":10,\"moves\":[{\"symbol\":null,\"time\":"));
+}
+
+#[test]
+fn accumulator_merges_symbols_and_hash_follows_every_series() {
+    let a = wavy(120);
+    let mut b = wavy(120);
+    for bar in &mut b {
+        bar.close *= 1.01;
+        bar.high *= 1.01;
+    }
+    let s = spec("y_3h", 3);
+    let (la, lb) = (build(&a, &s, None).unwrap(), build(&b, &s, None).unwrap());
+    let feed = |first: &labels::LongLabels, second: &labels::LongLabels| {
+        let mut acc = labels::LabelAccumulator::new(&s);
+        acc.add("AAA", first);
+        acc.add("BBB", second);
+        acc.finish()
+    };
+    let r = feed(&la, &lb);
+    assert_eq!(r.rows, 240);
+    assert_eq!(r.valid_rows, la.report().valid_rows + lb.report().valid_rows);
+    assert!(r.top_moves.iter().any(|m| m.symbol.as_deref() == Some("AAA")) || r.top_moves.iter().any(|m| m.symbol.as_deref() == Some("BBB")));
+    assert_eq!(feed(&la, &lb).label_hash, r.label_hash, "stable");
+    assert_ne!(feed(&la, &la).label_hash, r.label_hash, "changes with one symbol's labels");
+    assert_ne!(feed(&lb, &la).label_hash, r.label_hash, "depends on the series order");
+}
+
+#[test]
+fn label_family_columns_are_refused_as_inputs_by_the_d13a_canary() {
+    let ts = spec("y_4h", 4).target_spec("lbl_y_4h_y", "lbl_y_4h_fwd");
+    for kind in ["fwd", "y", "long_net", "action", "t1", "exit_ret", "m_net", "m_barrier", "weight"] {
+        let col = format!("lbl_other_{kind}");
+        let report = target::check(&ts, &["ret1".to_string(), col.clone()], false).unwrap_err();
+        assert!(report.leaks.iter().any(|l| l.detector == "D13a" && l.column.as_deref() == Some(col.as_str())), "{col}");
+    }
+    assert!(target::check(&ts, &["ret1".to_string(), "fwd16".to_string()], false).is_ok());
+    let view = rcsr::registry::select_view(
+        &["ret1".to_string(), "lbl_a_fwd".to_string()],
+        24,
+        1,
+        0,
+    );
+    assert!(view.map(|v| !v.columns.iter().any(|c| c.starts_with("lbl_"))).unwrap_or(true));
+}

@@ -24,7 +24,7 @@
 
 use crate::devlog::{num, text};
 use crate::manifest::sha256_hex;
-use crate::ohlcv::Bar;
+use crate::ohlcv::{Bar, Timeframe};
 use crate::target::{Scale, TargetSpec};
 
 /// Version of the label definitions; part of the label hash.
@@ -234,6 +234,8 @@ impl LongLabelSpec {
 #[derive(Clone, Debug)]
 pub struct LongLabels {
     pub spec: LongLabelSpec,
+    /// Row stamps (epoch seconds) of the input bars.
+    pub time: Vec<i64>,
     /// `s_W * sqrt(h)` after the floor; the decision-time scale.
     pub sigma_h: Vec<f64>,
     pub fwd: Vec<f64>,
@@ -302,6 +304,7 @@ pub fn build(bars: &[Bar], spec: &LongLabelSpec, funding: Option<&[f64]>) -> Res
     let nan = vec![f64::NAN; n];
     let mut out = LongLabels {
         spec: spec.clone(),
+        time: bars.iter().map(|b| b.time).collect(),
         sigma_h: nan.clone(),
         fwd: nan.clone(),
         y: nan.clone(),
@@ -430,9 +433,142 @@ pub fn meta_labels(primary: &[f64], labels: &LongLabels) -> Result<Vec<f64>, Str
         .collect())
 }
 
+/// Number of largest absolute forward moves listed in a label report.
+pub const TOP_MOVES: usize = 10;
+
+/// Store column prefix of the long-only label family.
+pub const COLUMN_PREFIX: &str = "lbl_";
+
+/// Label column kinds in store order. The flag is true where the column needs
+/// the volatility window `s_W` and is `NaN` during its warm-up.
+pub const COLUMN_KINDS: [(&str, bool); 9] = [
+    ("fwd", false),
+    ("y", true),
+    ("long_net", false),
+    ("action", false),
+    ("t1", false),
+    ("exit_ret", true),
+    ("m_net", true),
+    ("m_barrier", true),
+    ("weight", false),
+];
+
+/// `lbl_<label>_<kind>`.
+pub fn column_name(label: &str, kind: &str) -> String {
+    format!("{}{}_{}", COLUMN_PREFIX, label, kind)
+}
+
+/// Split a stored label column into its label name and kind.
+pub fn parse_column(name: &str) -> Option<(&str, &'static str)> {
+    let rest = name.strip_prefix(COLUMN_PREFIX)?;
+    for (kind, _) in COLUMN_KINDS {
+        if let Some(label) = rest.strip_suffix(kind).and_then(|l| l.strip_suffix('_')) {
+            if !label.is_empty() {
+                return Some((label, kind));
+            }
+        }
+    }
+    None
+}
+
+impl LongLabelSpec {
+    /// Parse `long:<horizon>[,name=ID][,delay=BARS][,fee=BP][,spread=BP]
+    /// [,slip=BP][,vol=BARS][,floor=BP][,clip=C][,up=U][,down=D][,stride=N]`.
+    /// The horizon is a bar count or a timeframe name resolved against
+    /// `bar_seconds`. The default name is `h<bars>`.
+    pub fn parse(src: &str, bar_seconds: i64) -> Result<Self, String> {
+        let bad = |part: &str| format!("label '{}': bad option '{}'", src, part);
+        let mut spec = LongLabelSpec::new("", bar_seconds, 0);
+        let mut named = false;
+        for part in src.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            if let Some(h) = part.strip_prefix("long:") {
+                spec.horizon_bars = match h.trim().parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        let secs = Timeframe::parse(h.trim())?.seconds();
+                        if bar_seconds <= 0 || secs < bar_seconds || secs % bar_seconds != 0 {
+                            return Err(format!(
+                                "label '{}': horizon {} is not a whole number of {}s bars",
+                                src, h.trim(), bar_seconds
+                            ));
+                        }
+                        (secs / bar_seconds) as usize
+                    }
+                };
+                continue;
+            }
+            let (key, value) = part.split_once('=').ok_or_else(|| bad(part))?;
+            let value = value.trim();
+            let float = || value.parse::<f64>().map_err(|_| bad(part));
+            let count = || value.parse::<usize>().map_err(|_| bad(part));
+            match key.trim() {
+                "name" => {
+                    if value.is_empty()
+                        || !value.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+                    {
+                        return Err(format!("label '{}': name must be lower-case ASCII letters, digits and '_'", src));
+                    }
+                    spec.name = value.to_string();
+                    named = true;
+                }
+                "delay" => spec.delay_bars = count()?,
+                "fee" => spec.cost.fee_bps = float()?,
+                "spread" => spec.cost.spread_bps = float()?,
+                "slip" => spec.cost.slippage_bps = float()?,
+                "vol" => spec.sigma_window = count()?,
+                "floor" => spec.sigma_floor_bps = float()?,
+                "clip" => spec.clip = float()?,
+                "up" => spec.barrier_up = float()?,
+                "down" => spec.barrier_down = float()?,
+                "stride" => spec.stride = count()?,
+                "side" => check_side(value)?,
+                _ => return Err(bad(part)),
+            }
+        }
+        if spec.horizon_bars == 0 {
+            return Err(format!("label '{}': needs 'long:<horizon>' with at least one bar", src));
+        }
+        if !named {
+            spec.name = format!("h{}", spec.horizon_bars);
+        }
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Volatility window of a `long:` label spec, read without resolving the horizon.
+    pub fn declared_sigma_window(src: &str) -> usize {
+        src.split(',')
+            .find_map(|p| p.trim().strip_prefix("vol=")?.trim().parse().ok())
+            .unwrap_or(LongLabelSpec::new("", 1, 1).sigma_window)
+    }
+
+    /// Stored column of `kind` for this label.
+    pub fn column(&self, kind: &str) -> String {
+        column_name(&self.name, kind)
+    }
+
+    /// Leading rows of `kind` that are `NaN` because `s_W` is not available.
+    pub fn column_warmup(&self, kind: &str) -> usize {
+        match COLUMN_KINDS.iter().find(|(k, _)| *k == kind) {
+            Some((_, true)) => self.sigma_window,
+            _ => 0,
+        }
+    }
+}
+
+/// One of the largest absolute forward moves.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopMove {
+    pub symbol: Option<String>,
+    /// Row stamp (the decision bar), epoch seconds.
+    pub time: i64,
+    pub fwd: f64,
+}
+
 /// Label production report.
 #[derive(Clone, Debug)]
 pub struct LabelReport {
+    pub name: String,
     pub rows: usize,
     pub valid_rows: usize,
     pub barrier_rows: usize,
@@ -450,6 +586,8 @@ pub struct LabelReport {
     pub fwd_quantiles: [f64; 7],
     /// Round-trip cost over the mean absolute forward move.
     pub cost_to_move: f64,
+    /// The `TOP_MOVES` largest `|fwd|` rows, largest first.
+    pub top_moves: Vec<TopMove>,
     pub average_uniqueness: f64,
     pub effective_n: f64,
     pub effective_n_hours: f64,
@@ -476,6 +614,82 @@ fn share(count: usize, of: usize) -> f64 {
     }
 }
 
+/// Counts and values behind a report; mergeable across series.
+#[derive(Clone, Debug, Default)]
+struct Tally {
+    rows: usize,
+    stride_rows: usize,
+    fwd: Vec<f64>,
+    barrier_rows: usize,
+    clipped: usize,
+    exits: [usize; 3],
+    action_long: usize,
+    uniqueness_sum: f64,
+    top: Vec<TopMove>,
+}
+
+fn move_order(a: &TopMove, b: &TopMove) -> std::cmp::Ordering {
+    b.fwd
+        .abs()
+        .partial_cmp(&a.fwd.abs())
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.time.cmp(&b.time))
+        .then(a.symbol.cmp(&b.symbol))
+}
+
+impl Tally {
+    fn merge(&mut self, other: Tally) {
+        self.rows += other.rows;
+        self.stride_rows += other.stride_rows;
+        self.fwd.extend(other.fwd);
+        self.barrier_rows += other.barrier_rows;
+        self.clipped += other.clipped;
+        for k in 0..3 {
+            self.exits[k] += other.exits[k];
+        }
+        self.action_long += other.action_long;
+        self.uniqueness_sum += other.uniqueness_sum;
+        self.top.extend(other.top);
+        self.top.sort_by(move_order);
+        self.top.truncate(TOP_MOVES);
+    }
+
+    fn into_report(mut self, spec: &LongLabelSpec, label_hash: String) -> LabelReport {
+        let nv = self.fwd.len();
+        self.fwd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mean_abs = if nv == 0 { f64::NAN } else { self.fwd.iter().map(|v| v.abs()).sum::<f64>() / nv as f64 };
+        let mut qs = [f64::NAN; 7];
+        for (slot, q) in qs.iter_mut().zip(QUANTILES) {
+            *slot = quantile(&self.fwd, q);
+        }
+        let hours = spec.horizon_seconds() as f64 / 3600.0;
+        LabelReport {
+            name: spec.name.clone(),
+            rows: self.rows,
+            valid_rows: nv,
+            barrier_rows: self.barrier_rows,
+            stride_rows: self.stride_rows,
+            profit_exits: self.exits[0],
+            stop_exits: self.exits[1],
+            vertical_exits: self.exits[2],
+            action_long_share: share(self.action_long, nv),
+            clipped_share: share(self.clipped, self.barrier_rows),
+            sign_pos_share: share(self.fwd.iter().filter(|&&v| v > 0.0).count(), nv),
+            sign_neg_share: share(self.fwd.iter().filter(|&&v| v < 0.0).count(), nv),
+            sign_zero_share: share(self.fwd.iter().filter(|&&v| v == 0.0).count(), nv),
+            fwd_mean: if nv == 0 { f64::NAN } else { self.fwd.iter().sum::<f64>() / nv as f64 },
+            fwd_quantiles: qs,
+            cost_to_move: spec.cost.round_trip() / mean_abs,
+            top_moves: self.top,
+            average_uniqueness: if nv == 0 { f64::NAN } else { self.uniqueness_sum / nv as f64 },
+            effective_n: self.uniqueness_sum,
+            effective_n_hours: self.uniqueness_sum * hours,
+            purge_seconds: spec.purge_seconds(),
+            label_hash,
+        }
+    }
+}
+
 impl LongLabels {
     /// Hash of the definition version, the spec and every column value.
     pub fn label_hash(&self) -> String {
@@ -492,46 +706,78 @@ impl LongLabels {
         sha256_hex(&bytes)
     }
 
-    pub fn report(&self) -> LabelReport {
+    /// Values of the stored column `kind` (see [`COLUMN_KINDS`]).
+    pub fn column(&self, kind: &str) -> Option<&[f64]> {
+        Some(match kind {
+            "fwd" => &self.fwd,
+            "y" => &self.y,
+            "long_net" => &self.long_net,
+            "action" => &self.action,
+            "t1" => &self.t1,
+            "exit_ret" => &self.exit_ret,
+            "m_net" => &self.m_net,
+            "m_barrier" => &self.m_barrier,
+            "weight" => &self.weight,
+            _ => return None,
+        })
+    }
+
+    fn tally(&self, symbol: Option<&str>) -> Tally {
         let rows = self.fwd.len();
         let valid: Vec<usize> = (0..rows).filter(|&t| self.fwd[t].is_finite()).collect();
-        let nv = valid.len();
         let with_y: Vec<usize> = valid.iter().copied().filter(|&t| self.y[t].is_finite()).collect();
         let kind = |k: u8| valid.iter().filter(|&&t| self.exit_kind[t] == k).count();
-        let mut fwd: Vec<f64> = valid.iter().map(|&t| self.fwd[t]).collect();
-        fwd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let mean_abs = if nv == 0 { f64::NAN } else { fwd.iter().map(|v| v.abs()).sum::<f64>() / nv as f64 };
-        let mut qs = [f64::NAN; 7];
-        for (slot, q) in qs.iter_mut().zip(QUANTILES) {
-            *slot = quantile(&fwd, q);
-        }
-        let u_sum: f64 = if nv == 0 { 0.0 } else { valid.iter().map(|&t| self.uniqueness[t]).sum() };
-        let hours = self.spec.horizon_seconds() as f64 / 3600.0;
-        LabelReport {
+        let mut top: Vec<TopMove> = valid
+            .iter()
+            .map(|&t| TopMove { symbol: symbol.map(str::to_string), time: self.time[t], fwd: self.fwd[t] })
+            .collect();
+        top.sort_by(move_order);
+        top.truncate(TOP_MOVES);
+        Tally {
             rows,
-            valid_rows: nv,
-            barrier_rows: with_y.len(),
             stride_rows: (0..rows).filter(|t| t % self.spec.stride != 0).count(),
-            profit_exits: kind(EXIT_PROFIT),
-            stop_exits: kind(EXIT_STOP),
-            vertical_exits: kind(EXIT_VERTICAL),
-            action_long_share: share(valid.iter().filter(|&&t| self.action[t] == 1.0).count(), nv),
-            clipped_share: share(
-                with_y.iter().filter(|&&t| self.y[t].abs() >= self.spec.clip).count(),
-                with_y.len(),
-            ),
-            sign_pos_share: share(valid.iter().filter(|&&t| self.fwd[t] > 0.0).count(), nv),
-            sign_neg_share: share(valid.iter().filter(|&&t| self.fwd[t] < 0.0).count(), nv),
-            sign_zero_share: share(valid.iter().filter(|&&t| self.fwd[t] == 0.0).count(), nv),
-            fwd_mean: if nv == 0 { f64::NAN } else { fwd.iter().sum::<f64>() / nv as f64 },
-            fwd_quantiles: qs,
-            cost_to_move: self.spec.cost.round_trip() / mean_abs,
-            average_uniqueness: if nv == 0 { f64::NAN } else { u_sum / nv as f64 },
-            effective_n: u_sum,
-            effective_n_hours: u_sum * hours,
-            purge_seconds: self.spec.purge_seconds(),
-            label_hash: self.label_hash(),
+            fwd: valid.iter().map(|&t| self.fwd[t]).collect(),
+            barrier_rows: with_y.len(),
+            clipped: with_y.iter().filter(|&&t| self.y[t].abs() >= self.spec.clip).count(),
+            exits: [kind(EXIT_PROFIT), kind(EXIT_STOP), kind(EXIT_VERTICAL)],
+            action_long: valid.iter().filter(|&&t| self.action[t] == 1.0).count(),
+            uniqueness_sum: valid.iter().map(|&t| self.uniqueness[t]).sum(),
+            top,
         }
+    }
+
+    /// Report of this one series. Top moves carry no symbol.
+    pub fn report(&self) -> LabelReport {
+        self.tally(None).into_report(&self.spec, self.label_hash())
+    }
+}
+
+/// Builds one report over several series (one per symbol). The panel label
+/// hash is the SHA-256 of the spec, then each series' symbol and series hash in
+/// feed order, so it changes when any symbol's labels change.
+#[derive(Clone, Debug)]
+pub struct LabelAccumulator {
+    spec: LongLabelSpec,
+    tally: Tally,
+    chain: Vec<u8>,
+}
+
+impl LabelAccumulator {
+    pub fn new(spec: &LongLabelSpec) -> Self {
+        LabelAccumulator { spec: spec.clone(), tally: Tally::default(), chain: spec.canonical().into_bytes() }
+    }
+
+    pub fn add(&mut self, symbol: &str, labels: &LongLabels) {
+        let symbol = (!symbol.is_empty()).then_some(symbol);
+        self.tally.merge(labels.tally(symbol));
+        self.chain.extend_from_slice(symbol.unwrap_or("").as_bytes());
+        self.chain.push(0);
+        self.chain.extend_from_slice(labels.label_hash().as_bytes());
+    }
+
+    pub fn finish(self) -> LabelReport {
+        let hash = sha256_hex(&self.chain);
+        self.tally.into_report(&self.spec, hash)
     }
 }
 
@@ -544,9 +790,24 @@ impl LabelReport {
             .map(|(v, p)| format!("\"p{}\":{}", num(p * 100.0), num(*v)))
             .collect::<Vec<_>>()
             .join(",");
+        let top = self
+            .top_moves
+            .iter()
+            .map(|m| {
+                format!(
+                    "{{\"symbol\":{},\"time\":{},\"time_iso\":{},\"fwd\":{}}}",
+                    m.symbol.as_deref().map(text).unwrap_or_else(|| "null".to_string()),
+                    m.time,
+                    text(&crate::enrich::format_utc_seconds(m.time)),
+                    num(m.fwd)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         format!(
-            "{{\"version\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{},\"label_hash\":{}}}",
+            "{{\"version\":{},\"name\":{},\"long_only\":true,\"rows\":{},\"valid_rows\":{},\"barrier_rows\":{},\"stride_rows\":{},\"exits\":{{\"profit\":{},\"stop\":{},\"vertical\":{}}},\"action_long_share\":{},\"clipped_share\":{},\"sign_share\":{{\"positive\":{},\"negative\":{},\"zero\":{}}},\"fwd_mean\":{},\"fwd_quantiles\":{{{}}},\"cost_to_move\":{},\"top_abs_moves\":{{\"n\":{},\"moves\":[{}]}},\"average_uniqueness\":{},\"effective_n\":{},\"effective_n_hours\":{},\"purge_seconds\":{},\"label_hash\":{}}}",
             text(VERSION),
+            text(&self.name),
             self.rows,
             self.valid_rows,
             self.barrier_rows,
@@ -562,6 +823,8 @@ impl LabelReport {
             num(self.fwd_mean),
             q,
             num(self.cost_to_move),
+            TOP_MOVES,
+            top,
             num(self.average_uniqueness),
             num(self.effective_n),
             num(self.effective_n_hours),
