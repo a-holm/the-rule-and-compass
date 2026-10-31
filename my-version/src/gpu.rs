@@ -744,6 +744,19 @@ extern "C" {
         out: *mut f64,
         status: *mut i32,
     ) -> f32;
+    #[cfg(test)]
+    fn rc_score_rows(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        nprog: i32,
+        kind: i32,
+        pcount: *const i32,
+        bounds: *const i64,
+        nbounds: i32,
+        out: *mut f64,
+        status: *mut i32,
+    ) -> f32;
     fn rc_pool_score(
         ctx: *mut RawCtx,
         which: i32,
@@ -906,6 +919,13 @@ struct RawMaxOut {
     row: i32,
     /// `0` ok; `2` a row was not finite.
     status: i32,
+}
+
+/// #293: a half-open row range `[start, start + len)` of the resident rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRange {
+    pub start: usize,
+    pub len: usize,
 }
 
 /// #287: one native scoring batch: `f64` values plus a per-candidate status.
@@ -1717,6 +1737,68 @@ impl GpuEvaluator {
         })();
         self.record_batch(started.elapsed().as_secs_f64(), ok);
         let (values, status, ms) = result;
+        ScoreBatch { values, status, ms }
+    }
+
+    /// #293 seam: score an explicit row partition. `ranges` must tile
+    /// `[0, n)` in order without gaps; the result is bit-identical to
+    /// [`Self::score_batch`] for every partition. A malformed partition is a
+    /// failed launch (negative `ms`).
+    #[cfg(test)]
+    pub(crate) fn score_rows(
+        &mut self,
+        prog: &[u32],
+        offsets: &[u32],
+        objective: ScoreObjective,
+        pcount: &[i32],
+        ranges: &[RowRange],
+    ) -> ScoreBatch {
+        let nprog = offsets.len().saturating_sub(1);
+        let failed = || ScoreBatch {
+            values: Vec::new(),
+            status: Vec::new(),
+            ms: -1.0,
+        };
+        if nprog == 0 || pcount.len() != nprog || ranges.is_empty() {
+            return failed();
+        }
+        let mut bounds = Vec::with_capacity(ranges.len() + 1);
+        let mut next = 0usize;
+        bounds.push(0i64);
+        for r in ranges {
+            if r.start != next || r.len == 0 {
+                return failed();
+            }
+            next += r.len;
+            bounds.push(next as i64);
+        }
+        let mut values = vec![0.0f64; nprog];
+        let mut status = vec![0i32; nprog];
+        let ms = unsafe {
+            rc_stats_begin(self.ctx);
+            rc_score_rows(
+                self.ctx,
+                prog.as_ptr(),
+                offsets.as_ptr(),
+                nprog as i32,
+                objective.code(),
+                pcount.as_ptr(),
+                bounds.as_ptr(),
+                bounds.len() as i32,
+                values.as_mut_ptr(),
+                status.as_mut_ptr(),
+            )
+        };
+        let status = status
+            .into_iter()
+            .map(|code| {
+                if ms < 0.0 {
+                    ScoreStatus::DeviceError
+                } else {
+                    ScoreStatus::from_code(code)
+                }
+            })
+            .collect();
         ScoreBatch { values, status, ms }
     }
 
@@ -9020,5 +9102,281 @@ mod alloc_ledger_tests {
         assert_eq!(report.live_bytes, resident);
         assert_eq!(last_alloc_failure(), Some((n * 8) as u64));
         assert_eq!(last_alloc_failure_tag().as_deref(), Some("cols_f64"));
+    }
+}
+
+/// #293: row-range scoring with the lane carry.
+#[cfg(test)]
+mod carry_tests {
+    use super::*;
+    use crate::expr::{constant, input, node, Op};
+
+    const KINDS: [ScoreObjective; 15] = [
+        ScoreObjective::Squared,
+        ScoreObjective::Absolute,
+        ScoreObjective::LogSquashed,
+        ScoreObjective::Signed,
+        ScoreObjective::Maximum,
+        ScoreObjective::Correlation,
+        ScoreObjective::CorrelationSigned,
+        ScoreObjective::Aic,
+        ScoreObjective::Aicc,
+        ScoreObjective::Bic,
+        ScoreObjective::LogLoss,
+        ScoreObjective::Brier,
+        ScoreObjective::HingeSigmoid,
+        ScoreObjective::HingeOrdinary,
+        ScoreObjective::HingeSquared,
+    ];
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0 >> 11
+        }
+        fn unit(&mut self) -> f64 {
+            self.next() as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    struct Data {
+        n: usize,
+        cols: Vec<f32>,
+        y: Vec<f32>,
+        sign: Vec<f64>,
+    }
+
+    /// Rows 10, 12 and 266 (or the last row) carry `|y| = 7`: with the constant
+    /// zero candidate the maximum ties inside one lane and across lanes.
+    fn data(n: usize) -> Data {
+        let mut rng = Lcg(0x5eed_0293 ^ n as u64);
+        let mut cols = vec![0.0f32; 2 * n];
+        let mut y = vec![0.0f32; n];
+        for i in 0..n {
+            let a = rng.unit() * 4.0 - 2.0;
+            let b = rng.unit() * 2.0 - 1.0;
+            cols[i] = a as f32;
+            cols[n + i] = b as f32;
+            y[i] = (0.7 * a + 0.3 * (2.0 * b).sin() + 0.2 * (rng.unit() - 0.5)) as f32;
+        }
+        for (k, &row) in [10usize, 12, 266, n - 1].iter().enumerate() {
+            if row < n {
+                y[row] = if k % 2 == 0 { 7.0 } else { -7.0 };
+            }
+        }
+        let sign = y.iter().map(|&v| if v > 0.1 { 1.0 } else { -1.0 }).collect();
+        Data { n, cols, y, sign }
+    }
+
+    fn trees() -> Vec<Node> {
+        let affine = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(0.8), input(0)]), constant(0.15)],
+        );
+        let sine = node(
+            Op::Add,
+            vec![
+                node(
+                    Op::Sin,
+                    vec![node(Op::Add, vec![node(Op::Mul, vec![constant(1.1), input(0)]), constant(0.1)])],
+                ),
+                node(Op::Mul, vec![constant(0.2), input(1)]),
+            ],
+        );
+        vec![
+            affine,
+            sine,
+            constant(0.0),
+            constant(0.5),
+            constant(f64::NAN),
+            node(Op::Mul, vec![input(0), input(1)]),
+            node(Op::Tanh, vec![node(Op::Mul, vec![constant(2.0), input(1)])]),
+            node(Op::Sub, vec![node(Op::Square, vec![input(0)]), input(1)]),
+        ]
+    }
+
+    fn evaluator(d: &Data, weights: &[f64]) -> Option<GpuEvaluator> {
+        if !probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return None;
+        }
+        let mut ev = GpuEvaluator::new(&d.cols, d.n, 2, &d.y)?;
+        assert!(ev.set_fit_sign(&d.sign));
+        if !weights.is_empty() {
+            assert!(ev.set_score_weights(weights));
+        }
+        Some(ev)
+    }
+
+    fn uniform(n: usize, step: usize) -> Vec<RowRange> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < n {
+            let len = step.min(n - start);
+            out.push(RowRange { start, len });
+            start += len;
+        }
+        out
+    }
+
+    /// 30 seeded cuts, unaligned, with adjacent cuts so 1-row ranges occur.
+    fn seeded(n: usize, seed: u64) -> Vec<RowRange> {
+        let mut rng = Lcg(seed);
+        let mut cuts = vec![1usize, 2, n - 1];
+        while cuts.len() < 30 {
+            let c = 1 + (rng.next() as usize) % (n - 1);
+            cuts.push(c);
+            if cuts.len() < 30 {
+                cuts.push((c + 1).min(n - 1));
+            }
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        let mut out = Vec::new();
+        let mut start = 0;
+        for c in cuts {
+            if c > start {
+                out.push(RowRange { start, len: c - start });
+                start = c;
+            }
+        }
+        out.push(RowRange { start, len: n - start });
+        out
+    }
+
+    fn partitions(n: usize) -> Vec<(String, Vec<RowRange>)> {
+        let mut parts = vec![("whole".to_string(), vec![RowRange { start: 0, len: n }])];
+        for step in [512usize, 1024, 8192] {
+            parts.push((format!("uniform {step}"), uniform(n, step)));
+        }
+        for seed in [11u64, 29] {
+            let p = seeded(n, seed);
+            assert!(p.iter().any(|r| r.len == 1), "the seeded cuts include a 1-row range");
+            parts.push((format!("seeded {seed}"), p));
+        }
+        parts
+    }
+
+    fn assert_same(label: &str, got: &ScoreBatch, want: &ScoreBatch) {
+        assert!(got.ms >= 0.0, "{label}: launch failed");
+        assert_eq!(got.values.len(), want.values.len(), "{label}");
+        for k in 0..want.values.len() {
+            assert_eq!(got.status[k], want.status[k], "{label} slot {k} status");
+            assert_eq!(
+                got.values[k].to_bits(),
+                want.values[k].to_bits(),
+                "{label} slot {k}: {} vs {}",
+                got.values[k],
+                want.values[k]
+            );
+        }
+    }
+
+    fn check_case(d: &Data, weights: &[f64], case: &str) {
+        let Some(mut ev) = evaluator(d, weights) else { return };
+        let trees = trees();
+        let pop = Population::from_trees(trees.iter());
+        assert_eq!(pop.len(), trees.len());
+        let (prog, offsets) = pop.programs();
+        let pcount = vec![2i32; pop.len()];
+        let parts = partitions(d.n);
+        for objective in KINDS {
+            let want = ev.score_batch(prog, offsets, objective, &pcount);
+            assert!(want.ms >= 0.0, "{case} {}: resident launch", objective.name());
+            assert_ne!(want.status[4], ScoreStatus::Ok, "{case} {}: the NaN candidate is unusable", objective.name());
+            assert_eq!(want.values[4], f64::INFINITY);
+            for (name, ranges) in &parts {
+                let got = ev.score_rows(prog, offsets, objective, &pcount, ranges);
+                assert_same(&format!("{case} n={} {} {name}", d.n, objective.name()), &got, &want);
+            }
+        }
+    }
+
+    #[test]
+    fn row_ranges_match_the_resident_kernel_bitwise() {
+        for n in [100usize, 70_001] {
+            let d = data(n);
+            check_case(&d, &[], "unweighted");
+            let zero: Vec<f64> = (0..n)
+                .map(|i| if i % 3 == 0 { 0.0 } else { 1.0 + (i % 4) as f64 * 0.25 })
+                .collect();
+            check_case(&d, &zero, "zero weights");
+            let mut negative = vec![1.0f64; n];
+            negative[5] = -1.0;
+            check_case(&d, &negative, "negative weight");
+            check_case(&d, &vec![0.0f64; n], "all-zero weights");
+        }
+    }
+
+    #[test]
+    fn waves_do_not_change_scores() {
+        let d = data(70_001);
+        let Some(mut ev) = evaluator(&d, &[]) else { return };
+        let base = trees();
+        let all: Vec<Node> = (0..30).map(|i| base[i % base.len()].clone()).collect();
+        let ranges = uniform(d.n, 8192);
+        for objective in [ScoreObjective::Squared, ScoreObjective::Correlation, ScoreObjective::Maximum] {
+            let score = |ev: &mut GpuEvaluator, trees: &[Node]| {
+                let pop = Population::from_trees(trees.iter());
+                let (prog, offsets) = pop.programs();
+                let pcount = vec![2i32; pop.len()];
+                ev.score_rows(prog, offsets, objective, &pcount, &ranges)
+            };
+            let whole = score(&mut ev, &all);
+            let (a, b) = all.split_at(11);
+            let mut parts = score(&mut ev, a);
+            let tail = score(&mut ev, b);
+            parts.values.extend(tail.values);
+            parts.status.extend(tail.status);
+            assert_same(objective.name(), &parts, &whole);
+            let pop = Population::from_trees(all.iter());
+            let (prog, offsets) = pop.programs();
+            let resident = ev.score_batch(prog, offsets, objective, &vec![2i32; all.len()]);
+            assert_same(objective.name(), &whole, &resident);
+        }
+    }
+
+    #[test]
+    fn carry_region_is_steady() {
+        let d = data(70_001);
+        let Some(mut ev) = evaluator(&d, &[]) else { return };
+        let base = trees();
+        let many: Vec<Node> = (0..512)
+            .map(|i| {
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Mul, vec![constant(0.001 * (i + 1) as f64), input(i % 2)]),
+                        base[i % base.len()].clone(),
+                    ],
+                )
+            })
+            .collect();
+        let pop = Population::from_trees(many.iter());
+        let (prog, offsets) = pop.programs();
+        let pcount = vec![2i32; pop.len()];
+        let ranges = uniform(d.n, 8192);
+        let first = ev.score_rows(prog, offsets, ScoreObjective::Squared, &pcount, &ranges);
+        assert!(first.ms >= 0.0);
+        let cold = ev.alloc_report();
+        let cold_arena = ev.arena_report();
+        assert_eq!(cold.max_request_tag, "carry");
+        assert_eq!(cold.max_request_bytes, 512 * (16 * 256 + 16));
+        for _ in 0..100 {
+            let again = ev.score_rows(prog, offsets, ScoreObjective::Squared, &pcount, &ranges);
+            assert_same("steady", &again, &first);
+        }
+        let steady = ev.alloc_report();
+        let arena = ev.arena_report();
+        assert_eq!(arena.steady_alloc_calls, 0, "{arena:?}");
+        assert_eq!(arena.alloc_calls, cold_arena.alloc_calls, "{arena:?}");
+        assert_eq!(steady.requests, cold.requests, "{steady:?}");
+        assert_eq!(steady.live_bytes, cold.live_bytes);
+        assert_eq!(steady.refused, 0);
     }
 }

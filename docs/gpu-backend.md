@@ -707,6 +707,19 @@ The failure marker is part of the C API: `rc_eval` returns a negative time when
 `cudaGetLastError` reports a launch or execution failure, and `eval_batch`
 returns an empty result when the program upload fails.
 
+### Row ranges and the lane carry (#293)
+
+`score_kernel` gives lane `l` (thread `l` of the block, `L = blockDim.x`, 256 for production runs) the rows `r` with `r mod L = l`, in ascending order, and folds the lanes with one fixed tree. `rc_score_rows` scores an explicit partition `0 = b0 < b1 < ... < bk = n` with the same decomposition:
+
+- The lane of a row is `r mod L` in absolute rows. It does not depend on the partition, the chunk count or the grid.
+- Per candidate, the carry holds `L` lane states (two f64 each) and an `int` bad flag. Maximum keeps its key bits and row in the two slots. The region is zeroed at the start of a batch.
+- `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
+- `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero classification weights, the AIC penalty on the host.
+
+The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`. `score_rows_kernel` repeats its row bodies, so the two change together.
+
+The carry is `P x (16 L + 16)` bytes (4,112 B per candidate), allocated once through the ledger with tag `carry` and grown only when the candidate count grows. Tests: `gpu::carry_tests`.
+
 ### Overlapping generation with scoring (issue #119)
 
 Steps 1 and 2 above share no data except the candidate trees: variation,

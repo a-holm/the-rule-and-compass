@@ -178,6 +178,12 @@ struct RcCtx {
     double *d_score_out;
     int *d_score_status;
     int score_cap;
+    /* #293: the lane carry of the row-range scorer, `carry_cap` candidates wide.
+       `carry_warm` is set after its first batch so a later growth counts as a
+       steady allocation. */
+    char *d_carry;
+    int carry_cap;
+    int carry_warm;
     /* #287: cached target moments for the two-pass correlation scorer. They are
        computed once from the resident f32 target at rc_create time. */
     double ybar;
@@ -1187,6 +1193,260 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
             }
             status[p] = 0;
         }
+    }
+}
+
+/* --- #293: row-range scoring with a lane carry ---------------------------
+ *
+ * The resident `score_kernel` gives lane `l` (a thread of the block) the rows
+ * `l, l + L, l + 2L, ...` in ascending order, with `L = blockDim.x`, and then
+ * folds the L lane states with one fixed shared-memory tree. A row range
+ * `[r_begin, r_end)` continues exactly that fold: lane `l` visits the rows
+ * `r = l (mod L)` of the range in ascending order, starting from the state it
+ * carried out of the previous range. The lane of a row is `r mod L` in
+ * absolute rows, never a tile-relative index, so any partition of `[0, n)`
+ * applied in order gives the same per-lane sums as the single pass, and the
+ * finish kernel runs the same tree. The step bodies below repeat the row
+ * bodies of `score_kernel`; the two must change together.
+ *
+ * Lane state per candidate: `lane_a` and `lane_b` (f64). Maximum keeps the key
+ * bits in `lane_a` and the row in `lane_b`. `bad` is an int per candidate,
+ * combined with OR.
+ */
+template <int MODE, int PASS>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_rows_kernel(
+    const float *__restrict__ cols,
+    int ld,
+    long long row0,
+    const float *__restrict__ y,
+    const float *__restrict__ tsign,
+    const double *__restrict__ w,
+    long long r_begin,
+    long long r_end,
+    const unsigned int *__restrict__ prog,
+    const unsigned int *__restrict__ off,
+    int width,
+    int pooled,
+    double *__restrict__ lane_a,
+    double *__restrict__ lane_b,
+    int *__restrict__ bad,
+    const double *__restrict__ pbar,
+    double ybar)
+{
+    const int tid = threadIdx.x;
+    const int lanes = blockDim.x;
+    const int p = blockIdx.x;
+    const unsigned int *code = pooled
+        ? prog + (size_t)p * (size_t)width
+        : prog + off[p];
+    const float *wc = cols - row0;
+    const size_t slot = (size_t)p * (size_t)lanes + (size_t)tid;
+
+    long long d = (long long)tid - r_begin % lanes;
+    if (d < 0) d += lanes;
+    const long long first = r_begin + d;
+
+    int lbad = 0;
+    double a = lane_a[slot];
+    double b = lane_b[slot];
+
+    if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const double wi = w ? w[i] : 1.0;
+            if (!isfinite(wi) || wi < 0.0) {
+                lbad = 1;
+                continue;
+            }
+            if (wi == 0.0) continue;
+            const float t = tsign ? tsign[i] : CUDART_NAN_F;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            a += wi * (double)rc_class_row_loss(pred, t, MODE);
+            b += wi;
+        }
+    } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        if (PASS == 0) {
+            for (long long r = first; r < r_end; r += lanes) {
+                const float pred = rc_exec_row(code, wc, ld, (int)r);
+                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                    lbad = 1;
+                } else {
+                    a += (double)pred;
+                }
+            }
+        } else {
+            const double pb = pbar[p];
+            for (long long r = first; r < r_end; r += lanes) {
+                const int i = (int)r;
+                const float pred = rc_exec_row(code, wc, ld, i);
+                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                    lbad = 1;
+                    continue;
+                }
+                const double dp = (double)pred - pb;
+                const double dy = (double)y[i] - ybar;
+                a += dp * dp;
+                b += dp * dy;
+            }
+        }
+    } else {
+        unsigned long long best_key = ((unsigned long long *)lane_a)[slot];
+        int best_row = ((int *)lane_b)[slot];
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            const double res = (double)pred - (double)y[i];
+            if (MODE == RC_SCORE_SQUARED || MODE == RC_SCORE_AIC ||
+                MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+                a += res * res;
+            } else if (MODE == RC_SCORE_ABSOLUTE) {
+                a += fabs(res);
+            } else if (MODE == RC_SCORE_LOG_SQUASHED) {
+                const double rr = res * res;
+                a += isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(res));
+            } else if (MODE == RC_SCORE_SIGNED) {
+                a += res;
+            } else if (MODE == RC_SCORE_MAXIMUM) {
+                const double ar = fabs(res);
+                const unsigned long long key = (unsigned long long)__double_as_longlong(ar);
+                if (key > best_key) {
+                    best_key = key;
+                    best_row = i;
+                }
+            }
+        }
+        if (MODE == RC_SCORE_MAXIMUM) {
+            ((unsigned long long *)lane_a)[slot] = best_key;
+            ((int *)lane_b)[slot] = best_row;
+        } else {
+            lane_a[slot] = a;
+        }
+        if (lbad) atomicOr(&bad[p], 1);
+        return;
+    }
+    lane_a[slot] = a;
+    lane_b[slot] = b;
+    if (lbad) atomicOr(&bad[p], 1);
+}
+
+/* Correlation between its two passes: the mean prediction from the pass-one
+   lanes through the resident tree, then both lane arrays reset. */
+template <int MODE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_mid_kernel(
+    double *__restrict__ lane_a,
+    double *__restrict__ lane_b,
+    double *__restrict__ pbar,
+    long long n)
+{
+    const int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
+    __shared__ double sh1[RC_MAX_THREADS];
+    sh1[tid] = lane_a[slot];
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int)tid < st) sh1[tid] += sh1[tid + st];
+        __syncthreads();
+    }
+    if (tid == 0) pbar[p] = sh1[0] / (double)n;
+    lane_a[slot] = 0.0;
+    lane_b[slot] = 0.0;
+}
+
+/* The resident tree and epilogue over the carried lanes. */
+template <int MODE>
+__global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
+    const double *__restrict__ lane_a,
+    const double *__restrict__ lane_b,
+    const int *__restrict__ bad,
+    long long n,
+    double syy,
+    double *__restrict__ out,
+    int *__restrict__ status)
+{
+    const int tid = threadIdx.x;
+    const int p = blockIdx.x;
+    const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
+    __shared__ double sh1[RC_MAX_THREADS];
+    __shared__ double sh2[RC_MAX_THREADS];
+    __shared__ unsigned long long shk[RC_MAX_THREADS];
+    __shared__ int shi[RC_MAX_THREADS];
+
+    if (bad[p]) {
+        if (tid == 0) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_NONFINITE;
+        }
+        return;
+    }
+    if (MODE == RC_SCORE_MAXIMUM) {
+        shk[tid] = ((const unsigned long long *)lane_a)[slot];
+        shi[tid] = ((const int *)lane_b)[slot];
+        __syncthreads();
+        for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+            if ((int)tid < st) {
+                const unsigned long long rk = shk[tid + st];
+                const int rr = shi[tid + st];
+                if (rk > shk[tid] || (rk == shk[tid] && rr < shi[tid])) {
+                    shk[tid] = rk;
+                    shi[tid] = rr;
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[p] = __longlong_as_double((long long)shk[0]);
+            status[p] = 0;
+        }
+        return;
+    }
+    sh1[tid] = lane_a[slot];
+    sh2[tid] = lane_b[slot];
+    __syncthreads();
+    const int two = (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) ||
+                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int)tid < st) {
+            sh1[tid] += sh1[tid + st];
+            if (two) sh2[tid] += sh2[tid + st];
+        }
+        __syncthreads();
+    }
+    if (tid != 0) return;
+    if (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) {
+        if (!(sh2[0] > 0.0)) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+        } else {
+            out[p] = sh1[0] / sh2[0];
+            status[p] = 0;
+        }
+    } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        const double spp = sh1[0];
+        const double spy = sh2[0];
+        const double rho = (spp <= 0.0 || syy <= 0.0)
+            ? 0.0
+            : spy / (sqrt(spp) * sqrt(syy));
+        out[p] = (MODE == RC_SCORE_CORRELATION_SIGNED) ? 1.0 - rho : 1.0 - fabs(rho);
+        status[p] = 0;
+    } else {
+        const double sum = sh1[0];
+        if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+            out[p] = sum;
+        } else if (MODE == RC_SCORE_SIGNED) {
+            out[p] = fabs(sum) / (double)n;
+        } else {
+            out[p] = sum / (double)n;
+        }
+        status[p] = 0;
     }
 }
 
@@ -3335,6 +3595,7 @@ void rc_destroy(void *ctx)
     if (c->d_out) rc_dev_free(c, c->d_out);
     if (c->d_score_out) rc_dev_free(c, c->d_score_out);
     if (c->d_score_status) rc_dev_free(c, c->d_score_status);
+    if (c->d_carry) rc_dev_free(c, c->d_carry);
     if (c->d_pool[0]) rc_dev_free(c, c->d_pool[0]);
     if (c->d_pool[1]) rc_dev_free(c, c->d_pool[1]);
     if (c->d_hash) rc_dev_free(c, c->d_hash);
@@ -3747,10 +4008,110 @@ static double rc_aic_value(int kind, double rss, int n, int k)
     return base + 2.0 * dk + 2.0 * dk * (dk + 1.0) / denom;
 }
 
+/* #293: lanes of the score launch, the block width of `score_kernel`. */
+static int rc_score_lanes(const RcCtx *c)
+{
+    int threads = RC_MIN_THREADS;
+    while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+    return threads;
+}
+
+/* #293: the lane carry region for `ncand` candidates, ledger tag "carry".
+   Per candidate: two f64 lane arrays, the correlation mean and the bad flag.
+   Capacity only grows. */
+int rc_carry_reserve(void *ctx, int ncand)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || ncand <= 0) return -1;
+    if (c->carry_cap >= ncand) return 0;
+    if (c->d_carry) {
+        rc_dev_free(c, c->d_carry);
+        c->d_carry = 0;
+        c->carry_cap = 0;
+        c->alloc_calls++;
+        if (c->warm || c->carry_warm) c->steady_alloc_calls++;
+    }
+    const size_t bytes = (size_t)ncand * ((size_t)rc_score_lanes(c) * 16 + 16);
+    void *p = 0;
+    if (rc_dev_alloc_kind(c, "carry", &p, bytes, 0) != 0) return -1;
+    c->alloc_calls++;
+    if (c->warm || c->carry_warm) c->steady_alloc_calls++;
+    c->d_carry = (char *)p;
+    c->carry_cap = ncand;
+    return 0;
+}
+
+extern "C++" {
+template <int MODE, int PASS>
+static void rc_rows_pass(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                         int width, int pooled, int nprog, int lanes,
+                         const long long *bounds, int nbounds)
+{
+    double *lane_a = (double *)c->d_carry;
+    double *lane_b = lane_a + (size_t)nprog * (size_t)lanes;
+    double *pbar = lane_b + (size_t)nprog * (size_t)lanes;
+    int *bad = (int *)(pbar + nprog);
+    for (int k = 0; k + 1 < nbounds; ++k) {
+        score_rows_kernel<MODE, PASS><<<nprog, lanes>>>(
+            c->d_cols, c->n, 0, c->d_y, c->d_tsign, c->d_w64,
+            bounds[k], bounds[k + 1], prog, off, width, pooled,
+            lane_a, lane_b, bad, pbar, c->ybar);
+    }
+}
+
+template <int MODE>
+static void rc_rows_run(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                        int width, int pooled, int nprog, int lanes,
+                        const long long *bounds, int nbounds)
+{
+    double *lane_a = (double *)c->d_carry;
+    double *lane_b = lane_a + (size_t)nprog * (size_t)lanes;
+    double *pbar = lane_b + (size_t)nprog * (size_t)lanes;
+    int *bad = (int *)(pbar + nprog);
+    cudaMemsetAsync(c->d_carry, 0,
+                    (size_t)nprog * ((size_t)lanes * 16 + 16), 0);
+    rc_rows_pass<MODE, 0>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
+    if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+        rc_rows_pass<MODE, 1>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
+    }
+    score_finish_kernel<MODE><<<nprog, lanes>>>(
+        lane_a, lane_b, bad, (long long)c->n, c->syy, c->d_score_out, c->d_score_status);
+}
+
+static int rc_rows_dispatch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
+                            int width, int pooled, int nprog, int kind, int lanes,
+                            const long long *bounds, int nbounds)
+{
+    switch (kind) {
+#define RC_ROWS_CASE(K) \
+        case K: rc_rows_run<K>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds); return 0;
+        RC_ROWS_CASE(RC_SCORE_SQUARED)
+        RC_ROWS_CASE(RC_SCORE_ABSOLUTE)
+        RC_ROWS_CASE(RC_SCORE_LOG_SQUASHED)
+        RC_ROWS_CASE(RC_SCORE_SIGNED)
+        RC_ROWS_CASE(RC_SCORE_MAXIMUM)
+        RC_ROWS_CASE(RC_SCORE_CORRELATION)
+        RC_ROWS_CASE(RC_SCORE_CORRELATION_SIGNED)
+        RC_ROWS_CASE(RC_SCORE_AIC)
+        RC_ROWS_CASE(RC_SCORE_AICC)
+        RC_ROWS_CASE(RC_SCORE_BIC)
+        RC_ROWS_CASE(RC_SCORE_LOG_LOSS)
+        RC_ROWS_CASE(RC_SCORE_BRIER)
+        RC_ROWS_CASE(RC_SCORE_HINGE_SIGMOID)
+        RC_ROWS_CASE(RC_SCORE_HINGE_ORDINARY)
+        RC_ROWS_CASE(RC_SCORE_HINGE_SQUARED)
+#undef RC_ROWS_CASE
+        default: return -1;
+    }
+}
+} /* extern "C++" */
+
 /* Shared launcher for the packed and fixed-slot pool entry points. */
 static float rc_score_launch(RcCtx *c, const unsigned int *prog,
                              const unsigned int *off, int width, int pooled,
                              int nprog, int kind, const int *pcount,
+                             const long long *bounds, int nbounds,
                              double *out, int *status)
 {
     RcStats *st = &c->stats;
@@ -3773,8 +4134,23 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         return -1.0f;
     }
     t = rc_now_ms();
+    if (bounds && rc_carry_reserve(c, nprog) != 0) {
+        st->failed = 1;
+        st->alloc_ms += rc_now_ms() - t;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
+    st->alloc_ms += rc_now_ms() - t;
+    t = rc_now_ms();
     cudaEventRecord(c->t0, 0);
-    switch (kind) {
+    if (bounds) {
+        if (rc_rows_dispatch(c, prog, off, width, pooled, nprog, kind, threads,
+                             bounds, nbounds) != 0) {
+            st->failed = 1;
+            st->wall_ms = rc_now_ms() - c->batch_start_ms;
+            return -1.0f;
+        }
+    } else switch (kind) {
         case RC_SCORE_SQUARED:
             score_kernel<RC_SCORE_SQUARED><<<nprog, threads>>>(
                 c->d_cols, c->d_y, c->n, c->v, prog, off, width, pooled,
@@ -3898,6 +4274,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    if (bounds) c->carry_warm = 1;
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
@@ -3920,7 +4297,30 @@ float rc_score_batch(void *ctx, const unsigned int *prog,
         cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
     }
     return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
-                           nprog, kind, pcount, out, status);
+                           nprog, kind, pcount, 0, 0, out, status);
+}
+
+/* #293: score a packed batch over an explicit row partition `bounds`
+   (0 = b0 < ... < b_last = n), bit-identical to `rc_score_batch`. */
+float rc_score_rows(void *ctx, const unsigned int *prog, const unsigned int *off,
+                    int nprog, int kind, const int *pcount,
+                    const long long *bounds, int nbounds,
+                    double *out, int *status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || nprog <= 0 || !out || !status || !bounds || nbounds < 2) return -1.0f;
+    if (bounds[0] != 0 || bounds[nbounds - 1] != (long long)c->n) return -1.0f;
+    for (int k = 0; k + 1 < nbounds; ++k) {
+        if (bounds[k + 1] <= bounds[k]) return -1.0f;
+    }
+    if (rc_set_programs(ctx, prog, off, nprog) != 0) return -1.0f;
+    const int slot = c->arena_slot;
+    if (!c->arena_prog[slot] || !c->arena_off[slot]) return -1.0f;
+    if (c->arena_upload_async) {
+        cudaStreamWaitEvent(0, c->ev_upload[slot], 0);
+    }
+    return rc_score_launch(c, c->arena_prog[slot], c->arena_off[slot], 0, 0,
+                           nprog, kind, pcount, bounds, nbounds, out, status);
 }
 
 /* #287: score the fixed-slot programs already uploaded to `which`. */
@@ -3931,7 +4331,7 @@ float rc_pool_score(void *ctx, int which, int nprog, int width, int kind,
     if (!c || !c->d_pool[which & 1] || nprog <= 0 || !out || !status)
         return -1.0f;
     return rc_score_launch(c, c->d_pool[which & 1], 0, width, 1, nprog, kind,
-                           pcount, out, status);
+                           pcount, 0, 0, out, status);
 }
 
 /* #118: start a fresh batch ledger. The Rust evaluator calls this once before
