@@ -1602,6 +1602,12 @@ pub struct Report {
     pub projection_columns: Vec<String>,
     pub read_seconds: f64,
     pub feature_seconds: f64,
+    /// Host-thread partition of `feature_seconds` (#300): `feature_read_seconds` + `feature_context_seconds` + `feature_gpu_seconds` + `gpu_write_seconds` + `feature_cpu_seconds` + `feature_other_seconds`. The device times above are busy measures and may overlap this timeline.
+    pub feature_read_seconds: f64,
+    pub feature_context_seconds: f64,
+    pub feature_gpu_seconds: f64,
+    pub feature_cpu_seconds: f64,
+    pub feature_other_seconds: f64,
     pub xs_seconds: f64,
     pub write_seconds: f64,
     pub total_seconds: f64,
@@ -1654,6 +1660,15 @@ impl Report {
                 self.write_seconds,
                 self.total_seconds,
                 self.peak_rss_bytes as f64 / (1024.0 * 1024.0)
+            ),
+            format!(
+                "# enrich: feature_parts read={:.3}s context={:.3}s gpu={:.3}s write={:.3}s cpu={:.3}s other={:.3}s",
+                self.feature_read_seconds,
+                self.feature_context_seconds,
+                self.feature_gpu_seconds,
+                self.gpu_write_seconds,
+                self.feature_cpu_seconds,
+                self.feature_other_seconds
             ),
         ];
         if let Some(hash) = &self.projection_hash {
@@ -1757,7 +1772,7 @@ impl Report {
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
-             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
+             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
             jstr(&self.output),
@@ -1806,6 +1821,11 @@ impl Report {
                 .join(","),
             self.read_seconds,
             self.feature_seconds,
+            self.feature_read_seconds,
+            self.feature_context_seconds,
+            self.feature_gpu_seconds,
+            self.feature_cpu_seconds,
+            self.feature_other_seconds,
             self.xs_seconds,
             self.write_seconds,
             self.total_seconds,
@@ -5643,10 +5663,10 @@ struct CrossPanel {
     /// `member_asof <= t` when the input carries a membership column; every
     /// row otherwise. Pre-listing/post-delisting rows never enter a statistic.
     member: Vec<bool>,
-    /// Row order `(time, symbol, row)`, the deterministic tie order.
-    order: Vec<u32>,
-    /// Start index in `order` of each timestamp group; `starts.len() == groups+1`.
-    starts: Vec<usize>,
+    /// Row order `(time, symbol, row)` and the start index of each timestamp
+    /// group (`starts.len() == groups+1`). Built on first CPU use only; the
+    /// device path keeps its own permutation.
+    grouped: std::sync::OnceLock<(Vec<u32>, Vec<usize>)>,
 }
 
 impl CrossPanel {
@@ -5682,37 +5702,38 @@ impl CrossPanel {
                 member[r] = vals[r].is_finite() && vals[r] <= times[r] as f64;
             }
         }
-        let mut order: Vec<u32> = (0..rows as u32).collect();
-        order.sort_unstable_by(|&a, &b| {
-            let (a, b) = (a as usize, b as usize);
-            times[a]
-                .cmp(&times[b])
-                .then(sym_key[a].cmp(&sym_key[b]))
-                .then(a.cmp(&b))
-        });
-        let mut starts = Vec::new();
-        let mut i = 0usize;
-        while i < order.len() {
-            starts.push(i);
-            let t = times[order[i] as usize];
-            while i < order.len() && times[order[i] as usize] == t {
-                i += 1;
-            }
-        }
-        starts.push(order.len());
         Ok(CrossPanel {
             times,
             sym_key,
             member,
-            order,
-            starts,
+            grouped: std::sync::OnceLock::new(),
         })
     }
 
     fn groups(&self) -> impl Iterator<Item = &[u32]> {
-        self.starts
-            .windows(2)
-            .map(move |w| &self.order[w[0]..w[1]])
+        let (order, starts) = self.grouped.get_or_init(|| {
+            let (times, sym_key) = (&self.times, &self.sym_key);
+            let mut order: Vec<u32> = (0..times.len() as u32).collect();
+            order.sort_unstable_by(|&a, &b| {
+                let (a, b) = (a as usize, b as usize);
+                times[a]
+                    .cmp(&times[b])
+                    .then(sym_key[a].cmp(&sym_key[b]))
+                    .then(a.cmp(&b))
+            });
+            let mut starts = Vec::new();
+            let mut i = 0usize;
+            while i < order.len() {
+                starts.push(i);
+                let t = times[order[i] as usize];
+                while i < order.len() && times[order[i] as usize] == t {
+                    i += 1;
+                }
+            }
+            starts.push(order.len());
+            (order, starts)
+        });
+        starts.windows(2).map(move |w| &order[w[0]..w[1]])
     }
 }
 
@@ -6753,6 +6774,13 @@ fn enrich_inner(
     // The feature phase includes both the GPU kernel pass and the CPU fallback
     // pass; the cross-sectional pass is timed separately below.
     let t_feat = Instant::now();
+    // Host-thread partition of the feature phase (#300): disjoint intervals on this thread.
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_read_seconds = 0.0f64;
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_context_seconds = 0.0f64;
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_gpu_seconds = 0.0f64;
 
     // Which output columns the cost model sent to a registered kernel.
     let mut gpu_names: BTreeSet<String> = BTreeSet::new();
@@ -6813,14 +6841,17 @@ fn enrich_inner(
             .cloned()
             .collect();
         if !mtf_wanted.is_empty() {
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let open = column_all(&store, cols.open)?;
             let high = column_all(&store, cols.high)?;
             let low = column_all(&store, cols.low)?;
             let close = column_all(&store, cols.close)?;
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
             let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-            match crate::mtf_gpu::compute(
+            let tg = Instant::now();
+            let mtf_result = crate::mtf_gpu::compute(
                 &times,
                 &open,
                 &high,
@@ -6830,11 +6861,15 @@ fn enrich_inner(
                 &seg_len,
                 step,
                 &mtf_wanted,
-            ) {
+            );
+            feature_gpu_seconds += tg.elapsed().as_secs_f64();
+            match mtf_result {
                 Ok((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }
@@ -6864,8 +6899,10 @@ fn enrich_inner(
             .cloned()
             .collect();
         if !bench_wanted.is_empty() {
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let close = column_all(&store, cols.close)?;
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
             let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
             let btc = cross.bench_series();
@@ -6878,7 +6915,8 @@ fn enrich_inner(
                         .map(|s| (!eth.symbol.is_empty() && s.symbol == eth.symbol) as u8),
                 )
                 .collect();
-            match crate::bench_gpu::compute(
+            let tg = Instant::now();
+            let bench_result = crate::bench_gpu::compute(
                 &times,
                 &close,
                 &seg_start,
@@ -6888,11 +6926,15 @@ fn enrich_inner(
                 Some(&eth_series),
                 &self_flags,
                 &bench_wanted,
-            ) {
+            );
+            feature_gpu_seconds += tg.elapsed().as_secs_f64();
+            match bench_result {
                 Some((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }
@@ -6968,6 +7010,7 @@ fn enrich_inner(
             if disabled {
                 device_projection = None;
             } else {
+                let tc = Instant::now();
                 gpu_ctx = crate::enrich_gpu::EnrichGpu::from_projected(
                     &store,
                     projection,
@@ -6978,11 +7021,13 @@ fn enrich_inner(
                     &precompute,
                     3,
                 );
+                feature_context_seconds += tc.elapsed().as_secs_f64();
             }
         }
         if gpu_ctx.is_none() {
             // Fallback: the historical whole-column upload. It is the narrow
             // path for an exotic store layout, not the default.
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let nan = vec![f64::NAN; store.n_rows()];
             let volume = match cols.volume {
@@ -7012,6 +7057,7 @@ fn enrich_inner(
                 Some(c) => column_all(&store, c)?,
                 None => nan,
             };
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let mut present = 0u32;
             if cols.volume.is_some() {
                 present |= crate::features_gpu::PRESENT_VOLUME;
@@ -7028,6 +7074,7 @@ fn enrich_inner(
             if cols.taker_buy_quote.is_some() {
                 present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
             }
+            let tc = Instant::now();
             gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
                 &times,
                 &open,
@@ -7044,6 +7091,7 @@ fn enrich_inner(
                 &seg_len,
                 step,
             );
+            feature_context_seconds += tc.elapsed().as_secs_f64();
         }
         if gpu_ctx.is_none() {
             // No device context: the whole planned GPU share falls back.
@@ -7061,6 +7109,8 @@ fn enrich_inner(
 
     #[cfg(feature = "cuda")]
     if let Some(gpu) = gpu_ctx.as_mut() {
+        let t_gpu_block = Instant::now();
+        let write_before_block = gpu_write_seconds;
         // Features computed per uploaded tile stay resident until downloaded.
         // Drain them first: they would otherwise hold the device memory the
         // fused flow and price-action planes need.
@@ -7271,6 +7321,8 @@ fn enrich_inner(
                 }
             }
         }
+        feature_gpu_seconds +=
+            t_gpu_block.elapsed().as_secs_f64() - (gpu_write_seconds - write_before_block);
         let stats = gpu.stats();
         gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
@@ -7288,6 +7340,7 @@ fn enrich_inner(
     }
 
     // Everything planned for the CPU (including failed GPU calls).
+    let t_cpu_pass = Instant::now();
     let cpu_own: Vec<String> = own
         .iter()
         .filter(|n| !gpu_done.contains(*n))
@@ -7367,7 +7420,14 @@ fn enrich_inner(
             }
         }
     }
+    let feature_cpu_seconds = t_cpu_pass.elapsed().as_secs_f64();
     let feature_seconds = t_feat.elapsed().as_secs_f64();
+    let feature_other_seconds = feature_seconds
+        - (feature_read_seconds
+            + feature_context_seconds
+            + feature_gpu_seconds
+            + gpu_write_seconds
+            + feature_cpu_seconds);
 
     // The cross-sectional pass reads the source columns back, so flush the
     // buffered writers first (the files are row-complete at this point).
@@ -7708,6 +7768,11 @@ fn enrich_inner(
                 .unwrap_or_default(),
             read_seconds,
             feature_seconds,
+            feature_read_seconds,
+            feature_context_seconds,
+            feature_gpu_seconds,
+            feature_cpu_seconds,
+            feature_other_seconds,
             xs_seconds,
             write_seconds: 0.0,
             total_seconds: started.elapsed().as_secs_f64(),
@@ -7766,6 +7831,11 @@ fn enrich_inner(
             .unwrap_or_default(),
         read_seconds,
         feature_seconds,
+        feature_read_seconds,
+        feature_context_seconds,
+        feature_gpu_seconds,
+        feature_cpu_seconds,
+        feature_other_seconds,
         xs_seconds,
         write_seconds,
         total_seconds: started.elapsed().as_secs_f64(),

@@ -243,6 +243,7 @@ fn eval_spec(windows: Vec<Window>) -> EvalSpec {
         policy: rcsr::walkforward::Policy::Threshold,
         band_width: 0.0,
         min_hold: 1,
+        gpu: false,
     }
 }
 
