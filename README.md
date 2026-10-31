@@ -594,8 +594,8 @@ walkforward`, `rcsr verify-manifest`, `rcsr dev-report`) carry their own option
 lists in `rcsr schema`; the block above is the root search command. The former
 Python pipeline is classified and retired in
 [`docs/python-pipeline-retirement.md`](docs/python-pipeline-retirement.md):
-the documented path is these Rust commands plus a thin `curl` acquisition
-recipe. `rcsr dev-report` summarises the optional `--dev-log` NDJSON record.
+the documented path is these Rust commands plus the acquisition tool
+[`rcsr-acquire`](#acquiring-the-binance-vision-archive). `rcsr dev-report` summarises the optional `--dev-log` NDJSON record.
 
 Input may be CSV, TSV, or whitespace-delimited, with a header row. Numeric
 columns can be used as inputs or target; text columns (dates, ticker symbols)
@@ -606,6 +606,26 @@ refused with an input error (exit 3) naming the 1-based line and both counts;
 A numeric cell may be missing (empty,
 `NA`, `NaN` or `null`, case-insensitively); `--fill` chooses whether those rows
 are dropped or filled, and the default leaves them untouched.
+
+## Acquiring the Binance Vision archive
+
+`rcsr-acquire` is a separate pure-std crate in `tools/acquire/`. It has no dependencies and uses `curl` as the transport, so `rcsr` itself holds no HTTP client. It reads the spot monthly kline archive at `data.binance.vision` and has three subcommands.
+
+```sh
+cargo build --release --manifest-path tools/acquire/Cargo.toml
+A=tools/acquire/target/release/rcsr-acquire
+
+$A list   --out archive --interval 15m             # archive/all_symbols_archive.txt, archive/keys_15m.json
+$A fetch  --symbols-file archive/all_symbols_archive.txt --interval 15m \
+          --from 2017-08 --to 2026-06 --out data --jobs 4
+$A verify --dir data --interval 15m --through 2026-12-31 --snapshot snapshot.json
+```
+
+* `list` pages through the bucket listing. Without `--symbols` it writes `all_symbols_archive.txt`. With `--interval` it also writes `keys_<iv>.json`, the published months per symbol. Use `--symbols A,B` to index a few symbols with one request each.
+* `fetch` writes `<out>/raw_<iv>/<SYM>/<SYM>-<iv>-YYYY-MM.zip`, the layout `rcsr prep --input` reads. A zip larger than 1000 bytes is never requested again. Every request appends one row to `<out>/downloads_<iv>.csv` (`symbol,interval,month,http_status,bytes,fetched_at`). A 404 is a row too: it marks the listing or delisting month. `--skip-404` does not repeat months an earlier run recorded as 404. `--to` defaults to the previous month, and a month that is not published yet is refused. `--jobs` defaults to 4. Each request retries 3 times.
+* `verify` downloads the `.CHECKSUM` sibling of every zip under `<dir>/raw_<iv>/`, compares it with the local SHA-256 and writes the snapshot JSON that `rcsr panel build --snapshot` embeds (`docs/panel.md`, "Snapshot provenance"). Per file it records `vendor_url`, `http_status`, `etag`, `last_modified`, `vendor_sha256`, `local_sha256`, `bytes`, `verified` and `fetched_at`. `coverage_last` is the last day of the newest verified month. `complete` is true only when every zip verifies and `coverage_last` reaches `--through`. The exit code is 1 when any zip is not verified.
+
+Exit codes: 0 success, 1 failed requests or unverified zips, 2 usage error. The data is spot only.
 
 ## Choosing how rows are split
 

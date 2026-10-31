@@ -22,7 +22,6 @@ Each pipeline is a job that repeated in the agent logs: one Claude Code orchestr
 ## Deliberately outside
 
 - Rust-only experiments: no pipeline. They are one rule (`_shared/rules.md` rule 9), one command block (`_shared/commands.md`, "Rust experiments") and one test (`my-version/tests/no_python.rs`). Stage `01_issue/stages/03_prove_red/` and `01_issue/stages/04_implement/` apply it.
-- The acquisition tool: its own issue. `06_data/stages/01_acquire/` is the contract it must fill.
 - Product-specific one-off research projects: they do not repeat.
 - Issue creation: a template (`_templates/issue-body.md`) and the checks in `01_issue/stages/02_issue_body/`, not a pipeline.
 
