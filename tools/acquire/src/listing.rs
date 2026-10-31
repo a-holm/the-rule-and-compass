@@ -43,8 +43,22 @@ fn unescape(s: &str) -> String {
 /// Parses one listing page. Only `<Key>` inside `<Contents>` and `<Prefix>` inside
 /// `<CommonPrefixes>` count: the top-level `<Prefix>` echoes the request.
 pub fn parse_page(xml: &str) -> Page {
-    let _ = xml;
-    Page::default()
+    let keys = tag_values(xml, "Contents")
+        .into_iter()
+        .filter_map(|c| tag_values(c, "Key").first().map(|k| unescape(k)))
+        .collect::<Vec<_>>();
+    let prefixes = tag_values(xml, "CommonPrefixes")
+        .into_iter()
+        .filter_map(|c| tag_values(c, "Prefix").first().map(|k| unescape(k)))
+        .collect::<Vec<_>>();
+    let truncated = tag_values(xml, "IsTruncated").first().is_some_and(|v| v.trim() == "true");
+    let explicit = tag_values(xml, "NextMarker").first().map(|m| unescape(m)).filter(|m| !m.is_empty());
+    let next_marker = if truncated {
+        explicit.or_else(|| keys.last().cloned()).or_else(|| prefixes.last().cloned())
+    } else {
+        None
+    };
+    Page { keys, prefixes, truncated, next_marker }
 }
 
 fn pct_encode(s: &str) -> String {
@@ -108,12 +122,31 @@ pub fn list_all(
 
 /// Symbol names from common prefixes like `data/spot/monthly/klines/BTCUSDT/`.
 pub fn symbols(prefixes: &[String], root: &str) -> Vec<String> {
-    let _ = (prefixes, root);
-    Vec::new()
+    let mut out: Vec<String> = prefixes
+        .iter()
+        .filter_map(|p| p.strip_prefix(root))
+        .map(|s| s.trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty() && !s.contains('/'))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Months of the `<SYM>-<interval>-YYYY-MM.zip` keys. `.CHECKSUM` siblings do not match.
 pub fn months_from_keys(keys: &[String], interval: &str) -> Vec<Month> {
-    let _ = (keys, interval);
-    Vec::new()
+    let mut out: Vec<Month> = keys
+        .iter()
+        .filter_map(|k| {
+            let name = k.rsplit('/').next()?.strip_suffix(".zip")?;
+            let (head, month) = name.split_at(name.len().checked_sub(7)?);
+            if !head.ends_with(&format!("-{interval}-")) {
+                return None;
+            }
+            Month::parse(month).ok()
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }

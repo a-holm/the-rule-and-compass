@@ -41,8 +41,8 @@ pub struct Entry {
 
 /// First token of a `.CHECKSUM` body, lowercased, when it is 64 hex digits.
 pub fn parse_checksum(body: &str) -> Option<String> {
-    let _ = body;
-    None
+    let token = body.split_whitespace().next()?.to_ascii_lowercase();
+    (token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())).then_some(token)
 }
 
 /// Zips present under `<dir>/raw_<interval>/`, filtered by symbols and months, sorted.
@@ -116,14 +116,68 @@ fn verify_one(cfg: &VerifyConfig, t: &dyn Transport, symbol: &str, month: Month,
 
 /// Verifies every selected zip. Entries are sorted by symbol and month.
 pub fn run(cfg: &VerifyConfig, t: &dyn Transport) -> io::Result<Vec<Entry>> {
-    let _ = (cfg, t);
-    Ok(Vec::new())
+    let items = discover(&cfg.dir, &cfg.interval, cfg.symbols.as_deref(), cfg.from, cfg.to)?;
+    let tmp = cfg.dir.join(".verify-tmp");
+    fs::create_dir_all(&tmp)?;
+    let next = AtomicUsize::new(0);
+    let results = Mutex::new(Vec::with_capacity(items.len()));
+    let workers = cfg.jobs.clamp(1, items.len().max(1));
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some((symbol, month)) = items.get(i) else { break };
+                let e = verify_one(cfg, t, symbol, *month, &tmp);
+                results.lock().expect("results lock").push(e);
+            });
+        }
+    });
+    let _ = fs::remove_dir(&tmp);
+    let mut entries = results.into_inner().expect("results lock");
+    entries.sort_by(|a, b| (&a.symbol, a.month).cmp(&(&b.symbol, b.month)));
+    Ok(entries)
 }
 
-/// Snapshot JSON object embedded by `rcsr prep --snapshot` and `rcsr panel --snapshot`.
+/// Snapshot JSON object embedded by `rcsr panel build --snapshot`.
 /// `coverage_last` is the last day of the newest verified month. `complete` needs every
 /// entry verified and `coverage_last >= through`; without `through` it is false.
 pub fn snapshot_json(entries: &[Entry], interval: &str, through: Option<&str>, fetched_at: &str) -> String {
-    let _ = (entries, interval, through, fetched_at);
-    String::new()
+    let verified = entries.iter().filter(|e| e.verified).count();
+    let coverage_last = entries.iter().filter(|e| e.verified).map(|e| e.month).max().map(Month::last_day);
+    let all_verified = !entries.is_empty() && verified == entries.len();
+    let complete = all_verified
+        && matches!((&coverage_last, through), (Some(c), Some(t)) if c.as_str() >= t);
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str("  \"source\": \"data.binance.vision\",\n");
+    s.push_str("  \"market\": \"spot\",\n");
+    s.push_str(&format!("  \"interval\": {},\n", quote(interval)));
+    s.push_str(&format!("  \"fetched_at\": {},\n", quote(fetched_at)));
+    s.push_str(&format!("  \"coverage_last\": {},\n", quote_opt(coverage_last.as_deref())));
+    s.push_str(&format!("  \"through\": {},\n", quote_opt(through)));
+    s.push_str(&format!("  \"complete\": {complete},\n"));
+    s.push_str(&format!("  \"files\": {},\n", entries.len()));
+    s.push_str(&format!("  \"verified\": {verified},\n"));
+    s.push_str("  \"entries\": [");
+    for (i, e) in entries.iter().enumerate() {
+        s.push_str(if i == 0 { "\n    " } else { ",\n    " });
+        s.push_str(&format!(
+            "{{\"symbol\": {}, \"month\": {}, \"vendor_url\": {}, \"http_status\": {}, \"etag\": {}, \
+             \"last_modified\": {}, \"vendor_sha256\": {}, \"local_sha256\": {}, \"bytes\": {}, \
+             \"verified\": {}, \"fetched_at\": {}}}",
+            quote(&e.symbol),
+            quote(&e.month.to_string()),
+            quote(&e.vendor_url),
+            e.http_status,
+            quote_opt(e.etag.as_deref()),
+            quote_opt(e.last_modified.as_deref()),
+            quote(&e.vendor_sha256),
+            quote(&e.local_sha256),
+            e.bytes,
+            e.verified,
+            quote(&e.fetched_at),
+        ));
+    }
+    s.push_str(if entries.is_empty() { "]\n}\n" } else { "\n  ]\n}\n" });
+    s
 }

@@ -119,8 +119,9 @@ impl Sha256 {
 
 /// Lowercase hex SHA-256 of `bytes`.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    let _ = bytes;
-    String::new()
+    let mut s = Sha256::new();
+    s.update(bytes);
+    s.finalize()
 }
 
 /// Lowercase hex SHA-256 of a file, streamed.

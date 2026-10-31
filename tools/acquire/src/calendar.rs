@@ -19,7 +19,17 @@ impl fmt::Display for Month {
 impl Month {
     /// Parses `YYYY-MM`.
     pub fn parse(s: &str) -> Result<Month, String> {
-        Err(format!("unimplemented {s}"))
+        let bad = || format!("invalid month '{s}', expected YYYY-MM");
+        let (y, m) = s.split_once('-').ok_or_else(bad)?;
+        if y.len() != 4 || m.len() != 2 {
+            return Err(bad());
+        }
+        let year: i32 = y.parse().map_err(|_| bad())?;
+        let month: u32 = m.parse().map_err(|_| bad())?;
+        if !(1..=12).contains(&month) {
+            return Err(bad());
+        }
+        Ok(Month { year, month })
     }
 
     pub fn next(self) -> Month {
@@ -45,8 +55,13 @@ impl Month {
 
 /// Months from `from` to `to`, both inclusive. Empty when `from > to`.
 pub fn range(from: Month, to: Month) -> Vec<Month> {
-    let _ = (from, to);
-    Vec::new()
+    let mut out = Vec::new();
+    let mut m = from;
+    while m <= to {
+        out.push(m);
+        m = m.next();
+    }
+    out
 }
 
 /// Rejects a range that reaches the current month or later: the archive publishes a
@@ -65,8 +80,10 @@ pub fn now_unix() -> i64 {
 
 /// `YYYY-MM-DDTHH:MM:SSZ` for Unix seconds.
 pub fn iso_from_unix(secs: i64) -> String {
-    let _ = secs;
-    String::new()
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 pub fn now_iso() -> String {

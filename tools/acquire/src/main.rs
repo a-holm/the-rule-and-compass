@@ -27,8 +27,8 @@ fetch   Downloads <out>/raw_<iv>/<SYM>/<SYM>-<iv>-YYYY-MM.zip for every month in
         --to defaults to the previous month; a month that is not published yet is refused.
         --skip-404 does not request months an earlier run recorded as 404.
 verify  Fetches the .CHECKSUM sibling of every zip under <dir>/raw_<iv>/, compares it with the
-        local SHA-256 and writes the snapshot JSON for `rcsr prep --snapshot` and
-        `rcsr panel --snapshot` (default <dir>/snapshot_<iv>.json). Exit 1 when a zip is
+        local SHA-256 and writes the snapshot JSON for `rcsr panel build --snapshot`
+        (default <dir>/snapshot_<iv>.json). Exit 1 when a zip is
         not verified. `complete` is true only when all zips verify and coverage_last is at
         least --through.
 

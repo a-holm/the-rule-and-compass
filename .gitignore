@@ -18,4 +18,3 @@ rcsr.dev.ndjson
 
 # Run artifacts of the workshop (verksted/) are git-ignored; the workshop itself is tracked.
 verksted/**/output/
-/tools/*/target/

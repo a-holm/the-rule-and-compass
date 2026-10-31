@@ -7,7 +7,7 @@ use std::fs;
 use std::path::Path;
 
 mod common;
-use common::{fixture, fixture_text, scratch, Fake};
+use common::{fixture, scratch, Fake};
 
 const BASE: &str = "https://example.test";
 const LIST: &str = "https://example.test/bucket";

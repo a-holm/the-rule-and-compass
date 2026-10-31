@@ -144,6 +144,49 @@ fn run_job(cfg: &FetchConfig, t: &dyn Transport, job: &Job) -> Outcome {
 /// Downloads every missing zip. One status row is appended to the CSV per request, in
 /// completion order. Existing zips and (with `skip_404`) known 404s make no request.
 pub fn run(cfg: &FetchConfig, t: &dyn Transport) -> io::Result<Summary> {
-    let _ = (cfg, t);
-    Ok(Summary::default())
+    fs::create_dir_all(&cfg.out)?;
+    let csv = csv_path(&cfg.out, &cfg.interval);
+    let (jobs, mut summary) = plan(cfg);
+    let fresh = fs::metadata(&csv).map(|m| m.len() == 0).unwrap_or(true);
+    let mut file = OpenOptions::new().create(true).append(true).open(&csv)?;
+    if fresh {
+        writeln!(file, "{CSV_HEADER}")?;
+    }
+    let next = AtomicUsize::new(0);
+    let (tx, rx) = mpsc::channel::<Outcome>();
+    let workers = cfg.jobs.clamp(1, jobs.len().max(1));
+    let mut write_err = None;
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let (next, jobs) = (&next, &jobs);
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(job) = jobs.get(i) else { break };
+                if tx.send(run_job(cfg, t, job)).is_err() {
+                    break;
+                }
+            });
+        }
+        drop(tx);
+        for o in rx {
+            summary.requests += 1;
+            match o.status {
+                200 => summary.ok += 1,
+                404 => summary.missing += 1,
+                _ => summary.failed += 1,
+            }
+            let row = format!(
+                "{},{},{},{},{},{}\n",
+                o.job.symbol, cfg.interval, o.job.month, o.status, o.bytes, o.at
+            );
+            if let Err(e) = file.write_all(row.as_bytes()).and_then(|_| file.flush()) {
+                write_err.get_or_insert(e);
+            }
+        }
+    });
+    match write_err {
+        Some(e) => Err(e),
+        None => Ok(summary),
+    }
 }
