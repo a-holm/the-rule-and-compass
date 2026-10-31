@@ -1889,6 +1889,18 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
                   (size_t)groups * sizeof(unsigned int)) == 0;
     c->last.alloc_ms += rc_now_ms() - t0;
     if (ok) {
+        size_t t3 = 0;
+        cub::DeviceSegmentedRadixSort::SortPairs(
+            NULL, t3, c->d_xs_keys, c->d_xs_keys_out, c->d_xs_order,
+            c->d_xs_rows_out, c->n, groups, c->d_xs_off, c->d_xs_off + 1);
+        if (t3 > c->xs_temp_bytes) {
+            cudaFree(c->d_xs_temp);
+            c->d_xs_temp = NULL;
+            ok = rc_alloc(&c->d_xs_temp, t3) == 0;
+            if (ok) c->xs_temp_bytes = t3;
+        }
+    }
+    if (ok) {
         k_group_starts<<<blocks, threads>>>(c->d_xs_rows_out, c->d_xs_gid,
                                             c->d_xs_off, c->n);
         int end = c->n;
