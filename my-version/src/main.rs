@@ -3831,6 +3831,7 @@ fn main() {
                     && Some(j) != time_col
                     && Some(j) != group_col
                     && Some(j) != weight_col
+                    && !registry::lookup(&table.names[j]).is_some_and(|r| r.family == "label")
             })
             .map(|j| table.names[j].clone())
             .collect();
@@ -3891,6 +3892,10 @@ fn main() {
     if vars.is_empty() {
         eprintln!("error: no input variables");
         std::process::exit(EXIT_INPUT);
+    }
+    if let Err(e) = registry::check_no_labels(&vars) {
+        eprintln!("error: {}", e);
+        std::process::exit(EXIT_LEAKAGE);
     }
     if let (Some(r), None) = (&target_resolved, &target_check) {
         target_check = Some(enforce_target_check(&r.spec, &vars, allow_target_structure));
@@ -4343,6 +4348,7 @@ fn main() {
             }
             let rung = diagnostics::target_structure_rung(&r.spec, &prepared, cfg.metric);
             let purge_line = target::purge_line(&r.spec, &prepared.report);
+            let label_report = target::label_report_for(&data_path, &r.spec.column);
             Some(target::Active {
                 spec: r.spec,
                 source: r.source,
@@ -4350,6 +4356,7 @@ fn main() {
                 check,
                 rung,
                 purge_line,
+                label_report,
             })
         }
         _ => None,
