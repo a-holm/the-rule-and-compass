@@ -33,10 +33,9 @@
 //!   p-values of all families keeps the family;
 //! * `dsr_above_min`: the deflated Sharpe ratio of the treatment, deflated by
 //!   `N_trials`, is at least `min_dsr`.
-//!
-//! The PBO of the arms' seed-mean series is reported with the verdict. It is
-//! an input record, not a gate: the CSCV centres every series, so it measures
-//! rank stability and not skill.
+//! * `pbo`: the PBO of the arms' seed-mean series, by CSCV on the raw series, is
+//!   below `max_pbo`. It is a property of the arm set, so it applies to every
+//!   family; a failure is listed on each family as `pbo`.
 //!
 //! The ablation is a selection on training data repeated inside every fold:
 //! each run selects its finalist on a validation slice and is scored on the
@@ -97,6 +96,8 @@ pub struct Rule {
     pub block_len: usize,
     pub seed: u32,
     pub pbo_blocks: usize,
+    /// A family ships only when the PBO of the arms is below this.
+    pub max_pbo: f64,
     pub families: Vec<FamilyDef>,
 }
 
@@ -225,6 +226,7 @@ pub fn parse_definition(text: &str) -> Result<Definition, String> {
             block_len: opt_f64(r, "block_len", 0.0) as usize,
             seed: opt_f64(r, "seed", 0.0) as u32,
             pbo_blocks: opt_f64(r, "pbo_blocks", 8.0) as usize,
+            max_pbo: opt_f64(r, "max_pbo", 0.5),
             families,
         },
         sha256: sha256_hex(text.as_bytes()),
@@ -264,6 +266,9 @@ fn validate_definition(d: &Definition) -> Result<(), String> {
     }
     if d.rule.pbo_blocks % 2 != 0 || d.rule.pbo_blocks < 2 {
         return Err("rule.pbo_blocks must be even and at least 2".to_string());
+    }
+    if !(d.rule.max_pbo > 0.0 && d.rule.max_pbo <= 1.0) {
+        return Err("rule.max_pbo must be in (0, 1]".to_string());
     }
     Ok(())
 }
@@ -1273,6 +1278,11 @@ pub fn verdict(def: &Definition, results: &[SeedResult], expected_hashes: &BTree
             Some(d) if d.dsr >= def.rule.min_dsr => {}
             Some(d) => failed.push(format!("dsr_above_min: DSR {} below {}", jnum(d.dsr), jnum(def.rule.min_dsr))),
             None => failed.push("dsr_above_min: too few periods".to_string()),
+        }
+        match &pbo {
+            Some(p) if p.pbo < def.rule.max_pbo => {}
+            Some(p) => failed.push(format!("pbo: PBO {} not below {}", jnum(p.pbo), jnum(def.rule.max_pbo))),
+            None => failed.push(format!("pbo: unavailable ({})", pbo_error.as_deref().unwrap_or("no result"))),
         }
         f.verdict = if failed.is_empty() { "ship" } else { "drop" };
         f.failed = failed;

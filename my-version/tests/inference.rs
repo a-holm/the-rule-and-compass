@@ -130,7 +130,7 @@ fn cols_from(a: &[f64], blocks: usize) -> usize {
 }
 
 #[test]
-fn pbo_is_one_for_mirrored_candidates_and_zero_for_a_dominant_one() {
+fn pbo_is_one_for_mirrored_candidates() {
     // Candidate A trends down block by block; B = -A. The in-sample winner is
     // always the out-of-sample loser.
     let rows = 6;
@@ -150,11 +150,42 @@ fn pbo_is_one_for_mirrored_candidates_and_zero_for_a_dominant_one() {
     // rank 1 of 2: omega = 1/3, logit = ln(0.5)
     assert!(pbo.logits.iter().all(|&l| close(l, 0.5f64.ln(), 1e-12)));
 
-    // A dominates B by a constant in every block.
-    let c: Vec<f64> = a.iter().map(|v| v - 0.25).collect();
-    let dom = pbo_cscv(&[a, c], blocks).unwrap();
-    assert_eq!(dom.pbo, 0.0);
-    assert!(dom.logits.iter().all(|&l| close(l, 2.0f64.ln(), 1e-12)));
+}
+
+fn pbo_fixture(k: usize, rows: usize, blocks: usize, drift: &[f64], seed: u32) -> Vec<Vec<f64>> {
+    let mut rng = Mt::new(seed);
+    (0..k)
+        .map(|c| {
+            (0..rows * blocks)
+                .map(|_| drift.get(c).copied().unwrap_or(0.0) + 0.01 * normal(&mut rng))
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn pbo_is_zero_for_a_noisy_candidate_with_a_real_edge() {
+    let cols = pbo_fixture(8, 30, 8, &[0.01], 7);
+    let p = pbo_cscv(&cols, 8).unwrap();
+    assert_eq!(p.combinations, 70);
+    assert_eq!(p.pbo, 0.0, "mean logit {}", p.mean_logit);
+}
+
+#[test]
+fn pbo_is_near_one_half_for_iid_noise_candidates() {
+    let cols = pbo_fixture(24, 30, 8, &[], 11);
+    let p = pbo_cscv(&cols, 8).unwrap();
+    assert!(p.pbo >= 0.3 && p.pbo <= 0.7, "pbo {}", p.pbo);
+}
+
+#[test]
+fn pbo_counts_a_tie_with_the_winner_as_not_worse_than_it() {
+    // rank = #{oos <= oos[best]}: identical candidates tie on every split,
+    // the winner ranks last of k and no combination counts as overfit.
+    let a: Vec<f64> = (0..48).map(|i| if i % 2 == 0 { 0.02 } else { -0.01 }).collect();
+    let p = pbo_cscv(&[a.clone(), a.clone(), a], 4).unwrap();
+    assert_eq!(p.pbo, 0.0);
+    assert!(p.logits.iter().all(|&l| close(l, 3.0f64.ln(), 1e-12)));
 }
 
 #[test]
