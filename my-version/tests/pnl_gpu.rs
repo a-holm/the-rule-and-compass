@@ -2305,23 +2305,31 @@ mod device_band_dp {
             f();
             t.elapsed().as_secs_f64()
         };
-        let (mut b0, mut b1, mut d0, mut d1) = (None, None, None, None);
-        let cpu_band = time(&mut || b0 = Some(band_scan(&scores, &returns, &groups, &band, side, 65_536).unwrap()));
-        let dev_band = time(&mut || {
-            b1 = Some(band_scan_device(&scores, &returns, &groups, &band, side, 256, 65_536).unwrap())
-        });
-        let cpu_dp = time(&mut || d0 = Some(dp_scan(&returns, &groups, side, 65_536).unwrap()));
-        let dev_dp = time(&mut || d1 = Some(dp_scan_device(&returns, &groups, side, 256, 65_536).unwrap()));
-        same_band(b0.as_ref().unwrap(), b1.as_ref().unwrap(), "bench band");
-        same_dp(d0.as_ref().unwrap(), d1.as_ref().unwrap(), side, "bench dp");
-        println!(
-            "n={} groups={} band cpu={:.4}s device={:.4}s dp cpu={:.4}s device={:.4}s (device includes upload and download)",
-            n,
-            b0.as_ref().unwrap().carries.len(),
-            cpu_band,
-            dev_band,
-            cpu_dp,
-            dev_dp
-        );
+        // Context creation is not part of the scan.
+        dp_scan_device(&returns[..2], &groups[..2], side, 32, 2).unwrap();
+        let (mut b0, mut d0) = (None, None);
+        let cpu_band = time(&mut || b0 = Some(band_scan(&scores, &returns, &groups, &band, side, n).unwrap()));
+        let cpu_dp = time(&mut || d0 = Some(dp_scan(&returns, &groups, side, n).unwrap()));
+        let (b0, d0) = (b0.unwrap(), d0.unwrap());
+        for chunk in [n, 65_536] {
+            let (mut b1, mut d1) = (None, None);
+            let dev_band = time(&mut || {
+                b1 = Some(band_scan_device(&scores, &returns, &groups, &band, side, 256, chunk).unwrap())
+            });
+            let dev_dp = time(&mut || d1 = Some(dp_scan_device(&returns, &groups, side, 256, chunk).unwrap()));
+            same_band(&b0, b1.as_ref().unwrap(), "bench band");
+            same_dp(&d0, d1.as_ref().unwrap(), side, "bench dp");
+            println!(
+                "n={} groups={} chunk={} band cpu={:.4}s device={:.4}s dp cpu={:.4}s device={:.4}s \
+                 (device includes upload and download)",
+                n,
+                b0.carries.len(),
+                chunk,
+                cpu_band,
+                dev_band,
+                cpu_dp,
+                dev_dp
+            );
+        }
     }
 }
