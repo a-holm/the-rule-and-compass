@@ -192,7 +192,7 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
                 fit_weighted_metric(tree, x, y, w, iters, metric),
                 BatchStatus::Unsupported,
             ),
-            Some(c) => match verify_proposal(tree, c, x, y, w, metric) {
+            Some(c) => match gate_device_proposal(tree, c, x, y, w, metric) {
                 Verdict::Accepted(v) => (v, BatchStatus::Gpu),
                 Verdict::Rejected => (
                     fit_weighted_metric(tree, x, y, w, iters, metric),
@@ -212,7 +212,7 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
 }
 
 /// The outcome of comparing one proposal with the starting constants.
-enum Verdict {
+pub enum Verdict {
     /// The proposal was accepted; carries its exact score of the metric.
     Accepted(f64),
     /// The proposal was not better (or was not finite): keep the start.
@@ -242,7 +242,7 @@ enum Verdict {
 /// `rank_correlation_signed`, `1 − |ρ|` for `rank_correlation`. The gate never
 /// sees an SSE, and a reflected model is a worse deal for the signed objective
 /// (`2 − score`) exactly as it is for the CPU arm.
-fn verify_proposal(
+pub fn gate_device_proposal(
     tree: &mut Node,
     proposal: &[f64],
     x: &[Vec<f64>],
@@ -586,14 +586,14 @@ impl BatchedFitter for BatchedGpu<'_> {
         }
         // #231: the rank family has a native **fit** objective on the device,
         // under the orientation the metric names, so the batched verifier no
-        // longer declines it. `verify_proposal` judges the proposal on the
+        // longer declines it. `gate_device_proposal` judges the proposal on the
         // exact integer statistic, never on SSE and never on `|ρ|` for the
         // signed metric.
         if let Some(signed) = rank_metric_signed(metric) {
             return self.propose_rank(trees, iters, y, w, signed);
         }
         if metric == Metric::Signed {
-            // #228: warm start only; `verify_proposal` projects and judges.
+            // #228: warm start only; `gate_device_proposal` projects and judges.
             return self.propose(trees, iters, DeviceLoss::Squared);
         }
         // #226: `median` is fitted by the batched exact median polish (squared
