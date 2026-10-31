@@ -24,7 +24,7 @@ fn sample(n: usize) -> Sample {
         x.push(vec![a, b]);
         y.push(2.0 * a + 3.0 * b + 1.0 + noise);
     }
-    Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
 }
 
 fn config(seed: u32) -> Config {

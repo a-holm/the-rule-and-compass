@@ -154,7 +154,8 @@ fn unit_of(name: &str, family: &str) -> String {
         "open" | "high" | "low" | "close" | "vwap" => "quote_price",
         "volume" | "taker_buy_base" => "base_units",
         "quote_volume" | "taker_buy_quote" => "quote_currency",
-        "trades" => "count",
+        "trades" | "gap" => "count",
+        "flags" => "flag",
         _ if name.contains("rank") => "rank_unit_interval",
         _ => match family {
             "calendar" => "unit_circle",
@@ -449,6 +450,10 @@ pub struct View {
     pub size: usize,
     pub columns: Vec<String>,
     pub families: Vec<(String, Vec<String>)>,
+    /// Every candidate column the view leaves out: name, registry family
+    /// (`unregistered` when absent) and the reason. Omission is a runtime
+    /// choice; the registry still lists the column.
+    pub omitted: Vec<(String, String, String)>,
 }
 
 impl View {
@@ -462,16 +467,24 @@ impl View {
                 format!("{}:[{}]", esc(f), n.join(","))
             })
             .collect();
+        let omitted: Vec<String> = self
+            .omitted
+            .iter()
+            .map(|(n, f, r)| {
+                format!("{{\"name\":{},\"family\":{},\"reason\":{}}}", esc(n), esc(f), esc(r))
+            })
+            .collect();
         format!(
             "{{\"view_id\":{},\"seed\":{},\"view\":{},\"size\":{},\"feature_registry_version\":{},\
-             \"columns\":[{}],\"families\":{{{}}}}}",
+             \"columns\":[{}],\"families\":{{{}}},\"omitted\":[{}]}}",
             esc(&self.id),
             self.seed,
             self.view,
             self.size,
             FEATURE_REGISTRY_VERSION,
             cols.join(","),
-            fams.join(",")
+            fams.join(","),
+            omitted.join(",")
         )
     }
 }
@@ -547,6 +560,23 @@ pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> R
     }
     let chosen: std::collections::BTreeSet<&String> = picked.values().flatten().collect();
     let cols: Vec<String> = columns.iter().filter(|c| chosen.contains(c)).cloned().collect();
+    let omitted: Vec<(String, String, String)> = columns
+        .iter()
+        .filter(|c| !chosen.contains(c))
+        .map(|c| {
+            let (family, reason) = match lookup(c) {
+                None => ("unregistered".to_string(), "not in the feature registry".to_string()),
+                Some(r) if !r.available => (r.family, "registered but unavailable".to_string()),
+                Some(r) if r.input => (r.family, "raw input column, not a view candidate".to_string()),
+                Some(r) if r.causal_offset > 0 => (r.family, "lead column, not a view candidate".to_string()),
+                Some(r) => {
+                    let reason = format!("not drawn by view {} of seed {}", view, seed);
+                    (r.family, reason)
+                }
+            };
+            (c.clone(), family, reason)
+        })
+        .collect();
     let families: Vec<(String, Vec<String>)> = picked.into_iter().collect();
     let id_text = format!("{}|{}|{}|{}|{}", FEATURE_REGISTRY_VERSION, seed, view, size, cols.join(","));
     let id = manifest::sha256_hex(id_text.as_bytes())[..12].to_string();
@@ -557,6 +587,7 @@ pub fn select_view(columns: &[String], size: usize, seed: u64, view: usize) -> R
         size,
         columns: cols,
         families,
+        omitted,
     })
 }
 
@@ -583,4 +614,132 @@ pub fn parse_lag_menu(s: &str) -> Result<Vec<usize>, String> {
     }
     out.sort_unstable();
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// Default financial feature set inventory
+// ---------------------------------------------------------------------------
+
+fn stored_dtype(name: &str) -> &'static str {
+    match name {
+        "ts" => "i64",
+        "symbol" => "u32",
+        _ => "f64",
+    }
+}
+
+/// Tests that prove an entry: `tests/<file>.rs::<fn>`. The first is the unit
+/// or parity test, the next the NaN/gap test, then the join or shift test
+/// where the family has one. A calendar field is a pure function of `ts`, so
+/// it has no gap test.
+pub fn test_ids(e: &RegistryEntry) -> Vec<&'static str> {
+    let mut ids: Vec<&'static str> = match e.family {
+        "identity" | "price" => vec![
+            "tests/enrich.rs::raw_ohlcv_flow_fields_round_trip_exactly",
+            "tests/enrich.rs::flow_family_requires_raw_fields_and_unknown_names_fail",
+        ],
+        "flow" if e.source == "input" => vec![
+            "tests/enrich.rs::raw_ohlcv_flow_fields_round_trip_exactly",
+            "tests/enrich.rs::flow_family_requires_raw_fields_and_unknown_names_fail",
+        ],
+        "flow" => vec![
+            "tests/enrich.rs::flow_formulas_match_hand_built_bars",
+            "tests/enrich.rs::flow_windows_are_gap_masked",
+            "tests/enrich.rs::flow_windows_never_bridge_a_listing_boundary",
+        ],
+        "cross" => vec![
+            "tests/enrich.rs::cross_family_is_exactly_the_registry_and_market_state_is_ex_self_pit",
+            "tests/enrich.rs::a_partial_cross_section_is_nan_and_a_prefix_is_causal",
+            "tests/enrich.rs::btc_and_eth_joins_use_the_same_timestamp_and_a_shift_fails",
+        ],
+        "mtf" => vec![
+            "tests/enrich.rs::mtf_36_columns_match_hand_built_higher_bars",
+            "tests/enrich.rs::mtf_every_column_is_nan_when_its_higher_bucket_is_missing",
+            "tests/enrich.rs::mtf_join_is_causal_and_a_future_shift_is_caught",
+        ],
+        "price_action" => vec![
+            "tests/enrich.rs::price_action_geometry_matches_flat_hand_bars",
+            "tests/enrich.rs::price_action_two_bar_and_window_gap_masked",
+            "tests/enrich.rs::price_action_is_prefix_causal_under_a_shifted_future_bar",
+        ],
+        "derivatives" => vec!["tests/derivatives.rs::every_reserved_column_is_unavailable_with_inventory_fields"],
+        "calendar" => vec![
+            "tests/enrich.rs::engine_inventory_is_complete_available_and_runs",
+            "tests/enrich.rs::engine_inventory_is_causal_on_a_prefix",
+        ],
+        _ => vec![
+            "tests/enrich.rs::engine_inventory_is_complete_available_and_runs",
+            "tests/enrich.rs::every_available_name_is_nan_after_a_gap",
+            "tests/enrich.rs::engine_inventory_is_causal_on_a_prefix",
+        ],
+    };
+    if enrich::COMPACT_NAMES.contains(&e.name.as_str()) {
+        ids.push("tests/enrich.rs::compact_matches_the_python_builder_on_a_contiguous_slice");
+    }
+    if e.derived {
+        ids.push("tests/enrich.rs::wasym1_identity_holds_on_finite_range_bars");
+    }
+    ids
+}
+
+/// The checked-in `docs/default_financial_features.json` content: one row per
+/// registry entry.
+pub fn default_features_json() -> String {
+    let reg = enrich::default_registry();
+    let compact: Vec<&str> = enrich::COMPACT_NAMES.to_vec();
+    let rows: Vec<String> = reg
+        .iter()
+        .map(|e| {
+            let r = lookup(&e.name);
+            let unit = r.as_ref().map(|r| r.unit.clone()).unwrap_or_default();
+            let dependency = if e.available {
+                e.source.to_string()
+            } else {
+                crate::derivatives::dependency_text(&e.name)
+            };
+            let tests: Vec<String> = test_ids(e).iter().map(|t| t.to_string()).collect();
+            format!(
+                "    {{\"name\":{},\"family\":{},\"timeframe\":{},\"warmup_bars\":{},\"pit_rule\":{},\
+                 \"dtype\":{},\"unit\":{},\"implementation\":{},\"available\":{},\"derived\":{},\
+                 \"compact\":{},\"source\":{},\"test_id\":{}}}",
+                esc(&e.name),
+                esc(e.family),
+                esc(e.timeframe),
+                e.warmup,
+                esc(e.pit),
+                esc(stored_dtype(&e.name)),
+                esc(&unit),
+                esc(&e.formula),
+                e.available,
+                e.derived,
+                compact.contains(&e.name.as_str()),
+                esc(&dependency),
+                esc(&tests.join("; "))
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"count\": {},\n  \"compact_subset\": {},\n  \"columns\": [\n{}\n  ]\n}}\n",
+        reg.len(),
+        compact.len(),
+        rows.join(",\n")
+    )
+}
+
+/// Availability matrix: per family, the available and unavailable counts.
+pub fn availability_matrix_json() -> String {
+    let mut fams: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for e in enrich::default_registry() {
+        let c = fams.entry(e.family).or_default();
+        if e.available {
+            c.0 += 1;
+        } else {
+            c.1 += 1;
+        }
+    }
+    let items: Vec<String> = fams
+        .iter()
+        .map(|(f, (a, u))| format!("{}:{{\"available\":{},\"unavailable\":{}}}", esc(f), a, u))
+        .collect();
+    format!("{{{}}}", items.join(","))
 }

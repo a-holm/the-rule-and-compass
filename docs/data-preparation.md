@@ -132,6 +132,8 @@ or bridges a gap in the producer. The compact 52-name profile and every name in
 `engine_catalogue` follow the same rule, even where the historical compact
 builder used positional windows that bridged a hole.
 
+Every available time-series name in the registry is tested for this rule: for each name, the first `warmup` bars after a hole are `NaN` (`every_available_name_is_nan_after_a_gap`). The cross-section, higher-timeframe and calendar families carry their own per-name tests, listed in `docs/default_financial_features.json`.
+
 The candle/price-action family (#261) is stricter still for its new columns:
 `clv16`, `body16`, `rng_atr`, `prev_range_pos`, `inside_s`, `outside_s`,
 `engulf_s`, `harami_s`, `nr4` and `trend96` are `NaN` when a bar has `H==L`, a

@@ -347,7 +347,7 @@ choice. `--metric` selects one of twenty objectives:
   sign is part of the objective and an inverted forecast is penalised. Use them
   for directional signals (returns, demand, a control response) where the
   forecast has to rise and fall with the target;
-* `slope` — match the trend rather than the level;
+* `slope` — match the trend rather than the level. It differences only row pairs that are adjacent in the original data order and in the same group (`--group-by`, or one group), so a random split keeps the pairs whose two rows both land on the same side. Fewer than 32 training pairs is a usage error that names `--split temporal`. The same pair set drives the fit, the validation and test scores and the baselines. `--bootstrap-error`, `--stability`, `--cv` and multi-output targets are refused with `--metric slope` (usage error), because resampled or refolded rows have no data order. The gate row filter drops rows from a sample and remaps the pairs to the kept rows;
 * `auc`, `log_loss`, `hinge` — classification; the target must have exactly two
   distinct values (or one, which scores as chance). The model output is a
   logit. A `{-1, 0, +1}` target is **rejected** rather than silently split at

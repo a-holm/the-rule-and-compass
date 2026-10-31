@@ -28,7 +28,7 @@ fn kg() -> Unit {
 }
 
 fn sample(x: Vec<Vec<f64>>, y: Vec<f64>) -> Sample {
-    Sample { x, y, w: Vec::new(), ys: Vec::new() }
+    Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
 }
 
 fn describe(out: &Outcome) -> Vec<(u64, u64, u64)> {

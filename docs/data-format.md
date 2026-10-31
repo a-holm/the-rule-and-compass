@@ -406,7 +406,7 @@ The projection hash is FNV-1a 64 over `index:name:dtype;` in header order.
 
 When the sidecar exists, a `--vars` name that it does not list exits 3 with the nearest registry name and its family. A store without a sidecar is unchanged.
 
-`--project n|auto` chooses `--vars` as a deterministic view of `n` registered derived columns (24-48, research cell 96-128, `auto` = 36): one column per family, a second per family when `n` exceeds the family count, rotated by `(--seed, --view)`. The view depends only on column names and the registry, never on rows. The view id, seed, view index and columns per family are written to `--run-manifest` under `view`; the read is then projected as usual.
+`--project n|auto` chooses `--vars` as a deterministic view of `n` registered derived columns (24-48, research cell 96-128, `auto` = 36): one column per family, a second per family when `n` exceeds the family count, rotated by `(--seed, --view)`. The view depends only on column names and the registry, never on rows. The view id, seed, view index and columns per family are written to `--run-manifest` under `view`; every candidate column the view leaves out is written under `view.omitted` with its registry family and reason, and the registry still lists it; the read is then projected as usual.
 
 `store::write_store_grouped` writes a store one group at a time from a producer closure, so peak memory is one group of every column and not the table. `write_store_with_time` is a producer over an in-memory table, so both paths write identical bytes (`tests/registry.rs`).
 
@@ -552,6 +552,8 @@ have a tested implementation; unavailable columns name their missing data
 dependency and fail closed when requested. The compact 52-name profile is a
 regression subset of this registry, not a separate store format; see
 `docs/ohlcv.md`.
+
+The identity fields `ts symbol listing_id member_asof gap flags` are registry entries of family `identity`. `rcsr schema` prints `availability_matrix` (available and unavailable counts per family), and `docs/default_financial_features.json` is the generated one-row-per-column inventory (family, timeframe, warm-up, PIT rule, dtype, unit, formula, availability, dependency, test ids).
 
 The ten derivative columns (funding, open interest, basis, long/short ratio, taker flow, liquidations) are registered `family=derivatives`, `available:false`, `source:null`, with `required_source`, `publication_lag`, `required_raw_field` and `flip_condition`. A request for one is refused with the missing raw field. A future local snapshot is a CSV `field,symbol,publish_time,value`; it enables columns only after a coverage-by-symbol/date check and a PIT join check, and the panel manifest then records the source, its sha256 and the enabled columns. See `docs/ohlcv.md`.
 

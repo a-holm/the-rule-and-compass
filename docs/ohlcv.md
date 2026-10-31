@@ -344,7 +344,8 @@ The production set is the **default financial feature set**, not a single
 expanded panel. It is the union of:
 
 * the raw OHLCV/flow fields (`open high low close volume quote_volume trades
-  taker_buy_base taker_buy_quote`) and identity/quality fields;
+  taker_buy_base taker_buy_quote`) and the identity fields (`ts symbol
+  listing_id member_asof gap flags`);
 * every engine column above (`all` + `py15m` + the #125 groups + `cross:btc`),
   currently **216** distinct names in the catalogue command
   `--features all,py15m,ta:full,exotic:cheap,cross:btc`;
@@ -369,7 +370,19 @@ unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
-the only way a requested column is omitted.
+the only way a requested column is omitted. A `--project` view records every
+candidate column it leaves out under `view.omitted` in `--run-manifest`, with the
+registry family and the reason; the registry still lists the column.
+
+`rcsr schema` also prints `availability_matrix`: the available and unavailable
+count per family, which sums to the registry size. `docs/default_financial_features.json`
+is the generated inventory with one row per registry entry: `name`, `family`,
+`timeframe`, `warmup_bars`, `pit_rule`, `dtype`, `unit`, `implementation`,
+`available`, `derived`, `compact`, `source` (the data dependency for an
+unavailable entry) and `test_id` (the unit, NaN/gap and join or shift tests).
+A test regenerates it and fails when it is stale; `RCSR_WRITE_INVENTORY=1`
+rewrites it. The only `derived` entry is `wasym1 = body1 - 2*clv1`, which
+holds exactly for `H > L` and is still materialised by `compact`.
 
 ### Derivatives family (reserved, gated)
 

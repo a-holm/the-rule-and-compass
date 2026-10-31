@@ -370,3 +370,18 @@ pub fn verify(snap: &Snapshot, path: &str, bytes: &[u8], symbols: &[String], sta
     }
     Ok(Verified { path: path.to_string(), sha256: sha256_hex(bytes), columns })
 }
+
+/// One-line data dependency of a reserved column: source, raw field, lag and
+/// the condition that flips it to available.
+pub fn dependency_text(name: &str) -> String {
+    match spec(name) {
+        Some(s) => format!(
+            "source {}; raw field {}; publication lag {}; {}",
+            s.source,
+            s.fields.join("+"),
+            s.publication_lag,
+            flip_condition(s)
+        ),
+        None => "none".to_string(),
+    }
+}

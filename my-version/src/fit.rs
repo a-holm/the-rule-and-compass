@@ -3240,6 +3240,32 @@ pub fn fit_weighted_strategy_metric(
     }
 }
 
+/// `slope` fit over explicit adjacent-row pairs: the squared fit, then the
+/// coordinate polish on the pair-based slope. Keeps the incumbent unless the
+/// trial improves it. Returns the slope at the kept constants.
+pub fn fit_slope_pairs(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    pairs: &[[u32; 2]],
+    iters: usize,
+) -> f64 {
+    let score_of = |t: &Node| {
+        metrics::score_slope_pairs(&predictions(t, x), y, pairs)
+    };
+    let start = score_of(tree);
+    let mut trial = tree.clone();
+    fit_weighted(&mut trial, x, y, &[], iters);
+    coordinate_polish_by(&mut trial, iters.max(1), &score_of);
+    let score = score_of(&trial);
+    if improves(score, start) {
+        *tree = trial;
+        score
+    } else {
+        start
+    }
+}
+
 /// Unweighted entry point for [`fit_weighted_metric`].
 pub fn fit_metric(
     tree: &mut Node,
@@ -3554,6 +3580,11 @@ pub(crate) fn coordinate_polish(
         }
         _ => metric_score(tree, x, y, w, metric),
     };
+    coordinate_polish_by(tree, sweeps, &score_of);
+}
+
+/// The ladder walk of [`coordinate_polish`] for an arbitrary score.
+fn coordinate_polish_by(tree: &mut Node, sweeps: usize, score_of: &dyn Fn(&Node) -> f64) {
     let mut best = score_of(tree);
     if !best.is_finite() {
         return;
