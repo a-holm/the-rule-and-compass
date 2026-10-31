@@ -2966,7 +2966,7 @@ pub fn fit_weighted_metric(
         Squared | Aic | Aicc | Bic => {
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
-        Absolute => irls_fit(tree, x, y, w, iters, metric, |r, _| {
+        Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
         LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
@@ -2998,14 +2998,13 @@ pub fn fit_weighted_metric(
         | Maximum
         | Interquartile
         | Slope
-        | ImplicitResidual
         | ImplicitDerivative => {
             let start = metric_score(tree, x, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
             coordinate_polish(&mut trial, x, y, w, metric, iters.max(1));
             let score = metric_score(&trial, x, y, w, metric);
-            if score.is_finite() && score < start {
+            if improves(score, start) {
                 *tree = trial;
                 score
             } else {
@@ -3084,6 +3083,13 @@ fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metri
     metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
 }
 
+/// The metric-monotone keep rule: a trial replaces the incumbent only when its
+/// score is finite and strictly lower. Two infinite scores never compare as an
+/// improvement.
+fn improves(score: f64, incumbent: f64) -> bool {
+    score.is_finite() && score < incumbent
+}
+
 /// One IRLS round: fit weighted least squares to `target` with per-row
 /// `weights`, then keep the trial only if the configured metric improves.
 ///
@@ -3134,7 +3140,7 @@ where
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, inner);
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         } else {
@@ -3161,7 +3167,7 @@ where
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, iters.max(4));
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         }
@@ -3319,7 +3325,7 @@ fn logistic_irls(
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, 2);
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         } else {
@@ -4013,6 +4019,62 @@ pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
 mod tests {
     use super::*;
     use crate::expr::{constant, input, node};
+
+    fn implicit_circle() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let n = 60;
+        let x = (0..n)
+            .map(|i| {
+                let a = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+                let r = 1.0 + 0.1 * ((i * 7 % 11) as f64 - 5.0) / 5.0;
+                vec![r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        (x, vec![0.0; n])
+    }
+
+    fn circle_tree(c: f64) -> Node {
+        node(
+            Op::Sub,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Square, vec![input(0)]),
+                        node(Op::Square, vec![input(1)]),
+                    ],
+                ),
+                constant(c),
+            ],
+        )
+    }
+
+    /// #396: on an implicit sample (`y == 0`) `implicit_residual` is the
+    /// `absolute` objective, so its fit moves the constant and matches the
+    /// `absolute` fit bit for bit.
+    #[test]
+    fn implicit_residual_fit_matches_absolute_and_moves_constants() {
+        let (x, y) = implicit_circle();
+        let mut a = circle_tree(1.7);
+        let mut r = circle_tree(1.7);
+        let before = r.clone();
+        let ea = fit_weighted_metric(&mut a, &x, &y, &[], 8, Metric::Absolute);
+        let er = fit_weighted_metric(&mut r, &x, &y, &[], 8, Metric::ImplicitResidual);
+        assert!(er.is_finite());
+        assert_ne!(r, before, "constants must move");
+        assert_eq!(er.to_bits(), ea.to_bits());
+        assert_eq!(r, a);
+    }
+
+    #[test]
+    fn keep_rule_never_compares_infinite_scores() {
+        let inf = f64::INFINITY;
+        assert!(!improves(inf, inf));
+        assert!(!improves(f64::NAN, inf));
+        assert!(!improves(inf, 1.0));
+        assert!(improves(1.0, inf));
+        assert!(improves(0.5, 1.0));
+        assert!(!improves(1.0, 1.0));
+    }
 
     /// #169: the GPU fit plan's constant cap is 20. `p <= 20` is offered to the
     /// kernel (no silent fallback) and `p = 21` is the first labelled
