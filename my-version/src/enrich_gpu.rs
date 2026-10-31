@@ -114,6 +114,7 @@ extern "C" {
     fn rc_enrich_value_ptr(ctx: *mut Raw, which: c_int) -> *mut f64;
     fn rc_enrich_new_output(ctx: *mut Raw) -> *mut f64;
     fn rc_enrich_release_output(p: *mut f64);
+    fn rc_enrich_set_test_budget(bytes: usize);
     fn rc_enrich_download_ptr(src: *const f64, dst: *mut f64, n: c_int) -> c_int;
     fn rc_enrich_note_projected_upload(ctx: *mut Raw, bytes: u64, ms: f64);
     fn rc_enrich_note_projected_download(ctx: *mut Raw, bytes: u64, ms: f64);
@@ -565,6 +566,11 @@ impl EnrichGpu {
         Some(gpu)
     }
 
+    /// Names of the tile-precomputed features still resident on the device.
+    pub fn precomputed_names(&self) -> Vec<String> {
+        self.precomputed.keys().cloned().collect()
+    }
+
     /// Download and remove one tile-precomputed feature, if it exists.
     pub fn take_precomputed(&mut self, name: &str) -> Option<Vec<f64>> {
         let ptr = self.precomputed.remove(name)?;
@@ -947,6 +953,13 @@ impl Drop for EnrichGpu {
         }
         unsafe { rc_enrich_destroy(self.ctx) };
     }
+}
+
+/// Limits the bytes the context may add after creation (tile outputs and
+/// fused planes). Zero removes the limit. Lets tests exhaust that share
+/// without exhausting the device.
+pub fn set_device_budget_for_tests(bytes: usize) {
+    unsafe { rc_enrich_set_test_budget(bytes) };
 }
 
 /// Map a catalogue name to the tiled kernel the transport can run while the

@@ -26,6 +26,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -90,9 +91,9 @@ static double rc_now_ms(void)
 static int rc_alloc(void **p, size_t bytes)
 {
 #ifdef RCSR_UNIFIED
-    return cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+    return (int)rc_checked_malloc_managed(p, bytes);
 #else
-    return cudaMalloc(p, bytes);
+    return (int)rc_checked_malloc(p, bytes);
 #endif
 }
 

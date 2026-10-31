@@ -122,6 +122,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/cuda/prep.cu");
     println!("cargo:rerun-if-changed=src/cuda/pnl.cu");
     println!("cargo:rerun-if-changed=src/cuda/pit.cu");
+    println!("cargo:rerun-if-changed=src/cuda/alloc_guard.h");
     println!("cargo:rerun-if-changed=src/cuda/arch.rs");
     println!("cargo:rerun-if-env-changed=RCSR_CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=RCSR_NVCC");

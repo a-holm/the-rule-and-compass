@@ -994,7 +994,7 @@ measured rates 0.36 M cells/s (CPU, per-row map lookup) and 100 M cells/s
 made the planner reject the device; with the measured rate `--gpu auto`
 dispatches the family above the 1M-row floor. The cross means follow `--gpu`:
 `on`, or `auto` above the 1M-row floor. A device failure falls back to the CPU
-loop for that block and is counted in `gpu_fallback`.
+loop for that block. Every fallback column is counted in `gpu_fallback`, listed with the failing path in `gpu_fallback_columns` (JSON `gpu.fallback_columns`, text lines `# enrich-fallback:`) and announced once per group by a `warning: device <path> failed` line.
 
 **Measured (RTX 3060, 16,113,108 rows, 109 symbols, `panel15m.rcsb`).**
 
@@ -1094,7 +1094,7 @@ for arm in cpu gpu compare; do
 done
 ```
 
-The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical per-column hashes. On 2026-10-30 the `cpu` arm finished (298 columns, 2579 s wall, 1603 s feature phase, 1.2 GB peak RSS); the `gpu` arm hung in the projected ring (#352; the reader thread waits for a free slot that is never returned) and was killed, so the 16.1M CPU/GPU comparison is not yet recorded.
+The `gpu` arm also repeats the GPU run with `--dry-run` and requires identical per-column hashes. The `gpu` arm fails when any column falls back and prints the fallback column names.
 
 ### Measured enrichment (2026-10-21)
 

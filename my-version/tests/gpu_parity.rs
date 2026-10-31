@@ -1132,7 +1132,7 @@ fn pit_asof_joins_are_byte_identical_and_causal() {
 ///
 /// Each arm is a separate invocation so no single lock hold covers both.
 #[test]
-#[ignore = "large store, see docs/ohlcv.md (RCSR_PARITY_ARM=cpu|gpu|compare); the gpu arm is blocked by a projected-ring hang (#352)"]
+#[ignore = "large store, see docs/ohlcv.md (RCSR_PARITY_ARM=cpu|gpu|compare)"]
 fn large_store_parity_at_the_declared_tiers() {
     let store_path = std::env::var("RCSR_PARITY_STORE")
         .unwrap_or_else(|_| "/mnt/lager/tmp/opencode/prep-measure/panel15m.rcsb".to_string());
@@ -1178,7 +1178,7 @@ fn large_store_parity_at_the_declared_tiers() {
                 "[large] gpu: {} columns ({} on device, {} fallback), wall {:.1}s, feature {:.1}s, kernel {:.2}s, d2h {:.2}s",
                 r.features.len(), r.gpu_columns, r.gpu_fallback, r.total_seconds, r.feature_seconds, r.gpu_kernel_seconds, r.gpu_d2h_seconds
             );
-            assert_eq!(r.gpu_fallback, 0, "{:?}", r.plans);
+            assert_eq!(r.gpu_fallback, 0, "fallback columns: {:?}", r.gpu_fallback_columns);
             assert_eq!(r.cpu_columns, 0, "{:?}", r.plans);
             save("gpu", &r);
             let mut again = options(&store_path, &p(&work, "gpu2.rcsb"), &names, GpuMode::On, store::DEFAULT_GROUP_ROWS);

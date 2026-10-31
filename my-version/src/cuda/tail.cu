@@ -18,6 +18,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
 
@@ -364,12 +365,12 @@ extern "C" int rc_tail_donchian(const long long *t, const double *high,
 {
     (void)nseg;
     double *pre = NULL, *hi = NULL, *lo = NULL;
-    if (cudaMalloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
-    if (cudaMalloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(pre);
         return -1;
     }
-    if (cudaMalloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(pre);
         cudaFree(hi);
         return -1;
@@ -439,12 +440,12 @@ __global__ void k_tail_stoch_d(const long long *__restrict__ t,
                              int which, double *out, double *scratch)
 {
     double *pre = NULL, *hi = NULL, *lo = NULL;
-    if (cudaMalloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
-    if (cudaMalloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(pre);
         return -1;
     }
-    if (cudaMalloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(pre);
         cudaFree(hi);
         return -1;
@@ -768,7 +769,7 @@ extern "C" int rc_tail_atr(const long long *t, const double *high,
                            int step, int period, int which, double *out)
 {
     double *tr = NULL;
-    if (cudaMalloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
     k_tail_atr<<<blocks, threads>>>(t, high, low, close, ss, sl, nseg, step,
                                     period, which, tr, out);
@@ -784,7 +785,7 @@ extern "C" int rc_tail_batr(const long long *t, const double *open,
                             int nseg, int n, int step, int period, double *out)
 {
     double *tr = NULL;
-    if (cudaMalloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
     k_tail_batr<<<blocks, threads>>>(t, open, high, low, close, ss, sl, nseg,
                                      step, period, tr, out);
@@ -800,7 +801,7 @@ extern "C" int rc_tail_gapatr(const long long *t, const double *open,
                               int nseg, int n, int step, int period, double *out)
 {
     double *tr = NULL;
-    if (cudaMalloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
     int threads = 128, blocks = (nseg + threads - 1) / threads;
     k_tail_gapatr<<<blocks, threads>>>(t, open, high, low, close, ss, sl, nseg,
                                        step, period, tr, out);
@@ -816,8 +817,8 @@ extern "C" int rc_tail_volrat(const long long *t, const double *high,
                               int step, int p1, int p2, double *out)
 {
     double *tr = NULL, *a1 = NULL;
-    if (cudaMalloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
-    if (cudaMalloc((void **)&a1, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&a1, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(tr);
         return -1;
     }
@@ -837,12 +838,12 @@ extern "C" int rc_tail_adx(const long long *t, const double *high,
                            int step, int period, int which, double *out)
 {
     double *tr = NULL, *pdi = NULL, *mdi = NULL;
-    if (cudaMalloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
-    if (cudaMalloc((void **)&pdi, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&tr, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+    if (rc_checked_malloc((void **)&pdi, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(tr);
         return -1;
     }
-    if (cudaMalloc((void **)&mdi, (size_t)n * sizeof(double)) != cudaSuccess) {
+    if (rc_checked_malloc((void **)&mdi, (size_t)n * sizeof(double)) != cudaSuccess) {
         cudaFree(tr);
         cudaFree(pdi);
         return -1;
@@ -1377,12 +1378,12 @@ extern "C" int rc_tail_exotic(const long long *t, const double *high,
         break;
     case 2: {
         double *pre = NULL, *hi = NULL, *lo = NULL;
-        if (cudaMalloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
-        if (cudaMalloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
+        if (rc_checked_malloc((void **)&pre, (size_t)n * sizeof(double)) != cudaSuccess) return -1;
+        if (rc_checked_malloc((void **)&hi, (size_t)n * sizeof(double)) != cudaSuccess) {
             cudaFree(pre);
             return -1;
         }
-        if (cudaMalloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
+        if (rc_checked_malloc((void **)&lo, (size_t)n * sizeof(double)) != cudaSuccess) {
             cudaFree(pre);
             cudaFree(hi);
             return -1;
