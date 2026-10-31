@@ -28,6 +28,8 @@
 
 #include <cub/cub.cuh>
 
+#include "win_stats.h"
+
 #define RC_MTF_LEAVES 11
 #define RC_MTF_RET1 0
 #define RC_MTF_RET4 1
@@ -93,6 +95,8 @@ typedef struct RcMtf {
     double *d_rs;
     double *d_rs2;
     double *d_rc;
+    double *d_rs3;
+    double *d_rs4;
     int *d_join_idx;
     double *d_age;
 
@@ -232,48 +236,51 @@ __device__ __forceinline__ bool rc_contig_local(const long long *t, int base,
            t[base + p] - (long long)(w - 1) * step;
 }
 
-__device__ __forceinline__ void rc_prefix_local(double *sum, double *sum2,
-                                                double *cnt, const double *x,
-                                                int start, int len, int pb)
+/* #364: window-statistic arena of one input. `ci` holds the finite count and
+   the accumulation distance of each slot as an int pair. */
+struct MtfArena {
+    double *s1;
+    double *c1;
+    double *s2;
+    double *c2;
+    int *ci;
+    const double *xp; /* x at slot q is xp[q] */
+    __device__ double s(int k, int q) const { return k == 0 ? s1[q] : s2[q]; }
+    __device__ double c(int k, int q) const { return k == 0 ? c1[q] : c2[q]; }
+    __device__ int bk(int q) const { return ci[2 * q + 1]; }
+    __device__ int cn(int q) const { return ci[2 * q]; }
+    __device__ double x(int q) const { return xp[q]; }
+};
+
+/* Sequential prefix over one segment in the CPU order (restart at the segment
+   start, every gap and every RW_BLOCK buckets). Slot `pb + 1 + p` is row `p`. */
+__device__ __forceinline__ void rc_prefix_local(const MtfArena &a, const double *x,
+                                                const long long *time, int start,
+                                                int len, int pb, int step, bool sq)
 {
-    sum[pb] = 0.0;
-    sum2[pb] = 0.0;
-    cnt[pb] = 0.0;
-    double s = 0.0, s2 = 0.0, c = 0.0;
-    for (int j = 0; j < len; ++j) {
-        double v = x[start + j];
-        if (isfinite(v)) {
-            s += v;
-            s2 += v * v;
-            c += 1.0;
+    a.s1[pb] = 0.0;
+    a.c1[pb] = 0.0;
+    a.s2[pb] = 0.0;
+    a.c2[pb] = 0.0;
+    a.ci[2 * pb] = 0;
+    a.ci[2 * pb + 1] = 0;
+    RwAcc acc;
+    rw_acc_init(&acc);
+    for (int p = 0; p < len; ++p) {
+        int i = start + p;
+        int q = pb + 1 + p;
+        bool restart = (p % RW_BLOCK) == 0 ||
+                       (p > 0 && time[i] - time[i - 1] != (long long)step);
+        rw_acc_push(&acc, x[i], q, restart, sq);
+        a.s1[q] = acc.s1;
+        a.c1[q] = acc.c1;
+        if (sq) {
+            a.s2[q] = acc.s2;
+            a.c2[q] = acc.c2;
         }
-        sum[pb + j + 1] = s;
-        sum2[pb + j + 1] = s2;
-        cnt[pb + j + 1] = c;
+        a.ci[2 * q] = acc.cnt;
+        a.ci[2 * q + 1] = q - acc.start;
     }
-}
-
-__device__ __forceinline__ double rc_mean_local(const double *sum,
-                                                const double *cnt, int pb,
-                                                int p, int w)
-{
-    int lo = pb + p + 1 - w;
-    int hi = pb + p + 1;
-    if (cnt[hi] - cnt[lo] < w) return NAN;
-    return (sum[hi] - sum[lo]) / (double)w;
-}
-
-__device__ __forceinline__ double rc_std_local(const double *sum,
-                                               const double *sum2,
-                                               const double *cnt, int pb,
-                                               int p, int w)
-{
-    int lo = pb + p + 1 - w;
-    int hi = pb + p + 1;
-    if (cnt[hi] - cnt[lo] < w) return NAN;
-    double m = (sum[hi] - sum[lo]) / (double)w;
-    double s2 = (sum2[hi] - sum2[lo]) / (double)w;
-    return sqrt(fmax(s2 - m * m, 0.0));
 }
 
 __device__ __forceinline__ double rc_rsi_norm(double gain, double loss)
@@ -297,7 +304,7 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
                              int nseg, int step, int max_buckets,
                              double *ps, double *ps2, double *pc,
                              double *rs, double *rs2, double *rc,
-                             double *leaf)
+                             double *rs3, double *rs4, double *leaf)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
@@ -472,14 +479,16 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
 
     /* Prefix sums for close (ma_ratio, trend_slope) and ret1 (vol). */
     int pb = bs + s;
-    rc_prefix_local(ps, ps2, pc, h_close, bs, len, pb);
-    rc_prefix_local(rs, rs2, rc, ret1, bs, len, pb);
+    MtfArena ca = {ps, ps2, ps2, ps2, (int *)pc, h_close + bs - pb - 1};
+    MtfArena ra = {rs, rs2, rs3, rs4, (int *)rc, ret1 + bs - pb - 1};
+    rc_prefix_local(ca, h_close, h_time, bs, len, pb, step, false);
+    rc_prefix_local(ra, ret1, h_time, bs, len, pb, step, true);
 
     for (int p = 0; p < len; ++p) {
         int i = bs + p;
         ma[i] = NAN;
         if (!rc_contig_local(h_time, bs, p, 20, step)) continue;
-        double m = rc_mean_local(ps, pc, pb, p, 20);
+        double m = rw_mean_strict(ca, pb + 1 + p, 20);
         if (isfinite(m) && m > 0.0) ma[i] = h_close[i] / m - 1.0;
     }
 
@@ -487,7 +496,7 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
         int i = bs + p;
         vol[i] = NAN;
         if (p < 20 || !rc_contig_local(h_time, bs, p, 20, step)) continue;
-        double sd = rc_std_local(rs, rs2, rc, pb, p, 20);
+        double sd = rw_std_pop(ra, pb + 1 + p, 20);
         if (isfinite(sd)) vol[i] = sd;
     }
 
@@ -495,8 +504,8 @@ __global__ void k_mtf_leaves(const long long *__restrict__ h_time,
         int i = bs + p;
         trend[i] = NAN;
         if (p < 39 || !rc_contig_local(h_time, bs, p, 40, step)) continue;
-        double now = rc_mean_local(ps, pc, pb, p, 20);
-        double prev = rc_mean_local(ps, pc, pb, p - 20, 20);
+        double now = rw_mean_strict(ca, pb + 1 + p, 20);
+        double prev = rw_mean_strict(ca, pb + 1 + p - 20, 20);
         if (isfinite(now) && isfinite(prev) && prev > 0.0) {
             trend[i] = now / prev - 1.0;
         }
@@ -610,6 +619,8 @@ RcMtf *rc_mtf_create(const long long *times, const double *open,
     ok &= rc_alloc((void **)&c->d_rs, pref * sizeof(double)) == 0;
     ok &= rc_alloc((void **)&c->d_rs2, pref * sizeof(double)) == 0;
     ok &= rc_alloc((void **)&c->d_rc, pref * sizeof(double)) == 0;
+    ok &= rc_alloc((void **)&c->d_rs3, pref * sizeof(double)) == 0;
+    ok &= rc_alloc((void **)&c->d_rs4, pref * sizeof(double)) == 0;
     ok &= rc_alloc((void **)&c->d_join_idx, rows * sizeof(int)) == 0;
     ok &= rc_alloc((void **)&c->d_age, rows * sizeof(double)) == 0;
     if (!ok) {
@@ -687,6 +698,8 @@ void rc_mtf_destroy(RcMtf *c)
     cudaFree(c->d_rs);
     cudaFree(c->d_rs2);
     cudaFree(c->d_rc);
+    cudaFree(c->d_rs3);
+    cudaFree(c->d_rs4);
     cudaFree(c->d_join_idx);
     cudaFree(c->d_age);
     free(c);
@@ -761,7 +774,7 @@ int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
         c->d_h_time, c->d_h_open, c->d_h_high, c->d_h_low, c->d_h_close,
         c->d_seg_bucket_start, c->d_seg_bucket_len, c->nseg, (int)tf_seconds,
         c->max_buckets, c->d_ps, c->d_ps2, c->d_pc, c->d_rs, c->d_rs2,
-        c->d_rc, c->d_leaf);
+        c->d_rc, c->d_rs3, c->d_rs4, c->d_leaf);
     k_join<<<sres, threads>>>(c->d_times, c->d_seg_start, c->d_seg_len,
                               c->d_seg_bucket_start, c->d_seg_bucket_len,
                               c->d_h_time, c->nseg, tf_seconds,

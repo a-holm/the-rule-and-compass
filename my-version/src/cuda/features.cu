@@ -40,6 +40,7 @@
 #include <time.h>
 
 #include "enrich_common.h"
+#include "win_stats.h"
 
 /* Flow output indices. Must match `features_gpu::FLOW_DEVICE_COLUMNS`. */
 enum {
@@ -362,86 +363,108 @@ __global__ void k_flow_state(RcEnrich *c, double *f)
  * avoiding the uncoalesced per-segment walk of a single thread. */
 #define RT_TILE 512
 #define RT_W 97
-#define RT_SLOTS (RT_W + RT_TILE + 1)
+#define RT_SLOTS (RT_W + RT_TILE)
 
+/* Slot `RT_W + j` holds tile row `j`; the first `RT_W` slots carry the last
+ * rows of the previous tile. The window statistics read the compensated
+ * running sums of `win_stats.h` through `RtView`. */
 typedef struct RtShared {
-    double p1[RT_SLOTS];
-    double p2[RT_SLOTS];
-    int pc[RT_SLOTS];
-    double xb[RT_TILE];
+    double s1[RT_SLOTS];
+    double c1[RT_SLOTS];
+    double s2[RT_SLOTS];
+    double c2[RT_SLOTS];
+    double xv[RT_SLOTS];
+    int cn[RT_SLOTS];
+    int bk[RT_SLOTS];
     double m1[RT_TILE];
-    double carry1[RT_W];
-    double carry2[RT_W];
-    int carryc[RT_W];
+    double k_s1[RT_W];
+    double k_c1[RT_W];
+    double k_s2[RT_W];
+    double k_c2[RT_W];
+    double k_xv[RT_W];
+    int k_cn[RT_W];
+    int k_bk[RT_W];
 } RtShared;
 
-__device__ __forceinline__ void rt_prefix_tile(RtShared *sh, int tlen,
-                                               double *s1, double *s2, int *sc)
+struct RtView {
+    const RtShared *sh;
+    __device__ double s(int k, int q) const { return k == 0 ? sh->s1[q] : sh->s2[q]; }
+    __device__ double c(int k, int q) const { return k == 0 ? sh->c1[q] : sh->c2[q]; }
+    __device__ int bk(int q) const { return sh->bk[q]; }
+    __device__ int cn(int q) const { return sh->cn[q]; }
+    __device__ double x(int q) const { return sh->xv[q]; }
+};
+
+/* Single-thread prefix of the staged tile in the CPU order: restart at the
+ * segment start, at gap rows and every RW_BLOCK segment-relative rows. */
+__device__ __forceinline__ void rt_prefix_tile(RtShared *sh, const RcEnrich *c,
+                                               int start, int base, int tlen,
+                                               RwAcc *acc, bool sq)
 {
     for (int k = 0; k < RT_W; ++k) {
-        sh->p1[k] = sh->carry1[k];
-        sh->p2[k] = sh->carry2[k];
-        sh->pc[k] = sh->carryc[k];
+        sh->s1[k] = sh->k_s1[k];
+        sh->c1[k] = sh->k_c1[k];
+        sh->s2[k] = sh->k_s2[k];
+        sh->c2[k] = sh->k_c2[k];
+        sh->xv[k] = sh->k_xv[k];
+        sh->cn[k] = sh->k_cn[k];
+        sh->bk[k] = sh->k_bk[k];
     }
-    sh->p1[RT_W] = *s1;
-    sh->p2[RT_W] = *s2;
-    sh->pc[RT_W] = *sc;
     for (int j = 0; j < tlen; ++j) {
-        double v = sh->xb[j];
-        if (isfinite(v)) {
-            *s1 += v;
-            *s2 += v * v;
-            *sc += 1;
-        }
-        sh->p1[RT_W + j + 1] = *s1;
-        sh->p2[RT_W + j + 1] = *s2;
-        sh->pc[RT_W + j + 1] = *sc;
+        int p = base + j;
+        int i = start + p;
+        bool restart = (p % RW_BLOCK) == 0 || (p > 0 && rc_gap(c, i));
+        rw_acc_push(acc, sh->xv[RT_W + j], p, restart, sq);
+        int q = RT_W + j;
+        sh->s1[q] = acc->s1;
+        sh->c1[q] = acc->c1;
+        sh->s2[q] = acc->s2;
+        sh->c2[q] = acc->c2;
+        sh->cn[q] = acc->cnt;
+        sh->bk[q] = p - acc->start;
     }
     for (int k = 0; k < RT_W; ++k) {
-        sh->carry1[k] = sh->p1[tlen + k];
-        sh->carry2[k] = sh->p2[tlen + k];
-        sh->carryc[k] = sh->pc[tlen + k];
+        sh->k_s1[k] = sh->s1[tlen + k];
+        sh->k_c1[k] = sh->c1[tlen + k];
+        sh->k_s2[k] = sh->s2[tlen + k];
+        sh->k_c2[k] = sh->c2[tlen + k];
+        sh->k_xv[k] = sh->xv[tlen + k];
+        sh->k_cn[k] = sh->cn[tlen + k];
+        sh->k_bk[k] = sh->bk[tlen + k];
     }
 }
 
 /* `rmean_py`: finite-count divisor, index `j` inside the staged tile. */
 __device__ __forceinline__ double rt_mean(const RtShared *sh, int j, int w)
 {
-    int lo = RT_W + j + 1 - w;
-    int hi = RT_W + j + 1;
-    double n = sh->pc[hi] - sh->pc[lo];
-    if (!(n > 0.0)) return NAN;
-    return (sh->p1[hi] - sh->p1[lo]) / n;
+    RtView v = {sh};
+    return rw_mean_finite(v, RT_W + j, w);
 }
 
 /* `rstd_py`: full finite window, population formula. */
 __device__ __forceinline__ double rt_std(const RtShared *sh, int j, int w)
 {
-    int lo = RT_W + j + 1 - w;
-    int hi = RT_W + j + 1;
-    if (sh->pc[hi] - sh->pc[lo] < w) return NAN;
-    double m = (sh->p1[hi] - sh->p1[lo]) / (double)w;
-    double s2 = (sh->p2[hi] - sh->p2[lo]) / (double)w;
-    double var = s2 - m * m;
-    if (var < 0.0) var = 0.0;
-    return sqrt(var);
+    RtView v = {sh};
+    return rw_std_pop(v, RT_W + j, w);
 }
 
 /* `rmean_strict`: every cell of the window must be finite. */
 __device__ __forceinline__ double rt_strict(const RtShared *sh, int j, int w)
 {
-    int lo = RT_W + j + 1 - w;
-    int hi = RT_W + j + 1;
-    if (sh->pc[hi] - sh->pc[lo] != w) return NAN;
-    return (sh->p1[hi] - sh->p1[lo]) / (double)w;
+    RtView v = {sh};
+    return rw_mean_strict(v, RT_W + j, w);
 }
 
 __device__ __forceinline__ void rt_zero_carry(RtShared *sh)
 {
     for (int k = 0; k < RT_W; ++k) {
-        sh->carry1[k] = 0.0;
-        sh->carry2[k] = 0.0;
-        sh->carryc[k] = 0;
+        sh->k_s1[k] = 0.0;
+        sh->k_c1[k] = 0.0;
+        sh->k_s2[k] = 0.0;
+        sh->k_c2[k] = 0.0;
+        sh->k_xv[k] = 0.0;
+        sh->k_cn[k] = 0;
+        sh->k_bk[k] = 0;
     }
 }
 
@@ -498,8 +521,8 @@ __global__ void k_flow_roll_single(const RcEnrich *c, const double *f,
               : (which == RC_FLOW_CVD_PROXY ? cvd : NULL)));
     const int w = 96;
     int tid = threadIdx.x;
-    double s1 = 0.0, s2 = 0.0;
-    int sc = 0;
+    RwAcc acc;
+    rw_acc_init(&acc);
     if (tid == 0) rt_zero_carry(&sh);
     __syncthreads();
     for (int base = 0; base < len; base += RT_TILE) {
@@ -518,10 +541,10 @@ __global__ void k_flow_roll_single(const RcEnrich *c, const double *f,
             } else {
                 v = src[i];
             }
-            sh.xb[j] = v;
+            sh.xv[RT_W + j] = v;
         }
         __syncthreads();
-        if (tid == 0) rt_prefix_tile(&sh, tlen, &s1, &s2, &sc);
+        if (tid == 0) rt_prefix_tile(&sh, c, start, base, tlen, &acc, which == RC_FLOW_OBV_Z96 || which == RC_FLOW_CVD_PROXY);
         __syncthreads();
         for (int j = tid; j < tlen; j += blockDim.x) {
             int p = base + j;
@@ -566,15 +589,15 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
     int tid = threadIdx.x;
 
     /* Pass A: mean of x1 into the scratch plane. */
-    double s1 = 0.0, s2 = 0.0;
-    int sc = 0;
+    RwAcc acc;
+    rw_acc_init(&acc);
     if (tid == 0) rt_zero_carry(&sh);
     __syncthreads();
     for (int base = 0; base < len; base += RT_TILE) {
         int tlen = rt_tile_len(len, base);
-        for (int j = tid; j < tlen; j += blockDim.x) sh.xb[j] = x1[start + base + j];
+        for (int j = tid; j < tlen; j += blockDim.x) sh.xv[RT_W + j] = x1[start + base + j];
         __syncthreads();
-        if (tid == 0) rt_prefix_tile(&sh, tlen, &s1, &s2, &sc);
+        if (tid == 0) rt_prefix_tile(&sh, c, start, base, tlen, &acc, false);
         __syncthreads();
         for (int j = tid; j < tlen; j += blockDim.x) {
             int p = base + j;
@@ -587,16 +610,14 @@ __global__ void k_flow_roll_two(const RcEnrich *c, const double *f, int which,
     }
 
     /* Pass B: mean of x2 and the consumer expression. */
-    s1 = 0.0;
-    s2 = 0.0;
-    sc = 0;
+    rw_acc_init(&acc);
     if (tid == 0) rt_zero_carry(&sh);
     __syncthreads();
     for (int base = 0; base < len; base += RT_TILE) {
         int tlen = rt_tile_len(len, base);
-        for (int j = tid; j < tlen; j += blockDim.x) sh.xb[j] = x2[start + base + j];
+        for (int j = tid; j < tlen; j += blockDim.x) sh.xv[RT_W + j] = x2[start + base + j];
         __syncthreads();
-        if (tid == 0) rt_prefix_tile(&sh, tlen, &s1, &s2, &sc);
+        if (tid == 0) rt_prefix_tile(&sh, c, start, base, tlen, &acc, false);
         __syncthreads();
         for (int j = tid; j < tlen; j += blockDim.x) {
             int p = base + j;
@@ -721,20 +742,20 @@ __global__ void k_price_roll(const RcEnrich *c, const double *f, int which, doub
     const double *valid = f + (size_t)RC_PB_VALID * n;
     int w = which == RC_PA_TREND96 ? 96 : 16;
     int tid = threadIdx.x;
-    double s1 = 0.0, s2 = 0.0;
-    int sc = 0;
+    RwAcc acc;
+    rw_acc_init(&acc);
     if (tid == 0) rt_zero_carry(&sh);
     __syncthreads();
     for (int base = 0; base < len; base += RT_TILE) {
         int tlen = rt_tile_len(len, base);
         for (int j = tid; j < tlen; j += blockDim.x) {
             int i = start + base + j;
-            sh.xb[j] = which == RC_PA_CLV16 ? clv[i]
+            sh.xv[RT_W + j] = which == RC_PA_CLV16 ? clv[i]
                      : (which == RC_PA_BODY16 ? body[i]
                         : (valid[i] != 0.0 ? c->d_close[i] : NAN));
         }
         __syncthreads();
-        if (tid == 0) rt_prefix_tile(&sh, tlen, &s1, &s2, &sc);
+        if (tid == 0) rt_prefix_tile(&sh, c, start, base, tlen, &acc, false);
         __syncthreads();
         for (int j = tid; j < tlen; j += blockDim.x) {
             int p = base + j;

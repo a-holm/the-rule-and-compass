@@ -702,7 +702,7 @@ fn batch_output_matches_per_column_downloads() {
     // Reference: the existing one-column-at-a-time entry points.
     let want = vec![
         ("r5", gpu.ret(5).unwrap()),
-        ("ma20", gpu.ma(20).unwrap()),
+        ("ma20", gpu.ma(20, rcsr::window_stats::MEAN_STRICT).unwrap()),
         ("vol20", gpu.vol(20).unwrap()),
         ("range1", gpu.range().unwrap()),
         ("clv1", gpu.clv().unwrap()),
@@ -720,7 +720,7 @@ fn batch_output_matches_per_column_downloads() {
     use rcsr::enrich_gpu::BatchOp;
     let ops: Vec<BatchOp> = vec![
         BatchOp::ret(5),
-        BatchOp::ma(20),
+        BatchOp::ma(20, rcsr::window_stats::MEAN_STRICT),
         BatchOp::vol(20),
         BatchOp::range(),
         BatchOp::clv(),

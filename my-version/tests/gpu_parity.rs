@@ -76,8 +76,8 @@ fn tier_violations(cols: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (name, tier) in cols {
         *seen.entry(name.as_str()).or_default() += 1;
-        if tier != "bitwise" && tier != "1e-12" && tier != "1e-6" {
-            out.push(format!("{name}: tier '{tier}' is not bitwise, 1e-12 or 1e-6"));
+        if tier != "bitwise" && tier != "1e-12" {
+            out.push(format!("{name}: tier '{tier}' is not bitwise or 1e-12"));
         }
     }
     for (name, n) in seen {
@@ -182,13 +182,6 @@ fn verdict(tier: &str, o: &Obs, cpu_sha: &str, gpu_sha: &str) -> Result<(), Stri
         "1e-12" => {
             if o.max_rel > TOL {
                 Err(format!("max relative diff {:.3e} exceeds 1e-12 (max abs {:.3e}), first {:?}", o.max_rel, o.max_abs, o.first_bad))
-            } else {
-                Ok(())
-            }
-        }
-        "1e-6" => {
-            if o.max_rel > 1e-6 {
-                Err(format!("max relative diff {:.3e} exceeds 1e-6 (max abs {:.3e})", o.max_rel, o.max_abs))
             } else {
                 Ok(())
             }
@@ -464,11 +457,12 @@ fn an_undeclared_or_duplicate_column_fails_the_tier_table() {
     let ok = vec![
         ("a".to_string(), "bitwise".to_string()),
         ("b".to_string(), "1e-12".to_string()),
-        ("c".to_string(), "1e-6".to_string()),
     ];
     assert!(tier_violations(&ok).is_empty());
     let unknown = vec![("a".to_string(), "1e-9".to_string())];
     assert_eq!(tier_violations(&unknown).len(), 1);
+    let removed = vec![("a".to_string(), "1e-6".to_string())];
+    assert_eq!(tier_violations(&removed).len(), 1, "the 1e-6 tier no longer exists");
     let none = vec![("a".to_string(), "reference".to_string())];
     assert_eq!(tier_violations(&none).len(), 1);
     let empty = vec![("a".to_string(), String::new())];
@@ -494,17 +488,11 @@ fn the_verdict_enforces_each_tier() {
     assert!(verdict("bitwise", &o, &c, &g).is_err(), "a declared bitwise column that differs must fail");
     assert!(verdict("1e-12", &o, &c, &g).is_ok());
 
-    // 1e-9: fails 1e-12, passes 1e-6.
+    // 1e-9 fails 1e-12, and no looser tier exists.
     let mut far = a.clone();
     far[3] += 4.0e-9;
     let (o, c, g) = observe(&a, &far);
     assert!(verdict("1e-12", &o, &c, &g).is_err());
-    assert!(verdict("1e-6", &o, &c, &g).is_ok());
-
-    // 1e-5: fails 1e-6.
-    let mut wide = a.clone();
-    wide[3] += 4.0e-5;
-    let (o, c, g) = observe(&a, &wide);
     assert!(verdict("1e-6", &o, &c, &g).is_err());
 
     // One NaN mask mismatch fails every tier.
@@ -512,7 +500,6 @@ fn the_verdict_enforces_each_tier() {
     mask[2] = 0.0;
     let (o, c, g) = observe(&a, &mask);
     assert!(verdict("1e-12", &o, &c, &g).is_err());
-    assert!(verdict("1e-6", &o, &c, &g).is_err());
     assert!(verdict("bitwise", &o, &c, &g).is_err());
 
     // NaN vs Inf is a mask mismatch.
@@ -684,18 +671,20 @@ fn ma672_matches_cpu_nan_mask_and_bits() {
 }
 
 #[test]
-fn ou_hl96_meets_its_1e6_tier() {
+fn no_device_column_declares_the_removed_1e6_tier() {
+    let cols: Vec<String> = device_columns().into_iter().filter(|c| c.tier == "1e-6").map(|c| c.name).collect();
+    assert!(cols.is_empty(), "columns on the removed 1e-6 tier: {cols:?}");
+}
+
+#[test]
+fn ou_hl96_meets_its_1e12_tier() {
+    let c = device_columns().into_iter().find(|c| c.name == "ou_hl96").expect("registered column");
+    assert_eq!(c.tier, "1e-12");
     assert_known_bug_column("ou_hl96");
 }
 
 #[test]
-fn ou_hl96_is_the_only_1e6_column() {
-    let cols: Vec<String> = device_columns().into_iter().filter(|c| c.tier == "1e-6").map(|c| c.name).collect();
-    assert_eq!(cols, vec!["ou_hl96".to_string()]);
-}
-
-#[test]
-fn ou_hl96_amplifies_last_bit_close_noise_beyond_1e12() {
+fn ou_hl96_response_to_last_bit_close_noise_is_bounded() {
     let dir = work_dir("ou-noise");
     let rows = fixture(6, 3_000);
     let mut noisy = rows.clone();
@@ -714,8 +703,7 @@ fn ou_hl96_amplifies_last_bit_close_noise_beyond_1e12() {
     };
     let (o, _, _) = observe(&run("base", &rows), &run("noisy", &noisy));
     eprintln!("[parity] ou_hl96 CPU response to 1-ulp close noise: max rel {:.3e}", o.max_rel);
-    assert!(o.max_rel > TOL, "1-ulp noise moved ou_hl96 by only {:.3e}", o.max_rel);
-    assert!(o.max_rel < 1e-6, "1-ulp noise moved ou_hl96 by {:.3e}", o.max_rel);
+    assert!(o.max_rel < 1e-9, "1-ulp noise moved ou_hl96 by {:.3e}", o.max_rel);
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1253,4 +1241,124 @@ fn large_store_parity_at_the_declared_tiers() {
         }
         other => panic!("unknown RCSR_PARITY_ARM '{other}'"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// cusum_abs_z after a gap: the window sum covers the window's own rows only
+// ---------------------------------------------------------------------------
+
+const CUSUM_ROWS: usize = 700;
+const CUSUM_GAP_ROW: usize = 300;
+
+/// One symbol, `CUSUM_ROWS` bars, five bars missing so that row `CUSUM_GAP_ROW`
+/// is the first row after the hole.
+fn cusum_gap_rows() -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut close = 100.0;
+    for i in 0..CUSUM_ROWS + 5 {
+        if (CUSUM_GAP_ROW..CUSUM_GAP_ROW + 5).contains(&i) {
+            continue;
+        }
+        let ret = ((mix(11, i as u64) % 2001) as f64 - 1000.0) / 1.0e5;
+        let open = close;
+        close *= 1.0 + ret;
+        rows.push(Row {
+            t: T0 + i as i64 * STEP,
+            sym: 2,
+            o: open,
+            h: open.max(close) + 0.1,
+            l: open.min(close) - 0.1,
+            c: close,
+            v: 10.0 + (i % 97) as f64,
+            qv: 1.0,
+            trades: 1.0,
+            tb: 1.0,
+            tq: 1.0,
+            member: T0 + i as i64 * STEP,
+        });
+    }
+    rows
+}
+
+/// `|sum of the window's z| / sqrt(96)` from the rows alone: z is the log
+/// return standardised by the mean and population deviation of its own 96-bar
+/// window, and a window sums the z of its rows only.
+fn cusum_direct(rows: &[Row]) -> Vec<f64> {
+    let n = rows.len();
+    let contig = |i: usize, w: usize| i + 1 >= w && rows[i + 1 - w].t == rows[i].t - (w as i64 - 1) * STEP;
+    let mut lr = vec![f64::NAN; n];
+    for i in 1..n {
+        if rows[i].t - rows[i - 1].t == STEP && rows[i].c > 0.0 && rows[i - 1].c > 0.0 {
+            lr[i] = (rows[i].c / rows[i - 1].c).ln();
+        }
+    }
+    let mut z = vec![f64::NAN; n];
+    for i in 95..n {
+        let win = &lr[i - 95..=i];
+        if !contig(i, 96) || !lr[i].is_finite() || win.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        let m = win.iter().sum::<f64>() / 96.0;
+        let sd = (win.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / 96.0).sqrt();
+        if sd > 0.0 {
+            z[i] = (lr[i] - m) / sd;
+        }
+    }
+    let mut out = vec![f64::NAN; n];
+    for i in 96..n {
+        if contig(i, 96) {
+            let s: f64 = z[i - 95..=i].iter().filter(|v| v.is_finite()).sum();
+            out[i] = s.abs() / 96f64.sqrt();
+        }
+    }
+    out
+}
+
+fn cusum_build(dir: &std::path::Path, tag: &str, gpu: GpuMode) -> Vec<f64> {
+    let rows = cusum_gap_rows();
+    let src = p(dir, &format!("{tag}-in.rcsb"));
+    let out = p(dir, &format!("{tag}-out.rcsb"));
+    write_fixture(&src, &rows, 4_096);
+    let names = vec!["cusum_abs_z".to_string()];
+    enrich::build(&options(&src, &out, &names, gpu, 4_096)).unwrap();
+    read_column(&out, "cusum_abs_z")
+}
+
+fn assert_cusum_matches_direct(label: &str, got: &[f64]) {
+    let want = cusum_direct(&cusum_gap_rows());
+    assert_eq!(got.len(), want.len());
+    assert!(want[CUSUM_GAP_ROW + 94].is_nan());
+    assert!(want[CUSUM_GAP_ROW + 95].is_finite());
+    assert!(want[CUSUM_GAP_ROW - 1].abs() > 0.0, "the run before the gap must carry a nonzero sum");
+    for i in 0..got.len() {
+        assert_eq!(got[i].is_nan(), want[i].is_nan(), "{label}: NaN mask at row {i}: got {} want {}", got[i], want[i]);
+        if want[i].is_finite() {
+            assert!((got[i] - want[i]).abs() <= 1e-9, "{label}: row {i}: got {} want {}", got[i], want[i]);
+        }
+    }
+}
+
+#[test]
+fn cusum_abs_z_one_gap_window_uses_only_its_own_rows_on_the_cpu() {
+    let dir = work_dir("cusum-cpu");
+    let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
+    assert_cusum_matches_direct("cpu", &cpu);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cusum_abs_z_one_gap_window_matches_the_cpu_on_the_device() {
+    if !have_device() {
+        return;
+    }
+    let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    enrich::set_gpu_floor_for_tests(0);
+    let dir = work_dir("cusum-gpu");
+    let c = device_columns().into_iter().find(|c| c.name == "cusum_abs_z").expect("device column");
+    let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
+    let gpu = cusum_build(&dir, "gpu", GpuMode::On);
+    assert_cusum_matches_direct("gpu", &gpu);
+    let (o, cs, gs) = observe(&cpu, &gpu);
+    verdict(c.tier, &o, &cs, &gs).unwrap_or_else(|e| panic!("cusum_abs_z [{}] {}: {e}", c.family, c.tier));
+    std::fs::remove_dir_all(&dir).ok();
 }
