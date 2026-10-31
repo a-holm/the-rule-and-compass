@@ -358,6 +358,8 @@ pub struct FitGen {
     pub refits: usize,
     /// CPU fallback counts labelled by cause.
     pub fallback_by_cause: Vec<(String, usize)>,
+    /// #265: fallbacks whose CPU refit lowered the exact error, by cause.
+    pub fallback_improved_by_cause: Vec<(String, usize)>,
     /// #256: wall seconds of the whole fit stage in this generation (device
     /// call, CPU fallback, write-back). Booked as `phases.fit`, not `eval`.
     pub host_seconds: f64,
@@ -375,14 +377,22 @@ impl FitGen {
             .iter()
             .map(|(k, v)| format!("{}:{}", text(k), v))
             .collect();
+        let improved: Vec<String> = self
+            .fallback_improved_by_cause
+            .iter()
+            .map(|(k, v)| format!("{}:{}", text(k), v))
+            .collect();
+        let improved_total: usize = self.fallback_improved_by_cause.iter().map(|(_, v)| *v).sum();
         format!(
-            "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\
+            "{{\"attempts\":{},\"gpu\":{},\"fallback\":{},\"refits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\
              \"host_seconds\":{},\"fallback_seconds\":{},\"fallback_workers\":{}}}",
             self.attempts,
             self.gpu,
             self.fallback,
             self.refits,
             causes.join(","),
+            improved_total,
+            improved.join(","),
             num(self.host_seconds),
             num(self.fallback_seconds),
             self.fallback_workers
@@ -1130,6 +1140,7 @@ mod tests {
                 fallback: 2,
                 refits: 1,
                 fallback_by_cause: vec![("ill_conditioned".to_string(), 2)],
+                fallback_improved_by_cause: vec![("ill_conditioned".to_string(), 1)],
                 host_seconds: 0.05,
                 fallback_seconds: 0.03,
                 fallback_workers: 4,
@@ -1175,6 +1186,13 @@ mod tests {
         let causes = fit.get("fallback_by_cause").and_then(|v| v.as_obj()).unwrap();
         assert_eq!(causes[0].0, "ill_conditioned");
         assert_eq!(causes[0].1.as_usize(), Some(2));
+        assert_eq!(fit.get("fallback_improved").and_then(|v| v.as_usize()), Some(1));
+        let improved = fit
+            .get("fallback_improved_by_cause")
+            .and_then(|v| v.as_obj())
+            .unwrap();
+        assert_eq!(improved[0].0, "ill_conditioned");
+        assert_eq!(improved[0].1.as_usize(), Some(1));
         assert_eq!(fit.get("host_seconds").and_then(|v| v.as_f64()), Some(0.05));
         assert_eq!(fit.get("fallback_seconds").and_then(|v| v.as_f64()), Some(0.03));
         assert_eq!(fit.get("fallback_workers").and_then(|v| v.as_usize()), Some(4));

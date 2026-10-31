@@ -697,3 +697,118 @@ fn the_planner_names_every_reason_for_the_cpu() {
         Err("no_device: no CUDA device found".to_string())
     );
 }
+
+// #302: the device PIT join in `panel build`.
+
+/// The `market` archives with a richer membership history: re-entry after an
+/// exclusion, a decision exactly on a bar time, a second decision at one
+/// instant, and a symbol with no decision at all.
+fn pit_market(dir: &Path) -> (PathBuf, PathBuf) {
+    let (raw, _) = market(dir, 24 * 40);
+    put_zip(&raw, "NODECUSDT", "2021-01", &hours(4.0, 0, 120, &[], Unit::Ms));
+    let m = dir.join("membership-pit.csv");
+    membership(
+        &m,
+        &[
+            (0, "AAAUSDT", 1),
+            (0, "BBBUSDT", 1),
+            (0, "CCCUSDT", 1),
+            (0, "DDDUSDT", 1),
+            (0, "EEEUSDT", 1),
+            (0, "DELUSDT", 1),
+            (0, "LUNAUSDT", 1),
+            (0, "NEWUSDT", 0),
+            (250, "NEWUSDT", 1),
+            (300, "DELUSDT", 0),
+            (330, "DELUSDT", 1),
+            (120, "CCCUSDT", 0),
+            (121, "CCCUSDT", 1),
+            (200, "DDDUSDT", 0),
+            (200, "DDDUSDT", 1),
+            (340, "EEEUSDT", 0),
+        ],
+    );
+    (raw, m)
+}
+
+fn manifest_backend(panel: &Path) -> String {
+    let text = std::fs::read_to_string(format!("{}.manifest.json", panel.display())).unwrap();
+    let at = text.find("\"backend\":").expect("no backend block");
+    text[at..].lines().next().unwrap().to_string()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn the_device_pit_panel_is_byte_identical_to_the_cpu_cold_and_warm() {
+    use panel_v2::GpuMode;
+    let dir = scratch("dev-panel");
+    let (raw, m) = pit_market(&dir);
+    let sha = |p: &Path| manifest::sha256_file(p).unwrap();
+    let cache = dir.join("cache");
+    let mut cold_base = base_opts(&raw, &dir.join("base-cold.rcsb"));
+    cold_base.resume = Some(cache.to_str().unwrap().to_string());
+    panel_v2::build_base(&cold_base).unwrap();
+    let mut warm_base = base_opts(&raw, &dir.join("base-warm.rcsb"));
+    warm_base.resume = cold_base.resume.clone();
+    let w = panel_v2::build_base(&warm_base).unwrap();
+    assert_eq!(w.reused, w.symbols);
+    assert_eq!(sha(&dir.join("base-cold.rcsb")), sha(&dir.join("base-warm.rcsb")));
+
+    let mut off = panel_opts(&dir.join("base-cold.rcsb"), &m, &dir.join("panel-off.rcsb"));
+    off.relists = panel_v2::parse_relists("LUNAUSDT@2021-01-12").unwrap();
+    off.gpu = GpuMode::Off;
+    let want = panel_v2::build_panel(&off).unwrap();
+    assert_eq!(want.route.requested, "off");
+    assert_eq!(want.route.passes, 0);
+    assert!(want.rows > 0 && want.delisted > 0 && want.listings > want.symbols);
+
+    for (tag, base) in [("cold", "base-cold.rcsb"), ("warm", "base-warm.rcsb")] {
+        let mut on = panel_opts(&dir.join(base), &m, &dir.join(format!("panel-on-{tag}.rcsb")));
+        on.relists = off.relists.clone();
+        on.gpu = GpuMode::On;
+        let got = panel_v2::build_panel(&on).unwrap();
+        assert_eq!(got.route.requested, "on");
+        assert_eq!(got.route.passes, 1, "{tag}: one device join");
+        assert!(got.route.symbols_device >= got.symbols, "{tag}: every symbol is joined on the device");
+        assert_eq!(got.route.symbols_cpu, 0, "{tag}");
+        assert!(got.route.fallbacks.is_empty(), "{tag}: {:?}", got.route.fallbacks);
+        assert!(got.route.h2d_bytes > 0 && got.route.d2h_bytes > 0, "{tag}: bytes moved");
+        assert_eq!(
+            (got.rows, got.symbols, got.delisted, got.gaps, got.listings),
+            (want.rows, want.symbols, want.delisted, want.gaps, want.listings),
+            "{tag}: summary"
+        );
+        assert_eq!(sha(&dir.join("panel-off.rcsb")), sha(&dir.join(format!("panel-on-{tag}.rcsb"))), "{tag}: store bytes");
+        let b = manifest_backend(&dir.join(format!("panel-on-{tag}.rcsb")));
+        assert!(b.starts_with("\"backend\":{\"requested\":\"on\""), "{b}");
+        assert!(b.contains("\"fallbacks\":[]"), "{b}");
+    }
+    let off_manifest = std::fs::read_to_string(dir.join("panel-off.rcsb.manifest.json")).unwrap();
+    assert!(!off_manifest.contains("\"backend\""), "--gpu off keeps today's manifest");
+}
+
+#[test]
+fn a_cpu_pit_join_under_auto_is_labelled_in_the_panel_manifest() {
+    use panel_v2::GpuMode;
+    let dir = scratch("dev-panel-label");
+    let (raw, m) = pit_market(&dir);
+    panel_v2::build_base(&base_opts(&raw, &dir.join("base.rcsb"))).unwrap();
+    let mut o = panel_opts(&dir.join("base.rcsb"), &m, &dir.join("auto.rcsb"));
+    o.relists = panel_v2::parse_relists("LUNAUSDT@2021-01-12").unwrap();
+    o.gpu = GpuMode::Auto;
+    let s = panel_v2::build_panel(&o).unwrap();
+    assert_eq!(s.route.symbols_device, 0, "a small panel stays on the CPU under auto");
+    assert_eq!(s.route.passes, 0);
+    let why = &s.route.fallbacks[0].0;
+    assert!(why.starts_with("too_few_rows") || why.starts_with("no_device"), "{why}");
+    let b = manifest_backend(&dir.join("auto.rcsb"));
+    assert!(b.starts_with("\"backend\":{\"requested\":\"auto\""), "{b}");
+    assert!(b.contains(&format!("\"reason\":\"{why}\"")), "{b}");
+    o.out = dir.join("off.rcsb").to_str().unwrap().to_string();
+    o.gpu = GpuMode::Off;
+    panel_v2::build_panel(&o).unwrap();
+    assert_eq!(
+        manifest::sha256_file(&dir.join("off.rcsb")).unwrap(),
+        manifest::sha256_file(&dir.join("auto.rcsb")).unwrap()
+    );
+}

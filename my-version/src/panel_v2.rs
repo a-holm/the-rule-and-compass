@@ -21,6 +21,7 @@ pub use crate::enrich::GpuMode;
 use crate::lockbox::{Guard, Lockbox};
 use crate::ohlcv::{self, Bar};
 use crate::panel::{self, Membership, Panel, PanelRow};
+use crate::panel_pit;
 use crate::panel_prep::{self, PrepBar, PrepSegment};
 use crate::{manifest, prep, store, zip};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1435,6 +1436,7 @@ pub struct PanelOptions {
     /// Share of the cross-section missing at one hour that makes it a venue outage.
     pub outage_share: f64,
     pub outage_min_symbols: usize,
+    pub gpu: GpuMode,
 }
 
 impl PanelOptions {
@@ -1451,6 +1453,7 @@ impl PanelOptions {
             jump_factor: 5.0,
             outage_share: 0.5,
             outage_min_symbols: 3,
+            gpu: GpuMode::Auto,
         }
     }
 }
@@ -1573,6 +1576,70 @@ struct Assembled {
     jumps: Vec<Jump>,
     listings: BTreeMap<String, u32>,
     declared_breaks: usize,
+    route: DeviceRoute,
+}
+
+/// The as-of join of every base bar against the membership decisions in force,
+/// from the device or the CPU reference. `Err` is the labelled reason the
+/// device was not used.
+fn pit_join(
+    block: &panel_pit::PitBlock,
+    mode: GpuMode,
+    route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    let params = panel_pit::PitParams::membership(OUT_STEP);
+    let rows = block.times.len();
+    let probe = if mode == GpuMode::Off { None } else { Some(crate::backend::probe()) };
+    let planned = match &probe {
+        Some(p) => plan_device(mode, rows, p),
+        None => Err("gpu_off".to_string()),
+    };
+    let symbols = block.segments.len();
+    let device = planned.and_then(|()| device_pit(block, params, route));
+    match device {
+        Ok(out) => {
+            route.symbols_device += symbols;
+            route.rows_device += rows;
+            route.device = probe.and_then(|p| p.device);
+            Ok(out)
+        }
+        Err(reason) => {
+            if mode != GpuMode::Off {
+                route.fall_back(reason, symbols);
+            }
+            route.symbols_cpu += symbols;
+            route.rows_cpu += rows;
+            panel_pit::join(block, params)
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn device_pit(
+    block: &panel_pit::PitBlock,
+    params: panel_pit::PitParams,
+    route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    if block.times.len() > i32::MAX as usize {
+        return Err(format!("too_many_rows: {}", block.times.len()));
+    }
+    let (out, stats) = crate::panel_pit_gpu::join(block, params)
+        .ok_or_else(|| "launch: the device PIT join failed".to_string())?;
+    route.passes += 1;
+    route.h2d_bytes += stats.h2d_bytes;
+    route.d2h_bytes += stats.d2h_bytes;
+    route.kernel_s += stats.kernel_s;
+    route.wall_s += stats.wall_s;
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_pit(
+    _block: &panel_pit::PitBlock,
+    _params: panel_pit::PitParams,
+    _route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    Err("no_device: built without --features cuda".to_string())
 }
 
 fn assemble(
@@ -1580,13 +1647,17 @@ fn assemble(
     membership: &Membership,
     opts: &PanelOptions,
     cutoff: Option<i64>,
-) -> Assembled {
-    let index = panel::membership_index(membership);
-    let mut rows: Vec<V2Row> = Vec::new();
-    let mut jumps = Vec::new();
+    mode: GpuMode,
+) -> Result<Assembled, String> {
+    struct Part<'a> {
+        symbol: &'a str,
+        bars: &'a [Bar],
+        aux: &'a [Aux],
+        ord: Vec<u32>,
+    }
+    let mut parts: Vec<Part> = Vec::new();
     let mut last = BTreeMap::new();
     let mut listings = BTreeMap::new();
-    let mut next_listing = 0u32;
     let mut declared_breaks = 0usize;
     for (symbol, (bars_all, aux_all)) in series_in {
         let keep = match cutoff {
@@ -1609,24 +1680,47 @@ fn assemble(
         declared_breaks += count as usize - 1;
         listings.insert(symbol.clone(), count);
         last.insert(symbol.clone(), *times.last().unwrap());
-        let decisions = index.get(symbol.as_str()).map(|v| v.as_slice());
-        let part = panel::symbol_panel_rows(symbol, bars, decisions, OUT_STEP);
+        parts.push(Part { symbol, bars, aux: &aux_all[..keep], ord });
+    }
+    let block = panel_pit::PitBlock::from_membership_slices(
+        parts.iter().map(|p| (p.symbol, p.bars)),
+        membership,
+    );
+    let mut route = DeviceRoute::new(mode);
+    let joined = if parts.is_empty() {
+        panel_pit::PitOutput::default()
+    } else {
+        pit_join(&block, mode, &mut route)?
+    };
+    let mut rows: Vec<V2Row> = Vec::new();
+    let mut jumps = Vec::new();
+    let mut next_listing = 0u32;
+    for (seg, p) in block.segments.iter().zip(&parts) {
+        let (lo, hi) = (seg.start, seg.start + seg.len);
+        let from = joined.kept_rows.partition_point(|r| *r < lo);
+        let to = joined.kept_rows.partition_point(|r| *r < hi);
         let mut prev: Option<(usize, f64)> = None;
-        for pr in part {
-            let k = times.partition_point(|t| *t < pr.bar.time);
-            let a = aux_all[k];
+        for &r in &joined.kept_rows[from..to] {
+            let k = (r - lo) as usize;
+            let bar = p.bars[k];
+            let a = p.aux[k];
             if let Some((pk, pclose)) = prev {
-                if pk + 1 == k && ord[pk] == ord[k] && pclose > 0.0 && pr.bar.open > 0.0 {
-                    let ratio = pr.bar.open / pclose;
+                if pk + 1 == k && p.ord[pk] == p.ord[k] && pclose > 0.0 && bar.open > 0.0 {
+                    let ratio = bar.open / pclose;
                     if ratio > opts.jump_factor || ratio < 1.0 / opts.jump_factor {
-                        jumps.push(Jump { symbol: symbol.clone(), at: pr.bar.time, ratio });
+                        jumps.push(Jump { symbol: p.symbol.to_string(), at: bar.time, ratio });
                     }
                 }
             }
-            prev = Some((k, pr.bar.close));
+            prev = Some((k, bar.close));
             rows.push(V2Row {
-                row: pr,
-                listing_id: next_listing + ord[k],
+                row: PanelRow {
+                    symbol: p.symbol.to_string(),
+                    bar,
+                    as_of: joined.as_of[r as usize],
+                    gap_buckets: joined.gap[r as usize] as usize,
+                },
+                listing_id: next_listing + p.ord[k],
                 cov15m: a.cov15m,
                 flags: a.flags,
                 dup_rows: a.dup_rows,
@@ -1634,10 +1728,10 @@ fn assemble(
                 traded: a.traded,
             });
         }
-        next_listing += count;
+        next_listing += listings[p.symbol];
     }
     rows.sort_by(|a, b| a.row.bar.time.cmp(&b.row.bar.time).then_with(|| a.row.symbol.cmp(&b.row.symbol)));
-    Assembled { rows, last, jumps, listings, declared_breaks }
+    Ok(Assembled { rows, last, jumps, listings, declared_breaks, route })
 }
 
 fn v2_table(rows: &[V2Row]) -> Table {
@@ -1782,6 +1876,7 @@ pub struct PanelSummary {
     pub gaps: usize,
     pub listings: usize,
     pub manifest: String,
+    pub route: DeviceRoute,
 }
 
 /// P4/P5: assemble the time-major panel and write the store and manifest.
@@ -1791,7 +1886,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let guard = Guard::new(opts.allow_lockbox, None);
     let all_times: Vec<i64> = series.values().flat_map(|(b, _)| b.iter().map(|x| x.time)).collect();
     guard.check_times("panel build", &all_times)?;
-    let asm = assemble(&series, &membership, opts, None);
+    let asm = assemble(&series, &membership, opts, None, opts.gpu)?;
     if !asm.jumps.is_empty() {
         let mut msg = format!(
             "{} undeclared level jump(s) (open/previous close beyond {}x inside one listing); \
@@ -1849,6 +1944,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         gaps: panel.gaps,
         listings: asm.listings.values().map(|c| *c as usize).sum(),
         manifest: manifest_path,
+        route: asm.route.clone(),
     })
 }
 
@@ -1902,6 +1998,9 @@ fn v2_block(
         PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
         crate::derivatives::manifest_json(None)
     );
+    if opts.gpu != GpuMode::Off {
+        let _ = write!(s, "\"backend\":{},", asm.route.json());
+    }
     let _ = write!(
         s,
         "\"resample\":{{\"in_step\":{},\"out_step\":{}}},\"listing\":{{\"gap_days\":{},\"relists\":[{}],\"total\":{},\"multi_listing_symbols\":[{}]}},",
@@ -2135,7 +2234,13 @@ pub fn validate(opts: &ValidateOptions) -> Report {
                 let distinct: Vec<i64> = ts.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
                 for k in 1..=opts.replay {
                     let cut = distinct[(distinct.len() - 1) * k / (opts.replay + 1)];
-                    let asm = assemble(series, &m, &opts.panel_options, Some(cut));
+                    let asm = match assemble(series, &m, &opts.panel_options, Some(cut), GpuMode::Off) {
+                        Ok(a) => a,
+                        Err(_) => {
+                            bad += 1;
+                            continue;
+                        }
+                    };
                     let upto = ts.partition_point(|t| *t <= cut);
                     if asm.rows.len() != upto {
                         bad += 1;
@@ -2330,8 +2435,8 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         }
         i += 1;
     }
-    if gpu.is_some() && cmd != "base" {
-        cli_usage(&format!("--gpu applies to `rcsr panel base`, not `{}`", cmd));
+    if gpu.is_some() && cmd != "base" && cmd != "build" {
+        cli_usage(&format!("--gpu applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
     }
     let mut po = |membership: &str, out: &str| -> PanelOptions {
         let mut p = PanelOptions::new(data.as_deref().unwrap_or(""), membership, out);
@@ -2342,6 +2447,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         p.relists = std::mem::take(&mut relists);
         p.jump_factor = jump_factor;
         p.outage_share = outage_share;
+        p.gpu = gpu.unwrap_or(GpuMode::Auto);
         p
     };
     match cmd {
@@ -2375,20 +2481,8 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                         "panel base: {} rows, {} symbols, {} cached -> {} (manifest {})",
                         s.rows, s.symbols, s.reused, out, s.manifest
                     );
-                    let r = &s.route;
-                    if r.requested != "off" {
-                        eprintln!(
-                            "panel base: gpu={} device={} cpu={} symbols, {} passes, kernel {:.3}s{}",
-                            r.requested,
-                            r.symbols_device,
-                            r.symbols_cpu,
-                            r.passes,
-                            r.kernel_s,
-                            r.fallbacks
-                                .iter()
-                                .map(|(why, n)| format!("; cpu fallback ({}): {} symbols", why, n))
-                                .collect::<String>()
-                        );
+                    if s.route.requested != "off" {
+                        eprintln!("{}", route_line("panel base", &s.route));
                     }
                 }
                 Err(e) => cli_fail(&e),
@@ -2402,10 +2496,15 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             let out = out.unwrap_or_else(|| "panel_hourly_default.rcsb".to_string());
             let p = po(&m, &out);
             match build_panel(&p) {
-                Ok(s) => eprintln!(
-                    "panel build: {} rows, {} symbols, {} delisted, {} gaps, {} listings -> {} (manifest {})",
-                    s.rows, s.symbols, s.delisted, s.gaps, s.listings, out, s.manifest
-                ),
+                Ok(s) => {
+                    eprintln!(
+                        "panel build: {} rows, {} symbols, {} delisted, {} gaps, {} listings -> {} (manifest {})",
+                        s.rows, s.symbols, s.delisted, s.gaps, s.listings, out, s.manifest
+                    );
+                    if s.route.requested != "off" {
+                        eprintln!("{}", route_line("panel build", &s.route));
+                    }
+                }
                 Err(e) => cli_fail(&e),
             }
         }
@@ -2429,6 +2528,23 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         other => cli_usage(&format!("unknown panel command '{}'", other)),
     }
     std::process::exit(0);
+}
+
+/// The CLI line naming where the device work ran and every CPU fallback.
+fn route_line(tool: &str, r: &DeviceRoute) -> String {
+    format!(
+        "{}: gpu={} device={} cpu={} symbols, {} passes, kernel {:.3}s{}",
+        tool,
+        r.requested,
+        r.symbols_device,
+        r.symbols_cpu,
+        r.passes,
+        r.kernel_s,
+        r.fallbacks
+            .iter()
+            .map(|(why, n)| format!("; cpu fallback ({}): {} symbols", why, n))
+            .collect::<String>()
+    )
 }
 
 fn value(args: &[String], i: &mut usize) -> String {
