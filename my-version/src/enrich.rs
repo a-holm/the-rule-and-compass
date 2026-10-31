@@ -7983,7 +7983,8 @@ INPUT / OUTPUT:
   --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
                           (default 222 MB/s on the shared ext4 store)
   --dry-run               print the report and write nothing
-  --json                  print the JSON report on stdout
+  --json                  print the JSON report on stdout; gpu.fallback_columns lists
+                          each column the device left to the CPU, with the failing path
 
 FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   returns    r1..r120, log close-to-close over exactly k contiguous bars

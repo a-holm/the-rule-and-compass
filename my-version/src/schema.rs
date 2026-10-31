@@ -267,7 +267,7 @@ pub fn json() -> String {
 {{\"name\":\"--write-bw\",\"type\":\"float\",\"default\":\"222 MB/s\",\"description\":\"measured sequential write bandwidth for cost model v2; the write term is charged separately from D2H\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
-{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout\"}}]}},\n  \
+{{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout; gpu.fallback_columns lists the name and failing path of every column the device left to the CPU\"}}]}},\n  \
          \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
 {{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
