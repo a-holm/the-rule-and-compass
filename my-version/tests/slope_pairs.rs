@@ -103,7 +103,7 @@ fn run(args: &[&str], csv: &str) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn rcsr");
-    child.stdin.as_mut().unwrap().write_all(csv.as_bytes()).unwrap();
+    let _ = child.stdin.as_mut().unwrap().write_all(csv.as_bytes());
     child.wait_with_output().expect("wait for rcsr")
 }
 
