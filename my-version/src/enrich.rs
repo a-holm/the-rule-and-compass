@@ -4947,7 +4947,8 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
     let mut cusum = vec![f64::NAN; n];
     for i in 96..n {
         if contig(times, i, 96, step) {
-            cusum[i] = (cs[i] - cs[i - 96]).abs() / (96.0f64).sqrt();
+            let base = if gap[i - 95] { 0.0 } else { cs[i - 96] };
+            cusum[i] = (cs[i] - base).abs() / (96.0f64).sqrt();
         }
     }
     out.insert("cusum_abs_z".to_string(), cusum);
