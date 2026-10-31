@@ -651,10 +651,39 @@ struct GpuSearch {
     device_fit_used: bool,
     /// #293: the device memory plan this evaluator was built under.
     memory_plan: Option<crate::memory::DevicePlan>,
+    /// #293: the tile stream of a tiled run, `None` when the rows are resident.
+    tile_stream: Option<TileStream>,
+}
+
+/// #293: what one scored batch streams to the device in a tiled run.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct TileStream {
+    tile_bytes: u64,
+    tiles: u64,
+    /// Candidates per wave.
+    wave: usize,
 }
 
 #[cfg(feature = "cuda")]
 impl GpuSearch {
+    /// #293: host-to-device bytes one batch of `candidates` streams in a tiled
+    /// run. Every wave sweeps all tiles, twice for the correlation family.
+    fn streamed_bytes(&self, candidates: usize) -> u64 {
+        let Some(t) = self.tile_stream else {
+            return 0;
+        };
+        let passes = match self.score {
+            Some(
+                crate::metrics::ScoreObjective::Correlation
+                | crate::metrics::ScoreObjective::CorrelationSigned,
+            ) => 2,
+            _ => 1,
+        };
+        let waves = candidates.div_ceil(t.wave).max(1) as u64;
+        waves * passes * t.tiles * t.tile_bytes
+    }
+
     fn new(
         train: &Sample,
         fit_data: bool,
@@ -668,9 +697,12 @@ impl GpuSearch {
         logistic_fit: bool,
         // #284: the run clock every device interval is placed on.
         run_start: std::time::Instant,
-        // #293: byte ceiling on the live device allocations (the plan budget).
-        budget: Option<u64>,
+        // #293: the device plan: its budget is the ceiling on the live device
+        // allocations, and a tiled plan streams the rows instead of holding them.
+        plan: Option<&crate::memory::DevicePlan>,
     ) -> Result<Self, String> {
+        let budget = plan.map(|p| p.budget);
+        let tiled = plan.filter(|p| p.mode == crate::memory::Residency::Tiled);
         // A test/diagnostic switch: `RCSR_GPU=0` makes a CUDA build behave as
         // if no device were present, so the fallback path can be exercised on
         // a machine that has one.
@@ -693,7 +725,24 @@ impl GpuSearch {
             }
         }
         let y: Vec<f32> = train.y.iter().map(|&v| v as f32).collect();
-        match crate::gpu::GpuEvaluator::with_budget(&cols, n_rows, n_vars, &y, budget) {
+        let created = match tiled {
+            Some(p) => {
+                if fit_data {
+                    return Err("device_memory: tiled residency has no device fit or exact statistic scorer".to_string());
+                }
+                crate::gpu::GpuEvaluator::new_tiled(
+                    cols,
+                    n_rows,
+                    n_vars,
+                    &y,
+                    p.tile_rows,
+                    budget,
+                    Some(p.partials_cap_bytes()),
+                )
+            }
+            None => crate::gpu::GpuEvaluator::with_budget(&cols, n_rows, n_vars, &y, budget),
+        };
+        match created {
             Some(mut ev) => {
                 // #284: one clock for evaluator and fit intervals.
                 ev.set_run_start(run_start);
@@ -756,6 +805,11 @@ impl GpuSearch {
                     device_eval_used: false,
                     device_fit_used: false,
                     memory_plan: None,
+                    tile_stream: tiled.map(|p| TileStream {
+                        tile_bytes: p.tile_rows as u64 * n_vars as u64 * 4,
+                        tiles: n_rows.div_ceil(p.tile_rows.max(1)) as u64,
+                        wave: p.wave_candidates.max(1),
+                    }),
                 })
             }
             None => Err(match crate::gpu::last_alloc_failure() {
@@ -1300,6 +1354,8 @@ impl GpuSearch {
             .map(|&(i, j)| islands[i][j].complexity.max(1.0))
             .fold(1.0f64, f64::max) as usize;
         let eval_workload = crate::dispatch::Workload::eval(pending.len(), train.len(), nodes);
+        let eval_workload = eval_workload
+            .with_bytes(eval_workload.bytes + self.streamed_bytes(pending.len()));
         // #290: a fit-only device run has no native scorer, so the evaluator is
         // CPU by contract and the plan says so. A native run lets the model
         // choose; a small batch keeps the CPU when launch dominates.
@@ -2533,10 +2589,18 @@ fn plan_blocker(plan: &crate::memory::DevicePlan) -> Option<String> {
     }
     if plan.workload.stat && plan.stat_route != crate::memory::StageRoute::Device {
         return Some(format!(
-            "device_memory: the exact {} scorer needs {} bytes of device memory, budget {} bytes",
+            "device_memory: the exact {} scorer needs {} bytes of device memory, budget {} bytes{}",
             "order/rank",
-            plan.terms.data_f32 + plan.terms.side_vectors + plan.terms.buffers,
-            plan.budget
+            (plan.workload.rows as u64)
+                .saturating_mul(plan.workload.vars as u64 + 1)
+                .saturating_mul(4)
+                .saturating_add(plan.terms.side_vectors + plan.terms.buffers),
+            plan.budget,
+            if plan.mode == crate::memory::Residency::Tiled {
+                format!("; the rows stream in tiles of {}, so the scorer runs on the CPU", plan.tile_rows)
+            } else {
+                String::new()
+            }
         ));
     }
     None
@@ -5226,7 +5290,7 @@ fn run_search(
                         score,
                         logistic_fit,
                         t0,
-                        memory_plan.as_ref().map(|p| p.budget),
+                        memory_plan.as_ref(),
                     ),
                 };
                 match created {
@@ -5311,6 +5375,19 @@ fn run_search(
                                     "# gpu-fit: {} ({}; exact rank polish, CPU f64 \
                                      fitness — native rank scoring is open, #230)",
                                     device, scheduling
+                                );
+                            }
+                        }
+                        if cfg.gpu_notes {
+                            if let Some(p) = g
+                                .memory_plan
+                                .as_ref()
+                                .filter(|p| p.mode == crate::memory::Residency::Tiled)
+                            {
+                                eprintln!(
+                                    "# gpu: tiled residency (tile {} rows, {} wave(s) of up to {} candidates; \
+                                     the rows stream from the host, fit and exact statistics stay on the CPU, device_memory)",
+                                    p.tile_rows, p.waves, p.wave_candidates
                                 );
                             }
                         }

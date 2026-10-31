@@ -602,6 +602,12 @@ struct RawArenaReport {
     fs_batches: u64,
     fs_dev_bytes: u64,
     fs_pinned_bytes: u64,
+    tile_rows: u64,
+    tiles: u64,
+    tile_uploads: u64,
+    tile_overlapped_uploads: u64,
+    tile_pinned_bytes: u64,
+    waves: u64,
 }
 
 /// `RcAllocReport` in `src/cuda/eval.cu` field for field.
@@ -683,6 +689,19 @@ pub struct ArenaReport {
     pub fit_device_bytes: u64,
     /// #334: current size of the pinned staging region in bytes.
     pub fit_pinned_bytes: u64,
+    /// #293: rows per tile, or `0` when the rows are resident.
+    pub tile_rows: u64,
+    /// #293: tile kernel launches, over all passes and waves.
+    pub tiles: u64,
+    /// #293: tile uploads issued.
+    pub tile_uploads: u64,
+    /// #293: uploads enqueued while the previous tile's kernel was still
+    /// outstanding.
+    pub tile_overlapped_uploads: u64,
+    /// #293: bytes of pinned host staging for the tile slots.
+    pub tile_pinned_bytes: u64,
+    /// #293: candidate waves launched.
+    pub waves: u64,
 }
 
 impl ArenaReport {
@@ -707,12 +726,27 @@ impl ArenaReport {
             fit_batches: raw.fs_batches,
             fit_device_bytes: raw.fs_dev_bytes,
             fit_pinned_bytes: raw.fs_pinned_bytes,
+            tile_rows: raw.tile_rows,
+            tiles: raw.tiles,
+            tile_uploads: raw.tile_uploads,
+            tile_overlapped_uploads: raw.tile_overlapped_uploads,
+            tile_pinned_bytes: raw.tile_pinned_bytes,
+            waves: raw.waves,
         }
     }
 }
 
 extern "C" {
     fn rc_create(cols: *const f32, n: i32, v: i32, y: *const f32, budget: u64) -> *mut RawCtx;
+    fn rc_create_tiled(
+        cols: *const f32,
+        n: i32,
+        v: i32,
+        y: *const f32,
+        tile_rows: i32,
+        budget: u64,
+        wave_cap: u64,
+    ) -> *mut RawCtx;
     fn rc_alloc_report(ctx: *mut RawCtx, out: *mut RawAllocReport) -> i32;
     fn rc_last_alloc_failure_tag() -> *const std::os::raw::c_char;
     fn rc_destroy(ctx: *mut RawCtx);
@@ -1339,6 +1373,9 @@ pub struct GpuEvaluator {
     /// native AUC score is declined rather than computed from a wrong label
     /// mask. Unused by the order and rank-correlation statistics.
     target_classes: Option<(usize, usize)>,
+    /// #293: the host copy of the feature columns a tiled context streams
+    /// from. The device context holds a pointer into it.
+    host_cols: Option<Vec<f32>>,
 }
 
 impl GpuEvaluator {
@@ -1379,7 +1416,64 @@ impl GpuEvaluator {
                 ledger: crate::gpu_stats::RunLedger::new(),
                 loss: crate::fit::DeviceLoss::Squared,
                 target_classes: None,
+                host_cols: None,
             })
+        }
+    }
+
+    /// #293: an evaluator whose feature columns stay on the host and stream
+    /// through two device tiles of `tile_rows` rows. `cols` is column-major
+    /// like [`Self::new`]. Scores are bit-identical to the resident evaluator
+    /// for every tile size. `partials_cap` bounds the lane carry in bytes, so
+    /// a population is scored in waves when it would pass it. The fit, the
+    /// exact rank and order statistics and the f64 twin are refused.
+    pub fn new_tiled(
+        cols: Vec<f32>,
+        n_rows: usize,
+        n_vars: usize,
+        y: &[f32],
+        tile_rows: usize,
+        budget: Option<u64>,
+        partials_cap: Option<u64>,
+    ) -> Option<Self> {
+        if tile_rows == 0 || cols.len() != n_rows * n_vars || y.len() != n_rows {
+            return None;
+        }
+        let ctx = unsafe {
+            rc_create_tiled(
+                cols.as_ptr(),
+                n_rows as i32,
+                n_vars as i32,
+                y.as_ptr(),
+                tile_rows as i32,
+                budget.unwrap_or(0),
+                partials_cap.unwrap_or(0),
+            )
+        };
+        if ctx.is_null() {
+            return None;
+        }
+        Some(GpuEvaluator {
+            ctx,
+            n_rows: n_rows as u64,
+            pool_cap: 0,
+            pool_width: 0,
+            pool_last: 0,
+            stats: GpuStats::default(),
+            run_start: std::time::Instant::now(),
+            ledger: crate::gpu_stats::RunLedger::new(),
+            loss: crate::fit::DeviceLoss::Squared,
+            target_classes: None,
+            host_cols: Some(cols),
+        })
+    }
+
+    /// #293: how the feature columns live on the device.
+    pub fn residency(&self) -> crate::memory::Residency {
+        if self.host_cols.is_some() {
+            crate::memory::Residency::Tiled
+        } else {
+            crate::memory::Residency::Resident
         }
     }
 
@@ -1590,6 +1684,12 @@ impl GpuEvaluator {
             fs_batches: 0,
             fs_dev_bytes: 0,
             fs_pinned_bytes: 0,
+            tile_rows: 0,
+            tiles: 0,
+            tile_uploads: 0,
+            tile_overlapped_uploads: 0,
+            tile_pinned_bytes: 0,
+            waves: 0,
         };
         if unsafe { rc_arena_report(self.ctx, &mut raw) } != 0 {
             return ArenaReport::from_raw(&raw);

@@ -119,7 +119,7 @@ Decision order:
 
 1. More than `i32::MAX` rows: refused at stage `eval`, because the kernels index rows with 32 bits.
 2. `data_f32 + side_vectors + buffers` within the budget: `resident`. An explicit device fit needs the twin as well, and the exact scorer needs the twin and the wave. A device fit that does not fit is refused at stage `fit`. A scorer that does not fit has `stat_route = cpu` and the run keeps the CPU.
-3. Otherwise `tiled` when two tiles of `tile_rows` rows, the side vectors, the buffers and at least one candidate's partials fit. `tile_rows` is the largest power of two with `2 x tile_rows x vars x 4 B` within L2, clamped to 512..8192. This build does not run the tiled mode yet, so a tiled plan is refused at stage `eval` (or `fit` for a device fit) with the reason `tiled residency is not available in this build`.
+3. Otherwise `tiled` when two tiles of `tile_rows` rows, the side vectors, the buffers and at least one candidate's partials fit. `tile_rows` is the largest power of two with `2 x tile_rows x vars x 4 B` within L2, clamped to 512..8192. In this mode the feature columns stay on the host and stream through two device tiles. The target, label sign and weights stay resident. An explicit device fit is refused at stage `fit` ("tiled residency has no device fit"). The default fit and the exact rank and order-statistic scorers run on the CPU, and the plan routes name `device_memory`. The candidates are scored in waves of `partials / 4,112 B` so the lane carry stays under the partials cap (64 MiB).
 4. Otherwise refused at stage `eval`.
 
 A refusal names the stage, the bytes it needs, the budget and the smallest fixes, each computed by re-running the plan: `--vars K` (largest count that fits), the largest training row count, `--fit-strategy exact` (stage `fit`), raising `--gpu-memory` or freeing device memory held by other processes, `--cpu`.
@@ -133,7 +133,7 @@ error: GPU memory plan refused the fit stage: the f64 fit twin does not fit besi
 
 Outcomes:
 
-* A refused `fit` stage exits 2, because a device fit is always explicit.
+* A refused `fit` stage exits 2, because a device fit is always explicit. A tiled run refuses `--fit-strategy gpu` the same way.
 * A refused `eval` stage exits 2 under `--gpu`. Without `--gpu` the run keeps the CPU, `backend` is `cpu`, `backend_reason` starts with `device_memory` and the route ledger names `device_memory`.
 * A device allocation that still fails is reported as `device_memory: the device refused an allocation of N bytes ...`, never as "no usable CUDA device".
 

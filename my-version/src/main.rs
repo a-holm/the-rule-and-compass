@@ -589,7 +589,12 @@ SEARCH:
                              --cpu); without --gpu the run keeps the CPU with
                              backend_reason starting device_memory. An explicit
                              --fit-strategy gpu whose f64 fit rows do not fit
-                             exits 2. JSON reports gpu.memory_plan
+                             exits 2. When only the f32 rows do not fit, the
+                             rows stream from the host in tiles (scores are
+                             unchanged); the default fit and the exact rank and
+                             order scorers then run on the CPU and an explicit
+                             --fit-strategy gpu exits 2. JSON reports
+                             gpu.memory_plan
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory

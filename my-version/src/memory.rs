@@ -817,6 +817,7 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
 
     let tile_rows = caps
         .tile_rows
+        .map(|t| (t / DEVICE_LANES * DEVICE_LANES).max(DEVICE_LANES))
         .unwrap_or_else(|| tile_rows_for(w.vars, d.l2_bytes, DEVICE_LANES));
     let sum = |parts: &[u64], sat: &mut bool| -> u64 {
         clamp_u64(parts.iter().map(|p| *p as u128).sum::<u128>(), sat)
@@ -942,7 +943,8 @@ fn plan_core(w: &DeviceWorkload, d: &DeviceInfo, caps: &DeviceCaps) -> DevicePla
             plan.fit_route = StageRoute::Refused;
             refusal("fit", "tiled residency has no device fit", core_twin, twin_terms)
         } else {
-            refusal("eval", "tiled residency is not available in this build", core, core_terms)
+            plan.fit_route = StageRoute::Cpu("device_memory");
+            None
         };
         plan.saturated = sat;
         return plan;
@@ -1099,6 +1101,12 @@ impl DevicePlan {
             binding,
             r.fixes.join("; or ")
         ))
+    }
+
+    /// Bytes of lane carry the planned wave holds, the cap a tiled evaluator
+    /// scores under.
+    pub fn partials_cap_bytes(&self) -> u64 {
+        self.wave_candidates as u64 * DEVICE_CARRY_BYTES as u64
     }
 
     /// One line for `backend_reason`: starts with `device_memory`.
@@ -1308,7 +1316,7 @@ mod tests {
         let refused = vec![
             (workload(364, 10_000, true), d, caps),
             (workload(364, 1_000, true), d, DeviceCaps::new(Some(2 * 1024 * MIB))),
-            (workload(56, 10_000, false), rtx3060(1_100), caps),
+            (workload(56, 10_000, false), rtx3060(1_030), caps),
             (workload(56, 10_000, true), rtx3060(2_048), caps),
             (
                 DeviceWorkload { rows: 1 << 31, ..workload(20, 10_000, false) },
@@ -1397,6 +1405,8 @@ mod tests {
         assert_eq!(p.wave_candidates, 10_000);
         assert_eq!(p.waves, 1);
         assert!(p.required <= p.budget);
+        assert!(p.refusal.is_none());
+        assert_eq!(p.fit_route, StageRoute::Cpu("device_memory"));
         let capped = DeviceCaps { partials_cap: 1 << 20, ..DeviceCaps::new(None) };
         let p = device_plan(&w, &rtx3060(2_048), &capped);
         assert_eq!(p.wave_candidates, (1 << 20) / 4112);

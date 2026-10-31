@@ -716,9 +716,22 @@ returns an empty result when the program upload fails.
 - `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
 - `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero classification weights, the AIC penalty on the host.
 
-The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`. `score_rows_kernel` repeats its row bodies, so the two change together.
+The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
 
 The carry is `P x (16 L + 16)` bytes (4,112 B per candidate), allocated once through the ledger with tag `carry` and grown only when the candidate count grows. Tests: `gpu::carry_tests`.
+
+`score_kernel` and `score_rows_kernel` fold rows through one `__device__` function (`score_step`), so the resident and the row-range paths cannot drift apart.
+
+### Tiled residency (#293)
+
+When the plan is `tiled`, `GpuEvaluator::new_tiled` (C: `rc_create_tiled`) keeps the column-major f32 feature columns on the host and allocates two device tile slots and two pinned staging slots of `tile_rows x vars x 4 B`. The target, label sign and weights stay resident by absolute row. Every score call runs the row-range kernels over the tiles:
+
+- Per wave of candidates, the tiles are swept in order (twice for the correlation family). A wave holds `partials cap / 4,112 B` candidates; one wave covers the whole population when it fits the cap.
+- For a tile, the host copies the `vars` column segments into the staging slot, the copy runs on a transfer stream behind the last kernel that read the device slot, and the kernel runs on the default stream behind the copy (events `ev_tile_copied`, `ev_tile_ready`, `ev_tile_used`). The next tile uploads while the current kernel runs.
+- The lane of a row is its absolute row modulo `L`, so scores are bit-identical to the resident kernels for every tile height and wave size.
+- The legacy evaluator, the batched fit, the exact rank and order-statistic scorers and the f64 twin are refused in a tiled context (the call returns a failure). The plan keeps them on the CPU.
+
+`ArenaReport` carries `tile_rows`, `tiles` (tile kernel launches), `tile_uploads`, `tile_overlapped_uploads`, `tile_pinned_bytes` and `waves`. A `# gpu: tiled residency (...)` note names the tile height and the waves. The eval stage of the route planner adds the streamed tile bytes to its transfer estimate. Tests: `tests/gpu_tiled.rs`.
 
 ### Overlapping generation with scoring (issue #119)
 
