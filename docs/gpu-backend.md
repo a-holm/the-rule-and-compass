@@ -2808,3 +2808,7 @@ the same planner with a zero-hysteresis compatibility calibration, preserving
 their measured crossovers.
 
 See [`dispatch.md`](dispatch.md) for the formulas, JSON shape and the tests.
+
+## Device memory plan (#293)
+
+The run plans its device memory before the first allocation. `--gpu-memory <size>` lowers the budget below `min(10.5 GiB, free - 1 GiB)`. A stage that does not fit is refused with its bytes and the smallest fix: `--gpu` exits 2, a plain run keeps the CPU with `backend_reason` starting `device_memory`, and an explicit `--fit-strategy gpu` whose f64 fit rows do not fit exits 2. `gpu.memory_plan` in `--json` records the plan. A failed device allocation is reported as `device_memory` with the byte count. The terms, the decision order and the refusal text are in [`memory-model.md`](memory-model.md).

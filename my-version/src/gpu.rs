@@ -717,6 +717,8 @@ extern "C" {
         out: *mut f32,
     ) -> i32;
     fn rc_device_count() -> i32;
+    fn rc_device_memory(free_b: *mut usize, total_b: *mut usize, l2_bytes: *mut i32) -> i32;
+    fn rc_last_alloc_failure() -> usize;
     /* #122: persistent, fixed-capacity, double-buffered program arena. */
     fn rc_pool_reserve(ctx: *mut RawCtx, nprog: i32, width: i32) -> i32;
     fn rc_pool_upload(ctx: *mut RawCtx, which: i32, prog: *const u32, nprog: i32) -> i32;
@@ -937,6 +939,30 @@ pub fn probe() -> crate::backend::Probe {
         return crate::backend::Probe::cpu("CUDA device attributes unavailable");
     }
     crate::backend::Probe::gpu(name)
+}
+
+/// #293: free and total device memory and the L2 size. Call it after the
+/// context exists, so the context's own overhead is already subtracted.
+pub fn device_info() -> Option<crate::memory::DeviceInfo> {
+    let (mut free, mut total, mut l2) = (0usize, 0usize, 0i32);
+    let rc = unsafe { rc_device_memory(&mut free, &mut total, &mut l2) };
+    if rc != 0 || total == 0 {
+        return None;
+    }
+    Some(crate::memory::DeviceInfo {
+        free: free as u64,
+        total: total as u64,
+        l2_bytes: l2.max(0) as u64,
+    })
+}
+
+/// #293: bytes of the most recent allocation the device refused while a
+/// context or its fit rows were being created.
+pub fn last_alloc_failure() -> Option<u64> {
+    match unsafe { rc_last_alloc_failure() } {
+        0 => None,
+        bytes => Some(bytes as u64),
+    }
 }
 
 /// A compiled population: the postfix programs of many expressions laid out

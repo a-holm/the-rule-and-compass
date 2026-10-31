@@ -27,7 +27,7 @@
 //!
 //! A stage may be refused the device for structural or arithmetic reasons
 //! (`launch`, `unsupported_plan`, `too_few_rows`, `too_many_constants`,
-//! `ill_conditioned`, `non_finite`, `metric_not_native`, `no_device`,
+//! `ill_conditioned`, `non_finite`, `metric_not_native`, `device_memory`, `no_device`,
 //! `exactness`). Those refusals are checked **before** any timing comparison.
 //! A model that let a slow measurement turn an arithmetic failure into a CPU
 //! route would hide the failure; [`FallbackCause::is_timing`] is therefore
@@ -208,6 +208,8 @@ pub enum Reason {
     NonFinite,
     /// The metric has no native device objective.
     MetricNotNative,
+    /// The device memory plan refuses the stage or routes it to the CPU.
+    DeviceMemory,
     /// Exactness or a reporting contract keeps this on the CPU.
     Exactness,
     /// The calibration is missing or degenerate.
@@ -230,6 +232,7 @@ impl Reason {
             Reason::IllConditioned => "ill_conditioned",
             Reason::NonFinite => "non_finite",
             Reason::MetricNotNative => "metric_not_native",
+            Reason::DeviceMemory => "device_memory",
             Reason::Exactness => "exactness",
             Reason::NoCalibration => "no_calibration",
         }
@@ -247,6 +250,7 @@ impl Reason {
                 | Reason::IllConditioned
                 | Reason::NonFinite
                 | Reason::MetricNotNative
+                | Reason::DeviceMemory
                 | Reason::Exactness
                 | Reason::NoCalibration
         )
@@ -265,12 +269,13 @@ pub enum FallbackCause {
     IllConditioned,
     NonFinite,
     MetricNotNative,
+    DeviceMemory,
     Exactness,
 }
 
 impl FallbackCause {
     /// Every cause the ledger can carry.
-    pub const ALL: [FallbackCause; 9] = [
+    pub const ALL: [FallbackCause; 10] = [
         FallbackCause::NoDevice,
         FallbackCause::UnsupportedPlan,
         FallbackCause::TooFewRows,
@@ -279,6 +284,7 @@ impl FallbackCause {
         FallbackCause::IllConditioned,
         FallbackCause::NonFinite,
         FallbackCause::MetricNotNative,
+        FallbackCause::DeviceMemory,
         FallbackCause::Exactness,
     ];
 
@@ -296,6 +302,7 @@ impl FallbackCause {
             FallbackCause::IllConditioned => Reason::IllConditioned,
             FallbackCause::NonFinite => Reason::NonFinite,
             FallbackCause::MetricNotNative => Reason::MetricNotNative,
+            FallbackCause::DeviceMemory => Reason::DeviceMemory,
             FallbackCause::Exactness => Reason::Exactness,
         }
     }

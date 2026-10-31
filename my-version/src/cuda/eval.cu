@@ -2691,10 +2691,13 @@ __global__ void hash_kernel(const unsigned int *__restrict__ prog,
  * Without the macro the dataset is copied once into plain device memory, which
  * is faster on a discrete GPU with its own VRAM (the RTX 3060 default).
  */
+static size_t g_alloc_fail_bytes = 0;
 #ifdef RCSR_UNIFIED
 static int rc_alloc(void **p, size_t bytes)
 {
-    return (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+    int rc = (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+    if (rc != 0) g_alloc_fail_bytes = bytes;
+    return rc;
 }
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
@@ -2707,7 +2710,9 @@ static void rc_download(void *dst, const void *src, size_t bytes)
 #else
 static int rc_alloc(void **p, size_t bytes)
 {
-    return (int)cudaMalloc(p, bytes);
+    int rc = (int)cudaMalloc(p, bytes);
+    if (rc != 0) g_alloc_fail_bytes = bytes;
+    return rc;
 }
 static void rc_upload(void *dst, const void *src, size_t bytes)
 {
@@ -3160,6 +3165,7 @@ void *rc_create(const float *cols, int n, int v, const float *y)
         snprintf(c->sync_reason, sizeof(c->sync_reason),
                  "RCSR_GPU_SYNC requests the synchronous copy path");
     }
+    g_alloc_fail_bytes = 0;
     size_t col_bytes = sizeof(float) * (size_t)n * (size_t)v;
     size_t y_bytes = sizeof(float) * (size_t)n;
     if (rc_alloc((void **)&c->d_cols, col_bytes) != 0 ||
@@ -3882,6 +3888,7 @@ int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long 
    It is uploaded once here rather than per batch. */
 int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double *w)
 {
+    g_alloc_fail_bytes = 0;
     RcCtx *c = (RcCtx *)ctx;
     if (!c || !cols || !y) return -1;
     if (c->d_cols64) { cudaFree(c->d_cols64); c->d_cols64 = 0; }
@@ -4889,6 +4896,23 @@ int rc_device_count(void)
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess) return -1;
     return n;
+}
+
+/* #293: free and total device memory and the L2 size, read once the context
+   exists so its own overhead is already subtracted from `free`. */
+int rc_device_memory(size_t *free_b, size_t *total_b, int *l2_bytes)
+{
+    if (cudaMemGetInfo(free_b, total_b) != cudaSuccess) return -1;
+    int l2 = 0;
+    if (cudaDeviceGetAttribute(&l2, cudaDevAttrL2CacheSize, 0) != cudaSuccess) l2 = 0;
+    *l2_bytes = l2;
+    return 0;
+}
+
+/* #293: bytes of the most recent refused device allocation, or 0. */
+size_t rc_last_alloc_failure(void)
+{
+    return g_alloc_fail_bytes;
 }
 
 } /* extern "C" */

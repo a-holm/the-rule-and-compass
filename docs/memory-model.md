@@ -101,3 +101,40 @@ At 16.1M rows one `f64` column is 128 MiB, so the arena cannot hold even one
 full column; that case uses per-column staging and is reported as such. At the
 3.87M-row scale the arena holds two columns, and a 500k-row parity fixture holds
 eight. The pinned mirror is reused across blocks, never allocated per column.
+
+## Device memory plan (#293)
+
+Before the first device allocation the run computes a plan: a pure function in `src/memory.rs` (`device_plan`) of the workload, the free device memory and the caps. The device is queried once with `cudaMemGetInfo` after the CUDA context exists, so the context's own overhead is already subtracted from `free`.
+
+```text
+budget = min(cap 10.5 GiB, free - reserve 1 GiB, --gpu-memory)
+data_f32     = rows x (vars + 1) x 4 B                      scoring rows and target
+side_vectors = rows x 12 B (label sign) + rows x 8 B (weights), when present
+fit_twin     = rows x (vars + 1) x 8 B                      --fit-strategy gpu, or the exact rank/order scorer
+buffers      = 1 MiB + program slots, score, hash and fit regions, linear in the candidate count
+stat_wave    = max(512 MiB, 6 x (rows x 64 B + 1 MiB))      exact rank/order scorer only
+```
+
+Decision order:
+
+1. More than `i32::MAX` rows: refused at stage `eval`, because the kernels index rows with 32 bits.
+2. `data_f32 + side_vectors + buffers` within the budget: `resident`. An explicit device fit needs the twin as well, and the exact scorer needs the twin and the wave. A device fit that does not fit is refused at stage `fit`. A scorer that does not fit has `stat_route = cpu` and the run keeps the CPU.
+3. Otherwise `tiled` when two tiles of `tile_rows` rows, the side vectors, the buffers and at least one candidate's partials fit. `tile_rows` is the largest power of two with `2 x tile_rows x vars x 4 B` within L2, clamped to 512..8192. This build does not run the tiled mode yet, so a tiled plan is refused at stage `eval` (or `fit` for a device fit) with the reason `tiled residency is not available in this build`.
+4. Otherwise refused at stage `eval`.
+
+A refusal names the stage, the bytes it needs, the budget and the smallest fixes, each computed by re-running the plan: `--vars K` (largest count that fits), the largest training row count, `--fit-strategy exact` (stage `fit`), raising `--gpu-memory` or freeing device memory held by other processes, `--cpu`.
+
+```text
+error: GPU memory plan refused the fit stage: the f64 fit twin does not fit beside the resident rows
+  need 19.55 GiB (20,992,000,000 bytes): rows f32 6.49 GiB + f64 fit twin 12.99 GiB + buffers 0.02 GiB (4,775,757 rows x 364 vars, P=10,000)
+  budget 10.09 GiB (10,830,741,504 bytes) = min(cap 10.50 GiB, free 11.09 GiB - reserve 1.00 GiB)
+  smallest fix: --vars 187; or at most 2457450 training rows (--sample-rows on store input, scaled by the train fraction); or --fit-strategy exact; or --cpu
+```
+
+Outcomes:
+
+* A refused `fit` stage exits 2, because a device fit is always explicit.
+* A refused `eval` stage exits 2 under `--gpu`. Without `--gpu` the run keeps the CPU, `backend` is `cpu`, `backend_reason` starts with `device_memory` and the route ledger names `device_memory`.
+* A device allocation that still fails is reported as `device_memory: the device refused an allocation of N bytes ...`, never as "no usable CUDA device".
+
+`--json` reports the plan as `gpu.memory_plan` (mode, budget and its source, free and total bytes, required bytes, every term, rows, vars, candidates, L2 bytes, tile rows, routes and the refusal with its fixes). The test hooks `RCSR_TEST_GPU_TILE_ROWS` and `RCSR_TEST_GPU_PARTIALS_CAP_BYTES` override the tile height and the partials cap.
