@@ -347,7 +347,7 @@ choice. `--metric` selects one of twenty objectives:
   sign is part of the objective and an inverted forecast is penalised. Use them
   for directional signals (returns, demand, a control response) where the
   forecast has to rise and fall with the target;
-* `slope` — match the trend rather than the level;
+* `slope` — match the trend rather than the level. It differences only row pairs that are adjacent in the original data order and in the same group (`--group-by`, or one group), so a random split keeps the pairs whose two rows both land on the same side. Fewer than 32 training pairs is a usage error that names `--split temporal`. The same pair set drives the fit, the validation and test scores and the baselines. `--bootstrap-error`, `--stability`, `--cv` and multi-output targets are refused with `--metric slope` (usage error), because resampled or refolded rows have no data order. The gate row filter drops rows from a sample and remaps the pairs to the kept rows;
 * `auc`, `log_loss`, `hinge` — classification; the target must have exactly two
   distinct values (or one, which scores as chance). The model output is a
   logit. A `{-1, 0, +1}` target is **rejected** rather than silently split at
@@ -530,6 +530,24 @@ resample is not covered by BLB's differentiability theorem — so the summary
 reports `resample_rows`, `source_rows` and `capped`. Below the threshold the
 summary is bit-identical to the pre-#92 result.
 
+### 3.12 Multiple testing for a long-only book (`rcsr walkforward --bootstrap`)
+
+A walk-forward report on many candidates is a selection problem. The report quantifies it on the pooled development series:
+
+| statistic | what it answers | threshold used by the protocol |
+|---|---|---|
+| block bootstrap CI and design effect | is the mean or Sharpe distinguishable from zero once labels overlap and returns are serially dependent | CI excludes 0 |
+| `N_eff` (participation ratio) | how many independent trials the candidate set is worth | reported |
+| DSR at `N_eff` and `10 N_eff` | probability the true Sharpe is positive after deflating for the trials, skew and kurtosis | reported with its inputs |
+| PBO (CSCV) | how often the in-sample winner ranks in the lower half out of sample | at most 0.20 |
+| SPA vs the best long/flat baseline | does any candidate beat cash, buy-and-hold or the constant book after data snooping | p at most 0.05 |
+| BH-FDR | which candidates survive a false discovery rate | q = 0.10 |
+| block-permutation and matched-exposure nulls | does the score time returns better than chance | `p = (1+count)/(B+1)` |
+
+Choices that the formulas leave open: block length `max(h, hold, ceil(n^(1/3)))`; 10000 draws is the recommended `--bootstrap`; the SPA uses the circular block bootstrap with Hansen's consistent, lower and upper recentering; PBO uses the per-period Sharpe over 16 blocks. A locked test is read once per sealed candidate (see `docs/walkforward.md`); a small tweak after a failed read is a new trial that inflates `N`.
+
+Verify: `tests/inference.rs` (hand-computed CVaR, break-even, BH, PSR and PBO fixtures, the AR(1) and overlapping-label design effects, SPA on signal and noise) and `tests/eval_protocol.rs`.
+
 ## 4. What `rcsr` reports today
 
 ### The test lockbox and the validation slice
@@ -592,6 +610,20 @@ Alongside the front, `rcsr` reports:
 | `skewness` | residual asymmetry (0 for a symmetric residual) |
 | `kurtosis` | excess kurtosis (0 for a Gaussian) |
 
+### Trading objectives and the lockbox
+
+With `--objective pnl|sharpe|log_growth` the finalist is chosen on the validation slice by the exact long/flat book. The test block is read once, after the choice, for the winner alone. Shuffling the test block changes the reported test book and nothing else: the selected expression, its constants and its validation book stay the same.
+
+The run refuses a setup that would leak or mis-state the book:
+
+* no temporal split, no validation slice, or no `forward_return` target spec;
+* a scaled, clipped or offset target without a `return_column` (the book needs realised returns);
+* no `--cost-bps` (a cost assumption is required; `0` only when stated);
+* a non-zero cost when the label is already net of cost;
+* `--position short` and `--allow-short` (there is no short leg).
+
+The target spec's purge already covers the label horizon between the training, validation and test blocks.
+
 ## 5. Not yet implemented (on the roadmap)
 
 * **Beta / variance-ratio drift tests**, and a **White** general
@@ -626,3 +658,4 @@ Alongside the front, `rcsr` reports:
   curse of dimensionality for nearest neighbours.
 * Cochran 1977, *Sampling Techniques*; NIST/SEMATECH e-Handbook §1.3.5.2 —
   standard error with the finite-population correction.
+

@@ -737,6 +737,8 @@ impl LabelSpec {
                     .trim()
                     .parse()
                     .map_err(|_| format!("bad volnorm '{}'", part))?;
+            } else if let Some(v) = part.strip_prefix("side=") {
+                crate::labels::check_side(v.trim())?;
             } else if let Some(v) = part.strip_prefix("stride=") {
                 spec.stride = v
                     .trim()
@@ -756,6 +758,19 @@ impl LabelSpec {
             return Err("cost must be finite and non-negative".to_string());
         }
         Ok(spec)
+    }
+
+    /// A stride below the horizon overlaps labels; from four hours on that
+    /// needs `--allow-overlap`.
+    pub fn check_overlap(&self, tf: Timeframe, allow_overlap: bool) -> Result<(), String> {
+        let seconds = self.horizon as i64 * tf.seconds();
+        if self.stride < self.horizon && seconds >= crate::labels::OVERLAP_GUARD_SECONDS && !allow_overlap {
+            return Err(format!(
+                "label fwd:{}: stride {} is below the {}-bar horizon, so labels overlap; use stride>={} or pass --allow-overlap",
+                self.horizon, self.stride, self.horizon, self.horizon
+            ));
+        }
+        Ok(())
     }
 }
 

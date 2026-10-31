@@ -162,6 +162,31 @@ INPUT:
                              member comes from the validation gates, not from
                              this order. test_error is scoring-only, never a
                              criterion.
+  --objective mse|pnl|sharpe|log_growth
+                             what finalist selection minimises on the
+                             validation slice (default mse: the fit metric).
+                             pnl, sharpe and log_growth score each Pareto
+                             member's exact CPU f64 predictions as a long/flat
+                             book (positions 0 or 1, never short) with cost per
+                             side on |delta p| including the final exit; the
+                             fit and the archive still use --metric. Needs a
+                             temporal split with --validation-frac, a
+                             forward_return --target-spec, and --cost-bps.
+                             The test block is read once, for the winner only
+  --position long_only       the only position map (default). short is refused
+  --allow-short              refused: there is no short P&L, borrow or funding
+  --threshold <f>            long when the prediction is strictly above <f>
+                             (default 0)
+  --cost-bps <f>             cost per side in basis points (required with a
+                             P&L objective; 0 only when stated)
+  --slippage-bps <f>         extra cost per side in basis points (default 0)
+  --cash-return <f>          return per row earned while flat (default 0)
+  --funding <col>            per-row funding rate paid while long
+  --max-position <f>         position cap in (0, 1] (default 1)
+  --min-trades <n>           fewer trades on validation make a candidate
+                             unusable (default 1)
+  --min-holding <n>          rows a long position is held before an exit
+                             (default 1)
   --require-validation       refuse (exit 2) when there is no validation slice
   --equivalence-z <z>        z for the validation gates: a member is supported
                              when it improves on the last supported entry by
@@ -207,6 +232,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
+  --lockbox <START,END>      declared locked test for the run.json `lockbox` object (UTC,
+                             half-open; default 2026-07-01,2027-01-01)
+  --ledger <file>            candidate ledger whose locked reads run.json counts
   --target-spec <file>       declared target spec (rcsr-target-spec/1 JSON; default
                              <data stem>.targets.json when it has an entry for the
                              target). The engine then: refuses a label whose
@@ -386,6 +414,12 @@ SEARCH:
                              absolute mean residual |mean(y-f)| (a weighted mean
                              with --weight); it has a documented degeneracy: its
                              optimum is a whole manifold at exactly 0.
+                             slope scores the mean absolute error of first
+                             differences over row pairs that are adjacent in the
+                             data order and in the same group (--group-by, or
+                             one group), whatever the split shuffles; fewer
+                             than 32 such training pairs is a usage error that
+                             points at --split temporal.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -453,7 +487,17 @@ SEARCH:
                              maximum on the device with --fit-strategy gpu,
                              #226/#232/#227)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
-                             exact). `exact` is the historical CPU
+                             gpu where admissible, else exact). With no flag, or
+                             `auto`, the engine resolves the arm once: `gpu`
+                             admitting every candidate with constants for
+                             squared/aic/aicc/bic with fitting on, the GPU
+                             evaluator, device memory for the f64 fit rows and
+                             a run-level cost model that predicts a win; else
+                             `exact` (no flag) or the structural `auto`. Other
+                             resolutions are labelled with their reason on
+                             stderr, in --json (GPU runs), --run-manifest and
+                             the development log. A resume keeps the saved arm.
+                             `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
                              dispatches by structure: closed-form QR for trees
                              affine in every constant, variable projection for
@@ -478,7 +522,13 @@ SEARCH:
                              a softplus trial objective (#234; the device
                              proposes constants and the exact CPU f64 log-loss
                              judges and refits; since #289 the search also
-                             scores log_loss natively on the device), or — for
+                             scores log_loss natively on the device), the exact correlation
+                             objective 1-|rho| or 1-rho with a frozen affine
+                             gauge (correlation_signed refines both gauge
+                             orientations; a tree affine in every constant takes
+                             the CPU least-squares closed form, labelled
+                             affine_closed_form; every proposal passes the
+                             exact f64 gate), or - for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
                              (#230), with rank_correlation_signed scored as
@@ -503,7 +553,8 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, `--metric log_loss`, a rank
+                             `--metric absolute`, `--metric log_loss`, `--metric
+                             correlation`, `--metric correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
                              strategy. `--metric signed` keeps the exact CPU
@@ -566,7 +617,9 @@ SEARCH:
                              through the exact f64 order-statistic/rank batch
                              scorer (#288) from 4096 rows (a two-valued target
                              for AUC); those statistics are bit-identical to
-                             the CPU for the same prediction vector. Every other
+                             the CPU for the same prediction vector (median and
+                             interquartile use a radix select from 4096 and
+                             65536 rows, rank and auc a sort). Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be
@@ -693,10 +746,12 @@ RUN INTEGRITY (#140):
                              any mismatch (exit 0 when everything matches)
 
 DISPATCH (#290):
-  Dispatch is planned per stage, not per run. A ~100 ms startup probe
-  calibrates the host and anchors the device rates; every run records the
-  values and a route ledger in --json (dispatch.calibration and
-  dispatch.route_ledger) and in --run-manifest. The route is device, cpu or
+  Dispatch is planned per stage, not per run. A short startup probe times the
+  host; with --gpu one device probe per process times the eval rate, fit rate,
+  H2D/D2H bandwidth and launch overhead, and without a device the corpus
+  anchors stay (device_source anchor). --json carries dispatch.calibration
+  labels and dispatch.route_ledger; --run-manifest adds the measured rates and
+  their spreads. The route is device, cpu or
   split with a machine reason; hysteresis (h=0.3) prevents oscillation at the
   crossover. A structural/arithmetic refusal (launch, unsupported_plan,
   too_few_rows, too_many_constants, ill_conditioned, non_finite,
@@ -809,6 +864,22 @@ fn jstr(s: &str) -> String {
     o
 }
 
+fn parse_trade_number(flag: &str, text: &str) -> f64 {
+    match text.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        _ => {
+            eprintln!("error: {} needs a finite number, got '{}'", flag, text);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+}
+
+/// #263: a usage error for the P&L objective, exit 2.
+fn trading_usage(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    std::process::exit(EXIT_USAGE);
+}
+
 /// JSON number, with non-finite values rendered as `null` (valid JSON).
 fn jnum(v: f64) -> String {
     if v.is_finite() {
@@ -887,6 +958,12 @@ fn ledger_json(
         .map(|(name, n)| format!("{}:{}", jstr(name), n))
         .collect::<Vec<_>>()
         .join(",");
+    let improved_causes = l
+        .fallback_improved_by_cause()
+        .iter()
+        .map(|(name, n)| format!("{}:{}", jstr(name), n))
+        .collect::<Vec<_>>()
+        .join(",");
     let structural_zero = Stage::ALL
         .iter()
         .filter(|s| s.structurally_zero_in_search())
@@ -906,7 +983,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -938,6 +1015,8 @@ fn ledger_json(
         l.device_fits(),
         l.fallback_fits(),
         causes,
+        l.fallback_improved(),
+        improved_causes,
         l.fit_alloc().alloc_calls,
         l.fit_alloc().growths,
         l.fit_alloc().steady_alloc_calls,
@@ -987,7 +1066,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1002,6 +1081,8 @@ fn gpu_json(
                 s.fit_gpu,
                 s.fit_fallback,
                 ops_json(&s.fit_fallback_by_cause),
+                s.fit_fallback_improved_by_cause.values().sum::<usize>(),
+                ops_json(&s.fit_fallback_improved_by_cause),
                 jnum(s.fit_fallback_seconds),
                 s.fit_fallback_bounded,
                 s.fit_fallback_workers,
@@ -1040,13 +1121,16 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
+        jstr(g.fit_admission.name()),
         g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
         g.fit_fallback,
         ops_json(&g.fit_fallback_by_cause),
+        g.fit_fallback_improved_by_cause.values().sum::<usize>(),
+        ops_json(&g.fit_fallback_improved_by_cause),
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
@@ -1561,6 +1645,7 @@ fn dev_run_start(
     every: usize,
     max_bytes: u64,
     resumed_from: Option<String>,
+    fit_resolution: Option<(String, String)>,
 ) -> rcsr::devlog::RunStart {
     let (commit, dirty) = manifest::build_info();
     let exe = std::env::current_exe().unwrap_or_default();
@@ -1607,6 +1692,7 @@ fn dev_run_start(
         every,
         max_bytes,
         resumed_from,
+        fit_resolution,
     }
 }
 
@@ -1765,6 +1851,9 @@ struct Row {
     /// Selection reads this (or train/AICc), never `test_error`.
     validation_error: f64,
     test_error: f64,
+    /// #263: the P&L objective on the validation slice, lower is better;
+    /// `NaN` without a trading objective.
+    objective_value: f64,
     /// Small-sample-corrected AIC (fit vs. constants), lower is better.
     aicc: f64,
     /// Bayesian information criterion, lower is better.
@@ -1860,6 +1949,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("panel") {
         rcsr::panel::run(&args[1..]);
     }
+    // #264: windows table, candidate ledger, sealed list.
+    if args.first().map(|s| s.as_str()) == Some("protocol") {
+        rcsr::protocol::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -1909,6 +2002,19 @@ fn main() {
     // the test lockbox.
     let mut validation_frac = 0.0f64;
     let mut select_by_arg: Option<String> = None;
+    // #263: exact long/flat P&L objective for finalist selection.
+    let mut objective_arg: Option<String> = None;
+    let mut trading_flags: Vec<&'static str> = Vec::new();
+    let mut position_arg: Option<String> = None;
+    let mut allow_short = false;
+    let mut trade_threshold = 0.0f64;
+    let mut trade_cost_bps: Option<f64> = None;
+    let mut trade_slippage_bps = 0.0f64;
+    let mut trade_cash_return = 0.0f64;
+    let mut trade_funding: Option<String> = None;
+    let mut trade_max_position = 1.0f64;
+    let mut trade_min_trades = 1usize;
+    let mut trade_min_holding = 1usize;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
     let mut progress = false;
@@ -1965,6 +2071,9 @@ fn main() {
     let mut allow_interpolate = false;
     // #145: a search may not train or score inside 2026H2 by default.
     let mut allow_lockbox = false;
+    // #264: declared locked test and the ledger whose reads run.json counts.
+    let mut lockbox_arg: Option<String> = None;
+    let mut ledger_arg: Option<String> = None;
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
@@ -2175,6 +2284,47 @@ fn main() {
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
             "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
             "--select-by" => select_by_arg = Some(val!()),
+            "--objective" => objective_arg = Some(val!()),
+            "--position" => {
+                trading_flags.push("--position");
+                position_arg = Some(val!());
+            }
+            "--allow-short" => {
+                trading_flags.push("--allow-short");
+                allow_short = true;
+            }
+            "--threshold" => {
+                trading_flags.push("--threshold");
+                trade_threshold = parse_trade_number("--threshold", &val!());
+            }
+            "--cost-bps" => {
+                trading_flags.push("--cost-bps");
+                trade_cost_bps = Some(parse_trade_number("--cost-bps", &val!()));
+            }
+            "--slippage-bps" => {
+                trading_flags.push("--slippage-bps");
+                trade_slippage_bps = parse_trade_number("--slippage-bps", &val!());
+            }
+            "--cash-return" => {
+                trading_flags.push("--cash-return");
+                trade_cash_return = parse_trade_number("--cash-return", &val!());
+            }
+            "--funding" => {
+                trading_flags.push("--funding");
+                trade_funding = Some(val!());
+            }
+            "--max-position" => {
+                trading_flags.push("--max-position");
+                trade_max_position = parse_trade_number("--max-position", &val!());
+            }
+            "--min-trades" => {
+                trading_flags.push("--min-trades");
+                trade_min_trades = parse_trade_number("--min-trades", &val!()) as usize;
+            }
+            "--min-holding" => {
+                trading_flags.push("--min-holding");
+                trade_min_holding = parse_trade_number("--min-holding", &val!()) as usize;
+            }
             "--fill" => {
                 let v = val!();
                 match data::FillMethod::parse(&v) {
@@ -2212,6 +2362,8 @@ fn main() {
                 }
             },
             "--allow-interpolate" => allow_interpolate = true,
+            "--lockbox" => lockbox_arg = Some(val!()),
+            "--ledger" => ledger_arg = Some(val!()),
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
@@ -2778,6 +2930,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #223: the engine resolves the fit arm only when the person did not name
+    // one, or named `auto`. A resume keeps the saved arm.
+    let mut fit_request: Option<fit::FitRequest> = if !fit_strategy_set {
+        Some(fit::FitRequest::Unset)
+    } else if cfg.fit_strategy == fit::FitStrategy::Auto {
+        Some(fit::FitRequest::Auto)
+    } else {
+        None
+    };
     // #223 + #229 + #222: an explicit `--fit-strategy gpu` asks for the batched
     // GPU LM, which minimises squared error, log-squashed loss or mean absolute
     // error. Refuse a metric with no native device objective instead of
@@ -2826,6 +2987,19 @@ fn main() {
         eprintln!("error: --implicit cannot be combined with --cv (not implemented yet)");
         eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
         std::process::exit(EXIT_USAGE);
+    }
+    if cfg.metric == Metric::Slope {
+        for (present, flag) in [
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (cv_mode.is_some(), "--cv"),
+        ] {
+            if present {
+                eprintln!("error: --metric slope cannot be combined with {}", flag);
+                eprintln!("  slope differences rows that are adjacent in the data order; resampled or refolded rows have no such order");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
     }
     if implicit_mode && bootstrap_resamples > 0 {
         eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
@@ -3027,6 +3201,7 @@ fn main() {
         }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
+        fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
@@ -3175,6 +3350,7 @@ fn main() {
             (require_validation, "--require-validation"),
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
+            (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -3435,7 +3611,10 @@ fn main() {
                     scan_cols,
                     projection: store_projection.as_ref().map(|p| p.indices()),
                     gpu: cfg.gpu,
-                    gpu_fit: cfg.gpu && cfg.fit_iters > 0 && cfg.fit_strategy.defers_to_gpu(),
+                    gpu_fit: cfg.gpu
+                        && cfg.fit_iters > 0
+                        && (cfg.fit_strategy.defers_to_gpu()
+                            || (fit_request.is_some() && cfg.metric.is_least_squares())),
                     mutable_prep,
                     simd: cfg.simd,
                 };
@@ -3957,6 +4136,96 @@ fn main() {
         }
     }
 
+    // #263: the exact long/flat P&L objective. Every refusal is a usage error
+    // raised before any data is read.
+    let objective = match rcsr::trading::Objective::parse(objective_arg.as_deref().unwrap_or("mse")) {
+        Ok(o) => o,
+        Err(e) => trading_usage(&e),
+    };
+    if !objective.is_trading() {
+        if let Some(flag) = trading_flags.first() {
+            trading_usage(&format!("{} needs --objective pnl, sharpe or log_growth", flag));
+        }
+    }
+    let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
+    let mut trading_cols: Option<data::TradingColumns> = None;
+    if objective.is_trading() {
+        let name = objective.name();
+        if multi_output {
+            trading_usage("--objective is not supported with multiple targets (--target y1,y2)");
+        }
+        if allow_short || position_arg.as_deref().is_some_and(|p| p != "long_only") {
+            trading_usage(
+                "--position short and --allow-short are refused: the book is long-only, \
+                 there is no short P&L, borrow or funding",
+            );
+        }
+        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+            || time_col.is_none()
+        {
+            trading_usage(&format!(
+                "--objective {} needs a temporal split: add --time <col> and --split temporal",
+                name
+            ));
+        }
+        let ts = match &target_resolved {
+            Some(r) => &r.spec,
+            None => trading_usage(&format!(
+                "--objective {} needs a forward-return target: declare it with --target-spec",
+                name
+            )),
+        };
+        if ts.kind != "forward_return" {
+            trading_usage(&format!(
+                "--objective {} needs a forward_return target, the spec declares '{}'",
+                name, ts.kind
+            ));
+        }
+        let cost = match trade_cost_bps {
+            Some(c) => c,
+            None => trading_usage(&format!(
+                "--objective {} needs a cost assumption: --cost-bps <f> per side (0 only when stated)",
+                name
+            )),
+        };
+        if cost < 0.0 || trade_slippage_bps < 0.0 {
+            trading_usage("--cost-bps and --slippage-bps must be non-negative");
+        }
+        if ts.cost_in_label && cost + trade_slippage_bps != 0.0 {
+            trading_usage(
+                "cost_already_in_label: the target spec says the label is net of cost, \
+                 so a non-zero --cost-bps or --slippage-bps would charge it twice",
+            );
+        }
+        let unit_scale = matches!(&ts.scale, target::Scale::Constant { value } if *value == 1.0);
+        if ts.return_column.is_none() && (ts.offset != 0.0 || ts.clip.is_some() || !unit_scale) {
+            trading_usage(
+                "the target is scaled, clipped or offset: declare a return_column in the \
+                 target spec so the P&L uses realised returns",
+            );
+        }
+        trading_cols = Some(data::TradingColumns {
+            return_column: ts.return_column.clone(),
+            log_returns: ts.return_units == "log",
+            funding_column: trade_funding.clone(),
+        });
+        let tspec = rcsr::trading::TradingSpec {
+            cost_bps: cost,
+            slippage_bps: trade_slippage_bps,
+            funding_col: trade_funding.clone(),
+            cash_return: trade_cash_return,
+            min_trades: trade_min_trades,
+            min_holding: trade_min_holding,
+            threshold: trade_threshold,
+            max_position: trade_max_position,
+            ..Default::default()
+        };
+        if let Err(e) = tspec.validate() {
+            trading_usage(&e);
+        }
+        trading_spec = Some(tspec);
+    }
+
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -3975,6 +4244,7 @@ fn main() {
         },
         allow_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
+        trading: trading_cols.clone(),
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -4046,6 +4316,19 @@ fn main() {
     };
     notes.extend(prepared.report.notes.iter().cloned());
     let prepared_s = run_start.elapsed().as_secs_f64();
+    if cfg.metric == Metric::Slope {
+        match prepared.require_slope_pairs() {
+            Ok(pairs) => notes.push(format!(
+                "slope: differencing {} adjacent-row pair(s) among {} training row(s)",
+                pairs,
+                prepared.train.len()
+            )),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
 
     // #254: the zero-parameter rung and, under the override, the proxy table.
     let target_active: Option<target::Active> = match (target_resolved.take(), target_check.take()) {
@@ -4217,6 +4500,21 @@ fn main() {
     if select_by.is_none() && prepared.validation.is_some() {
         select_by = Some(rcsr::selection::SelectBy::Validation);
     }
+    if objective.is_trading() {
+        if select_by_arg
+            .as_deref()
+            .is_some_and(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "validation" | "val"))
+        {
+            trading_usage("--objective selects on the validation slice; use --select-by validation or drop it");
+        }
+        if prepared.validation.is_none() {
+            trading_usage(&format!(
+                "--objective {} needs a validation slice: add --validation-frac <f>",
+                objective.name()
+            ));
+        }
+        select_by = Some(rcsr::selection::SelectBy::ValidationObjective);
+    }
     if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
         eprintln!(
             "error: --select-by validation needs a validation slice;              add --validation-frac <f>"
@@ -4364,6 +4662,35 @@ fn main() {
     }
     let effective_backend = search::effective_backend(&cfg, &prepared.train);
 
+    // #223: resolve the fit arm once, before the memory plan and the run
+    // records. A CPU-only run keeps today's arm and prints nothing new.
+    let fit_resolution: Option<fit::FitResolution> = fit_request
+        .map(|request| search::resolve_fit_strategy(&cfg, &prepared.train, request));
+    if let Some(r) = &fit_resolution {
+        cfg.fit_strategy = r.strategy;
+        cfg.fit_admission = r.admission;
+        if !quiet && effective_backend == Backend::Gpu {
+            if r.strategy == fit::FitStrategy::Gpu {
+                eprintln!(
+                    "# gpu-fit: {} -> gpu ({}, admit {})",
+                    r.source,
+                    cfg.metric.name(),
+                    r.admission.name()
+                );
+            } else {
+                eprintln!(
+                    "# gpu-fit: {} -> {} ({})",
+                    r.source,
+                    r.strategy.name(),
+                    r.reason
+                );
+            }
+        }
+    }
+    let fit_provenance: Option<(String, String)> = fit_resolution
+        .as_ref()
+        .map(|r| (r.source.to_string(), r.reason.clone()));
+
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
     // population. A syntax error is a usage error and keeps the parser's
@@ -4463,6 +4790,7 @@ fn main() {
         );
         let mut m = m;
         m.start_utc = run_start_utc.clone();
+        m.fit_resolution = fit_provenance.clone();
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),
@@ -4758,6 +5086,7 @@ fn main() {
                         dev_every,
                         dev_log_max_bytes,
                         resume_path.clone(),
+                        fit_provenance.clone(),
                     );
                     sink.write(&rcsr::devlog::run_start_json(&info), true);
                     if !quiet {
@@ -5073,6 +5402,16 @@ fn main() {
                 Some(v) => search::eval_error(&s.tree, v, cfg.metric),
                 None => f64::NAN,
             };
+            let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
+                (Some(tspec), Some(v), Some(slice)) => {
+                    let vpred: Vec<f64> = v.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+                    match rcsr::trading::evaluate(&vpred, &slice.ret, &slice.rows, tspec) {
+                        Ok(stats) => objective.score(&stats, tspec.min_trades),
+                        Err(_) => f64::INFINITY,
+                    }
+                }
+                _ => f64::NAN,
+            };
             let pred: Vec<f64> = prepared
                 .train
                 .x
@@ -5134,6 +5473,7 @@ fn main() {
                 train_error,
                 validation_error,
                 test_error,
+                objective_value,
                 aicc,
                 bic,
                 dw,
@@ -5206,7 +5546,9 @@ fn main() {
             .iter()
             .map(|r| rcsr::selection::Candidate {
                 train: r.train_error,
-                validation: if r.validation_error.is_finite() {
+                validation: if objective.is_trading() {
+                    Some(r.objective_value)
+                } else if r.validation_error.is_finite() {
                     Some(r.validation_error)
                 } else {
                     None
@@ -5223,6 +5565,50 @@ fn main() {
         }
         if !quiet {
             eprintln!("# selection: {} (test errors are scoring-only)", by.name());
+        }
+    }
+
+    // #263: the trading objective's finalist. Selection above read only the
+    // validation slice; the test book is scored here, for the winner alone.
+    let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
+        (Some(tspec), Some(top)) => {
+            let tree = &sorted[top.archive_rank - 1].tree;
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>| match slice {
+                Some(slice) => {
+                    let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
+                    rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec)
+                }
+                None => Err("no trading rows".to_string()),
+            };
+            let split = prepared.trading.as_ref();
+            let usable = rows.iter().filter(|r| r.objective_value.is_finite()).count();
+            if usable == 0 && !quiet {
+                eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
+            }
+            Some(rcsr::trading::FinalistReport {
+                objective,
+                spec: tspec.clone(),
+                candidates: rows.len(),
+                usable,
+                expression: top.expression.clone(),
+                archive_rank: top.archive_rank,
+                fit_metric: cfg.metric.name().to_string(),
+                fit_error: top.train_error,
+                validation_error: top.validation_error,
+                test_error: top.test_error,
+                validation_value: top.objective_value,
+                validation: match &prepared.validation {
+                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
+                    None => Err("no validation slice".to_string()),
+                },
+                test: book(&prepared.test, split.map(|t| &t.test)),
+            })
+        }
+        _ => None,
+    };
+    if let Some(rep) = &objective_report {
+        if format == Format::Text && !quiet {
+            eprintln!("{}", rep.text());
         }
     }
 
@@ -5426,6 +5812,7 @@ fn main() {
                 y,
                 w: prepared.train.w.clone(),
                 ys: Vec::new(),
+                pairs: None,
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -5928,6 +6315,35 @@ fn main() {
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
                 target::split_purge_json(&prepared.report)
             );
+            // #264: lockbox facts of the loaded table (rows, date range, read count).
+            let lockbox_json = {
+                let lockbox = match lockbox_arg.as_deref() {
+                    Some(s) => rcsr::lockbox::Lockbox::parse(s).unwrap_or_else(|e| {
+                        eprintln!("error: --lockbox: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }),
+                    None => rcsr::lockbox::Lockbox::crypto_2026h2(),
+                };
+                let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
+                    Some(j) => data::time_keys_with(&table, j, &spec.time)
+                        .map(|(k, _)| k)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.floor() as i64)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let overlap = lockbox.overlap(times.iter().copied());
+                let reads = ledger_arg
+                    .as_ref()
+                    .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
+                    .unwrap_or(0);
+                let mut j = lockbox.json(&overlap, allow_lockbox, false, allow_lockbox && overlap.rows > 0);
+                j.pop();
+                j.push_str(&format!(",\"read_count\":{}}}", reads));
+                j
+            };
             let seeds_json: Vec<String> = seed_rows
                 .iter()
                 .map(|(expression, complexity, error)| {
@@ -6154,7 +6570,20 @@ fn main() {
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+            // #223: the resolution is reported when the device ran the search,
+            // so a CPU-backend run keeps the historical object.
+            let fit_provenance_json = match (&fit_provenance, outcome.backend.name()) {
+                (Some((source, reason)), "gpu") => format!(
+                    ",\"strategy_source\":{},\"strategy_reason\":{}",
+                    jstr(source),
+                    jstr(reason)
+                ),
+                _ => String::new(),
+            };
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact
+                && outcome.fit_rows == 0
+                && fit_provenance_json.is_empty()
+            {
                 // #116: the historical default JSON stays byte-identical; the
                 // portfolio fields appear when a non-default arm or fit-row
                 // screen is in use.
@@ -6165,12 +6594,13 @@ fn main() {
                 )
             } else {
                 format!(
-                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}}}",
                     jstr(cfg.metric.name()),
                     jnum(best_fit_loss),
                     jstr(cfg.fit_strategy.name()),
                     outcome.fit_rows,
-                    fit::fit_arm_counts_full().since(fit_before).gpu
+                    fit::fit_arm_counts_full().since(fit_before).gpu,
+                    fit_provenance_json
                 )
             };
             // #141: report the backend that actually guided the search, with
@@ -6194,8 +6624,16 @@ fn main() {
                     .map(jstr)
                     .unwrap_or_else(|| "null".to_string())
             );
+            let backend_json = match &objective_report {
+                Some(rep) => format!(
+                    "{}\"objective\":{},",
+                    backend_json,
+                    rep.json(outcome.backend.name(), backend_reason.as_deref())
+                ),
+                None => backend_json,
+            };
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -6212,6 +6650,7 @@ fn main() {
                 prepared.train.len(),
                 prepared.test.len(),
                 split_json,
+                lockbox_json,
                 target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
@@ -6999,7 +7438,7 @@ fn run_eval(
 
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-        metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
+        metrics::score_sample(&pred, s, metric, k)
     };
     let train_error = score(&prepared.train);
     // One test block leaves `fold_samples` empty (#133): score the test block.
@@ -8647,6 +9086,46 @@ OPTIONS:
                              matched-exposure random long, each with exposure,
                              turnover, beta and excess over cash. With
                              --device-pnl they are cross-checked on the device
+  --entry-offset <seconds>   seconds from the row stamp to the label entry
+                             (default 0). Required purge = entry-offset +
+                             horizon + delay; a window with a shorter gap is
+                             refused
+  --delay <seconds>          execution delay, part of the required purge
+                             (default 0)
+  --windows-scheme <name>    with a protocol/windows.csv table: keep the rows of
+                             one scheme (expanding | rolling | locked). The
+                             table's validation_start column replaces
+                             --validation-frac
+  --bootstrap <B>            circular block bootstrap with B draws (default 0 =
+                             off; 10000 recommended). Reports CIs for the mean
+                             and Sharpe, the design effect against an iid row
+                             bootstrap, effective n, DSR at N_eff and 10 N_eff,
+                             PBO (CSCV), SPA against the best long/flat baseline
+                             and BH-FDR over the candidates
+  --block-len <L>            block length in periods (default
+                             max(h, hold, n^(1/3))); must be >= max(h, hold)
+  --null-draws <B>           draws of the hour-block permutation null and the
+                             matched-exposure random long/flat null (default 0
+                             = off); p = (1+count)/(B+1)
+  --trials <N>               total trials behind the candidates, the N of the
+                             DSR (default: the candidate count)
+  --protocol-seed <n>        seed of every bootstrap, null and SPA draw
+  --pbo-blocks <S>           even CSCV block count (default 16)
+  --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
+  --ledger <file>            append-only JSONL candidate ledger. A development
+                             run appends a candidate (test_read:false) and
+                             refuses windows that touch the declared lockbox
+  --lockbox <START,END>      declared locked test, UTC half-open (default
+                             2025-07-01,2026-07-01); active with --ledger or
+                             --locked-test
+  --locked-test              read the locked test once for a sealed candidate.
+                             Needs --ledger and --sealed. A second read, an
+                             unsealed candidate or a code/data hash that differs
+                             from the sealed entry is refused
+  --sealed <file>            locked_candidates.json from `rcsr protocol seal`
+  --verify-read              with --locked-test: recompute a recorded read and
+                             compare its report hash; records nothing
+  --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
@@ -8698,6 +9177,14 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut markdown: Option<String> = None;
     let mut quiet = false;
     let mut allow_lockbox = false;
+    let mut popts = walkforward::ProtocolOptions::default();
+    let mut windows_scheme: Option<String> = None;
+    let mut ledger_path: Option<String> = None;
+    let mut sealed_path: Option<String> = None;
+    let mut locked_test = false;
+    let mut verify_read = false;
+    let mut lockbox_arg: Option<String> = None;
+    let mut expect_hash: Option<String> = None;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -8851,6 +9338,60 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--quiet" => quiet = true,
+            "--entry-offset" => {
+                popts.entry_offset = number(need(args, i + 1, "--entry-offset"), "--entry-offset");
+                i += 1;
+            }
+            "--delay" => {
+                popts.delay = number(need(args, i + 1, "--delay"), "--delay");
+                i += 1;
+            }
+            "--windows-scheme" => {
+                windows_scheme = Some(need(args, i + 1, "--windows-scheme"));
+                i += 1;
+            }
+            "--bootstrap" | "--block-len" | "--null-draws" | "--trials" | "--protocol-seed" | "--pbo-blocks" => {
+                let flag = args[i].clone();
+                let src = need(args, i + 1, &flag);
+                let v = match src.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("error: {} needs a non-negative integer, got '{}'", flag, src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                match flag.as_str() {
+                    "--bootstrap" => popts.bootstrap_draws = v as usize,
+                    "--block-len" => popts.block_len = Some(v as usize),
+                    "--null-draws" => popts.null_draws = v as usize,
+                    "--trials" => popts.trials = Some(v as usize),
+                    "--protocol-seed" => popts.seed = v as u32,
+                    _ => popts.pbo_blocks = v as usize,
+                }
+                i += 1;
+            }
+            "--fdr-q" => {
+                popts.fdr_q = number(need(args, i + 1, "--fdr-q"), "--fdr-q");
+                i += 1;
+            }
+            "--ledger" => {
+                ledger_path = Some(need(args, i + 1, "--ledger"));
+                i += 1;
+            }
+            "--sealed" => {
+                sealed_path = Some(need(args, i + 1, "--sealed"));
+                i += 1;
+            }
+            "--lockbox" => {
+                lockbox_arg = Some(need(args, i + 1, "--lockbox"));
+                i += 1;
+            }
+            "--expect-report-sha256" => {
+                expect_hash = Some(need(args, i + 1, "--expect-report-sha256"));
+                i += 1;
+            }
+            "--locked-test" => locked_test = true,
+            "--verify-read" => verify_read = true,
             "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
@@ -8948,6 +9489,22 @@ fn run_walkforward(args: &[String]) -> ! {
     });
     if let Some(file) = windows_file {
         match std::fs::read_to_string(&file) {
+            Ok(text) if rcsr::protocol::is_windows_table(&text) => {
+                match rcsr::protocol::parse_windows_csv(&text, windows_scheme.as_deref()) {
+                    Ok(rows) => {
+                        for r in rows {
+                            popts
+                                .validation_starts
+                                .push((r.window.label.clone(), r.validation_start));
+                            windows.push(r.window);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}: {}", file, e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             Ok(text) => {
                 let mut seen = 0usize;
                 for (n, line) in text.lines().enumerate() {
@@ -9021,12 +9578,155 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let report = match walkforward::run_path(&data_path, &spec) {
+    let declared_lock: Option<(f64, f64)> = if ledger_path.is_some() || locked_test || lockbox_arg.is_some() {
+        match &lockbox_arg {
+            Some(s) => match rcsr::lockbox::Lockbox::parse(s) {
+                Ok(l) => Some((l.start as f64, l.end as f64)),
+                Err(e) => {
+                    eprintln!("error: --lockbox: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            None => Some(rcsr::protocol::default_locked_range()),
+        }
+    } else {
+        None
+    };
+    if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
+        eprintln!("error: --locked-test needs --ledger and --sealed");
+        std::process::exit(EXIT_USAGE);
+    }
+    if let Some((ls, le)) = declared_lock {
+        for w in &spec.windows {
+            let train_hits = w.train_start < le && w.train_end > ls;
+            let test_hits = w.test_start < le && w.test_end > ls;
+            let test_inside = w.test_start >= ls && w.test_end <= le;
+            let problem = if locked_test {
+                if train_hits {
+                    Some("trains on the locked test")
+                } else if !test_inside {
+                    Some("tests outside the locked test")
+                } else {
+                    None
+                }
+            } else if train_hits || test_hits {
+                Some("touches the declared locked test; read it only with --locked-test and a sealed list")
+            } else {
+                None
+            };
+            if let Some(p) = problem {
+                eprintln!("error: window '{}' {}", w.label, p);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    let (data_sha, build_id) = if ledger_path.is_some() {
+        let sha = match rcsr::manifest::sha256_file(&data_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let (commit, dirty) = rcsr::manifest::build_info();
+        (sha, if dirty { format!("{}-dirty", commit) } else { commit })
+    } else {
+        (String::new(), String::new())
+    };
+    let spec_sha = rcsr::manifest::sha256_hex(rcsr::protocol::procedure_spec(&spec, &popts).as_bytes());
+    let candidate_id = rcsr::protocol::Candidate::address(&spec_sha, &data_sha, &build_id);
+    let ledger = ledger_path.as_ref().map(rcsr::protocol::Ledger::new);
+    let mut read_count = 0u64;
+    if let Some(l) = &ledger {
+        let r = (|| -> Result<u64, String> {
+            l.verify_chain()?;
+            if locked_test {
+                let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
+                if verify_read {
+                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id)?;
+                } else {
+                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id)?;
+                }
+            }
+            l.read_count()
+        })();
+        match r {
+            Ok(c) => read_count = c,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    let report = match walkforward::run_path_with(&data_path, &spec, &popts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+    };
+    let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());
+    if let Some(want) = &expect_hash {
+        if want != &report_sha {
+            eprintln!("error: report sha256 {} differs from the expected {}", report_sha, want);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    let mut protocol_json: Option<String> = None;
+    if let Some((ls, le)) = declared_lock {
+        let rows: usize = if locked_test { report.windows.iter().map(|w| w.test_rows).sum() } else { 0 };
+        let first = report.windows.iter().map(|w| w.window.test_start).fold(f64::INFINITY, f64::min);
+        let last = report.windows.iter().map(|w| w.window.test_end).fold(f64::NEG_INFINITY, f64::max);
+        if let Some(l) = &ledger {
+            let outcome = if locked_test && verify_read {
+                match l.read_report_sha(&candidate_id) {
+                    Some(h) if h == report_sha => Ok(read_count),
+                    Some(h) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
+                    None => Err("no recorded read for this candidate".to_string()),
+                }
+            } else if locked_test {
+                l.record_read(&candidate_id, &report_sha)
+            } else {
+                l.add_candidate(&rcsr::protocol::Candidate {
+                    id: candidate_id.clone(),
+                    spec_sha256: spec_sha.clone(),
+                    data_sha256: data_sha.clone(),
+                    build_commit: build_id.clone(),
+                    report_sha256: report_sha.clone(),
+                    expression: report.candidates.join(" | "),
+                })
+                .map(|_| read_count)
+            };
+            match outcome {
+                Ok(c) => read_count = c,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        let facts = rcsr::protocol::LockboxFacts {
+            start: ls,
+            end: le,
+            rows,
+            first_ts: if rows > 0 { Some(first) } else { None },
+            last_ts: if rows > 0 { Some(last) } else { None },
+            read_count,
+        };
+        protocol_json = Some(format!(
+            "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
+             \"ledger\":{},\"windows_scheme\":{}}}",
+            facts.json(),
+            if ledger.is_some() { format!("\"{}\"", candidate_id) } else { "null".to_string() },
+            format!("\"{}\"", report_sha),
+            locked_test,
+            ledger_path.as_ref().map_or("null".to_string(), |p| format!("{:?}", p)),
+            windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
+        ));
+    }
+    let report_json = || match &protocol_json {
+        Some(p) => report.json_with_protocol(p),
+        None => report.json(),
     };
     for w in &report.windows {
         let reasons = [
@@ -9043,7 +9743,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
     if let Some(path) = out {
-        if let Err(e) = std::fs::write(&path, report.json()) {
+        if let Err(e) = std::fs::write(&path, report_json()) {
             eprintln!("error: {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -9057,7 +9757,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
     }
     if json {
-        println!("{}", report.json());
+        println!("{}", report_json());
     } else if !quiet && !wrote_out && !wrote_markdown {
         print!("{}", report.text());
     }
@@ -9890,6 +10590,8 @@ mod tests {
         g.fit_fallback_by_cause
             .insert("ill_conditioned".to_string(), 2);
         g.fit_fallback_by_cause.insert("non_finite".to_string(), 1);
+        g.fit_fallback_improved_by_cause
+            .insert("ill_conditioned".to_string(), 1);
         g.fit_status_by_label
             .insert("rank_deficient".to_string(), 4);
         g.fit_refits = 5;
@@ -9903,7 +10605,7 @@ mod tests {
         g.fit_fallback_max = 4096;
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
             json
         );
@@ -9924,7 +10626,7 @@ mod tests {
         l.record_stage(Stage::Archive, 0.5);
         l.record_stage(Stage::HostOther, 3.0);
         l.record_fit(2.0, 1.5, 0.4);
-        l.record_fit_counters(10, 8, 2, [("non_finite".to_string(), 2)].into_iter().collect());
+        l.record_fit_counters(10, 8, 2, [("non_finite".to_string(), 2)].into_iter().collect(), [("non_finite".to_string(), 1)].into_iter().collect());
         l.record_eval_fallback(3, 0.2);
         l.record_interval(Stage::Eval, 0, 1.0, 4.0);
         l.record_interval(Stage::Fit, 1, 3.0, 5.0);
@@ -9940,6 +10642,7 @@ mod tests {
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",
             "\"fallback_by_cause\":{\"non_finite\":2}",
+            "\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"non_finite\":1}",
             "\"alloc\":{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":0,\"growths\":0,\"steady_alloc_calls\":0,\"batches\":0}",
             "\"units\":\"fraction\"",
             "\"scope\":\"run\"",
@@ -9980,6 +10683,7 @@ mod tests {
             y: vec![0.0, 2.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         // SSE = 2, n = 2 -> MSE = 1.
         assert!((gpu_baseline_error(&train) - 1.0).abs() < 1e-12);

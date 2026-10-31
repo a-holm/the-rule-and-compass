@@ -2862,3 +2862,159 @@ fn engine_inventory_future_shift_is_caught_by_the_prefix_check() {
     assert!(checked > 100, "only {checked} engine columns exercised");
     assert!(missed.is_empty(), "future-shifted columns not detected: {missed:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Issue #269: default financial feature set gate
+// ---------------------------------------------------------------------------
+
+/// A hole is never bridged: for every available time-series name that is not a
+/// raw input, a calendar field, a cross-section or a higher-timeframe join, a
+/// row after the hole does not depend on any bar before it. The pre-hole bars
+/// are replaced by different prices and flow; every post-hole value must keep
+/// its value and its NaN mask. The cross-section, higher-timeframe and
+/// calendar families carry their own per-name tests, named in the inventory.
+#[test]
+fn every_available_name_is_nan_after_a_gap() {
+    let dir = tmp_dir("every_gap");
+    let a_src = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let b_src = dir.join("b.rcsb").to_string_lossy().into_owned();
+    let a_out = dir.join("a_out.rcsb").to_string_lossy().into_owned();
+    let b_out = dir.join("b_out.rcsb").to_string_lossy().into_owned();
+    let gap = 450usize;
+    let n = 900usize;
+    let make = |altered: bool| {
+        let mut rows: Vec<(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)> = Vec::new();
+        for (symbol, base) in [("AAA", 100.0), ("BTCUSDT", 200.0)] {
+            for i in 0..n {
+                let t = if i < gap { i as i64 * 900 } else { (i as i64 + 5) * 900 };
+                let x = i as f64;
+                let pre = i < gap && altered;
+                let scale = if pre { 1.0 + 0.4 * (x * 0.9).cos().abs() } else { 1.0 };
+                let p = (base + (x * 0.23).sin() * 2.0 + x * 0.01) * scale;
+                let o = p + (x * 0.7).cos() * 0.2;
+                let c = p + (x * 0.4).sin() * 0.3;
+                let h = o.max(c) + 0.3 + (i % 5) as f64 * 0.05;
+                let l = o.min(c) - 0.3 - (i % 3) as f64 * 0.04;
+                let v = (10.0 + (i % 11) as f64) * if pre { 3.0 } else { 1.0 };
+                let share = 0.5 + 0.3 * (x * 0.31).sin() + if pre { 0.1 } else { 0.0 };
+                let qv = v * (h + l + c) / 3.0;
+                rows.push((t, symbol.to_string(), o, h, l, c, v, qv, 100.0 + v, v * share, v * share * c));
+            }
+        }
+        rows
+    };
+    write_flow_store(&a_src, &make(false), false, 64);
+    write_flow_store(&b_src, &make(true), false, 64);
+    let reg = enrich::default_registry();
+    let exempt = |family: &str| {
+        matches!(family, "identity" | "price" | "calendar" | "cross" | "mtf" | "derivatives")
+    };
+    let names: Vec<&enrich::RegistryEntry> = reg
+        .iter()
+        .filter(|e| e.available && e.source != "input" && !exempt(e.family))
+        .collect();
+    assert!(names.len() > 200, "only {} names under the gap rule", names.len());
+    let spec: Vec<&str> = names.iter().map(|e| e.name.as_str()).collect();
+    enrich::build(&opts(&a_src, &a_out, &spec.join(","))).unwrap();
+    enrich::build(&opts(&b_src, &b_out, &spec.join(","))).unwrap();
+    let mut failures: Vec<String> = Vec::new();
+    for e in &names {
+        let a = column(&a_out, &e.name);
+        let b = column(&b_out, &e.name);
+        let mut finite = 0usize;
+        'rows: for segment in 0..2usize {
+            for i in gap..n {
+                let (x, y) = (a[segment * n + i], b[segment * n + i]);
+                let same = (x.is_nan() && y.is_nan()) || (x - y).abs() <= 1e-9 * (1.0 + y.abs());
+                if !same {
+                    failures.push(format!("{} (family {}): {x} vs {y} at gap+{}", e.name, e.family, i - gap));
+                    break 'rows;
+                }
+                finite += usize::from(x.is_finite());
+            }
+        }
+        if failures.last().map_or(true, |f| !f.starts_with(&e.name)) && e.warmup + 10 < n - gap && finite == 0 {
+            failures.push(format!("{} is never finite after the hole", e.name));
+        }
+    }
+    assert!(failures.is_empty(), "{} names bridge the hole:\n{}", failures.len(), failures.join("\n"));
+}
+
+
+/// A real `--features compact` run appends exactly the 52 compact names in
+/// compact order, and `wasym1` is the only name registered as derived.
+#[test]
+fn compact_run_emits_exactly_the_52_names_and_only_wasym1_is_derived() {
+    let dir = tmp_dir("compact_run");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let mut rows = wavy_rows("AAA", 400, 0, 900, 0.0);
+    rows.extend(wavy_rows("BTCUSDT", 400, 0, 900, 1.3));
+    write_store_with_flow(&src, &rows, 64);
+    let input_names = FileStore::open(&src).unwrap().header().names();
+    let report = enrich::build(&opts(&src, &out, "compact")).unwrap();
+    assert_eq!(report.features.len(), 52);
+    let names = FileStore::open(&out).unwrap().header().names();
+    let appended: Vec<String> = names[input_names.len()..].to_vec();
+    assert_eq!(appended, enrich::compact_names());
+    assert!(appended.contains(&"wasym1".to_string()), "wasym1 stays materialised");
+    let derived: Vec<String> = enrich::default_registry()
+        .into_iter()
+        .filter(|e| e.derived)
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(derived, vec!["wasym1".to_string()]);
+    assert!(enrich::expand("not_a_feature").unwrap_err().contains("unknown"));
+}
+
+/// The registry carries the identity columns `gap` and `flags`, and the schema
+/// prints a per-family availability matrix that sums to the registry.
+#[test]
+fn registry_inventory_has_identity_gap_flags_and_a_complete_matrix() {
+    let reg = enrich::default_registry();
+    for name in ["ts", "symbol", "listing_id", "member_asof", "gap", "flags"] {
+        let e = reg.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} missing"));
+        assert_eq!(e.family, "identity");
+        assert!(e.available);
+    }
+    let matrix = rcsr::registry::availability_matrix_json();
+    let mut total = 0usize;
+    for part in matrix.split("\"available\":").skip(1) {
+        total += part.split(',').next().unwrap().parse::<usize>().unwrap();
+    }
+    for part in matrix.split("\"unavailable\":").skip(1) {
+        total += part.split('}').next().unwrap().parse::<usize>().unwrap();
+    }
+    assert_eq!(total, reg.len(), "{matrix}");
+    assert!(rcsr::schema::json().contains("\"availability_matrix\""));
+    for e in reg.iter().filter(|e| !e.available) {
+        let dep = rcsr::derivatives::dependency_text(&e.name);
+        assert!(dep.contains("source") && dep.contains("publication lag"), "{} dependency: {dep}", e.name);
+    }
+}
+
+/// `docs/default_financial_features.json` is the generated inventory: one row
+/// per registry entry, every referenced test exists. Set
+/// `RCSR_WRITE_INVENTORY=1` to regenerate it.
+#[test]
+fn default_financial_features_inventory_is_current_and_every_test_id_exists() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("../docs/default_financial_features.json");
+    let want = rcsr::registry::default_features_json();
+    if std::env::var("RCSR_WRITE_INVENTORY").is_ok() {
+        std::fs::write(&path, &want).unwrap();
+    }
+    let have = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(have, want, "docs/default_financial_features.json is stale; rerun with RCSR_WRITE_INVENTORY=1");
+    let reg = enrich::default_registry();
+    assert_eq!(have.matches("\"name\":").count(), reg.len());
+    assert!(have.contains(&format!("\"count\": {}", reg.len())));
+    assert!(have.contains("\"compact_subset\": 52"));
+    for e in &reg {
+        for id in rcsr::registry::test_ids(e) {
+            let (file, func) = id.split_once("::").unwrap();
+            let text = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            assert!(text.contains(&format!("fn {func}(")), "{} cites missing test {id}", e.name);
+        }
+    }
+}

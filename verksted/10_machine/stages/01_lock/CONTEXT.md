@@ -16,7 +16,7 @@ Do NOT load: stopping or reniceing processes.
 
 ## Process
 
-1. The lock script `one-full-suite.sh` serialises cargo, sets autogroup 19, `nice -n 19` and `ionice -c 3`. Every cargo build, cargo test and `rcsr-bench` goes through it. Look before starting: no other cargo or rustc process.
+1. The lock script `one-full-suite.sh` serialises cargo, sets autogroup 19 and runs the command under `chrt -i 0` (SCHED_IDLE), `nice -n 19` and `ionice -c 3`. While `desktop-busy.sh` exits 0 (GPU video decoder or encoder busy, or the file `/mnt/lager/tmp/opencode/STREAMING` exists) it also pins the command to CPUs 2,3,6,7 and sets `RUST_TEST_THREADS=4`. `build-slot.sh` does the same and allows 1 slot instead of 3. Every cargo build, cargo test and `rcsr-bench` goes through it. Look before starting: no other cargo or rustc process.
 2. Write `lock.md`: running cargo, rustc and rcsr-bench processes with their nice values.
 3. A direct `cargo` call is the loophole; report it, do not copy it.
 

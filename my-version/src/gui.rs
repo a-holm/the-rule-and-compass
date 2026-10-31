@@ -777,6 +777,17 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--force", "the server does not enforce the CLI memory guard"),
     ("--gpu-memory", "the server does not take a device memory cap"),
     ("--select-by", "the GUI uses the engine's default selection criterion"),
+    ("--objective", "the GUI does not run the long/flat P&L objective"),
+    ("--position", "the GUI does not run the long/flat P&L objective"),
+    ("--allow-short", "the GUI does not run the long/flat P&L objective"),
+    ("--threshold", "the GUI does not run the long/flat P&L objective"),
+    ("--cost-bps", "the GUI does not run the long/flat P&L objective"),
+    ("--slippage-bps", "the GUI does not run the long/flat P&L objective"),
+    ("--cash-return", "the GUI does not run the long/flat P&L objective"),
+    ("--funding", "the GUI does not run the long/flat P&L objective"),
+    ("--max-position", "the GUI does not run the long/flat P&L objective"),
+    ("--min-trades", "the GUI does not run the long/flat P&L objective"),
+    ("--min-holding", "the GUI does not run the long/flat P&L objective"),
     ("--baseline-samples", "the GUI baseline uses the engine's default sample size"),
     ("--null-block", "the GUI null control only shuffles single rows"),
     ("--implicit", "the implicit target-as-input transform is not wired into the form"),
@@ -1320,6 +1331,7 @@ impl RunPlan {
             allow_lockbox: raw.allow_lockbox,
             purge_seconds: None,
             scale_column: None,
+            trading: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {
@@ -1360,6 +1372,21 @@ impl RunPlan {
 
         if let Some(src) = &raw.eval_expr {
             expr::parse(src, &vars).map_err(|e| format!("cannot parse --eval-expr: {}", e))?;
+        }
+
+        // #223: resolve the fit arm like the CLI does. The web front end is a
+        // fresh run, never a resume.
+        let mut cfg = cfg;
+        let named = request.args.iter().position(|a| a == "--fit-strategy");
+        let fit_request = match named {
+            None => Some(fit::FitRequest::Unset),
+            Some(_) if cfg.fit_strategy == fit::FitStrategy::Auto => Some(fit::FitRequest::Auto),
+            Some(_) => None,
+        };
+        if let Some(fit_request) = fit_request {
+            let resolved = search::resolve_fit_strategy(&cfg, &prepared.train, fit_request);
+            cfg.fit_strategy = resolved.strategy;
+            cfg.fit_admission = resolved.admission;
         }
 
         Ok(RunPlan {
@@ -1602,6 +1629,7 @@ impl RunPlan {
                     y,
                     w: prepared.train.w.clone(),
                     ys: Vec::new(),
+                    pairs: None,
                 };
                 let out = search::run(&self.cfg, &shuffled, &shuffled);
                 let b = out
@@ -1829,7 +1857,7 @@ impl RunPlan {
         };
         let score = |s: &data::Sample| -> f64 {
             let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-            metrics::score_weighted(&pred, &s.y, &s.w, self.cfg.metric, k)
+            metrics::score_sample(&pred, s, self.cfg.metric, k)
         };
         let train_error = score(&prepared.train);
         let fold_errors: Vec<f64> = prepared.fold_samples.iter().map(score).collect();

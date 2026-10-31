@@ -26,6 +26,7 @@ fn sample(n: usize, seed: u32) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -1430,4 +1431,223 @@ fn zero_adjoint_constant_is_frozen_and_the_rest_are_fitted() {
     assert!((device[0] - 1.3).abs() < 1e-3, "slope {}", device[0]);
     assert!((device[1] - 0.5).abs() < 1e-3, "intercept {}", device[1]);
     assert_eq!(device[2], 0.7, "the frozen slot does not move");
+}
+
+#[test]
+fn checkpoint_round_trip_preserves_the_admission() {
+    let train = sample(160, 1);
+    let test = sample(40, 2);
+    let base = Config {
+        generations: 2,
+        islands: 1,
+        pop: 12,
+        max_complexity: 8,
+        fit_iters: 2,
+        patience: 0,
+        seed: 4,
+        fit_strategy: FitStrategy::Gpu,
+        gpu: false,
+        ..Default::default()
+    };
+    assert_eq!(base.fit_admission, rcsr::fit::FitAdmission::Screened);
+    let save = |cfg: &Config| {
+        let mut text: Option<String> = None;
+        search::run_resumable(cfg, &train, &test, None, 0, |cp| {
+            text = Some(cp.to_text());
+        })
+        .expect("fresh run");
+        text.expect("a checkpoint callback")
+    };
+    let screened = save(&base);
+    assert!(
+        !screened.contains("fit_admission"),
+        "the default admission leaves the checkpoint bytes unchanged"
+    );
+    let cp = Checkpoint::from_text(&screened).expect("parse screened checkpoint");
+    assert_eq!(cp.config.fit_admission, rcsr::fit::FitAdmission::Screened);
+
+    let all = Config { fit_admission: rcsr::fit::FitAdmission::All, ..base.clone() };
+    let text = save(&all);
+    assert!(text.contains("config fit_admission all"));
+    let cp = Checkpoint::from_text(&text).expect("parse all checkpoint");
+    assert_eq!(cp.config.fit_strategy, FitStrategy::Gpu);
+    assert_eq!(cp.config.fit_admission, rcsr::fit::FitAdmission::All);
+    let again = Checkpoint::from_text(&cp.to_text()).expect("reparse");
+    assert_eq!(again.config.fit_admission, rcsr::fit::FitAdmission::All);
+    assert_ne!(
+        rcsr::checkpoint::config_hash(&again.config),
+        rcsr::checkpoint::config_hash(&base),
+        "the admission is part of the config hash"
+    );
+}
+
+fn cli_csv() -> String {
+    let mut text = String::from("x0,x1,y\n");
+    for i in 0..300 {
+        let a = ((i * 37) % 101) as f64 / 25.0 - 2.0;
+        let b = ((i * 53) % 97) as f64 / 24.0 - 2.0;
+        let noise = (((i * 29) % 13) as f64 - 6.0) / 100.0;
+        text.push_str(&format!("{a},{b},{}\n", 1.5 * (0.8 * a).sin() + 0.3 * b + noise));
+    }
+    text
+}
+
+/// The `fitting` object and the Pareto array of one `--json` run: everything
+/// the fit arm can change, without the wall-clock fields.
+fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", "-", "--target", "y", "--vars", "x0,x1", "--islands", "1", "--pop", "30",
+            "--generations", "3", "--seed", "1", "--patience", "0", "--json", "--no-dev-log",
+        ])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(cli_csv().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let json = String::from_utf8(out.stdout).unwrap();
+    let fitting = json.split("\"fitting\":").nth(1).unwrap().split('}').next().unwrap().to_string();
+    let front = json.split("\"pareto\":").nth(1).unwrap().to_string();
+    (fitting, front)
+}
+
+/// A CPU run keeps today's archive and `fitting` object whether the arm is
+/// unset or explicitly `exact`.
+#[test]
+fn cpu_default_run_is_byte_identical_to_explicit_exact() {
+    let default = cli_fit_and_front(&["--cpu", "--metric", "squared"]);
+    let exact = cli_fit_and_front(&["--cpu", "--metric", "squared", "--fit-strategy", "exact"]);
+    assert_eq!(default, exact);
+    assert!(!default.0.contains("strategy_source"), "{}", default.0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (fitting, front) = cli_fit_and_front(&["--metric", "squared"]);
+    assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_source\":\"default\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"admissible\""), "{fitting}");
+    let again = cli_fit_and_front(&["--metric", "squared"]);
+    assert_eq!(front, again.1, "two default-resolved runs give one front");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--no-fit"]);
+    assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"no_fit\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "absolute"]);
+    assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"metric_not_least_squares\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "auto"]);
+    assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_source\":\"auto\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "gpu"]);
+    assert!(!fitting.contains("strategy_source"), "an explicit arm is never resolved: {fitting}");
+}
+
+#[cfg(feature = "cuda")]
+fn correlation_run(metric: Metric, seed: u32, fit_iters: usize) -> (Outcome, Sample) {
+    let train = sample(2000, seed);
+    let test = sample(200, seed + 1);
+    let cfg = Config {
+        generations: 4,
+        pop: 32,
+        fit_iters,
+        metric,
+        ..gpu_config(seed + 2)
+    };
+    (search::run(&cfg, &train, &test), train)
+}
+
+/// The correlation family fits on the device through the exact gate: two runs
+/// are bit-identical and every archive error is the exact CPU `f64` metric.
+#[cfg(feature = "cuda")]
+fn assert_correlation_gpu_fit_is_deterministic_and_exact(metric: Metric, seed: u32) {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (a, train) = correlation_run(metric, seed, 4);
+    let (b, _) = correlation_run(metric, seed, 4);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.test_errors, b.test_errors);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu, "{:?}", a.backend_reason);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "the correlation fit kernel must run: {:?}", g);
+    assert_fit_ledger(g);
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, metric);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "archive row is not the exact CPU {} score: {} vs {}",
+            metric.name(),
+            s.error,
+            cpu
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_gpu_fit_run_is_deterministic_and_exact() {
+    assert_correlation_gpu_fit_is_deterministic_and_exact(Metric::Correlation, 81);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_gpu_fit_run_is_deterministic_and_exact() {
+    assert_correlation_gpu_fit_is_deterministic_and_exact(Metric::CorrelationSigned, 91);
+}
+
+/// `--fit-iters 0` attempts no fit and moves no constant for either metric.
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_gpu_no_fit_is_a_true_noop() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    for metric in [Metric::Correlation, Metric::CorrelationSigned] {
+        let (out, train) = correlation_run(metric, 101, 0);
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert_eq!(g.fit_attempts, 0, "no fit may be attempted: {:?}", g);
+        assert_eq!(g.fit_gpu, 0);
+        for s in &out.archive.items {
+            let cpu = search::eval_error(&s.tree, &train, metric);
+            assert_eq!(s.error.to_bits(), cpu.to_bits());
+        }
+    }
+}
+
+/// Affine-in-constants correlation trees take the CPU closed form, labelled
+/// `affine_closed_form`, and the ledger still closes.
+#[cfg(feature = "cuda")]
+#[test]
+fn an_affine_correlation_tree_takes_the_closed_form() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (out, _) = correlation_run(Metric::CorrelationSigned, 111, 4);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert_fit_ledger(g);
+    let affine = g
+        .fit_fallback_by_cause
+        .get("affine_closed_form")
+        .copied()
+        .unwrap_or(0);
+    assert!(affine > 0, "no affine tree was routed: {:?}", g.fit_fallback_by_cause);
 }

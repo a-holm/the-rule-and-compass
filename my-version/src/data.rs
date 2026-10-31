@@ -52,6 +52,12 @@ pub struct Sample {
     /// column per target**, including the first one; `y` is a copy of
     /// `ys[0]` so every single-target diagnostic keeps working unchanged.
     pub ys: Vec<Vec<f64>>,
+    /// Row pairs `[a, b]` (positions in this sample) that the order-dependent
+    /// `slope` metric differences: `b` is the row that directly follows `a` in
+    /// the original data order, within the same group. `None` means the rows
+    /// are already in data order and every consecutive pair counts (the
+    /// historical behaviour). Set by [`Prepared::require_slope_pairs`].
+    pub pairs: Option<Vec<[u32; 2]>>,
 }
 
 impl Sample {
@@ -62,6 +68,7 @@ impl Sample {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
@@ -76,6 +83,7 @@ impl Sample {
             y,
             w,
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
@@ -1560,6 +1568,9 @@ pub struct SplitSpec {
     /// #254: the target spec's scale column. Its raw values for the prepared
     /// rows are returned in [`Prepared::target_scale`].
     pub scale_column: Option<String>,
+    /// #263: the columns a long/flat P&L objective reads. `None` builds no
+    /// trading rows.
+    pub trading: Option<TradingColumns>,
 }
 
 impl Default for SplitSpec {
@@ -1579,6 +1590,7 @@ impl Default for SplitSpec {
             allow_lockbox: false,
             purge_seconds: None,
             scale_column: None,
+            trading: None,
         }
     }
 }
@@ -1675,6 +1687,117 @@ pub struct Prepared {
     /// #257: raw time keys of the prepared rows, aligned with the samples.
     /// `None` without a time column.
     pub keys: Option<RowKeys>,
+    /// #263: time, group, return and funding of the validation and test rows.
+    pub trading: Option<TradingSplit>,
+    /// Adjacent-row pairs of every sample (see [`Sample::pairs`]), kept so the
+    /// `slope` metric can adopt them through [`Prepared::require_slope_pairs`].
+    pub slope_pairs: SlopePairs,
+}
+
+/// Columns of the long/flat P&L book (#263).
+#[derive(Clone, Debug, Default)]
+pub struct TradingColumns {
+    /// Per-row simple or log return realised by a long position. `None`
+    /// uses the target column itself.
+    pub return_column: Option<String>,
+    /// The return column holds log returns; they are converted to simple
+    /// returns (`exp_m1`).
+    pub log_returns: bool,
+    pub funding_column: Option<String>,
+}
+
+/// One slice of the trading rows, aligned with the sample rows.
+#[derive(Clone, Debug, Default)]
+pub struct TradingSlice {
+    pub rows: crate::trading::TradingRows,
+    pub ret: Vec<f64>,
+}
+
+/// Trading rows of the validation slice and the pooled test block (#263).
+#[derive(Clone, Debug, Default)]
+pub struct TradingSplit {
+    pub validation: Option<TradingSlice>,
+    pub test: TradingSlice,
+}
+
+/// The pair lists of [`Prepared`]'s samples, in the order of each sample.
+#[derive(Clone, Debug, Default)]
+pub struct SlopePairs {
+    pub train: Vec<[u32; 2]>,
+    pub validation: Option<Vec<[u32; 2]>>,
+    pub test: Vec<[u32; 2]>,
+    pub folds: Vec<Vec<[u32; 2]>>,
+    pub split: &'static str,
+}
+
+impl Prepared {
+    /// Hand the adjacent-row pairs to every sample, for the `slope` metric.
+    /// Refuses when the training side keeps fewer than
+    /// [`crate::metrics::SLOPE_MIN_PAIRS`] pairs. Returns the training pair
+    /// count.
+    pub fn require_slope_pairs(&mut self) -> Result<usize, String> {
+        let found = self.slope_pairs.train.len();
+        if found < crate::metrics::SLOPE_MIN_PAIRS {
+            return Err(format!(
+                "metric slope differences rows that are adjacent in the data order and in the same group; \
+                 the {} split leaves {} such pair(s) among {} training row(s), fewer than the minimum {}. \
+                 Use --split temporal (contiguous blocks keep adjacent rows together) or provide more rows",
+                self.slope_pairs.split,
+                found,
+                self.train.len(),
+                crate::metrics::SLOPE_MIN_PAIRS
+            ));
+        }
+        let p = &self.slope_pairs;
+        self.train.pairs = Some(p.train.clone());
+        if let Some(v) = self.validation.as_mut() {
+            v.pairs = p.validation.clone();
+        }
+        self.test.pairs = Some(p.test.clone());
+        for (s, f) in self.fold_samples.iter_mut().zip(&p.folds) {
+            s.pairs = Some(f.clone());
+        }
+        Ok(found)
+    }
+}
+
+/// For every table row, the closest earlier row of the same group in data
+/// order, or `usize::MAX` for the first row of a group. `order` lists the
+/// rows from first to last (time order); `None` means table order. `group`
+/// gives each row's group id; `None` means a single group.
+pub fn row_predecessors(n: usize, order: Option<&[usize]>, group: Option<&[usize]>) -> Vec<usize> {
+    let mut prev = vec![usize::MAX; n];
+    let mut last: HashMap<usize, usize> = HashMap::new();
+    let mut visit = |r: usize| {
+        let g = group.map_or(0, |g| g[r]);
+        if let Some(p) = last.insert(g, r) {
+            prev[r] = p;
+        }
+    };
+    match order {
+        Some(o) => o.iter().for_each(|&r| visit(r)),
+        None => (0..n).for_each(&mut visit),
+    }
+    prev
+}
+
+/// The pairs `[a, b]` of sample positions for the sample made of table `rows`:
+/// `b` holds a row whose predecessor `prev[row]` is also in the sample, at
+/// position `a`. Rows can be in any order (a shuffled training side); a pair
+/// never crosses a group boundary or skips a row that is missing from the side.
+pub fn adjacent_pairs(rows: &[usize], prev: &[usize]) -> Vec<[u32; 2]> {
+    let mut at = vec![u32::MAX; prev.len()];
+    for (k, &r) in rows.iter().enumerate() {
+        at[r] = k as u32;
+    }
+    let mut out = Vec::new();
+    for (k, &r) in rows.iter().enumerate() {
+        let p = prev[r];
+        if p != usize::MAX && at[p] != u32::MAX {
+            out.push([at[p], k as u32]);
+        }
+    }
+    out
 }
 
 /// Time keys of the prepared rows (#257). Equal keys are one timestamp.
@@ -3212,9 +3335,39 @@ fn prepare_full_targets_weighted_inner(
             test: pick(&test_idx),
         }
     });
+    let trading = match &spec.trading {
+        Some(cols) => Some(build_trading(
+            cols,
+            spec,
+            filtered,
+            &validation_idx,
+            &test_idx,
+            validation.as_ref(),
+            &test,
+        )?),
+        None => None,
+    };
+    let slope_pairs = {
+        let order = spec.time_col.map(|tc| sorted_by(&time_keys(filtered, tc)));
+        let groups = spec.group_col.map(|gc| group_ids(filtered, gc).0);
+        let prev = row_predecessors(filtered.len(), order.as_deref(), groups.as_deref());
+        SlopePairs {
+            train: adjacent_pairs(&train_idx, &prev),
+            validation: (!validation_idx.is_empty()).then(|| adjacent_pairs(&validation_idx, &prev)),
+            test: adjacent_pairs(&test_idx, &prev),
+            folds: if fold_idx.len() > 1 {
+                fold_idx.iter().map(|f| adjacent_pairs(f, &prev)).collect()
+            } else {
+                Vec::new()
+            },
+            split: spec.mode.name(),
+        }
+    };
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
         keys,
+        trading,
+        slope_pairs,
         target_scale,
         train,
         validation,
@@ -4139,6 +4292,69 @@ fn sorted_by(keys: &TimeKeys) -> Vec<usize> {
     let mut order: Vec<usize> = (0..keys.len()).collect();
     order.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
     order
+}
+
+/// Time, group, return and funding of the validation and test rows (#263).
+fn build_trading(
+    cols: &TradingColumns,
+    spec: &SplitSpec,
+    filtered: &Table,
+    validation_idx: &[usize],
+    test_idx: &[usize],
+    validation: Option<&Sample>,
+    test: &Sample,
+) -> Result<TradingSplit, String> {
+    let tc = spec
+        .time_col
+        .ok_or("a P&L objective needs a time column (--time <col>)")?;
+    let time = time_keys(filtered, tc).to_f64();
+    let group: Vec<u64> = match spec.group_col {
+        Some(gc) => group_ids(filtered, gc).0.into_iter().map(|g| g as u64).collect(),
+        None => vec![0u64; filtered.len()],
+    };
+    let numeric = |name: &str, what: &str| -> Result<Vec<f64>, String> {
+        let j = filtered
+            .index_of(name)
+            .map_err(|e| format!("{} column: {}", what, e))?;
+        if !filtered.numeric[j] {
+            return Err(format!("{} column '{}' is not numeric", what, name));
+        }
+        Ok(filtered.col(j).to_vec())
+    };
+    let ret_col = match &cols.return_column {
+        Some(name) => Some(numeric(name, "return")?),
+        None => None,
+    };
+    let fund_col = match &cols.funding_column {
+        Some(name) => Some(numeric(name, "funding")?),
+        None => None,
+    };
+    let slice = |idx: &[usize], sample: &Sample| -> TradingSlice {
+        let ret: Vec<f64> = match &ret_col {
+            Some(c) => idx.iter().map(|&i| c[i]).collect(),
+            None => sample.y.clone(),
+        };
+        let ret = if cols.log_returns {
+            ret.into_iter().map(f64::exp_m1).collect()
+        } else {
+            ret
+        };
+        TradingSlice {
+            rows: crate::trading::TradingRows {
+                time: idx.iter().map(|&i| time[i]).collect(),
+                group: idx.iter().map(|&i| group[i]).collect(),
+                funding: match &fund_col {
+                    Some(c) => idx.iter().map(|&i| c[i]).collect(),
+                    None => Vec::new(),
+                },
+            },
+            ret,
+        }
+    };
+    Ok(TradingSplit {
+        validation: validation.map(|v| slice(validation_idx, v)),
+        test: slice(test_idx, test),
+    })
 }
 
 /// Comparable ordering key for every row of a time column.

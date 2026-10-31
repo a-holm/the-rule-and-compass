@@ -236,6 +236,9 @@ pub struct ControlRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlSet {
     pub seed: u64,
+    /// Equal-weight net period series of each control, in [`ControlKind::ALL`]
+    /// order, on the block's valid periods.
+    pub series: Vec<Vec<f64>>,
     /// The constant control's side (`true` = long).
     pub constant_long: bool,
     pub train_mean: f64,
@@ -411,6 +414,7 @@ pub fn evaluate_controls(
     };
     Ok(ControlSet {
         seed,
+        series,
         constant_long,
         train_mean,
         rows,

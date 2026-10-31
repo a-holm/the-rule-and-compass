@@ -26,6 +26,7 @@ fn sample(n: usize) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -132,12 +133,14 @@ fn recovers_a_law_with_fit_samples() {
         y: ys.clone(),
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let test = Sample {
         x: xs,
         y: ys,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let cfg = Config {
         generations: 40,

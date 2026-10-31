@@ -220,9 +220,11 @@ in shared memory and written once per expression.
 
 **Branchless operators, matched semantics.** Division, `log`, `sqrt`, `tan` and
 `pow` use the *same* domain guards as the host evaluator, expressed as predicated
-selects rather than branches. Anything non-finite, or larger than a shared
-magnitude limit of 1e30, counts as a hard failure on **both** sides — so the
-GPU and CPU agree on which candidates are hopeless.
+selects rather than branches. The legacy f32 SSE evaluator (`eval_batch`,
+`eval_pool`) and its host reference `cpu_sse` count a non-finite prediction, or
+one above a shared magnitude limit of 1e30, as a hard failure on **both** sides.
+The native score paths use the rule in "Large predictions and overflowing
+residuals" instead.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
@@ -494,11 +496,20 @@ squared error:
 The device kernel uses a fixed reduction tree, ascending row order and no
 floating-point atomics, so the same candidate scores identical bits alone or in
 a batch of 7 or 447. `maximum` compares the IEEE-754 bits of `|r|` and breaks an
-exact tie on the lowest row. A non-finite prediction (or one above the same
-`1e30` hard-magnitude limit used elsewhere) returns **`+inf` with status 2**,
-never the old finite `1e30/n`. `score_batch`/`score_pool` return `f64` values
+exact tie on the lowest row. A non-finite prediction returns **`+inf` with
+status 2**, never the old finite `1e30/n`; a finite prediction of any magnitude
+is scored (see below). `score_batch`/`score_pool` return `f64` values
 plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
+
+**Large predictions and overflowing residuals.** The device follows the CPU scorer (`metrics::score_weighted`) exactly. There is no magnitude limit on the native score paths.
+
+* A prediction that is not finite on a row with positive weight scores `+inf` (status 2, `None` on the order-statistic paths). Nothing else does.
+* A finite prediction of any magnitude is scored. The f32 score kernels (`score_kernel`, `score_step`, the row-range and classification kernels) widen the f32 prediction to `f64` before the residual, so a residual cannot overflow there. A prediction that overflows the f32 range is `inf` in the kernel and is therefore `+inf`, because the f32 program cannot represent it. The CPU gives the same `+inf` when it scores those f32 rows.
+* The exact `f64` order-statistic paths (`median`, `maximum`, `interquartile`, sort and select) form `pred - y` in `f64`. A residual that overflows keys as `+inf`, the largest finite-or-infinite key, so the maximum is `+inf`, the median ignores it unless it is the middle key, and the interquartile mean is `+inf` only when the window holds it. A NaN residual (a NaN target) marks the segment non-finite.
+* The legacy f32 SSE evaluator (`eval_batch`, `eval_pool`, `cpu_sse`) keeps its 1e30 hard-failure limit. It serves the fit and test APIs, not scoring.
+
+`gpu::tests::large_finite_predictions_score_like_the_cpu`, `gpu::classification_parity_tests::large_finite_predictions_score_like_the_cpu` and `gpu::order_select_tests::large_predictions_and_overflowing_residuals_match_the_cpu` pin the rule for every native metric, with repeat bit identity.
 
 `median`, `interquartile`, `rank_correlation`, `rank_correlation_signed` and
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
@@ -577,8 +588,8 @@ runs the exact `f64` forward pass from the resident rows, and returns one
 
 | `ScoreStat` | device work | exactness contract |
 |---|---|---|
-| `Median` | segmented sort of the `|r|` bit patterns, then the middle pick (even `n` averages the two middles) | bit-identical to `metrics::median_abs` |
-| `Interquartile` | the same sort, mean of ranks `[⌊n/4⌋, ⌊3n/4⌋)` (all rows below `n = 4`) | fixed-order tree mean, `1e-12` relative |
+| `Median` | radix select of the middle key(s) of the `|r|` bit patterns from 4 096 rows, segmented sort below; even `n` averages the two middles | bit-identical to `metrics::median_abs` |
+| `Interquartile` | ranks `[⌊n/4⌋, ⌊3n/4⌋)` (all rows below `n = 4`) added in ascending order by one thread; from 65 536 rows the window boundaries are selected and only the interior is sorted | bit-identical to `metrics::interquartile_mean_abs` |
 | `Maximum` | integer max on the `|r|` bits plus the lowest maximiser | bit-identical, order-free |
 | `RankCorrelation` | exact integer rank sums of #230, then `1 − |ρ|` | bit-identical to the exact `RankTarget` statistic |
 | `RankCorrelationSigned` | the same sums under `1 − ρ` | bit-identical, orientation preserved |
@@ -645,26 +656,117 @@ tree scorer rather than being ranked by SSE. A failed device batch returns an
 error, the evaluator is dropped and the generation is re-scored on the CPU, as
 for every other device failure.
 
-**Measurements.** The reproducible paired bench is
+**Measurements.** The reproducible paired bench for the rank statistics is
 `cargo test --release --features cuda --lib bench_score_batch -- --ignored
 --nocapture` (`RCSR_BENCH_N`, `RCSR_BENCH_P` override the sample/candidates).
 On the RTX 3060 at `N = 100 000`, `P = 8`, one wave and a 6.4 MB wave charge:
 
 | statistic | device s/row/candidate | one-thread exact CPU s/row/candidate |
 |---|---:|---:|
-| `median` | 7.6e-9 | 1.13e-8 (rank-sum reference) |
 | `rank_correlation` | 1.29e-8 (includes the first-call rank prepare) | 1.13e-8 |
 | `rank_correlation_signed` | 9.3e-9 | 1.13e-8 |
 
 Against the search's **8-worker** CPU scorer (ideal ≈ `1.4e-9 s/row`) the
-sort-based path is ≈1× or slower at this size, as report
-`01-native-scoring.md` §5 predicted (≈4.5 s each at `N = 2.456 M`, `P = 447`,
-where a wave holds three candidates). The production radix histogram/select path
-is the follow-up that removes the `2N` sort buffer and the 64 B/row wave; this
-change is the correctness entry point and the dispatch gate, so the run-level
-gain for rank/AUC runs is device residency, not a claimed speed-up. The
-`N = 2.456 M`, `P = 447` cell is reproducible with `RCSR_BENCH_N=2456306
-RCSR_BENCH_P=447` on a device with enough memory.
+sort-based rank path is ≈1× or slower at this size, as report
+`01-native-scoring.md` §5 predicted (≈4.5 s at `N = 2.456 M`, `P = 447`, where a
+wave holds three candidates). Rank correlation and AUC need the rank of every
+row; a selection returns the key at a rank, not the rank of every key, and
+refining every histogram bucket down to single keys is a full radix sort. They
+stay on the sort path. The `N = 2.456 M`, `P = 447` cell is reproducible with
+`RCSR_BENCH_N=2456306 RCSR_BENCH_P=447` on a device with enough memory.
+
+#### Radix select path for the order statistics
+
+CUB's `DeviceSegmentedRadixSort` runs one thread block per segment per digit
+pass, so `P` candidates use at most `P` blocks and every pass reads and writes
+every key. The median, the maximum and the interquartile window boundaries are
+one or two order statistics, so they do not need the sort.
+
+* **Key.** The bit pattern of `|pred − y|` in exact `f64`. The value is never
+  negative, so the unsigned bit order is the numeric order; `fabs` maps `−0.0`
+  to `+0.0` like the CPU's `f64::abs`, and subnormals and `f64::MAX` order as
+  plain bits. Both paths call one row-key function (`md_row_key`), so a
+  non-finite prediction or a NaN residual marks the segment non-finite on both,
+  which scores `+inf` like the CPU. A residual that overflows keys as `+inf`.
+* **Passes** (`src/cuda/radix_select.h`). Six 11-bit digits, high to low. Every
+  segment is spread over many blocks (grid `(segments, blocks per segment)`).
+  Pass 0 is fused into the prediction sweep; later passes read the key buffer
+  once and count, per rank, only keys that agree with the prefix fixed so far.
+  Lanes with the same digit merge into one shared atomic (`__match_any_sync`),
+  so the exponent bins of pass 0 do not serialise. A pick kernel per segment
+  scans the 2 048 bins, fixes the digit and the residual rank on the device and
+  clears the bins: 13 launches, no host round trip. Up to two ranks share one
+  read: `n/2 − 1` and `n/2` for an even median, `⌊n/4⌋` and `⌊3n/4⌋ − 1` for the
+  interquartile window.
+* **Interquartile mean.** The CPU adds the window left to right
+  (`iter().sum()`), and `f64` addition is not associative, so the sum needs the
+  window in ascending order; it is not an interpolated quantile. The window is
+  `a` copies of `s[lo]`, the interior keys `s[lo] < k < s[hi−1]` sorted, and
+  `b` copies of `s[hi−1]`. The select path counts `#{k ≤ s[lo]}`, copies only
+  the interior (at most `hi − lo − 2` keys), sorts that half with CUB and adds
+  the sequence in order. On both paths one thread adds while the other warps
+  stage the next tile in shared memory. Each add is a dependent `f64` add
+  (about 30 ns on the RTX 3060), the inherent cost of bit-identity; the #232 fit
+  ladder keeps its tree mean because it only compares trials.
+* **Determinism.** Counts are integer atomics, the pick is an integer scan and
+  the selected key is a function of the key multiset, so blocks per segment,
+  wave split and batch composition cannot change a value. The interior's copy
+  order varies from run to run; the sort removes it.
+* **Memory.** 8 B per row per segment for the median and the maximum (keys
+  only), 24 B for the interquartile mean, against the sort path's 64 B, so a
+  512 MB wave holds 8× (3×) more candidates. Every buffer comes from the
+  persistent fit/score region (`rc_fs_reserve`).
+* **Dispatch and fallback.** `gpu::order_stat_path(code, n)` returns the
+  measured path. A select call that fails as a whole (allocation, launch, an
+  internal consistency check reported as status 3, a statistic it does not
+  compute) is re-run on the sort path with the sort path's own wave shape. The
+  #232 tree mean is sort-only.
+
+`cargo test --release --features cuda --lib bench_order_select_crossover --
+--ignored --nocapture` (`RCSR_BENCH_NS`, `RCSR_BENCH_PS` override the grids)
+measures sort vs select vs the 8-worker CPU scorer (`std::thread::scope`, eval
+plus metric per candidate) on one affine candidate shape. RTX 3060, 8 CPU
+threads, best of three device runs, milliseconds:
+
+| `N` | `P` | median sort | median select | IQR sort | IQR select | max scan | max select | CPU8 median | CPU8 IQR |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 096 | 8 | 0.154 | 0.148 | 0.213 | 0.294 | 0.038 | 0.114 | 1.84 | 1.68 |
+| 4 096 | 128 | 0.720 | 0.413 | 0.803 | 0.746 | 0.083 | 0.263 | 17.6 | 14.6 |
+| 16 384 | 8 | 0.346 | 0.281 | 0.559 | 0.740 | 0.089 | 0.226 | 7.07 | 7.00 |
+| 16 384 | 128 | 2.34 | 0.731 | 3.33 | 2.45 | 0.227 | 0.791 | 52.3 | 63.6 |
+| 65 536 | 8 | 1.24 | 0.388 | 2.10 | 1.95 | 0.274 | 0.317 | 24.8 | 21.7 |
+| 65 536 | 128 | 9.51 | 2.69 | 12.0 | 9.13 | 0.716 | 2.70 | 246 | 258 |
+| 262 144 | 8 | 4.56 | 0.869 | 8.53 | 6.56 | 1.44 | 0.617 | 81.3 | 70.4 |
+| 262 144 | 128 | 45.0 | 10.6 | 64.2 | 38.3 | 2.79 | 9.92 | 1 184 | 1 298 |
+| 1 048 576 | 8 | 38.9 | 2.80 | 68.4 | 27.7 | 5.25 | 2.76 | 395 | 365 |
+| 1 048 576 | 128 | 374 | 44.9 | 662 | 235 | 11.4 | 42.8 | 5 605 | 5 281 |
+
+The CPU column varies by up to 40 % between runs on the shared desktop (an
+earlier run gave 3 955 ms and 3 892 ms at `N = 1 048 576`, `P = 128`). The
+rules that follow:
+
+* `median`: select from 4 096 rows (`ORDER_SELECT_MIN_ROWS`, the scoring floor).
+  It is faster in every cell, from 1.04× at 4 096 × 8 to 8.3× at
+  1 048 576 × 128, where it is 88-125× the 8-worker CPU.
+* `interquartile`: select from 65 536 rows (`IQR_SELECT_MIN_ROWS`), the
+  smallest `N` at which it is faster at both `P`. Below it, with few
+  candidates, the extra launches cost more than the half sort saves. At
+  1 048 576 × 128 it is 2.8× the exact sort path and 17-22× the 8-worker CPU.
+* `maximum`: the one-pass #227 scan stays. It is faster in 8 of 10 cells; the
+  select path wins only with `P = 8` from 262 144 rows, by under 3 ms, and the
+  search ranks `maximum` with the #287 objective kernel anyway. The select path
+  still computes rank `n − 1`, pinned bit for bit against the scan's CPU value.
+
+The large `N = 2.456 M`, `P = 447` comparison against the 8-worker CPU (#288
+T1) is the final full test, not part of this bench.
+
+Tests: `src/gpu_order_select_tests.rs` pins median, maximum and the
+interquartile mean bit for bit against the CPU on both paths for `n = 1..40` and
+around the bin and tile boundaries; 1, 2, 3, 7 and 64 blocks per segment at
+70 000 and 70 001 rows; batch composition, one segment per wave and repetition;
+an entirely tied multiset, `−0.0` residuals, subnormals and `±f64::MAX`;
+all-NaN and one-NaN predictions; the crossover on both sides of each threshold
+and the sort-path fallback.
 
 ### Reported backend and the startup summary
 
@@ -1034,8 +1136,9 @@ and f64 reporting stay authoritative meanwhile.
 
 Scoring was on the GPU long before fitting was: non-affine candidates still ran
 the scalar CPU Levenberg–Marquardt loop, which dominated wall time at large `N`.
-`--fit-strategy gpu` (opt-in; `exact` remains the default) moves that loop into
-one CUDA block per candidate:
+`--fit-strategy gpu` moves that loop into one CUDA block per candidate. It is
+the default where admissible (see [Default fit arm](#default-fit-arm)); an
+explicit `gpu` is always honoured:
 
 1. The postorder tree is flattened into 4-word records `[op, kid0, kid1, slot]`.
    Only operators with an analytic value and adjoint are eligible.
@@ -1324,6 +1427,45 @@ and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
 synchronous schedule.
 
 **Zero diagonal (#399).** `ft_solve` freezes a slot whose normal-equation diagonal is exactly `0.0` on every arm. A constant with a zero adjoint on all active rows cannot move the prediction, so its row and column become the identity, its right-hand side is `0` and its step is `0`. The other constants are still fitted, as the CPU ridge solve (`fit.rs::solve`, ridge `1e-12`) does. A negative or non-finite diagonal is still status `1`. `tests/gpu_fit.rs::zero_adjoint_constant_is_frozen_and_the_rest_are_fitted` pins it.
+
+### Default fit arm
+
+A run that names no `--fit-strategy`, or names `auto`, resolves its fit arm once, before generation 0 and before the device memory plan. An explicit arm (`exact`, `linear`, `varpro`, `stream`, `gpu`) is never resolved, and a resume keeps the saved arm and admission. The resolved arm is `gpu` when all of these hold, checked in this order; the first failing factor is the labelled reason:
+
+1. `metric_not_least_squares`: the metric is `squared`, `aic`, `aicc` or `bic`.
+2. `no_fit`: `--fit-iters` is above 0.
+3. The backend reason: the GPU evaluator runs the search (`--cpu/--no-gpu`, `no usable CUDA device`, `built without --features cuda` and the evaluator refusals keep the CPU).
+4. `device_memory`: the memory plan has no `fit` refusal for the f64 fit rows.
+5. `dispatch_cost`: the run-level cost model predicts a win.
+
+When one fails, no flag keeps `exact` and `auto` keeps the structural CPU `auto`, so every CPU-only run (non-CUDA build, `--cpu`, no device, an ineligible run) keeps its archive and JSON byte for byte.
+
+A resolved `gpu` arm admits every candidate with constants at every row count (`gpu.fit.admission` is `all`). An explicit `--fit-strategy gpu` keeps the `max(32, pop/4)` admission below 1 048 576 rows (`screened`). The admission is saved in checkpoints (`config fit_admission all`; a missing line means `screened`) and is part of the config hash.
+
+The cost model is pure and reads no timing. With `I` island threads, `C` cores, `W = min(C, 8)` fallback workers, `s = 1` when every configured operator has a device fit opcode and no custom block is defined (else `0`), `k = 0.05` (device cost of one fit-row relative to one CPU thread), `E = 1.32` (overhead of the batched arm) and `h = 0.3` (required margin):
+
+```text
+cpu = 1 / min(I, C)
+gpu = (s * k + (1 - s) / W) * E * (1 + h)
+device iff gpu < cpu
+```
+
+With `W = 8`: without full operator coverage (the default operator set, because `if` has no fit opcode) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+
+Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
+
+| cell (train rows, islands x pop, generations) | arm | seeds | speed-up | test error better/worse/tie | hypervolume better/worse |
+|---|---|---:|---:|---|---|
+| 300, 1 x 200, 20 | screened | 3 | 3.75x | 3/0/0 | 2/1 |
+| 300, 1 x 200, 20 | all | 3 | 2.60x | 2/1/0 | 2/1 |
+| 1 500, 1 x 200, 20 | screened | 13 | 6.11x | 3/9/1 | 3/10 |
+| 1 500, 1 x 200, 20 | all | 13 | 5.08x | 6/5/2 | 9/4 |
+| 1 500, 4 x 50, 20 | all | 13 | 1.80x | 6/6/1 | 5/7 |
+| 15 000, 1 x 200, 10 | screened | 3 | 7.75x | 1/2/0 | 1/2 |
+| 15 000, 1 x 200, 10 | all | 3 | 4.20x | 2/1/0 | 2/1 |
+| 115 500, 4 x 64, 3 | all | 2 | 1.52x | 0/2/0 | 0/2 |
+
+Provenance. The non-quiet stderr line `# gpu-fit: default -> gpu (squared, admit all)` (or `-> exact (dispatch_cost)`) appears when the GPU evaluator runs the search. On a GPU run `--json` `fitting` carries `strategy_source` (`default` or `auto`) and `strategy_reason` (`admissible` or the failing factor). `--run-manifest` carries `fit_resolution` and the development log `run_start` carries `fit_strategy_source` and `fit_strategy_reason`, both for every resolved run.
 
 ### LogSquashed on the batched kernel (issue #229)
 
@@ -1815,6 +1957,15 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
+### Correlation arm
+
+`--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.
+
+* **Orientation.** `correlation_signed` has a genuine sign. The kernel refines two orientations from the same entry constants: the incoming scale sign, then its negation, which thread 0 writes to the shared scale slot after the restore barrier. The lower objective wins, a tie keeps the incoming orientation, and `--fit-iters 0` never flips. Status is the status of the kept orientation (`recovered`, `no_improvement`, `start_unusable`, `rank_deficient` keep their meaning). `correlation` has one orientation.
+* **Closed form.** A tree that is affine in every constant has a global optimum, the weighted least-squares fit (`correlation::fit`). Such a tree never reaches the device: it is routed to the exact CPU arm with the label `affine_closed_form`. This label is a route, not a failure.
+* **Exact gate.** Every proposal passes `fit::gate_device_proposal` on the configured metric. A worse or non-finite proposal restores the incoming constants and the CPU arm refits (`worse`, `non_finite`).
+* **Cost.** The dispatch model scales the calibrated fit rates by passes per candidate relative to one squared LM run: `correlation` 1 on both sides, `correlation_signed` 2 on the device (two orientations) and 3 on the CPU (three orientations tried).
+
 ## The DGX Spark path
 
 | | |
@@ -2042,7 +2193,7 @@ Definitions that matter:
   seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
   is a telemetry defect. `fit` separates raw device kernel seconds from the
   measured exact-CPU fallback and finalist-refit seconds, with
-  `fallback_by_cause`; `eval_fallback` does the same for the evaluator's CPU
+  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels; `gpu.fit` and each `gpu.generations[]` entry carry the same fields); `eval_fallback` does the same for the evaluator's CPU
   pool. Every derived value is
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
@@ -2228,6 +2379,10 @@ exit, the cooldown minimum, one-row groups and non-finite scores match the CPU;
 refusals carry a reason; and `rcsr walkforward --gpu` reports the same JSON as
 the CPU run apart from the backend labels.
 
+## Panel base on the device
+
+`rcsr panel base --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) folds the decoded 15m bars of a wave of symbols into hourly base rows with the fused duplicate scan, resample and gap pass of `src/cuda/prep.cu`. The planner chooses per wave: `off` is always CPU, `auto` needs a usable device and at least 1M decoded rows, `on` needs a device. The store is byte-identical on every route. Each CPU wave under `auto` or `on` is named in the base manifest `backend` block with its reason (`too_few_rows`, `no_device`, `launch`). The pass adds no device allocation of its own beyond the context of `src/panel_prep_gpu.rs`. See `docs/panel.md`.
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
@@ -2267,6 +2422,7 @@ the CPU run apart from the backend labels.
 | `absolute` native `\|r\|` loss in the evaluator and fit kernel, L1/IRLS weights, true-MAE Armijo, parity with CPU IRLS, determinism, zero-residual/ill-conditioned labels, `--no-fit` no-op, metric-aware gate and finalist refit (#222) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`, `src/fit.rs`) | **verified** (see the #222 section) |
 | Exact interquartile window mean (rank `[⌊n/4⌋, ⌊3n/4⌋)`, all rows below `n = 4`, ties at both boundaries, constant predictions, odd/even `n`), CPU parity of the score and of the polished constants, determinism across batch composition, ill-conditioned/declined labels and the `--no-fit` no-op (#232) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` order-statistic tests, `src/fit/interquartile.rs`, `src/fit/gpu.rs`, `tests/gpu_interquartile.rs`) | **verified** (see the #232 section) |
 | Exact order/rank **scoring** entry point (#288): median/IQR/maximum/rank/AUC bit-identical to the CPU for the same prediction vector, AUC integer identity and chance cases, non-binary AUC refusal, `+inf` for non-finite predictions, batch-composition/repeat determinism, gate admission and named row-floor refusals | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` `score_batch_*` and `auc_*` tests, `src/search.rs` gate tests) | **verified** (see the #288 section) |
+| Radix select path for the median and the interquartile mean (#288): bit-identical to the sort path and the CPU on every size `n = 1..40` and around the bin/tile boundaries, independent of blocks per segment, wave split and batch composition, ties/`-0.0`/subnormal/`f64::MAX`, non-finite refusal, measured crossover and sort-path fallback | RTX 3060, `src/gpu_order_select_tests.rs` under `compute-sanitizer` memcheck and plain, `bench_order_select_crossover` | **verified** (see [the radix select path](#radix-select-path-for-the-order-statistics)) |
 | `interquartile` paired fit stage and end-to-end quality | RTX 3060, `bench_interquartile_fit_stage` and `bench_end_to_end` (`RCSR_BENCH_METRIC=interquartile`) | **measured on two workloads** — 8.1–32.2× fit stage at 4 096–154 000 rows, 2.5–4.1× end-to-end at equal evaluations, same best error and hypervolume at 50 000 rows, 1.2–3.1 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 | `absolute` paired fit stage and end-to-end quality | RTX 3060, `bench_batched_fit_absolute` and `bench_end_to_end` (`RCSR_BENCH_METRIC=absolute`) | **measured on one workload** — 32.4–35.7× fit stage, no-worse 64/64 at `p=4,8`, 3.55× end-to-end, 6.0 % fallbacks (all `ill_conditioned`); corpus-wide basin-split rate not measured |
 
@@ -2340,7 +2496,7 @@ order and **commits the first strict improver**, never the best of the six
 trials. A test drives `coordinate_polish` and the device polish from the same
 starting constants and asserts bit-identical constants, for the unsigned and the
 signed objective. `--no-fit` never enters the arm (nothing to fit), and the
-`--fit-strategy exact` default keeps the CPU path bit for bit.
+CPU `--fit-strategy exact` arm stays bit for bit.
 
 **Fallbacks.** A candidate is offered only when it has a GPU fit plan (`p ≤ 20`,
 ≤ 96 nodes, no shared block constants, analytic operators) and at least `32p`
@@ -2636,10 +2792,13 @@ keep row order), so the selected *set* is reproducible as well. Tests cover all
 tied residuals, an all-equal multiset, a top-boundary tie, a bottom-boundary
 tie, half the rows tied at the top, and `n = 2..9` (the `n < 4` fallback).
 
-**Exactness and the f32 boundary risk.** The window sum is a **fixed 256-thread
-tree reduction** over ranks `[lo, hi)` (`k_order_stat_pick`), because a
-single-thread left-to-right sum is bit-identical to the CPU but costs ~200 µs
-per trial at 154 000 rows. The consequence is stated exactly:
+**Exactness and the f32 boundary risk.** The fit ladder's window sum is a
+**fixed 256-thread tree reduction** over ranks `[lo, hi)` (`k_order_stat_pick`,
+`RC_OS_IQR_TREE`), because the ladder runs many trials per candidate and only
+compares them. The **scoring** entry point (#288) uses the bit-identical
+single-thread left-to-right sum instead (`RC_OS_IQR_EXACT`, see
+[the radix select path](#radix-select-path-for-the-order-statistics)). For the
+ladder the consequence is stated exactly:
 
 * the interquartile device score is deterministic (fixed window, fixed thread
   count, no float atomics) and agrees with `metrics::score_weighted` to
@@ -2909,11 +3068,15 @@ hysteresis band `h = 0.3` so a stage does not oscillate at the crossover.
 `vary` stays CPU until #291; `select`, `archive`, `features`, `pnl`, `io` and
 the exact `refit` are CPU by contract.
 
-A ~100 ms startup probe measures the host rate and anchors the device rates;
-the values, source, sample count and reproducibility band are written to
-`--json` under `dispatch.calibration` (the probe wall time is provenance and
-appears only in the manifest, so the result JSON stays byte-stable) and to
-`--run-manifest` under `dispatch`.
+A host probe times the host rate. With `--gpu` and a usable device, one device
+probe per process times the scoring rate, the batched fit rate, the H2D and D2H
+bandwidth and the launch overhead on a small resident dataset, and those values
+replace the corpus anchors. Without a device the anchors stay and are labelled
+`anchor`. Every probed term is the median of its timed reps and carries the
+spread of those reps. `--json` under `dispatch.calibration` carries the
+provenance labels (`source`, `device_source`, sample counts), so the result JSON
+stays byte-stable. `--run-manifest` under `dispatch.calibration` adds the
+measured rates, their `spread` and the probe wall time.
 The per-stage `dispatch.route_ledger` carries `route`, `reason`, `calls`,
 `candidates`, `predicted_s`, `actual_s`, `actual_over_predicted`, `bytes` and
 `switches`.
@@ -2945,3 +3108,7 @@ The rank and order-statistic score calls split their trials into sub-waves, so o
 ### Throughput at the wide-panel scale
 
 Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).
+
+## Panel build on the device
+
+`rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every base bar against the membership decisions with the monotone as-of merge of `src/cuda/pit.cu`, then derives the gap tags and chain starts. The planner is the one of `panel base`: `off` is always CPU, `auto` needs a usable device and at least 1M base rows, `on` needs a device. The block is one segment per symbol and one launch. The store is byte-identical on every route. A CPU join under `auto` or `on` is named in the `v2.backend` block of the panel manifest with its reason (`too_few_rows`, `no_device`, `launch`). The device buffers go through `src/cuda/alloc_guard.h`. `panel validate` replays prefixes on the CPU reference. MTF columns have their own device path in `src/cuda/mtf.cu`. See `docs/panel.md`.

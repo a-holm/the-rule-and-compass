@@ -17,9 +17,11 @@
 //! are not part of this store.
 
 use crate::data::{Column, DictColumn, Table};
+pub use crate::enrich::GpuMode;
 use crate::lockbox::{Guard, Lockbox};
 use crate::ohlcv::{self, Bar};
 use crate::panel::{self, Membership, Panel, PanelRow};
+use crate::panel_pit;
 use crate::panel_prep::{self, PrepBar, PrepSegment};
 use crate::{manifest, prep, store, zip};
 use std::collections::{BTreeMap, BTreeSet};
@@ -589,6 +591,7 @@ pub struct BaseOptions {
     pub resume: Option<String>,
     pub group_rows: usize,
     pub interval_seconds: i64,
+    pub gpu: GpuMode,
 }
 
 impl BaseOptions {
@@ -602,6 +605,7 @@ impl BaseOptions {
             resume: None,
             group_rows: store::DEFAULT_GROUP_ROWS,
             interval_seconds: IN_STEP,
+            gpu: GpuMode::Auto,
         }
     }
 }
@@ -615,20 +619,43 @@ pub fn fold_symbol(
     keep_partial: bool,
 ) -> Result<(Vec<BaseRow>, SymbolLedger), String> {
     let raws: Vec<Raw> = decoded.into_iter().map(|r| r.0).collect();
+    fold_cpu(symbol, &raws, invalid, units, keep_partial)
+}
+
+fn fold_cpu(
+    symbol: &str,
+    raws: &[Raw],
+    invalid: Vec<InvalidBar>,
+    units: [usize; 3],
+    keep_partial: bool,
+) -> Result<(Vec<BaseRow>, SymbolLedger), String> {
     let bars: Vec<PrepBar> = raws.iter().map(|r| r.prep_bar()).collect();
     let segments = [PrepSegment { start: 0, len: bars.len() as u32 }];
     let out = panel_prep::prepare(&bars, &segments, IN_STEP, OUT_STEP, keep_partial)
         .map_err(|e| format!("{}: {}", symbol, e))?;
+    Ok(fold_output(raws, invalid, units, keep_partial, out))
+}
+
+/// Base rows and ledger of one symbol from its prepared buckets. `out` holds
+/// only this symbol's buckets and conflicts, from the CPU or the device pass.
+fn fold_output(
+    raws: &[Raw],
+    invalid: Vec<InvalidBar>,
+    units: [usize; 3],
+    keep_partial: bool,
+    out: panel_prep::PrepOutput,
+) -> (Vec<BaseRow>, SymbolLedger) {
     let mut unit_at: Vec<(i64, u8)> = raws.iter().map(|r| (r.time, r.unit)).collect();
     unit_at.sort_by_key(|x| x.0);
+    let unique = unit_at.windows(2).filter(|w| w[0].0 != w[1].0).count() + usize::from(!unit_at.is_empty());
     let mut buckets_seen: BTreeSet<i64> = BTreeSet::new();
-    for r in &raws {
+    for r in raws {
         buckets_seen.insert(r.time.div_euclid(OUT_STEP) * OUT_STEP);
     }
     let mut rows = Vec::with_capacity(out.buckets.len());
     let mut ledger = SymbolLedger {
-        input_rows: out.input_rows,
-        unique_rows: out.unique_rows,
+        input_rows: raws.len(),
+        unique_rows: unique,
         units,
         invalid,
         ..Default::default()
@@ -670,7 +697,7 @@ pub fn fold_symbol(
         ledger.partial_dropped = buckets_seen.len() - out.buckets.len();
     }
     ledger.conflicts = out.conflicts.iter().map(|c| (c.time, c.len)).collect();
-    Ok((rows, ledger))
+    (rows, ledger)
 }
 
 /// A decoded row wrapper, public so tests can fold fixtures without archives.
@@ -872,6 +899,271 @@ pub struct BaseSummary {
     pub symbols: usize,
     pub reused: usize,
     pub manifest: String,
+    pub route: DeviceRoute,
+}
+
+/// Where the 15m to 1h fold ran, with every reason the device was not used.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeviceRoute {
+    /// `auto`, `on` or `off`.
+    pub requested: &'static str,
+    pub device: Option<String>,
+    pub symbols_device: usize,
+    pub symbols_cpu: usize,
+    pub rows_device: usize,
+    pub rows_cpu: usize,
+    /// Device launches (one per wave of symbols).
+    pub passes: usize,
+    /// Labelled reasons the CPU ran a wave, with the symbols it covered.
+    pub fallbacks: Vec<(String, usize)>,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub kernel_s: f64,
+    pub wall_s: f64,
+}
+
+impl DeviceRoute {
+    fn new(mode: GpuMode) -> Self {
+        DeviceRoute {
+            requested: match mode {
+                GpuMode::Auto => "auto",
+                GpuMode::On => "on",
+                GpuMode::Off => "off",
+            },
+            ..Default::default()
+        }
+    }
+
+    fn fall_back(&mut self, reason: String, symbols: usize) {
+        match self.fallbacks.iter_mut().find(|f| f.0 == reason) {
+            Some(f) => f.1 += symbols,
+            None => self.fallbacks.push((reason, symbols)),
+        }
+    }
+
+    fn json(&self) -> String {
+        let fallbacks: Vec<String> = self
+            .fallbacks
+            .iter()
+            .map(|(r, n)| format!("{{\"reason\":{},\"symbols\":{}}}", jstr(r), n))
+            .collect();
+        format!(
+            "{{\"requested\":{},\"device\":{},\"symbols_device\":{},\"symbols_cpu\":{},\"rows_device\":{},\"rows_cpu\":{},\"passes\":{},\"h2d_bytes\":{},\"d2h_bytes\":{},\"fallbacks\":[{}]}}",
+            jstr(self.requested),
+            self.device.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+            self.symbols_device,
+            self.symbols_cpu,
+            self.rows_device,
+            self.rows_cpu,
+            self.passes,
+            self.h2d_bytes,
+            self.d2h_bytes,
+            fallbacks.join(",")
+        )
+    }
+}
+
+/// The planner: whether one wave of `rows` decoded 15m bars runs on the device.
+/// `Err` is the labelled reason for the CPU. `--gpu on` forces the device; `auto`
+/// needs at least [`crate::enrich::GPU_MIN_ROWS`] rows, below which the upload
+/// and launch cost more than the CPU fold.
+pub fn plan_device(mode: GpuMode, rows: usize, probe: &crate::backend::Probe) -> Result<(), String> {
+    match mode {
+        GpuMode::Off => Err("gpu_off".to_string()),
+        _ if !probe.available() => Err(format!(
+            "no_device: {}",
+            probe.reason.as_deref().unwrap_or("no usable CUDA device")
+        )),
+        GpuMode::On => Ok(()),
+        GpuMode::Auto if rows >= crate::enrich::GPU_MIN_ROWS => Ok(()),
+        GpuMode::Auto => Err(format!(
+            "too_few_rows: {} < {}",
+            rows,
+            crate::enrich::GPU_MIN_ROWS
+        )),
+    }
+}
+
+/// One symbol decoded and waiting for its fold.
+struct Fresh {
+    symbol: String,
+    key: String,
+    hashes: Vec<(String, String, u64)>,
+    raws: Vec<Raw>,
+    invalid: Vec<InvalidBar>,
+    units: [usize; 3],
+}
+
+enum Loaded {
+    Cached(BaseSymbol, Vec<(String, String, u64)>),
+    Fresh(Fresh),
+}
+
+fn load_symbol(
+    opts: &BaseOptions,
+    root: &Path,
+    settings: &str,
+    symbol: String,
+    srcs: Vec<prep::Source>,
+    reused: &AtomicUsize,
+) -> Result<Loaded, String> {
+    let mut blobs = Vec::new();
+    let mut hashes = Vec::new();
+    for s in &srcs {
+        let bytes = std::fs::read(&s.path).map_err(|e| format!("{}: {}", s.path.display(), e))?;
+        hashes.push((relative(root, &s.path), manifest::sha256_hex(&bytes), bytes.len() as u64));
+        blobs.push(bytes);
+    }
+    let mut key = String::from(settings);
+    for (p, h, n) in &hashes {
+        let _ = write!(key, ";{}:{}:{}", p, h, n);
+    }
+    let key = manifest::sha256_hex(key.as_bytes());
+    if let Some(dir) = &opts.resume {
+        let path = cache_path(dir, &symbol);
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(sym) = decode_symbol(&bytes, &key) {
+                reused.fetch_add(1, Ordering::Relaxed);
+                return Ok(Loaded::Cached(sym, hashes));
+            }
+        }
+    }
+    let mut raws: Vec<Raw> = Vec::new();
+    let mut invalid = Vec::new();
+    let mut units = [0usize; 3];
+    for (s, bytes) in srcs.iter().zip(blobs) {
+        let mut d = decode_bytes(&s.path, &symbol, bytes)?;
+        for b in &mut d.invalid {
+            b.path = relative(root, &s.path);
+        }
+        raws.extend(d.rows);
+        invalid.extend(d.invalid);
+        for k in 0..3 {
+            units[k] += d.units[k];
+        }
+    }
+    Ok(Loaded::Fresh(Fresh { symbol, key, hashes, raws, invalid, units }))
+}
+
+fn finish_symbol(
+    opts: &BaseOptions,
+    f: Fresh,
+    rows: Vec<BaseRow>,
+    ledger: SymbolLedger,
+) -> Result<(BaseSymbol, Vec<(String, String, u64)>), String> {
+    let sym = BaseSymbol { symbol: f.symbol.clone(), rows, ledger };
+    if let Some(dir) = &opts.resume {
+        publish_bytes(&cache_path(dir, &f.symbol), &encode_symbol(&f.key, &sym))?;
+    }
+    Ok((sym, f.hashes))
+}
+
+fn fold_fresh_cpu(
+    opts: &BaseOptions,
+    mut f: Fresh,
+) -> Result<(BaseSymbol, Vec<(String, String, u64)>), String> {
+    let invalid = std::mem::take(&mut f.invalid);
+    let (rows, ledger) = fold_cpu(&f.symbol, &f.raws, invalid, f.units, opts.keep_partial)?;
+    finish_symbol(opts, f, rows, ledger)
+}
+
+/// One device pass over the wave's symbols as segments of one block. Returns
+/// each symbol's buckets and conflicts, in input order.
+#[cfg(feature = "cuda")]
+fn device_prepare(
+    fresh: &[Fresh],
+    keep_partial: bool,
+    route: &mut DeviceRoute,
+) -> Result<Vec<panel_prep::PrepOutput>, String> {
+    let total: usize = fresh.iter().map(|f| f.raws.len()).sum();
+    if total > i32::MAX as usize {
+        return Err(format!("too_many_rows: {}", total));
+    }
+    let mut bars: Vec<PrepBar> = Vec::with_capacity(total);
+    let mut segments = Vec::new();
+    let mut owner = Vec::new();
+    for (i, f) in fresh.iter().enumerate() {
+        if f.raws.is_empty() {
+            continue;
+        }
+        segments.push(PrepSegment { start: bars.len() as u32, len: f.raws.len() as u32 });
+        owner.push(i);
+        bars.extend(f.raws.iter().map(|r| r.prep_bar()));
+    }
+    let mut per = vec![panel_prep::PrepOutput::default(); fresh.len()];
+    if bars.is_empty() {
+        return Ok(per);
+    }
+    let (out, stats) = crate::panel_prep_gpu::prepare(&bars, &segments, IN_STEP, OUT_STEP, keep_partial)
+        .ok_or_else(|| "launch: the device prep pass failed".to_string())?;
+    for b in out.buckets {
+        let i = *owner
+            .get(b.segment as usize)
+            .ok_or_else(|| format!("launch: bucket in segment {}", b.segment))?;
+        per[i].buckets.push(b);
+    }
+    for c in out.conflicts {
+        let i = *owner
+            .get(c.segment as usize)
+            .ok_or_else(|| format!("launch: conflict in segment {}", c.segment))?;
+        per[i].conflicts.push(c);
+    }
+    route.passes += 1;
+    route.h2d_bytes += stats.h2d_bytes;
+    route.d2h_bytes += stats.d2h_bytes;
+    route.kernel_s += stats.kernel_s;
+    route.wall_s += stats.wall_s;
+    Ok(per)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_prepare(
+    _fresh: &[Fresh],
+    _keep_partial: bool,
+    _route: &mut DeviceRoute,
+) -> Result<Vec<panel_prep::PrepOutput>, String> {
+    Err("no_device: built without --features cuda".to_string())
+}
+
+/// Fold one wave of freshly decoded symbols where the planner chooses.
+fn fold_wave(
+    opts: &BaseOptions,
+    fresh: Vec<Fresh>,
+    probe: &crate::backend::Probe,
+    route: &mut DeviceRoute,
+) -> Result<Vec<(BaseSymbol, Vec<(String, String, u64)>)>, String> {
+    let rows: usize = fresh.iter().map(|f| f.raws.len()).sum();
+    let n = fresh.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let outputs = match plan_device(opts.gpu, rows, probe) {
+        Ok(()) => match device_prepare(&fresh, opts.keep_partial, route) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                route.fall_back(e, n);
+                None
+            }
+        },
+        Err(reason) => {
+            route.fall_back(reason, n);
+            None
+        }
+    };
+    let Some(outputs) = outputs else {
+        route.symbols_cpu += n;
+        route.rows_cpu += rows;
+        return parallel(fresh, opts.jobs, |f| fold_fresh_cpu(opts, f));
+    };
+    route.symbols_device += n;
+    route.rows_device += rows;
+    route.device = probe.device.clone();
+    let items: Vec<(Fresh, panel_prep::PrepOutput)> = fresh.into_iter().zip(outputs).collect();
+    parallel(items, opts.jobs, |(mut f, out)| {
+        let invalid = std::mem::take(&mut f.invalid);
+        let (rows, ledger) = fold_output(&f.raws, invalid, f.units, opts.keep_partial, out);
+        finish_symbol(opts, f, rows, ledger)
+    })
 }
 
 /// P1: decode the archives, apply the duplicate and full-bucket policy and
@@ -895,51 +1187,37 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir, e))?;
     }
     let settings = format!("interval={};keep_partial={}", IN_STEP, opts.keep_partial);
-    let groups: Vec<(String, Vec<prep::Source>)> = by_symbol.into_iter().collect();
+    let mut groups: Vec<(String, Vec<prep::Source>)> = by_symbol.into_iter().collect();
     let reused = AtomicUsize::new(0);
-    let done: Vec<(BaseSymbol, Vec<(String, String, u64)>)> = parallel(groups, opts.jobs, |(symbol, srcs)| {
-        let mut blobs = Vec::new();
-        let mut hashes = Vec::new();
-        for s in &srcs {
-            let bytes = std::fs::read(&s.path).map_err(|e| format!("{}: {}", s.path.display(), e))?;
-            hashes.push((relative(&root, &s.path), manifest::sha256_hex(&bytes), bytes.len() as u64));
-            blobs.push(bytes);
-        }
-        let mut key = String::from(&settings);
-        for (p, h, n) in &hashes {
-            let _ = write!(key, ";{}:{}:{}", p, h, n);
-        }
-        let key = manifest::sha256_hex(key.as_bytes());
-        if let Some(dir) = &opts.resume {
-            let path = cache_path(dir, &symbol);
-            if let Ok(bytes) = std::fs::read(&path) {
-                if let Ok(sym) = decode_symbol(&bytes, &key) {
-                    reused.fetch_add(1, Ordering::Relaxed);
-                    return Ok((sym, hashes));
+    let mut route = DeviceRoute::new(opts.gpu);
+    let done: Vec<(BaseSymbol, Vec<(String, String, u64)>)> = if opts.gpu == GpuMode::Off {
+        parallel(groups, opts.jobs, |(symbol, srcs)| {
+            match load_symbol(opts, &root, &settings, symbol, srcs, &reused)? {
+                Loaded::Cached(sym, hashes) => Ok((sym, hashes)),
+                Loaded::Fresh(f) => fold_fresh_cpu(opts, f),
+            }
+        })?
+    } else {
+        let probe = crate::backend::probe();
+        let wave = opts.jobs.max(1) * 8;
+        let mut done = Vec::new();
+        while !groups.is_empty() {
+            let rest = groups.split_off(wave.min(groups.len()));
+            let chunk = std::mem::replace(&mut groups, rest);
+            let loaded = parallel(chunk, opts.jobs, |(symbol, srcs)| {
+                load_symbol(opts, &root, &settings, symbol, srcs, &reused)
+            })?;
+            let mut fresh = Vec::new();
+            for l in loaded {
+                match l {
+                    Loaded::Cached(sym, hashes) => done.push((sym, hashes)),
+                    Loaded::Fresh(f) => fresh.push(f),
                 }
             }
+            done.extend(fold_wave(opts, fresh, &probe, &mut route)?);
         }
-        let mut raws: Vec<Raw2> = Vec::new();
-        let mut invalid = Vec::new();
-        let mut units = [0usize; 3];
-        for (s, bytes) in srcs.iter().zip(blobs) {
-            let mut d = decode_bytes(&s.path, &symbol, bytes)?;
-            for b in &mut d.invalid {
-                b.path = relative(&root, &s.path);
-            }
-            raws.extend(d.rows.into_iter().map(Raw2));
-            invalid.extend(d.invalid);
-            for k in 0..3 {
-                units[k] += d.units[k];
-            }
-        }
-        let (rows, ledger) = fold_symbol(&symbol, raws, invalid, units, opts.keep_partial)?;
-        let sym = BaseSymbol { symbol: symbol.clone(), rows, ledger };
-        if let Some(dir) = &opts.resume {
-            publish_bytes(&cache_path(dir, &symbol), &encode_symbol(&key, &sym))?;
-        }
-        Ok((sym, hashes))
-    })?;
+        done
+    };
     let mut syms: Vec<BaseSymbol> = Vec::new();
     let mut inputs: Vec<(String, String, u64)> = Vec::new();
     for (s, h) in done {
@@ -955,7 +1233,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         return Err("panel base: no complete hourly bucket was produced".to_string());
     }
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
-    let text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow);
+    let text = base_manifest(opts, &syms, &inputs, &overlap, guard.allow, &route);
     let manifest_path = format!("{}.manifest.json", opts.out);
     std::fs::write(&manifest_path, text).map_err(|e| format!("{}: {}", manifest_path, e))?;
     Ok(BaseSummary {
@@ -963,6 +1241,7 @@ pub fn build_base(opts: &BaseOptions) -> Result<BaseSummary, String> {
         symbols: syms.len(),
         reused: reused.load(Ordering::Relaxed),
         manifest: manifest_path,
+        route,
     })
 }
 
@@ -1038,6 +1317,7 @@ fn base_manifest(
     inputs: &[(String, String, u64)],
     overlap: &crate::lockbox::Overlap,
     allowed: bool,
+    route: &DeviceRoute,
 ) -> String {
     let mut input_rows = 0usize;
     let mut unique_rows = 0usize;
@@ -1086,6 +1366,9 @@ fn base_manifest(
         "  \"resample\":{{\"in_step\":{},\"out_step\":{},\"require_full_bucket\":{},\"keep_partial\":{}}},",
         IN_STEP, OUT_STEP, !opts.keep_partial, opts.keep_partial
     );
+    if opts.gpu != GpuMode::Off {
+        let _ = writeln!(s, "  \"backend\":{},", route.json());
+    }
     let _ = writeln!(s, "  \"columns\":[{}],", BASE_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","));
     let _ = writeln!(s, "  \"inputs\":{{\"files\":{},\"archives\":[", inputs.len());
     for (i, (p, h, n)) in inputs.iter().enumerate() {
@@ -1153,6 +1436,7 @@ pub struct PanelOptions {
     /// Share of the cross-section missing at one hour that makes it a venue outage.
     pub outage_share: f64,
     pub outage_min_symbols: usize,
+    pub gpu: GpuMode,
 }
 
 impl PanelOptions {
@@ -1169,6 +1453,7 @@ impl PanelOptions {
             jump_factor: 5.0,
             outage_share: 0.5,
             outage_min_symbols: 3,
+            gpu: GpuMode::Auto,
         }
     }
 }
@@ -1291,6 +1576,70 @@ struct Assembled {
     jumps: Vec<Jump>,
     listings: BTreeMap<String, u32>,
     declared_breaks: usize,
+    route: DeviceRoute,
+}
+
+/// The as-of join of every base bar against the membership decisions in force,
+/// from the device or the CPU reference. `Err` is the labelled reason the
+/// device was not used.
+fn pit_join(
+    block: &panel_pit::PitBlock,
+    mode: GpuMode,
+    route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    let params = panel_pit::PitParams::membership(OUT_STEP);
+    let rows = block.times.len();
+    let probe = if mode == GpuMode::Off { None } else { Some(crate::backend::probe()) };
+    let planned = match &probe {
+        Some(p) => plan_device(mode, rows, p),
+        None => Err("gpu_off".to_string()),
+    };
+    let symbols = block.segments.len();
+    let device = planned.and_then(|()| device_pit(block, params, route));
+    match device {
+        Ok(out) => {
+            route.symbols_device += symbols;
+            route.rows_device += rows;
+            route.device = probe.and_then(|p| p.device);
+            Ok(out)
+        }
+        Err(reason) => {
+            if mode != GpuMode::Off {
+                route.fall_back(reason, symbols);
+            }
+            route.symbols_cpu += symbols;
+            route.rows_cpu += rows;
+            panel_pit::join(block, params)
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn device_pit(
+    block: &panel_pit::PitBlock,
+    params: panel_pit::PitParams,
+    route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    if block.times.len() > i32::MAX as usize {
+        return Err(format!("too_many_rows: {}", block.times.len()));
+    }
+    let (out, stats) = crate::panel_pit_gpu::join(block, params)
+        .ok_or_else(|| "launch: the device PIT join failed".to_string())?;
+    route.passes += 1;
+    route.h2d_bytes += stats.h2d_bytes;
+    route.d2h_bytes += stats.d2h_bytes;
+    route.kernel_s += stats.kernel_s;
+    route.wall_s += stats.wall_s;
+    Ok(out)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn device_pit(
+    _block: &panel_pit::PitBlock,
+    _params: panel_pit::PitParams,
+    _route: &mut DeviceRoute,
+) -> Result<panel_pit::PitOutput, String> {
+    Err("no_device: built without --features cuda".to_string())
 }
 
 fn assemble(
@@ -1298,13 +1647,17 @@ fn assemble(
     membership: &Membership,
     opts: &PanelOptions,
     cutoff: Option<i64>,
-) -> Assembled {
-    let index = panel::membership_index(membership);
-    let mut rows: Vec<V2Row> = Vec::new();
-    let mut jumps = Vec::new();
+    mode: GpuMode,
+) -> Result<Assembled, String> {
+    struct Part<'a> {
+        symbol: &'a str,
+        bars: &'a [Bar],
+        aux: &'a [Aux],
+        ord: Vec<u32>,
+    }
+    let mut parts: Vec<Part> = Vec::new();
     let mut last = BTreeMap::new();
     let mut listings = BTreeMap::new();
-    let mut next_listing = 0u32;
     let mut declared_breaks = 0usize;
     for (symbol, (bars_all, aux_all)) in series_in {
         let keep = match cutoff {
@@ -1327,24 +1680,47 @@ fn assemble(
         declared_breaks += count as usize - 1;
         listings.insert(symbol.clone(), count);
         last.insert(symbol.clone(), *times.last().unwrap());
-        let decisions = index.get(symbol.as_str()).map(|v| v.as_slice());
-        let part = panel::symbol_panel_rows(symbol, bars, decisions, OUT_STEP);
+        parts.push(Part { symbol, bars, aux: &aux_all[..keep], ord });
+    }
+    let block = panel_pit::PitBlock::from_membership_slices(
+        parts.iter().map(|p| (p.symbol, p.bars)),
+        membership,
+    );
+    let mut route = DeviceRoute::new(mode);
+    let joined = if parts.is_empty() {
+        panel_pit::PitOutput::default()
+    } else {
+        pit_join(&block, mode, &mut route)?
+    };
+    let mut rows: Vec<V2Row> = Vec::new();
+    let mut jumps = Vec::new();
+    let mut next_listing = 0u32;
+    for (seg, p) in block.segments.iter().zip(&parts) {
+        let (lo, hi) = (seg.start, seg.start + seg.len);
+        let from = joined.kept_rows.partition_point(|r| *r < lo);
+        let to = joined.kept_rows.partition_point(|r| *r < hi);
         let mut prev: Option<(usize, f64)> = None;
-        for pr in part {
-            let k = times.partition_point(|t| *t < pr.bar.time);
-            let a = aux_all[k];
+        for &r in &joined.kept_rows[from..to] {
+            let k = (r - lo) as usize;
+            let bar = p.bars[k];
+            let a = p.aux[k];
             if let Some((pk, pclose)) = prev {
-                if pk + 1 == k && ord[pk] == ord[k] && pclose > 0.0 && pr.bar.open > 0.0 {
-                    let ratio = pr.bar.open / pclose;
+                if pk + 1 == k && p.ord[pk] == p.ord[k] && pclose > 0.0 && bar.open > 0.0 {
+                    let ratio = bar.open / pclose;
                     if ratio > opts.jump_factor || ratio < 1.0 / opts.jump_factor {
-                        jumps.push(Jump { symbol: symbol.clone(), at: pr.bar.time, ratio });
+                        jumps.push(Jump { symbol: p.symbol.to_string(), at: bar.time, ratio });
                     }
                 }
             }
-            prev = Some((k, pr.bar.close));
+            prev = Some((k, bar.close));
             rows.push(V2Row {
-                row: pr,
-                listing_id: next_listing + ord[k],
+                row: PanelRow {
+                    symbol: p.symbol.to_string(),
+                    bar,
+                    as_of: joined.as_of[r as usize],
+                    gap_buckets: joined.gap[r as usize] as usize,
+                },
+                listing_id: next_listing + p.ord[k],
                 cov15m: a.cov15m,
                 flags: a.flags,
                 dup_rows: a.dup_rows,
@@ -1352,10 +1728,10 @@ fn assemble(
                 traded: a.traded,
             });
         }
-        next_listing += count;
+        next_listing += listings[p.symbol];
     }
     rows.sort_by(|a, b| a.row.bar.time.cmp(&b.row.bar.time).then_with(|| a.row.symbol.cmp(&b.row.symbol)));
-    Assembled { rows, last, jumps, listings, declared_breaks }
+    Ok(Assembled { rows, last, jumps, listings, declared_breaks, route })
 }
 
 fn v2_table(rows: &[V2Row]) -> Table {
@@ -1500,6 +1876,7 @@ pub struct PanelSummary {
     pub gaps: usize,
     pub listings: usize,
     pub manifest: String,
+    pub route: DeviceRoute,
 }
 
 /// P4/P5: assemble the time-major panel and write the store and manifest.
@@ -1509,7 +1886,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     let guard = Guard::new(opts.allow_lockbox, None);
     let all_times: Vec<i64> = series.values().flat_map(|(b, _)| b.iter().map(|x| x.time)).collect();
     guard.check_times("panel build", &all_times)?;
-    let asm = assemble(&series, &membership, opts, None);
+    let asm = assemble(&series, &membership, opts, None, opts.gpu)?;
     if !asm.jumps.is_empty() {
         let mut msg = format!(
             "{} undeclared level jump(s) (open/previous close beyond {}x inside one listing); \
@@ -1567,6 +1944,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
         gaps: panel.gaps,
         listings: asm.listings.values().map(|c| *c as usize).sum(),
         manifest: manifest_path,
+        route: asm.route.clone(),
     })
 }
 
@@ -1620,6 +1998,9 @@ fn v2_block(
         PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
         crate::derivatives::manifest_json(None)
     );
+    if opts.gpu != GpuMode::Off {
+        let _ = write!(s, "\"backend\":{},", asm.route.json());
+    }
     let _ = write!(
         s,
         "\"resample\":{{\"in_step\":{},\"out_step\":{}}},\"listing\":{{\"gap_days\":{},\"relists\":[{}],\"total\":{},\"multi_listing_symbols\":[{}]}},",
@@ -1853,7 +2234,13 @@ pub fn validate(opts: &ValidateOptions) -> Report {
                 let distinct: Vec<i64> = ts.iter().copied().collect::<BTreeSet<_>>().into_iter().collect();
                 for k in 1..=opts.replay {
                     let cut = distinct[(distinct.len() - 1) * k / (opts.replay + 1)];
-                    let asm = assemble(series, &m, &opts.panel_options, Some(cut));
+                    let asm = match assemble(series, &m, &opts.panel_options, Some(cut), GpuMode::Off) {
+                        Ok(a) => a,
+                        Err(_) => {
+                            bad += 1;
+                            continue;
+                        }
+                    };
                     let upto = ts.partition_point(|t| *t <= cut);
                     if asm.rows.len() != upto {
                         bad += 1;
@@ -2000,6 +2387,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
     let mut jump_factor = 5.0f64;
     let mut outage_share = 0.5f64;
     let mut replay = 3usize;
+    let mut gpu: Option<GpuMode> = None;
     let mut i = 0usize;
     while i < args.len() {
         let num = |s: String, name: &str| -> f64 {
@@ -2029,12 +2417,26 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
                     cli_usage("the v2 panel is hourly: --bar-seconds must be 3600");
                 }
             }
+            "--gpu" => {
+                let mode = match args.get(i + 1).map(|s| s.as_str()) {
+                    Some(m @ ("auto" | "on" | "off" | "cpu" | "force")) => {
+                        i += 1;
+                        GpuMode::parse(m).unwrap_or_else(|e| cli_usage(&e))
+                    }
+                    _ => GpuMode::On,
+                };
+                gpu = Some(mode);
+            }
+            "--no-gpu" | "--cpu" => gpu = Some(GpuMode::Off),
             "--keep-partial" => keep_partial = true,
             "--require-full-bucket" => keep_partial = false,
             "--allow-lockbox" => allow_lockbox = true,
             other => cli_usage(&format!("unknown option '{}' for `rcsr panel {}` (hourly v2)", other, cmd)),
         }
         i += 1;
+    }
+    if gpu.is_some() && cmd != "base" && cmd != "build" {
+        cli_usage(&format!("--gpu applies to `rcsr panel base` and `rcsr panel build`, not `{}`", cmd));
     }
     let mut po = |membership: &str, out: &str| -> PanelOptions {
         let mut p = PanelOptions::new(data.as_deref().unwrap_or(""), membership, out);
@@ -2045,6 +2447,7 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         p.relists = std::mem::take(&mut relists);
         p.jump_factor = jump_factor;
         p.outage_share = outage_share;
+        p.gpu = gpu.unwrap_or(GpuMode::Auto);
         p
     };
     match cmd {
@@ -2066,16 +2469,22 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             o.allow_lockbox = allow_lockbox;
             o.resume = resume;
             o.group_rows = group_rows;
+            o.gpu = gpu.unwrap_or(GpuMode::Auto);
             o.interval_seconds = match interval.as_str() {
                 "15m" => IN_STEP,
                 "1m" => 60,
                 other => cli_usage(&format!("unknown --interval '{}' (15m or 1m)", other)),
             };
             match build_base(&o) {
-                Ok(s) => eprintln!(
-                    "panel base: {} rows, {} symbols, {} cached -> {} (manifest {})",
-                    s.rows, s.symbols, s.reused, out, s.manifest
-                ),
+                Ok(s) => {
+                    eprintln!(
+                        "panel base: {} rows, {} symbols, {} cached -> {} (manifest {})",
+                        s.rows, s.symbols, s.reused, out, s.manifest
+                    );
+                    if s.route.requested != "off" {
+                        eprintln!("{}", route_line("panel base", &s.route));
+                    }
+                }
                 Err(e) => cli_fail(&e),
             }
         }
@@ -2087,10 +2496,15 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
             let out = out.unwrap_or_else(|| "panel_hourly_default.rcsb".to_string());
             let p = po(&m, &out);
             match build_panel(&p) {
-                Ok(s) => eprintln!(
-                    "panel build: {} rows, {} symbols, {} delisted, {} gaps, {} listings -> {} (manifest {})",
-                    s.rows, s.symbols, s.delisted, s.gaps, s.listings, out, s.manifest
-                ),
+                Ok(s) => {
+                    eprintln!(
+                        "panel build: {} rows, {} symbols, {} delisted, {} gaps, {} listings -> {} (manifest {})",
+                        s.rows, s.symbols, s.delisted, s.gaps, s.listings, out, s.manifest
+                    );
+                    if s.route.requested != "off" {
+                        eprintln!("{}", route_line("panel build", &s.route));
+                    }
+                }
                 Err(e) => cli_fail(&e),
             }
         }
@@ -2114,6 +2528,23 @@ pub fn cli(cmd: &str, args: &[String]) -> ! {
         other => cli_usage(&format!("unknown panel command '{}'", other)),
     }
     std::process::exit(0);
+}
+
+/// The CLI line naming where the device work ran and every CPU fallback.
+fn route_line(tool: &str, r: &DeviceRoute) -> String {
+    format!(
+        "{}: gpu={} device={} cpu={} symbols, {} passes, kernel {:.3}s{}",
+        tool,
+        r.requested,
+        r.symbols_device,
+        r.symbols_cpu,
+        r.passes,
+        r.kernel_s,
+        r.fallbacks
+            .iter()
+            .map(|(why, n)| format!("; cpu fallback ({}): {} symbols", why, n))
+            .collect::<String>()
+    )
 }
 
 fn value(args: &[String], i: &mut usize) -> String {

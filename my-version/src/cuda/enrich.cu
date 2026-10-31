@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "cub_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -152,6 +153,14 @@ extern "C" unsigned long long rc_enrich_test_launch_hits(void)
 }
 
 #define RC_LAUNCH_FAULT(site) rc_launch_fault(site)
+
+
+static int g_force_cub_fail = 0;
+
+extern "C" void rc_enrich_test_force_cub_fail(int on)
+{
+    g_force_cub_fail = on;
+}
 
 static int rc_alloc(void **p, size_t bytes)
 {
@@ -1905,11 +1914,18 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
                                                  sizeof(unsigned char));
 
     size_t t1 = 0, t2 = 0;
-    cub::DeviceRadixSort::SortPairs(
-        NULL, t1, c->d_xs_keys, c->d_xs_keys_out,
-        c->d_xs_order, c->d_xs_order_tmp, c->n);
-    cub::DeviceScan::InclusiveSum(NULL, t2, c->d_xs_rows_out, c->d_xs_gid,
-                                  c->n);
+    if (rc_cub_status(cub::DeviceRadixSort::SortPairs(
+            NULL, t1, c->d_xs_keys, c->d_xs_keys_out,
+            c->d_xs_order, c->d_xs_order_tmp, c->n)) != cudaSuccess ||
+        rc_cub_status(cub::DeviceScan::InclusiveSum(
+            NULL, t2, c->d_xs_rows_out, c->d_xs_gid, c->n)) != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     size_t temp_bytes = t1 > t2 ? t1 : t2;
     t0 = rc_now_ms();
     if (rc_alloc(&c->d_xs_temp, temp_bytes) != 0) {
@@ -1942,21 +1958,45 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     c->last.launch_ms += rc_now_ms() - l0;
 
     /* Pass 1: stable by symbol. The value carried along is the row index. */
-    cub::DeviceRadixSort::SortPairs(
+    cudaError_t cub_err = RC_CUB(g_force_cub_fail, cub::DeviceRadixSort::SortPairs(
         c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
-        c->d_xs_order, c->d_xs_order_tmp, c->n);
+        c->d_xs_order, c->d_xs_order_tmp, c->n));
+    if (cub_err != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     /* Pass 2: stable by time. Equal times retain the symbol/row order. */
     k_keys_from_time<<<blocks, threads>>>(c->d_times, c->d_xs_order_tmp,
                                           c->d_xs_keys, c->n);
-    cub::DeviceRadixSort::SortPairs(
+    cub_err = rc_cub_status(cub::DeviceRadixSort::SortPairs(
         c->d_xs_temp, temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
-        c->d_xs_order_tmp, c->d_xs_order, c->n);
+        c->d_xs_order_tmp, c->d_xs_order, c->n));
+    if (cub_err != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
 
     /* Group boundaries, ids and starts from the time-ordered permutation. */
     k_group_boundary<<<blocks, threads>>>(c->d_times, c->d_xs_order,
                                           c->d_xs_rows_out, c->n);
-    cub::DeviceScan::InclusiveSum(c->d_xs_temp, temp_bytes, c->d_xs_rows_out,
-                                  c->d_xs_gid, c->n);
+    cub_err = rc_cub_status(cub::DeviceScan::InclusiveSum(
+        c->d_xs_temp, temp_bytes, c->d_xs_rows_out, c->d_xs_gid, c->n));
+    if (cub_err != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     k_gid_zero_based<<<blocks, threads>>>(c->d_xs_gid, c->n);
     unsigned int last_gid = 0;
     cudaMemcpy(&last_gid, c->d_xs_gid + (c->n - 1), sizeof(unsigned int),
@@ -1972,10 +2012,11 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     c->last.alloc_ms += rc_now_ms() - t0;
     if (ok) {
         size_t t3 = 0;
-        cub::DeviceSegmentedRadixSort::SortPairs(
-            NULL, t3, c->d_xs_keys, c->d_xs_keys_out, c->d_xs_order,
-            c->d_xs_rows_out, c->n, groups, c->d_xs_off, c->d_xs_off + 1);
-        if (t3 > c->xs_temp_bytes) {
+        ok = rc_cub_status(cub::DeviceSegmentedRadixSort::SortPairs(
+                 NULL, t3, c->d_xs_keys, c->d_xs_keys_out, c->d_xs_order,
+                 c->d_xs_rows_out, c->n, groups, c->d_xs_off,
+                 c->d_xs_off + 1)) == cudaSuccess;
+        if (ok && t3 > c->xs_temp_bytes) {
             cudaFree(c->d_xs_temp);
             c->d_xs_temp = NULL;
             ok = rc_alloc(&c->d_xs_temp, t3) == 0;
@@ -2049,11 +2090,18 @@ int rc_enrich_xs_rank(void *v, const double *src, double *out)
                                      c->d_xs_member, c->d_xs_keys, c->n);
     c->last.launch_ms = rc_now_ms() - l0;
     double l1 = rc_now_ms();
-    cub::DeviceSegmentedRadixSort::SortPairs(
+    cudaError_t cub_err = rc_cub_status(cub::DeviceSegmentedRadixSort::SortPairs(
         c->d_xs_temp, c->xs_temp_bytes, c->d_xs_keys, c->d_xs_keys_out,
         c->d_xs_order, c->d_xs_rows_out, c->n, c->xs_groups,
-        c->d_xs_off, c->d_xs_off + 1);
+        c->d_xs_off, c->d_xs_off + 1));
     c->last.launch_ms += rc_now_ms() - l1;
+    if (cub_err != cudaSuccess) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     int cblocks = (c->xs_groups + threads - 1) / threads;
     k_count_finite<<<cblocks, threads>>>(c->d_xs_keys_out, c->d_xs_off,
                                          c->xs_groups, c->d_xs_counts);

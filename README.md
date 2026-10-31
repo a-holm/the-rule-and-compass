@@ -40,7 +40,12 @@ arm; the correlation *scorer* is native on the device since #287;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+forced individually. With no `--fit-strategy`, or with `auto`, a run on the GPU
+evaluator with `squared`, `aic`, `aicc` or `bic`, fitting on, device memory for
+the f64 fit rows and a run-level cost model that predicts a win resolves to the
+batched kernel with every candidate with constants admitted; every other run
+keeps `exact` (no flag) or the structural `auto`, so CPU-only runs are
+unchanged, and each resolution is labelled with its reason. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device; the same exact
 integer sums also **score** every candidate on the device from 4 096 training
 rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
@@ -183,6 +188,8 @@ strategy's P&L. `--gpu` runs both scans on the CUDA device, bit-identical to the
 CPU scans, and names the reason when it falls back to the CPU. See [`docs/walkforward.md`](docs/walkforward.md) for the
 semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
 the pinned 4M-row benchmark protocol and the measured wall time.
+
+The long-only evaluation protocol builds on it: the UTC windows table `protocol/windows.csv`, a purge of `--entry-offset + --horizon + --delay`, an economics block (Sortino, Calmar, CVaR, break-even cost, cost ladder, cash, buy-and-hold and equal-weight benchmarks with exposure and beta), a circular block bootstrap with a design effect (`--bootstrap`), block-permutation and matched-exposure nulls (`--null-draws`), DSR, PBO, SPA and BH-FDR, and a candidate ledger with a sealed list and a one-read locked test (`--ledger`, `--locked-test`, `rcsr protocol`). See the "Long-only evaluation protocol" section of [`docs/walkforward.md`](docs/walkforward.md).
 
 Grammar: `+ - * / ^` (`^` is right-associative and binds tighter than unary
 minus), function calls with any arity (`sin(x)`, `min(x, y)`, `if(c, a, b)`),
@@ -444,9 +451,9 @@ atomically instead of streaming it. See
   (`mkt_*`, `breadth`, `dispersion`, `rel_mkt*`, `avg_corr`,
   `btc_volume_share`) run one thread per timestamp in the CPU addition order
   (`--features cuda`, tiers per column in `rcsr schema` `gpu_feature_parity`),
-  the point-in-time membership and MTF as-of joins (`src/cuda/pit.cu`, #302: `as_of <= t` and
-  `h.time + tf <= t` merges with `bar_age`, chain resets and `lookahead_violations`; bitwise vs the
-  CPU reference, membership decisions stay on the CPU, `rcsr panel build` is not rewired),
+  the point-in-time membership as-of join (`src/cuda/pit.cu`: an `as_of <= t` merge with chain
+  resets and `lookahead_violations`; bitwise vs the CPU reference, membership decisions stay on
+  the CPU, `rcsr panel build --gpu auto|on|off` runs it),
   the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
@@ -462,7 +469,9 @@ atomically instead of streaming it. See
   default financial feature set is registered in `rcsr schema`
   (`feature_registry`): every available column has a tested producer, and
   registered-but-unavailable derivative columns fail closed with the missing
-  dependency instead of being silently dropped. The `engine_catalogue` block
+  dependency instead of being silently dropped; `availability_matrix` counts available and
+  unavailable columns per family and `docs/default_financial_features.json` lists every
+  registry column with its PIT rule, dtype, unit and proving tests. The `engine_catalogue` block
   enumerates all 254 engine names (216 in
   `all,py15m,ta:full,exotic:cheap,cross:btc` plus 38 compact-only names) with
   family, warm-up, availability, exact formula and the explicit canonical
@@ -572,8 +581,11 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
+     [--objective mse|pnl|sharpe|log_growth] [--position long_only] [--threshold f]
+     [--cost-bps f] [--slippage-bps f] [--cash-return f] [--funding col]
+     [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--target-spec file] [--allow-target-structure]
+     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -695,6 +707,15 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--select-by train|validation|aicc` chooses the display order; the test
   block is a scoring-only lockbox and is never used to select. See
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
+* `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
+  slice by an exact long/flat book (position 0 or 1, never short, cost per side
+  on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
+  fit error. The fit and the archive keep `--metric`. It needs a temporal
+  split, `--validation-frac`, a `forward_return` `--target-spec` and
+  `--cost-bps`. `--json` adds an `objective` block with the validation and test
+  books, cash and buy-and-hold comparisons and the break-even cost. See
+  [`docs/walkforward.md`](docs/walkforward.md) and
+  [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`
   run the **validation gates** (section 3.10b of `docs/overfitting.md`): a
   noise-scaled supported front on the validation slice (`--equivalence-z`,
@@ -734,8 +755,11 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
-| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
+| `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
+| `--ledger file` | candidate ledger whose locked reads run.json counts |
+| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
+| `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1194,8 +1218,9 @@ floor, keep the CPU evaluator, print the *named* reason and record it in
 
 Cross-backend runs are **not bit-identical**: objective-kernel fitness is `f32`,
 so it can change the search trajectory. The #288 statistics are exact `f64` and
-match the CPU bit for bit for the same prediction vector (interquartile to
-`1e-12` relative), but the prediction itself may round differently on the two
+match the CPU bit for bit for the same prediction vector (median and
+interquartile through a radix select from 4 096 and 65 536 rows, rank and AUC
+through a sort), but the prediction itself may round differently on the two
 devices. Reported metrics, constants and diagnostics are always rebuilt on the
 CPU in exact `f64`; use `--cpu` for a byte-identical reproduction. A metric may
 use the GPU only when the score table names a native scorer for it, so no run is
