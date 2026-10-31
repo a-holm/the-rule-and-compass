@@ -2190,8 +2190,26 @@ caller runs the CPU scan.
   `DpScan::bound` add them with the CPU code.
 * **Parallelism.** Chains are the unit of parallel work: `candidates x groups x
   (K + 1)` for the band, `2 x groups` for the DP. A single long group is one
-  serial chain per start state, so the device helps a panel with many groups
-  and loses on one long series.
+  serial chain per start state. A launch only runs the chains of the groups
+  its row chunk touches, so `rcsr walkforward --gpu` scans all rows in one
+  launch; smaller chunks give the same bits but serialise the groups.
+
+Measured on the RTX 3060 (`sm_86`), 3,943,856 rows, `β = 0.1`, `K = 1`, one
+candidate, block size 256, one launch, device times including upload and
+download (`bench_band_dp_device_vs_cpu`, log
+`/mnt/lager/tmp/eureqa-gates/issue306-final.log`):
+
+| groups | band CPU | band device | DP CPU | DP device |
+|---:|---:|---:|---:|---:|
+| 439 (9,001 rows each) | 0.100 s | 0.098 s | 0.030 s | 0.033 s |
+| 3,944 (1,000 rows each) | 0.094 s | 0.083 s | 0.032 s | 0.029 s |
+| 1 | 0.106 s | 1.131 s | 0.031 s | 0.905 s |
+
+The device scan is exact, not faster: on a panel it is level with the CPU, and
+one long series is 10 to 30 times slower, because a chain is one dependent
+`f64` add and two loads per row in one thread. With 64 k-row chunks the
+439-group band takes 0.267 s. The device path pays off only with many chains
+(many groups or a candidate batch); the walk-forward runs one candidate.
 
 Tests (`tests/pnl_gpu.rs`, module `device_band_dp`): the band, cooldown and DP
 carries, positions, net and bound equal the CPU at 1, 32, 256 and the maximum

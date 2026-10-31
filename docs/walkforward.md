@@ -205,7 +205,12 @@ bound.
 * The block size (1 up to the device limit) only changes which thread owns a
   chain, never the order of its sums. The scan is launched once per row chunk;
   a chain whose group continues from an earlier chunk resumes its state and
-  value from device memory.
+  value from device memory. The walk-forward uses one chunk for all rows, so
+  every group's chains run in the same launch.
+* The device scan is for exactness, not speed: on a 3.9 M-row panel it is
+  level with the CPU, and a single long series is 10 to 30 times slower (one
+  thread per chain). The measurements are in
+  [`docs/gpu-backend.md`](gpu-backend.md#band-cooldown-and-hindsight-dp-scan-issue-306).
 * The per-group carries come back to the host, and the net and the bound are
   summed there by the same code as the CPU path.
 * Scores stay `f64` on the device, so a score on `θ ± β` compares exactly as on
