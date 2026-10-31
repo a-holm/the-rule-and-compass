@@ -2846,3 +2846,7 @@ Every device allocation of an evaluator goes through one tagged wrapper. It coun
 No production request scales with `P x N`. The n-scaled requests are the dataset (`cols`, `y`), its f64 twin (`cols_f64`, `y_f64`, `w_f64`), the label sign (`tsign`, `tsign_f64`), the rank target (`rank_b`) and the fit and score region (`fit_region`). `GpuEvaluator::predictions`, which writes `P x N` values, exists only in test builds, and `rc_predict` refuses an output above 64 MiB.
 
 The rank and order-statistic score calls split their trials into sub-waves, so one call stays inside 512 MiB (64 bytes per row and segment) even when six trials of one candidate exceed it. The fit and score region caps its growth slack at 512 MiB when the batch itself fits.
+
+### Throughput at the wide-panel scale
+
+Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).
