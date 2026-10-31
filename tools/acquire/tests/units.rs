@@ -139,3 +139,14 @@ fn error_body_is_not_a_listing() {
     let page = parse_page(std::str::from_utf8(&fixture("missing_2026-10.xml")).unwrap());
     assert!(page.keys.is_empty() && page.prefixes.is_empty() && !page.truncated);
 }
+
+#[test]
+fn json_parse_reads_nested_values_and_escapes() {
+    use rcsr_acquire::json::{parse, Value};
+    let v = parse(" {\"a\": [1, -2.5e3, null, true], \"s\": \"x\\u00e9\\ud83d\\ude00\\n\"} ").unwrap();
+    assert_eq!(v.get("s").and_then(Value::as_str), Some("x\u{e9}\u{1f600}\n"));
+    assert_eq!(v.get("a").and_then(Value::as_array).map(<[Value]>::len), Some(4));
+    for bad in ["", "{", "[1,]", "{\"a\" 1}", "\"\\ud800\"", "1 2", "[\"a\nb\"]", "nul"] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
+}

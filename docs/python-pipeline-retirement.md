@@ -24,7 +24,7 @@ or in `rcsr-acquire`.
 | 6 | `build_panel_daily_100.py` | superseded | `rcsr prep --resample 1d --label ...` |
 | 7 | `build_panel_daily_all.py` | superseded | `rcsr prep --resample 1d` + `rcsr panel` membership |
 | 8 | `build_panel_daily_long.py` | superseded | `rcsr prep --resample 1d --label ...`; long-history config archived |
-| 9 | `build_universe_pit.py` | superseded | `rcsr panel` point-in-time membership |
+| 9 | `build_universe_pit.py` | superseded | `rcsr-acquire universe` (name and product filter); `rcsr panel` point-in-time membership by ADV |
 | 10 | `compact_hourly.py` | superseded | `rcsr prep --resample 1h`; extra hourly features are `rcsr enrich` |
 | 11 | `dl_15m_all.py` | superseded | `rcsr-acquire fetch` (`curl` transport, no Rust HTTP client) |
 | 12 | `download_15m_100.py` | superseded | `rcsr-acquire fetch` |
@@ -55,7 +55,7 @@ or in `rcsr-acquire`.
 | 37 | `run_gpu_daily_8h.py` | superseded | `rcsr walkforward --gpu ...` |
 | 38 | `run_gpu_daily_extra.py` | superseded | `rcsr walkforward --gpu ...` |
 | 39 | `run_walkforward.py` | superseded | `rcsr walkforward --windows ...` |
-| 40 | `select_universe.py` | superseded | `rcsr panel` membership selection |
+| 40 | `select_universe.py` | superseded | `rcsr-acquire universe --top-by-quote-volume` (file inputs only); `rcsr panel` membership selection |
 | 41 | `verify_hourly.py` | superseded | `FileStore::open` validates magic/version/header/block offsets; `rcsr verify-manifest` checks the provenance. The redundant script is archived |
 
 ## Decisions
@@ -65,7 +65,8 @@ or in `rcsr-acquire`.
   `https://data.binance.vision/`. `list` reads the bucket listing, `fetch` skips
   existing zips and records every request, 404 included, in a status CSV, and
   `verify` checks each zip against its vendor `.CHECKSUM` and writes the snapshot
-  JSON. Details: [README, "Acquiring the Binance Vision archive"](../README.md#acquiring-the-binance-vision-archive).
+  JSON. `universe` filters the listed USDT symbols to genuine crypto pairs from pinned
+  file inputs and does no network access. Details: [README, "Acquiring the Binance Vision archive"](../README.md#acquiring-the-binance-vision-archive).
 * **Panels and membership.** `rcsr prep` owns raw decoding, resampling, causal
   joins, features and labels (#123/#125); `rcsr panel` owns point-in-time
   membership, costs and the lockbox (#145).

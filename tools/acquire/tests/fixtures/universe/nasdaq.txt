@@ -1,0 +1,4 @@
+Symbol|Security Name|Market Category
+AAPL|Apple Inc.|Q
+MSFT|Microsoft|Q
+File Creation Time: 1031202600:00|||

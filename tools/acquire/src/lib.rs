@@ -9,6 +9,7 @@ pub mod json;
 pub mod listing;
 pub mod sha256;
 pub mod transport;
+pub mod universe;
 pub mod verify;
 
 /// Public download host of the archive.
