@@ -36,6 +36,7 @@ pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
 pub mod features;
+pub mod labels; // #262: long-only horizon, action and triple-barrier labels
 pub mod bench_gpu; // #299: device benchmark joins, beta and cross means
 pub mod features_gpu; // #297: fused flow / price-action device producers
 pub mod fit;

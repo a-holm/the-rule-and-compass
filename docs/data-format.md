@@ -26,13 +26,13 @@ loaded when `--target-spec` is absent and it has an entry for `--target`:
   "entry_price":"open of the next 15m bar","exit_price":"close of the 4th next 15m bar",
   "offset":0.0,"scale":{"kind":"constant","value":1.0},"clip":null,
   "units":"log_return","cost_bps":null,"cost_in_label":false,
-  "construction_columns":[],"note":null}]}
+  "construction_columns":[],"note":null,"long_only":true}]}
 ```
 
 `rcsr schema` lists every field (`target_spec.fields`). An invalid file is exit 2,
 an unreadable one exit 3. A sidecar without an entry for the target means no
 spec; `--target-spec` without one is exit 2. The spec's scale column is read
-from the table even when it is not an input. See `docs/time-series.md` §2b.
+from the table even when it is not an input. `long_only` is optional and always true; `false` is exit 2. See `docs/time-series.md` §2b and §3b.
 
 ## Memory guard
 

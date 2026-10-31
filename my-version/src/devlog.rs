@@ -652,6 +652,8 @@ pub struct RunStart {
     pub max_bytes: u64,
     /// Set when this run continues a checkpoint.
     pub resumed_from: Option<String>,
+    /// #223: `(source, reason)` when the engine resolved the fit arm.
+    pub fit_resolution: Option<(String, String)>,
 }
 
 fn config_json(config: &[(String, String)]) -> String {
@@ -670,7 +672,7 @@ fn config_json(config: &[(String, String)]) -> String {
 
 /// One line for `run_start`. Terminal: always written, never capped.
 pub fn run_start_json(r: &RunStart) -> String {
-    format!(
+    let mut json = format!(
         "{{\"schema\":\"{}\",\"v\":{},\"event\":\"run_start\",\"command\":{},\"version\":{},\
          \"commit\":{},\"dirty\":{},\"binary_sha256\":{},\
          \"data\":{{\"path\":{},\"sha256\":{},\"full_rows\":{},\"sampled_rows\":{},\
@@ -712,7 +714,16 @@ pub fn run_start_json(r: &RunStart) -> String {
         r.every,
         r.max_bytes,
         r.resumed_from.as_ref().map(|p| text(p)).unwrap_or_else(|| "null".into())
-    )
+    );
+    if let Some((source, reason)) = &r.fit_resolution {
+        json.pop();
+        json.push_str(&format!(
+            ",\"fit_strategy_source\":{},\"fit_strategy_reason\":{}}}",
+            text(source),
+            text(reason)
+        ));
+    }
+    json
 }
 
 /// What `run_end` records about the run.

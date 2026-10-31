@@ -137,3 +137,7 @@ come from the `f64` rebuild.
 The existing arm floors (`median`/`interquartile` 4 096 rows, `maximum` 512
 rows) are expressed through the same planner with a zero-hysteresis
 compatibility calibration, so their measured crossover is unchanged.
+
+## The run-level fit rule
+
+The stage model above decides one candidate batch. The fit arm of a whole run (`exact` or the batched GPU LM for `squared`, `aic`, `aicc`, `bic`) is a separate, pure rule that reads no timing: `min(islands, cores) * (s * k + (1 - s) / W) * E * (1 + h) < 1`, with `k = 0.05`, `E = 1.32`, `h = 0.3`, `W` the fallback workers and `s = 1` only when every configured operator has a device fit opcode. It is resolved once before generation 0; see "Default fit arm" in `gpu-backend.md`. The per-candidate model cannot decide it: its device and CPU fit costs scale with the same row, constant and sweep factors, so the device always wins there and the floor of `32p` rows is the only guard.

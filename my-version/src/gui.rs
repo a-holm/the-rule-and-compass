@@ -1362,6 +1362,21 @@ impl RunPlan {
             expr::parse(src, &vars).map_err(|e| format!("cannot parse --eval-expr: {}", e))?;
         }
 
+        // #223: resolve the fit arm like the CLI does. The web front end is a
+        // fresh run, never a resume.
+        let mut cfg = cfg;
+        let named = request.args.iter().position(|a| a == "--fit-strategy");
+        let fit_request = match named {
+            None => Some(fit::FitRequest::Unset),
+            Some(_) if cfg.fit_strategy == fit::FitStrategy::Auto => Some(fit::FitRequest::Auto),
+            Some(_) => None,
+        };
+        if let Some(fit_request) = fit_request {
+            let resolved = search::resolve_fit_strategy(&cfg, &prepared.train, fit_request);
+            cfg.fit_strategy = resolved.strategy;
+            cfg.fit_admission = resolved.admission;
+        }
+
         Ok(RunPlan {
             cfg,
             prepared,
