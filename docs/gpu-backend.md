@@ -1606,7 +1606,7 @@ exactly the gradient of `Σ ln(1 + exp(−t·p))` that `ft_solve`'s
   row keeps a (tiny) weight rather than disappearing from the Hessian.
 * **Metric-aware acceptance.** After the batch, every accepted proposal is
   judged by the exact `f64` `log_loss` at the proposal against the exact value
-  at the starting constants (`fit::gate_proposal`). Worse → revert and label
+  at the starting constants (`fit::gate_device_proposal`). Worse → revert and label
   `log_loss_worse`, non-finite → revert and label `non_finite`. Finalists are
   refit by `fit_weighted_metric` in CPU `f64` and every reported error is the
   exact CPU log-loss of the stored tree.
@@ -1797,6 +1797,15 @@ runs it on the same tree — indicative, not a quiet box): `signed`
 already feasible (p=3, 4), and `4.37e-4 → 1.08e-8` (p=8, near-collinear basis,
 `not_converged` — two rounds did not certify, and the polish it replaces cost
 15× the arm and left the bias at `4.37e-4`).
+
+### Deferred-fit contract
+
+The deferred device fit does per candidate what the CPU arm does.
+
+* **One exact gate.** `fit::device_fit_is_gated` is true for `log_loss`, `correlation`, `correlation_signed` and `signed`. For these, `GpuSearch::fit_pending` passes every usable proposal through `fit::gate_device_proposal`, the same function `fit_batch_verified` uses: rank, signed projection, the configured metric in exact `f64`, or squared SSE. `Rejected` restores the incoming constants and sends the candidate to the exact CPU arm with the label `worse` (`log_loss_worse` for `log_loss`); `NonFinite` does the same with the label `non_finite`. `NotIdentifiable` (signed only) uses the label `not_identifiable`.
+* **Refresh.** After the device write-back, after the CPU fallback batch and after the pipeline write-back, `refresh_after_fit` simplifies each fitted tree and recomputes its complexity, as `evolve_island` does after the CPU fit. Dead `1*` and `+ 0` nodes left by the kernel no longer reach tie-breaks or the in-search archive. A tree the dimensional filter rejects keeps an infinite error.
+* **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
+* **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
 ## The DGX Spark path
 
