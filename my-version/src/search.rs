@@ -997,29 +997,34 @@ impl GpuSearch {
                 // suggestion, never the final word. The other LM arms keep
                 // their historical trajectory (their proposal is the kernel's
                 // own optimum of the same objective).
-                let gated = matches!(cfg.metric, Metric::LogLoss);
+                let gated = crate::fit::device_fit_is_gated(cfg.metric);
                 for ((i, j, plan), res) in jobs.iter().zip(out) {
                     let finite = res.c.iter().all(|v| v.is_finite());
                     let usable = crate::fit::fit_status_usable(res.status);
                     if gated && usable && finite {
-                        let tree = &mut islands[*i][*j].tree;
-                        let (_, verdict) = crate::fit::gate_proposal(
-                            tree,
-                            |t| plan.apply(t, &res.c),
+                        let verdict = crate::fit::gate_device_proposal(
+                            &mut islands[*i][*j].tree,
+                            &res.c,
                             &train.x,
                             &train.y,
                             &train.w,
                             cfg.metric,
                         );
                         let cause = match verdict {
-                            crate::fit::ProposalGate::Kept => {
+                            crate::fit::Verdict::Accepted(_) => {
                                 self.fit_gpu += 1;
                                 self.stats.entry(generation).or_default().fit_gpu += 1;
                                 crate::fit::note_gpu_fit(true);
                                 continue;
                             }
-                            crate::fit::ProposalGate::Worse => FitFallbackCause::LogLossWorse,
-                            crate::fit::ProposalGate::NonFinite => FitFallbackCause::NonFinite,
+                            crate::fit::Verdict::NonFinite => FitFallbackCause::NonFinite,
+                            crate::fit::Verdict::Rejected if cfg.metric == Metric::LogLoss => {
+                                FitFallbackCause::LogLossWorse
+                            }
+                            crate::fit::Verdict::Rejected => FitFallbackCause::Worse,
+                            crate::fit::Verdict::NotIdentifiable => {
+                                FitFallbackCause::NotIdentifiable
+                            }
                         };
                         fallbacks.push((*i, *j, cause));
                         self.note_fit_fallback(generation, cause);
@@ -1119,6 +1124,9 @@ impl GpuSearch {
         let stats = self.stats.entry(generation).or_default();
         stats.fit_fallback_seconds += fallback_seconds;
         stats.fit_fallback_workers = stats.fit_fallback_workers.max(workers_used);
+        for &(i, j) in admitted {
+            refresh_after_fit(&mut islands[i][j], cfg);
+        }
     }
 
     /// #169: record one CPU fallback for this generation and the whole run.
@@ -1175,10 +1183,30 @@ impl GpuSearch {
             // The non-promoted offspring keep this screening score, so the
             // generation evaluates every candidate once and only survivors a
             // second time after the fit.
-            self.fit_screened += pending.len();
-            self.stats.entry(generation).or_default().fit_screened += pending.len();
-            self.evaluate_the_batch(islands, &pending, train, cfg, generation, dispatcher)?;
-            let admitted = select_promoted(islands, &pending, train.len());
+            let wide = wide_admission(cfg.metric, train.len());
+            // #393: with wide admission every candidate with constants is
+            // fitted and scored once after the fit, so only the constant-free
+            // ones need the screening score.
+            let screened: Vec<(usize, usize)> = if wide {
+                pending
+                    .iter()
+                    .copied()
+                    .filter(|&(i, j)| {
+                        matches!(
+                            crate::fit::gpu_fit_plan_reason(&islands[i][j].tree),
+                            Err(crate::fit::GpuFitReject::NoConstants)
+                        )
+                    })
+                    .collect()
+            } else {
+                pending.clone()
+            };
+            self.fit_screened += screened.len();
+            self.stats.entry(generation).or_default().fit_screened += screened.len();
+            if !screened.is_empty() {
+                self.evaluate_the_batch(islands, &screened, train, cfg, generation, dispatcher)?;
+            }
+            let admitted = select_promoted(islands, &pending, wide);
             let fit_start = std::time::Instant::now();
             self.fit_pending(islands, &admitted, train, cfg, generation, dispatcher);
             self.fit_host_ms += fit_start.elapsed().as_secs_f64() * 1000.0;
@@ -3085,6 +3113,13 @@ pub enum FitFallbackCause {
     /// #234: the kernel's log-loss constants scored strictly worse than the
     /// starting constants in exact `f64` `log_loss`, so the start was kept.
     LogLossWorse,
+    /// #393: the exact gate judged the device proposal on the configured metric
+    /// and it scored worse (or non-finite) than the starting constants, so the
+    /// start was kept and the exact CPU arm refits.
+    Worse,
+    /// #393: `signed` only. No constant can move the mean, so the proposal has
+    /// no justification on the bias; the exact CPU arm refits.
+    NotIdentifiable,
     /// #227: the device maximum-error stage declined (allocation, launch or an
     /// inconsistent scan) and the exact CPU maximum arm took over.
     MaximumDeclined,
@@ -3097,7 +3132,7 @@ pub enum FitFallbackCause {
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 14] = [
+    pub const ALL: [FitFallbackCause; 16] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -3112,6 +3147,8 @@ impl FitFallbackCause {
         FitFallbackCause::LogLossWorse,
         FitFallbackCause::MaximumDeclined,
         FitFallbackCause::DispatchCost,
+        FitFallbackCause::Worse,
+        FitFallbackCause::NotIdentifiable,
     ];
 
     /// Stable JSON label.
@@ -3131,6 +3168,8 @@ impl FitFallbackCause {
             FitFallbackCause::LogLossWorse => "log_loss_worse",
             FitFallbackCause::MaximumDeclined => "maximum_declined",
             FitFallbackCause::DispatchCost => "dispatch_cost",
+            FitFallbackCause::Worse => "worse",
+            FitFallbackCause::NotIdentifiable => "not_identifiable",
         }
     }
 }
@@ -3219,6 +3258,28 @@ fn maximum_status_fallback_cause(status: i32) -> FitFallbackCause {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 pub(crate) const WIDE_ADMISSION_ROWS: usize = 1 << 20;
 
+/// #393: the CPU path simplifies the tree and recomputes its complexity after a
+/// fit (`evolve_island`). The deferred path calls this for every candidate whose
+/// constants a device fit, a CPU fallback or the pipeline write-back replaced,
+/// so tie-breaks and the in-search archive see the fitted tree. A candidate the
+/// dimensional filter rejects keeps an infinite error, as in [`Ind::pending`].
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn refresh_after_fit(ind: &mut Ind, cfg: &Config) {
+    ind.tree = expr::simplify(&ind.tree);
+    ind.complexity = cfg.complexity_model.complexity(&ind.tree);
+    if !cfg.accepts_dimensions(&ind.tree) {
+        ind.error = f64::INFINITY;
+    }
+}
+
+/// #393: true when every candidate with constants is fitted: the row count is at
+/// or above [`WIDE_ADMISSION_ROWS`], or the metric is gated and fitted by the CPU
+/// arm on every candidate ([`crate::fit::admits_every_candidate`]).
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn wide_admission(metric: Metric, train_rows: usize) -> bool {
+    train_rows >= WIDE_ADMISSION_ROWS || crate::fit::admits_every_candidate(metric)
+}
+
 /// #169: how many offspring of one island are admitted to the fitted LM batch.
 ///
 /// Below [`WIDE_ADMISSION_ROWS`] the fixed fraction `pop/4` is floored at 32 so
@@ -3230,8 +3291,8 @@ pub(crate) const WIDE_ADMISSION_ROWS: usize = 1 << 20;
 /// 3.9M hourly cell failed its quality gate that way). The choice uses only the
 /// population size and the row count, never timing, so it is reproducible.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
-fn admission_count(island_pop: usize, train_rows: usize) -> usize {
-    if train_rows >= WIDE_ADMISSION_ROWS {
+fn admission_count(island_pop: usize, wide: bool) -> usize {
+    if wide {
         return island_pop.max(1);
     }
     ((island_pop / 4).max(32)).min(island_pop).max(1)
@@ -3241,17 +3302,17 @@ fn admission_count(island_pop: usize, train_rows: usize) -> usize {
 ///
 /// Every pending (`error.is_nan()`) individual is screened with its seed
 /// constants first. Per island, the best `admission_count(island_pop,
-/// train_rows)` are promoted; ties break on complexity and then on the
+/// wide)` are promoted; ties break on complexity and then on the
 /// population index, so the set depends only on the screened errors, the row
 /// count and the fixed island/population order. Non-promoted offspring keep
-/// their screening score. At `train_rows >= WIDE_ADMISSION_ROWS` every
+/// their screening score. When `wide` is set (see [`wide_admission`]) every
 /// candidate with constants is promoted, so the screen can only exclude trees
 /// that have nothing to fit.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn select_promoted(
     islands: &[Vec<Ind>],
     pending: &[(usize, usize)],
-    train_rows: usize,
+    wide: bool,
 ) -> Vec<(usize, usize)> {
     let mut promoted = Vec::with_capacity(pending.len());
     for (i, pop) in islands.iter().enumerate() {
@@ -3278,7 +3339,7 @@ fn select_promoted(
                 )
                 .then(a.0.cmp(&b.0))
         });
-        let take = admission_count(pop.len(), train_rows).min(ranked.len());
+        let take = admission_count(pop.len(), wide).min(ranked.len());
         promoted.extend(ranked[..take].iter().map(|&(j, _, _)| (i, j)));
     }
     // Fitting order is deterministic; the candidates are independent, but a
@@ -3671,7 +3732,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
         && train_rows >= WIDE_ADMISSION_ROWS
         && cfg.fit_iters > 0
         && crate::fit::fit_loss(cfg.metric).is_some()
-        && cfg.metric != Metric::LogLoss
+        && !crate::fit::device_fit_is_gated(cfg.metric)
 }
 
 /// #119: offer a freshly generated candidate to the overlap queue. Sending is
@@ -4892,7 +4953,7 @@ fn run_postfix_search(
         }
 
         if gen_best.is_finite() {
-            if gen_best <= 1e-24 {
+            if cfg.metric.is_solved(gen_best) {
                 converged_early = true;
                 stop_reason = "solved"; // #211
             }
@@ -6055,6 +6116,7 @@ fn run_search(
                                         crate::fit::gpu_fit_plan_reason(&islands[i][j].tree)
                                     {
                                         plan.apply(&mut islands[i][j].tree, c);
+                                        refresh_after_fit(&mut islands[i][j], cfg);
                                     }
                                 }
                                 islands[i][j].error = r.error;
@@ -6247,7 +6309,7 @@ fn run_search(
             }
 
             if gen_best.is_finite() {
-                if gen_best <= 1e-24 {
+                if cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
                     break;
@@ -6741,6 +6803,7 @@ mod tests {
         assert_eq!(split_fit_window([1.0, 2.0, 3.0], f64::NAN).1, 0.0);
     }
     use crate::expr::{constant, input, node, Op};
+    use crate::metrics::Metric;
 
     /// `y = x0` on a small grid, two inputs.
     fn sample() -> Sample {
@@ -6843,19 +6906,18 @@ mod tests {
     /// and the training row count, and widens to every candidate at large `N`.
     #[test]
     fn admission_count_is_the_documented_fraction() {
-        let small = WIDE_ADMISSION_ROWS - 1;
-        assert_eq!(admission_count(1, small), 1);
-        assert_eq!(admission_count(24, small), 24, "small islands admit everyone");
-        assert_eq!(admission_count(64, small), 32, "max(32, pop/4)");
-        assert_eq!(admission_count(100, small), 32);
-        assert_eq!(admission_count(128, small), 32);
-        assert_eq!(admission_count(256, small), 64);
+        assert_eq!(admission_count(1, false), 1);
+        assert_eq!(admission_count(24, false), 24, "small islands admit everyone");
+        assert_eq!(admission_count(64, false), 32, "max(32, pop/4)");
+        assert_eq!(admission_count(100, false), 32);
+        assert_eq!(admission_count(128, false), 32);
+        assert_eq!(admission_count(256, false), 64);
         // 154k, the pinned fit-heavy cell: the documented fraction is unchanged.
-        assert_eq!(admission_count(256, 154_000), 64);
+        assert_eq!(admission_count(256, false), 64);
         // The 3.9M hourly cell: every candidate with constants is admitted.
-        assert_eq!(admission_count(128, 3_900_000), 128);
-        assert_eq!(admission_count(256, WIDE_ADMISSION_ROWS), 256);
-        assert_eq!(admission_count(1, WIDE_ADMISSION_ROWS), 1);
+        assert_eq!(admission_count(128, true), 128);
+        assert_eq!(admission_count(256, true), 256);
+        assert_eq!(admission_count(1, true), 1);
     }
 
     /// #169: promotion is deterministic, per island, and ranks on the same
@@ -6881,8 +6943,8 @@ mod tests {
         let pending: Vec<(usize, usize)> = (0..2)
             .flat_map(|i| (0..n).filter(|j| j % 17 != 0).map(move |j| (i, j)))
             .collect();
-        let a = select_promoted(&islands, &pending, 240);
-        let b = select_promoted(&islands, &pending, 240);
+        let a = select_promoted(&islands, &pending, false);
+        let b = select_promoted(&islands, &pending, false);
         assert_eq!(a, b, "the same screen must yield the same admission set");
         assert_eq!(a.len(), 64, "32 per island");
 
@@ -6929,7 +6991,7 @@ mod tests {
             ind.error = 5.0;
         }
         let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
-        let got = select_promoted(&islands, &pending, 240);
+        let got = select_promoted(&islands, &pending, false);
         let mut wanted: Vec<(usize, usize)> = (0..8).map(|j| (0, j)).collect();
         wanted.extend((40..64).map(|j| (0, j)));
         assert_eq!(got, wanted, "lower complexity wins an error tie");
@@ -6948,7 +7010,7 @@ mod tests {
             islands[0].push(ind);
         }
         let pending: Vec<(usize, usize)> = (0..64).map(|j| (0, j)).collect();
-        let got = select_promoted(&islands, &pending, 240);
+        let got = select_promoted(&islands, &pending, false);
         assert_eq!(got.len(), 32);
         assert!(
             got.iter().all(|&(_, j)| j % 2 == 1),
@@ -6972,19 +7034,96 @@ mod tests {
             islands[0].push(ind);
         }
         let pending: Vec<(usize, usize)> = (0..128).map(|j| (0, j)).collect();
-        let got = select_promoted(&islands, &pending, WIDE_ADMISSION_ROWS);
+        let got = select_promoted(&islands, &pending, wide_admission(Metric::Squared, WIDE_ADMISSION_ROWS));
         let wanted: Vec<(usize, usize)> = (0..128).filter(|j| j % 16 != 0).map(|j| (0, j)).collect();
         assert_eq!(
             got, wanted,
             "every fittable candidate must be admitted at large N"
         );
         // Just below the threshold the old fraction still applies.
-        let narrow = select_promoted(&islands, &pending, WIDE_ADMISSION_ROWS - 1);
+        let narrow = select_promoted(&islands, &pending, wide_admission(Metric::Squared, WIDE_ADMISSION_ROWS - 1));
         assert_eq!(
             narrow.len(),
             32,
             "below the threshold the pop/4 floor is unchanged"
         );
+    }
+
+    /// #393: the deferred path simplifies and recomputes complexity after a fit
+    /// write-back, exactly as the CPU path does.
+    #[test]
+    fn refresh_after_fit_matches_the_cpu_write_back() {
+        let cfg = Config::default();
+        let tree = node(
+            Op::Add,
+            vec![
+                constant(0.0),
+                node(Op::Mul, vec![constant(1.0), node(Op::Sin, vec![input(0)])]),
+            ],
+        );
+        let before = cfg.complexity_model.complexity(&tree);
+        let mut ind = Ind {
+            tree: tree.clone(),
+            error: f64::NAN,
+            complexity: before,
+            descriptor: None,
+        };
+        refresh_after_fit(&mut ind, &cfg);
+        let want = expr::simplify(&tree);
+        assert_eq!(expr::structural_hash(&ind.tree), expr::structural_hash(&want));
+        assert_eq!(ind.complexity, cfg.complexity_model.complexity(&want));
+        assert!(ind.complexity < before, "dead 0+ and 1* nodes carry no complexity");
+    }
+
+    /// #393: the metrics whose proposals need the exact gate defer without the
+    /// ungated pipeline write-back, and are fitted for every candidate.
+    #[test]
+    fn gated_arms_defer_and_stay_out_of_the_pipeline() {
+        for metric in [
+            Metric::Correlation,
+            Metric::CorrelationSigned,
+            Metric::Signed,
+            Metric::LogLoss,
+        ] {
+            assert!(crate::fit::device_fit_is_gated(metric), "{metric:?}");
+            let cfg = Config {
+                fit_strategy: crate::fit::FitStrategy::Gpu,
+                fit_iters: 8,
+                metric,
+                pipeline_depth: 2,
+                ..Default::default()
+            };
+            assert!(!pipeline_fit_safe(&cfg, WIDE_ADMISSION_ROWS, false), "{metric:?}");
+        }
+        for metric in [Metric::Squared, Metric::LogSquashed, Metric::Absolute] {
+            assert!(!crate::fit::device_fit_is_gated(metric), "{metric:?}");
+        }
+    }
+
+    /// #393: the gated arms fit every candidate with constants at any row count,
+    /// like the CPU arm; squared keeps `max(32, pop/4)` below the threshold.
+    #[test]
+    fn gated_arms_admit_every_candidate_with_constants() {
+        let mut islands = vec![Vec::new()];
+        for j in 0..128 {
+            let mut ind = pending_ind(1.0 + j as f64, 1.0);
+            if j % 16 == 0 {
+                ind.tree = input(0);
+            }
+            islands[0].push(ind);
+        }
+        let pending: Vec<(usize, usize)> = (0..128).map(|j| (0, j)).collect();
+        let wanted: Vec<(usize, usize)> =
+            (0..128).filter(|j| j % 16 != 0).map(|j| (0, j)).collect();
+        let rows = WIDE_ADMISSION_ROWS - 1;
+        for metric in [Metric::Correlation, Metric::CorrelationSigned, Metric::Signed] {
+            assert!(crate::fit::admits_every_candidate(metric));
+            let got = select_promoted(&islands, &pending, wide_admission(metric, rows));
+            assert_eq!(got, wanted, "{metric:?}");
+        }
+        let squared = select_promoted(&islands, &pending, wide_admission(Metric::Squared, rows));
+        assert_eq!(squared.len(), 32);
+        assert!(!crate::fit::admits_every_candidate(Metric::LogLoss));
     }
 
     /// #169: every CPU fallback cause has a stable label, and both the plan
@@ -7010,6 +7149,8 @@ mod tests {
                 "log_loss_worse",
                 "maximum_declined",
                 "dispatch_cost",
+                "worse",
+                "not_identifiable",
             ]
         );
         assert_eq!(
@@ -7436,6 +7577,47 @@ mod tests {
             out.archive.items.iter().all(|s| s.error.is_finite()),
             "every archived error is finite"
         );
+    }
+
+    fn stop_run(metric: crate::metrics::Metric, law: bool) -> Outcome {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for i in 0..40 {
+            let a = -1.0 + 2.0 * i as f64 / 39.0;
+            x.push(vec![a]);
+            y.push(if law { 2.0 * a + 1.0 } else { a });
+        }
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let cfg = Config {
+            metric,
+            generations: 6,
+            pop: 30,
+            islands: 1,
+            seed: 5,
+            patience: 0,
+            gpu: false,
+            ..Config::default()
+        };
+        run(&cfg, &train, &train.clone())
+    }
+
+    /// #402: a negative information criterion is a good fit, not a solved run.
+    #[test]
+    fn information_criteria_run_every_generation() {
+        for metric in [Metric::Aic, Metric::Aicc, Metric::Bic] {
+            let out = stop_run(metric, true);
+            assert_eq!(out.stop_reason, "generations", "{}", metric.name());
+            assert_eq!(out.generations, 6, "{}", metric.name());
+        }
+    }
+
+    /// #402: squared and absolute still stop when the error reaches zero.
+    #[test]
+    fn squared_and_absolute_still_stop_at_zero_error() {
+        for metric in [Metric::Squared, Metric::Absolute] {
+            let out = stop_run(metric, false);
+            assert_eq!(out.stop_reason, "solved", "{}", metric.name());
+            assert!(out.generations < 6, "{}", metric.name());
+        }
     }
 
     #[test]

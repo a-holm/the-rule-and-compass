@@ -58,6 +58,10 @@ through it. A group wider than the cap is a refusal, not a fallback to a full
 table. The reader writes straight into the pinned slot (`pread`), so there is
 no intermediate `Vec<f64>` and no second host copy.
 
+### Registry views and the grouped writer (issue #260)
+
+`--project n` picks 24-48 registered columns before the read, so a 200-column or 364-column store is projected to the view and the resident term follows the view size. `store::write_store_grouped` holds one group of every column (`group_rows x columns x 8` bytes), not the table. `tests/registry.rs` writes a 128-column, 1,000,000-row store (about 1 GiB) in a child process and asserts that the writer and a 13-column projected read of it each stay under 256 MiB peak RSS (`VmHWM`). The 364-column, 20-variable peak-RSS and prep-wall measurements on the real store are taken in the final full test.
+
 ## Row selectors
 
 A split, fold or evaluation subset is described by a [`RowSelector`]:

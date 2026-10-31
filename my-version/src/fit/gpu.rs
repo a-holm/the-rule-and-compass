@@ -192,9 +192,9 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
                 fit_weighted_metric(tree, x, y, w, iters, metric),
                 BatchStatus::Unsupported,
             ),
-            Some(c) => match verify_proposal(tree, c, x, y, w, metric) {
+            Some(c) => match gate_device_proposal(tree, c, x, y, w, metric) {
                 Verdict::Accepted(v) => (v, BatchStatus::Gpu),
-                Verdict::Rejected => (
+                Verdict::Rejected | Verdict::NonFinite => (
                     fit_weighted_metric(tree, x, y, w, iters, metric),
                     BatchStatus::Worse,
                 ),
@@ -212,11 +212,14 @@ pub fn fit_batch_verified<B: BatchedFitter + ?Sized>(
 }
 
 /// The outcome of comparing one proposal with the starting constants.
-enum Verdict {
+pub enum Verdict {
     /// The proposal was accepted; carries its exact score of the metric.
     Accepted(f64),
     /// The proposal was not better (or was not finite): keep the start.
     Rejected,
+    /// The proposal, or the objective at the proposal or at the start, was not
+    /// finite: keep the start.
+    NonFinite,
     /// #228: `signed`, and no constant can move the mean, so the proposal has
     /// no justification on the bias. Keep the start and label it.
     NotIdentifiable,
@@ -242,7 +245,7 @@ enum Verdict {
 /// `rank_correlation_signed`, `1 − |ρ|` for `rank_correlation`. The gate never
 /// sees an SSE, and a reflected model is a worse deal for the signed objective
 /// (`2 − score`) exactly as it is for the CPU arm.
-fn verify_proposal(
+pub fn gate_device_proposal(
     tree: &mut Node,
     proposal: &[f64],
     x: &[Vec<f64>],
@@ -251,8 +254,11 @@ fn verify_proposal(
     metric: Metric,
 ) -> Verdict {
     let f = flatten(tree);
-    if proposal.len() != f.nconst || !proposal.iter().all(|v| v.is_finite()) {
+    if proposal.len() != f.nconst {
         return Verdict::Rejected;
+    }
+    if !proposal.iter().all(|v| v.is_finite()) {
+        return Verdict::NonFinite;
     }
     let mut c0 = vec![0.0; f.nconst];
     for i in 0..f.op.len() {
@@ -296,9 +302,11 @@ fn verify_proposal(
             Some(outcome) => outcome.is_projected() || candidate < start,
             None => true,
         };
-        if !candidate.is_finite() || !start.is_finite() || candidate > start || !justified {
+        let finite = candidate.is_finite() && start.is_finite();
+        if !finite || candidate > start || !justified {
             return match projected {
                 Some(SignedProjection::Unidentifiable) => Verdict::NotIdentifiable,
+                _ if !finite => Verdict::NonFinite,
                 _ => Verdict::Rejected,
             };
         }
@@ -309,7 +317,10 @@ fn verify_proposal(
     let mut v = vec![0.0; f.op.len()];
     let start = sse(&f, x, y, w, &c0, &mut v);
     let candidate = sse(&f, x, y, w, proposal, &mut v);
-    if !candidate.is_finite() || !start.is_finite() || candidate > start {
+    if !candidate.is_finite() || !start.is_finite() {
+        return Verdict::NonFinite;
+    }
+    if candidate > start {
         return Verdict::Rejected;
     }
     write_constants(tree, &f, proposal);
@@ -586,14 +597,14 @@ impl BatchedFitter for BatchedGpu<'_> {
         }
         // #231: the rank family has a native **fit** objective on the device,
         // under the orientation the metric names, so the batched verifier no
-        // longer declines it. `verify_proposal` judges the proposal on the
+        // longer declines it. `gate_device_proposal` judges the proposal on the
         // exact integer statistic, never on SSE and never on `|ρ|` for the
         // signed metric.
         if let Some(signed) = rank_metric_signed(metric) {
             return self.propose_rank(trees, iters, y, w, signed);
         }
         if metric == Metric::Signed {
-            // #228: warm start only; `verify_proposal` projects and judges.
+            // #228: warm start only; `gate_device_proposal` projects and judges.
             return self.propose(trees, iters, DeviceLoss::Squared);
         }
         // #226: `median` is fitted by the batched exact median polish (squared
@@ -715,6 +726,19 @@ mod tests {
         let mut out = tree.clone();
         write_constants(&mut out, &f, c);
         out
+    }
+
+    #[test]
+    fn a_non_finite_device_proposal_is_labelled_non_finite() {
+        let x = vec![vec![1.0, 2.0, 3.0, 4.0]];
+        let y = vec![1.0, 2.0, 3.0, 4.0];
+        for metric in [Metric::Squared, Metric::LogLoss] {
+            let mut tree = model();
+            let before = fitted(&tree);
+            let verdict = gate_device_proposal(&mut tree, &[f64::NAN, 0.1], &x, &y, &[], metric);
+            assert!(matches!(verdict, Verdict::NonFinite), "{metric:?}");
+            assert_eq!(fitted(&tree), before, "{metric:?}: the start is kept");
+        }
     }
 
     fn fitted(tree: &Node) -> Vec<f64> {
