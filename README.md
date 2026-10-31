@@ -40,7 +40,12 @@ arm; the correlation *scorer* is native on the device since #287;
 below 1 048 576 training rows it fits the screened top
 `max(32, pop/4)` of each island, and at or above that size every candidate with
 constants, so the seed-constant screen cannot cost quality at large `N`) can be
-forced individually. For `--metric rank_correlation`/`rank_correlation_signed`
+forced individually. With no `--fit-strategy`, or with `auto`, a run on the GPU
+evaluator with `squared`, `aic`, `aicc` or `bic`, fitting on, device memory for
+the f64 fit rows and a run-level cost model that predicts a win resolves to the
+batched kernel with every candidate with constants admitted; every other run
+keeps `exact` (no flag) or the structural `auto`, so CPU-only runs are
+unchanged, and each resolution is labelled with its reason. For `--metric rank_correlation`/`rank_correlation_signed`
 the same arm fits the exact integer rank polish on the device; the same exact
 integer sums also **score** every candidate on the device from 4 096 training
 rows (#288), and finalists are still rebuilt in CPU `f64`; `rank_correlation_signed`
@@ -734,8 +739,9 @@ run:
 | `--smooth-centred k` | the old **centred** window; reads future bars, is opt-in, and is reported as look-ahead |
 | `--allow-interpolate` | permit `--fill interpolate` on time-ordered data (it reads the next bar; otherwise refused) |
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
-| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
+| `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
+| `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1194,8 +1200,9 @@ floor, keep the CPU evaluator, print the *named* reason and record it in
 
 Cross-backend runs are **not bit-identical**: objective-kernel fitness is `f32`,
 so it can change the search trajectory. The #288 statistics are exact `f64` and
-match the CPU bit for bit for the same prediction vector (interquartile to
-`1e-12` relative), but the prediction itself may round differently on the two
+match the CPU bit for bit for the same prediction vector (median and
+interquartile through a radix select from 4 096 and 65 536 rows, rank and AUC
+through a sort), but the prediction itself may round differently on the two
 devices. Reported metrics, constants and diagnostics are always rebuilt on the
 CPU in exact `f64`; use `--cpu` for a byte-identical reproduction. A metric may
 use the GPU only when the score table names a native scorer for it, so no run is
