@@ -246,6 +246,15 @@ struct RcCtx {
     int nprog;
     int out_cap;
     cudaEvent_t t0, t1;
+    /* #284: device-time anchor. Kernel spans are placed by the event distance
+       from `ev_base`, whose host time is `base_host_ms` on the rc_now_ms clock.
+       The anchor is renewed once it is old, so the float event distance stays
+       fine-grained over a long run. */
+    cudaEvent_t ev_base;
+    int base_ok;
+    double base_host_ms;
+    double span_start_ms[2];
+    int span_ok[2];
     /* #118: the current batch's ledger and its start on the same monotonic
        clock, so `wall_ms` covers the whole begin..download path. */
     RcStats stats;
@@ -342,6 +351,32 @@ static char g_alloc_fail_tag[32] = "";
 static void rc_ledger_tag(char *dst, const char *tag)
 {
     snprintf(dst, 32, "%s", tag ? tag : "");
+}
+
+/* #284: place the kernel span `t0..t1` on the rc_now_ms clock from the event
+   distance to the anchor. `which` is 0 for the evaluator and 1 for the fit
+   stage. Both events are complete when this runs (the elapsed-time query
+   needs that). A failed query leaves the span unavailable and the Rust side
+   keeps the host envelope. */
+static void rc_span_capture(RcCtx *c, int which)
+{
+    c->span_ok[which] = 0;
+    if (!c->base_ok) return;
+    float off = 0.0f;
+    if (cudaEventElapsedTime(&off, c->ev_base, c->t0) != cudaSuccess || off < 0.0f) {
+        cudaGetLastError();
+        return;
+    }
+    c->span_start_ms[which] = c->base_host_ms + (double)off;
+    c->span_ok[which] = 1;
+    if ((double)off > 30000.0) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+        } else {
+            c->base_ok = 0;
+        }
+    }
 }
 
 static int rc_ledger_refuse(RcCtx *c, const char *tag, size_t bytes)
@@ -3608,6 +3643,15 @@ static void *rc_create_impl(const float *cols, int n, int v, const float *y,
     }
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
+    c->base_ok = 0;
+    c->span_ok[0] = c->span_ok[1] = 0;
+    if (cudaEventCreate(&c->ev_base) == cudaSuccess) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+            c->base_ok = 1;
+        }
+    }
     /* #285: copy streams and the per-slot events. A failed stream/event
        creation is not fatal: the batch path then keeps its synchronous
        semantics with a recorded reason. */
@@ -3716,6 +3760,7 @@ void rc_destroy(void *ctx)
     if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
     if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
     if (c->s_eval) cudaStreamDestroy(c->s_eval);
+    cudaEventDestroy(c->ev_base);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -3869,6 +3914,7 @@ float rc_eval_collect(void *ctx, float *out)
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = c->pending.nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     if (failed) st->failed = 1;
@@ -4069,6 +4115,7 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
@@ -4495,6 +4542,7 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     if (bounds || c->tiled) c->carry_warm = 1;
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
@@ -4583,6 +4631,21 @@ int rc_last_stats(void *ctx, RcStats *out)
     if (!c || !out) return -1;
     *out = c->stats;
     return 0;
+}
+
+/* #284: the last kernel span of kind `which` (0 evaluator, 1 fit), placed by
+   event timestamps. Writes the span start and the current time on the same
+   monotonic clock, in milliseconds, and clears the span. Returns 1 when a span
+   was available, else 0 and the caller keeps its host envelope. */
+int rc_last_span(void *ctx, int which, double *start_ms, double *now_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !start_ms || !now_ms || which < 0 || which > 1) return 0;
+    if (!c->span_ok[which]) return 0;
+    c->span_ok[which] = 0;
+    *start_ms = c->span_start_ms[which];
+    *now_ms = rc_now_ms();
+    return 1;
 }
 
 /* Canonical postfix hashes of the last uploaded buffer. */
@@ -4801,6 +4864,7 @@ float rc_fit_batch(void *ctx,
     rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5084,6 +5148,7 @@ float rc_rank_score_batch(void *ctx,
     rc_fs_ok(c, RC_FS_RANK);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5448,6 +5513,7 @@ float rc_max_scan_batch(void *ctx,
     rc_fs_ok(c, RC_FS_MAX);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5571,6 +5637,7 @@ float rc_order_stat_score_batch(void *ctx,
     rc_fs_ok(c, RC_FS_ORDER);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 

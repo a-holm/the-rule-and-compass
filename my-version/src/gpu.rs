@@ -562,6 +562,10 @@ struct RawCtx {
     _private: [u8; 0],
 }
 
+/// #284: kernel span kinds read through `rc_last_span`.
+pub(crate) const SPAN_EVAL: i32 = 0;
+pub(crate) const SPAN_FIT: i32 = 1;
+
 /// #118: the C-side ledger for one batch, in milliseconds. The host windows are
 /// disjoint: allocation, H2D copy, launch, event sync and D2H copy. `kernel_ms`
 /// is GPU-event time inside the wall and feeds the duty estimate, not the sum.
@@ -804,6 +808,8 @@ extern "C" {
     /* #118: start and read one batch's host-time ledger. */
     fn rc_stats_begin(ctx: *mut RawCtx);
     fn rc_last_stats(ctx: *mut RawCtx, out: *mut RawStats) -> i32;
+    /* #284: last kernel span by event timestamps (0 evaluator, 1 fit). */
+    fn rc_last_span(ctx: *mut RawCtx, which: i32, start_ms: *mut f64, now_ms: *mut f64) -> i32;
     #[cfg(test)]
     fn rc_predict(
         ctx: *mut RawCtx,
@@ -2146,11 +2152,29 @@ impl GpuEvaluator {
             // #284: the evaluator's device interval is the raw kernel window,
             // not the host envelope. Place it on the run clock using the
             // measured outer wall; a failed batch keeps its interval too.
-            let end_s = self.run_start.elapsed().as_secs_f64();
-            let start_s = (end_s - wall_s).max(0.0);
-            self.ledger
-                .record_eval_kernel(0, start_s, raw.kernel_ms.max(0.0) / 1e3);
+            let kernel_s = raw.kernel_ms.max(0.0) / 1e3;
+            match self.take_span_start_s(SPAN_EVAL) {
+                Some(start_s) => self.ledger.record_eval_kernel_event(0, start_s, kernel_s),
+                None => {
+                    let end_s = self.run_start.elapsed().as_secs_f64();
+                    let start_s = (end_s - wall_s).max(0.0);
+                    self.ledger.record_eval_kernel(0, start_s, kernel_s);
+                }
+            }
         }
+    }
+
+    /// #284: the start of the last kernel span of kind `which` on the run clock,
+    /// from CUDA event timestamps. `None` when the events are unavailable, and
+    /// the caller then keeps the host envelope.
+    pub(crate) fn take_span_start_s(&mut self, which: i32) -> Option<f64> {
+        let (mut start_ms, mut now_ms) = (0.0f64, 0.0f64);
+        let ok = unsafe { rc_last_span(self.ctx, which, &mut start_ms, &mut now_ms) };
+        if ok != 1 {
+            return None;
+        }
+        let age_s = ((now_ms - start_ms) / 1e3).max(0.0);
+        Some((self.run_start.elapsed().as_secs_f64() - age_s).max(0.0))
     }
 
     /// #284: place this evaluator's device intervals on the caller's run clock.
