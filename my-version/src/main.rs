@@ -10801,8 +10801,6 @@ mod tests {
         }
     }
 
-    /// Every report flag and type must stay documented in `--help` and `schema`.
-    #[test]
     /// #211: the development log is a documented surface: every flag, the
     /// schema id, the four event names and the analyzer are in `--help` and in
     /// `rcsr schema`.
@@ -10850,6 +10848,8 @@ mod tests {
         assert!(report_usage.contains("<log>"));
     }
 
+    /// Every report flag and type must stay documented in `--help` and `schema`.
+    #[test]
     fn help_and_schema_document_reports() {
         for flag in ["--report", "--report-out", "--report-repeats"] {
             assert!(usage().contains(flag), "usage() is missing {flag}");
