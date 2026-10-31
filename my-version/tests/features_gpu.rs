@@ -583,6 +583,45 @@ mod device {
         );
     }
 
+
+    #[test]
+    fn nr4_is_bit_exact_on_the_device() {
+        if !rcsr::gpu::probe().available() {
+            eprintln!("skipping: no CUDA device");
+            return;
+        }
+        enrich::set_gpu_floor_for_tests(0);
+        let dir = tmp_dir("nr4");
+        let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+        let cpu_out = dir.join("cpu.rcsb").to_string_lossy().into_owned();
+        let gpu_out = dir.join("gpu.rcsb").to_string_lossy().into_owned();
+        let mut all = rows("AAA", 3_000, 0, 1_200);
+        all.extend(rows("BBB", 3_000, 0, 1_700));
+        write_store(&src, &all, 4_096);
+        let cpu = enrich::build(&opts(&src, &cpu_out, GpuMode::Off, 4_096)).unwrap();
+        let gpu = enrich::build(&opts(&src, &gpu_out, GpuMode::On, 4_096)).unwrap();
+        assert_eq!(cpu.gpu_columns, 0);
+        assert_eq!(gpu.gpu_fallback, 0, "plans: {:?}", gpu.plans);
+        assert_eq!(gpu.cpu_columns, 0);
+        assert_eq!(gpu.gpu_columns, gpu.features.len());
+        assert!(fg::is_device_price_action("nr4"));
+        assert_eq!(fg::device_tier("nr4"), Some("bitwise"));
+        assert!(
+            gpu.plans.iter().any(|p| p.backend == "gpu"),
+            "no group dispatched: {:?}",
+            gpu.plans
+        );
+        let a = column(&cpu_out, "nr4");
+        let b = column(&gpu_out, "nr4");
+        assert_eq!(a.len(), b.len());
+        let finite = a.iter().filter(|v| v.is_finite()).count();
+        let nan = a.iter().filter(|v| v.is_nan()).count();
+        assert!(finite > 0 && nan > 0, "fixture must hold finite and NaN nr4 rows");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "nr4 row {i}: CPU {x:?} vs GPU {y:?}");
+        }
+        eprintln!("nr4 bit-exact: {finite} finite rows, {nan} NaN rows, {} rows", a.len());
+    }
     #[test]
     fn fused_cost_is_measured_on_one_million_rows() {
         if !rcsr::gpu::probe().available() {
