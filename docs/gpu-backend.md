@@ -2151,6 +2151,80 @@ order, so device/CPU parity is bit-identical on the fixtures (and within
 `1e-9` relative, the acceptance gate, even if a future input exposes a rounding
 difference).
 
+## Band, cooldown and hindsight DP scan (issue #306)
+
+`rc_band_scan` and `rc_dp_scan` in `src/cuda/pnl.cu` run the no-trade band, its
+minimum-hold (cooldown) variant and the hindsight DP of
+[`docs/walkforward.md`](walkforward.md#associative-carries-and-chunk-invariance).
+`rcsr walkforward --gpu` uses them; `trading_gpu::band_scan_device`,
+`cooldown_scan_device`, their `_batch` forms and `dp_scan_device` are the Rust
+entry points.
+
+The contract is stricter than the P&L reduction: the device result equals the
+serial CPU scan **bit for bit**, or the call returns `Err(reason)` and the
+caller runs the CPU scan.
+
+* **No reassociation.** The CPU folds each chain left to right: one chain per
+  `(candidate, group, start state)` for the band, one per `(group, source
+  state)` for the DP. The carry algebra is associative, but its rewards are
+  `f64` sums and `f64` addition is not (`[1, 2^-53, 2^-53]` is `1.0` left to
+  right and `1 + 2^-52` right first). A parallel prefix over carries, CUB's
+  `DeviceScan` included, therefore cannot reproduce the CPU bits; CCCL's
+  determinism levels promise run-to-run or GPU-to-GPU reproducibility, not
+  equality with a serial fold. The device folds each chain in one thread, in
+  ascending row order, with the CPU's operations in the CPU's order
+  (`-fmad=false`).
+* **Layout.** A 1-D grid-stride loop over chains. Band chain
+  `(candidate * groups + group) * (K + 1) + start`, so the start states of one
+  group sit in adjacent threads and read the same rows; DP chain
+  `2 * group + source`. Any block size from 1 to `rc_band_dp_max_threads()`
+  (the smaller `maxThreadsPerBlock` of the two kernels) gives the same bits:
+  it only changes which thread owns a chain. One block per candidate (the P&L
+  layout) would leave a one-candidate walk-forward on a single SM.
+* **Chunks.** The host launches once per row chunk. A chain whose group starts
+  inside the chunk starts from its initial state; any other chain resumes its
+  `(state, value)` from device memory, as the P&L kernel resumes a segment.
+* **Memory.** Returns, group offsets and the per-chain state are resident for
+  the call; scores are `f64` and stream through the declared 8-candidate tile;
+  the start-flat chain writes `u8` positions for the tile. Every allocation
+  goes through `rc_checked_malloc`.
+* **Host side.** Inputs are validated by the CPU scan's own checks first
+  (finite returns, contiguous groups, parameters), and the C entry points
+  re-check the group offsets before any upload. The per-group carries come
+  back to the host, where `BandScan::net`, `CooldownScan::net` and
+  `DpScan::bound` add them with the CPU code.
+* **Parallelism.** Chains are the unit of parallel work: `candidates x groups x
+  (K + 1)` for the band, `2 x groups` for the DP. A single long group is one
+  serial chain per start state. A launch only runs the chains of the groups
+  its row chunk touches, so `rcsr walkforward --gpu` scans all rows in one
+  launch; smaller chunks give the same bits but serialise the groups.
+
+Measured on the RTX 3060 (`sm_86`), 3,943,856 rows, `β = 0.1`, `K = 1`, one
+candidate, block size 256, one launch, device times including upload and
+download (`bench_band_dp_device_vs_cpu`, log
+`/mnt/lager/tmp/eureqa-gates/issue306-final.log`):
+
+| groups | band CPU | band device | DP CPU | DP device |
+|---:|---:|---:|---:|---:|
+| 439 (9,001 rows each) | 0.100 s | 0.098 s | 0.030 s | 0.033 s |
+| 3,944 (1,000 rows each) | 0.094 s | 0.083 s | 0.032 s | 0.029 s |
+| 1 | 0.106 s | 1.131 s | 0.031 s | 0.905 s |
+
+The device scan is exact, not faster: on a panel it is level with the CPU, and
+one long series is 10 to 30 times slower, because a chain is one dependent
+`f64` add and two loads per row in one thread. With 64 k-row chunks the
+439-group band takes 0.267 s. The device path pays off only with many chains
+(many groups or a candidate batch); the walk-forward runs one candidate.
+
+Tests (`tests/pnl_gpu.rs`, module `device_band_dp`): the band, cooldown and DP
+carries, positions, net and bound equal the CPU at 1, 32, 128, 256, 512 and the maximum
+block size and at 4 k and 64 k chunks; every candidate of a padded
+two-tile batch equals its alone run; the `n <= 20` brute-force DP and the
+`β = 0` threshold identity hold on the device; seams, mid-series entry, final
+exit, the cooldown minimum, one-row groups and non-finite scores match the CPU;
+refusals carry a reason; and `rcsr walkforward --gpu` reports the same JSON as
+the CPU run apart from the backend labels.
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
@@ -2176,6 +2250,7 @@ difference).
 | `sm_121` compilation (cubin + SASS + register/smem audit) | x86_64 host, CUDA 13.0.88, **no GPU** (`tests/sm121_compile.rs`) | **verified — compiled, not run** |
 | `sm_121` execution on a GB10 (device, driver, GPU tests, benchmark) | needs a dated session on `sm_121` hardware | **hardware-gated — not run here** |
 | Dataset larger than device VRAM through managed memory | needs a GB10 (or a >12 GB dataset) | **unverified** — the allocation path is compiled and exercised on `sm_86`, but not at that size |
+| Band, cooldown and hindsight DP scan bit-identical to the serial CPU scan at block sizes 1/32/128/256/512/max and 4 k/64 k chunks, padded batches, brute force `n <= 20`, `β = 0`, labelled refusal, `walkforward --gpu` (#306) | RTX 3060, `cargo test --release --features cuda --test pnl_gpu device_band_dp` | **verified** (see the #306 section) |
 | On-GPU FP64 verification of survivors | planned | **unverified** — survivors are re-checked by the CPU `f64` evaluator today |
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
 | logistic log-loss constants on the batched kernel: Fisher weights `q(1-q)`, uploaded label sign, softplus trial objective, closed-form and parity fixtures, extreme logits, single-class refusal, proposal gate, determinism, `--no-fit`, 28/32/64-iteration termination guard (#234) | RTX 3060, `cargo test --release --features cuda --test logloss_gpu` (21 tests) and the ignored `bench_logloss_end_to_end` | **verified** on three paired seeds (2.38×/3.92×/3.14×, quality a wash) |
