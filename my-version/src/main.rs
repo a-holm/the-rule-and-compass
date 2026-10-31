@@ -185,6 +185,10 @@ ROW WEIGHTS:
                              prediction or label is read. Refused for metrics
                              with no weighted definition (median, maximum,
                              interquartile, slope, rank_correlation, auc).
+                             On the GPU backend the device scorer carries the
+                             weights for every metric listed above that has a
+                             native scorer; a weighted run is never ranked on
+                             unweighted loss.
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   See docs/time-series.md for which preparation steps read ahead.
