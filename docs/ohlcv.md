@@ -612,6 +612,12 @@ report (`# enrich-feature: ...`) and the JSON sidecar. The candle/price-action
 registry entries record `source: "15m OHLCV bars; not a target construction
 column"`, and no candle column is used to construct a label.
 
+### Registry schema, views and time-major append (#260)
+
+Every column of the default financial feature set resolves to a registry entry (`registry::lookup`): family, timeframe, source columns, transform, causal offset, warm-up, unit, PIT rule, semantic cost, status. `<panel>.schema.json` adds the dtype, availability range and a per-column SHA-256 (docs/data-format.md). `rcsr schema` prints `feature_registry_version`, `schema_version` and the `feature_registry` array. Compact 52-feature parity is owned by #269; the registry only registers and hashes columns.
+
+`rcsr enrich` still needs one contiguous run per symbol. Compute a family on the symbol-major store, then carry it into the time-major panel with `rcsr panel append` (see `rcsr panel --help`); the panel's own blocks and per-column hashes do not change, and prefix causality is inherited from the enrich pass (`tests/registry.rs::an_appended_family_is_causal_on_a_prefix`, `every_registered_available_column_is_causal_on_a_prefix`).
+
 ### Causality, gaps and warm-up
 
 `rcsr enrich` reads one symbol at a time, so the input must contain one
@@ -937,6 +943,22 @@ per-column staging path with the reason recorded. `RCSR_ENRICH_GPU_BATCH=0`
 selects the per-column path for an A/B measurement. The report now carries
 `gpu.kernel_s`, `gpu.d2h_s`, `gpu.write_s`, `gpu.transfer_bytes` and the
 `write_bw` charged by the planner, separately.
+
+`timing.feature_s` is the host-thread wall time of the feature phase. It is
+partitioned into disjoint intervals on that thread:
+
+| Field | Interval |
+|---|---|
+| `timing.feature_read_s` | whole-column host reads for the MTF, benchmark and whole-column upload paths |
+| `timing.feature_context_s` | device context creation, including the projected upload |
+| `timing.feature_gpu_s` | host-side launch, sync and download wall of the GPU section, excluding `gpu.write_s` |
+| `gpu.write_s` | host staging writes of GPU output blocks |
+| `timing.feature_cpu_s` | the CPU fallback pass |
+| `timing.feature_other_s` | `feature_s` minus the five above; never negative beyond clock rounding |
+
+`gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
+overlap the host timeline and are not summed into the partition. The text
+report prints the partition on the `# enrich: feature_parts` line.
 
 Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
 --dry-run` (same input, same 118 dispatched columns, alternating order, two runs

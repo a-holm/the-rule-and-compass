@@ -22,7 +22,8 @@ use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
 use rcsr::{
-    backend, data, diagnostics, leakage, multi, qd, search, stability, store, target, walkforward,
+    backend, data, diagnostics, leakage, multi, qd, registry, search, stability, store, target,
+    walkforward,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -247,6 +248,12 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
+  --project <n|auto>         choose the variables as a deterministic family-stratified
+                             view of n registered feature columns (24-48, research
+                             cell 96-128; auto = 36), one or two per family, rotated
+                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             The view id and columns go to --run-manifest
+  --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
                              read to --vars, targets, --weight, --time and
                              --group-by when a .rcsb store is read with --vars
@@ -262,6 +269,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
 HISTORY AND DELAYED VARIABLES (lags, for forecasting):
   --lags <k>                 add x_lag1..x_lagk as inputs per variable, computed
                              inside each series (group + time order + gaps)
+  --lag-set <k,..|default>  declared lag menu in bars, e.g. 1,4,24,96 (`default`
+                             is that menu): adds x_lag<k> only for the listed k. Instead of
+                             --lags; the run reports nvars before and after
   --history-frac <f>         keep the first fraction of each series as history:
                              those rows supply the past but are not scored
   --gap-break <f>            start a new series when the time step exceeds f x the
@@ -1900,6 +1910,9 @@ fn main() {
     let mut gap_src: Option<String> = None;
     let mut folds = 1usize;
     let mut lags = 0usize;
+    let mut lag_set_src: Option<String> = None;
+    let mut project_src: Option<String> = None;
+    let mut view_index = 0usize;
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut date_only = data::DateOnlyPolicy::Error;
@@ -2236,6 +2249,9 @@ fn main() {
             "--gap" => gap_src = Some(val!()),
             "--folds" => folds = val!().parse().unwrap_or(1).max(1),
             "--lags" => lags = val!().parse().unwrap_or(0),
+            "--lag-set" => lag_set_src = Some(val!()),
+            "--project" => project_src = Some(val!()),
+            "--view" => view_index = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             // #130: strict time parsing. Every choice is reported.
@@ -3217,6 +3233,27 @@ fn main() {
     // #294: the resolved read projection used by this run, recorded in the
     // manifest. `None` means the historical full-column load.
     let mut store_projection: Option<store::Projection> = None;
+    let mut view_record: Option<registry::View> = None;
+    let lag_menu: Vec<usize> = match &lag_set_src {
+        Some(s) => {
+            if lags > 0 {
+                eprintln!("error: --lags and --lag-set are alternatives; give one");
+                std::process::exit(EXIT_USAGE);
+            }
+            match registry::parse_lag_menu(s) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    if project_src.is_some() && !store::is_store_path(&data_path) {
+        eprintln!("error: --project needs a .rcsb store with registered feature columns");
+        std::process::exit(EXIT_USAGE);
+    }
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -3247,6 +3284,58 @@ fn main() {
     } else if store::is_store_path(&data_path) {
         match store::FileStore::open(&data_path) {
             Ok(fs) => {
+                // #260: a --project view fixes --vars from the registry; a store
+                // with a schema sidecar refuses a name it does not list.
+                if let Some(src) = &project_src {
+                    if !vars.is_empty() {
+                        eprintln!("error: --project selects the variables; do not combine it with --vars");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                    let size = if src == "auto" {
+                        registry::DEFAULT_VIEW_SIZE
+                    } else {
+                        src.parse().unwrap_or_else(|_| {
+                            eprintln!("error: --project takes a view size or auto, got '{}'", src);
+                            std::process::exit(EXIT_USAGE);
+                        })
+                    };
+                    let excluded: Vec<&str> = target_names
+                        .iter()
+                        .map(|s| s.as_str())
+                        .chain(time_name.as_deref())
+                        .chain(group_name.as_deref())
+                        .chain(weight_name.as_deref())
+                        .collect();
+                    let candidates: Vec<String> = fs
+                        .header()
+                        .columns()
+                        .iter()
+                        .filter(|c| c.numeric && !excluded.contains(&c.name.as_str()))
+                        .map(|c| c.name.clone())
+                        .collect();
+                    match registry::select_view(&candidates, size, cfg.seed as u64, view_index) {
+                        Ok(v) => {
+                            eprintln!(
+                                "view {}: {} columns from {} families (seed {}, view {})",
+                                v.id,
+                                v.columns.len(),
+                                v.families.len(),
+                                v.seed,
+                                v.view
+                            );
+                            vars = v.columns.clone();
+                            view_record = Some(v);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {}", e);
+                            std::process::exit(EXIT_INPUT);
+                        }
+                    }
+                }
+                if let Err(e) = registry::check_vars(&data_path, &vars) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
                 // #112: project from the header before reading a group. The
                 // search copies only variables, targets and the weight; time
                 // and group are scanned during preparation.
@@ -3785,7 +3874,7 @@ fn main() {
     // `time_col`/`group_col` stay valid. The leading rows of each series become
     // history: they supply the past for later rows but are not scored.
     let mut lag_report = data::LagReport::default();
-    let table = if lags > 0 || history_frac > 0.0 {
+    let table = if lags > 0 || !lag_menu.is_empty() || history_frac > 0.0 {
         let lag_spec = data::LagSpec {
             lags,
             history_frac,
@@ -3796,8 +3885,15 @@ fn main() {
                 tz,
             },
         };
-        match data::add_lags(&table, &vars, &lag_spec, time_col, group_col) {
+        let lagged = if lag_menu.is_empty() {
+            data::add_lags(&table, &vars, &lag_spec, time_col, group_col)
+        } else {
+            data::add_lags_menu(&table, &vars, &lag_spec, &lag_menu, time_col, group_col)
+        };
+        match lagged {
             Ok((t2, v2, rep)) => {
+                eprintln!("nvars {} -> {}", rep.nvars_before, rep.nvars_after);
+                notes.push(format!("nvars {} -> {}", rep.nvars_before, rep.nvars_after));
                 lag_report = rep;
                 vars = v2;
                 t2
@@ -3892,6 +3988,7 @@ fn main() {
         && !multi_output
         && !implicit_mode
         && lags == 0
+        && lag_menu.is_empty()
         && history_frac == 0.0
         && prep.fill == data::FillMethod::None
         && prep.outlier_iqr.is_none()
@@ -4367,6 +4464,9 @@ fn main() {
                 columns: p.names(),
                 indices: p.indices(),
             });
+        }
+        if let Some(v) = &view_record {
+            m.view = Some(v.json());
         }
         if let Some(a) = &target_active {
             m.target_spec = Some((
@@ -5791,7 +5891,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -5811,6 +5911,9 @@ fn main() {
                 prepared.report.groups_train,
                 prepared.report.groups_test,
                 lag_report.lags,
+                lag_report.menu.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
+                lag_report.nvars_before,
+                lag_report.nvars_after,
                 lag_report.series,
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
@@ -8509,6 +8612,12 @@ OPTIONS:
                              the threshold rule bit for bit)
   --min-hold <n>             minimum consecutive long rows before a band exit
                              (default 1; requires --policy band)
+  --gpu                      run the --policy band/cooldown scan and the --policy
+                             dp hindsight scan on the CUDA device. The result is
+                             bit-identical to the CPU scan; when the device
+                             refuses (no device, non-CUDA build, allocation),
+                             the CPU scan runs and band/hindsight_bound carry
+                             backend=cpu and fallback_reason
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -8568,6 +8677,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut policy = walkforward::Policy::Threshold;
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
+    let mut gpu = false;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -8709,6 +8819,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--gpu" => gpu = true,
             "--control-seed" => {
                 let src = need(args, i + 1, "--control-seed");
                 control_seed = match src.parse::<u64>() {
@@ -8899,6 +9010,7 @@ fn run_walkforward(args: &[String]) -> ! {
         policy,
         band_width,
         min_hold,
+        gpu,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
@@ -8907,6 +9019,18 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     };
+    for w in &report.windows {
+        let reasons = [
+            w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),
+            w.hindsight_bound.as_ref().and_then(|h| h.fallback_reason.as_deref()),
+        ];
+        for reason in reasons.into_iter().flatten() {
+            eprintln!(
+                "note: window '{}': --gpu scan ran on the CPU: {}",
+                w.window.label, reason
+            );
+        }
+    }
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
     if let Some(path) = out {

@@ -4910,6 +4910,11 @@ pub struct LagSpec {
 #[derive(Clone, Default)]
 pub struct LagReport {
     pub lags: usize,
+    /// The declared bar menu (`--lag-set`), or `1..=lags` for `--lags`.
+    pub menu: Vec<usize>,
+    /// Variables before and after the delayed copies are added.
+    pub nvars_before: usize,
+    pub nvars_after: usize,
     pub series: usize,
     pub rows_in: usize,
     pub rows_kept: usize,
@@ -4933,13 +4938,33 @@ pub fn add_lags(
     time_col: Option<usize>,
     group_col: Option<usize>,
 ) -> Result<(Table, Vec<String>, LagReport), String> {
+    let menu: Vec<usize> = (1..=lag.lags).collect();
+    add_lags_menu(t, vars, lag, &menu, time_col, group_col)
+}
+
+/// [`add_lags`] with a declared menu of delays in bars (`--lag-set 1,4,24,96`).
+/// Column `x_lag<k>` is `x` delayed by `k` bars inside its series; `lag.lags` is
+/// ignored. The report carries the variable count before and after.
+pub fn add_lags_menu(
+    t: &Table,
+    vars: &[String],
+    lag: &LagSpec,
+    menu: &[usize],
+    time_col: Option<usize>,
+    group_col: Option<usize>,
+) -> Result<(Table, Vec<String>, LagReport), String> {
     let n = t.len();
+    let max_lag = menu.iter().copied().max().unwrap_or(0);
     let mut report = LagReport {
-        lags: lag.lags,
+        lags: max_lag,
+        menu: menu.to_vec(),
+        nvars_before: vars.len(),
+        nvars_after: vars.len() + vars.len() * menu.len(),
         rows_in: n,
         ..Default::default()
     };
-    if lag.lags == 0 && lag.history_frac <= 0.0 {
+    if menu.is_empty() && lag.history_frac <= 0.0 {
+        report.nvars_after = vars.len();
         report.rows_kept = n;
         return Ok((t.clone(), vars.to_vec(), report));
     }
@@ -5015,7 +5040,7 @@ pub fn add_lags(
     let mut keep = vec![false; n];
     for i in 0..n {
         let len = seg_rows[seg_id[i]].len() as f64;
-        let reserve = lag.lags.max((lag.history_frac * len).ceil() as usize);
+        let reserve = max_lag.max((lag.history_frac * len).ceil() as usize);
         if seg_pos[i] >= reserve {
             keep[i] = true;
         } else {
@@ -5027,7 +5052,7 @@ pub fn add_lags(
     let mut new_vars = vars.to_vec();
     let mut lag_names = Vec::new();
     for v in vars {
-        for k in 1..=lag.lags {
+        for &k in menu {
             let name = format!("{}_lag{}", v, k);
             lag_names.push(name.clone());
             new_vars.push(name);
@@ -5045,7 +5070,7 @@ pub fn add_lags(
     for (r, &i) in kept.iter().enumerate() {
         let mut c = 0usize;
         for &j in &var_idx {
-            for k in 1..=lag.lags {
+            for &k in menu {
                 let v = if seg_pos[i] >= k {
                     let src = seg_rows[seg_id[i]][seg_pos[i] - k];
                     t.value(src, j)
@@ -5079,7 +5104,7 @@ pub fn add_lags(
         "{} series, {} history row(s) dropped, {} delayed column(s) added",
         report.series,
         report.history_rows,
-        lag.lags * vars.len()
+        menu.len() * vars.len()
     ));
 
     Ok((out, new_vars, report))

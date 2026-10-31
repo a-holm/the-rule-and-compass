@@ -2963,6 +2963,12 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #398: the level-set distance has its own fit; the generic score of this
+    // metric is `+inf`, so every caller must reach `implicit::fit` here.
+    if metric == ImplicitDerivative {
+        crate::implicit::fit(tree, x, w, iters);
+        return crate::implicit::score_rows(tree, x, w, metric);
+    }
     // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
     // not only the squared family. IRLS, logistic IRLS and the coordinate
     // polish all force a minimum of one sweep, so return the current score
@@ -2986,6 +2992,7 @@ pub fn fit_weighted_metric(
         Squared | Aic | Aicc | Bic => {
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
+        ImplicitDerivative => unreachable!("the level-set metric returned above"),
         Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
@@ -3017,8 +3024,7 @@ pub fn fit_weighted_metric(
         | Median
         | Maximum
         | Interquartile
-        | Slope
-        | ImplicitDerivative => {
+        | Slope => {
             let start = metric_score(tree, x, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
@@ -4050,20 +4056,88 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
 /// occur in `tree` receives `0`; an input index outside `x` is ignored (the
 /// same row would evaluate to `NaN`).
 pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
-    let f = flatten(tree);
-    let n = f.op.len();
-    let mut c = vec![0.0; f.nconst];
-    for i in 0..n {
-        if f.cslot[i] >= 0 {
-            c[f.cslot[i] as usize] = f.val[i];
+    InputGradients::new(tree).gradient(x).to_vec()
+}
+
+/// One tree prepared for repeated input-gradient sweeps: the flat form, the
+/// constant vector and the scratch buffers are built once and reused per row.
+pub(crate) struct InputGradients {
+    f: Flat,
+    c: Vec<f64>,
+    v: Vec<f64>,
+    adj: Vec<f64>,
+    grad: Vec<f64>,
+    cgrad: Vec<f64>,
+}
+
+impl InputGradients {
+    pub(crate) fn new(tree: &Node) -> Self {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        InputGradients {
+            f,
+            c,
+            v: vec![0.0; n],
+            adj: vec![0.0; n],
+            grad: Vec::new(),
+            cgrad: Vec::new(),
         }
     }
-    let mut v = vec![0.0; n];
-    eval_row(&f, x, &c, &mut v);
-    let mut adj = vec![0.0; n];
-    let mut grad = vec![0.0; x.len()];
-    backward_impl(&f, &v, &mut adj, None, Some(&mut grad));
-    grad
+
+    /// Replace the tree's own constants, in pre-order, with `values`.
+    pub(crate) fn set_constants(&mut self, values: &[f64]) {
+        for (&slot, &val) in self.f.normal_order.iter().zip(values) {
+            self.c[slot] = val;
+        }
+    }
+
+    /// `∇f` at `x`; one forward and one backward sweep, no allocation.
+    pub(crate) fn gradient(&mut self, x: &[f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, None, Some(&mut self.grad));
+        &self.grad
+    }
+
+    /// `∂f/∂cⱼ` at `x` for the tree's own constants (pre-order), written to
+    /// `out`; one forward and one backward sweep.
+    pub(crate) fn constant_gradient(&mut self, x: &[f64], out: &mut [f64]) {
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, Some(&mut self.cgrad), None);
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+    }
+
+    /// [`Self::gradient`] and [`Self::constant_gradient`] from one sweep: returns
+    /// `∇f` and writes `∂f/∂cⱼ` to `out`.
+    pub(crate) fn both_gradients(&mut self, x: &[f64], out: &mut [f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(
+            &self.f,
+            &self.v,
+            &mut self.adj,
+            Some(&mut self.cgrad),
+            Some(&mut self.grad),
+        );
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+        &self.grad
+    }
 }
 
 #[cfg(test)]
