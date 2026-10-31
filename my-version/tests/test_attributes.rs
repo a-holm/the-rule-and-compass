@@ -1,5 +1,6 @@
-//! Guard: a function in a `#[cfg(test)]` module that is neither a test nor
-//! referenced anywhere in its file is a test that lost its `#[test]`.
+//! Guard: a function directly inside a `#[cfg(test)]` module that is neither a
+//! test nor referenced anywhere in its file is a test that lost its `#[test]`.
+//! A `#[test]` joined onto a comment line, or repeated, is caught too.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,11 +16,12 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn fn_name(line: &str) -> Option<&str> {
-    let mut rest = line.strip_prefix("    ")?;
-    if rest.starts_with(' ') {
-        return None;
-    }
+fn indent(line: &str) -> usize {
+    line.len() - line.trim_start().len()
+}
+
+fn fn_name(item: &str) -> Option<&str> {
+    let mut rest = item;
     for prefix in ["pub(crate) ", "pub ", "const ", "unsafe ", "async "] {
         rest = rest.strip_prefix(prefix).unwrap_or(rest);
     }
@@ -29,41 +31,56 @@ fn fn_name(line: &str) -> Option<&str> {
 }
 
 fn mentions(text: &str, name: &str) -> usize {
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
     text.match_indices(name)
         .filter(|(i, _)| {
-            let before = text[..*i].chars().next_back();
-            let after = text[i + name.len()..].chars().next();
-            let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
-            !word(before) && !word(after)
+            !word(text[..*i].chars().next_back()) && !word(text[i + name.len()..].chars().next())
         })
         .count()
 }
 
-fn scan(text: &str) -> Vec<String> {
+/// `whole_file`: the file is itself a `#[cfg(test)]` module (declared with
+/// `mod name;`), so its items sit at indent 0.
+fn scan(text: &str, whole_file: bool) -> Vec<String> {
     let mut problems = Vec::new();
-    let mut in_test_code = false;
+    // Indent of the items inside the current test module.
+    let mut item_indent: Option<usize> = whole_file.then_some(0);
+    let mut module_indent = 0;
+    let mut cfg_test_pending = false;
     let mut attrs: Vec<&str> = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed == "#[cfg(test)]" {
-            in_test_code = true;
+            cfg_test_pending = true;
         }
         if trimmed.starts_with("#[") || trimmed.starts_with("///") {
             attrs.push(trimmed);
             continue;
         }
-        if in_test_code {
-            let tests = attrs.iter().filter(|a| **a == "#[test]").count();
-            if tests > 1 {
-                problems.push(format!("line {}: duplicated #[test]", n + 1));
-            }
-            if let Some(name) = fn_name(line) {
-                let runs = tests > 0 || attrs.iter().any(|a| a.starts_with("#[ignore"));
-                if !runs && mentions(text, name) < 2 {
-                    problems.push(format!("line {}: `{name}` is never run or called", n + 1));
+        if trimmed.is_empty() {
+            attrs.clear();
+            continue;
+        }
+        if let Some(ind) = item_indent {
+            if !whole_file && indent(line) == module_indent && trimmed == "}" {
+                item_indent = None;
+            } else if indent(line) == ind {
+                let tests = attrs.iter().filter(|a| **a == "#[test]").count();
+                if tests > 1 {
+                    problems.push(format!("line {}: duplicated #[test]", n + 1));
+                }
+                if let Some(name) = fn_name(trimmed) {
+                    let runs = tests > 0 || attrs.iter().any(|a| a.starts_with("#[ignore"));
+                    if !runs && mentions(text, name) < 2 {
+                        problems.push(format!("line {}: `{name}` is never run or called", n + 1));
+                    }
                 }
             }
+        } else if cfg_test_pending && trimmed.starts_with("mod ") && trimmed.ends_with('{') {
+            module_indent = indent(line);
+            item_indent = Some(module_indent + 4);
         }
+        cfg_test_pending = false;
         attrs.clear();
     }
     problems
@@ -77,7 +94,8 @@ fn every_function_in_a_test_module_is_a_test_or_is_used() {
     let mut problems = Vec::new();
     for file in files {
         let text = fs::read_to_string(&file).unwrap();
-        for p in scan(&text) {
+        let stem = file.file_stem().unwrap().to_string_lossy();
+        for p in scan(&text, stem.ends_with("_tests")) {
             problems.push(format!("{}: {p}", file.display()));
         }
     }
@@ -87,11 +105,14 @@ fn every_function_in_a_test_module_is_a_test_or_is_used() {
 #[test]
 fn the_scan_flags_the_known_defects() {
     let lost = "#[cfg(test)]\nmod tests {\n    /// doc\n    fn a_test() {}\n}\n";
-    assert_eq!(scan(lost).len(), 1);
+    assert_eq!(scan(lost, false).len(), 1);
     let joined = "#[cfg(test)]\nmod tests {\n    /// doc    #[test]\n    fn a_test() {}\n}\n";
-    assert_eq!(scan(joined).len(), 1);
+    assert_eq!(scan(joined, false).len(), 1);
     let dup = "#[cfg(test)]\nmod tests {\n    #[test]\n    /// doc\n    #[test]\n    fn a_test() {}\n}\n";
-    assert_eq!(scan(dup).len(), 1);
+    assert_eq!(scan(dup, false).len(), 1);
     let ok = "#[cfg(test)]\nmod tests {\n    fn helper() {}\n    #[test]\n    fn a_test() { helper(); }\n}\n";
-    assert!(scan(ok).is_empty());
+    assert!(scan(ok, false).is_empty());
+    let production = "#[cfg(test)]\nmod tests {\n}\nimpl X {\n    fn unused() {}\n}\n";
+    assert!(scan(production, false).is_empty());
+    assert_eq!(scan("fn a_test() {}\n", true).len(), 1);
 }
