@@ -2,7 +2,7 @@
 
 One job: keep the user's desktop first, measure what loads the machine before accusing anyone, and touch only processes you started.
 
-Evidence: the lock script (nice 19, ionice idle, autogroup 19, `PAUSE` file); the 2026-10-30 session where a stream had to be protected, a hung test held the lock for 90 minutes, and a terminal in software rendering used 345 % CPU; "kan du gjøre diskord til hovedprioritet", "stopp crawl.sh" only on request.
+Evidence: the lock scripts (SCHED_IDLE, nice 19, ionice idle, autogroup 19, streaming-aware core pinning, `PAUSE` file); the 2026-10-30 session where a stream had to be protected, a hung test held the lock for 90 minutes, and a terminal in software rendering used 345 % CPU; "kan du gjøre diskord til hovedprioritet", "stopp crawl.sh" only on request.
 
 ## Inputs
 
