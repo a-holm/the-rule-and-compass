@@ -207,6 +207,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
                              a look-ahead on time series; reported as centred
   --allow-interpolate        permit --fill interpolate on time-ordered data
   --allow-lockbox            permit train/validation/test rows in 2026H2 (declared final test only)
+  --lockbox <START,END>      declared locked test for the run.json `lockbox` object (UTC,
+                             half-open; default 2026-07-01,2027-01-01)
+  --ledger <file>            candidate ledger whose locked reads run.json counts
   --target-spec <file>       declared target spec (rcsr-target-spec/1 JSON; default
                              <data stem>.targets.json when it has an entry for the
                              target). The engine then: refuses a label whose
@@ -1873,6 +1876,10 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("panel") {
         rcsr::panel::run(&args[1..]);
     }
+    // #264: windows table, candidate ledger, sealed list.
+    if args.first().map(|s| s.as_str()) == Some("protocol") {
+        rcsr::protocol::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -1978,6 +1985,9 @@ fn main() {
     let mut allow_interpolate = false;
     // #145: a search may not train or score inside 2026H2 by default.
     let mut allow_lockbox = false;
+    // #264: declared locked test and the ledger whose reads run.json counts.
+    let mut lockbox_arg: Option<String> = None;
+    let mut ledger_arg: Option<String> = None;
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
@@ -2225,6 +2235,8 @@ fn main() {
                 }
             },
             "--allow-interpolate" => allow_interpolate = true,
+            "--lockbox" => lockbox_arg = Some(val!()),
+            "--ledger" => ledger_arg = Some(val!()),
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
@@ -5985,6 +5997,35 @@ fn main() {
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
                 target::split_purge_json(&prepared.report)
             );
+            // #264: lockbox facts of the loaded table (rows, date range, read count).
+            let lockbox_json = {
+                let lockbox = match lockbox_arg.as_deref() {
+                    Some(s) => rcsr::lockbox::Lockbox::parse(s).unwrap_or_else(|e| {
+                        eprintln!("error: --lockbox: {}", e);
+                        std::process::exit(EXIT_USAGE);
+                    }),
+                    None => rcsr::lockbox::Lockbox::crypto_2026h2(),
+                };
+                let times: Vec<i64> = match time_name.as_deref().and_then(|n| table.index_of(n).ok()) {
+                    Some(j) => data::time_keys_with(&table, j, &spec.time)
+                        .map(|(k, _)| k)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter(|v| v.is_finite())
+                        .map(|v| v.floor() as i64)
+                        .collect(),
+                    None => Vec::new(),
+                };
+                let overlap = lockbox.overlap(times.iter().copied());
+                let reads = ledger_arg
+                    .as_ref()
+                    .map(|p| rcsr::protocol::Ledger::new(p).read_count().unwrap_or(0))
+                    .unwrap_or(0);
+                let mut j = lockbox.json(&overlap, allow_lockbox, false, allow_lockbox && overlap.rows > 0);
+                j.pop();
+                j.push_str(&format!(",\"read_count\":{}}}", reads));
+                j
+            };
             let seeds_json: Vec<String> = seed_rows
                 .iter()
                 .map(|(expression, complexity, error)| {
@@ -6266,7 +6307,7 @@ fn main() {
                     .unwrap_or_else(|| "null".to_string())
             );
             let result_json = format!(
-                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
+                "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86
                 backend_json,     // #141
                 jstr(VERSION),
@@ -6283,6 +6324,7 @@ fn main() {
                 prepared.train.len(),
                 prepared.test.len(),
                 split_json,
+                lockbox_json,
                 target_spec_json,
                 prepared.prep.json(),
                 outcome.generations,
@@ -8718,6 +8760,46 @@ OPTIONS:
                              matched-exposure random long, each with exposure,
                              turnover, beta and excess over cash. With
                              --device-pnl they are cross-checked on the device
+  --entry-offset <seconds>   seconds from the row stamp to the label entry
+                             (default 0). Required purge = entry-offset +
+                             horizon + delay; a window with a shorter gap is
+                             refused
+  --delay <seconds>          execution delay, part of the required purge
+                             (default 0)
+  --windows-scheme <name>    with a protocol/windows.csv table: keep the rows of
+                             one scheme (expanding | rolling | locked). The
+                             table's validation_start column replaces
+                             --validation-frac
+  --bootstrap <B>            circular block bootstrap with B draws (default 0 =
+                             off; 10000 recommended). Reports CIs for the mean
+                             and Sharpe, the design effect against an iid row
+                             bootstrap, effective n, DSR at N_eff and 10 N_eff,
+                             PBO (CSCV), SPA against the best long/flat baseline
+                             and BH-FDR over the candidates
+  --block-len <L>            block length in periods (default
+                             max(h, hold, n^(1/3))); must be >= max(h, hold)
+  --null-draws <B>           draws of the hour-block permutation null and the
+                             matched-exposure random long/flat null (default 0
+                             = off); p = (1+count)/(B+1)
+  --trials <N>               total trials behind the candidates, the N of the
+                             DSR (default: the candidate count)
+  --protocol-seed <n>        seed of every bootstrap, null and SPA draw
+  --pbo-blocks <S>           even CSCV block count (default 16)
+  --fdr-q <q>                Benjamini-Hochberg rate (default 0.10)
+  --ledger <file>            append-only JSONL candidate ledger. A development
+                             run appends a candidate (test_read:false) and
+                             refuses windows that touch the declared lockbox
+  --lockbox <START,END>      declared locked test, UTC half-open (default
+                             2025-07-01,2026-07-01); active with --ledger or
+                             --locked-test
+  --locked-test              read the locked test once for a sealed candidate.
+                             Needs --ledger and --sealed. A second read, an
+                             unsealed candidate or a code/data hash that differs
+                             from the sealed entry is refused
+  --sealed <file>            locked_candidates.json from `rcsr protocol seal`
+  --verify-read              with --locked-test: recompute a recorded read and
+                             compare its report hash; records nothing
+  --expect-report-sha256 <h> exit 1 unless the report JSON hashes to h
   --json                     print the full JSON report to stdout
   --out <file>               write the JSON report to a file
   --markdown <file|->        write the Markdown report ('-' = stdout)
@@ -8769,6 +8851,14 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut markdown: Option<String> = None;
     let mut quiet = false;
     let mut allow_lockbox = false;
+    let mut popts = walkforward::ProtocolOptions::default();
+    let mut windows_scheme: Option<String> = None;
+    let mut ledger_path: Option<String> = None;
+    let mut sealed_path: Option<String> = None;
+    let mut locked_test = false;
+    let mut verify_read = false;
+    let mut lockbox_arg: Option<String> = None;
+    let mut expect_hash: Option<String> = None;
 
     let need = |args: &[String], i: usize, flag: &str| -> String {
         match args.get(i) {
@@ -8922,6 +9012,60 @@ fn run_walkforward(args: &[String]) -> ! {
                 i += 1;
             }
             "--quiet" => quiet = true,
+            "--entry-offset" => {
+                popts.entry_offset = number(need(args, i + 1, "--entry-offset"), "--entry-offset");
+                i += 1;
+            }
+            "--delay" => {
+                popts.delay = number(need(args, i + 1, "--delay"), "--delay");
+                i += 1;
+            }
+            "--windows-scheme" => {
+                windows_scheme = Some(need(args, i + 1, "--windows-scheme"));
+                i += 1;
+            }
+            "--bootstrap" | "--block-len" | "--null-draws" | "--trials" | "--protocol-seed" | "--pbo-blocks" => {
+                let flag = args[i].clone();
+                let src = need(args, i + 1, &flag);
+                let v = match src.parse::<u64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        eprintln!("error: {} needs a non-negative integer, got '{}'", flag, src);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                };
+                match flag.as_str() {
+                    "--bootstrap" => popts.bootstrap_draws = v as usize,
+                    "--block-len" => popts.block_len = Some(v as usize),
+                    "--null-draws" => popts.null_draws = v as usize,
+                    "--trials" => popts.trials = Some(v as usize),
+                    "--protocol-seed" => popts.seed = v as u32,
+                    _ => popts.pbo_blocks = v as usize,
+                }
+                i += 1;
+            }
+            "--fdr-q" => {
+                popts.fdr_q = number(need(args, i + 1, "--fdr-q"), "--fdr-q");
+                i += 1;
+            }
+            "--ledger" => {
+                ledger_path = Some(need(args, i + 1, "--ledger"));
+                i += 1;
+            }
+            "--sealed" => {
+                sealed_path = Some(need(args, i + 1, "--sealed"));
+                i += 1;
+            }
+            "--lockbox" => {
+                lockbox_arg = Some(need(args, i + 1, "--lockbox"));
+                i += 1;
+            }
+            "--expect-report-sha256" => {
+                expect_hash = Some(need(args, i + 1, "--expect-report-sha256"));
+                i += 1;
+            }
+            "--locked-test" => locked_test = true,
+            "--verify-read" => verify_read = true,
             "--allow-lockbox" => allow_lockbox = true,
             other if other.starts_with("--policy=") => {
                 let src = &other["--policy=".len()..];
@@ -9019,6 +9163,22 @@ fn run_walkforward(args: &[String]) -> ! {
     });
     if let Some(file) = windows_file {
         match std::fs::read_to_string(&file) {
+            Ok(text) if rcsr::protocol::is_windows_table(&text) => {
+                match rcsr::protocol::parse_windows_csv(&text, windows_scheme.as_deref()) {
+                    Ok(rows) => {
+                        for r in rows {
+                            popts
+                                .validation_starts
+                                .push((r.window.label.clone(), r.validation_start));
+                            windows.push(r.window);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("error: {}: {}", file, e);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             Ok(text) => {
                 let mut seen = 0usize;
                 for (n, line) in text.lines().enumerate() {
@@ -9092,12 +9252,155 @@ fn run_walkforward(args: &[String]) -> ! {
         min_hold,
         gpu,
     };
-    let report = match walkforward::run_path(&data_path, &spec) {
+    let declared_lock: Option<(f64, f64)> = if ledger_path.is_some() || locked_test || lockbox_arg.is_some() {
+        match &lockbox_arg {
+            Some(s) => match rcsr::lockbox::Lockbox::parse(s) {
+                Ok(l) => Some((l.start as f64, l.end as f64)),
+                Err(e) => {
+                    eprintln!("error: --lockbox: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            },
+            None => Some(rcsr::protocol::default_locked_range()),
+        }
+    } else {
+        None
+    };
+    if locked_test && (ledger_path.is_none() || sealed_path.is_none()) {
+        eprintln!("error: --locked-test needs --ledger and --sealed");
+        std::process::exit(EXIT_USAGE);
+    }
+    if let Some((ls, le)) = declared_lock {
+        for w in &spec.windows {
+            let train_hits = w.train_start < le && w.train_end > ls;
+            let test_hits = w.test_start < le && w.test_end > ls;
+            let test_inside = w.test_start >= ls && w.test_end <= le;
+            let problem = if locked_test {
+                if train_hits {
+                    Some("trains on the locked test")
+                } else if !test_inside {
+                    Some("tests outside the locked test")
+                } else {
+                    None
+                }
+            } else if train_hits || test_hits {
+                Some("touches the declared locked test; read it only with --locked-test and a sealed list")
+            } else {
+                None
+            };
+            if let Some(p) = problem {
+                eprintln!("error: window '{}' {}", w.label, p);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    let (data_sha, build_id) = if ledger_path.is_some() {
+        let sha = match rcsr::manifest::sha256_file(&data_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        };
+        let (commit, dirty) = rcsr::manifest::build_info();
+        (sha, if dirty { format!("{}-dirty", commit) } else { commit })
+    } else {
+        (String::new(), String::new())
+    };
+    let spec_sha = rcsr::manifest::sha256_hex(rcsr::protocol::procedure_spec(&spec, &popts).as_bytes());
+    let candidate_id = rcsr::protocol::Candidate::address(&spec_sha, &data_sha, &build_id);
+    let ledger = ledger_path.as_ref().map(rcsr::protocol::Ledger::new);
+    let mut read_count = 0u64;
+    if let Some(l) = &ledger {
+        let r = (|| -> Result<u64, String> {
+            l.verify_chain()?;
+            if locked_test {
+                let sealed = std::path::Path::new(sealed_path.as_deref().unwrap_or(""));
+                if verify_read {
+                    l.authorize_sealed(sealed, &candidate_id, &data_sha, &build_id)?;
+                } else {
+                    l.authorize_read(sealed, &candidate_id, &data_sha, &build_id)?;
+                }
+            }
+            l.read_count()
+        })();
+        match r {
+            Ok(c) => read_count = c,
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_INPUT);
+            }
+        }
+    }
+    let report = match walkforward::run_path_with(&data_path, &spec, &popts) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
+    };
+    let report_sha = rcsr::manifest::sha256_hex(report.json().as_bytes());
+    if let Some(want) = &expect_hash {
+        if want != &report_sha {
+            eprintln!("error: report sha256 {} differs from the expected {}", report_sha, want);
+            std::process::exit(EXIT_INPUT);
+        }
+    }
+    let mut protocol_json: Option<String> = None;
+    if let Some((ls, le)) = declared_lock {
+        let rows: usize = if locked_test { report.windows.iter().map(|w| w.test_rows).sum() } else { 0 };
+        let first = report.windows.iter().map(|w| w.window.test_start).fold(f64::INFINITY, f64::min);
+        let last = report.windows.iter().map(|w| w.window.test_end).fold(f64::NEG_INFINITY, f64::max);
+        if let Some(l) = &ledger {
+            let outcome = if locked_test && verify_read {
+                match l.read_report_sha(&candidate_id) {
+                    Some(h) if h == report_sha => Ok(read_count),
+                    Some(h) => Err(format!("report sha256 {} differs from the recorded read {}", report_sha, h)),
+                    None => Err("no recorded read for this candidate".to_string()),
+                }
+            } else if locked_test {
+                l.record_read(&candidate_id, &report_sha)
+            } else {
+                l.add_candidate(&rcsr::protocol::Candidate {
+                    id: candidate_id.clone(),
+                    spec_sha256: spec_sha.clone(),
+                    data_sha256: data_sha.clone(),
+                    build_commit: build_id.clone(),
+                    report_sha256: report_sha.clone(),
+                    expression: report.candidates.join(" | "),
+                })
+                .map(|_| read_count)
+            };
+            match outcome {
+                Ok(c) => read_count = c,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
+            }
+        }
+        let facts = rcsr::protocol::LockboxFacts {
+            start: ls,
+            end: le,
+            rows,
+            first_ts: if rows > 0 { Some(first) } else { None },
+            last_ts: if rows > 0 { Some(last) } else { None },
+            read_count,
+        };
+        protocol_json = Some(format!(
+            "{{\"lockbox\":{},\"candidate_id\":{},\"report_sha256\":{},\"test_read\":{},\
+             \"ledger\":{},\"windows_scheme\":{}}}",
+            facts.json(),
+            if ledger.is_some() { format!("\"{}\"", candidate_id) } else { "null".to_string() },
+            format!("\"{}\"", report_sha),
+            locked_test,
+            ledger_path.as_ref().map_or("null".to_string(), |p| format!("{:?}", p)),
+            windows_scheme.as_ref().map_or("null".to_string(), |s| format!("{:?}", s)),
+        ));
+    }
+    let report_json = || match &protocol_json {
+        Some(p) => report.json_with_protocol(p),
+        None => report.json(),
     };
     for w in &report.windows {
         let reasons = [
@@ -9114,7 +9417,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
     if let Some(path) = out {
-        if let Err(e) = std::fs::write(&path, report.json()) {
+        if let Err(e) = std::fs::write(&path, report_json()) {
             eprintln!("error: {}: {}", path, e);
             std::process::exit(EXIT_INPUT);
         }
@@ -9128,7 +9431,7 @@ fn run_walkforward(args: &[String]) -> ! {
         }
     }
     if json {
-        println!("{}", report.json());
+        println!("{}", report_json());
     } else if !quiet && !wrote_out && !wrote_markdown {
         print!("{}", report.text());
     }

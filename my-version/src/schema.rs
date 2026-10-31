@@ -31,6 +31,8 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--skip-malformed", "flag", "false", "drop data rows whose field count differs from the header and report the count; default refuses the file with an input error naming the 1-based line"),
         ("--test-frac", "float", "0.25", "held-out fraction"),
         ("--allow-lockbox", "flag", "false", "permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only)"),
+        ("--lockbox", "string", "2026-07-01,2027-01-01", "declared locked test START,END (UTC, half-open) reported in the run.json lockbox object: rows, date range, read count"),
+        ("--ledger", "string", "none", "candidate ledger (JSONL) whose locked-test reads run.json reports as lockbox.read_count"),
         ("--target-spec", "string", "<data stem>.targets.json when present", "declared target spec (rcsr-target-spec/1): D13 structure refusal, purge derived from the label window, zero-parameter rung baselines.target_structure; see \"target_spec\""),
         ("--allow-target-structure", "flag", "false", "run a target whose null prediction depends on a column (D13c) for a diagnostic replay: prints a warning, records check.status = overridden and a proxy table. D13a and D13b stay fatal"),
         ("--validation-frac", "float", "0", "fraction of the chronological training period held out as a validation slice for selection (0 = off); the test block is scoring-only"),
@@ -211,6 +213,22 @@ pub fn json() -> String {
 {{\"name\":\"--periods-per-year\",\"type\":\"float\",\"default\":\"inferred\",\"description\":\"annualisation override\"}},\
 {{\"name\":\"--device-pnl\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"recompute each test block through the fused f64 long-only reduction (CUDA kernel when available, identical canonical CPU segments otherwise) and report it with cash and buy-and-hold benchmarks; the scalar evaluator remains the authority\"}},\
 {{\"name\":\"--control-seed\",\"type\":\"integer\",\"default\":\"0\",\"description\":\"seed of the matched-exposure random-long control; every walkforward window reports cash, buy-and-hold, constant long/flat and matched-exposure random long with exposure, turnover, beta and excess over cash\"}},\
+{{\"name\":\"--entry-offset\",\"type\":\"float\",\"default\":\"0\",\"description\":\"seconds from the row stamp to the label entry; required purge = entry-offset + horizon + delay, and a window with a shorter gap is refused\"}},\
+{{\"name\":\"--delay\",\"type\":\"float\",\"default\":\"0\",\"description\":\"execution delay in seconds; part of the required purge\"}},\
+{{\"name\":\"--windows-scheme\",\"type\":\"enum\",\"default\":\"all rows\",\"description\":\"expanding | rolling | locked: keep one scheme of a protocol/windows.csv table; its validation_start column replaces --validation-frac\"}},\
+{{\"name\":\"--bootstrap\",\"type\":\"int\",\"default\":\"0\",\"description\":\"circular block bootstrap draws (0 = off; 10000 recommended): mean and Sharpe CIs, design effect vs iid rows, effective n, DSR at N_eff and 10 N_eff, PBO/CSCV, SPA vs the best long/flat baseline, BH-FDR\"}},\
+{{\"name\":\"--block-len\",\"type\":\"int\",\"default\":\"max(h, hold, n^(1/3))\",\"description\":\"bootstrap block length in periods; must be at least max(h, holding period)\"}},\
+{{\"name\":\"--null-draws\",\"type\":\"int\",\"default\":\"0\",\"description\":\"draws of the hour-block permutation null and the matched-exposure random long/flat null (0 = off); p = (1+count)/(B+1)\"}},\
+{{\"name\":\"--trials\",\"type\":\"int\",\"default\":\"candidate count\",\"description\":\"total trials behind the candidates, the N of the DSR\"}},\
+{{\"name\":\"--protocol-seed\",\"type\":\"int\",\"default\":\"20260101\",\"description\":\"seed of every bootstrap, null and SPA draw\"}},\
+{{\"name\":\"--pbo-blocks\",\"type\":\"int\",\"default\":\"16\",\"description\":\"even block count S of the CSCV PBO\"}},\
+{{\"name\":\"--fdr-q\",\"type\":\"float\",\"default\":\"0.10\",\"description\":\"Benjamini-Hochberg false discovery rate\"}},\
+{{\"name\":\"--ledger\",\"type\":\"string\",\"default\":\"none\",\"description\":\"append-only JSONL candidate ledger; a development run appends a candidate with test_read:false and refuses windows that touch the declared lockbox\"}},\
+{{\"name\":\"--lockbox\",\"type\":\"string\",\"default\":\"2025-07-01,2026-07-01\",\"description\":\"START,END of the declared locked test (UTC, half-open); active with --ledger or --locked-test\"}},\
+{{\"name\":\"--locked-test\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"read the locked test once for a sealed candidate; needs --ledger and --sealed, refuses a second read and any code or data hash that differs from the sealed entry\"}},\
+{{\"name\":\"--sealed\",\"type\":\"string\",\"default\":\"none\",\"description\":\"locked_candidates.json written by `rcsr protocol seal`\"}},\
+{{\"name\":\"--verify-read\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"with --locked-test: re-run a recorded read and compare its report hash; records nothing\"}},\
+{{\"name\":\"--expect-report-sha256\",\"type\":\"string\",\"default\":\"none\",\"description\":\"exit 1 unless the SHA-256 of the report JSON equals this value\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report\"}},\
 {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to a path\"}},\
 {{\"name\":\"--markdown\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the Markdown report ('-' = stdout)\"}}],\
@@ -221,6 +239,12 @@ pub fn json() -> String {
          \"drawdown\":\"log-equity peak-to-trough as a negative fraction; -1 on ruin\",\
          \"beta_alpha\":\"beta from (n,sum x,sum y,sum xy,sum x^2); alpha per period, annualised by periods_per_year\",\
          \"daily\":\"compound blocks with risk::compound_blocks then use periods_per_year=365\"}}}},\n  \
+         \"protocol\":{{\"command\":\"rcsr protocol\",\"summary\":\"UTC windows table, sealed candidate list and ledger checks of the long-only evaluation protocol\",\"doc\":\"docs/walkforward.md\",\"options\":[\
+{{\"name\":\"windows\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"write the UTC windows table (--purge-seconds, default 219600; --out)\"}},\
+{{\"name\":\"seal\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"write locked_candidates.json for the unread ledger candidates (--ledger, --out, repeatable --id) and record its SHA-256 in the ledger\"}},\
+{{\"name\":\"verify\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"check the ledger hash chain and print the line and locked-read counts (--ledger)\"}},\
+{{\"name\":\"selectors\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"print --train-select and --test-select for one window of the table (--windows, --label, --time-col, optional --scheme); the purge is in the train range for every symbol\"}},\
+{{\"name\":\"candidates\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"list the candidates without a locked read (--ledger)\"}}]}},\n  \
          \"import\":{{\"command\":\"rcsr import\",\"summary\":\"import a CSV/TSV table into a versioned .rcsb column store\",\"doc\":\"docs/data-format.md\",\"options\":[\
  {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"positional input\",\"description\":\"input table; alternative to the positional path\"}},\
  {{\"name\":\"--out\",\"type\":\"string\",\"default\":\"input path with .rcsb\",\"description\":\"output column store\"}},\

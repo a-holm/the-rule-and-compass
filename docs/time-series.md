@@ -240,7 +240,7 @@ The triple barrier is long side only: profit `P0*exp(+u*sigma_H)`, stop `P0*exp(
 
 A row is `NaN` when any bar from `t` to `t+h+d` is missing, partial or has a non-positive price. No label bridges a gap and nothing after `t+h+d` is read.
 
-**Purge.** `purge_seconds = entry_offset + h + delay`, derived from the spec and never from a name: a 60 minute label on 15 minute bars purges 4500 s, a 60 hour label on hourly bars 219600 s. `LongLabelSpec::target_spec` writes the matching `rcsr-target-spec/1` entry (`long_only: true`, `return_column`, scale column `vol<W>`), so the split purges `required_purge_seconds` around every validation and test row. `--gap` stays row based; with `--train-select`/`--test-select` write the purge into the selectors.
+**Purge.** `purge_seconds = entry_offset + h + delay`, derived from the spec and never from a name: a 60 minute label on 15 minute bars purges 4500 s, a 60 hour label on hourly bars 219600 s. `LongLabelSpec::target_spec` writes the matching `rcsr-target-spec/1` entry (`long_only: true`, `return_column`, scale column `vol<W>`), so the split purges `required_purge_seconds` around every validation and test row. `--gap` stays row based and is ignored with explicit `--train-select`/`--test-select`; `rcsr protocol selectors` prints selectors that carry the purge, and `rcsr walkforward` refuses a window whose gap is shorter than `--entry-offset + --horizon + --delay`.
 
 **Overlap.** Uniqueness weights `u_i = mean over the label's bars of 1/c_t` and `w_i = u_i*n/sum(u)` are stored with the labels (`c_t` is the number of labels covering bar `t`). The report records `effective_n = sum(u)` and `effective_n_hours = effective_n * horizon hours`. A stride below the horizon is refused for horizons of 4 h and longer unless `--allow-overlap` is given (`rcsr enrich`, `rcsr prep`); stride at `h` is the primary fix.
 
@@ -651,3 +651,15 @@ echo $((islands * pop * generations * seeds * folds))
 If every item above has a number, a command or a written justification, the
 result is reviewable. If any item is missing, the default conclusion is "not
 yet a forecast".
+
+---
+
+## Long-only evaluation protocol
+
+For the hourly panel the windows, purge, locked test and uncertainty are fixed in `protocol/windows.csv` and `docs/walkforward.md` (Long-only evaluation protocol). The checklist for a long-only book:
+
+* **Purge in time.** `purge_seconds >= entry_offset + h + delay` for every symbol; a late listing or a gap in one symbol never puts a training label inside a test window. Verify: `tests/eval_protocol.rs::no_training_label_reaches_a_test_window_on_a_ragged_panel` and `tests/protocol.rs::generated_selectors_leave_the_required_purge_on_a_ragged_panel`.
+* **Row counts are not sample sizes.** 4.78 M rows hide at most about 78 k hourly time points and about 1300 non-overlapping 60 h labels. Report `effective_n` from the block bootstrap design effect, in hours.
+* **Block, not row, uncertainty.** A circular block bootstrap with `L >= max(h, holding period)`. Verify: `tests/inference.rs::iid_over_rejects_on_ar1_and_the_block_does_not`.
+* **Benchmarks beside the book.** Cash, buy-and-hold, equal-weight universe and the best long/flat baseline, with exposure and beta, so market drift is visible.
+* **One read of the locked test**, after `locked_candidates.json` is sealed. A tweak and rerun is a new trial.

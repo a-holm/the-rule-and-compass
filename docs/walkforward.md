@@ -23,8 +23,7 @@ Each `--window` (or row of a `--windows` CSV with columns
 ranges: `[train_start, train_end)` and `[test_start, test_end)`. Windows are
 reported and pooled in test-time order; overlapping test blocks are refused.
 
-The purge gap is `test_start - train_end`. It must be at least both `--horizon`
-(the forward-label horizon) and `--embargo` (default: the horizon). Rows in the
+The purge gap is `test_start - train_end`. It must be at least `--entry-offset + --horizon + --delay` (the forward-label horizon and the seconds before and after it) and at least `--embargo` (default: the horizon). Rows in the
 gap are never used. The threshold is computed only from training rows, or from
 the trailing `--validation-frac` of the training time range when that option is
 set; the test block is never consulted. Quantiles use linear interpolation
@@ -351,6 +350,63 @@ sizes give identical bits, and `merge` appends canonical shards in ascending
 order. The serial `walkforward::sharpe` and `equity_metrics` remain the
 reference; the risk module is tested to `1e-12` against them on 100 k returns.
 There is no short or borrow kernel: the input is the long-only period series.
+
+## Long-only evaluation protocol
+
+The primary book is long or flat against cash. Short exposure, borrow and funding on shorts are out of scope. A long-only result can be market drift, so every report carries exposure, beta and excess over cash beside the book.
+
+### Four tiers and the windows table
+
+Training fits, validation selects, development out-of-sample evaluates the procedure, and a locked test is read once per sealed candidate. [`protocol/windows.csv`](../protocol/windows.csv) holds the UTC boundaries (`rcsr protocol windows` regenerates it, and a test pins the file to the generator):
+
+| range | UTC |
+|---|---|
+| warm-up (indicators only, never trained on) | 2021 |
+| development | 2022-01-01 to 2025-07-01 |
+| expanding folds | quarterly tests from 2023-01-01, train from 2022-01-01 |
+| rolling folds | quarterly tests from 2024-01-01, train on the previous 24 months |
+| locked test | 2025-07-01 to 2026-07-01 |
+| reserved | 2026H2 (the engine lockbox) |
+
+Each row has `train_end = test_start - purge_seconds` (219600 s: 1 h entry plus a 60 h label) and `validation_start` six calendar months before the test start. `--windows protocol/windows.csv --windows-scheme expanding` loads one scheme; the table's `validation_start` replaces `--validation-frac`. The validation slice sets the threshold and selects among `--expr` candidates. Select the procedure, not the lucky candidate: pool the development series of the chosen procedure.
+
+### Purge
+
+The required purge is `--entry-offset + --horizon + --delay` seconds. A window whose `test_start - train_end` is shorter is refused, and the report carries `split.required_purge_seconds`, `split.purge_seconds` (the smallest gap) and per window `train_last_time`: the stamp of the last training row, whose label ends at most `required_purge_seconds` later, before `test_start`. The purge is in time and applies to every symbol, so a late listing or a hole in one symbol cannot bring a training label into a test window.
+
+`--gap` counts rows and does not apply to explicit `--train-select`/`--test-select`. `rcsr protocol selectors --windows protocol/windows.csv --label expanding-2023Q1 --time-col ts` prints selectors with the purge written into the training range.
+
+### Economics
+
+The `economics` object (and a Markdown section) holds, for the pooled series: Sortino, Calmar (`cagr / |max drawdown|`), CVaR 95 and 99 (the mean return of the worst `ceil(n (1 - level))` periods, a negative number), the break-even cost in bp per side (`base * mean(gross) / mean(gross - net)`, since cost is linear in the per-side rate), the cost ladder at 0.5x, 1x, 2x and 3x the cost, and the daily Sharpe and Sortino (`sqrt(365)`) when the stamps are epoch seconds. Daily returns compound the periods of one UTC day.
+
+The benchmark table has the same fields for the strategy, `cash`, `buy_and_hold` (one charged entry and exit per symbol), `equal_weight_universe` (always long, no cost), `constant_long_flat` and `best_long_flat_baseline` (the best mean of cash, buy-and-hold and constant, ties to the earlier). Exposure is long rows over valid rows. Beta is on the equal-weight universe. Every benchmark series starts each window flat, like the controls.
+
+### Block uncertainty (`--bootstrap B`)
+
+* **Circular block bootstrap** of the pooled net series with block length `L >= max(h, holding period)` periods (default `max(h, hold, ceil(n^(1/3)))`; a shorter `--block-len` is refused). It reports the mean and annualised Sharpe with percentile 95% CIs.
+* **Design effect**: the variance of the bootstrap mean with blocks over the same with iid rows (`L = 1`). `effective_n = n / design_effect`, in periods (hours on an hourly grid). The `p_mean_positive` field is the one-sided centred p-value `(1 + count) / (B + 1)`.
+* **N_eff**: the participation ratio of the candidate correlation matrix, `N^2 / sum c_ij^2`; identical candidates give 1 and uncorrelated ones give `N`. With `--trials N` the effective trials are `N * PR / candidates`.
+* **DSR** (Bailey and Lopez de Prado) at `N_eff` and `10 N_eff`, with `SR0 = sqrt(V) ((1-g) Z(1-1/N) + g Z(1-1/(N e)))`, `V` the variance of the candidate Sharpes (the Mertens estimator variance with one candidate), `T` the effective n, and skew and raw kurtosis of the series. All inputs are in the report.
+* **PBO** by CSCV with `--pbo-blocks` (default 16) blocks, per-period Sharpe as the measure; needs two candidates.
+* **SPA** (Hansen 2005, joint circular block bootstrap, consistent, lower and upper recentering) of the candidates against the best long/flat baseline.
+* **BH-FDR** at `--fdr-q` over the per-candidate one-sided block-bootstrap p-values.
+
+Candidates are evaluated on the test periods with their own validation threshold only for these diagnostics; the selection stays on validation.
+
+### Nulls (`--null-draws B`)
+
+* **Hour-block permutation**: within each test window the cross-sections of targets are permuted in blocks of `L` periods (the same permutation for all symbols); positions and costs stay fixed.
+* **Matched-exposure random long/flat**: the strategy's own long and flat runs shuffled inside each symbol (see Long-only controls), `B` times.
+* **Always-long**: the buy-and-hold series, reported without a p-value.
+
+`p = (1 + #{null >= observed}) / (B + 1)` for the mean and for the per-period Sharpe. A search-budget null is `--null-block` in the search.
+
+### Candidate ledger and the locked test
+
+`--ledger FILE` makes a development run append a `candidate` line (content-addressed id over the procedure, the data SHA-256 and the build commit; `test_read:false`). Each line holds the SHA-256 of the previous line, so an edit breaks the chain. A development window that touches the declared lockbox (`--lockbox START,END`, default 2025-07-01 to 2026-07-01) is refused.
+
+`rcsr protocol seal --ledger L --out locked_candidates.json` writes the sealed list and records its hash in the ledger. `--locked-test --sealed locked_candidates.json` then reads the locked test: the candidate must be in the sealed list, the data and build hashes must equal the sealed entry (otherwise the run is void), and the candidate must not have `test_read:true`. The read appends a `test_read` line with the report hash and the new `read_count`; a second read is refused. `--verify-read --expect-report-sha256 H` recomputes the read and compares hashes without recording anything. The report's `protocol` object holds the lockbox rows, date range and read count; `run.json` carries a `lockbox` object (`--lockbox`, `--ledger`) with the rows in the range, their first and last stamps and the read count.
 
 ## Fold sign test
 
