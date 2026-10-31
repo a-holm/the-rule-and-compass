@@ -25,6 +25,7 @@ pub mod panel_pit; // #302: exact CPU reference for the PIT membership/MTF as-of
 #[cfg(feature = "cuda")]
 pub mod panel_pit_gpu; // #302: device PIT as-of merge joins
 pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
+pub mod panel_v2; // #259: default hourly point-in-time panel (snapshot, base, build, validate)
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;

@@ -192,6 +192,79 @@ build settings. A warm prep reuses every completed symbol, so it does not
 re-parse the ZIPs or recompute features; it still assembles and writes the
 store. The measured stages are reported below.
 
+## Default hourly panel v2 (#259)
+
+The compact 52-column panel is a smoke fixture. The default research panel is a time-major hourly point-in-time panel built in stages. Each stage is a command and each stage reads only the previous stage's output.
+
+```sh
+rcsr panel snapshot --input raw_15m_all --jobs 8 --out snapshot.json
+rcsr panel base --input raw_15m_all --jobs 8 --resume work/base-parts --out base_h1.rcsb
+rcsr panel membership --data base_h1.rcsb --start 2021-01-01 --end 2026-07-01 \
+  --top 100 --lookback 90 --min-history 90 --min-bars 60 --rebalance 30 \
+  --cache work/membership-cache --out membership_hourly_pit.csv
+rcsr panel build --data base_h1.rcsb --membership membership_hourly_pit.csv \
+  --snapshot snapshot.json --out panel_hourly_default.rcsb
+rcsr panel validate --data panel_hourly_default.rcsb --base base_h1.rcsb \
+  --membership membership_hourly_pit.csv
+```
+
+`panel build` switches to the v2 builder when `--data` is a v2 base store (it carries `cov15m`). The legacy path above is unchanged for stores without it.
+
+### P0 `snapshot`
+
+Reads every `.zip` or `.csv` below `--input`. No network access. For each archive it records the SHA-256, byte size, mtime, row count, first and last timestamp, a timestamp unit histogram (`s`, `ms`, `us`), the number of duplicate rows, the number of conflicting duplicate instants and the number of invalid OHLC rows. The top level lists every archive with duplicate rows (`duplicates`), every refused bar (`invalid_ohlc`, with the reason and the four prices) and a unit histogram per symbol (`mixed_units`). The text is a pure function of the archives, so two runs on unchanged files are byte-identical. Embed it with `panel build --snapshot snapshot.json`.
+
+An OHLC row is invalid when a price is not finite or not positive, `high < low`, `high < max(open, close)` or `low > min(open, close)`. `AUDUSDT 2020-11-13 04:15` (`high 0.72033 < close 0.72194`) is the known case.
+
+### P1 `base`
+
+Decodes the 15m archives and writes the symbol-major hourly base store `base_h1.rcsb` plus `base_h1.rcsb.manifest.json`.
+
+* Timestamps are normalised per value (seconds, milliseconds, microseconds). `archive_unit` is 0, 1 or 2 for the unit of the bucket's first source bar.
+* An invalid OHLC row is refused and listed. The hour that contained it has three bars, so it is dropped like any partial hour.
+* Duplicate instants follow the `panel_prep` policy. Identical copies collapse to one bar and `dup_rows` counts the source rows. Differing copies aggregate once (open first, high max, low min, close last, flows summed), set `DUPLICATE_CONFLICT` (flag bit 2) and are listed with symbol and timestamp in the manifest.
+* An hour is complete only with four contiguous 15m bars (`cov15m == 4`). A partial hour is dropped and counted (`--require-full-bucket`, the default). With `--keep-partial` it is written with `cov15m` 1 to 3 and `PARTIAL_BUCKET` (flag bit 1).
+* `gap` is the number of missing hourly buckets since the previous written bucket of the symbol.
+* The lockbox guard refuses an archive whose month intersects `[2026-07-01, 2027-01-01)` before it is decoded, and refuses decoded rows in it. `--interval 1m` is accepted only so that the guard fires first; the fold is defined for 15m bars. `--allow-lockbox` is the only override.
+* `--resume <dir>` writes one atomic cache file per symbol keyed by the SHA-256 of its archives and the settings. A warm run decodes nothing and writes a byte-identical store.
+
+Columns: `ts symbol open high low close volume quote_volume trades taker_buy_base taker_buy_quote cov15m gap flags traded dup_rows archive_unit`.
+
+### P2 and P4 `membership`, `build`
+
+`membership` is unchanged. `build` keeps the rows that are members at `ts` (same rules as above: no fill across a gap, listing, delisting or membership exclusion) and writes the time-major store sorted by `(ts, symbol)`.
+
+Columns: `ts symbol listing_id member_asof open high low close volume quote_volume trades taker_buy_base taker_buy_quote vwap gap cov15m flags traded dup_rows archive_unit`.
+
+* `vwap = quote_volume / volume`, `NaN` when the volume is zero.
+* `listing_id` is global and numbered over the whole base series in symbol order, so it does not depend on the membership. A new listing starts after a gap of more than `--listing-gap-days` (default 30) between two base bars of a symbol, and at a declared `--relist SYMBOL@DATE`. LUNA is two listings.
+* An open to previous close ratio beyond `--jump-factor` (default 5) between two adjacent bars of one listing is an undeclared level jump and fails the build with the list of jumps. Declare the break with `--relist`.
+* Rows in the lockbox refuse the build unless `--allow-lockbox`.
+* The manifest keeps the legacy blocks and adds `v2`: columns, the derivatives block (`"available":false`), listing counts, the jump check, the quality counters (duplicate buckets and extra rows, conflicts, invalid OHLC, partial buckets, zero-volume, venue and symbol outage buckets, max gap, `cov15m` histogram), the venue outage windows, the membership ledger check and the base manifest's quality block verbatim.
+
+An hour is a venue outage when the missing symbols are at least `--outage-share` (default 0.5) of the symbols present or missing at that hour and at least three are missing. Other missing buckets are symbol outages. Nothing is bridged either way.
+
+### P6 `validate`
+
+Prints a JSON report and exits 3 when a check fails.
+
+| id | check | needs |
+|---|---|---|
+| V1 | opens, required columns | |
+| V2 | `(ts, symbol)` unique, ordered, `ts % 3600 == 0` | |
+| V3 | every row is a real base bar | `--base` |
+| V4 | OHLC, flow, taker and vwap invariants | |
+| V5 | `cov15m == 4` unless `PARTIAL_BUCKET` | |
+| V6 | `gap` matches the timestamp distance | |
+| V7 | prefix replay: rebuilding from the base truncated at a cut reproduces every earlier row (`--replay N`, default 3) | `--base`, `--membership` |
+| V8 | rank columns | not applicable |
+| V9 | no undeclared level jump inside a listing | |
+| V10 | store SHA-256 equals the manifest | manifest |
+| V11 | zero lockbox rows | |
+| V12 | each row's `member_asof` is the decision in force with `member = 1`; per-year rows equal the manifest | `--membership` |
+
+Enriched feature parts are not part of this store. The feature registry and projection work (#260) adds them.
+
 ## Audit and canaries
 
 ```sh
