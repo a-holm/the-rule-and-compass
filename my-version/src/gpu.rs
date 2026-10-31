@@ -3941,6 +3941,82 @@ mod tests {
         }
     }
 
+    /// #422: a finite prediction of any f32 magnitude is scored like the CPU
+    /// scores the same rows; only a non-finite prediction is `+inf`. The rows
+    /// straddle 1e30 and reach the f32 maximum; one candidate overflows f32 to
+    /// `inf` and is `+inf` with status 2 on both sides. Repeats are
+    /// bit-identical.
+    #[test]
+    fn large_finite_predictions_score_like_the_cpu() {
+        use crate::metrics::{score_weighted, Metric};
+
+        let (cols, n, nv, y, _) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let scaled = |c: f64| node(Op::Mul, vec![input(0), constant(c)]);
+        let trees = vec![
+            scaled(1.5e30),
+            scaled(1e30),
+            scaled(4e30),
+            scaled(1e35),
+            scaled(3e38),
+            node(Op::Add, vec![scaled(3e38), scaled(3e38)]),
+        ];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+        let objectives = [
+            (Metric::Squared, ScoreObjective::Squared),
+            (Metric::Absolute, ScoreObjective::Absolute),
+            (Metric::LogSquashed, ScoreObjective::LogSquashed),
+            (Metric::Signed, ScoreObjective::Signed),
+            (Metric::Maximum, ScoreObjective::Maximum),
+            (Metric::Correlation, ScoreObjective::Correlation),
+            (Metric::CorrelationSigned, ScoreObjective::CorrelationSigned),
+            (Metric::Aic, ScoreObjective::Aic),
+            (Metric::Aicc, ScoreObjective::Aicc),
+            (Metric::Bic, ScoreObjective::Bic),
+        ];
+        let pcount = vec![2i32; trees.len()];
+        let uniform = vec![1.0f64; n];
+        for weights in [&[][..], &uniform[..]] {
+            assert!(ev.set_score_weights(weights));
+            for (metric, objective) in objectives {
+                if objective == ScoreObjective::Maximum && !weights.is_empty() {
+                    continue;
+                }
+                let batch = ev.score_batch(prog, offsets, objective, &pcount);
+                let again = ev.score_batch(prog, offsets, objective, &pcount);
+                assert!(batch.ms >= 0.0, "{} launch", metric.name());
+                for k in 0..trees.len() {
+                    let rows: Vec<f64> =
+                        preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+                    let want = score_weighted(&rows, &y64, weights, metric, 2);
+                    let got = batch.values[k];
+                    let what = format!("{} slot {k} weights {}", metric.name(), weights.len());
+                    assert_eq!(got.to_bits(), again.values[k].to_bits(), "{what}: repeat");
+                    if !want.is_finite() {
+                        assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{what}");
+                        assert_eq!(got, f64::INFINITY, "{what}");
+                        continue;
+                    }
+                    assert_eq!(batch.status[k], ScoreStatus::Ok, "{what}");
+                    if objective == ScoreObjective::Maximum {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{what}");
+                    } else if objective.is_correlation() {
+                        assert!((got - want).abs() <= 1e-9, "{what}: GPU {got} vs CPU {want}");
+                    } else {
+                        let tol = 1e-9 * (1.0 + want.abs());
+                        assert!((got - want).abs() <= tol, "{what}: GPU {got} vs CPU {want}");
+                    }
+                }
+            }
+        }
+    }
+
     /// #287: the same candidate alone, in a batch of 7 and through the
     /// fixed-slot arena produces identical bits (two runs included).
     #[test]
@@ -9505,6 +9581,60 @@ mod classification_parity_tests {
                     "{} model {i}: f32-row error {f32err:.2e} exceeds 1e-5",
                     objective.name()
                 );
+            }
+        }
+    }
+
+    /// #422: a finite prediction above 1e30 (up to the f32 maximum) is scored
+    /// like the CPU scores the same rows, for every classification objective;
+    /// an f32 overflow to `inf` is `+inf`. Repeats are bit-identical.
+    #[test]
+    fn large_finite_predictions_score_like_the_cpu() {
+        if !probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let s = binary_sample(512, 0.35, 0.25, 22);
+        let trees = [
+            affine(3e30, 0.0),
+            affine(-3e30, 1e30),
+            affine(1e35, 0.0),
+            affine(3e38, 0.0),
+            node(Op::Add, vec![affine(3e38, 0.0), affine(3e38, 0.0)]),
+        ];
+        for objective in [
+            ScoreObjective::LogLoss,
+            ScoreObjective::Brier,
+            ScoreObjective::HingeSigmoid,
+            ScoreObjective::HingeOrdinary,
+            ScoreObjective::HingeSquared,
+        ] {
+            let mut ev = evaluator(&s);
+            let pop = Population::from_trees(trees.iter());
+            let pc = vec![0i32; pop.len()];
+            let batch = ev.score_population(&pop, objective, &pc);
+            let again = ev.score_population(&pop, objective, &pc);
+            assert!(batch.ms >= 0.0, "kernel launch failed");
+            let preds = ev
+                .predictions(pop.programs().0, pop.programs().1)
+                .expect("raw predictions");
+            for k in 0..trees.len() {
+                let rows: Vec<f64> = preds[k * s.len()..(k + 1) * s.len()]
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect();
+                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric(), 0);
+                let got = batch.values[k];
+                let what = format!("{} model {k}", objective.name());
+                assert_eq!(got.to_bits(), again.values[k].to_bits(), "{what}: repeat");
+                if want.is_finite() {
+                    assert_eq!(batch.status[k], ScoreStatus::Ok, "{what}");
+                    let err = (got - want).abs() / want.abs().max(1.0);
+                    assert!(err <= 1e-6, "{what}: device {got} vs CPU {want}");
+                } else {
+                    assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{what}");
+                    assert_eq!(got, f64::INFINITY, "{what}");
+                }
             }
         }
     }
