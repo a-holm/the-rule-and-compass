@@ -18,7 +18,7 @@ Do NOT load: fixing findings inside this run.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. `rcsr dev-report runs/<label>.dev.ndjson`. Dispatch independent auditors (Opus with tractatus_thinking is the research exception, no code) with the dev report and the result JSON.
+2. `rcsr dev-report runs/<label>.dev.ndjson`. Dispatch independent auditors (Opus with tractatus_thinking and context7 is the exception for hard tasks) with the dev report and the result JSON.
 3. Write `SYNTHESIS.md` with one `## <axis>` section per axis and a `verdict: pass|fail: <reason>` line in each. Required axes: `Leakage`, `GPU use`, `Baselines`.
 4. Label every claim measured, derived or inferred. An inferred claim is not a finding.
 

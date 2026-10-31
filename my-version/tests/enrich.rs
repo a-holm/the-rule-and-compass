@@ -1069,6 +1069,83 @@ fn flow_windows_are_gap_masked() {
     assert!(vwap.iter().all(|x| x.is_finite()), "raw vwap does not need a window");
 }
 
+/// A flow window never bridges a symbol listing segment: after a migration
+/// (next symbol starts on the very next bar) and after a delisting followed by
+/// a later listing, the first full window of every flow column is NaN, and the
+/// later values equal a standalone build of that symbol.
+#[test]
+fn flow_windows_never_bridge_a_listing_boundary() {
+    let names = [
+        "vwap_dev96",
+        "obv_z96",
+        "taker_ratio96",
+        "trade_intensity96",
+        "avg_trade_size96",
+        "amihud96",
+        "zero_ret_share96",
+        "cvd_proxy",
+    ];
+    let segment = |sym: &str, first_bar: i64, n: usize| {
+        let mut rows = flow_rows(n);
+        for (i, r) in rows.iter_mut().enumerate() {
+            r.0 = (first_bar + i as i64) * 900;
+            r.1 = sym.to_string();
+        }
+        rows
+    };
+    let old = segment("OLD", 0, 200);
+    let new = segment("NEW", 200, 220);
+    let late = segment("LATE", 700, 200);
+    let mut all = old.clone();
+    all.extend(new.clone());
+    all.extend(late.clone());
+
+    let dir = tmp_dir("flow_boundary");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_flow_store(&src, &all, false, 32);
+    enrich::build(&opts(&src, &out, "flow")).unwrap();
+
+    let solo = |tag: &str, rows: &[(i64, String, f64, f64, f64, f64, f64, f64, f64, f64, f64)]| {
+        let d = tmp_dir(tag);
+        let s = d.join("in.rcsb").to_string_lossy().into_owned();
+        let o = d.join("out.rcsb").to_string_lossy().into_owned();
+        write_flow_store(&s, rows, false, 32);
+        enrich::build(&opts(&s, &o, "flow")).unwrap();
+        o
+    };
+    let solo_new = solo("flow_boundary_new", &new);
+    let solo_late = solo("flow_boundary_late", &late);
+
+    for name in names {
+        let v = column(&out, name);
+        let sn = column(&solo_new, name);
+        let sl = column(&solo_late, name);
+        for (start, len, solo_v, label) in [(200usize, 220usize, &sn, "NEW"), (420, 200, &sl, "LATE")] {
+            for i in 0..95 {
+                assert!(v[start + i].is_nan(), "{name} bridged into {label} at segment row {i}");
+            }
+            assert!(v[start + 95].is_finite(), "{name} must be finite on the first full {label} window");
+            for i in 0..len {
+                let (a, b) = (v[start + i], solo_v[i]);
+                assert!(
+                    a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                    "{name} {label} row {i}: {a} differs from the standalone build {b}"
+                );
+            }
+        }
+    }
+    let imb = column(&out, "taker_imb16");
+    for start in [200usize, 420] {
+        for i in 0..15 {
+            assert!(imb[start + i].is_nan(), "taker_imb16 bridged into segment at {start} row {i}");
+        }
+        assert!(imb[start + 15].is_finite(), "taker_imb16 must be finite after its own window");
+    }
+    let vwap = column(&out, "vwap");
+    assert!(vwap.iter().all(|x| x.is_finite()), "raw vwap does not need a window");
+}
+
 /// The four flow names shared with the compact profile pass the compact
 /// regression fixture at abs/rel <= 1e-12.
 #[test]
@@ -2730,3 +2807,58 @@ fn engine_inventory_is_causal_on_a_prefix() {
     }
 }
 
+
+fn prefix_differs(full: &[f64], prefix: &[f64], cut: usize) -> bool {
+    (0..cut).any(|i| {
+        full[i].is_nan() != prefix[i].is_nan()
+            || (full[i].is_finite() && (full[i] - prefix[i]).abs() > 1e-12)
+    })
+}
+
+/// Negative control for `engine_inventory_is_causal_on_a_prefix`: a column
+/// whose row `i` holds the value of row `i + 1` reads a future bar, and the
+/// same prefix comparison must flag every engine column that varies.
+#[test]
+fn engine_inventory_future_shift_is_caught_by_the_prefix_check() {
+    let dir = tmp_dir("engine_causal_neg");
+    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let prefix_out = dir.join("prefix_out.rcsb").to_string_lossy().into_owned();
+    let n = 3400usize;
+    let cut = 3200usize;
+    let mut rows = wavy_rows("AAA", n, 0, 900, 0.0);
+    rows.extend(wavy_rows("BTCUSDT", n, 0, 900, 1.3));
+    let mut short = wavy_rows("AAA", cut, 0, 900, 0.0);
+    short.extend(wavy_rows("BTCUSDT", cut, 0, 900, 1.3));
+    write_store_with_flow(&full, &rows, 128);
+    write_store_with_flow(&prefix, &short, 128);
+    let spec = "all,py15m,ta:full,exotic:cheap,cross:btc,compact";
+    enrich::build(&opts(&full, &full_out, spec)).unwrap();
+    enrich::build(&opts(&prefix, &prefix_out, spec)).unwrap();
+    let input_names = FileStore::open(&full).unwrap().header().names();
+    let names = FileStore::open(&full_out).unwrap().header().names();
+    let (mut checked, mut missed) = (0usize, Vec::new());
+    for name in names.iter().skip(input_names.len()) {
+        let a = column(&full_out, name);
+        let b = column(&prefix_out, name);
+        assert!(!prefix_differs(&a, &b, cut), "{name}: the causal column must pass");
+        let mut leaked = a.clone();
+        for i in 0..cut {
+            leaked[i] = a[i + 1];
+        }
+        let varies = (0..cut).any(|i| {
+            a[i].is_nan() != a[i + 1].is_nan()
+                || (a[i].is_finite() && (a[i] - a[i + 1]).abs() > 1e-12)
+        });
+        if !varies {
+            continue;
+        }
+        checked += 1;
+        if !prefix_differs(&leaked, &b, cut) {
+            missed.push(name.clone());
+        }
+    }
+    assert!(checked > 100, "only {checked} engine columns exercised");
+    assert!(missed.is_empty(), "future-shifted columns not detected: {missed:?}");
+}

@@ -18,7 +18,7 @@ Do NOT load: implementation, the premise measurements, the decision.
 ## Process
 
 1. If an input is missing or empty, stop and say which.
-2. Decompose with `mcp__tractatus_thinking__tractatus_thinking`. Read primary sources: papers, vendor docs, the repo. Use context7 for library semantics. Web search for the rest.
+2. Decompose with `mcp__tractatus_thinking__tractatus_thinking`. Read primary sources: papers, vendor docs, the repo. Use context7 for library semantics. No web search or web fetch.
 3. Write `method.md`. Every claim is one bullet: `- [measured|derived|inferred] <claim> | falsifier: <test that would refute it>`.
 4. For a hang or deadlock, add the wait-for graph and list every cycle.
 
