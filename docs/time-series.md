@@ -301,6 +301,8 @@ replay at 20 cuts, and a future-shifted column that fails `lookahead_violations`
 `docs/mtf-inventory.json` is the 36-row inventory; `rcsr schema` lists every
 column with `family=mtf`, timeframe and PIT rule.
 
+`docs/default_financial_features.json` is the inventory of the whole default financial feature set. Each row names its PIT rule and the tests that prove it: the unit or parity test, the NaN/gap test, and for cross-asset columns the timestamp-join test and for higher-timeframe columns the future-shift test. The compact 52 are a marked subset (`compact:true`), used as the regression fixture.
+
 ---
 
 ## 5. Select on validation, keep a lockbox

@@ -462,7 +462,9 @@ atomically instead of streaming it. See
   default financial feature set is registered in `rcsr schema`
   (`feature_registry`): every available column has a tested producer, and
   registered-but-unavailable derivative columns fail closed with the missing
-  dependency instead of being silently dropped. The `engine_catalogue` block
+  dependency instead of being silently dropped; `availability_matrix` counts available and
+  unavailable columns per family and `docs/default_financial_features.json` lists every
+  registry column with its PIT rule, dtype, unit and proving tests. The `engine_catalogue` block
   enumerates all 254 engine names (216 in
   `all,py15m,ta:full,exotic:cheap,cross:btc` plus 38 compact-only names) with
   family, warm-up, availability, exact formula and the explicit canonical

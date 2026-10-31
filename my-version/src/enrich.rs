@@ -646,6 +646,8 @@ pub fn default_registry() -> Vec<RegistryEntry> {
         ("symbol", "identity"),
         ("listing_id", "identity"),
         ("member_asof", "identity"),
+        ("gap", "identity"),
+        ("flags", "identity"),
         ("open", "price"),
         ("high", "price"),
         ("low", "price"),

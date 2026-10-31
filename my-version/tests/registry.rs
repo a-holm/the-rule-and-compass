@@ -766,3 +766,34 @@ fn lags_and_lag_set_report_nvars_on_the_command_line() {
     assert!(!both.status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A projection may leave a column out, but it records the omission and the
+/// reason, and the registry still lists the column.
+#[test]
+fn a_view_records_every_omitted_column_and_the_registry_still_lists_it() {
+    let mut names = feature_names();
+    names.extend(["ts", "close", "flags", "not_a_feature"].map(String::from));
+    names.push("r16_lag4".to_string());
+    let v = registry::select_view(&names, 36, 7, 0).unwrap();
+    assert_eq!(v.columns.len() + v.omitted.len(), names.len(), "every candidate is chosen or omitted");
+    let mut seen = std::collections::BTreeSet::new();
+    for (name, family, reason) in &v.omitted {
+        assert!(!v.columns.contains(name), "{name} both chosen and omitted");
+        assert!(seen.insert(name.clone()), "{name} omitted twice");
+        assert!(!reason.is_empty() && !family.is_empty());
+        if name == "not_a_feature" {
+            assert_eq!(family, "unregistered");
+        } else {
+            let r = registry::lookup(name).unwrap_or_else(|| panic!("{name} left the registry"));
+            assert_eq!(&r.family, family);
+        }
+    }
+    let reason_of = |n: &str| v.omitted.iter().find(|(x, _, _)| x == n).map(|(_, _, r)| r.clone());
+    assert!(reason_of("close").unwrap().contains("raw input"));
+    assert!(reason_of("flags").unwrap().contains("raw input"));
+    assert!(reason_of("not_a_feature").unwrap().contains("not in the feature registry"));
+    assert!(v.omitted.iter().any(|(_, _, r)| r.contains("not drawn by view 0")));
+    let json = v.json();
+    assert!(json.contains("\"omitted\":[{\"name\":"), "{json}");
+    assert!(json.contains("\"reason\":"), "{json}");
+}
