@@ -2943,6 +2943,12 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #398: the level-set distance has its own fit; the generic score of this
+    // metric is `+inf`, so every caller must reach `implicit::fit` here.
+    if metric == ImplicitDerivative {
+        crate::implicit::fit(tree, x, w, iters);
+        return crate::implicit::score_rows(tree, x, w, metric);
+    }
     // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
     // not only the squared family. IRLS, logistic IRLS and the coordinate
     // polish all force a minimum of one sweep, so return the current score
@@ -2966,6 +2972,7 @@ pub fn fit_weighted_metric(
         Squared | Aic | Aicc | Bic => {
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
+        ImplicitDerivative => unreachable!("the level-set metric returned above"),
         Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
@@ -2997,8 +3004,7 @@ pub fn fit_weighted_metric(
         | Median
         | Maximum
         | Interquartile
-        | Slope
-        | ImplicitDerivative => {
+        | Slope => {
             let start = metric_score(tree, x, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);

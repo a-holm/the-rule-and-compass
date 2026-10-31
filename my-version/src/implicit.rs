@@ -493,4 +493,165 @@ mod tests {
         let c = -expr::eval(&f, &[0.0, 0.0]);
         assert!((c - 1.0).abs() < 1e-6, "radius = {c}");
     }
+
+    fn lcg(state: &mut u64) -> f64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((*state >> 11) as f64) / ((1u64 << 53) as f64)
+    }
+
+    /// Points near the curve `((x - cx) / a)^2 + ((y - cy) / b)^2 = 1`.
+    fn ellipse_rows(n: usize, cx: f64, cy: f64, a: f64, b: f64, seed: u64) -> Vec<Vec<f64>> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                let t = 2.0 * std::f64::consts::PI * lcg(&mut s);
+                let k = 1.0 + 0.01 * (lcg(&mut s) - 0.5);
+                vec![cx + k * a * t.cos(), cy + k * b * t.sin()]
+            })
+            .collect()
+    }
+
+    fn sq(i: usize) -> Node {
+        node(Op::Square, vec![input(i)])
+    }
+
+    fn weighted_sum(terms: Vec<Node>, c: f64) -> Node {
+        let mut it = terms.into_iter();
+        let first = it.next().unwrap();
+        let sum = it.fold(first, |acc, t| node(Op::Add, vec![acc, t]));
+        node(Op::Sub, vec![sum, constant(c)])
+    }
+
+    /// Fixture trees and their rows: circle, ellipse, shifted circle, and a
+    /// transcendental form, each with and without weights.
+    fn fixtures() -> Vec<(Node, Vec<Vec<f64>>, Vec<f64>)> {
+        let mul = |c: f64, t: Node| node(Op::Mul, vec![constant(c), t]);
+        let shifted = |c: f64, i: usize| {
+            node(Op::Square, vec![node(Op::Sub, vec![input(i), constant(c)])])
+        };
+        let trees = vec![
+            (
+                weighted_sum(vec![sq(0), sq(1)], 4.0),
+                ellipse_rows(120, 0.0, 0.0, 1.0, 1.0, 1),
+            ),
+            (
+                weighted_sum(vec![mul(1.0, sq(0)), mul(2.0, sq(1))], 3.0),
+                ellipse_rows(120, 0.0, 0.0, 2.0, 1.0, 2),
+            ),
+            (
+                weighted_sum(vec![shifted(0.5, 0), shifted(0.5, 1)], 2.0),
+                ellipse_rows(150, 1.0, 0.0, 2.0, 2.0, 3),
+            ),
+            (
+                node(
+                    Op::Sub,
+                    vec![
+                        node(
+                            Op::Add,
+                            vec![
+                                node(Op::Sin, vec![mul(0.9, input(0))]),
+                                mul(1.2, input(1)),
+                            ],
+                        ),
+                        constant(0.3),
+                    ],
+                ),
+                ellipse_rows(100, 0.0, 0.0, 1.5, 1.5, 4),
+            ),
+        ];
+        let mut out = Vec::new();
+        for (tree, x) in trees {
+            let mut s = 99;
+            let w: Vec<f64> = x.iter().map(|_| 0.5 + lcg(&mut s)).collect();
+            out.push((tree.clone(), x.clone(), Vec::new()));
+            out.push((tree, x, w));
+        }
+        out
+    }
+
+    fn fnv(h: &mut u64, v: f64) {
+        for b in v.to_bits().to_le_bytes() {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    /// Hash of every score, signed distance, fitted constant and fit error.
+    fn fixture_hash() -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for (tree, x, w) in fixtures() {
+            let s = Sample {
+                x: x.clone(),
+                y: vec![0.0; x.len()],
+                w: w.clone(),
+                ys: Vec::new(),
+            };
+            for m in [Metric::ImplicitDerivative, Metric::ImplicitResidual] {
+                fnv(&mut h, score(&tree, &s, m));
+            }
+            for row in &x {
+                fnv(&mut h, signed_distance(&tree, row).unwrap_or(f64::NAN));
+            }
+            for iters in [0, 1, 8, 20] {
+                let mut t = tree.clone();
+                fnv(&mut h, fit(&mut t, &x, &w, iters));
+                for c in constants(&t) {
+                    fnv(&mut h, c);
+                }
+            }
+        }
+        h
+    }
+
+    #[test]
+    fn implicit_fixture_bits_are_pinned() {
+        assert_eq!(format!("{:016x}", fixture_hash()), "9926197398bf2e00");
+    }
+
+    #[test]
+    fn implicit_derivative_refit_through_fit_weighted_metric_moves_constants() {
+        let x = ellipse_rows(120, 0.0, 0.0, 1.0, 1.0, 1);
+        let y = vec![0.0; x.len()];
+        let before = weighted_sum(vec![sq(0), sq(1)], 4.0);
+        let mut t = before.clone();
+        let score = fit::fit_weighted_metric(&mut t, &x, &y, &[], 20, Metric::ImplicitDerivative);
+        assert!(score.is_finite(), "score = {score}");
+        let s = Sample { x: x.clone(), y, w: Vec::new(), ys: Vec::new() };
+        assert!(score < super::score(&before, &s, Metric::ImplicitDerivative));
+        let c = -expr::eval(&t, &[0.0, 0.0]);
+        assert!((c - 1.0).abs() < 0.01, "radius squared = {c}");
+    }
+
+    #[test]
+    #[ignore]
+    fn implicit_fit_timing_report() {
+        let x = ellipse_rows(1500, 1.0, 0.0, 2.0, 2.0, 7);
+        let w: Vec<f64> = Vec::new();
+        let tree = weighted_sum(
+            vec![
+                node(Op::Square, vec![node(Op::Sub, vec![input(0), constant(0.5)])]),
+                node(Op::Square, vec![node(Op::Sub, vec![input(1), constant(0.5)])]),
+            ],
+            2.0,
+        );
+        let s = Sample { x: x.clone(), y: vec![0.0; x.len()], w: Vec::new(), ys: Vec::new() };
+        let reps = 20;
+        let t0 = std::time::Instant::now();
+        let mut acc = 0.0;
+        for _ in 0..reps {
+            acc += score(&tree, &s, Metric::ImplicitDerivative);
+        }
+        let score_ms = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        let t1 = std::time::Instant::now();
+        let mut last = Vec::new();
+        for _ in 0..reps {
+            let mut t = tree.clone();
+            acc += fit(&mut t, &x, &w, 20);
+            last = constants(&t);
+        }
+        let fit_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
+        println!("TIMING score_ms={score_ms:.3} fit20_ms={fit_ms:.3} acc={acc:e} c={last:?}");
+    }
 }
