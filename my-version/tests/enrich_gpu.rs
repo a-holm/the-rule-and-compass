@@ -908,3 +908,47 @@ fn batch_output_matches_per_column_downloads() {
         delta.kernel_s * 1e3
     );
 }
+
+extern "C" {
+    fn rc_enrich_test_force_cub_fail(on: i32);
+}
+
+/// #410: a refused CUB call in the cross-section sort reports failure, so the
+/// caller keeps the CPU path, and the next call on the same context works.
+#[test]
+fn refused_cub_sort_fails_cross_section_prepare_then_recovers() {
+    use rcsr::enrich_gpu::EnrichGpu;
+
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let (symbols, steps) = (24usize, 40usize);
+    let n = symbols * steps;
+    let mut times = Vec::with_capacity(n);
+    let mut sym = Vec::with_capacity(n);
+    for k in 0..symbols {
+        for i in 0..steps {
+            times.push(1_700_000_000i64 + i as i64 * 900);
+            sym.push(k as u32);
+        }
+    }
+    let close = vec![100.0f64; n];
+    let zeros = vec![0.0f64; n];
+    let seg_start: Vec<u32> = (0..symbols).map(|k| (k * steps) as u32).collect();
+    let seg_len = vec![steps as u32; symbols];
+    let mut gpu = EnrichGpu::new(
+        &times, &close, &close, &close, &close, &zeros, &zeros, &seg_start, &seg_len, 900,
+    )
+    .expect("CUDA context");
+    let src: Vec<f64> = (0..n).map(|i| (i % 29) as f64).collect();
+
+    unsafe { rc_enrich_test_force_cub_fail(1) };
+    let refused = gpu.prepare_cross_section(&sym, None);
+    unsafe { rc_enrich_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB sort must fail the prepare");
+    assert!(gpu.rank(&src).is_none(), "no permutation may survive a failed prepare");
+
+    assert!(gpu.prepare_cross_section(&sym, None), "no error may stay pending");
+    assert!(gpu.rank(&src).is_some());
+}
