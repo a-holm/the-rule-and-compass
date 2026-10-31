@@ -154,27 +154,6 @@ a measured guard, not a speed-up claim: the 16M paired measurement is still
 missing, and the 1.05M fixture has only two symbol segments, so the
 one-thread-per-segment leaf/join passes underutilise the device.
 
-### Device MTF as-of join and `bar_age` (`--features cuda`)
-
-`src/cuda/pit.cu` (issue #302) also joins higher-timeframe bars onto base rows
-with the monotone merge used for membership; `src/panel_pit.rs` is the CPU
-reference and mirrors `ohlcv::join_causal`. A higher bar `h` is visible to a row
-at `t` when `h.time + tf <= t`, so a bar closing exactly at `t` is visible and
-the forming bar is not. Per row:
-
-* `bar_age = t - (h.time + tf)` in seconds; `NaN` only when no bar is visible. A
-  stale bucket keeps a finite `bar_age`.
-* `fresh` is 1 when the visible bar is exactly the previous expected bucket
-  (`floor(t/tf)*tf - tf`). A row that is not fresh yields `NaN` value leaves, so
-  a missing bucket is never bridged by an older one.
-* `lookahead_violations` counts any row whose leaf was not yet closed. A column
-  shifted one bar into the future is reported, with the same count as
-  `ohlcv::lookahead_violations`.
-
-The result is bit-identical to the CPU reference at any block and chunk size, and
-any prefix of the timeline equals the full run truncated (`tests/panel_gpu.rs`,
-`tests/panel_pit.rs`).
-
 ### Device panel preparation: duplicates, 15m → 1h and gaps (`--features cuda`)
 
 `src/panel_prep.rs` is the exact CPU reference and `src/panel_prep_gpu.rs` /
@@ -365,7 +344,8 @@ The production set is the **default financial feature set**, not a single
 expanded panel. It is the union of:
 
 * the raw OHLCV/flow fields (`open high low close volume quote_volume trades
-  taker_buy_base taker_buy_quote`) and identity/quality fields;
+  taker_buy_base taker_buy_quote`) and the identity fields (`ts symbol
+  listing_id member_asof gap flags`);
 * every engine column above (`all` + `py15m` + the #125 groups + `cross:btc`),
   currently **216** distinct names in the catalogue command
   `--features all,py15m,ta:full,exotic:cheap,cross:btc`;
@@ -390,7 +370,19 @@ unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
-the only way a requested column is omitted.
+the only way a requested column is omitted. A `--project` view records every
+candidate column it leaves out under `view.omitted` in `--run-manifest`, with the
+registry family and the reason; the registry still lists the column.
+
+`rcsr schema` also prints `availability_matrix`: the available and unavailable
+count per family, which sums to the registry size. `docs/default_financial_features.json`
+is the generated inventory with one row per registry entry: `name`, `family`,
+`timeframe`, `warmup_bars`, `pit_rule`, `dtype`, `unit`, `implementation`,
+`available`, `derived`, `compact`, `source` (the data dependency for an
+unavailable entry) and `test_id` (the unit, NaN/gap and join or shift tests).
+A test regenerates it and fails when it is stale; `RCSR_WRITE_INVENTORY=1`
+rewrites it. The only `derived` entry is `wasym1 = body1 - 2*clv1`, which
+holds exactly for `H > L` and is still materialised by `compact`.
 
 ### Derivatives family (reserved, gated)
 

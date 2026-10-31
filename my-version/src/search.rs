@@ -904,6 +904,12 @@ impl GpuSearch {
                 fallbacks.push((i, j, FitFallbackCause::SingleClass));
                 continue;
             }
+            if matches!(cfg.metric, Metric::Correlation | Metric::CorrelationSigned)
+                && crate::fit::is_affine_correlation_tree(&islands[i][j].tree)
+            {
+                fallbacks.push((i, j, FitFallbackCause::AffineClosedForm));
+                continue;
+            }
             match crate::fit::gpu_fit_plan_reason(&islands[i][j].tree) {
                 _ if fit_loss.is_none()
                     && rank_loss.is_none()
@@ -923,6 +929,10 @@ impl GpuSearch {
                         cfg.fit_iters,
                     )
                     .with_min_rows(32 * plan.nconst);
+                    let workload = match fit_loss {
+                        Some(loss) => workload.with_objective(loss),
+                        None => workload,
+                    };
                     let decision = dispatcher.plan(crate::dispatch::Stage::Fit, &workload);
                     if decision.route == crate::dispatch::Route::Device {
                         jobs.push((i, j, plan));
@@ -3219,6 +3229,10 @@ pub enum FitFallbackCause {
     /// #393: `signed` only. No constant can move the mean, so the proposal has
     /// no justification on the bias; the exact CPU arm refits.
     NotIdentifiable,
+    /// A correlation tree that is affine in every constant has a global closed
+    /// form (weighted least squares). It is a route, not a failure: the CPU arm
+    /// solves it directly and the device never sees it.
+    AffineClosedForm,
     /// #227: the device maximum-error stage declined (allocation, launch or an
     /// inconsistent scan) and the exact CPU maximum arm took over.
     MaximumDeclined,
@@ -3231,7 +3245,7 @@ pub enum FitFallbackCause {
 
 impl FitFallbackCause {
     /// Every cause, in reporting order.
-    pub const ALL: [FitFallbackCause; 16] = [
+    pub const ALL: [FitFallbackCause; 17] = [
         FitFallbackCause::UnsupportedPlan,
         FitFallbackCause::TooFewRows,
         FitFallbackCause::TooManyConstants,
@@ -3248,6 +3262,7 @@ impl FitFallbackCause {
         FitFallbackCause::DispatchCost,
         FitFallbackCause::Worse,
         FitFallbackCause::NotIdentifiable,
+        FitFallbackCause::AffineClosedForm,
     ];
 
     /// Stable JSON label.
@@ -3269,6 +3284,7 @@ impl FitFallbackCause {
             FitFallbackCause::DispatchCost => "dispatch_cost",
             FitFallbackCause::Worse => "worse",
             FitFallbackCause::NotIdentifiable => "not_identifiable",
+            FitFallbackCause::AffineClosedForm => "affine_closed_form",
         }
     }
 }
@@ -5349,8 +5365,15 @@ fn run_search(
     // startup cost model; contract stages (variation, selection, archive, I/O,
     // features, P&L and exact refit) are planned once and recorded so the
     // ledger answers for every stage, not only the two that can move.
-    let mut dispatcher =
-        crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::probe());
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut calibration = crate::dispatch::Calibration::probe();
+    #[cfg(feature = "cuda")]
+    if cfg.gpu {
+        if let Some(rates) = crate::dispatch_gpu::device_rates() {
+            calibration = calibration.with_device_rates(rates);
+        }
+    }
+    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
     for stage in [
         crate::dispatch::Stage::Vary,
         crate::dispatch::Stage::Select,
@@ -7318,6 +7341,7 @@ mod tests {
                 "dispatch_cost",
                 "worse",
                 "not_identifiable",
+                "affine_closed_form",
             ]
         );
         assert_eq!(

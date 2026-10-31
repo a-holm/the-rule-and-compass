@@ -1948,6 +1948,15 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
+### Correlation arm
+
+`--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.
+
+* **Orientation.** `correlation_signed` has a genuine sign. The kernel refines two orientations from the same entry constants: the incoming scale sign, then its negation, which thread 0 writes to the shared scale slot after the restore barrier. The lower objective wins, a tie keeps the incoming orientation, and `--fit-iters 0` never flips. Status is the status of the kept orientation (`recovered`, `no_improvement`, `start_unusable`, `rank_deficient` keep their meaning). `correlation` has one orientation.
+* **Closed form.** A tree that is affine in every constant has a global optimum, the weighted least-squares fit (`correlation::fit`). Such a tree never reaches the device: it is routed to the exact CPU arm with the label `affine_closed_form`. This label is a route, not a failure.
+* **Exact gate.** Every proposal passes `fit::gate_device_proposal` on the configured metric. A worse or non-finite proposal restores the incoming constants and the CPU arm refits (`worse`, `non_finite`).
+* **Cost.** The dispatch model scales the calibrated fit rates by passes per candidate relative to one squared LM run: `correlation` 1 on both sides, `correlation_signed` 2 on the device (two orientations) and 3 on the CPU (three orientations tried).
+
 ## The DGX Spark path
 
 | | |
@@ -3050,11 +3059,15 @@ hysteresis band `h = 0.3` so a stage does not oscillate at the crossover.
 `vary` stays CPU until #291; `select`, `archive`, `features`, `pnl`, `io` and
 the exact `refit` are CPU by contract.
 
-A ~100 ms startup probe measures the host rate and anchors the device rates;
-the values, source, sample count and reproducibility band are written to
-`--json` under `dispatch.calibration` (the probe wall time is provenance and
-appears only in the manifest, so the result JSON stays byte-stable) and to
-`--run-manifest` under `dispatch`.
+A host probe times the host rate. With `--gpu` and a usable device, one device
+probe per process times the scoring rate, the batched fit rate, the H2D and D2H
+bandwidth and the launch overhead on a small resident dataset, and those values
+replace the corpus anchors. Without a device the anchors stay and are labelled
+`anchor`. Every probed term is the median of its timed reps and carries the
+spread of those reps. `--json` under `dispatch.calibration` carries the
+provenance labels (`source`, `device_source`, sample counts), so the result JSON
+stays byte-stable. `--run-manifest` under `dispatch.calibration` adds the
+measured rates, their `spread` and the probe wall time.
 The per-stage `dispatch.route_ledger` carries `route`, `reason`, `calls`,
 `candidates`, `predicted_s`, `actual_s`, `actual_over_predicted`, `bytes` and
 `switches`.
@@ -3086,3 +3099,7 @@ The rank and order-statistic score calls split their trials into sub-waves, so o
 ### Throughput at the wide-panel scale
 
 Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).
+
+## Panel build on the device
+
+`rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every base bar against the membership decisions with the monotone as-of merge of `src/cuda/pit.cu`, then derives the gap tags and chain starts. The planner is the one of `panel base`: `off` is always CPU, `auto` needs a usable device and at least 1M base rows, `on` needs a device. The block is one segment per symbol and one launch. The store is byte-identical on every route. A CPU join under `auto` or `on` is named in the `v2.backend` block of the panel manifest with its reason (`too_few_rows`, `no_device`, `launch`). The device buffers go through `src/cuda/alloc_guard.h`. `panel validate` replays prefixes on the CPU reference. MTF columns have their own device path in `src/cuda/mtf.cu`. See `docs/panel.md`.
