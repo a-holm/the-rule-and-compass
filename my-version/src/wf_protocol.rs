@@ -293,6 +293,7 @@ pub fn infer(i: &InferenceInput) -> Result<Inference, String> {
                 })
                 .collect()
         };
+        out.bootstrap = Some(summary.clone());
         out.multiple = Some(Multiple {
             trials,
             candidates: k.max(1),

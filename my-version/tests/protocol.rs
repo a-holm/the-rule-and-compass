@@ -154,7 +154,7 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
     };
     // a development window that touches the declared lockbox is refused
     let (code, _, err) = base(&["--window", "bad,0,100,110,210"]);
-    assert_eq!(code, 1, "{}", err);
+    assert_eq!(code, 3, "{}", err);
     assert!(err.contains("locked test"), "{}", err);
     // the development run is recorded
     let (code, out, err) = base(&["--window", "dev,0,60,70,150"]);
@@ -165,14 +165,14 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
     let locked = ["--locked-test", "--sealed", &s, "--window", "locked,0,150,210,300"];
     std::fs::write(&s, "{}").unwrap();
     let (code, _, err) = base(&locked);
-    assert_eq!(code, 1, "{}", err);
+    assert_eq!(code, 3, "{}", err);
     assert!(err.contains("not sealed"), "{}", err);
     let (code, out, err) = rcsr(&["protocol", "seal", "--ledger", &l, "--out", &s]);
     assert_eq!(code, 0, "{}", err);
     assert!(out.starts_with("sealed_sha256 "));
     // training into the lockbox is refused even with the seal
     let (code, _, err) = base(&["--locked-test", "--sealed", &s, "--window", "locked,0,250,260,300"]);
-    assert_eq!(code, 1, "{}", err);
+    assert_eq!(code, 3, "{}", err);
     assert!(err.contains("trains on the locked test"), "{}", err);
     // the locked read
     let (code, out, err) = base(&locked);
@@ -183,21 +183,21 @@ fn the_cli_runs_the_whole_protocol_and_refuses_a_second_read() {
     let hash = out.split("\"report_sha256\":\"").nth(1).unwrap().split('"').next().unwrap().to_string();
     // a second read is refused
     let (code, _, err) = base(&locked);
-    assert_eq!(code, 1, "{}", err);
+    assert_eq!(code, 3, "{}", err);
     assert!(err.contains("already has test_read:true"), "{}", err);
     // the reproduce command matches the recorded hash and records nothing
     let (code, out, err) = base(&["--locked-test", "--verify-read", "--sealed", &s, "--window", "locked,0,150,210,300", "--expect-report-sha256", &hash]);
     assert_eq!(code, 0, "{}", err);
     assert!(out.contains("\"read_count\":1"));
     let (code, _, _) = base(&["--locked-test", "--verify-read", "--sealed", &s, "--window", "locked,0,150,210,300", "--expect-report-sha256", &"0".repeat(64)]);
-    assert_eq!(code, 1);
+    assert_eq!(code, 3);
     let (code, out, _) = rcsr(&["protocol", "verify", "--ledger", &l]);
     assert_eq!(code, 0);
     assert!(out.contains("1 locked read(s)"), "{}", out);
     // changed data is a different candidate: the sealed list does not know it
     std::fs::write(&data, csv.replacen("\n0,", "\n0.5,", 1)).unwrap();
     let (code, _, err) = base(&locked);
-    assert_eq!(code, 1, "{}", err);
+    assert_eq!(code, 3, "{}", err);
     assert!(err.contains("not in the sealed list"), "{}", err);
 }
 
