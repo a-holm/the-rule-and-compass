@@ -35,20 +35,22 @@
 //!
 //! ## Calibration
 //!
-//! [`Calibration::probe`] measures the host's evaluation rate and copy
-//! bandwidth in a short startup probe (well under the 100 ms budget on the
-//! reference host) and clamps the result to a stated band around the measured
-//! device anchors. The values, their source, the probe time and the band are
-//! written to the run manifest and the `--json` route ledger. Three probes on
-//! one host are required to agree within [`Calibration::band`].
+//! [`Calibration::probe`] times the host in a short startup probe. With a
+//! device, `crate::dispatch_gpu::device_probe` times the device eval rate, the
+//! fit rate, the H2D and D2H bandwidth and the launch overhead once per
+//! process, and [`Calibration::with_device_rates`] installs them. Every probed
+//! term carries its own spread: the largest sample over the smallest sample of
+//! its timed reps. Two probes agree on a term when their values differ by no
+//! more than the larger of the two spreads ([`Calibration::agreement`]). The
+//! values, their sources (`probe` or `anchor` for the device terms), the spread
+//! and the probe time are written to the run manifest.
 //!
 //! The device anchors are the measured corpus values from
 //! `arbeidsmappe/crypto-rcsr/gpu-coverage/09-dispatch-architecture.md` §6 and
 //! `06-fit-fallback.md`: ~20e9 row-evals/s, 89.5 ms per accepted fit at
 //! 2.456 M rows × 52 variables, ~12 GB/s effective PCIe and 3–7 µs launch.
-//! A device probe can replace them with [`DeviceRates`]; without a device the
-//! model records them as anchors and still refuses device routes when no
-//! device exists.
+//! Without a device the model keeps them as anchors, labelled `anchor`, and
+//! still refuses device routes when no device exists.
 //!
 //! ## Exactness
 //!
@@ -86,9 +88,9 @@ pub const FIT_REF_ROWS: f64 = 2_456_306.0;
 pub const FIT_REF_CONSTANTS: f64 = 4.0;
 pub const FIT_REF_SWEEPS: f64 = 8.0;
 
-/// Probe values are clamped to this factor around their anchor, so three
-/// startup probes on one host cannot disagree by more than `band²`.
-pub const CALIBRATION_BAND: f64 = 2.0;
+/// The host terms that route stages stay within this factor of their anchors,
+/// so the route ledger of two identical CPU runs has identical bytes. The raw
+/// probe rate is reported unclamped as `host_rate`.
 const PROBE_CLAMP: f64 = 1.34;
 
 /// A stage whose route is planned independently.
@@ -313,6 +315,20 @@ impl FallbackCause {
     }
 }
 
+/// Cost of one candidate relative to one squared LM run, `(device, cpu)`.
+///
+/// A squared LM run is `2·sweeps + 3` row passes on either side, so the sweep
+/// count cancels. The device kernel runs it once per gauge orientation: twice
+/// for `correlation_signed`. `correlation::fit` on the CPU runs one LM per
+/// orientation tried: three for `correlation_signed`. Unsigned correlation has
+/// one orientation on both sides.
+fn fit_pass_scale(objective: Option<crate::fit::DeviceLoss>) -> (f64, f64) {
+    match objective {
+        Some(crate::fit::DeviceLoss::CorrelationSigned) => (2.0, 3.0),
+        _ => (1.0, 1.0),
+    }
+}
+
 /// Work shape offered to the planner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Workload {
@@ -333,6 +349,9 @@ pub struct Workload {
     pub split_fraction: Option<f64>,
     /// A structural or arithmetic refusal checked before timing.
     pub refusal: Option<FallbackCause>,
+    /// The fit objective; `None` and the squared family use the calibrated
+    /// rates unscaled.
+    pub objective: Option<crate::fit::DeviceLoss>,
 }
 
 impl Workload {
@@ -351,6 +370,7 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
@@ -369,6 +389,7 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
@@ -386,11 +407,17 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
     pub fn with_min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
+        self
+    }
+
+    pub fn with_objective(mut self, objective: crate::fit::DeviceLoss) -> Self {
+        self.objective = Some(objective);
         self
     }
 
@@ -440,6 +467,29 @@ pub struct Decision {
     pub cost: Cost,
 }
 
+/// Spread of each probed term: the largest timed rep over the smallest one,
+/// always at least `1.0`. A term that was not probed carries `1.0`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Spread {
+    pub r_eval: f64,
+    pub r_fit: f64,
+    pub bw: f64,
+    pub launch_s: f64,
+    pub cpu_eval: f64,
+}
+
+impl Default for Spread {
+    fn default() -> Self {
+        Spread {
+            r_eval: 1.0,
+            r_fit: 1.0,
+            bw: 1.0,
+            launch_s: 1.0,
+            cpu_eval: 1.0,
+        }
+    }
+}
+
 /// Calibrated rates used by the model.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Calibration {
@@ -449,22 +499,33 @@ pub struct Calibration {
     pub r_fit: f64,
     /// Effective transfer bandwidth, bytes/s.
     pub bw: f64,
+    /// Host-to-device bandwidth, bytes/s. Equals `bw` for an anchor.
+    pub bw_h2d: f64,
+    /// Device-to-host bandwidth, bytes/s. Equals `bw` for an anchor.
+    pub bw_d2h: f64,
     /// Launch/synchronisation overhead, seconds.
     pub launch_s: f64,
     /// Measured host row-evals per second.
     pub cpu_eval: f64,
     /// Exact host fits per second at the reference shape.
     pub cpu_fit: f64,
+    /// Unclamped rate of the host probe loop, per second; `0.0` when no host
+    /// probe ran.
+    pub host_rate: f64,
     /// Hysteresis fraction.
     pub hysteresis: f64,
-    /// Startup probe wall, seconds.
+    /// Startup probe wall (host and device), seconds.
     pub probe_s: f64,
     /// Number of timed samples behind the host terms.
     pub samples: u32,
-    /// Stated reproducibility band (relative factor).
-    pub band: f64,
-    /// Where the values came from: `startup_probe`, `anchors` or `device`.
+    /// Number of timed samples behind each device term; `0` for an anchor.
+    pub device_samples: u32,
+    /// Spread of every probed term.
+    pub spread: Spread,
+    /// Where the host values came from: `startup_probe` or `anchors`.
     pub source: &'static str,
+    /// Where the device values came from: `probe` or `anchor`.
+    pub device_source: &'static str,
 }
 
 impl Default for Calibration {
@@ -473,48 +534,46 @@ impl Default for Calibration {
             r_eval: DEFAULT_R_EVAL,
             r_fit: DEFAULT_R_FIT,
             bw: DEFAULT_BW,
+            bw_h2d: DEFAULT_BW,
+            bw_d2h: DEFAULT_BW,
             launch_s: DEFAULT_LAUNCH_S,
             cpu_eval: DEFAULT_CPU_EVAL,
             cpu_fit: DEFAULT_CPU_FIT,
+            host_rate: 0.0,
             hysteresis: DEFAULT_HYSTERESIS,
             probe_s: 0.0,
             samples: 0,
-            band: CALIBRATION_BAND,
+            device_samples: 0,
+            spread: Spread::default(),
             source: "anchors",
+            device_source: "anchor",
         }
     }
 }
 
 impl Calibration {
-    /// Run the short startup probe.
+    /// Run the short host probe. The device terms stay anchors until
+    /// [`Self::with_device_rates`] replaces them.
     ///
-    /// Device rates are anchored at the measured corpus values; host rates are
-    /// timed and used to scale them, clamped to `PROBE_CLAMP` so a noisy or
-    /// oversubscribed host cannot move a route by more than one band. The
-    /// probe is deliberately bounded: three host-evaluation reps and three
-    /// copy reps.
+    /// The host rate scales the host anchors in proportion to the probe's
+    /// reference rate. Nothing is clamped: the measured spread is reported.
     pub fn probe() -> Self {
         let start = Instant::now();
-        let (measured, samples) = probe_cpu_eval();
-        // Clamp the host rate to the anchor band before it can move a route.
-        // The probe still measures the host; the clamp is what makes three
-        // runs reproducible on a shared machine.
-        let scale = clamp_ratio(measured / DEFAULT_CPU_EVAL, PROBE_CLAMP);
-        let cpu_eval = DEFAULT_CPU_EVAL * scale;
-        let cal = Calibration {
-            r_eval: DEFAULT_R_EVAL * scale,
-            r_fit: DEFAULT_R_FIT * scale,
-            bw: DEFAULT_BW,
-            launch_s: DEFAULT_LAUNCH_S,
-            cpu_eval,
+        let host = probe_cpu_eval();
+        let scale = clamp_ratio(host.rate / DEFAULT_CPU_EVAL, PROBE_CLAMP);
+        Calibration {
+            cpu_eval: DEFAULT_CPU_EVAL * scale,
             cpu_fit: DEFAULT_CPU_FIT * scale,
-            hysteresis: DEFAULT_HYSTERESIS,
+            host_rate: host.rate,
             probe_s: start.elapsed().as_secs_f64(),
-            samples,
-            band: CALIBRATION_BAND,
+            samples: host.samples,
+            spread: Spread {
+                cpu_eval: host.spread,
+                ..Spread::default()
+            },
             source: "startup_probe",
-        };
-        cal
+            ..Calibration::default()
+        }
     }
 
     /// Replace the device terms with hardware-probe rates.
@@ -527,11 +586,27 @@ impl Calibration {
         }
         if rates.bw.is_finite() && rates.bw > 0.0 {
             self.bw = rates.bw;
+            self.bw_h2d = if rates.bw_h2d.is_finite() && rates.bw_h2d > 0.0 {
+                rates.bw_h2d
+            } else {
+                rates.bw
+            };
+            self.bw_d2h = if rates.bw_d2h.is_finite() && rates.bw_d2h > 0.0 {
+                rates.bw_d2h
+            } else {
+                rates.bw
+            };
         }
         if rates.launch_s.is_finite() && rates.launch_s >= 0.0 {
             self.launch_s = rates.launch_s;
         }
-        self.source = "device";
+        self.spread.r_eval = rates.spread.r_eval;
+        self.spread.r_fit = rates.spread.r_fit;
+        self.spread.bw = rates.spread.bw;
+        self.spread.launch_s = rates.spread.launch_s;
+        self.device_samples = rates.samples;
+        self.probe_s += rates.probe_s;
+        self.device_source = "probe";
         self
     }
 
@@ -575,68 +650,90 @@ impl Calibration {
             * (FIT_REF_SWEEPS / sweeps)
     }
 
-    /// Are two probes on one host within the stated band on every term?
-    pub fn reproducible_within(&self, other: &Calibration, band: f64) -> bool {
+    /// Per term: name, ratio of the larger value to the smaller one, and the
+    /// band the two probes state, which is the larger of their two spreads. A
+    /// non-finite or non-positive value gives an infinite ratio.
+    pub fn agreement(&self, other: &Calibration) -> Vec<(&'static str, f64, f64)> {
         let terms = [
-            (self.r_eval, other.r_eval),
-            (self.r_fit, other.r_fit),
-            (self.bw, other.bw),
-            (self.launch_s.max(1e-12), other.launch_s.max(1e-12)),
-            (self.cpu_eval, other.cpu_eval),
-            (self.cpu_fit, other.cpu_fit),
+            ("r_eval", self.r_eval, other.r_eval, self.spread.r_eval, other.spread.r_eval),
+            ("r_fit", self.r_fit, other.r_fit, self.spread.r_fit, other.spread.r_fit),
+            ("bw", self.bw, other.bw, self.spread.bw, other.spread.bw),
+            (
+                "launch_s",
+                self.launch_s.max(1e-12),
+                other.launch_s.max(1e-12),
+                self.spread.launch_s,
+                other.spread.launch_s,
+            ),
+            (
+                "host_rate",
+                self.host_rate,
+                other.host_rate,
+                self.spread.cpu_eval,
+                other.spread.cpu_eval,
+            ),
         ];
-        terms.iter().all(|(a, b)| {
-            if !a.is_finite() || !b.is_finite() || *a <= 0.0 || *b <= 0.0 {
-                return false;
-            }
-            let ratio = (a / b).max(b / a);
-            ratio <= band
-        })
+        terms
+            .iter()
+            .filter(|t| t.1 > 0.0 || t.2 > 0.0)
+            .map(|&(name, a, b, sa, sb)| {
+                let ratio = if a.is_finite() && b.is_finite() && a > 0.0 && b > 0.0 {
+                    (a / b).max(b / a)
+                } else {
+                    f64::INFINITY
+                };
+                (name, ratio, sa.max(sb))
+            })
+            .collect()
     }
 
-    /// JSON object with the rates, source and band. The startup probe time is
-    /// deliberately **not** here: it is wall-clock noise and must not make the
-    /// result JSON differ between two otherwise identical runs (the dev-log
-    /// contract keeps the archive and result bytes identical). The manifest
-    /// variant below records it as provenance.
+    /// Result-JSON variant: provenance labels only. The measured rates and the
+    /// probe time are wall-clock noise and must not make the result JSON differ
+    /// between two otherwise identical runs (the dev-log contract keeps the
+    /// archive and result bytes identical). The manifest variant below records
+    /// the measured values.
     pub fn json(&self) -> String {
         format!(
-            "{{\"model_version\":{},\"source\":\"{}\",\"samples\":{},\"band\":{:.3},\"hysteresis\":{:.4},\"r_eval\":{:.6e},\"r_fit\":{:.6e},\"bw\":{:.6e},\"launch_s\":{:.9},\"cpu_eval\":{:.6e},\"cpu_fit\":{:.6e},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
+            "{{\"model_version\":{},\"source\":\"{}\",\"device_source\":\"{}\",\"samples\":{},\"device_samples\":{},\"hysteresis\":{:.4},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
             MODEL_VERSION,
             self.source,
+            self.device_source,
             self.samples,
-            self.band,
+            self.device_samples,
             self.hysteresis,
-            self.r_eval,
-            self.r_fit,
-            self.bw,
-            self.launch_s,
-            self.cpu_eval,
-            self.cpu_fit,
             FIT_REF_ROWS,
             FIT_REF_CONSTANTS,
             FIT_REF_SWEEPS
         )
     }
 
-    /// Provenance variant for `--run-manifest`, including the measured probe
-    /// time. A manifest is not compared byte-for-byte across runs, so the
-    /// timing belongs here rather than in the result JSON.
+    /// Provenance variant for `--run-manifest`: the measured rates, their
+    /// sources, spreads and the probe time. A manifest is not compared
+    /// byte-for-byte across runs.
     pub fn manifest_json(&self) -> String {
         format!(
-            "{{\"model_version\":{},\"source\":\"{}\",\"probe_s\":{:.6},\"samples\":{},\"band\":{:.3},\"hysteresis\":{:.4},\"r_eval\":{:.6e},\"r_fit\":{:.6e},\"bw\":{:.6e},\"launch_s\":{:.9},\"cpu_eval\":{:.6e},\"cpu_fit\":{:.6e},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
+            "{{\"model_version\":{},\"source\":\"{}\",\"device_source\":\"{}\",\"probe_s\":{:.6},\"samples\":{},\"device_samples\":{},\"hysteresis\":{:.4},\"r_eval\":{:.6e},\"r_fit\":{:.6e},\"bw\":{:.6e},\"bw_h2d\":{:.6e},\"bw_d2h\":{:.6e},\"launch_s\":{:.9},\"cpu_eval\":{:.6e},\"cpu_fit\":{:.6e},\"host_rate\":{:.6e},\"spread\":{{\"r_eval\":{:.4},\"r_fit\":{:.4},\"bw\":{:.4},\"launch_s\":{:.4},\"cpu_eval\":{:.4}}},\"fit_ref\":{{\"rows\":{:.0},\"constants\":{:.0},\"sweeps\":{:.0}}}}}",
             MODEL_VERSION,
             self.source,
+            self.device_source,
             self.probe_s,
             self.samples,
-            self.band,
+            self.device_samples,
             self.hysteresis,
             self.r_eval,
             self.r_fit,
             self.bw,
+            self.bw_h2d,
+            self.bw_d2h,
             self.launch_s,
             self.cpu_eval,
             self.cpu_fit,
+            self.host_rate,
+            self.spread.r_eval,
+            self.spread.r_fit,
+            self.spread.bw,
+            self.spread.launch_s,
+            self.spread.cpu_eval,
             FIT_REF_ROWS,
             FIT_REF_CONSTANTS,
             FIT_REF_SWEEPS
@@ -650,7 +747,14 @@ pub struct DeviceRates {
     pub r_eval: f64,
     pub r_fit: f64,
     pub bw: f64,
+    pub bw_h2d: f64,
+    pub bw_d2h: f64,
     pub launch_s: f64,
+    pub spread: Spread,
+    /// Timed reps behind each term.
+    pub samples: u32,
+    /// Wall of the whole device probe, seconds.
+    pub probe_s: f64,
 }
 
 impl Default for DeviceRates {
@@ -659,7 +763,12 @@ impl Default for DeviceRates {
             r_eval: DEFAULT_R_EVAL,
             r_fit: DEFAULT_R_FIT,
             bw: DEFAULT_BW,
+            bw_h2d: DEFAULT_BW,
+            bw_d2h: DEFAULT_BW,
             launch_s: DEFAULT_LAUNCH_S,
+            spread: Spread::default(),
+            samples: 0,
+            probe_s: 0.0,
         }
     }
 }
@@ -885,8 +994,12 @@ impl Dispatcher {
                 }
                 Stage::Fit => {
                     let candidates = workload.candidates.max(1) as f64;
-                    let fit = candidates / cal.fit_rate(workload.rows, workload.constants, workload.sweeps);
-                    let cpu = candidates / cal.cpu_fit_rate(workload.rows, workload.constants, workload.sweeps);
+                    let (dev_passes, cpu_passes) =
+                        fit_pass_scale(workload.objective);
+                    let fit = dev_passes * candidates
+                        / cal.fit_rate(workload.rows, workload.constants, workload.sweeps);
+                    let cpu = cpu_passes * candidates
+                        / cal.cpu_fit_rate(workload.rows, workload.constants, workload.sweeps);
                     (0.0, fit, cpu)
                 }
                 _ => (0.0, 0.0, 0.0),
@@ -1016,17 +1129,41 @@ fn clamp_ratio(value: f64, max: f64) -> f64 {
     }
 }
 
-/// Time a small, deterministic host evaluation loop. Returns the rate and the
-/// number of timed reps (the best rep is used, which is the least noisy
-/// estimate of the achievable rate).
-fn probe_cpu_eval() -> (f64, u32) {
-    const ROWS: usize = 16_384;
-    const REPS: usize = 4;
-    let x: Vec<f64> = (0..ROWS).map(|i| (i as f64) * 0.000_1 - 0.8).collect();
+/// Median and spread of a set of timed reps: the middle value, and the largest
+/// over the smallest. Non-finite and non-positive reps are dropped; an empty
+/// set gives `None`.
+pub fn median_and_spread(samples: &[f64]) -> Option<(f64, f64)> {
+    let mut v: Vec<f64> = samples
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite() && *x > 0.0)
+        .collect();
+    if v.is_empty() {
+        return None;
+    }
+    v.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+    let median = if v.len() % 2 == 1 {
+        v[v.len() / 2]
+    } else {
+        0.5 * (v[v.len() / 2 - 1] + v[v.len() / 2])
+    };
+    Some((median, v[v.len() - 1] / v[0]))
+}
+
+struct HostProbe {
+    rate: f64,
+    spread: f64,
+    samples: u32,
+}
+
+/// Time a small, deterministic host evaluation loop. The rate is the median of
+/// the timed reps and the spread is their largest over their smallest.
+fn probe_cpu_eval() -> HostProbe {
+    const ROWS: usize = 65_536;
+    const REPS: usize = 31;
+    let x: Vec<f64> = (0..ROWS).map(|i| (i as f64) * 0.000_01 - 0.3).collect();
     let y: Vec<f64> = (0..ROWS).map(|i| (i as f64).sin()).collect();
-    let mut best = f64::INFINITY;
-    let mut last = 0.0;
-    for _ in 0..REPS {
+    let run = || {
         let t = Instant::now();
         let mut a = 0.0f64;
         let mut b = 0.0f64;
@@ -1038,17 +1175,37 @@ fn probe_cpu_eval() -> (f64, u32) {
             c += v * y[i];
         }
         let elapsed = t.elapsed().as_secs_f64();
-        // Keep the read/write sinks alive without changing the loop shape.
-        last = a + b + c;
+        (elapsed, a + b + c)
+    };
+    // One untimed pass warms the caches and the clock.
+    let (_, mut sink) = run();
+    let mut rates = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let (elapsed, s) = run();
+        sink += s;
         if elapsed > 0.0 {
-            best = best.min(elapsed);
+            rates.push(ROWS as f64 * 4.0 / elapsed);
         }
     }
-    if last.is_nan() {
-        return (DEFAULT_CPU_EVAL, REPS as u32);
+    if sink.is_nan() {
+        return HostProbe {
+            rate: DEFAULT_CPU_EVAL,
+            spread: 1.0,
+            samples: REPS as u32,
+        };
     }
-    let rate = (ROWS as f64 * 4.0) / best.max(1e-12);
-    (rate, REPS as u32)
+    match median_and_spread(&rates) {
+        Some((rate, spread)) => HostProbe {
+            rate,
+            spread,
+            samples: rates.len() as u32,
+        },
+        None => HostProbe {
+            rate: DEFAULT_CPU_EVAL,
+            spread: 1.0,
+            samples: 0,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -1155,25 +1312,89 @@ mod tests {
     }
 
     #[test]
-    fn calib_probe_is_finite_and_reproducible_within_its_stated_band() {
-        let a = Calibration::probe();
-        let b = Calibration::probe();
-        let c = Calibration::probe();
-        assert!(a.is_usable());
-        assert!(a.probe_s < 0.1, "startup probe took {:.3}s", a.probe_s);
-        assert!(a.reproducible_within(&b, a.band), "{:?} vs {:?}", a, b);
-        assert!(b.reproducible_within(&c, b.band), "{:?} vs {:?}", b, c);
-        // The host terms are clamped to the anchor band.
-        assert!(a.cpu_eval >= DEFAULT_CPU_EVAL / PROBE_CLAMP * 0.5);
-        assert!(a.cpu_eval <= DEFAULT_CPU_EVAL * PROBE_CLAMP * 2.0);
+    fn host_probe_three_runs_agree_within_the_larger_of_their_own_spreads() {
+        let runs = [Calibration::probe(), Calibration::probe(), Calibration::probe()];
+        for run in &runs {
+            assert!(run.is_usable());
+            assert!(run.probe_s < 0.1, "startup probe took {:.3}s", run.probe_s);
+            assert_eq!(run.device_source, "anchor");
+        }
+        for (i, j) in [(0, 1), (1, 2), (0, 2)] {
+            for (term, ratio, band) in runs[i].agreement(&runs[j]) {
+                assert!(
+                    ratio <= band,
+                    "probes {} and {} differ on {} by {:.4}x, past the band {:.4}x (the larger of the two probes' own spreads)",
+                    i, j, term, ratio, band
+                );
+            }
+        }
     }
 
     #[test]
-    fn calibration_json_carries_source_and_band() {
-        let j = Calibration::probe().json();
+    fn agreement_rejects_values_outside_the_probes_own_spread() {
+        let a = Calibration::default();
+        let mut b = Calibration::default();
+        b.r_eval = a.r_eval * 3.0;
+        b.spread.r_eval = 1.1;
+        let rows = a.agreement(&b);
+        let (_, ratio, band) = rows.iter().find(|r| r.0 == "r_eval").copied().unwrap();
+        assert!(ratio > band, "ratio {} band {}", ratio, band);
+        assert!(rows.iter().filter(|r| r.1 > r.2).count() == 1);
+    }
+
+    #[test]
+    fn median_and_spread_are_the_middle_rep_and_max_over_min() {
+        assert_eq!(median_and_spread(&[4.0, 1.0, 2.0]), Some((2.0, 4.0)));
+        assert_eq!(median_and_spread(&[1.0, 3.0]), Some((2.0, 3.0)));
+        assert_eq!(median_and_spread(&[f64::NAN, -1.0]), None);
+    }
+
+    #[test]
+    fn device_rates_replace_the_anchors_and_are_labelled_probe() {
+        let anchor = Calibration::default();
+        assert_eq!(anchor.device_source, "anchor");
+        let rates = DeviceRates {
+            r_eval: 3.0e9,
+            r_fit: 7.0,
+            bw: 5.0e9,
+            bw_h2d: 6.0e9,
+            bw_d2h: 4.5e9,
+            launch_s: 2.0e-5,
+            spread: Spread {
+                r_eval: 1.05,
+                r_fit: 1.07,
+                bw: 1.1,
+                launch_s: 1.3,
+                cpu_eval: 1.0,
+            },
+            samples: 7,
+            probe_s: 0.05,
+        };
+        let cal = anchor.with_device_rates(rates);
+        assert_eq!(cal.device_source, "probe");
+        assert_eq!((cal.r_eval, cal.r_fit, cal.bw, cal.launch_s), (3.0e9, 7.0, 5.0e9, 2.0e-5));
+        assert_eq!((cal.bw_h2d, cal.bw_d2h, cal.device_samples), (6.0e9, 4.5e9, 7));
+        assert_eq!(cal.spread.launch_s, 1.3);
+        let m = cal.manifest_json();
+        assert!(m.contains("\"device_source\":\"probe\""), "{}", m);
+        assert!(m.contains("\"r_eval\":3.000000e9"), "{}", m);
+        assert!(m.contains("\"bw_h2d\":6.000000e9"), "{}", m);
+        assert!(m.contains("\"spread\":{\"r_eval\":1.0500"), "{}", m);
+        assert!(anchor.manifest_json().contains("\"device_source\":\"anchor\""));
+    }
+
+    #[test]
+    fn calibration_json_labels_sources_and_leaves_measured_rates_to_the_manifest() {
+        let cal = Calibration::probe();
+        let j = cal.json();
         assert!(j.contains("\"source\":\"startup_probe\""));
-        assert!(j.contains("\"band\":2.000"));
+        assert!(j.contains("\"device_source\":\"anchor\""));
         assert!(j.contains("\"model_version\":1"));
+        assert!(!j.contains("r_eval"), "the result JSON carries no measured rate: {}", j);
+        let m = cal.manifest_json();
+        for key in ["r_eval", "r_fit", "bw", "bw_h2d", "bw_d2h", "launch_s", "cpu_eval", "host_rate", "spread"] {
+            assert!(m.contains(&format!("\"{}\":", key)), "{} missing in {}", key, m);
+        }
     }
 
     #[test]

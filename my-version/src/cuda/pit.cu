@@ -1,14 +1,9 @@
 /*
  * Device point-in-time as-of joins (issue #302).
  *
- * One kernel family serves two joins:
- *
- *   membership   key = decision `as_of`,     delay = 0
- *   MTF          key = higher bar `time`,    delay = timeframe seconds
- *
- * A leaf (decision or higher bar) is visible to a base row at time `t` when
- * `key + delay <= t`. The predicate is `<=`, never `<`: a decision at `as_of`
- * is visible to a row at `as_of`. Both leaf lists and the base rows are
+ * Membership as-of join. A decision is visible to a base row at time `t` when
+ * `as_of <= t`. The predicate is `<=`, never `<`: a decision at `as_of` is
+ * visible to a row at `as_of`. The decision list and the base rows are
  * non-decreasing inside one symbol segment, so the join is a monotone merge.
  *
  * The decisions themselves (ranking, ADV tie-breaks, `member`) stay on the CPU
@@ -19,8 +14,8 @@
  *   1. k_asof: each thread owns a chunk of consecutive base rows. It binary
  *      searches the chunk's first row once, then advances a cursor; the
  *      remaining rows cost one comparison each instead of a fresh search;
- *   2. k_gap_rows: pointwise `keep` (decision found and member), `bar_age`, the
- *      freshness flag and the gap tag. A gap is counted only between two kept
+ *   2. k_gap_rows: pointwise `keep` (decision found and member) and the gap
+ *      tag. A gap is counted only between two kept
  *      adjacent rows of one segment and one input chain, so `member=0`, listing,
  *      delisting and migration reset the chain and nothing bridges them;
  *   3. an inclusive scan of the chain starts numbers the chains (from 1 inside each
@@ -84,8 +79,6 @@ typedef struct RcPit {
     int chunk_cap;
 
     int *d_leaf;
-    double *d_age;
-    unsigned char *d_fresh;
     unsigned char *d_keep;
     unsigned char *d_found;
     long long *d_as_of;
@@ -111,8 +104,6 @@ typedef struct RcPit {
 
 typedef struct RcPitHostOut {
     int *leaf;
-    double *age;
-    unsigned char *fresh;
     unsigned char *keep;
     unsigned char *found;
     long long *as_of;
@@ -177,13 +168,6 @@ static int blocks_for(long long n, int threads)
     return (int)((n + threads - 1) / threads);
 }
 
-__device__ __forceinline__ long long rc_pit_floor_div(long long a, long long b)
-{
-    long long q = a / b;
-    if ((a % b != 0) && ((a < 0) != (b < 0))) --q;
-    return q;
-}
-
 /* One thread per chunk of consecutive rows of one segment. */
 __global__ void k_asof(const long long *__restrict__ t,
                        const int *__restrict__ ch_seg,
@@ -194,10 +178,7 @@ __global__ void k_asof(const long long *__restrict__ t,
                        const int *__restrict__ leaf_len,
                        const long long *__restrict__ key,
                        const unsigned char *__restrict__ member,
-                       long long delay, long long fresh_tf,
                        int *__restrict__ leaf,
-                       double *__restrict__ age,
-                       unsigned char *__restrict__ fresh,
                        unsigned char *__restrict__ keep,
                        unsigned char *__restrict__ found,
                        long long *__restrict__ as_of,
@@ -218,7 +199,7 @@ __global__ void k_asof(const long long *__restrict__ t,
     while (a < b) {
         int m = a + ((b - a) >> 1);
         ++n_loads;
-        if (key[m] + delay <= first) a = m + 1;
+        if (key[m] <= first) a = m + 1;
         else b = m;
     }
     int cursor = a;
@@ -226,25 +207,17 @@ __global__ void k_asof(const long long *__restrict__ t,
         long long now = t[r];
         while (cursor < le) {
             ++n_loads;
-            if (key[cursor] + delay <= now) ++cursor;
+            if (key[cursor] <= now) ++cursor;
             else break;
         }
         int j = cursor - 1;
         if (j >= ls) {
-            long long visible = key[j] + delay;
             leaf[r] = j;
-            age[r] = (double)(now - visible);
-            fresh[r] = (fresh_tf <= 0 ||
-                        key[j] == rc_pit_floor_div(now, fresh_tf) * fresh_tf - fresh_tf)
-                           ? 1
-                           : 0;
             found[r] = 1;
             keep[r] = member[j] ? 1 : 0;
             as_of[r] = key[j];
         } else {
             leaf[r] = -1;
-            age[r] = NAN;
-            fresh[r] = 0;
             found[r] = 0;
             keep[r] = 0;
             as_of[r] = 0;
@@ -310,7 +283,7 @@ __global__ void k_check(const long long *__restrict__ t,
                         const int *__restrict__ leaf_start,
                         const int *__restrict__ leaf_len,
                         const long long *__restrict__ key,
-                        const int *__restrict__ idx, int n, long long delay,
+                        const int *__restrict__ idx, int n,
                         unsigned long long *__restrict__ counter)
 {
     int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -319,7 +292,7 @@ __global__ void k_check(const long long *__restrict__ t,
     if (j < 0) return;
     int s = row_seg[r];
     int ls = leaf_start[s];
-    bool bad = (j < ls) || (j >= ls + leaf_len[s]) || (key[j] + delay > t[r]);
+    bool bad = (j < ls) || (j >= ls + leaf_len[s]) || (key[j] > t[r]);
     if (bad) atomicAdd(counter, 1ULL);
 }
 
@@ -367,8 +340,6 @@ RcPit *rc_pit_create(const long long *times, const long long *chain, int n,
     ok &= rc_alloc((void **)&c->d_key, nl * sizeof(long long)) == 0;
     ok &= rc_alloc((void **)&c->d_member, nl * sizeof(unsigned char)) == 0;
     ok &= rc_alloc((void **)&c->d_leaf, rows * sizeof(int)) == 0;
-    ok &= rc_alloc((void **)&c->d_age, rows * sizeof(double)) == 0;
-    ok &= rc_alloc((void **)&c->d_fresh, rows * sizeof(unsigned char)) == 0;
     ok &= rc_alloc((void **)&c->d_keep, rows * sizeof(unsigned char)) == 0;
     ok &= rc_alloc((void **)&c->d_found, rows * sizeof(unsigned char)) == 0;
     ok &= rc_alloc((void **)&c->d_as_of, rows * sizeof(long long)) == 0;
@@ -434,8 +405,6 @@ void rc_pit_destroy(RcPit *c)
     rc_free(c->d_ch_lo);
     rc_free(c->d_ch_hi);
     rc_free(c->d_leaf);
-    rc_free(c->d_age);
-    rc_free(c->d_fresh);
     rc_free(c->d_keep);
     rc_free(c->d_found);
     rc_free(c->d_as_of);
@@ -465,13 +434,10 @@ extern "C" void rc_pit_test_force_cub_fail(int on)
     g_force_cub_fail = on;
 }
 
-/* Run one join. `delay` is added to every leaf key; `fresh_tf` > 0 marks a
- * row fresh only when the visible leaf is exactly the previous expected
- * bucket; `step` is the gap bucket size. */
-int rc_pit_run(RcPit *c, long long delay, long long fresh_tf, long long step,
-               int threads, int chunk_rows)
+/* Run one join. `step` is the gap bucket size. */
+int rc_pit_run(RcPit *c, long long step, int threads, int chunk_rows)
 {
-    if (!c || step <= 0 || delay < 0 || fresh_tf < 0) return 1;
+    if (!c || step <= 0) return 1;
     if (threads < 32 || threads > 1024 || threads % 32 != 0) return 2;
     if (chunk_rows < 1) return 3;
     stats_begin(c);
@@ -542,8 +508,7 @@ int rc_pit_run(RcPit *c, long long delay, long long fresh_tf, long long step,
     int nb_chunk = blocks_for(nchunk, threads);
     k_asof<<<nb_chunk, threads>>>(c->d_time, c->d_ch_seg, c->d_ch_lo, c->d_ch_hi,
                                   nchunk, c->d_leaf_start, c->d_leaf_len, c->d_key,
-                                  c->d_member, delay, fresh_tf, c->d_leaf, c->d_age,
-                                  c->d_fresh, c->d_keep, c->d_found, c->d_as_of,
+                                  c->d_member, c->d_leaf, c->d_keep, c->d_found, c->d_as_of,
                                   c->d_counter);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -613,7 +578,7 @@ int rc_pit_run(RcPit *c, long long delay, long long fresh_tf, long long step,
     /* Self-check of the join just produced; the expected count is zero. */
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
     k_check<<<nb, threads>>>(c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len,
-                             c->d_key, c->d_leaf, c->n, delay, c->d_counter);
+                             c->d_key, c->d_leaf, c->n, c->d_counter);
     cudaDeviceSynchronize();
     unsigned long long viol = 0;
     rc_download(&viol, c->d_counter, sizeof(viol));
@@ -624,10 +589,9 @@ int rc_pit_run(RcPit *c, long long delay, long long fresh_tf, long long step,
 }
 
 /* Count look-ahead violations of a caller-supplied leaf index column. */
-int rc_pit_check(RcPit *c, const int *idx, long long delay,
-                 unsigned long long *violations)
+int rc_pit_check(RcPit *c, const int *idx, unsigned long long *violations)
 {
-    if (!c || !idx || !violations || delay < 0) return 1;
+    if (!c || !idx || !violations) return 1;
     stats_begin(c);
     rc_upload(c->d_check_idx, idx, (size_t)c->n * sizeof(int));
     int *d_row_seg = c->d_row_seg;
@@ -638,7 +602,7 @@ int rc_pit_check(RcPit *c, const int *idx, long long delay,
     cudaMemset(c->d_counter, 0, sizeof(unsigned long long));
     k_check<<<blocks_for(c->n, threads), threads>>>(
         c->d_time, d_row_seg, c->d_leaf_start, c->d_leaf_len, c->d_key,
-        c->d_check_idx, c->n, delay, c->d_counter);
+        c->d_check_idx, c->n, c->d_counter);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     rc_download(violations, c->d_counter, sizeof(unsigned long long));
@@ -655,8 +619,6 @@ int rc_pit_download(RcPit *c, RcPitHostOut *out)
     stats_begin(c);
     size_t n = (size_t)c->n;
     rc_download(out->leaf, c->d_leaf, n * sizeof(int));
-    rc_download(out->age, c->d_age, n * sizeof(double));
-    rc_download(out->fresh, c->d_fresh, n);
     rc_download(out->keep, c->d_keep, n);
     rc_download(out->found, c->d_found, n);
     rc_download(out->as_of, c->d_as_of, n * sizeof(long long));
@@ -667,7 +629,7 @@ int rc_pit_download(RcPit *c, RcPitHostOut *out)
     cudaError_t err = cudaGetLastError();
     c->last.n_kept = c->n_kept;
     c->last.n_chunks = c->n_chunks;
-    c->last.d2h_bytes = n * (4 + 8 + 1 + 1 + 1 + 8 + 4 + 4) + (size_t)keep_n * 4;
+    c->last.d2h_bytes = n * (4 + 1 + 1 + 8 + 4 + 4) + (size_t)keep_n * 4;
     stats_end_phase(c, 2);
     return err == cudaSuccess ? 0 : 2;
 }

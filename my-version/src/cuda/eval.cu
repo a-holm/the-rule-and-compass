@@ -899,7 +899,7 @@ __device__ __forceinline__ float rc_sigmoid_f(float x)
 
    The surrogate keeps the historical expression rather than `2*sigmoid(-u)`
    so the pre-#289 `hinge` value does not move by a rounding step. */
-__device__ __forceinline__ float rc_class_row_loss(float p, float tsign, int loss)
+__device__ __forceinline__ double rc_class_row_loss(float p, float tsign, int loss)
 {
     const float u = tsign * p;
     if (loss == RC_SCORE_LOG_LOSS) {
@@ -916,8 +916,8 @@ __device__ __forceinline__ float rc_class_row_loss(float p, float tsign, int los
         return h > 0.0f ? h : 0.0f;
     }
     if (loss == RC_SCORE_HINGE_SQUARED) {
-        const float h = 1.0f - u;
-        return h > 0.0f ? h * h : 0.0f;
+        const double h = 1.0 - (double)u;
+        return h > 0.0 ? h * h : 0.0;
     }
     if (loss == RC_SCORE_HINGE_SIGMOID) {
         const float s = 2.0f * rc_sigmoid_f(p) - 1.0f;
@@ -1040,11 +1040,11 @@ __device__ __forceinline__ void score_step(
             if (wi == 0.0) continue;
             const float t = tsign ? tsign[i] : CUDART_NAN_F;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(t) || !isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
-            a += wi * (double)rc_class_row_loss(pred, t, MODE);
+            a += wi * rc_class_row_loss(pred, t, MODE);
             b += wi;
         }
     } else if (w && MODE != RC_SCORE_MAXIMUM) {
@@ -1061,7 +1061,7 @@ __device__ __forceinline__ void score_step(
             }
             if (wi == 0.0) continue;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
@@ -1094,7 +1094,7 @@ __device__ __forceinline__ void score_step(
         if (PASS == 0) {
             for (long long r = first; r < r_end; r += lanes) {
                 const float pred = rc_exec_row(code, wc, ld, (int)r);
-                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                if (!isfinite(pred)) {
                     lbad = 1;
                 } else {
                     a += (double)pred;
@@ -1104,7 +1104,7 @@ __device__ __forceinline__ void score_step(
             for (long long r = first; r < r_end; r += lanes) {
                 const int i = (int)r;
                 const float pred = rc_exec_row(code, wc, ld, i);
-                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                if (!isfinite(pred)) {
                     lbad = 1;
                     continue;
                 }
@@ -1118,7 +1118,7 @@ __device__ __forceinline__ void score_step(
         for (long long r = first; r < r_end; r += lanes) {
             const int i = (int)r;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
@@ -1157,8 +1157,8 @@ __device__ __forceinline__ void score_step(
  * template, not by a runtime switch inside the row loop. Correlation needs two
  * passes (sum p, then centred moments); every other objective is one pass.
  *
- * A non-finite prediction (or one above the same 1e30 hard-magnitude limit the
- * old f32 evaluator used) writes `+inf` and status 2. It never writes a finite
+ * A non-finite prediction writes `+inf` and status 2. A finite prediction of any
+ * magnitude is scored, as the CPU does. The kernel never writes a finite
  * sentinel that the host could divide by n.
  */
 template <int MODE>
@@ -2833,118 +2833,153 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (go >= 0 && go < p) S->sc[go] = 0.0;
         }
         __syncthreads();
-        int status = 0;
+        /* Signed correlation has a genuine orientation: the scale slot of the
+           frozen gauge is the only sign that moves. Both orientations are
+           refined from the same entry constants and the better endpoint is
+           kept; a tie keeps the incoming one. iters == 0 never flips. */
+        const bool flip = iters > 0 && metric == RC_LOSS_CORRELATION_SIGNED && g[0] >= 0 &&
+                          g[0] < p;
+        const int passes = flip ? 2 : 1;
+        const double entry = (tid < p) ? S->sc[tid] : 0.0;
+        double kept = entry;
+        double overall = 1.0;
         double best = 1.0;
-        if (iters > 0) {
-            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
-                                          S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
-                                          &S->sbest, &S->srho, &S->sbad, metric);
-            if (tid == 0) S->sstart = S->sbad ? 0 : 1;
-            if (S->sbad) {
-                status = 2;
-            } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
-                best = 1.0;
-            } else if (S->svar < 1e-24 * S->syy) {
-                status = 1;
-            } else {
-                best = S->sbest;
-                double lambda = 1e-3;
-                int assembled = 1;
-                for (int it = 0; it < iters && status == 0; ++it) {
-                    if (!assembled) {
-                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
-                                                      S->sr, S->sjtj, S->sjtr, S->scorr,
-                                                      &S->svar, &S->syy, &S->sbest, &S->srho,
-                                                      &S->sbad, metric);
-                        assembled = 1;
-                        if (S->sbad) {
-                            status = 2;
-                            break;
-                        }
-                        if (S->svar < 1e-24 * S->syy) {
-                            status = 1;
-                            break;
-                        }
-                    }
-                    if (tid == 0) {
-                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
-                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
-                                                         S->sL, 0);
-                        S->ssolved = (solve != 1);
-                        if (solve == 4) S->srank = 1;
-                    }
-                    __syncthreads();
-                    if (!S->ssolved) {
-                        status = 1;
-                        break;
-                    }
-                    if (tid < p) {
-                        double t = S->sc[tid] + S->sdelta[tid];
-                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
-                    }
-                    __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
-                                                        S->sred, metric);
-                    if (trial < best) {
-                        if (tid < p) S->sc[tid] = S->strial[tid];
-                        best = trial;
-                        lambda = fmax(lambda / 8.0, 1e-12);
-                        assembled = 0;
-                        if (tid == 0) S->simproved = 1;
-                        if (best <= 0.0) break;
-                    } else {
-                        lambda *= 6.0;
-                        if (lambda > 1e9) break;
-                    }
-                    __syncthreads();
+        int status = 0;
+        for (int pass = 0; pass < passes; ++pass) {
+            if (pass == 1) {
+                if (tid < p) S->sc[tid] = entry;
+                if (tid == 0) {
+                    S->sbad = 0;
+                    S->srank = 0;
+                    S->simproved = 0;
+                    S->sstart = 0;
                 }
-                for (int it = 0; it < 4 && status == 0 && best > 0.0; ++it) {
-                    ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
-                                                  S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
-                                                  &S->sbest, &S->srho, &S->sbad, metric);
-                    if (S->sbad) {
-                        status = 2;
-                        break;
-                    }
-                    if (tid == 0) {
-                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
-                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
-                                                         S->sL, 0);
-                        S->ssolved = (solve != 1);
-                        if (solve == 4) S->srank = 1;
-                    }
-                    __syncthreads();
-                    if (!S->ssolved) break;
-                    if (tid < p) {
-                        double t = S->sc[tid] + S->sdelta[tid];
-                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
-                    }
-                    __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
-                                                        S->sred, metric);
-                    if (trial < best) {
-                        if (tid < p) S->sc[tid] = S->strial[tid];
-                        best = trial;
-                        if (tid == 0) S->simproved = 1;
-                    } else {
-                        break;
-                    }
-                    __syncthreads();
-                }
+                __syncthreads();
+                if (tid == 0) S->sc[g[0]] = -S->sc[g[0]];
+                __syncthreads();
             }
-        } else {
-            best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
-        }
-        __syncthreads();
-        if (tid == 0) {
+            int pass_status = 0;
+            double pass_best = 1.0;
+            if (iters > 0) {
+                ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                              S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                              &S->sbest, &S->srho, &S->sbad, metric);
+                if (tid == 0) S->sstart = S->sbad ? 0 : 1;
+                if (S->sbad) {
+                    pass_status = 2;
+                } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
+                    pass_best = 1.0;
+                } else if (S->svar < 1e-24 * S->syy) {
+                    pass_status = 1;
+                } else {
+                    pass_best = S->sbest;
+                    double lambda = 1e-3;
+                    int assembled = 1;
+                    for (int it = 0; it < iters && pass_status == 0; ++it) {
+                        if (!assembled) {
+                            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
+                                                          S->sr, S->sjtj, S->sjtr, S->scorr,
+                                                          &S->svar, &S->syy, &S->sbest, &S->srho,
+                                                          &S->sbad, metric);
+                            assembled = 1;
+                            if (S->sbad) {
+                                pass_status = 2;
+                                break;
+                            }
+                            if (S->svar < 1e-24 * S->syy) {
+                                pass_status = 1;
+                                break;
+                            }
+                        }
+                        if (tid == 0) {
+                            ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                            const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
+                                                             S->sL, 0);
+                            S->ssolved = (solve != 1);
+                            if (solve == 4) S->srank = 1;
+                        }
+                        __syncthreads();
+                        if (!S->ssolved) {
+                            pass_status = 1;
+                            break;
+                        }
+                        if (tid < p) {
+                            double t = S->sc[tid] + S->sdelta[tid];
+                            S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                        }
+                        __syncthreads();
+                        double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                            S->sred, metric);
+                        if (trial < pass_best) {
+                            if (tid < p) S->sc[tid] = S->strial[tid];
+                            pass_best = trial;
+                            lambda = fmax(lambda / 8.0, 1e-12);
+                            assembled = 0;
+                            if (tid == 0) S->simproved = 1;
+                            if (pass_best <= 0.0) break;
+                        } else {
+                            lambda *= 6.0;
+                            if (lambda > 1e9) break;
+                        }
+                        __syncthreads();
+                    }
+                    for (int it = 0; it < 4 && pass_status == 0 && pass_best > 0.0; ++it) {
+                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                                      S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                                      &S->sbest, &S->srho, &S->sbad, metric);
+                        if (S->sbad) {
+                            pass_status = 2;
+                            break;
+                        }
+                        if (tid == 0) {
+                            ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                            const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
+                                                             S->sL, 0);
+                            S->ssolved = (solve != 1);
+                            if (solve == 4) S->srank = 1;
+                        }
+                        __syncthreads();
+                        if (!S->ssolved) break;
+                        if (tid < p) {
+                            double t = S->sc[tid] + S->sdelta[tid];
+                            S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                        }
+                        __syncthreads();
+                        double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                            S->sred, metric);
+                        if (trial < pass_best) {
+                            if (tid < p) S->sc[tid] = S->strial[tid];
+                            pass_best = trial;
+                            if (tid == 0) S->simproved = 1;
+                        } else {
+                            break;
+                        }
+                        __syncthreads();
+                    }
+                }
+            } else {
+                pass_best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
+            }
+            __syncthreads();
             /* #286: a finite correlation answer is returned, never refit for a
                rank/gauge label the exact finalist refit already owns. */
-            if (status == 1 || status == 2) {
-                if (!S->sstart) status = 7;
-                else status = S->simproved ? 5 : 6;
-            } else if (status == 0 && S->srank) {
-                status = 4;
+            if (pass_status == 1 || pass_status == 2) {
+                if (!S->sstart) pass_status = 7;
+                else pass_status = S->simproved ? 5 : 6;
+            } else if (pass_status == 0 && S->srank) {
+                pass_status = 4;
             }
+            __syncthreads();
+            if (pass == 0 || pass_best < overall) {
+                overall = pass_best;
+                best = pass_best;
+                status = pass_status;
+                if (tid < p) kept = S->sc[tid];
+            }
+        }
+        if (tid < p) S->sc[tid] = kept;
+        __syncthreads();
+        if (tid == 0) {
             for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
             outsse[cand] = best;
             outstatus[cand] = status;
@@ -5324,8 +5359,8 @@ __device__ __forceinline__ double md_key_value(unsigned long long k)
 }
 
 /* The key of one row: the bit pattern of `|pred − y|` in exact f64, or the
- * all-ones sentinel and a non-zero return for a non-finite prediction or
- * residual (the landed #169 guard, never a silent 1e30). The sort and the
+ * all-ones sentinel and a non-zero return for a non-finite prediction or a NaN
+ * residual. An overflowing residual keys as `+inf`. The sort and the
  * select path both call this, so they admit exactly the same rows. */
 __device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const double *c,
                                           const double *__restrict__ cols,
@@ -5336,7 +5371,7 @@ __device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const d
     ft_forward_d(nd, m, cols, n, row, c, v);
     const double pred = v[m - 1];
     const double r = pred - y[row];
-    if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+    if (!isfinite(pred) || isnan(r)) {
         *key = 0xFFFFFFFFFFFFFFFFULL;
         return 1;
     }
@@ -5814,7 +5849,7 @@ __global__ void k_max_scan(const unsigned int *__restrict__ prog,
         ft_forward_d(nd, m, cols, n, row, c, v);
         const double pred = v[m - 1];
         const double r = pred - y[row];
-        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+        if (!isfinite(pred) || isnan(r)) {
             mybad |= 1;
             break;
         }
@@ -6297,6 +6332,37 @@ int rc_rank_debug_b(void *ctx, long long *out)
     if (rc_rank_prepare(ctx) != 0) return -1;
     rc_download(out, c->d_rank_b, sizeof(long long) * (size_t)c->n);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+/* #290: time `reps` pinned-host copies of `bytes` each way over the context's
+   device. `h2d_ms` and `d2h_ms` receive one wall time per rep. Returns 0, or -1
+   when an allocation or copy fails. */
+int rc_copy_probe(void *ctx, unsigned long long bytes, int reps, double *h2d_ms, double *d2h_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || bytes == 0 || reps <= 0 || !h2d_ms || !d2h_ms) return -1;
+    void *dev = 0;
+    void *host = 0;
+    if (rc_dev_alloc_kind(c, "copy_probe", &dev, (size_t)bytes, 0) != 0) return -1;
+    if (cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        rc_dev_free(c, dev);
+        return -1;
+    }
+    memset(host, 0, (size_t)bytes);
+    int rc = 0;
+    for (int i = 0; i < reps && rc == 0; ++i) {
+        double t = rc_now_ms();
+        if (cudaMemcpy(dev, host, (size_t)bytes, cudaMemcpyHostToDevice) != cudaSuccess) rc = -1;
+        h2d_ms[i] = rc_now_ms() - t;
+        t = rc_now_ms();
+        if (cudaMemcpy(host, dev, (size_t)bytes, cudaMemcpyDeviceToHost) != cudaSuccess) rc = -1;
+        d2h_ms[i] = rc_now_ms() - t;
+    }
+    if (rc != 0) cudaGetLastError();
+    cudaFreeHost(host);
+    rc_dev_free(c, dev);
+    return rc;
 }
 
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.

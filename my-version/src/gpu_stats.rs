@@ -202,6 +202,8 @@ pub struct RunLedger {
     fallback_fits: u64,
     /// Fit fallbacks labelled by cause.
     fallback_by_cause: std::collections::BTreeMap<String, usize>,
+    /// Fallbacks whose exact CPU refit lowered the exact error, by cause.
+    fallback_improved_by_cause: std::collections::BTreeMap<String, usize>,
     /// Candidates scored by the evaluator's CPU fallback pool.
     eval_fallback_programs: u64,
     /// Wall seconds the evaluator's CPU fallback pool spent.
@@ -338,12 +340,16 @@ impl RunLedger {
         device_fits: u64,
         fallback_fits: u64,
         by_cause: std::collections::BTreeMap<String, usize>,
+        improved_by_cause: std::collections::BTreeMap<String, usize>,
     ) {
         self.admitted += admitted;
         self.device_fits += device_fits;
         self.fallback_fits += fallback_fits;
         for (name, count) in by_cause {
             *self.fallback_by_cause.entry(name).or_default() += count;
+        }
+        for (name, count) in improved_by_cause {
+            *self.fallback_improved_by_cause.entry(name).or_default() += count;
         }
     }
 
@@ -402,6 +408,12 @@ impl RunLedger {
         self.fit_alloc.batches += other.fit_alloc.batches;
         for (name, count) in &other.fallback_by_cause {
             *self.fallback_by_cause.entry(name.clone()).or_default() += *count;
+        }
+        for (name, count) in &other.fallback_improved_by_cause {
+            *self
+                .fallback_improved_by_cause
+                .entry(name.clone())
+                .or_default() += *count;
         }
     }
 
@@ -498,6 +510,12 @@ impl RunLedger {
 
     pub fn fallback_by_cause(&self) -> &std::collections::BTreeMap<String, usize> {
         &self.fallback_by_cause
+    }
+    pub fn fallback_improved_by_cause(&self) -> &std::collections::BTreeMap<String, usize> {
+        &self.fallback_improved_by_cause
+    }
+    pub fn fallback_improved(&self) -> u64 {
+        self.fallback_improved_by_cause.values().map(|n| *n as u64).sum()
     }
 
     pub fn eval_fallback_programs(&self) -> u64 {
@@ -949,7 +967,7 @@ mod tests {
             // Fit is a sub-window of eval, so the exclusive eval stage is the
             // measured eval window minus the nested fit window.
             l.record_stage(Stage::Eval, -fit); // ignored by design
-            l.record_fit_counters(1, if gen % 2 == 0 { 1 } else { 0 }, if gen % 2 == 0 { 0 } else { 1 }, std::collections::BTreeMap::new());
+            l.record_fit_counters(1, if gen % 2 == 0 { 1 } else { 0 }, if gen % 2 == 0 { 0 } else { 1 }, std::collections::BTreeMap::new(), std::collections::BTreeMap::new());
             l.record_interval(Stage::Eval, 0, t, t + 0.015);
             l.record_interval(Stage::Fit, 1, t + 0.012, t + 0.016);
             t += prep + vary + eval + select + archive;
@@ -973,6 +991,24 @@ mod tests {
         assert_eq!(q.units, "decades_per_gpu_hour");
         assert_eq!(q.scope, "run");
         assert!((q.denominator - 7.467_618_67 / 3600.0).abs() < 1e-15);
+    }
+
+    /// #265: improved refits are kept per cause, summed, and merged.
+    #[test]
+    fn ledger_counts_improved_fallbacks_per_cause() {
+        let causes = |pairs: &[(&str, usize)]| -> std::collections::BTreeMap<String, usize> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let mut a = RunLedger::new();
+        a.record_fit_counters(10, 5, 5, causes(&[("worse", 3), ("launch", 2)]), causes(&[("worse", 2)]));
+        let mut b = RunLedger::new();
+        b.record_fit_counters(4, 2, 2, causes(&[("worse", 2)]), causes(&[("worse", 1), ("launch", 1)]));
+        a.absorb(&b);
+        assert_eq!(a.fallback_improved(), 4);
+        assert_eq!(a.fallback_improved_by_cause(), &causes(&[("launch", 1), ("worse", 3)]));
+        for (cause, improved) in a.fallback_improved_by_cause() {
+            assert!(improved <= &a.fallback_by_cause()[cause]);
+        }
     }
 
     /// #284: `since()` differences a benchmark window without losing bytes.

@@ -834,6 +834,7 @@ extern "C" {
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+    fn rc_copy_probe(ctx: *mut RawCtx, bytes: u64, reps: i32, h2d_ms: *mut f64, d2h_ms: *mut f64) -> i32;
     fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
     /* #234: the per-row label sign `t = 2l - 1` the log-loss fit arm reads. A
        null pointer clears it, and every log-loss launch is then refused.
@@ -1674,6 +1675,22 @@ impl GpuEvaluator {
     /// default for `RCSR_CUDA_ARCH=sm_121`.
     pub fn unified_memory() -> bool {
         unsafe { rc_unified() != 0 }
+    }
+
+    /// #290: wall time in milliseconds of `reps` pinned-host copies of `bytes`
+    /// each way, one entry per rep. `None` when the device refuses the buffer
+    /// or a copy fails.
+    pub(crate) fn copy_probe(&mut self, bytes: usize, reps: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+        let mut h2d = vec![0.0f64; reps];
+        let mut d2h = vec![0.0f64; reps];
+        let rc = unsafe {
+            rc_copy_probe(self.ctx, bytes as u64, reps as i32, h2d.as_mut_ptr(), d2h.as_mut_ptr())
+        };
+        if rc == 0 {
+            Some((h2d, d2h))
+        } else {
+            None
+        }
     }
 
     /// #131 fixtures: raw per-row predictions for a packed batch, `P × N`
@@ -3775,6 +3792,65 @@ mod tests {
         }
     }
 
+    /// The device `Absolute` scorer, chosen by the dispatch table for
+    /// `implicit_residual`, equals the CPU `score_weighted(ImplicitResidual)` on an
+    /// implicit circle sample (target 0) at the absolute metric's tier.
+    #[test]
+    fn implicit_residual_device_score_matches_the_cpu_metric() {
+        use crate::metrics::{native_score_objective, score_weighted, Metric};
+
+        let n = 256;
+        let nv = 2;
+        let mut cols = vec![0.0f32; nv * n];
+        for i in 0..n {
+            let a = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+            let r = 1.0 + 0.05 * ((i * 7 % 13) as f32 / 13.0 - 0.5);
+            cols[i] = r * a.cos();
+            cols[n + i] = r * a.sin();
+        }
+        let y = vec![0.0f32; n];
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let circle = |c: f64| {
+            node(
+                Op::Sub,
+                vec![
+                    node(
+                        Op::Add,
+                        vec![
+                            node(Op::Square, vec![input(0)]),
+                            node(Op::Square, vec![input(1)]),
+                        ],
+                    ),
+                    constant(c),
+                ],
+            )
+        };
+        let trees = vec![circle(1.0), circle(0.0), circle(2.5)];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let objective = native_score_objective(Metric::ImplicitResidual)
+            .expect("implicit_residual is natively scored");
+        assert_eq!(objective, ScoreObjective::Absolute);
+        let batch = ev.score_batch(prog, offsets, objective, &[1i32; 3]);
+        assert!(batch.is_consistent());
+        let zeros = vec![0.0f64; n];
+        for k in 0..trees.len() {
+            let pred: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+            let want = score_weighted(&pred, &zeros, &[], Metric::ImplicitResidual, 1);
+            assert_eq!(batch.status[k], ScoreStatus::Ok, "slot {k}");
+            let tol = 1e-12 * (1.0 + want.abs());
+            assert!(
+                (batch.values[k] - want).abs() <= tol,
+                "slot {k}: GPU {} vs CPU {want}",
+                batch.values[k]
+            );
+        }
+    }
+
     /// Weighted regression scoring: every native regression objective with a
     /// weighted form matches `metrics::score_weighted` on the same f32-rounded
     /// predictions, at the unweighted tiers (1e-12 relative, 1e-9 for the
@@ -3920,6 +3996,82 @@ mod tests {
                 assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{}", objective.name());
                 assert_eq!(batch.values[k], f64::INFINITY, "{}", objective.name());
                 assert!(batch.values[k].is_infinite());
+            }
+        }
+    }
+
+    /// #422: a finite prediction of any f32 magnitude is scored like the CPU
+    /// scores the same rows; only a non-finite prediction is `+inf`. The rows
+    /// straddle 1e30 and reach the f32 maximum; one candidate overflows f32 to
+    /// `inf` and is `+inf` with status 2 on both sides. Repeats are
+    /// bit-identical.
+    #[test]
+    fn large_finite_predictions_score_like_the_cpu() {
+        use crate::metrics::{score_weighted, Metric};
+
+        let (cols, n, nv, y, _) = fixture();
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let scaled = |c: f64| node(Op::Mul, vec![input(0), constant(c)]);
+        let trees = vec![
+            scaled(1.5e30),
+            scaled(1e30),
+            scaled(4e30),
+            scaled(1e35),
+            scaled(3e38),
+            node(Op::Add, vec![scaled(3e38), scaled(3e38)]),
+        ];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let y64: Vec<f64> = y.iter().map(|&v| v as f64).collect();
+        let objectives = [
+            (Metric::Squared, ScoreObjective::Squared),
+            (Metric::Absolute, ScoreObjective::Absolute),
+            (Metric::LogSquashed, ScoreObjective::LogSquashed),
+            (Metric::Signed, ScoreObjective::Signed),
+            (Metric::Maximum, ScoreObjective::Maximum),
+            (Metric::Correlation, ScoreObjective::Correlation),
+            (Metric::CorrelationSigned, ScoreObjective::CorrelationSigned),
+            (Metric::Aic, ScoreObjective::Aic),
+            (Metric::Aicc, ScoreObjective::Aicc),
+            (Metric::Bic, ScoreObjective::Bic),
+        ];
+        let pcount = vec![2i32; trees.len()];
+        let uniform = vec![1.0f64; n];
+        for weights in [&[][..], &uniform[..]] {
+            assert!(ev.set_score_weights(weights));
+            for (metric, objective) in objectives {
+                if objective == ScoreObjective::Maximum && !weights.is_empty() {
+                    continue;
+                }
+                let batch = ev.score_batch(prog, offsets, objective, &pcount);
+                let again = ev.score_batch(prog, offsets, objective, &pcount);
+                assert!(batch.ms >= 0.0, "{} launch", metric.name());
+                for k in 0..trees.len() {
+                    let rows: Vec<f64> =
+                        preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+                    let want = score_weighted(&rows, &y64, weights, metric, 2);
+                    let got = batch.values[k];
+                    let what = format!("{} slot {k} weights {}", metric.name(), weights.len());
+                    assert_eq!(got.to_bits(), again.values[k].to_bits(), "{what}: repeat");
+                    if !want.is_finite() {
+                        assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{what}");
+                        assert_eq!(got, f64::INFINITY, "{what}");
+                        continue;
+                    }
+                    assert_eq!(batch.status[k], ScoreStatus::Ok, "{what}");
+                    if objective == ScoreObjective::Maximum {
+                        assert_eq!(got.to_bits(), want.to_bits(), "{what}");
+                    } else if objective.is_correlation() {
+                        assert!((got - want).abs() <= 1e-9, "{what}: GPU {got} vs CPU {want}");
+                    } else {
+                        let tol = 1e-9 * (1.0 + want.abs());
+                        assert!((got - want).abs() <= tol, "{what}: GPU {got} vs CPU {want}");
+                    }
+                }
             }
         }
     }
@@ -6411,6 +6563,226 @@ mod fit_tests {
         let plan = crate::fit::gpu_fit_plan(&corr_model()).expect("plan");
         let (out, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::Correlation);
         assert_eq!(out[0].status, 7, "non-finite start is labelled log-only");
+    }
+
+    /// signed correlation recovers an inverted start on the device by
+    /// flipping the frozen gauge scale (a second orientation pass), never by
+    /// reflecting the tree, and the result is bitwise deterministic.
+    ///
+    /// The fixture's shape `exp(x)` has no inner constant that could absorb the
+    /// sign, and the gauge masks the scale slot, so the LM alone cannot change
+    /// the orientation: only the second orientation pass can.
+    #[test]
+    fn gpu_signed_correlation_recovers_an_inverted_start() {
+        let n = 600usize;
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![-2.0 + 4.0 * i as f64 / (n - 1) as f64])
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let noise = (((i * 37) % 11) as f64 - 5.0) * 1e-4;
+                -(1.5 * r[0].exp() + 0.3 + noise)
+            })
+            .collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<f64>>();
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+        let model = || {
+            node(
+                Op::Add,
+                vec![node(Op::Mul, vec![constant(0.5), node(Op::Exp, vec![input(0)])]), constant(0.1)],
+            )
+        };
+        let mut tree = model();
+        let start = corr_at(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(start > 1.0, "the fixture must start inverted: {start}");
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("correlation plan");
+        assert_eq!(plan.gauge, [0, 1], "outer a*T+b pair");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::CorrelationSigned);
+        assert!(ms >= 0.0, "signed correlation kernel ran");
+        assert_eq!(out[0].status, 0, "well-conditioned fixture");
+        plan.apply(&mut tree, &out[0].c);
+        assert_eq!(out[0].c[0], -1.0, "the probe must flip the frozen scale");
+        assert_eq!(out[0].c[1], 0.0, "offset must be renormalised");
+        let got = corr_at(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(got < start, "signed device fit {start} -> {got}");
+        assert!(got < 0.01, "the device did not recover the direction: {got}");
+        // The exact objective agrees with the kernel's own score.
+        assert!((out[0].sse - got).abs() < 1e-6, "kernel {} vs exact {got}", out[0].sse);
+
+        let (again, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::CorrelationSigned);
+        assert_eq!(
+            again[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            out[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(again[0].sse.to_bits(), out[0].sse.to_bits());
+    }
+
+    /// A simplified tree (`Add(b, Mul(a, T))`, gauge `[1, 0]`) is flipped too:
+    /// thread 0 negates the shared scale, not a private copy of the entry value.
+    ///
+    /// The fixture's shape `exp(x)` has no inner constant that could absorb the
+    /// sign, and the gauge masks the scale slot, so the LM alone cannot change
+    /// the orientation: only the second orientation pass can.
+    #[test]
+    fn gpu_signed_correlation_flips_a_simplified_gauge() {
+        let n = 600usize;
+        let x: Vec<Vec<f64>> = (0..n)
+            .map(|i| vec![-2.0 + 4.0 * i as f64 / (n - 1) as f64])
+            .collect();
+        let y: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let noise = (((i * 37) % 11) as f64 - 5.0) * 1e-4;
+                -(1.5 * r[0].exp() + 0.3 + noise)
+            })
+            .collect();
+        let (cols, y32) = cols_from(&x, &y);
+        let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+            Some(ev) => ev,
+            None => {
+                eprintln!("skipping GPU test: no usable CUDA device");
+                return;
+            }
+        };
+        let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<f64>>();
+        assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+        let model = || {
+            node(
+                Op::Add,
+                vec![node(Op::Mul, vec![constant(0.5), node(Op::Exp, vec![input(0)])]), constant(0.1)],
+            )
+        };
+        let mut tree = crate::expr::simplify(&model());
+        let start = corr_at(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(start > 1.0, "the fixture must start inverted: {start}");
+        let plan = crate::fit::gpu_fit_plan(&tree).expect("correlation plan");
+        assert_eq!(plan.gauge, [1, 0], "simplify sorts the offset first");
+        let (out, ms) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::CorrelationSigned);
+        assert!(ms >= 0.0, "signed correlation kernel ran");
+        assert_eq!(out[0].status, 0, "well-conditioned fixture");
+        plan.apply(&mut tree, &out[0].c);
+        assert_eq!(out[0].c[1], -1.0, "the second pass must flip the frozen scale");
+        assert_eq!(out[0].c[0], 0.0, "offset must be renormalised");
+        let got = corr_at(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(got < start, "signed device fit {start} -> {got}");
+        assert!(got < 0.01, "the device did not recover the direction: {got}");
+        // The exact objective agrees with the kernel's own score.
+        assert!((out[0].sse - got).abs() < 1e-6, "kernel {} vs exact {got}", out[0].sse);
+
+        let (again, _) = ev.fit_batch(&[&plan], 8, crate::fit::DeviceLoss::CorrelationSigned);
+        assert_eq!(
+            again[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            out[0].c.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(again[0].sse.to_bits(), out[0].sse.to_bits());
+    }
+
+    /// paired measurement (ignored) of the signed correlation arms on
+    /// recorded rows: historical CPU path against the batched kernel, at the
+    /// row counts the cost model's crossover is fitted on.
+    #[test]
+    #[ignore]
+    fn bench_correlation_fit_paired_signed() {
+        for &n in &[500usize, 2_000, 10_000, 50_000] {
+            for &candidates in &[1usize, 8, 64] {
+                let (x, y0) = corr_fixture(n);
+                let y: Vec<f64> = y0.iter().map(|v| -v).collect();
+                let (cols, y32) = cols_from(&x, &y);
+                let mut ev = match GpuEvaluator::new(&cols, n, 1, &y32) {
+                    Some(ev) => ev,
+                    None => {
+                        eprintln!("skipping GPU benchmark: no usable device");
+                        return;
+                    }
+                };
+                let cols64 = cols.iter().map(|&v| v as f64).collect::<Vec<f64>>();
+                assert!(ev.set_fit_data(&cols64, &y, &[]));
+                let starts: Vec<f64> = (0..candidates)
+                    .map(|k| 0.4 + 1.6 * k as f64 / candidates as f64)
+                    .collect();
+                let build = |b: f64| {
+                    node(
+                        Op::Add,
+                        vec![
+                            node(
+                                Op::Mul,
+                                vec![
+                                    constant(0.8),
+                                    node(Op::Sin, vec![node(Op::Mul, vec![constant(b), input(0)])]),
+                                ],
+                            ),
+                            constant(0.25),
+                        ],
+                    )
+                };
+                let t0 = std::time::Instant::now();
+                let mut cpu_scores = Vec::with_capacity(candidates);
+                let mut start_scores = Vec::with_capacity(candidates);
+                for &b in &starts {
+                    let mut t = build(b);
+                    start_scores.push(corr_at(&t, &x, &y, Metric::CorrelationSigned));
+                    cpu_scores.push(crate::fit::fit_weighted_metric(
+                        &mut t,
+                        &x,
+                        &y,
+                        &[],
+                        8,
+                        Metric::CorrelationSigned,
+                    ));
+                }
+                let cpu = t0.elapsed().as_secs_f64();
+                let plans: Vec<crate::fit::GpuFitPlan> = starts
+                    .iter()
+                    .map(|&b| crate::fit::gpu_fit_plan(&build(b)).expect("plan"))
+                    .collect();
+                let refs: Vec<&crate::fit::GpuFitPlan> = plans.iter().collect();
+                let t1 = std::time::Instant::now();
+                let (out, kernel_ms) =
+                    ev.fit_batch(&refs, 8, crate::fit::DeviceLoss::CorrelationSigned);
+                let gpu = t1.elapsed().as_secs_f64();
+                let mut fallbacks = 0usize;
+                let mut accepted = 0usize;
+                let mut wins = 0usize;
+                let mut deltas: Vec<f64> = Vec::new();
+                for (k, res) in out.iter().enumerate() {
+                    if res.status != 0 {
+                        fallbacks += 1;
+                        continue;
+                    }
+                    let mut t = build(starts[k]);
+                    plans[k].apply(&mut t, &res.c);
+                    let s = corr_at(&t, &x, &y, Metric::CorrelationSigned);
+                    if s <= start_scores[k] + 1e-9 {
+                        accepted += 1;
+                    }
+                    deltas.push(s - cpu_scores[k]);
+                    if s <= cpu_scores[k] + 1e-6 {
+                        wins += 1;
+                    }
+                }
+                deltas.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let median = deltas.get(deltas.len() / 2).copied().unwrap_or(f64::NAN);
+                let worst = deltas.last().copied().unwrap_or(f64::NAN);
+                eprintln!(
+                    "signed correlation paired: N={n} P={candidates} p=3 cpu={cpu:.3}s gpu={gpu:.3}s kernel={kernel_ms:.1}ms speedup={:.1}x fallbacks={fallbacks} accepted={accepted}/{candidates} gpu<=cpu+1e-6={wins}/{candidates} median_delta={median:.3e} worst_delta={worst:.3e} row_candidates={}",
+                    cpu / gpu.max(1e-9),
+                    n * candidates
+                );
+            }
+        }
     }
 
     /// #224 paired measurement (ignored): historical CPU correlation fitting
@@ -9268,6 +9640,60 @@ mod classification_parity_tests {
                     "{} model {i}: f32-row error {f32err:.2e} exceeds 1e-5",
                     objective.name()
                 );
+            }
+        }
+    }
+
+    /// #422: a finite prediction above 1e30 (up to the f32 maximum) is scored
+    /// like the CPU scores the same rows, for every classification objective;
+    /// an f32 overflow to `inf` is `+inf`. Repeats are bit-identical.
+    #[test]
+    fn large_finite_predictions_score_like_the_cpu() {
+        if !probe().available() {
+            eprintln!("skipping GPU test: no usable CUDA device");
+            return;
+        }
+        let s = binary_sample(512, 0.35, 0.25, 22);
+        let trees = [
+            affine(3e30, 0.0),
+            affine(-3e30, 1e30),
+            affine(1e35, 0.0),
+            affine(3e38, 0.0),
+            node(Op::Add, vec![affine(3e38, 0.0), affine(3e38, 0.0)]),
+        ];
+        for objective in [
+            ScoreObjective::LogLoss,
+            ScoreObjective::Brier,
+            ScoreObjective::HingeSigmoid,
+            ScoreObjective::HingeOrdinary,
+            ScoreObjective::HingeSquared,
+        ] {
+            let mut ev = evaluator(&s);
+            let pop = Population::from_trees(trees.iter());
+            let pc = vec![0i32; pop.len()];
+            let batch = ev.score_population(&pop, objective, &pc);
+            let again = ev.score_population(&pop, objective, &pc);
+            assert!(batch.ms >= 0.0, "kernel launch failed");
+            let preds = ev
+                .predictions(pop.programs().0, pop.programs().1)
+                .expect("raw predictions");
+            for k in 0..trees.len() {
+                let rows: Vec<f64> = preds[k * s.len()..(k + 1) * s.len()]
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect();
+                let want = metrics::score_weighted(&rows, &s.y, &s.w, objective.metric(), 0);
+                let got = batch.values[k];
+                let what = format!("{} model {k}", objective.name());
+                assert_eq!(got.to_bits(), again.values[k].to_bits(), "{what}: repeat");
+                if want.is_finite() {
+                    assert_eq!(batch.status[k], ScoreStatus::Ok, "{what}");
+                    let err = (got - want).abs() / want.abs().max(1.0);
+                    assert!(err <= 1e-6, "{what}: device {got} vs CPU {want}");
+                } else {
+                    assert_eq!(batch.status[k], ScoreStatus::NonFinite, "{what}");
+                    assert_eq!(got, f64::INFINITY, "{what}");
+                }
             }
         }
     }
