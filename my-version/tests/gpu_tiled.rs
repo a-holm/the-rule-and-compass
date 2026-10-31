@@ -337,6 +337,7 @@ fn sample(n: usize, vars: usize, seed: u32) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 

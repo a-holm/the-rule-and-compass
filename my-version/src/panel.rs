@@ -2068,6 +2068,9 @@ HOURLY V2 PANEL (#259):
   rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--scratch dir]
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
+  --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;
+                          on: always; off: the CPU path). Same store bytes either way; a CPU wave
+                          is labelled in <out>.manifest.json (backend). --no-gpu/--cpu = off
   --require-full-bucket   base: drop an hour with fewer than four 15m bars (default)
   --keep-partial          base: keep it with cov15m 1-3 and the PARTIAL_BUCKET flag
   --interval <15m|1m>     base: archive interval; 1m only reaches the lockbox guard

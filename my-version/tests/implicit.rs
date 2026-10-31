@@ -32,6 +32,7 @@ fn noisy_circle(n: usize, noise: f64, seed: u32) -> Sample {
         y: vec![0.0; n],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -366,12 +367,14 @@ fn make_implicit_appends_a_normalised_target_and_zeroes_the_target() {
         y: vec![2.0, 4.0, 6.0],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let test = Sample {
         x: vec![vec![4.0]],
         y: vec![8.0],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let (mean, std) = data::implicit_target_stats(&train);
     assert!((mean - 4.0).abs() < 1e-12);
@@ -393,6 +396,7 @@ fn make_implicit_appends_a_normalised_target_and_zeroes_the_target() {
         y: vec![2.0, 2.0],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     assert_eq!(data::implicit_target_stats(&flat), (2.0, 1.0));
 }

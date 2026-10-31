@@ -646,6 +646,8 @@ pub fn default_registry() -> Vec<RegistryEntry> {
         ("symbol", "identity"),
         ("listing_id", "identity"),
         ("member_asof", "identity"),
+        ("gap", "identity"),
+        ("flags", "identity"),
         ("open", "price"),
         ("high", "price"),
         ("low", "price"),
@@ -1466,7 +1468,7 @@ pub enum GpuMode {
 }
 
 impl GpuMode {
-    fn parse(s: &str) -> Result<Self, String> {
+    pub fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Ok(GpuMode::Auto),
             "on" | "force" | "gpu" => Ok(GpuMode::On),

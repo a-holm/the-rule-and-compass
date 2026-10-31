@@ -67,7 +67,9 @@ pub enum Metric {
     HingeOrdinary,
     /// Mean squared hinge `max(0, 1 − t·p)²` (classification).
     HingeSquared,
-    /// Mean absolute error of the first difference: how well slopes match.
+    /// Mean absolute error of the first difference over adjacent-row pairs
+    /// (same group, consecutive in the original data order): how well slopes
+    /// match. See [`SLOPE_MIN_PAIRS`] and [`score_slope_pairs`].
     Slope,
     /// Mean distance from each point to the candidate's zero level set,
     /// `|f(p)| / ||∇f(p)||` (implicit model, issue #14).
@@ -846,6 +848,35 @@ pub fn score_native_weighted(
             }
             NativeScore::ok(sum / denom)
         }
+    }
+}
+
+/// Fewest adjacent-row pairs the training side may keep for `slope`; below it
+/// the CLI refuses the metric. Matches the 32-row floors used elsewhere
+/// (`FUSED_MIN_SEGMENTS`, the QD update floor, the 32-rows-per-constant rule).
+pub const SLOPE_MIN_PAIRS: usize = 32;
+
+/// Mean absolute error of the first difference over explicit row pairs
+/// `[a, b]` (positions in `pred` and `y`). No pairs, or a non-finite
+/// prediction, scores `+inf`.
+pub fn score_slope_pairs(pred: &[f64], y: &[f64], pairs: &[[u32; 2]]) -> f64 {
+    if pairs.is_empty() || pred.len() != y.len() || pred.iter().any(|p| !p.is_finite()) {
+        return f64::INFINITY;
+    }
+    let mut acc = 0.0;
+    for &[a, b] in pairs {
+        let (a, b) = (a as usize, b as usize);
+        acc += ((pred[b] - pred[a]) - (y[b] - y[a])).abs();
+    }
+    acc / pairs.len() as f64
+}
+
+/// Score a prediction on a sample: [`score_weighted`], except that `slope`
+/// differences the sample's adjacent-row pairs when it carries them.
+pub fn score_sample(pred: &[f64], s: &crate::data::Sample, m: Metric, k: usize) -> f64 {
+    match (m, &s.pairs) {
+        (Metric::Slope, Some(pairs)) => score_slope_pairs(pred, &s.y, pairs),
+        _ => score_weighted(pred, &s.y, &s.w, m, k),
     }
 }
 

@@ -16,6 +16,8 @@ pub mod enrich; // #200: append-only OHLCV feature enrichment
 #[cfg(feature = "cuda")]
 pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 #[cfg(feature = "cuda")]
+pub mod dispatch_gpu; // #290: device calibration probe
+#[cfg(feature = "cuda")]
 pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
 #[cfg(feature = "cuda")]
 pub mod mtf_gpu; // #296: device MTF resample and causal join
@@ -42,6 +44,7 @@ pub mod genome;
 #[cfg(feature = "cuda")]
 pub mod gpu;
 pub mod gpu_stats;
+pub mod inference; // #264: block bootstrap, DSR, PBO, SPA, BH-FDR
 pub mod gui;
 pub mod implicit;
 pub mod leakage; // #129: differential leakage detectors
@@ -79,5 +82,7 @@ pub mod trading; // #263: exact long/flat P&L, Sharpe and log-growth objective
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
+pub mod wf_protocol; // #264: economics, block inference and nulls for the walk-forward report
+pub mod protocol; // #264: windows table, candidate ledger, sealed list, one-read lockbox
 pub mod window_stats;
 pub mod zip; // #123: minimal stored/deflate ZIP reader
