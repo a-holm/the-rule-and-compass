@@ -936,6 +936,22 @@ selects the per-column path for an A/B measurement. The report now carries
 `gpu.kernel_s`, `gpu.d2h_s`, `gpu.write_s`, `gpu.transfer_bytes` and the
 `write_bw` charged by the planner, separately.
 
+`timing.feature_s` is the host-thread wall time of the feature phase. It is
+partitioned into disjoint intervals on that thread:
+
+| Field | Interval |
+|---|---|
+| `timing.feature_read_s` | whole-column host reads for the MTF, benchmark and whole-column upload paths |
+| `timing.feature_context_s` | device context creation, including the projected upload |
+| `timing.feature_gpu_s` | host-side launch, sync and download wall of the GPU section, excluding `gpu.write_s` |
+| `gpu.write_s` | host staging writes of GPU output blocks |
+| `timing.feature_cpu_s` | the CPU fallback pass |
+| `timing.feature_other_s` | `feature_s` minus the five above; never negative beyond clock rounding |
+
+`gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
+overlap the host timeline and are not summed into the partition. The text
+report prints the partition on the `# enrich: feature_parts` line.
+
 Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
 --dry-run` (same input, same 118 dispatched columns, alternating order, two runs
 each):
