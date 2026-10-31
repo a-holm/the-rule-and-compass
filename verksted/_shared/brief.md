@@ -13,6 +13,7 @@ Rules for every agent in this repo. The ticket section follows below.
 - Waiting: one blocking call, or one background shell and its notification. Never start repeated wait loops. Never write `pgrep -f` or `until ! pgrep -f` loops: they match their own command line and never end.
 - Never use `pkill` or `killall`. Kill only a process you started.
 - No Python, ever: no `python3`, no `.py` file, no Python fixtures or golden values. Experiments, reference computations and helpers are Rust: crate tests, or single-file programs built with `nice -n 19 rustc -O` outside the repo. Quick checks are shell.
+- GPU safety: changed CUDA code, squeezed device memory and allocation-failure tests run first under `compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99`, through the lock, with an outer `timeout`. No plain GPU run until it is clean. After GPU work `journalctl -k` shows no new `Xid` line (rule 31).
 - Git: `git commit -m` with a conventional subject (`fix(area): ...`, `feat(area): ...`, `test(area): ...`) and the body line `Refs #N`. Never `Closes` or `Fixes`. No AI attribution, no co-author trailers. Never force-push. Never rebase after a push: merge the base branch instead.
 - Style: plain technical English, no em-dashes. Code comments only for constraints the code cannot show; no measured numbers in comments. Update `--help`, `rcsr schema`, `README.md` and `docs/` when behaviour changes.
 - If the issue does not cover a choice, or a criterion fails twice for the same reason, stop and report the exact question.

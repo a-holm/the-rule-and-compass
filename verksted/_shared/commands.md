@@ -115,6 +115,14 @@ perl -0pi -e 's/old/new/' <file>                                                
 git ls-files '*.py'                                                                   # must print nothing
 ```
 
+## GPU safety
+
+```sh
+$L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=sm_86 timeout 580 cargo test --release --features cuda --no-run" > "$G/issue$N-build.log" 2>&1
+$L bash -c "cd $W/my-version && timeout 580 compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99 target/release/deps/<test>-<hash> <filter> --nocapture" > "$G/issue$N-memcheck.log" 2>&1   # exit 0 before any plain GPU run
+journalctl -k --since "<start>" | grep -i xid   # must print nothing
+```
+
 ## Data and runs
 
 ```sh

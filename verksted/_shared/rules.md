@@ -49,3 +49,7 @@ The rules most often broken, each with its source. Sources: `AGENTS.md` and `doc
 
 29. A long run starts only when its preconditions hold, and then at once. GPU by default with an explicit backend. Baselines beside every result. (source: user, 2026-10-20 and 2026-10-21)
 30. `HANDOFF.md` is present tense, untracked and temporary. (source: user, 2026-10-22)
+
+## GPU
+
+31. A device out-of-bounds access can crash the NVIDIA driver and freeze the whole machine. Any test that changes CUDA code, squeezes device memory or exercises an allocation-failure path runs first under `compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99` (test binary built with `cargo test --no-run`, small inputs, outer `timeout`, through the lock). No plain GPU run of changed CUDA code until that run is clean. A refused device allocation leaves no dangling device pointer and no pending CUDA error. After GPU work `journalctl -k` shows no new `Xid` line. (source: user, 2026-10-31; machine freeze, #381)
