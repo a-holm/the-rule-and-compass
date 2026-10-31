@@ -2342,6 +2342,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if let Some(reason) = crate::metrics::score_refusal(cfg.metric) {
         return Some(reason);
     }
+    if cfg.metric == crate::metrics::Metric::ImplicitResidual
+        && train.y.iter().any(|&v| v != 0.0)
+    {
+        return Some("implicit_residual needs an all-zero training target");
+    }
     // #288: AUC needs exactly two distinct target values; the label rule is
     // the CPU midpoint rule, so any other target is refused, never collapsed.
     if cfg.metric == crate::metrics::Metric::Auc

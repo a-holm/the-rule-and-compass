@@ -504,8 +504,10 @@ remains for the fit and test APIs.
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
 by `GpuEvaluator::score_stat_batch` over flattened plans on the exact `f64` forward
 pass, from the measured 4 096-row floor (see the #288 section below). `slope`
-and the implicit metrics remain CPU. Their named reason is printed and recorded
-in `backend_reason`, and so is the row floor for an `Exact` metric.
+and `implicit` remain CPU. `implicit_residual` is the `absolute` objective on the
+all-zero implicit target: it shares the `absolute` native scorer and the L1 IRLS
+device fit arm, and a run with a non-zero target is refused by name. The named reason of a
+refused metric is printed and recorded in `backend_reason`, and so is the row floor for an `Exact` metric.
 `log_loss`, `brier` and the three hinge forms are native since #289 — see
 [Classification fitness](#classification-fitness-issue-289) below. Their
 fitness, the label sign and (for the classification family) the per-row

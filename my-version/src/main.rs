@@ -375,6 +375,9 @@ SEARCH:
                              interquartile  slope  auc  log_loss  brier  hinge
                              hinge_ordinary  hinge_squared  aic  aicc  bic
                              implicit  implicit_residual  (implicit model)
+                             implicit_residual is the absolute metric on the all-zero
+                             implicit target: it is scored and fitted on the GPU
+                             like absolute
                              correlation/rank_correlation score 1-|r| and accept an
                              inverted model; the _signed variants score 1-r and
                              require the right direction. auc/log_loss/brier and

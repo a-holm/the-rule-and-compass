@@ -372,7 +372,7 @@ impl FitObjective {
         match metric {
             Metric::Squared => Some(DeviceLoss::Squared),
             Metric::LogSquashed => Some(DeviceLoss::LogSquashed),
-            Metric::Absolute => Some(DeviceLoss::Absolute),
+            Metric::Absolute | Metric::ImplicitResidual => Some(DeviceLoss::Absolute),
             _ => None,
         }
     }

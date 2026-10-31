@@ -3775,6 +3775,65 @@ mod tests {
         }
     }
 
+    /// The device `Absolute` scorer, chosen by the dispatch table for
+    /// `implicit_residual`, equals the CPU `score_weighted(ImplicitResidual)` on an
+    /// implicit circle sample (target 0) at the absolute metric's tier.
+    #[test]
+    fn implicit_residual_device_score_matches_the_cpu_metric() {
+        use crate::metrics::{native_score_objective, score_weighted, Metric};
+
+        let n = 256;
+        let nv = 2;
+        let mut cols = vec![0.0f32; nv * n];
+        for i in 0..n {
+            let a = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+            let r = 1.0 + 0.05 * ((i * 7 % 13) as f32 / 13.0 - 0.5);
+            cols[i] = r * a.cos();
+            cols[n + i] = r * a.sin();
+        }
+        let y = vec![0.0f32; n];
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let circle = |c: f64| {
+            node(
+                Op::Sub,
+                vec![
+                    node(
+                        Op::Add,
+                        vec![
+                            node(Op::Square, vec![input(0)]),
+                            node(Op::Square, vec![input(1)]),
+                        ],
+                    ),
+                    constant(c),
+                ],
+            )
+        };
+        let trees = vec![circle(1.0), circle(0.0), circle(2.5)];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let objective = native_score_objective(Metric::ImplicitResidual)
+            .expect("implicit_residual is natively scored");
+        assert_eq!(objective, ScoreObjective::Absolute);
+        let batch = ev.score_batch(prog, offsets, objective, &[1i32; 3]);
+        assert!(batch.is_consistent());
+        let zeros = vec![0.0f64; n];
+        for k in 0..trees.len() {
+            let pred: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+            let want = score_weighted(&pred, &zeros, &[], Metric::ImplicitResidual, 1);
+            assert_eq!(batch.status[k], ScoreStatus::Ok, "slot {k}");
+            let tol = 1e-12 * (1.0 + want.abs());
+            assert!(
+                (batch.values[k] - want).abs() <= tol,
+                "slot {k}: GPU {} vs CPU {want}",
+                batch.values[k]
+            );
+        }
+    }
+
     /// Weighted regression scoring: every native regression objective with a
     /// weighted form matches `metrics::score_weighted` on the same f32-rounded
     /// predictions, at the unweighted tiers (1e-12 relative, 1e-9 for the
