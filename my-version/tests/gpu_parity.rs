@@ -39,8 +39,6 @@ const TOL: f64 = 1e-12;
 const KNOWN_BUGS: &[(&str, &str)] = &[
     ("amihud96", "flow, tier 1e-12: max rel 9.929e-1 (abs 1.635e2), first row 42074 CPU 0.171 GPU 85.46; also not prefix-causal (row 42074 GPU 85.46 full vs 4.137 after removing later rows)"),
     ("xs_rank_amihud96", "bitwise: 13 bit mismatches, max abs 6.087e-1; ranks of the device amihud96"),
-    ("ma96", "bitwise: 1243 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 188882)"),
-    ("ma672", "bitwise: 8731 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 189458)"),
     ("ou_hl96", "tier 1e-12: max rel 1.314e-7 (abs 1.382e-7); #298 accepted 1e-6, no matching tier"),
 ];
 
@@ -660,14 +658,12 @@ fn bug_xs_rank_amihud96() {
 }
 
 #[test]
-#[ignore = "bug #356: ma96 NaN mask differs (1243 rows): CPU finite, GPU NaN around a NaN close"]
-fn bug_ma96() {
+fn ma96_matches_cpu_nan_mask_and_bits() {
     assert_known_bug_column("ma96");
 }
 
 #[test]
-#[ignore = "bug #356: ma672 NaN mask differs (8731 rows): CPU finite, GPU NaN around a NaN close"]
-fn bug_ma672() {
+fn ma672_matches_cpu_nan_mask_and_bits() {
     assert_known_bug_column("ma672");
 }
 
