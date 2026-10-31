@@ -8,6 +8,7 @@
 
 use rcsr::data;
 use rcsr::enrich::{self, GpuMode, Options};
+use rcsr::window_stats::log1p_det;
 use rcsr::store::{self, FileStore};
 
 const STEP: i64 = 900;
@@ -422,7 +423,7 @@ fn reference(sym: &[Row]) -> Vec<(&'static str, Vec<Option<f64>>)> {
 
     // ou_hl96: AR(1) of x = ln C - ln SMA96, centred in the window.
     let x: Vec<f64> = (0..n)
-        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { ((c[i] - ma96[i]) / ma96[i]).ln_1p() } else { f64::NAN })
+        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { log1p_det((c[i] - ma96[i]) / ma96[i]) } else { f64::NAN })
         .collect();
     let xl = rlag(&x, &t);
     let cov = ref_cov(&x, &xl, 96, &t);
@@ -584,6 +585,10 @@ fn rolling_families_error_table() {
     for (name, e) in &errs {
         assert!(e.compared > 0, "{name}: nothing compared");
         assert_eq!(e.mask, 0, "{name}: NaN mask differs from the reference");
+        assert!(e.max_scaled <= 1e-13, "{name}: scaled error {:.3e}", e.max_scaled);
+        if *name == "ou_hl96" {
+            assert!(e.max_rel <= 1e-12, "ou_hl96 relative error {:.3e}", e.max_rel);
+        }
     }
 }
 
@@ -631,4 +636,44 @@ fn cpu_feature_phase_time() {
         eprintln!("[wstats] rows {} columns {} feature_seconds {:.3}", rep.rows, names.len(), rep.feature_seconds);
     }
     eprintln!("[wstats] best feature_seconds {best:.3}");
+}
+
+/// Writes every engine column of the 24-symbol fixture to `RCSR_WS_DUMP`.
+#[test]
+#[ignore = "evidence tool: RCSR_WS_DUMP=<path> cargo test --release --test window_stats dump_engine_columns -- --ignored"]
+fn dump_engine_columns() {
+    let path = std::env::var("RCSR_WS_DUMP").expect("RCSR_WS_DUMP");
+    let rows = fixture(24, 21_000);
+    let names: Vec<String> = enrich::engine_names();
+    let (out, _) = build(&rows, &names, "dump");
+    std::fs::copy(&out, &path).unwrap();
+}
+
+/// Per column: cells that turned NaN or finite between two dumps, and the
+/// largest scaled difference of the cells finite in both.
+#[test]
+#[ignore = "evidence tool: RCSR_WS_A=<old> RCSR_WS_B=<new>"]
+fn compare_engine_dumps() {
+    let (a, b) = (std::env::var("RCSR_WS_A").unwrap(), std::env::var("RCSR_WS_B").unwrap());
+    let sa = FileStore::open(&a).unwrap();
+    let names = enrich::engine_names();
+    eprintln!("[wstats] {:<26} {:>9} {:>9} {:>12}", "column", "fin->nan", "nan->fin", "max_scaled");
+    for name in &names {
+        if sa.header().column_index(name).is_none() {
+            continue;
+        }
+        let (x, y) = (read_column(&a, name), read_column(&b, name));
+        let (mut to_nan, mut to_fin, mut worst) = (0usize, 0usize, 0.0f64);
+        for (p, q) in x.iter().zip(&y) {
+            match (p.is_finite(), q.is_finite()) {
+                (true, false) => to_nan += 1,
+                (false, true) => to_fin += 1,
+                (true, true) => worst = worst.max((p - q).abs() / (1.0 + q.abs())),
+                _ => {}
+            }
+        }
+        if to_nan > 0 || to_fin > 0 || worst > 0.0 {
+            eprintln!("[wstats] {:<26} {:>9} {:>9} {:>12.3e}", name, to_nan, to_fin, worst);
+        }
+    }
 }

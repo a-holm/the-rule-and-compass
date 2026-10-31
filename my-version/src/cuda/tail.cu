@@ -21,6 +21,8 @@
 #include <math.h>
 #include <stdint.h>
 
+#include "win_stats.h"
+
 #define TAIL_MAX_W 1024
 
 __device__ __forceinline__ bool tail_contig(const long long *t, int i, int w, int step)
@@ -40,28 +42,6 @@ __device__ __forceinline__ double tail_div_pos(double a, double b)
 {
     if (!isfinite(a) || !isfinite(b) || b <= 0.0) return NAN;
     return a / b;
-}
-
-/* Prefix over one segment. `pb = start + segment_id` gives every segment its
-   own boundary slot, exactly like the reference `Prefix::new`. */
-__device__ void tail_prefix(double *sum, double *sum2, double *cnt,
-                            const double *x, int start, int len, int pb)
-{
-    sum[pb] = 0.0;
-    if (sum2) sum2[pb] = 0.0;
-    if (cnt) cnt[pb] = 0.0;
-    double s = 0.0, s2 = 0.0, c = 0.0;
-    for (int j = 0; j < len; ++j) {
-        double v = x[start + j];
-        if (isfinite(v)) {
-            s += v;
-            if (sum2) s2 += v * v;
-            c += 1.0;
-        }
-        sum[pb + j + 1] = s;
-        if (sum2) sum2[pb + j + 1] = s2;
-        if (cnt) cnt[pb + j + 1] = c;
-    }
 }
 
 template <int CAP>
@@ -128,95 +108,111 @@ struct TailRing {
     }
 };
 
-/* Causal prefix ring. Storing the cumulative sums (not a running window sum)
-   reproduces the CPU `Prefix` subtraction exactly: `sum[i]-sum[i-w]` is the
-   same f64 operation, so rolling mean/std columns are bit-identical. */
-template <int CAP>
+/* Causal compensated prefix ring (#364). It keeps the last `CAP + 1` rows of
+   the block-local Sum2 (and, when `SQ`, Dot2 of x*x) running sums, so a window
+   statistic is computed by the same code as the CPU `WinStats`. Rows are
+   pushed once each, in segment order, with `restart` set at every
+   `RW_BLOCK`-th row and at every gap row. */
+template <int CAP, bool SQ = false>
 struct TailPrefix {
-    double cs[CAP + 1];
-    double cs2[CAP + 1];
-    double cc[CAP + 1];
+    static const int SPAN = CAP + 1;
+    double s1[SPAN];
+    double c1[SPAN];
+    double s2[SQ ? SPAN : 1];
+    double c2[SQ ? SPAN : 1];
+    double xv[SQ ? SPAN : 1];
+    int cn[SPAN];
+    int bk[SPAN];
     int win;
-    int pos;
     int n;
-    double sum;
-    double sum2;
-    double cnt;
+    RwAcc acc;
 
-    __device__ TailPrefix()
-        : win(CAP), pos(0), n(0), sum(0.0), sum2(0.0), cnt(0)
-    {
-        for (int i = 0; i <= CAP; ++i) {
-            cs[i] = 0.0;
-            cs2[i] = 0.0;
-            cc[i] = 0.0;
-        }
-    }
+    __device__ TailPrefix() : win(CAP), n(0) { rw_acc_init(&acc); }
 
     __device__ void set_window(int w)
     {
         win = w < 1 ? 1 : (w > CAP ? CAP : w);
-        pos = 0;
         n = 0;
-        sum = 0.0;
-        sum2 = 0.0;
-        cnt = 0.0;
-        for (int i = 0; i <= CAP; ++i) {
-            cs[i] = 0.0;
-            cs2[i] = 0.0;
-            cc[i] = 0.0;
-        }
+        rw_acc_init(&acc);
     }
 
-    __device__ int idx_back(int k) const
+    struct View {
+        const TailPrefix *r;
+        __device__ int slot(int q) const { return q % SPAN; }
+        __device__ double s(int k, int q) const
+        {
+            return q < 0 ? 0.0 : (k == 0 ? r->s1[slot(q)] : r->s2[SQ ? slot(q) : 0]);
+        }
+        __device__ double c(int k, int q) const
+        {
+            return q < 0 ? 0.0 : (k == 0 ? r->c1[slot(q)] : r->c2[SQ ? slot(q) : 0]);
+        }
+        __device__ int bk(int q) const { return r->bk[slot(q)]; }
+        __device__ int cn(int q) const { return q < 0 ? 0 : r->cn[slot(q)]; }
+        __device__ double x(int q) const { return r->xv[SQ ? slot(q) : 0]; }
+    };
+
+    __device__ void store(int q)
     {
-        int idx = pos - k;
-        int span = win + 1;
-        while (idx < 0) idx += span;
-        return idx;
+        int j = q % SPAN;
+        s1[j] = acc.s1;
+        c1[j] = acc.c1;
+        if (SQ) {
+            s2[j] = acc.s2;
+            c2[j] = acc.c2;
+        }
+        cn[j] = acc.cnt;
+        bk[j] = q - acc.start;
     }
 
-    __device__ void push(double v)
+    __device__ void push(double v, bool restart)
     {
-        if (isfinite(v)) {
-            sum += v;
-            sum2 += v * v;
-            cnt += 1.0;
-        }
-        pos += 1;
-        if (pos == win + 1) pos = 0;
-        cs[pos] = sum;
-        cs2[pos] = sum2;
-        cc[pos] = cnt;
+        int q = n;
+        rw_acc_push(&acc, v, q, restart, SQ);
+        if (SQ) xv[q % SPAN] = v;
+        store(q);
+        n += 1;
+    }
+
+    /* Dot2 of a*b into the first stream (pair ring). */
+    __device__ void push_dot(double a, double b, bool restart)
+    {
+        int q = n;
+        rw_acc_push_dot(&acc, a, b, q, restart);
+        store(q);
         n += 1;
     }
 
     __device__ bool full() const { return n >= win; }
 
+    /* Window of the last `win` rows (clamped at the segment start; the
+       callers mask rows with fewer than `win` rows). */
+    __device__ int span_w() const { return win < n ? win : n; }
+
     __device__ double mean_finite() const
     {
-        int j = idx_back(win);
-        double c = cnt - cc[j];
-        return c > 0.0 ? (sum - cs[j]) / c : NAN;
+        View v = {this};
+        return rw_mean_finite(v, n - 1, span_w());
     }
 
     __device__ double mean_full() const
     {
-        int j = idx_back(win);
-        double c = cnt - cc[j];
-        return c == (double)win ? (sum - cs[j]) / (double)win : NAN;
+        View v = {this};
+        return rw_mean_strict(v, n - 1, span_w());
     }
 
     __device__ double std_full() const
     {
-        int j = idx_back(win);
-        double c = cnt - cc[j];
-        if (c < (double)win) return NAN;
-        double m = (sum - cs[j]) / (double)win;
-        double s2 = (sum2 - cs2[j]) / (double)win;
-        return sqrt(fmax(s2 - m * m, 0.0));
+        View v = {this};
+        return rw_std_pop(v, n - 1, span_w());
     }
 };
+
+/* Ring restart rule shared with the CPU `acc0_of`. */
+__device__ __forceinline__ bool tail_restart(const long long *t, int i, int p, int step)
+{
+    return (p % RW_BLOCK) == 0 || (p > 0 && t[i] - t[i - 1] != (long long)step);
+}
 
 /* ------------------------------------------------------------------------- */
 /* Blocked rolling extrema (van Herk/Gil-Werman prefix-suffix)               */
@@ -403,43 +399,29 @@ __global__ void k_tail_stoch_k(const long long *__restrict__ t,
     (void)mean_w;
 }
 
-__global__ void k_tail_prefix_count_sum(const double *__restrict__ x, int n,
-                                        const int *__restrict__ ss,
-                                        const int *__restrict__ sl, int nseg,
-                                        double *__restrict__ sum,
-                                        double *__restrict__ cnt)
+/* Stochastic %D: the rolling mean of %K, in place over `out`. */
+__global__ void k_tail_stoch_d(const long long *__restrict__ t,
+                               const int *__restrict__ ss,
+                               const int *__restrict__ sl, int nseg,
+                               int step, int w, double *out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
-    tail_prefix(sum, NULL, cnt, x, ss[s], sl[s], ss[s] + s);
-}
-
-__global__ void k_tail_mean3(const long long *__restrict__ t,
-                             const double *__restrict__ x, int n,
-                             const int *__restrict__ ss,
-                             const int *__restrict__ sl, int nseg,
-                             int step, int w,
-                             const double *__restrict__ sum,
-                             const double *__restrict__ cnt,
-                             double *__restrict__ out)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    int s = 0;
-    while (s + 1 < nseg && i >= ss[s] + sl[s]) ++s;
-    int pb = ss[s] + s;
-    int p = i - ss[s];
-    if (w <= 0 || p + 1 < w || !tail_contig(t, i, w, step)) {
-        out[i] = NAN;
-        return;
+    int start = ss[s], len = sl[s];
+    TailPrefix<8> ring;
+    ring.set_window(w);
+    for (int p = 0; p < len; ++p) {
+        int i = start + p;
+        ring.push(out[i], tail_restart(t, i, p, step));
+        if (w <= 0 || p + 1 < w || !tail_contig(t, i, w, step)) {
+            out[i] = NAN;
+        } else {
+            out[i] = ring.mean_finite();
+        }
     }
-    int lo = pb + p + 1 - w;
-    int hi = pb + p + 1;
-    double c = cnt[hi] - cnt[lo];
-    out[i] = c > 0.0 ? (sum[hi] - sum[lo]) / c : NAN;
 }
 
-extern "C" int rc_tail_stoch(const long long *t, const double *high,
+ extern "C" int rc_tail_stoch(const long long *t, const double *high,
                              const double *low, const double *close,
                              const int *seg_id, const int *ss, const int *sl,
                              int nseg, int n, int step, int w, int mean_w,
@@ -464,15 +446,8 @@ extern "C" int rc_tail_stoch(const long long *t, const double *high,
         if (cudaGetLastError() != cudaSuccess) rc = -1;
     }
     if (rc == 0 && which == 1) {
-        size_t nb = (size_t)n + (size_t)nseg + 1;
-        double *sum = scratch;
-        double *cnt = scratch + nb;
-        int threads = 256, blocks = (n + threads - 1) / threads;
-        int sblocks = (nseg + threads - 1) / threads;
-        k_tail_prefix_count_sum<<<sblocks, threads>>>(out, n, ss, sl, nseg, sum, cnt);
-        k_tail_fill_nan<<<blocks, threads>>>(out, n);
-        k_tail_mean3<<<blocks, threads>>>(t, out, n, ss, sl, nseg, step, mean_w,
-                                          sum, cnt, out);
+        int threads = 128, sblocks = (nseg + threads - 1) / threads;
+        k_tail_stoch_d<<<sblocks, threads>>>(t, ss, sl, nseg, step, mean_w, out);
         if (cudaGetLastError() != cudaSuccess) rc = -1;
     }
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -922,11 +897,11 @@ __global__ void k_tail_bb_z_prefix(const long long *__restrict__ t,
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
-    TailPrefix<TAIL_MAX_W> ring;
+    TailPrefix<TAIL_MAX_W, true> ring;
     ring.set_window(w);
     for (int p = 0; p < len; ++p) {
         int i = start + p;
-        ring.push(close[i]);
+        ring.push(close[i], tail_restart(t, i, p, step));
         if (!tail_contig(t, i, w, step) || p + 1 < w) {
             out[i] = NAN;
             continue;
@@ -975,7 +950,7 @@ __global__ void k_tail_ma_slope(const long long *__restrict__ t,
     mring.set_window(lag + 1);
     for (int p = 0; p < len; ++p) {
         int i = start + p;
-        cring.push(close[i]);
+        cring.push(close[i], tail_restart(t, i, p, step));
         double ma = NAN;
         if (tail_contig(t, i, w, step) && p + 1 >= w) ma = cring.mean_finite();
         mring.push(ma);
@@ -1087,6 +1062,28 @@ __global__ void k_tail_exotic_simple5(const long long *__restrict__ t,
     }
 }
 
+/* `cov / var` of x against its lag over the last 96 rows, from double-word
+   co-moments (the device twin of `window_stats::comoment_ratio`). */
+template <class VX, class VL, class VXL>
+__device__ double tail_comoment_ratio(const VX &vx, const VL &vl, const VXL &vxl, int hi, int w)
+{
+    int lo = hi + 1 - w;
+    double na = (double)(vxl.cn(hi) - vxl.cn(lo - 1));
+    double nb = (double)(vx.cn(hi) - vx.cn(lo - 1));
+    double nc = (double)(vl.cn(hi) - vl.cn(lo - 1));
+    if (!(na > 0.0 && nb > 0.0 && nc > 0.0)) return NAN;
+    RwDw a = rw_win(vx, 0, lo, hi);
+    RwDw b = rw_win(vl, 0, lo, hi);
+    RwDw c = rw_win(vxl, 0, lo, hi);
+    RwDw d = rw_win(vl, 1, lo, hi);
+    RwDw numc = rw_dw_add(rw_dw_mul_f(c, __dmul_rn(nb, nc)),
+                          rw_dw_neg(rw_dw_mul_f(rw_dw_mul(a, b), na)));
+    double cov = __ddiv_rn(numc.h, __dmul_rn(__dmul_rn(na, nb), nc));
+    RwDw numv = rw_dw_add(rw_dw_mul_f(d, nc), rw_dw_neg(rw_dw_mul(b, b)));
+    double var = __ddiv_rn(rw_guarded(vl, numv, d, nc, lo, hi), __dmul_rn(nc, nc));
+    return var > 0.0 ? __ddiv_rn(cov, var) : NAN;
+}
+
 __global__ void k_tail_exotic_ou(const long long *__restrict__ t,
                                  const double *__restrict__ close,
                                  const int *__restrict__ ss,
@@ -1096,34 +1093,32 @@ __global__ void k_tail_exotic_ou(const long long *__restrict__ t,
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
-    TailPrefix<96> cr, xr, xlr, xxr, x2r;
+    TailPrefix<96> cr, xr, xxr;
+    TailPrefix<96, true> xlr;
     double prev_x = NAN;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
-        cr.push(close[i]);
+        bool rs = tail_restart(t, i, p, step);
+        cr.push(close[i], rs);
         double ma = tail_contig(t, i, 96, step) && p + 1 >= 96 ? cr.mean_finite() : NAN;
         double x = (close[i] > 0.0 && isfinite(ma) && ma > 0.0)
-                       ? log(close[i]) - log(ma)
+                       ? rw_log1p_det((close[i] - ma) / ma)
                        : NAN;
         double xl = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev_x : NAN;
         prev_x = x;
-        xr.push(x);
-        xlr.push(xl);
-        xxr.push(x * xl);
-        x2r.push(xl * xl);
-        double ex = xr.mean_finite();
-        double exl = xlr.mean_finite();
-        double exx = xxr.mean_finite();
-        double ex2 = x2r.mean_finite();
-        if (!tail_contig(t, i, 96, step) ||
-            !(isfinite(ex) && isfinite(exl) && isfinite(exx) && isfinite(ex2))) {
+        xr.push(x, rs);
+        xlr.push(xl, rs);
+        xxr.push_dot(x, xl, rs);
+        if (!tail_contig(t, i, 96, step) || p + 1 < 96) {
             out[i] = NAN;
             continue;
         }
-        double cov = exx - ex * exl;
-        double var = ex2 - exl * exl;
-        if (var > 0.0) {
-            double phi = fmax(1e-6, fmin(0.999999, cov / var));
+        TailPrefix<96>::View vx = {&xr};
+        TailPrefix<96, true>::View vl = {&xlr};
+        TailPrefix<96>::View vxl = {&xxr};
+        double ratio = tail_comoment_ratio(vx, vl, vxl, p, 96);
+        if (isfinite(ratio)) {
+            double phi = fmax(1e-6, fmin(0.999999, ratio));
             double hl = -0.69314718055994530942 / log(phi);
             out[i] = log(1.0 + fmax(0.0, fmin(1000.0, hl)));
         } else {
@@ -1141,16 +1136,18 @@ __global__ void k_tail_exotic_acf(const long long *__restrict__ t,
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
-    TailPrefix<384> lr, lrl, prod;
+    TailPrefix<384, true> lr, lrl;
+    TailPrefix<384> prod;
     double prev = NAN;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
+        bool rs = tail_restart(t, i, p, step);
         double v = tail_ret1(t, close, i, step);
         double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
         prev = v;
-        lr.push(v);
-        lrl.push(l);
-        prod.push(v * l);
+        lr.push(v, rs);
+        lrl.push(l, rs);
+        prod.push(v * l, rs);
         bool ok = tail_contig(t, i, 384, step) && p + 1 >= 384;
         double mlr = lr.mean_finite();
         double mlrl = lrl.mean_finite();
@@ -1175,11 +1172,12 @@ __global__ void k_tail_exotic_vr4(const long long *__restrict__ t,
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
-    TailPrefix<384> lr, r4;
+    TailPrefix<384, true> lr, r4;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
-        lr.push(tail_ret1(t, close, i, step));
-        r4.push(tail_ret_k(t, close, i, 4, step));
+        bool rs = tail_restart(t, i, p, step);
+        lr.push(tail_ret1(t, close, i, step), rs);
+        r4.push(tail_ret_k(t, close, i, 4, step), rs);
         double sdlr = lr.std_full();
         double sdr4 = r4.std_full();
         double den = 4.0 * sdlr * sdlr;
@@ -1203,11 +1201,12 @@ __global__ void k_tail_exotic_rskew(const long long *__restrict__ t,
     TailPrefix<96> lr, d2, d3;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
-        lr.push(tail_ret1(t, close, i, step));
+        bool rs = tail_restart(t, i, p, step);
+        lr.push(tail_ret1(t, close, i, step), rs);
         double m = tail_contig(t, i, 96, step) && p + 1 >= 96 ? lr.mean_finite() : NAN;
         double d = tail_ret1(t, close, i, step) - m;
-        d2.push(d * d);
-        d3.push(d * d * d);
+        d2.push(d * d, rs);
+        d3.push(d * d * d, rs);
         double m2 = d2.mean_finite();
         double m3 = d3.mean_finite();
         if (tail_contig(t, i, 96, step) && p + 1 >= 96 && m2 > 0.0 &&
@@ -1232,11 +1231,12 @@ __global__ void k_tail_exotic_jump(const long long *__restrict__ t,
     double prev = NAN;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
+        bool rs = tail_restart(t, i, p, step);
         double v = tail_ret1(t, close, i, step);
         double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
         prev = v;
-        rv.push(v * v);
-        bv.push(fabs(v) * fabs(l));
+        rv.push(v * v, rs);
+        bv.push(fabs(v) * fabs(l), rs);
         double mrv = rv.mean_finite();
         double mbv = bv.mean_finite();
         if (tail_contig(t, i, 96, step) && p + 1 >= 96 && isfinite(mrv) &&
@@ -1260,10 +1260,11 @@ __global__ void k_tail_exotic_semivar(const long long *__restrict__ t,
     TailPrefix<96> rv, dn, up;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
+        bool rs = tail_restart(t, i, p, step);
         double v = tail_ret1(t, close, i, step);
-        rv.push(v * v);
-        dn.push(isfinite(v) && v < 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN));
-        up.push(isfinite(v) && v > 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN));
+        rv.push(v * v, rs);
+        dn.push(isfinite(v) && v < 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
+        up.push(isfinite(v) && v > 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
         double mrv = rv.mean_finite();
         double mdn = dn.mean_finite();
         double mup = up.mean_finite();
@@ -1285,14 +1286,15 @@ __global__ void k_tail_exotic_cusum(const long long *__restrict__ t,
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
-    TailPrefix<96> lr;
+    TailPrefix<96, true> lr;
     TailRing<97> cs_ring;
     double acc = 0.0;
     for (int p = 0; p < len; ++p) {
         int i = start + p;
+        bool rs = tail_restart(t, i, p, step);
         bool gap = p > 0 && (t[i] - t[i - 1] != (long long)step);
         if (gap) acc = 0.0;
-        lr.push(tail_ret1(t, close, i, step));
+        lr.push(tail_ret1(t, close, i, step), rs);
         double m = tail_contig(t, i, 96, step) && p + 1 >= 96 ? lr.mean_finite() : NAN;
         double sd = lr.std_full();
         double z = (isfinite(tail_ret1(t, close, i, step)) && isfinite(m) &&

@@ -203,6 +203,19 @@ __device__ __forceinline__ double rw_std_pop(const V &v, int hi, int w)
     return __dsqrt_rn(fmax(vv, 0.0));
 }
 
+/* `window_stats::log1p_det`: ln(1 + r) from + - * / only for |r| <= 0.25. */
+__device__ __forceinline__ double rw_log1p_det(double r)
+{
+    if (!(fabs(r) <= 0.25)) return log1p(r);
+    double z = __ddiv_rn(r, __dadd_rn(2.0, r));
+    double z2 = __dmul_rn(z, z);
+    double s = __ddiv_rn(1.0, 21.0);
+    for (int k = 9; k >= 0; --k) {
+        s = __dadd_rn(__dmul_rn(s, z2), __ddiv_rn(1.0, (double)(2 * k + 1)));
+    }
+    return __dmul_rn(__dmul_rn(2.0, z), s);
+}
+
 /* One running accumulation step. `restart` zeroes the accumulation first. */
 struct RwAcc {
     double s1, c1, s2, c2;

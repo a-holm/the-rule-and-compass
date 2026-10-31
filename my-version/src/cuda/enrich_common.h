@@ -61,6 +61,11 @@ typedef struct RcEnrich {
     double *d_b;
     double *d_c;
     double *d_d;
+    /* #364: compensation plane and integer planes of the window-statistic arena
+       (`d_a`, `d_b`, `d_c` hold the sums, `d_e` the squares compensation). */
+    double *d_e;
+    int *d_cn;
+    int *d_bk;
     double *d_out;
     double *d_out2;
     double *d_out3;

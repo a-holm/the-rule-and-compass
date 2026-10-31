@@ -25,6 +25,7 @@
 #include <cub/cub.cuh>
 
 #include "enrich_common.h"
+#include "win_stats.h"
 
 /* #300: hard cap for the per-family output arena and the pinned D2H mirror. */
 #define RC_BATCH_ARENA_BYTES (64ULL * 1024ULL * 1024ULL)
@@ -112,47 +113,56 @@ __device__ __forceinline__ bool rc_contig(const long long *t, int i, int w, int 
     return t[i + 1 - w] == t[i] - (long long)(w - 1) * step;
 }
 
-/* Sequential prefix over one segment. Each segment gets its own base
-   (`start + segment_id`) inside the scratch arena so two segment threads never
-   write the same boundary slot. */
-__device__ void rc_prefix(double *sum, double *sum2, double *cnt,
-                          const double *x, int start, int len, int pb)
+/* #364: window-statistic arena. Slot `pb + 1 + p` holds the running sums of
+   segment row `p`; slot `pb` is the zero entry before the first row. Each
+   segment owns `len + 1` slots starting at `pb = start + segment_id`. */
+struct RwArena {
+    double *s1;
+    double *c1;
+    double *s2;
+    double *c2;
+    int *cn;
+    int *bk;
+};
+
+struct RwArenaView {
+    RwArena a;
+    const double *xp; /* x at slot q is xp[q] */
+    __device__ double s(int k, int q) const { return k == 0 ? a.s1[q] : a.s2[q]; }
+    __device__ double c(int k, int q) const { return k == 0 ? a.c1[q] : a.c2[q]; }
+    __device__ int bk(int q) const { return a.bk[q]; }
+    __device__ int cn(int q) const { return a.cn[q]; }
+    __device__ double x(int q) const { return xp[q]; }
+};
+
+/* Sequential Sum2 (and Dot2 of x*x when `sq`) prefix over one segment, in the
+   CPU order: restart at the segment start, every gap row and every RW_BLOCK
+   segment-relative rows. */
+__device__ void rw_build(const RwArena &a, const double *x, const long long *t,
+                         int start, int len, int pb, int step, bool sq)
 {
-    sum[pb] = 0.0;
-    sum2[pb] = 0.0;
-    cnt[pb] = 0.0;
-    double s = 0.0, s2 = 0.0, c = 0.0;
-    for (int j = 0; j < len; ++j) {
-        double v = x[start + j];
-        if (rc_finite(v)) {
-            s += v;
-            s2 += v * v;
-            c += 1.0;
+    a.s1[pb] = 0.0;
+    a.c1[pb] = 0.0;
+    a.s2[pb] = 0.0;
+    a.c2[pb] = 0.0;
+    a.cn[pb] = 0;
+    a.bk[pb] = 0;
+    RwAcc acc;
+    rw_acc_init(&acc);
+    for (int p = 0; p < len; ++p) {
+        int i = start + p;
+        int q = pb + 1 + p;
+        bool restart = (p % RW_BLOCK) == 0 || (p > 0 && t[i] - t[i - 1] != (long long)step);
+        rw_acc_push(&acc, x[i], q, restart, sq);
+        a.s1[q] = acc.s1;
+        a.c1[q] = acc.c1;
+        if (sq) {
+            a.s2[q] = acc.s2;
+            a.c2[q] = acc.c2;
         }
-        sum[pb + j + 1] = s;
-        sum2[pb + j + 1] = s2;
-        cnt[pb + j + 1] = c;
+        a.cn[q] = acc.cnt;
+        a.bk[q] = q - acc.start;
     }
-}
-
-__device__ __forceinline__ double rc_std(const double *sum, const double *sum2,
-                                         const double *cnt, int pb, int p, int w)
-{
-    int lo = pb + p + 1 - w;
-    int hi = pb + p + 1;
-    if (cnt[hi] - cnt[lo] < w) return NAN;
-    double m = (sum[hi] - sum[lo]) / (double)w;
-    double s2 = (sum2[hi] - sum2[lo]) / (double)w;
-    return sqrt(fmax(s2 - m * m, 0.0));
-}
-
-__device__ __forceinline__ double rc_mean(const double *sum, const double *cnt,
-                                          int pb, int p, int w)
-{
-    int lo = pb + p + 1 - w;
-    int hi = pb + p + 1;
-    if (cnt[hi] - cnt[lo] < w) return NAN;
-    return (sum[hi] - sum[lo]) / (double)w;
 }
 
 __device__ __forceinline__ int rc_weekday(long long days)
@@ -402,36 +412,38 @@ __global__ void k_seg_id_tile(const int *__restrict__ ss, const int *__restrict_
 
 __global__ void k_ma(const long long *__restrict__ t, const double *__restrict__ close,
                      const int *__restrict__ ss, const int *__restrict__ sl,
-                     int nseg, int step, int w,
-                     double *sa, double *sb, double *sc, double *__restrict__ out)
+                     int nseg, int step, int w, int mode, RwArena ar,
+                     double *__restrict__ out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
     int pb = start + s;
-    rc_prefix(sa, sb, sc, close, start, len, pb);
+    rw_build(ar, close, t, start, len, pb, step, false);
+    RwArenaView v = {ar, close + start - pb - 1};
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         out[i] = NAN;
         if (p + 1 < w || !rc_contig(t, i, w, step)) continue;
-        if (w == 96 || w == 672) {
-            /* Compact engine columns ma96/ma672 average the finite closes
-               of the window; the catalogue maN columns need the full window. */
-            double cnt = sc[pb + p + 1] - sc[pb + p + 1 - w];
-            if (!(cnt > 0.0) || !(close[i] > 0.0)) continue;
-            double m = (sa[pb + p + 1] - sa[pb + p + 1 - w]) / cnt;
+        int hi = pb + 1 + p;
+        if (mode == RC_WIN_MEAN_FINITE) {
+            /* Compact engine columns ma96/ma672 average the finite closes of
+               the window. */
+            double m = rw_mean_finite(v, hi, w);
+            if (!(close[i] > 0.0)) continue;
             if (isfinite(close[i]) && isfinite(m) && m != 0.0) out[i] = close[i] / m - 1.0;
             continue;
         }
-        double m = rc_mean(sa, sc, pb, p, w);
+        /* The catalogue maN columns need the full window. */
+        double m = rw_mean_strict(v, hi, w);
         if (isfinite(m) && m > 0.0) out[i] = close[i] / m - 1.0;
     }
 }
 
 __global__ void k_vol(const long long *__restrict__ t, const double *__restrict__ close,
                       const int *__restrict__ ss, const int *__restrict__ sl,
-                      int nseg, int step, int w,
-                      double *sa, double *sb, double *sc, double *ret, double *__restrict__ out)
+                      int nseg, int step, int w, RwArena ar, double *ret,
+                      double *__restrict__ out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
@@ -446,39 +458,42 @@ __global__ void k_vol(const long long *__restrict__ t, const double *__restrict_
         ret[i] = v;
     }
     int pb = start + s;
-    rc_prefix(sa, sb, sc, ret, start, len, pb);
+    rw_build(ar, ret, t, start, len, pb, step, true);
+    RwArenaView v = {ar, ret + start - pb - 1};
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         out[i] = NAN;
         if (p < w || !rc_contig(t, i, w, step)) continue;
-        out[i] = rc_std(sa, sb, sc, pb, p, w);
+        out[i] = rw_std_pop(v, pb + 1 + p, w);
     }
 }
 
 __global__ void k_bb_width(const long long *__restrict__ t, const double *__restrict__ close,
                            const int *__restrict__ ss, const int *__restrict__ sl,
-                           int nseg, int step, int w,
-                           double *sa, double *sb, double *sc, double *__restrict__ out)
+                           int nseg, int step, int w, RwArena ar,
+                           double *__restrict__ out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
     int start = ss[s], len = sl[s];
     int pb = start + s;
-    rc_prefix(sa, sb, sc, close, start, len, pb);
+    rw_build(ar, close, t, start, len, pb, step, true);
+    RwArenaView v = {ar, close + start - pb - 1};
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         out[i] = NAN;
         if (p + 1 < w || !rc_contig(t, i, w, step)) continue;
-        double m = rc_mean(sa, sc, pb, p, w);
-        double sd = rc_std(sa, sb, sc, pb, p, w);
+        int hi = pb + 1 + p;
+        double m = rw_mean_strict(v, hi, w);
+        double sd = rw_std_pop(v, hi, w);
         if (isfinite(m) && isfinite(sd) && m > 0.0) out[i] = 4.0 * sd / m;
     }
 }
 
 __global__ void k_vz(const long long *__restrict__ t, const double *__restrict__ volume,
                      const int *__restrict__ ss, const int *__restrict__ sl,
-                     int nseg, int step, int w,
-                     double *sa, double *sb, double *sc, double *x, double *__restrict__ out)
+                     int nseg, int step, int w, RwArena ar, double *x,
+                     double *__restrict__ out)
 {
     int s = blockIdx.x * blockDim.x + threadIdx.x;
     if (s >= nseg) return;
@@ -488,13 +503,15 @@ __global__ void k_vz(const long long *__restrict__ t, const double *__restrict__
         x[i] = volume[i] >= 0.0 ? log1p(volume[i]) : NAN;
     }
     int pb = start + s;
-    rc_prefix(sa, sb, sc, x, start, len, pb);
+    rw_build(ar, x, t, start, len, pb, step, true);
+    RwArenaView v = {ar, x + start - pb - 1};
     for (int p = 0; p < len; ++p) {
         int i = start + p;
         out[i] = NAN;
         if (!rc_contig(t, i, w, step)) continue;
-        double m = rc_mean(sa, sc, pb, p, w);
-        double sd = rc_std(sa, sb, sc, pb, p, w);
+        int hi = pb + 1 + p;
+        double m = rw_mean_strict(v, hi, w);
+        double sd = rw_std_pop(v, hi, w);
         if (isfinite(m) && isfinite(sd) && sd > 0.0) out[i] = (x[i] - m) / sd;
     }
 }
@@ -977,6 +994,9 @@ void *rc_enrich_create(const long long *times, const double *open, const double 
     if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_d, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_e, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_cn, (rows + (size_t)nseg + 1) * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_bk, (rows + (size_t)nseg + 1) * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out2, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out3, rows * sizeof(double)) != 0) ok = 0;
@@ -1054,6 +1074,9 @@ void rc_enrich_destroy(void *v)
     cudaFree(c->d_b);
     cudaFree(c->d_c);
     cudaFree(c->d_d);
+    cudaFree(c->d_e);
+    cudaFree(c->d_cn);
+    cudaFree(c->d_bk);
     cudaFree(c->d_out);
     cudaFree(c->d_out2);
     cudaFree(c->d_out3);
@@ -1200,14 +1223,20 @@ int rc_enrich_calendar(void *v, int which, double *out)
     RC_END(c);
 }
 
-int rc_enrich_ma(void *v, int w, double *out)
+static RwArena rw_arena(const RcEnrich *c)
+{
+    RwArena a = {c->d_a, c->d_b, c->d_c, c->d_e, c->d_cn, c->d_bk};
+    return a;
+}
+
+int rc_enrich_ma(void *v, int w, int mode, double *out)
 {
     RcEnrich *c = (RcEnrich *)v;
     RC_ELEM_BEGIN(c, 0, 0);
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
     RC_ELEM_LAUNCH(c, (k_ma<<<blocks, threads>>>(c->d_times, c->d_close,
                                                  c->d_seg_start, c->d_seg_len, c->nseg,
-                                                 c->step, w, c->d_a, c->d_b, c->d_c, c->d_out)));
+                                                 c->step, w, mode, rw_arena(c), c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
 }
@@ -1219,7 +1248,7 @@ int rc_enrich_vol(void *v, int w, double *out)
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
     RC_ELEM_LAUNCH(c, (k_vol<<<blocks, threads>>>(c->d_times, c->d_close,
                                                   c->d_seg_start, c->d_seg_len, c->nseg,
-                                                  c->step, w, c->d_a, c->d_b, c->d_c,
+                                                  c->step, w, rw_arena(c),
                                                   c->d_d, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1232,7 +1261,7 @@ int rc_enrich_bb_width(void *v, int w, double *out)
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
     RC_ELEM_LAUNCH(c, (k_bb_width<<<blocks, threads>>>(c->d_times, c->d_close,
                                                        c->d_seg_start, c->d_seg_len, c->nseg,
-                                                       c->step, w, c->d_a, c->d_b, c->d_c,
+                                                       c->step, w, rw_arena(c),
                                                        c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1245,7 +1274,7 @@ int rc_enrich_vz(void *v, int w, double *out)
     int threads = 128, blocks = (c->nseg + threads - 1) / threads;
     RC_ELEM_LAUNCH(c, (k_vz<<<blocks, threads>>>(c->d_times, c->d_volume,
                                                  c->d_seg_start, c->d_seg_len, c->nseg,
-                                                 c->step, w, c->d_a, c->d_b, c->d_c,
+                                                 c->step, w, rw_arena(c),
                                                  c->d_d, c->d_out)));
     RC_DOWNLOAD(c, out, c->d_out);
     RC_END(c);
@@ -1484,23 +1513,23 @@ static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
         return 1;
     case RC_OP_MA:
         k_ma<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
-                                    c->d_seg_len, c->nseg, c->step, op->a,
-                                    c->d_a, c->d_b, c->d_c, c->d_out);
+                                    c->d_seg_len, c->nseg, c->step, op->a, op->b,
+                                    rw_arena(c), c->d_out);
         return 1;
     case RC_OP_VOL:
         k_vol<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
                                      c->d_seg_len, c->nseg, c->step, op->a,
-                                     c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+                                     rw_arena(c), c->d_d, c->d_out);
         return 1;
     case RC_OP_BB_WIDTH:
         k_bb_width<<<sblocks, sthreads>>>(c->d_times, c->d_close, c->d_seg_start,
                                           c->d_seg_len, c->nseg, c->step, op->a,
-                                          c->d_a, c->d_b, c->d_c, c->d_out);
+                                          rw_arena(c), c->d_out);
         return 1;
     case RC_OP_VZ:
         k_vz<<<sblocks, sthreads>>>(c->d_times, c->d_volume, c->d_seg_start,
                                     c->d_seg_len, c->nseg, c->step, op->a,
-                                    c->d_a, c->d_b, c->d_c, c->d_d, c->d_out);
+                                    rw_arena(c), c->d_d, c->d_out);
         return 1;
     case RC_OP_DONCHIAN:
         k_donchian<<<sblocks, sthreads>>>(c->d_times, c->d_high, c->d_low,
@@ -2145,6 +2174,9 @@ void *rc_enrich_create_arena(int n, int nseg, int step, const int *seg_start,
     if (ok && rc_alloc((void **)&c->d_b, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_c, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_d, rows * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_e, (rows + (size_t)nseg + 1) * sizeof(double)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_cn, (rows + (size_t)nseg + 1) * sizeof(int)) != 0) ok = 0;
+    if (ok && rc_alloc((void **)&c->d_bk, (rows + (size_t)nseg + 1) * sizeof(int)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out2, rows * sizeof(double)) != 0) ok = 0;
     if (ok && rc_alloc((void **)&c->d_out3, rows * sizeof(double)) != 0) ok = 0;

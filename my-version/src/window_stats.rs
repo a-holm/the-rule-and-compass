@@ -9,6 +9,10 @@
 
 use std::cell::OnceCell;
 
+/// Mean policies shared with `RC_WIN_MEAN_*` in `win_stats.h`.
+pub const MEAN_FINITE: i32 = 0;
+pub const MEAN_STRICT: i32 = 1;
+
 /// Rows per accumulation. The device kernels use the same constant.
 pub const BLOCK: usize = 1024;
 
@@ -295,6 +299,26 @@ impl<'a> WinStats<'a> {
     }
 }
 
+/// `ln(1 + r)` from `+ - * /` only for `|r| <= 0.25`, so the device reproduces it
+/// bit for bit: `2 atanh(z)` with `z = r / (2 + r)`. Larger arguments use the
+/// platform `ln_1p`. The AR(1) coefficient behind `ou_hl96` is a difference of
+/// near-equal sums whose output amplifies a last-bit logarithm difference by
+/// up to 1e3, so its input must not depend on the platform logarithm.
+pub fn log1p_det(r: f64) -> f64 {
+    if !(r.abs() <= 0.25) {
+        return r.ln_1p();
+    }
+    let z = r / (2.0 + r);
+    let z2 = z * z;
+    let mut s = 1.0 / 21.0;
+    let mut k = 10;
+    while k > 0 {
+        k -= 1;
+        s = s * z2 + 1.0 / (2 * k + 1) as f64;
+    }
+    (2.0 * z) * s
+}
+
 /// `cov / var` of `x` against its lag `xl` over each `w`-row window, from
 /// double-word co-moments with the finite-count sets A (both finite), B (`x`
 /// finite) and C (`xl` finite). `NaN` where a set is empty, the window is not
@@ -544,6 +568,23 @@ mod tests {
                 assert_eq!(st.std_pop(i, w).is_some(), strict[i], "std w{w} i{i}");
             }
         }
+    }
+
+    #[test]
+    fn log1p_det_is_accurate_and_continuous_at_its_cutoff() {
+        let mut worst = 0.0f64;
+        for k in -2500..=2500 {
+            let r = k as f64 * 1e-4 + 3.3e-9;
+            let want = r.ln_1p();
+            let got = log1p_det(r);
+            if want != 0.0 {
+                worst = worst.max(((got - want) / want).abs());
+            }
+        }
+        assert!(worst < 1e-15, "worst relative error {worst:e}");
+        assert_eq!(log1p_det(0.0), 0.0);
+        assert!(log1p_det(f64::NAN).is_nan());
+        assert_eq!(log1p_det(0.3), 0.3f64.ln_1p());
     }
 
     #[test]

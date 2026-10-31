@@ -379,7 +379,7 @@ contains every engine name with `family`, `warmup`, `available` and its exact
 canonical producer. `feature_registry` contains one object per default-set
 column with `name`, `family`, `timeframe`, `warmup`, `available`, `derived`,
 `parity_tier`, `formula`, `formula_sha256`, `source`, `pit` and, when
-unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `1e-6` (`ou_hl96` only), `unavailable` or
+unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
 `reference` (CPU-only reference in this change).
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
@@ -526,6 +526,17 @@ panel. Nothing is forward-filled, so a symbol's first and last bar are hard
 boundaries. `docs/cross-asset-inventory.json` is the machine-readable
 name/family/warm-up/PIT/test inventory.
 
+### Rolling window statistics
+
+Every rolling mean and standard deviation of the engine comes from block-local compensated prefix sums (`src/window_stats.rs` on the CPU, `src/cuda/win_stats.h` on the device). The two sides run the same loops in the same operation order with IEEE `+ - * / sqrt` only and no fused multiply-add, so a column without a transcendental in its chain is bit-identical.
+
+* Each series (one symbol) keeps a Sum2 stream for `x` and a Dot2 stream, with an exact Dekker product, for `x*x` and `x*y`. The accumulation restarts at the series start, at every gap row and every 1,024 series-relative rows. Restarts only bound the rows that enter a window's rounding error; which windows are valid is still decided by `contig` and the finite counts.
+* A window sum is the exact `two_sum` difference of two prefix pairs plus the compensation difference, as a double-word. A window that contains a restart is summed piece by piece, from the window end backwards.
+* A mean is the double-word sum divided by the count, rounded once with one correction step. A population standard deviation is `sqrt((w*S2 - S1^2) / w^2)` with the numerator in double-word, and exactly `0` when every finite cell of the window is equal. A z-score over such a window is therefore `NaN`, not noise.
+* `ou_hl96` takes double-word co-moments over the three finite-count sets (both finite, `x` finite, lag finite) and `x = ln_1p((C - SMA96) / SMA96)`, which equals `ln(C) - ln(SMA96)` and keeps the device logarithm noise below 1e-12 in the output.
+* The NaN policy of the window mean is an explicit parameter. `ma96` and `ma672` average the finite closes of the window (`RC_WIN_MEAN_FINITE`, the compact reference); the catalogue `maN` columns need a full window (`RC_WIN_MEAN_STRICT`). The two are deliberately different.
+* The max error against an exact reference is within 1 ulp for means and 2 ulp for standard deviations at condition numbers (`mean^2 / var`) up to about 1e10; `tests/window_stats.rs` reports the error of every rolling family, the locality of a symbol alone against the same symbol inside a 24-symbol panel, and the CPU feature-phase time.
+
 ### Compact parity fixture
 
 `my-version/tests/fixtures/enrich/compact_15m_ohlcv.csv` is a contiguous 7,200
@@ -536,13 +547,7 @@ value at `abs <= 1e-12` or `rel <= 1e-12`, requires exact NaN masks, and reports
 the per-feature worst error. Expected values are produced by the builder's own
 Python functions on the same slice; the full 25 GB panel is not checked in.
 
-One numerical note belongs in the record: the compact builder accumulates
-`rmean`/`rstd` with `np.cumsum` over the **whole symbol history**. On a 196k-row
-history, cancellation in `cs[i+1]-cs[i+1-w]` perturbs a 96-bar standard
-deviation by up to about `2e-8`, so a slice-local recomputation cannot reproduce
-that artefact to `1e-12` even though the formula is identical. The fixture
-therefore pins the formula and summation order on the same slice; the residual
-against the historical full-panel CSV is recorded in issue #269.
+The compact builder accumulates `rmean`/`rstd` with `np.cumsum` over the **whole symbol history**. On a 196k-row history, cancellation in `cs[i+1]-cs[i+1-w]` perturbs a 96-bar standard deviation by up to about `2e-8`, which a slice-local recomputation cannot reproduce. The engine windows are accurate to rounding, so the fixture compares at 1e-8 (`PARITY_TOL` in `tests/enrich.rs`).
 
 ### Candle/price-action family (#261)
 
@@ -686,9 +691,10 @@ Gap and missing-column policy is the CPU policy, not a near-copy:
   internal outage behave exactly like the per-symbol `gap_mask`; `gap[0]` is
   false, OBV/CVD restart at a gap, and Wilder state restarts at a gap;
 * rolling consumers stage a tile of the source plane in shared memory and one
-  thread builds the running prefix in CPU order, so `rmean_py`/`rstd_py`/
-  `rmean_strict` keep their exact addition order while global accesses stay
-  coalesced; two-bar geometry runs one thread per row.
+  thread builds the compensated running sums in CPU order (see [Rolling window
+  statistics](#rolling-window-statistics)), so `rmean_py`/`rstd_py`/`rmean_strict`
+  keep their exact operation order while global accesses stay coalesced;
+  two-bar geometry runs one thread per row.
 
 Parity tiers are declared per column in `feature_registry.parity_tier`:
 
@@ -1021,7 +1027,7 @@ kernels reuse the same resident context but take raw device pointers, so the
 | extrema | `don20 don96 stoch_k stoch_d close_pos20` | blocked van Herk/Gil–Werman prefix-suffix (`O(n)`) | bitwise |
 | ATR / ADX / DI | `atr14 natr14 atr50 batr gapatr volrat adx14 di_plus di_minus di_diff14` | run-serial Wilder recurrence | `1e-12` |
 | Bollinger | `bb20_z bb20_bw bb50 bb50_bw bb96 bb_width96` | rolling mean/std per segment | `1e-12` |
-| exotic | `rmean5 rstd5 ou_hl96 acf1 vr4 rskew96 jump_share semivar_asym cusum_abs_z` | causal prefix rings | `1e-6` (log-derived chain, near-unit AR coefficient) |
+| exotic | `rmean5 rstd5 ou_hl96 acf1 vr4 rskew96 jump_share semivar_asym cusum_abs_z` | causal compensated prefix rings | `1e-12` (`ou_hl96`, `acf1`, `vr4`, `rskew96`, `jump_share`, `semivar_asym`, `cusum_abs_z` take logarithms) |
 | calendar | `tod_sin tod_cos` | integer bar-of-day phase | bitwise |
 
 The extrema kernel computes the prefix and suffix extrema of blocks of exactly
@@ -1059,9 +1065,8 @@ family.
 |---|---|
 | `bitwise` | SHA-256 of the raw f64 bytes is equal, no bit differs, NaN/Inf masks equal |
 | `1e-12` | NaN/Inf masks equal and `\|a-b\| <= 1e-12 * (1 + max(\|a\|,\|b\|))` |
-| `1e-6` | NaN/Inf masks equal and `\|a-b\| <= 1e-6 * (1 + max(\|a\|,\|b\|))` |
 
-`1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. `1e-6` is declared for `ou_hl96` alone: it is `ln(1+clip(-ln2/ln(phi),0,1000))` over an AR(1) coefficient `phi = cov/var` of 96-bar window sums of `ln(C) - ln(SMA96)`. A last-bit difference between the device and the host `ln` perturbs `x` by about 1e-13 relative, the covariance cancels most of that signal, and `ln(phi)` amplifies the rest (`ou_hl96_amplifies_last_bit_close_noise_beyond_1e12` measures the CPU response to 1-ulp close noise). Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the three fails `every_device_column_declares_exactly_one_tier`.
+`1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. `ou_hl96` is `1e-12`: its window co-moments are double-word sums and its input is `ln_1p((C - SMA96) / SMA96)`, so a last-bit logarithm difference between the device and the host stays far below 1e-12 (`ou_hl96_response_to_last_bit_close_noise_is_bounded` measures the CPU response to 1-ulp close noise). Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the two fails `every_device_column_declares_exactly_one_tier`.
 
 The fixture has 24 symbols x 21,000 bars (476,730 rows) with holes, a 5 h and a 32 h outage (stale 1h/4h and 1d buckets), a NaN close, zero volume, `H == L`, tied returns, PIT non-member rows and fewer than 20 members before bar 3,000.
 

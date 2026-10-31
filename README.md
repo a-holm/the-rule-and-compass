@@ -459,7 +459,7 @@ atomically instead of streaming it. See
   column, with non-members and NaN keyed last. The
   fused flow and price-action device producers materialise their twelve and
   eleven derived columns from one base pass per family, with a declared
-  `bitwise`/`1e-12`/`1e-6` tier per column (`feature_registry.parity_tier`). The
+  `bitwise`/`1e-12` tier per column (`feature_registry.parity_tier`). The
   default financial feature set is registered in `rcsr schema`
   (`feature_registry`): every available column has a tested producer, and
   registered-but-unavailable derivative columns fail closed with the missing

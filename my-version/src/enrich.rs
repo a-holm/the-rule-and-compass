@@ -617,14 +617,10 @@ pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
 /// `1e-12`: anything that evaluates `ln`, `sin` or `cos` (CUDA and the host
 /// libm differ in the last bit), anything derived from the 1-bar log return,
 /// and the MTF `vol` leaf. `bitwise`: elementwise geometry, min/max, lags of
-/// exact values, ranks, and recurrences evaluated in the CPU order. `1e-6`:
-/// `ou_hl96` only; its AR(1) coefficient comes from a difference of window
-/// sums of last-bit-noisy log values and enters `ln(phi)`, which amplifies
-/// the last-bit logarithm difference far beyond 1e-12.
+/// exact values, ranks, rolling means and standard deviations (the compensated
+/// window sums of `window_stats` run the same operations on both sides), and
+/// recurrences evaluated in the CPU order.
 fn engine_device_tier(name: &str) -> &'static str {
-    if name == "ou_hl96" {
-        return "1e-6";
-    }
     let numeric = |s: Option<&str>| s.map_or(false, |r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
     let log_based = numeric(name.strip_prefix('r'))
         || numeric(name.strip_prefix("vol"))
@@ -637,7 +633,7 @@ fn engine_device_tier(name: &str) -> &'static str {
         || (is_mtf(name) && name.ends_with("_vol"))
         || matches!(
             name,
-            "ret1" | "ret5" | "vz96" | "vol_z96" | "acf1" | "vr4" | "rskew96"
+            "ret1" | "ret5" | "vz96" | "vol_z96" | "acf1" | "vr4" | "rskew96" | "ou_hl96"
                 | "jump_share" | "semivar_asym" | "cusum_abs_z" | "rmean5" | "rstd5"
         );
     if log_based {
@@ -4846,7 +4842,7 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
 
     // Exotic statistical family.
     let x: Vec<f64> = (0..n)
-        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { ((c[i] - ma96[i]) / ma96[i]).ln_1p() } else { f64::NAN })
+        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { window_stats::log1p_det((c[i] - ma96[i]) / ma96[i]) } else { f64::NAN })
         .collect();
     let xl = rlag(&x, 1, times, step);
     let ou_ratio = window_stats::comoment_ratio(&x, &xl, 96, times, step);
@@ -6138,7 +6134,7 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         return gpu.ret(k);
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        return gpu.ma(w);
+        return gpu.ma(w, ma_window_policy(name));
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.vol(w);
@@ -6206,6 +6202,18 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
     }
 }
 
+/// NaN policy of the device `maN` mean: `ma96` and `ma672` average the finite
+/// closes of the window like the compact reference; the catalogue `maN`
+/// columns need a full window.
+#[cfg(feature = "cuda")]
+fn ma_window_policy(name: &str) -> i32 {
+    if matches!(name, "ma96" | "ma672") {
+        window_stats::MEAN_FINITE
+    } else {
+        window_stats::MEAN_STRICT
+    }
+}
+
 /// #300: the same dispatch as [`gpu_feature`], as a descriptor for the batched
 /// output arena. `None` means the name has no single-slot batch kernel.
 #[cfg(feature = "cuda")]
@@ -6215,7 +6223,7 @@ fn gpu_batch_op(name: &str) -> Option<crate::enrich_gpu::BatchOp> {
         return Some(BatchOp::ret(k));
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        return Some(BatchOp::ma(w));
+        return Some(BatchOp::ma(w, ma_window_policy(name)));
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
         return Some(BatchOp::vol(w));
