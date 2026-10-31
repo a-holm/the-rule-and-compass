@@ -1798,6 +1798,7 @@ pub fn reference_metrics(
         false,
         false,
         None,
+        false,
     )
     .metrics
 }
