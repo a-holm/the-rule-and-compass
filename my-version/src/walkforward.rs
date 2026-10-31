@@ -1564,6 +1564,9 @@ fn evaluate_window(
     // #306: the band/cooldown book. `positions` are aligned with `order`;
     // `net` includes the final exit of every group. `dp` deliberately keeps
     // the threshold book: the DP is a bound, not a strategy.
+    // One device launch over all rows: a chunk only partitions launches, and a
+    // launch only runs the chains of the groups it touches.
+    let device_chunk = ord_returns.len().max(1);
     type BandBook = (Vec<f64>, f64, usize, String, String, Option<String>);
     let band_scan: Option<BandBook> = if policy == Policy::Band {
         let params = crate::trading_gpu::BandParams {
@@ -1583,7 +1586,7 @@ fn evaluate_window(
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
-                        65_536,
+                        device_chunk,
                     )
                 },
                 || {
@@ -1618,7 +1621,7 @@ fn evaluate_window(
                         &params,
                         cost_side,
                         crate::trading_gpu::SCAN_THREADS,
-                        65_536,
+                        device_chunk,
                     )
                 },
                 || {
@@ -1783,7 +1786,7 @@ fn evaluate_window(
                     &ord_groups,
                     cost_side,
                     crate::trading_gpu::SCAN_THREADS,
-                    65_536,
+                    device_chunk,
                 )
             },
             || crate::trading_gpu::dp_scan(&ord_returns, &ord_groups, cost_side, 65_536),
