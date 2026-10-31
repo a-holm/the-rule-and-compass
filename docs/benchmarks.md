@@ -351,6 +351,7 @@ with one wall clock and exclusive main-thread stages:
 | `device_split` | evaluator kernel/launch/copy/alloc seconds plus the fit kernel split, all in seconds |
 | `fit.kernel_s`, `fit.fallback_s`, `fit.refit_s` | raw device kernel, measured exact-CPU fallback and finalist-refit seconds |
 | `fit.admitted/device_fits/fallback_fits/fallback_by_cause` | fit counters and every labelled fallback cause |
+| `fit.fallback_improved`, `fit.fallback_improved_by_cause` | fallbacks whose exact CPU refit lowered the exact error, in total and by cause; the share of `fallback_fits` is the refit yield |
 | `eval_fallback.programs/seconds` | evaluator CPU-fallback work |
 | `quality_per_gpu_hour` | decades per run wall-hour, with like-unit errors and full provenance |
 
