@@ -1807,6 +1807,15 @@ The deferred device fit does per candidate what the CPU arm does.
 * **Pipeline exclusion.** `pipeline_fit_safe` is false for every gated metric, because the pipeline write-back applies kernel constants without the gate.
 * **Wide admission.** `wide_admission` is true at 1 048 576 training rows or more, and for `correlation`, `correlation_signed` and `signed` at any size. With `wide`, `select_promoted` takes every candidate with constants and `GpuSearch::score` screens only the candidates without constants; the others are fitted and scored once. Other metrics keep `max(32, pop/4)` below the threshold.
 
+### Correlation arm
+
+`--metric correlation` (`1 − |ρ|`) and `--metric correlation_signed` (`1 − ρ`) fit on the device through `fit::fit_loss`. The kernel minimises exactly the configured objective with an analytic gradient and curvature in `f64`. The affine gauge pair `(a, b)` of an outer `a*T + b` is renormalised to `(sign a, 0)` and frozen, so its step is exactly zero.
+
+* **Orientation.** `correlation_signed` has a genuine sign. The kernel refines two orientations from the same entry constants: the incoming scale sign, then its negation, which thread 0 writes to the shared scale slot after the restore barrier. The lower objective wins, a tie keeps the incoming orientation, and `--fit-iters 0` never flips. Status is the status of the kept orientation (`recovered`, `no_improvement`, `start_unusable`, `rank_deficient` keep their meaning). `correlation` has one orientation.
+* **Closed form.** A tree that is affine in every constant has a global optimum, the weighted least-squares fit (`correlation::fit`). Such a tree never reaches the device: it is routed to the exact CPU arm with the label `affine_closed_form`. This label is a route, not a failure.
+* **Exact gate.** Every proposal passes `fit::gate_device_proposal` on the configured metric. A worse or non-finite proposal restores the incoming constants and the CPU arm refits (`worse`, `non_finite`).
+* **Cost.** The dispatch model scales the calibrated fit rates by passes per candidate relative to one squared LM run: `correlation` 1 on both sides, `correlation_signed` 2 on the device (two orientations) and 3 on the CPU (three orientations tried).
+
 ## The DGX Spark path
 
 | | |

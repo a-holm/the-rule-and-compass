@@ -786,4 +786,131 @@ mod tests {
         }
         out
     }
+
+    // -- signed orientation --
+
+    /// `1 − ρ` charges the reflection exactly `2ρ`, while `1 − |ρ|`
+    /// charges it nothing. This is the difference the signed arm exists for.
+    #[test]
+    fn the_signed_objective_penalises_the_reflection() {
+        let x = rows(41);
+        let h: Vec<f64> = x.iter().map(|r| 1.3 * (0.9 * r[0]).sin() + 0.2).collect();
+        let mirrored: Vec<f64> = h.iter().map(|v| -v).collect();
+        let rho = crate::metrics::correlation(&h, &h);
+        let rho_reflected = crate::metrics::correlation(&mirrored, &h);
+        assert!(rho > 0.99, "rho={rho}");
+        assert!((rho_reflected + rho).abs() < 1e-12, "rho(-h) = -rho(h)");
+        assert_eq!(objective(true, rho), 1.0 - rho);
+        assert_eq!(objective(true, rho_reflected), 1.0 - rho_reflected);
+        // Reflected: 1 - (-rho) = 2 - (1 - rho).
+        let gap = objective(true, rho_reflected) - objective(true, rho);
+        assert!((gap - 2.0 * rho).abs() < 1e-12, "reflection penalty {gap}");
+        // Unsigned scores both orientations identically.
+        assert!((objective(false, rho) - objective(false, rho_reflected)).abs() < 1e-12);
+    }
+
+    /// the signed fit recovers an inverted start by choosing the sign of
+    /// the frozen affine scale, and it never returns the reflected answer.
+    #[test]
+    fn the_signed_fit_returns_the_positive_orientation_not_the_reflection() {
+        let x = rows(81);
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| -(1.4 * (0.9 * r[0]).sin() + 0.15 * r[0] + 0.2))
+            .collect();
+        let mut tree = gauge_tree();
+        let start = score(&tree, &x, &y, Metric::CorrelationSigned);
+        assert!(start > 1.0, "the fixture must start inverted: {start}");
+        let got = fit(&mut tree, &x, &y, &[], 12, Metric::CorrelationSigned);
+        assert!(got < start, "signed fit {start} -> {got}");
+        assert!(got < 0.05, "signed fit did not recover the direction: {got}");
+        // The reported prediction is positively correlated with the target:
+        // the fit selected the orientation instead of the reflection.
+        let pred: Vec<f64> = x.iter().map(|r| expr::eval(&tree, r)).collect();
+        assert!(
+            crate::metrics::correlation(&pred, &y) > 0.9,
+            "fitted rho must be positive"
+        );
+        // The gauge is frozen and renormalised: the scale is a unit sign and
+        // the offset is exactly zero. Either sign is a valid optimum (the
+        // inner constants absorb the sign), but the *prediction* must be
+        // positively correlated with the target, never the reflection.
+        let scale = expr::nth(&tree, 2).expect("scale constant").val;
+        let offset = expr::nth(&tree, 7).expect("offset constant").val;
+        assert!(scale == 1.0 || scale == -1.0, "scale={scale}");
+        assert_eq!(offset, 0.0, "offset={offset}");
+    }
+
+    /// the same shape started from `-T` must reach the same signed
+    /// optimum, because the orientation search is free and `ρ(a·T+b) = ρ(T)`.
+    #[test]
+    fn the_signed_fit_is_invariant_to_the_starting_orientation() {
+        let x = rows(57);
+        let y: Vec<f64> = x.iter().map(|r| 1.1 * (1.2 * r[0]).sin() + 0.3).collect();
+        let mut positive = gauge_tree();
+        let mut negative = gauge_tree();
+        if let Some(n) = expr::nth_mut(&mut negative, 2) {
+            n.val = -0.7;
+        }
+        let start_pos = score(&positive, &x, &y, Metric::CorrelationSigned);
+        let start_neg = score(&negative, &x, &y, Metric::CorrelationSigned);
+        assert!(start_neg > start_pos, "the negative start must be the worse one");
+        let a = fit(&mut positive, &x, &y, &[], 12, Metric::CorrelationSigned);
+        let b = fit(&mut negative, &x, &y, &[], 12, Metric::CorrelationSigned);
+        assert!(a < 0.05, "positive start {start_pos} -> {a}");
+        assert!(b < 0.05, "negative start {start_neg} -> {b}");
+        assert!(
+            (a - b).abs() < 1e-12,
+            "the orientation of the start must not decide the optimum: {a} vs {b}"
+        );
+    }
+
+    /// a degenerate variance under the signed objective is exactly `1.0`
+    /// and the incoming constants are untouched.
+    #[test]
+    fn a_constant_prediction_scores_exactly_one_signed() {
+        let x = rows(20);
+        let y: Vec<f64> = x.iter().map(|r| r[0] * 2.0).collect();
+        let mut tree = node(
+            Op::Add,
+            vec![
+                node(Op::Sin, vec![node(Op::Mul, vec![constant(0.0), input(0)])]),
+                constant(3.0),
+            ],
+        );
+        let before = fitted(&tree);
+        let score = fit(&mut tree, &x, &y, &[], 8, Metric::CorrelationSigned);
+        assert_eq!(score, 1.0);
+        assert_eq!(fitted(&tree), before);
+    }
+
+    /// the signed arm is deterministic bit for bit.
+    #[test]
+    fn the_signed_fit_is_deterministic() {
+        let x = rows(97);
+        let y: Vec<f64> = x
+            .iter()
+            .map(|r| -(1.2 * (1.7 * r[0]).cos() - 0.3 * r[0] + 0.1))
+            .collect();
+        let mut a = gauge_tree();
+        let mut b = gauge_tree();
+        let sa = fit(&mut a, &x, &y, &[], 9, Metric::CorrelationSigned);
+        let sb = fit(&mut b, &x, &y, &[], 9, Metric::CorrelationSigned);
+        assert_eq!(sa.to_bits(), sb.to_bits());
+        assert_eq!(fitted(&a), fitted(&b));
+    }
+
+    /// `--no-fit` under the signed objective returns the current score
+    /// bit for bit and moves nothing.
+    #[test]
+    fn signed_zero_iterations_is_a_true_no_op() {
+        let x = rows(30);
+        let y: Vec<f64> = x.iter().map(|r| -(0.8 * r[0]).sin() + 0.2).collect();
+        let mut tree = gauge_tree();
+        let before = fitted(&tree);
+        let start = score(&tree, &x, &y, Metric::CorrelationSigned);
+        let got = fit(&mut tree, &x, &y, &[], 0, Metric::CorrelationSigned);
+        assert_eq!(got.to_bits(), start.to_bits());
+        assert_eq!(fitted(&tree), before);
+    }
 }
