@@ -342,6 +342,10 @@ with one wall clock and exclusive main-thread stages:
 | `stage_sum_s`, `unaccounted_s`, `closure` | `Σ stage_s + unaccounted_s = wall_s`; `closure` is the `{value,numerator,denominator,units,scope}` residual, acceptance `< 1 %` |
 | `device_busy_s` | **union** of device intervals across streams, never their sum |
 | `device_busy_sum_s`, `device_overlap_s`, `device_intervals` | the naive sum, the double count it would introduce, and the interval count |
+| `device_interval_basis` | how intervals were placed: `basis` is `events` (CUDA event timestamps read back after the sync), `host_envelope` (fallback when events are unavailable), `mixed` or `none`, with the `events` and `host_envelope` counts |
+| `stages.io_s` | checkpoint snapshot and write windows inside the search clock |
+| `structural_zero_stages` | stages with no work inside a search run by design (`features`, `pnl`): enrichment and P&L are separate commands, so a zero there is structural, not a missing measurement |
+| `outside_run` | windows before the search clock starts, outside the closure: `io_s` (table load) and `features_s` (fill, outlier, lag and split preparation); the JSON write happens after the report is serialised and is not measurable inside it |
 | `duty_run` | `device_busy_s / wall_s`, units `fraction`, scope `run` |
 | `eval_kernel_duty`, `fit_kernel_duty` | scoped sub-ratios (`evaluator_window`, `fit_stage`) |
 | `device_split` | evaluator kernel/launch/copy/alloc seconds plus the fit kernel split, all in seconds |
