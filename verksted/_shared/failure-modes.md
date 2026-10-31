@@ -28,3 +28,4 @@ Mined from the Claude Code and opencode sessions of this repo (2026-10-18 to 202
 | F22 | Shared `CARGO_TARGET_DIR` linked artefacts from another tree | opencode 2026-10-18, twice | rule 6 |
 | F23 | DNS failure during fetch or merge; retry loops | 2026-10-30 | verify with `gh pr view --json state,mergeCommit` after a retry |
 | F24 | `rm -rf` with variables denied by a safety check | three agents | rule 7: `git worktree remove` with an explicit path |
+| F25 | Device out-of-bounds read after a refused allocation (Xid 31); nvidia_uvm NULL dereference; every CPU soft-locked; desktop frozen 07:33 to 13:07 | kernel log 2026-10-31, #381 | rule 31 |
