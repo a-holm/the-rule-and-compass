@@ -592,6 +592,20 @@ Alongside the front, `rcsr` reports:
 | `skewness` | residual asymmetry (0 for a symmetric residual) |
 | `kurtosis` | excess kurtosis (0 for a Gaussian) |
 
+### Trading objectives and the lockbox
+
+With `--objective pnl|sharpe|log_growth` the finalist is chosen on the validation slice by the exact long/flat book. The test block is read once, after the choice, for the winner alone. Shuffling the test block changes the reported test book and nothing else: the selected expression, its constants and its validation book stay the same.
+
+The run refuses a setup that would leak or mis-state the book:
+
+* no temporal split, no validation slice, or no `forward_return` target spec;
+* a scaled, clipped or offset target without a `return_column` (the book needs realised returns);
+* no `--cost-bps` (a cost assumption is required; `0` only when stated);
+* a non-zero cost when the label is already net of cost;
+* `--position short` and `--allow-short` (there is no short leg).
+
+The target spec's purge already covers the label horizon between the training, validation and test blocks.
+
 ## 5. Not yet implemented (on the roadmap)
 
 * **Beta / variance-ratio drift tests**, and a **White** general

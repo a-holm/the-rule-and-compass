@@ -777,6 +777,17 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--force", "the server does not enforce the CLI memory guard"),
     ("--gpu-memory", "the server does not take a device memory cap"),
     ("--select-by", "the GUI uses the engine's default selection criterion"),
+    ("--objective", "the GUI does not run the long/flat P&L objective"),
+    ("--position", "the GUI does not run the long/flat P&L objective"),
+    ("--allow-short", "the GUI does not run the long/flat P&L objective"),
+    ("--threshold", "the GUI does not run the long/flat P&L objective"),
+    ("--cost-bps", "the GUI does not run the long/flat P&L objective"),
+    ("--slippage-bps", "the GUI does not run the long/flat P&L objective"),
+    ("--cash-return", "the GUI does not run the long/flat P&L objective"),
+    ("--funding", "the GUI does not run the long/flat P&L objective"),
+    ("--max-position", "the GUI does not run the long/flat P&L objective"),
+    ("--min-trades", "the GUI does not run the long/flat P&L objective"),
+    ("--min-holding", "the GUI does not run the long/flat P&L objective"),
     ("--baseline-samples", "the GUI baseline uses the engine's default sample size"),
     ("--null-block", "the GUI null control only shuffles single rows"),
     ("--implicit", "the implicit target-as-input transform is not wired into the form"),
@@ -1320,6 +1331,7 @@ impl RunPlan {
             allow_lockbox: raw.allow_lockbox,
             purge_seconds: None,
             scale_column: None,
+            trading: None,
         };
         let cv_dtypes = dtypes.clone();
         let prep = data::PrepSpec {

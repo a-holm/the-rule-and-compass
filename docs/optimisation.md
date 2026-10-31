@@ -1204,6 +1204,22 @@ stages; fitting and all f64 reporting stay on the CPU.
 
 ---
 
+### 3.5 Selecting finalists on a trading objective
+
+`--objective pnl|sharpe|log_growth` separates the loss the fitter minimises from the value that picks the finalist.
+
+* The fitter, the archive and every dominance test keep `--metric`. A surrogate error and a P&L value are never compared in one dominance test.
+* After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
+* `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
+* A direct in-search P&L fitness is not implemented. The objective only chooses among archived members.
+
+```sh
+rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 \
+     --target-spec bars.targets.json --objective sharpe --cost-bps 5 --json
+```
+
+The JSON `objective` block carries the fit error, the validation and test books, the cash and buy-and-hold comparisons, the number of candidates and usable candidates, and `backend_reason`.
+
 ## 4. Hardware
 
 ### 4.1 The machine we have
