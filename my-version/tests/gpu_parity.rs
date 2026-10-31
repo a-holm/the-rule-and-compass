@@ -585,7 +585,7 @@ fn device_columns_match_the_cpu_at_their_declared_tier() {
         assert_eq!(&gs, rep_g, "{}: report hash is the SHA-256 of the stored column", c.name);
         all_finite += o.finite;
         if std::env::var("RCSR_PARITY_VERBOSE").is_ok() {
-            eprintln!("[col] {} {} {} identical={} max_abs={:.3e} max_rel={:.3e} mask={} first={:?}", c.family, c.name, c.tier, cs == gs, o.max_abs, o.max_rel, o.mask_mismatch, o.first_bad);
+            eprintln!("[col] {} {} {} hash={} identical={} max_abs={:.3e} max_rel={:.3e} mask={} first={:?}", c.family, c.name, c.tier, gs, cs == gs, o.max_abs, o.max_rel, o.mask_mismatch, o.first_bad);
         }
         if let Err(e) = verdict(c.tier, &o, &cs, &gs) {
             if bug_names().contains(&c.name.as_str()) {
@@ -619,6 +619,14 @@ fn device_columns_match_the_cpu_at_their_declared_tier() {
     eprintln!("[parity] rows={} columns={} finite_cells={}", cpu.rows, s.names.len(), all_finite);
     eprintln!("[parity] cpu feature_s={:.2} gpu feature_s={:.2} gpu kernel_s={:.2} d2h_s={:.2}",
         cpu.feature_seconds, gpu.feature_seconds, gpu.gpu_kernel_seconds, gpu.gpu_d2h_seconds);
+    if let Some(budget) = std::env::var("RCSR_PARITY_KERNEL_BUDGET_S").ok().and_then(|v| v.parse::<f64>().ok()) {
+        assert!(
+            gpu.gpu_kernel_seconds <= budget,
+            "device kernel time {:.2}s exceeds the budget {:.2}s",
+            gpu.gpu_kernel_seconds,
+            budget
+        );
+    }
     eprintln!("| family | columns | tiers | bit-identical | max abs | max rel | mask mismatches |");
     eprintln!("|---|---:|---|---:|---:|---:|---:|");
     for (name, f) in &fams {

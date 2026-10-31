@@ -214,6 +214,17 @@ __device__ __forceinline__ bool tail_restart(const long long *t, int i, int p, i
     return (p % RW_BLOCK) == 0 || (p > 0 && t[i] - t[i - 1] != (long long)step);
 }
 
+/* Chunked walk of a segment. One CTA per segment; thread `b` owns the rows of
+   block `b` (RW_BLOCK rows) and replays `warm_blocks` blocks before it, so its
+   prefix rings hold the accumulations of the sequential walk. Accumulations
+   restart at every block start, so a replay from a block start is exact.
+   `warm_blocks * RW_BLOCK` must cover every look-back of the kernel. */
+__device__ __forceinline__ int tail_warm_start(int p0, int warm_blocks)
+{
+    int pw = p0 - warm_blocks * RW_BLOCK;
+    return pw > 0 ? pw : 0;
+}
+
 /* ------------------------------------------------------------------------- */
 /* Blocked rolling extrema (van Herk/Gil-Werman prefix-suffix)               */
 /* ------------------------------------------------------------------------- */
@@ -894,26 +905,30 @@ __global__ void k_tail_bb_z_prefix(const long long *__restrict__ t,
                                    int step, int w, int mode,
                                    double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
     TailPrefix<TAIL_MAX_W, true> ring;
-    ring.set_window(w);
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        ring.push(close[i], tail_restart(t, i, p, step));
-        if (!tail_contig(t, i, w, step) || p + 1 < w) {
-            out[i] = NAN;
-            continue;
-        }
-        double m = ring.mean_full();
-        double sd = ring.std_full();
-        if (!isfinite(m) || !isfinite(sd) || sd <= 0.0) {
-            out[i] = NAN;
-        } else if (mode == 0) {
-            out[i] = (close[i] - m) / sd;
-        } else {
-            out[i] = tail_clip((close[i] - m) / (2.0 * sd), -1.0, 1.0);
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        ring.set_window(w);
+        for (int p = tail_warm_start(p0, 1); p < pe; ++p) {
+            int i = start + p;
+            ring.push(close[i], tail_restart(t, i, p, step));
+            if (p < p0) continue;
+            if (!tail_contig(t, i, w, step) || p + 1 < w) {
+                out[i] = NAN;
+                continue;
+            }
+            double m = ring.mean_full();
+            double sd = ring.std_full();
+            if (!isfinite(m) || !isfinite(sd) || sd <= 0.0) {
+                out[i] = NAN;
+            } else if (mode == 0) {
+                out[i] = (close[i] - m) / sd;
+            } else {
+                out[i] = tail_clip((close[i] - m) / (2.0 * sd), -1.0, 1.0);
+            }
         }
     }
 }
@@ -926,7 +941,7 @@ extern "C" int rc_tail_bb_z(const long long *t, const double *close,
     if (mode == 0) {
         k_tail_bb_z_direct<<<blocks, threads>>>(t, close, ss, sl, nseg, step, w, out);
     } else {
-        k_tail_bb_z_prefix<<<blocks, threads>>>(t, close, ss, sl, nseg, step, w, mode, out);
+        k_tail_bb_z_prefix<<<nseg, 32>>>(t, close, ss, sl, nseg, step, w, mode, out);
     }
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
@@ -941,25 +956,30 @@ __global__ void k_tail_ma_slope(const long long *__restrict__ t,
                                 int step, int w, int lag,
                                 double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
+    int warm = (w + lag + RW_BLOCK - 1) / RW_BLOCK;
     TailPrefix<TAIL_MAX_W> cring;
     TailRing<TAIL_MAX_W> mring;
-    cring.set_window(w);
-    mring.set_window(lag + 1);
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        cring.push(close[i], tail_restart(t, i, p, step));
-        double ma = NAN;
-        if (tail_contig(t, i, w, step) && p + 1 >= w) ma = cring.mean_finite();
-        mring.push(ma);
-        double old = mring.back(lag);
-        if (p >= lag && t[i] - t[i - lag] == (long long)lag * step &&
-            isfinite(ma) && isfinite(old) && old != 0.0) {
-            out[i] = ma / old - 1.0;
-        } else {
-            out[i] = NAN;
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        cring.set_window(w);
+        mring.set_window(lag + 1);
+        for (int p = tail_warm_start(p0, warm); p < pe; ++p) {
+            int i = start + p;
+            cring.push(close[i], tail_restart(t, i, p, step));
+            double ma = NAN;
+            if (tail_contig(t, i, w, step) && p + 1 >= w) ma = cring.mean_finite();
+            mring.push(ma);
+            if (p < p0) continue;
+            double old = mring.back(lag);
+            if (p >= lag && t[i] - t[i - lag] == (long long)lag * step &&
+                isfinite(ma) && isfinite(old) && old != 0.0) {
+                out[i] = ma / old - 1.0;
+            } else {
+                out[i] = NAN;
+            }
         }
     }
 }
@@ -968,8 +988,7 @@ extern "C" int rc_tail_ma_slope(const long long *t, const double *close,
                                 const int *ss, const int *sl, int nseg, int n,
                                 int step, int w, int lag, double *out)
 {
-    int threads = 128, blocks = (nseg + threads - 1) / threads;
-    k_tail_ma_slope<<<blocks, threads>>>(t, close, ss, sl, nseg, step, w, lag, out);
+    k_tail_ma_slope<<<nseg, 32>>>(t, close, ss, sl, nseg, step, w, lag, out);
     int rc = cudaGetLastError() == cudaSuccess ? 0 : -1;
     if (rc == 0 && cudaDeviceSynchronize() != cudaSuccess) rc = -1;
     (void)n;
@@ -1133,32 +1152,40 @@ __global__ void k_tail_exotic_acf(const long long *__restrict__ t,
                                   const int *__restrict__ sl, int nseg,
                                   int step, double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
     TailPrefix<384, true> lr, lrl;
     TailPrefix<384> prod;
-    double prev = NAN;
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        bool rs = tail_restart(t, i, p, step);
-        double v = tail_ret1(t, close, i, step);
-        double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
-        prev = v;
-        lr.push(v, rs);
-        lrl.push(l, rs);
-        prod.push(v * l, rs);
-        bool ok = tail_contig(t, i, 384, step) && p + 1 >= 384;
-        double mlr = lr.mean_finite();
-        double mlrl = lrl.mean_finite();
-        double mp = prod.mean_finite();
-        double sdlr = lr.std_full();
-        double sdlrl = lrl.std_full();
-        double den = sdlr * sdlrl;
-        if (ok && isfinite(mp) && isfinite(mlr) && isfinite(mlrl) && den > 0.0) {
-            out[i] = (mp - mlr * mlrl) / den;
-        } else {
-            out[i] = NAN;
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        int pw = tail_warm_start(p0, 1);
+        lr.set_window(384);
+        lrl.set_window(384);
+        prod.set_window(384);
+        double prev = pw > 0 ? tail_ret1(t, close, start + pw - 1, step) : NAN;
+        for (int p = pw; p < pe; ++p) {
+            int i = start + p;
+            bool rs = tail_restart(t, i, p, step);
+            double v = tail_ret1(t, close, i, step);
+            double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
+            prev = v;
+            lr.push(v, rs);
+            lrl.push(l, rs);
+            prod.push(v * l, rs);
+            if (p < p0) continue;
+            bool ok = tail_contig(t, i, 384, step) && p + 1 >= 384;
+            double mlr = lr.mean_finite();
+            double mlrl = lrl.mean_finite();
+            double mp = prod.mean_finite();
+            double sdlr = lr.std_full();
+            double sdlrl = lrl.std_full();
+            double den = sdlr * sdlrl;
+            if (ok && isfinite(mp) && isfinite(mlr) && isfinite(mlrl) && den > 0.0) {
+                out[i] = (mp - mlr * mlrl) / den;
+            } else {
+                out[i] = NAN;
+            }
         }
     }
 }
@@ -1169,22 +1196,28 @@ __global__ void k_tail_exotic_vr4(const long long *__restrict__ t,
                                   const int *__restrict__ sl, int nseg,
                                   int step, double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
     TailPrefix<384, true> lr, r4;
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        bool rs = tail_restart(t, i, p, step);
-        lr.push(tail_ret1(t, close, i, step), rs);
-        r4.push(tail_ret_k(t, close, i, 4, step), rs);
-        double sdlr = lr.std_full();
-        double sdr4 = r4.std_full();
-        double den = 4.0 * sdlr * sdlr;
-        if (tail_contig(t, i, 384, step) && p + 1 >= 384 && den > 0.0) {
-            out[i] = (sdr4 * sdr4) / den;
-        } else {
-            out[i] = NAN;
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        lr.set_window(384);
+        r4.set_window(384);
+        for (int p = tail_warm_start(p0, 1); p < pe; ++p) {
+            int i = start + p;
+            bool rs = tail_restart(t, i, p, step);
+            lr.push(tail_ret1(t, close, i, step), rs);
+            r4.push(tail_ret_k(t, close, i, 4, step), rs);
+            if (p < p0) continue;
+            double sdlr = lr.std_full();
+            double sdr4 = r4.std_full();
+            double den = 4.0 * sdlr * sdlr;
+            if (tail_contig(t, i, 384, step) && p + 1 >= 384 && den > 0.0) {
+                out[i] = (sdr4 * sdr4) / den;
+            } else {
+                out[i] = NAN;
+            }
         }
     }
 }
@@ -1224,26 +1257,33 @@ __global__ void k_tail_exotic_jump(const long long *__restrict__ t,
                                    const int *__restrict__ sl, int nseg,
                                    int step, double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
     TailPrefix<96> rv, bv;
-    double prev = NAN;
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        bool rs = tail_restart(t, i, p, step);
-        double v = tail_ret1(t, close, i, step);
-        double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
-        prev = v;
-        rv.push(v * v, rs);
-        bv.push(fabs(v) * fabs(l), rs);
-        double mrv = rv.mean_finite();
-        double mbv = bv.mean_finite();
-        if (tail_contig(t, i, 96, step) && p + 1 >= 96 && isfinite(mrv) &&
-            isfinite(mbv) && mrv > 0.0) {
-            out[i] = fmax(mrv - (3.14159265358979323846 / 2.0) * mbv, 0.0) / mrv;
-        } else {
-            out[i] = NAN;
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        int pw = tail_warm_start(p0, 1);
+        rv.set_window(96);
+        bv.set_window(96);
+        double prev = pw > 0 ? tail_ret1(t, close, start + pw - 1, step) : NAN;
+        for (int p = pw; p < pe; ++p) {
+            int i = start + p;
+            bool rs = tail_restart(t, i, p, step);
+            double v = tail_ret1(t, close, i, step);
+            double l = (p > 0 && t[i] - t[i - 1] == (long long)step) ? prev : NAN;
+            prev = v;
+            rv.push(v * v, rs);
+            bv.push(fabs(v) * fabs(l), rs);
+            if (p < p0) continue;
+            double mrv = rv.mean_finite();
+            double mbv = bv.mean_finite();
+            if (tail_contig(t, i, 96, step) && p + 1 >= 96 && isfinite(mrv) &&
+                isfinite(mbv) && mrv > 0.0) {
+                out[i] = fmax(mrv - (3.14159265358979323846 / 2.0) * mbv, 0.0) / mrv;
+            } else {
+                out[i] = NAN;
+            }
         }
     }
 }
@@ -1254,25 +1294,32 @@ __global__ void k_tail_exotic_semivar(const long long *__restrict__ t,
                                       const int *__restrict__ sl, int nseg,
                                       int step, double *__restrict__ out)
 {
-    int s = blockIdx.x * blockDim.x + threadIdx.x;
-    if (s >= nseg) return;
+    int s = blockIdx.x;
     int start = ss[s], len = sl[s];
     TailPrefix<96> rv, dn, up;
-    for (int p = 0; p < len; ++p) {
-        int i = start + p;
-        bool rs = tail_restart(t, i, p, step);
-        double v = tail_ret1(t, close, i, step);
-        rv.push(v * v, rs);
-        dn.push(isfinite(v) && v < 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
-        up.push(isfinite(v) && v > 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
-        double mrv = rv.mean_finite();
-        double mdn = dn.mean_finite();
-        double mup = up.mean_finite();
-        if (tail_contig(t, i, 96, step) && p + 1 >= 96 && isfinite(mrv) &&
-            isfinite(mdn) && isfinite(mup) && mrv > 0.0) {
-            out[i] = (mdn - mup) / mrv;
-        } else {
-            out[i] = NAN;
+    for (int b = threadIdx.x; b * RW_BLOCK < len; b += blockDim.x) {
+        int p0 = b * RW_BLOCK;
+        int pe = min(len, p0 + RW_BLOCK);
+        rv.set_window(96);
+        dn.set_window(96);
+        up.set_window(96);
+        for (int p = tail_warm_start(p0, 1); p < pe; ++p) {
+            int i = start + p;
+            bool rs = tail_restart(t, i, p, step);
+            double v = tail_ret1(t, close, i, step);
+            rv.push(v * v, rs);
+            dn.push(isfinite(v) && v < 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
+            up.push(isfinite(v) && v > 0.0 ? v * v : (isfinite(v) ? 0.0 : NAN), rs);
+            if (p < p0) continue;
+            double mrv = rv.mean_finite();
+            double mdn = dn.mean_finite();
+            double mup = up.mean_finite();
+            if (tail_contig(t, i, 96, step) && p + 1 >= 96 && isfinite(mrv) &&
+                isfinite(mdn) && isfinite(mup) && mrv > 0.0) {
+                out[i] = (mdn - mup) / mrv;
+            } else {
+                out[i] = NAN;
+            }
         }
     }
 }
@@ -1357,19 +1404,19 @@ extern "C" int rc_tail_exotic(const long long *t, const double *high,
         k_tail_exotic_ou<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 4:
-        k_tail_exotic_acf<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        k_tail_exotic_acf<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 5:
-        k_tail_exotic_vr4<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        k_tail_exotic_vr4<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 6:
         k_tail_exotic_rskew<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 7:
-        k_tail_exotic_jump<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        k_tail_exotic_jump<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 8:
-        k_tail_exotic_semivar<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
+        k_tail_exotic_semivar<<<nseg, 32>>>(t, close, ss, sl, nseg, step, out);
         break;
     case 9:
         k_tail_exotic_cusum<<<blocks, threads>>>(t, close, ss, sl, nseg, step, out);
