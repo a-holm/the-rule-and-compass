@@ -74,6 +74,14 @@ have no evidence yet. If the current best error is at or below the search's
 solved floor (`1e-24`), confidence is **1**: there is nothing left to improve,
 even when the window contains the jump to the exact answer.
 
+The solved stop is defined per metric by `Metric::is_solved` (#402). Every
+non-negative error metric (absolute, squared, correlation forms, median,
+maximum, signed, log-squashed, rank forms, interquartile, slope, implicit,
+AUC, log loss, Brier, hinge forms) is solved when the error is at or below
+`1e-24`. AIC, AICC and BIC go negative on a good fit and the search holds only
+the criterion, not the residual sum of squares, so they are never solved: they
+stop on `patience`, `time_budget` or `generations`.
+
 ### Stability
 
 For two form sets `A` and `B`, use the Jaccard overlap

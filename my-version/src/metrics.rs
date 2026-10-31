@@ -208,9 +208,11 @@ impl Metric {
     /// True when `best_error` means the run is solved and the search may stop.
     ///
     /// Error metrics are non-negative, so solved means the error reached the
-    /// floor [`crate::progress_stats::SOLVED_ERROR`].
+    /// floor [`crate::progress_stats::SOLVED_ERROR`]. The information criteria
+    /// go negative on a good fit and the search sites hold only the criterion,
+    /// not its residual sum of squares, so they are never solved.
     pub fn is_solved(self, best_error: f64) -> bool {
-        best_error <= crate::progress_stats::SOLVED_ERROR
+        !self.is_parameter_aware() && best_error <= crate::progress_stats::SOLVED_ERROR
     }
 
     /// True for metrics that depend on the number of fitted constants.
