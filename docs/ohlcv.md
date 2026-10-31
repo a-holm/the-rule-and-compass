@@ -379,7 +379,7 @@ contains every engine name with `family`, `warmup`, `available` and its exact
 canonical producer. `feature_registry` contains one object per default-set
 column with `name`, `family`, `timeframe`, `warmup`, `available`, `derived`,
 `parity_tier`, `formula`, `formula_sha256`, `source`, `pit` and, when
-unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `unavailable` or
+unavailable, `reason`. `parity_tier` is `bitwise`, `1e-12`, `1e-6` (`ou_hl96` only), `unavailable` or
 `reference` (CPU-only reference in this change).
 Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
@@ -1059,8 +1059,9 @@ family.
 |---|---|
 | `bitwise` | SHA-256 of the raw f64 bytes is equal, no bit differs, NaN/Inf masks equal |
 | `1e-12` | NaN/Inf masks equal and `\|a-b\| <= 1e-12 * (1 + max(\|a\|,\|b\|))` |
+| `1e-6` | NaN/Inf masks equal and `\|a-b\| <= 1e-6 * (1 + max(\|a\|,\|b\|))` |
 
-`1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the two fails `every_device_column_declares_exactly_one_tier`.
+`1e-12` is declared for anything that evaluates `ln`, `sin` or `cos` (`r<k>`, `vol<w>`, `lag_r1_<k>`, `vz96`, `vol_z96`, calendar, the log-based exotic columns, the MTF `vol` leaf) and for the flow and benchmark columns named by #297 and #299. `1e-6` is declared for `ou_hl96` alone: it is `ln(1+clip(-ln2/ln(phi),0,1000))` over an AR(1) coefficient `phi = cov/var` of 96-bar window sums of `ln(C) - ln(SMA96)`. A last-bit difference between the device and the host `ln` perturbs `x` by about 1e-13 relative, the covariance cancels most of that signal, and `ln(phi)` amplifies the rest (`ou_hl96_amplifies_last_bit_close_noise_beyond_1e12` measures the CPU response to 1-ulp close noise). Elementwise geometry, min/max, ranks, MTF lookups and recurrences evaluated in the CPU order are `bitwise`. A device column whose tier is not one of the three fails `every_device_column_declares_exactly_one_tier`.
 
 The fixture has 24 symbols x 21,000 bars (476,730 rows) with holes, a 5 h and a 32 h outage (stale 1h/4h and 1d buckets), a NaN close, zero volume, `H == L`, tied returns, PIT non-member rows and fewer than 20 members before bar 3,000.
 

@@ -2238,7 +2238,8 @@ __device__ double ft_corr_score(const unsigned int *nd,
     return (metric == RC_LOSS_CORRELATION_SIGNED) ? (1.0 - rho) : (1.0 - fabs(rho));
 }
 
-/* Mask the affine gauge slots and turn the rho gradient into the objective
+/* Thread 0 only: it rewrites `jtj` and `jtr` in place and the negation is not
+ * idempotent. Mask the affine gauge slots and turn the rho gradient into the objective
  * gradient: L = 1 - sigma*rho, so ft_solve with jtr = dL gives
  * delta = -H^{-1} dL. A gauge slot gets a zero right-hand side and an identity
  * row/column, so its step is exactly zero. */
@@ -2361,8 +2362,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                             break;
                         }
                     }
-                    ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
+                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                         const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
                                                          S->sL, 0);
                         S->ssolved = (solve != 1);
@@ -2401,8 +2402,8 @@ __global__ void fit_kernel(const float *__restrict__ cols,
                         status = 2;
                         break;
                     }
-                    ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                     if (tid == 0) {
+                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
                         const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
                                                          S->sL, 0);
                         S->ssolved = (solve != 1);

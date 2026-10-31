@@ -616,8 +616,14 @@ pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
 /// `1e-12`: anything that evaluates `ln`, `sin` or `cos` (CUDA and the host
 /// libm differ in the last bit), anything derived from the 1-bar log return,
 /// and the MTF `vol` leaf. `bitwise`: elementwise geometry, min/max, lags of
-/// exact values, ranks, and recurrences evaluated in the CPU order.
+/// exact values, ranks, and recurrences evaluated in the CPU order. `1e-6`:
+/// `ou_hl96` only; its AR(1) coefficient comes from a difference of window
+/// sums of last-bit-noisy log values and enters `ln(phi)`, which amplifies
+/// the last-bit logarithm difference far beyond 1e-12.
 fn engine_device_tier(name: &str) -> &'static str {
+    if name == "ou_hl96" {
+        return "1e-6";
+    }
     let numeric = |s: Option<&str>| s.map_or(false, |r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
     let log_based = numeric(name.strip_prefix('r'))
         || numeric(name.strip_prefix("vol"))
@@ -630,7 +636,7 @@ fn engine_device_tier(name: &str) -> &'static str {
         || (is_mtf(name) && name.ends_with("_vol"))
         || matches!(
             name,
-            "ret1" | "ret5" | "vz96" | "vol_z96" | "ou_hl96" | "acf1" | "vr4" | "rskew96"
+            "ret1" | "ret5" | "vz96" | "vol_z96" | "acf1" | "vr4" | "rskew96"
                 | "jump_share" | "semivar_asym" | "cusum_abs_z" | "rmean5" | "rstd5"
         );
     if log_based {

@@ -37,9 +37,6 @@ const TOL: f64 = 1e-12;
 /// entry is `(name, measured fixture result)`. They are excluded from the main
 /// gate and asserted by `known_parity_bugs_stay_ignored`.
 const KNOWN_BUGS: &[(&str, &str)] = &[
-    ("amihud96", "flow, tier 1e-12: max rel 9.929e-1 (abs 1.635e2), first row 42074 CPU 0.171 GPU 85.46; also not prefix-causal (row 42074 GPU 85.46 full vs 4.137 after removing later rows)"),
-    ("xs_rank_amihud96", "bitwise: 13 bit mismatches, max abs 6.087e-1; ranks of the device amihud96"),
-    ("ou_hl96", "tier 1e-12: max rel 1.314e-7 (abs 1.382e-7); #298 accepted 1e-6, no matching tier"),
 ];
 
 static HEAVY: Mutex<()> = Mutex::new(());
@@ -79,8 +76,8 @@ fn tier_violations(cols: &[(String, String)]) -> Vec<String> {
     let mut out = Vec::new();
     for (name, tier) in cols {
         *seen.entry(name.as_str()).or_default() += 1;
-        if tier != "bitwise" && tier != "1e-12" {
-            out.push(format!("{name}: tier '{tier}' is not bitwise or 1e-12"));
+        if tier != "bitwise" && tier != "1e-12" && tier != "1e-6" {
+            out.push(format!("{name}: tier '{tier}' is not bitwise, 1e-12 or 1e-6"));
         }
     }
     for (name, n) in seen {
@@ -185,6 +182,13 @@ fn verdict(tier: &str, o: &Obs, cpu_sha: &str, gpu_sha: &str) -> Result<(), Stri
         "1e-12" => {
             if o.max_rel > TOL {
                 Err(format!("max relative diff {:.3e} exceeds 1e-12 (max abs {:.3e}), first {:?}", o.max_rel, o.max_abs, o.first_bad))
+            } else {
+                Ok(())
+            }
+        }
+        "1e-6" => {
+            if o.max_rel > 1e-6 {
+                Err(format!("max relative diff {:.3e} exceeds 1e-6 (max abs {:.3e})", o.max_rel, o.max_abs))
             } else {
                 Ok(())
             }
@@ -457,8 +461,14 @@ fn every_device_column_declares_exactly_one_tier() {
 
 #[test]
 fn an_undeclared_or_duplicate_column_fails_the_tier_table() {
-    let ok = vec![("a".to_string(), "bitwise".to_string()), ("b".to_string(), "1e-12".to_string())];
+    let ok = vec![
+        ("a".to_string(), "bitwise".to_string()),
+        ("b".to_string(), "1e-12".to_string()),
+        ("c".to_string(), "1e-6".to_string()),
+    ];
     assert!(tier_violations(&ok).is_empty());
+    let unknown = vec![("a".to_string(), "1e-9".to_string())];
+    assert_eq!(tier_violations(&unknown).len(), 1);
     let none = vec![("a".to_string(), "reference".to_string())];
     assert_eq!(tier_violations(&none).len(), 1);
     let empty = vec![("a".to_string(), String::new())];
@@ -484,17 +494,25 @@ fn the_verdict_enforces_each_tier() {
     assert!(verdict("bitwise", &o, &c, &g).is_err(), "a declared bitwise column that differs must fail");
     assert!(verdict("1e-12", &o, &c, &g).is_ok());
 
-    // 1e-9: fails both.
+    // 1e-9: fails 1e-12, passes 1e-6.
     let mut far = a.clone();
     far[3] += 4.0e-9;
     let (o, c, g) = observe(&a, &far);
     assert!(verdict("1e-12", &o, &c, &g).is_err());
+    assert!(verdict("1e-6", &o, &c, &g).is_ok());
+
+    // 1e-5: fails 1e-6.
+    let mut wide = a.clone();
+    wide[3] += 4.0e-5;
+    let (o, c, g) = observe(&a, &wide);
+    assert!(verdict("1e-6", &o, &c, &g).is_err());
 
     // One NaN mask mismatch fails every tier.
     let mut mask = a.clone();
     mask[2] = 0.0;
     let (o, c, g) = observe(&a, &mask);
     assert!(verdict("1e-12", &o, &c, &g).is_err());
+    assert!(verdict("1e-6", &o, &c, &g).is_err());
     assert!(verdict("bitwise", &o, &c, &g).is_err());
 
     // NaN vs Inf is a mask mismatch.
@@ -646,14 +664,12 @@ fn known_bugs_are_documented_and_registered() {
 }
 
 #[test]
-#[ignore = "bug #355: amihud96 GPU differs from CPU beyond 1e-12 (rel 9.929e-1, first row 42074 CPU 0.171 GPU 85.46) and is not prefix-causal"]
-fn bug_amihud96() {
+fn amihud96_matches_the_cpu_and_ignores_the_previous_symbol() {
     assert_known_bug_column("amihud96");
 }
 
 #[test]
-#[ignore = "bug #355: xs_rank_amihud96 ranks differ (13 rows, max abs 6.087e-1); follows amihud96"]
-fn bug_xs_rank_amihud96() {
+fn xs_rank_amihud96_is_bit_identical_to_the_cpu() {
     assert_known_bug_column("xs_rank_amihud96");
 }
 
@@ -668,9 +684,39 @@ fn ma672_matches_cpu_nan_mask_and_bits() {
 }
 
 #[test]
-#[ignore = "bug #357: ou_hl96 differs by 1.3e-7 relative; exceeds the 1e-12 tier (#298 accepted 1e-6)"]
-fn bug_ou_hl96() {
+fn ou_hl96_meets_its_1e6_tier() {
     assert_known_bug_column("ou_hl96");
+}
+
+#[test]
+fn ou_hl96_is_the_only_1e6_column() {
+    let cols: Vec<String> = device_columns().into_iter().filter(|c| c.tier == "1e-6").map(|c| c.name).collect();
+    assert_eq!(cols, vec!["ou_hl96".to_string()]);
+}
+
+#[test]
+fn ou_hl96_amplifies_last_bit_close_noise_beyond_1e12() {
+    let dir = work_dir("ou-noise");
+    let rows = fixture(6, 3_000);
+    let mut noisy = rows.clone();
+    for (i, r) in noisy.iter_mut().enumerate() {
+        if r.c.is_finite() && mix(7, i as u64) % 2 == 0 {
+            r.c = f64::from_bits(r.c.to_bits() + 1);
+        }
+    }
+    let names = vec!["ou_hl96".to_string()];
+    let run = |tag: &str, rows: &[Row]| {
+        let src = p(&dir, &format!("{tag}-in.rcsb"));
+        let out = p(&dir, &format!("{tag}-out.rcsb"));
+        write_fixture(&src, rows, 65_536);
+        enrich::build(&options(&src, &out, &names, GpuMode::Off, 65_536)).unwrap();
+        read_column(&out, "ou_hl96")
+    };
+    let (o, _, _) = observe(&run("base", &rows), &run("noisy", &noisy));
+    eprintln!("[parity] ou_hl96 CPU response to 1-ulp close noise: max rel {:.3e}", o.max_rel);
+    assert!(o.max_rel > TOL, "1-ulp noise moved ou_hl96 by only {:.3e}", o.max_rel);
+    assert!(o.max_rel < 1e-6, "1-ulp noise moved ou_hl96 by {:.3e}", o.max_rel);
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
