@@ -39,6 +39,23 @@ gh issue list --label roadmap --limit 100
 
 Run long jobs under `scripts/stall-watch.sh -- <command>`: on a stall it writes all thread backtraces to `<log>.stacks.txt` and never kills anything. Dump a live process with `scripts/stacks.sh <pid>` (the process needs `RCSR_ATTACHABLE=1`). Details: the debugging section of [`docs/issue-workflow.md`](docs/issue-workflow.md).
 
+## Workshop
+
+Recurring agent workflows are numbered pipelines with a checked contract per stage: start at [`verksted/AGENTS.md`](verksted/AGENTS.md).
+
+| Task | Go to |
+|---|---|
+| implement an issue | [`verksted/01_issue/CONTEXT.md`](verksted/01_issue/CONTEXT.md) |
+| research a hard issue | [`verksted/02_research/CONTEXT.md`](verksted/02_research/CONTEXT.md) |
+| run agents in parallel | [`verksted/03_orchestrate/CONTEXT.md`](verksted/03_orchestrate/CONTEXT.md) |
+| gate and land the integration branch | [`verksted/04_gate/CONTEXT.md`](verksted/04_gate/CONTEXT.md) |
+| diagnose a hang or a CPU/GPU delta | [`verksted/05_diagnose/CONTEXT.md`](verksted/05_diagnose/CONTEXT.md) |
+| prepare data | [`verksted/06_data/CONTEXT.md`](verksted/06_data/CONTEXT.md) |
+| run a long search | [`verksted/07_longrun/CONTEXT.md`](verksted/07_longrun/CONTEXT.md) |
+| close an issue and clean up | [`verksted/08_close/CONTEXT.md`](verksted/08_close/CONTEXT.md) |
+| report status or hand off | [`verksted/09_handoff/CONTEXT.md`](verksted/09_handoff/CONTEXT.md) |
+| protect the shared desktop | [`verksted/10_machine/CONTEXT.md`](verksted/10_machine/CONTEXT.md) |
+
 ## Non-negotiables
 
 * Every non-trivial change starts from a GitHub issue. No issue, no work.

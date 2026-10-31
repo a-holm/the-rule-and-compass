@@ -278,14 +278,18 @@ in the JSON report.
 
 `--snapshot <file>` embeds a verified archive-snapshot JSON verbatim as the
 manifest's `snapshot` block, so vendor checksums, `coverage_last` and the
-`complete` flag travel with the panel. The snapshot file is produced by the
-fetch/verify step described below; the builder rejects anything that is not a
-JSON object.
+`complete` flag travel with the panel. The snapshot file is produced by
+`rcsr-acquire verify` (README, "Acquiring the Binance Vision archive"); the builder
+rejects anything that is not a JSON object. Its fields are `source`, `market`, `interval`,
+`fetched_at`, `coverage_last`, `through`, `complete`, `files`, `verified` and an `entries` array
+with the per-zip vendor URL, HTTP status, `etag`, `last_modified`, both SHA-256 values, byte
+count and `verified` flag.
 
 ## Snapshot provenance (archive-only)
 
-The public Binance Vision monthly archive was fetched and checked against the
-vendor's sibling `.CHECKSUM` on 2026-10-21. All five samples matched:
+The public Binance Vision monthly archive is fetched with `rcsr-acquire fetch` and checked
+against the vendor sibling `.CHECKSUM` with `rcsr-acquire verify`. The reference check on
+2026-10-21 matched all five samples:
 
 | archive | bytes | vendor `Last-Modified` | SHA-256 (vendor = local) |
 |---|---:|---|---|

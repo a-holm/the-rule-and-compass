@@ -1,0 +1,46 @@
+# Default rules of `rcsr-acquire universe`. A file passed with --config replaces
+# every key it names; keys it leaves out keep these values.
+# Matching is on the base asset: the symbol without its USDT suffix.
+
+# Exact bases that are stablecoins.
+stablecoins = [
+  "USDC", "FDUSD", "TUSD", "BUSD", "DAI", "USDP", "EUR", "GBP", "AEUR", "USD1", "RLUSD",
+  "XUSD", "RWUSD", "USDE", "USDS", "PYUSD", "GUSD", "FRAX", "LUSD", "EURC", "UST", "USTC",
+  "SUSD", "BFUSD", "PAX", "HUSD", "USDN", "USDD", "USDSOLD", "USDSB", "KGST", "UIDR", "U",
+  "UUSD", "USD",
+]
+
+# Exact bases that are fiat currencies.
+fiat = [
+  "EUR", "GBP", "AUD", "TRY", "BRL", "AEUR", "EURI", "BKRW", "BIDR", "IDRT", "ARS", "COP",
+  "KZT", "MXN", "ZAR", "AED",
+]
+
+# Exact bases that are commodity tokens.
+commodities = ["PAXG", "XAUT", "XAU", "XAG", "GOLD"]
+
+# A base ending in one of these is a leveraged token, unless listed as an exception.
+leveraged_suffixes = ["UP", "DOWN", "BULL", "BEAR"]
+leveraged_exceptions = ["JUP", "SYRUP"]
+
+# Retired stablecoins, reported under their own rule in addition to any other.
+stablecoin_legacy = ["USDSOLD", "USDSB"]
+
+# Name heuristic for tokenised stocks, applied only to symbols with no entry in the
+# products file: a base that ends in B and whose prefix is an equity ticker, except for
+# the crypto bases below. Single-letter equity bases are excluded outright.
+crypto_b_bases = ["AMB", "ARB", "BNB", "BB", "BE", "DGB", "MOB", "PHB", "TRB", "VIB"]
+single_letter_equities = ["A", "C", "D", "F", "S", "T", "U", "W", "X"]
+
+# Product tags in the products file that trigger a rule.
+tag_tokenised_stock = ["bStocks"]
+tag_stablecoin = ["stablecoin"]
+tag_commodity = ["tCommodities"]
+
+# --top-by-quote-volume only: bases shorter than this and bases in top_exclude are skipped.
+top_min_base_len = 2
+top_exclude = [
+  "TSLA", "SNDK", "SOXL", "SPCX", "MU", "INTC", "CRCL", "KORU", "MSTR", "SKHY", "QQQ", "NVDA",
+  "NBIS", "SNXX", "EWWY", "AMD", "SOXS", "GOOGL", "BNC", "XAU", "XAG", "PAXG", "XAUT", "AAPL",
+  "MSFT", "AMZN", "META", "NFLX", "COIN", "SPY",
+]
