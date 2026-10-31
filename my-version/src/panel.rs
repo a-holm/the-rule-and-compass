@@ -328,9 +328,9 @@ pub fn build_panel_with_step(
     assemble_panel(rows, series)
 }
 
-type MemberIndex<'a> = BTreeMap<&'a str, Vec<&'a MembershipRow>>;
+pub(crate) type MemberIndex<'a> = BTreeMap<&'a str, Vec<&'a MembershipRow>>;
 
-fn membership_index(membership: &Membership) -> MemberIndex<'_> {
+pub(crate) fn membership_index(membership: &Membership) -> MemberIndex<'_> {
     // One sorted index per symbol: the naive `at()` scan is O(decisions) per
     // bar and turns a 665k-row build into minutes.
     let mut index: MemberIndex<'_> = BTreeMap::new();
@@ -343,7 +343,7 @@ fn membership_index(membership: &Membership) -> MemberIndex<'_> {
     index
 }
 
-fn symbol_panel_rows(
+pub(crate) fn symbol_panel_rows(
     symbol: &str,
     bars: &[Bar],
     decisions: Option<&[&MembershipRow]>,
@@ -395,7 +395,7 @@ fn assemble_panel(
 /// Assemble rows when the end of each symbol's input series is already known.
 /// A warm resumed build never reads the series, so it takes them from the part
 /// headers; the delisted set is therefore identical to the cold build's.
-fn assemble_panel_with_last(
+pub(crate) fn assemble_panel_with_last(
     mut rows: Vec<PanelRow>,
     last: &BTreeMap<String, i64>,
 ) -> Result<Panel, String> {
@@ -611,7 +611,7 @@ fn index_path(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Publish a small file atomically (`tmp` + rename).
-fn publish_text(path: &std::path::Path, text: &str) -> Result<(), String> {
+pub(crate) fn publish_text(path: &std::path::Path, text: &str) -> Result<(), String> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -1188,7 +1188,7 @@ pub fn provenance_json_with(
     s
 }
 
-fn date(ts: i64) -> String {
+pub(crate) fn date(ts: i64) -> String {
     let (y, m, d) = ohlcv::civil_from_days(ts.div_euclid(86_400));
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
@@ -1529,7 +1529,7 @@ pub fn parse_migrations(s: &str) -> Result<Vec<Migration>, String> {
     Ok(out)
 }
 
-fn read_table(path: &str) -> Result<Table, String> {
+pub(crate) fn read_table(path: &str) -> Result<Table, String> {
     if store::is_store_path(path) {
         store::FileStore::open(path)?.to_table()
     } else {
@@ -1544,6 +1544,15 @@ pub fn run(args: &[String]) -> ! {
         std::process::exit(0);
     }
     let cmd = args[0].as_str();
+    // #259: the hourly v2 pipeline. `build` switches to it when `--data` is a
+    // v2 base store (it carries `cov15m`).
+    let v2_build = cmd == "build"
+        && args
+            .windows(2)
+            .any(|w| w[0] == "--data" && crate::panel_v2::is_base_store(&w[1]));
+    if matches!(cmd, "snapshot" | "base" | "validate") || v2_build {
+        crate::panel_v2::cli(cmd, &args[1..]);
+    }
     let mut data = None;
     let mut membership_path = None;
     let mut out = None;
@@ -1557,6 +1566,10 @@ pub fn run(args: &[String]) -> ! {
     let mut resume: Option<String> = None;
     let mut membership_cache: Option<String> = None;
     let mut snapshot_path: Option<String> = None;
+    let mut strict = false;
+    let mut relists: Vec<(String, i64)> = Vec::new();
+    let mut jump_factor = 5.0f64;
+    let mut listing_gap_days = 30i64;
     let mut i = 1usize;
     while i < args.len() {
         let val = |i: usize| -> String {
@@ -1629,6 +1642,19 @@ pub fn run(args: &[String]) -> ! {
             }
             "--cache" => {
                 membership_cache = Some(val(i));
+                i += 1;
+            }
+            "--strict" => strict = true,
+            "--relist" => {
+                relists.extend(crate::panel_v2::parse_relists(&val(i)).unwrap_or_else(|e| fail(&e)));
+                i += 1;
+            }
+            "--jump-factor" => {
+                jump_factor = val(i).parse().unwrap_or(jump_factor);
+                i += 1;
+            }
+            "--listing-gap-days" => {
+                listing_gap_days = val(i).parse().unwrap_or(listing_gap_days);
                 i += 1;
             }
             "--snapshot" => {
@@ -1876,11 +1902,31 @@ pub fn run(args: &[String]) -> ! {
                     c.old, c.new, c.measured_ratio, c.declared_k, c.pass, c.reason
                 );
             }
-            for j in level_jumps(&series, 5.0) {
-                println!("# panel: jump {} at {} ratio={:.4}", j.symbol, date(j.at), j.ratio);
+            let mut undeclared = 0usize;
+            for j in level_jumps(&series, jump_factor) {
+                let wanted: Vec<i64> = relists.iter().filter(|(s, _)| *s == j.symbol).map(|(_, t)| *t).collect();
+                let prev = series.get(&j.symbol).and_then(|b| {
+                    let k = b.partition_point(|x| x.time < j.at);
+                    k.checked_sub(1).map(|k| b[k].time)
+                });
+                let declared = crate::panel_v2::jump_declared(prev, j.at, &wanted, listing_gap_days);
+                undeclared += !declared as usize;
+                println!(
+                    "# panel: jump {} at {} ratio={:.4} declared={}",
+                    j.symbol,
+                    date(j.at),
+                    j.ratio,
+                    declared
+                );
             }
             for (s, t, n) in long_gaps(&series, 7) {
                 println!("# panel: gap {} at {} missing_days={}", s, date(t), n);
+            }
+            if strict && undeclared > 0 {
+                fail(&format!(
+                    "{} undeclared level jump(s); declare the break with --relist SYMBOL@DATE",
+                    undeclared
+                ));
             }
         }
         "cost" => {
@@ -1911,7 +1957,7 @@ pub fn run(args: &[String]) -> ! {
     std::process::exit(0);
 }
 
-fn read_membership(path: &str) -> Result<Membership, String> {
+pub(crate) fn read_membership(path: &str) -> Result<Membership, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
     let mut rows = Vec::new();
     let mut as_ofs = BTreeSet::new();
@@ -1952,7 +1998,7 @@ fn fail(msg: &str) -> ! {
     std::process::exit(3);
 }
 
-fn jstr(s: &str) -> String {
+pub(crate) fn jstr(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
         match c {
@@ -2002,11 +2048,32 @@ BUILD / AUDIT:
                           only (no 1.5 GB parse) and prints the resume line
   --snapshot <json>       embed a verified archive-snapshot manifest verbatim
                           under the panel manifest's `snapshot` block
+  --strict               audit: exit 3 on a level jump that is not declared (--relist) or
+                          a listing break (gap over --listing-gap-days, default 30)
 
 `build` refuses 2026H2 by default. Every row is a real bar: delisted symbols
 stop at their last bar, listings start at their first, and no value is
 forward-filled across a listing/delisting/migration boundary. `audit` reports
 splices, level jumps, long gaps, per-year symbol counts and delisted names.
+
+HOURLY V2 PANEL (#259):
+  rcsr panel snapshot --input raw_15m_all --out snapshot.json [--jobs n]
+  rcsr panel base --input raw_15m_all --out base_h1.rcsb [options]
+  rcsr panel build --data base_h1.rcsb --membership membership.csv --out panel.rcsb [options]
+  rcsr panel validate --data panel.rcsb [--base base_h1.rcsb] [--membership membership.csv]
+  --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
+  --jobs <n>              parallel symbols for snapshot and base (default 1)
+  --require-full-bucket   base: drop an hour with fewer than four 15m bars (default)
+  --keep-partial          base: keep it with cov15m 1-3 and the PARTIAL_BUCKET flag
+  --interval <15m|1m>     base: archive interval; 1m only reaches the lockbox guard
+  --resume <dir>          base: per-symbol cache keyed by the archive SHA-256
+  --relist SYMBOL@DATE    build: declare a listing break (repeatable, comma list)
+  --listing-gap-days <n>  build: a longer gap between two bars starts a new listing (30)
+  --jump-factor <x>       build: undeclared open/previous-close ratio that fails (5)
+  --outage-share <x>      build: share of the cross-section missing for a venue outage (0.5)
+  --replay <n>            validate: prefix-causality cuts (3)
+  `build` uses the v2 builder when --data has a cov15m column. `validate` exits 3
+  when a check fails. A 2026H2 archive or row is refused without --allow-lockbox.
 "
         .to_string()
 }

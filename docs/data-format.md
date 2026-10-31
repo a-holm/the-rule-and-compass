@@ -244,6 +244,8 @@ keeps the feature phase well below the final table; the peak is the assembly
 table itself. The output checksum is computed in 1 MiB chunks, so hashing a
 multi-gigabyte store does not add it to RSS.
 
+`rcsr prep` sums the flows of duplicate instants and resamples whatever bars fall in a bucket. That is a general importer. It is not the policy of the default hourly panel: a four-copy month would quadruple volume, and a one-bar hour would look complete. The hourly panel uses `rcsr panel base` instead (duplicates collapse when identical, partial hours are dropped, `cov15m`, `flags`, `dup_rows` and `archive_unit` are stored). See [`panel.md`](panel.md#default-hourly-panel-v2-259).
+
 ### Resumable, checksum-keyed parts
 
 ```sh

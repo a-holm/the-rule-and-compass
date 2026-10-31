@@ -268,7 +268,7 @@ pub fn json() -> String {
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout; gpu.fallback_columns lists the name and failing path of every column the device left to the CPU; timing.feature_s is partitioned on the host thread into timing.feature_read_s, feature_context_s, feature_gpu_s, gpu.write_s, feature_cpu_s and feature_other_s (feature_other_s is the non-negative remainder); gpu.kernel_s, h2d_s and d2h_s are device-busy measures that may overlap that timeline\"}}]}},\n  \
-         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, canaries, costs and the 2026H2 lockbox\",\"options\":[\
+         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, hourly v2 panel (snapshot, base, build, validate), canaries, costs and the 2026H2 lockbox\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
 {{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership CSV or panel .rcsb\"}},\
@@ -284,6 +284,17 @@ pub fn json() -> String {
 {{\"name\":\"--end\",\"type\":\"time\",\"default\":\"panellast\",\"description\":\"explicit evaluated range end; checked against the lockbox\"}},\
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit an explicitly evaluated 2026H2 range\"}},\
 {{\"name\":\"--resume\",\"type\":\"path\",\"default\":\"none\",\"description\":\"resumable build cache: one atomic binary .part per symbol keyed by the store SHA-256 and the membership; a fully warm run reads the parts only\"}},\
+{{\"name\":\"--input\",\"type\":\"path\",\"default\":\"none\",\"description\":\"snapshot and base: archive directory of monthly 15m ZIPs\"}},\
+{{\"name\":\"--jobs\",\"type\":\"int\",\"default\":\"1\",\"description\":\"snapshot and base: parallel symbols\"}},\
+{{\"name\":\"--require-full-bucket\",\"type\":\"flag\",\"default\":\"true\",\"description\":\"base: drop an hour with fewer than four 15m bars\"}},\
+{{\"name\":\"--keep-partial\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"base: keep a partial hour with cov15m 1-3 and the PARTIAL_BUCKET flag\"}},\
+{{\"name\":\"--interval\",\"type\":\"enum\",\"default\":\"15m\",\"description\":\"base: 15m | 1m (1m only reaches the lockbox guard)\"}},\
+{{\"name\":\"--base\",\"type\":\"path\",\"default\":\"none\",\"description\":\"validate: base store for V3 and V7\"}},\
+{{\"name\":\"--relist\",\"type\":\"string\",\"default\":\"none\",\"description\":\"build: SYMBOL at DATE listing break declared by hand\"}},\
+{{\"name\":\"--listing-gap-days\",\"type\":\"int\",\"default\":\"30\",\"description\":\"build: a longer gap between two bars starts a new listing\"}},\
+{{\"name\":\"--jump-factor\",\"type\":\"float\",\"default\":\"5\",\"description\":\"build: undeclared open/previous-close ratio that fails the build\"}},\
+{{\"name\":\"--outage-share\",\"type\":\"float\",\"default\":\"0.5\",\"description\":\"build: share of the cross-section missing for a venue outage\"}},\
+{{\"name\":\"--replay\",\"type\":\"int\",\"default\":\"3\",\"description\":\"validate: prefix-causality cuts\"}},\
 {{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}}]}},\n  \
          \"dev_log\":{{\"schema\":\"rcsr-devlog/1\",\"version\":1,\"flag\":\"--dev-log\",\"default\":\"on (summary level)\",\"levels\":[\"summary\",\"full\"],\"default_path\":\"rcsr.dev.ndjson next to --json-out/--save, else the working directory\",\"disable\":\"--no-dev-log\",\"cadence\":\"summary clamp(generations/10,10,25), full 1; --dev-log-every overrides\",\"analyzer\":\"rcsr dev-report <log>\",\"events\":[\"run_start\",\"generation\",\"checkpoint\",\"run_end\"],\"atomic\":\"one complete line per write to an O_APPEND file; a killed run leaves a valid prefix\",\"bounded\":\"--dev-log-max-bytes caps generation and checkpoint events; run_start and run_end are always written\",\"trajectory\":\"the log is a reading: the archive, results and config hash are byte-identical with it on and off\",\"privacy\":\"counts, timings, hashes and error statistics only; no raw rows or personal data\",\"doc\":\"docs/dev-log.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
