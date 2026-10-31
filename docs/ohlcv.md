@@ -370,8 +370,10 @@ expanded panel. It is the union of:
   (`enrich::engine_names()`), emitted by the same command plus `compact`;
 * the 36 multi-timeframe columns (`--features mtf`), which are
   `available:true` with a tested causal join;
-* cross-sectional market-state/rank and reserved derivative columns, which
-  remain `available:false` with an explicit dependency.
+* the 45 `cross` columns (#273: benchmark joins, market state, breadth, dispersion,
+  average correlation, ranks), which are `available:true`;
+* the reserved derivative columns, which are the only `available:false` entries
+  and carry an explicit dependency.
 
 `rcsr schema` prints two machine-readable inventories. `engine_catalogue`
 contains every engine name with `family`, `warmup`, `available` and its exact
