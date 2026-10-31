@@ -1304,7 +1304,8 @@ __global__ void k_tail_exotic_cusum(const long long *__restrict__ t,
         if (isfinite(z)) acc += z;
         cs_ring.push(acc);
         if (tail_contig(t, i, 96, step) && p >= 96) {
-            double old = cs_ring.back(96);
+            bool run_starts = t[i - 95] - t[i - 96] != (long long)step;
+            double old = run_starts ? 0.0 : cs_ring.back(96);
             out[i] = fabs(acc - old) / sqrt(96.0);
         } else {
             out[i] = NAN;
