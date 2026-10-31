@@ -299,8 +299,8 @@ Rules:
 
 * **Never run `cargo build`, `cargo test` or `rcsr-bench` while another one is
   running.** Look first (`ps -eo pcpu,args | grep -E 'cargo|rustc'`), then wait.
-* Builds run in a build slot: up to 3 concurrent machine-wide, at nice 19 and
-  ionice idle, only while MemAvailable is at least 8 GiB and the `PAUSE` file is
+* Builds run in a build slot: up to 3 concurrent machine-wide (1 while the desktop
+  streams), only while MemAvailable is at least 8 GiB and the `PAUSE` file is
   absent. Builds use the CPU only:
 
   ```sh
@@ -314,6 +314,17 @@ Rules:
   /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
     'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
   ```
+
+* Both scripts run the command under SCHED_IDLE (`chrt -i 0`), nice 19 and ionice
+  idle, so the desktop gets all the CPU it wants. While the desktop streams video
+  (`/mnt/lager/tmp/opencode/desktop-busy.sh` exits 0: the GPU video decoder or
+  encoder is busy, or the file `/mnt/lager/tmp/opencode/STREAMING` exists) both pin
+  work to CPUs 2,3,6,7, the build slots drop to 1 and `RUST_TEST_THREADS=4`.
+  Otherwise 3 build slots on all CPUs. Never work around the lock, SCHED_IDLE or
+  the pinning.
+
+* A Claude Code hook blocks any Bash command that invokes `python` or `pip` in
+  this repository.
 
 * Ticket tests are minimal: only the tests a change adds or touches. The one
   full test (gate plus large-store arms) runs once on the integration branch,
