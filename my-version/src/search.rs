@@ -1017,6 +1017,7 @@ impl GpuSearch {
                                 crate::fit::note_gpu_fit(true);
                                 continue;
                             }
+                            crate::fit::Verdict::NonFinite => FitFallbackCause::NonFinite,
                             crate::fit::Verdict::Rejected if cfg.metric == Metric::LogLoss => {
                                 FitFallbackCause::LogLossWorse
                             }
