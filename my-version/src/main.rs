@@ -235,6 +235,9 @@ DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   --lockbox <START,END>      declared locked test for the run.json `lockbox` object (UTC,
                              half-open; default 2026-07-01,2027-01-01)
   --ledger <file>            candidate ledger whose locked reads run.json counts
+  --arm <name>              ablation arm label; run.json gains an `ablation` object with the arm,
+                             the SHA-256 of the ordered variable list, the generation budget and
+                             the generations reached
   --target-spec <file>       declared target spec (rcsr-target-spec/1 JSON; default
                              <data stem>.targets.json when it has an entry for the
                              target). The engine then: refuses a label whose
@@ -1934,6 +1937,13 @@ fn main() {
     if args.first().map(|s| s.as_str()) == Some("protocol") {
         rcsr::protocol::run(&args[1..]);
     }
+    // #266: long-only baseline ladder and add-one-family ablation.
+    if args.first().map(|s| s.as_str()) == Some("ladder") {
+        rcsr::ladder::run(&args[1..]);
+    }
+    if args.first().map(|s| s.as_str()) == Some("ablation") {
+        rcsr::ablation::run(&args[1..]);
+    }
     // #124: a reusable Rust walk-forward evaluator over the column store.
     if matches!(
         args.first().map(|s| s.as_str()),
@@ -2055,6 +2065,8 @@ fn main() {
     // #264: declared locked test and the ledger whose reads run.json counts.
     let mut lockbox_arg: Option<String> = None;
     let mut ledger_arg: Option<String> = None;
+    // #266: ablation arm label recorded in the run report.
+    let mut arm_arg: Option<String> = None;
     // #254: declared target spec and the structural-term override.
     let mut target_spec_path: Option<String> = None;
     let mut allow_target_structure = false;
@@ -2345,6 +2357,7 @@ fn main() {
             "--allow-interpolate" => allow_interpolate = true,
             "--lockbox" => lockbox_arg = Some(val!()),
             "--ledger" => ledger_arg = Some(val!()),
+            "--arm" => arm_arg = Some(val!()),
             "--allow-lockbox" => allow_lockbox = true,
             "--target-spec" => target_spec_path = Some(val!()),
             "--allow-target-structure" => allow_target_structure = true,
@@ -6610,6 +6623,17 @@ fn main() {
                     "{}\"objective\":{},",
                     backend_json,
                     rep.json(outcome.backend.name(), backend_reason.as_deref())
+                ),
+                None => backend_json,
+            };
+            let backend_json = match &arm_arg {
+                Some(arm) => format!(
+                    "{}\"ablation\":{{\"arm\":{},\"feature_list_sha256\":{},\"generation_budget\":{},\"generations_run\":{}}},",
+                    backend_json,
+                    jstr(arm),
+                    jstr(&rcsr::ablation::feature_list_sha256(&vars)),
+                    cfg.generations,
+                    outcome.generations
                 ),
                 None => backend_json,
             };
