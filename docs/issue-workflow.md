@@ -35,6 +35,9 @@ traceable, reviewable and parallel-safe.
 8. Merge with **squash**, then remove the worktree and delete the branch.
 9. Never commit build output, datasets or local scratch. Keep `worktrees/`,
    `target/` and local-only directories out of git (they already are).
+10. **Rust only.** No Python files, no `python3` calls in tests, scripts, docs or
+    workflows. Experiments, reference computations, fixtures and measurement
+    tools are written in Rust. The guard is `my-version/tests/no_python.rs`.
 
 ---
 

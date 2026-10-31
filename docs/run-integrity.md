@@ -90,7 +90,7 @@ is never interleaved with progress in the same file.
 A launcher should:
 
 * choose `(label, seed)` and derive the numeric seed with a **stable** hash —
-  never Python's salted `hash(label)`;
+  never a per-process salted hash;
 * state the backend explicitly (`--gpu` or `--cpu`), even when CPU is the
   default, and pass the same one on resume;
 * record the exact command line and the resolved seed;
@@ -107,7 +107,7 @@ Two tracked examples implement the contract:
 * [`scripts/run-long.sh`](../scripts/run-long.sh) — one uninterrupted or
   resumed run; requires `--gpu`/`--cpu` and writes a manifest, atomic result,
   command record, progress log and a per-label development log.
-* [`scripts/launch-windows.py`](../scripts/launch-windows.py) — several
+* [`rcsr-launch`](../my-version/src/bin/rcsr_launch.rs) (`my-version/target/release/rcsr-launch`) — several
   walk-forward windows; derives `SHA-256(label:seed)`, reuses the same backend
   on resume, and writes one manifest/log/result set per window. `--dry-run`
   prints the resolved commands without searching.
@@ -117,16 +117,13 @@ directory are **retired**. Their classification and the Rust command that
 replaces each one are in
 [`python-pipeline-retirement.md`](python-pipeline-retirement.md); one-off probes
 are archived under `pilot/archive/` and must not be used. In particular, do not
-resume a long run with them (`hash(label)` seeds, `/dev/null` stderr, plain
+resume a long run with them (per-process salted seeds, `/dev/null` stderr, plain
 `--json` redirected to a file without a manifest). Use the tracked launchers
-above, or the `rcsr walkforward` command directly. The tracked
-`scripts/launch-windows.py` is the one remaining Python helper; it already
-follows the contract (SHA-256 seeds, explicit backend, manifest, atomic JSON,
-progress log) and is scheduled for a shell/Rust replacement as a separate
-follow-up, not as part of the data pipeline.
+above, or the `rcsr walkforward` command directly. The repository contains no Python; `my-version/tests/no_python.rs` fails on a
+tracked `.py` file or a `python` shebang.
 
 `my-version/tests/launchers.rs` enforces the contract on every tracked
-`scripts/*.sh`/`*.py`: no `DEVNULL`, no Python `hash(`, an explicit backend, and
+`scripts/*.sh` and on `rcsr-launch`: no `DEVNULL`, an explicit backend, and
 `--run-manifest`/`--json-out`/`--progress`. It also runs `run-long.sh`
 end-to-end and checks the manifest with `rcsr verify-manifest`.
 
@@ -138,7 +135,7 @@ run (the "10-hour run"):
 1. **Launch** with an explicit backend, a manifest, an atomic result, a
    checkpoint and a per-run development log:
    `scripts/run-long.sh ... --gpu` (or the per-window
-   `scripts/launch-windows.py`).
+   `rcsr-launch`).
 2. **Watch** the development log instead of an external monitor:
    `tail -f runs/<label>.dev.ndjson` shows a summary event every 10–25
    generations (error, front size, phase times, fit/GPU/fallback counts, GPU
