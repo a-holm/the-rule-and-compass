@@ -2730,3 +2730,58 @@ fn engine_inventory_is_causal_on_a_prefix() {
     }
 }
 
+
+fn prefix_differs(full: &[f64], prefix: &[f64], cut: usize) -> bool {
+    (0..cut).any(|i| {
+        full[i].is_nan() != prefix[i].is_nan()
+            || (full[i].is_finite() && (full[i] - prefix[i]).abs() > 1e-12)
+    })
+}
+
+/// Negative control for `engine_inventory_is_causal_on_a_prefix`: a column
+/// whose row `i` holds the value of row `i + 1` reads a future bar, and the
+/// same prefix comparison must flag every engine column that varies.
+#[test]
+fn engine_inventory_future_shift_is_caught_by_the_prefix_check() {
+    let dir = tmp_dir("engine_causal_neg");
+    let full = dir.join("full.rcsb").to_string_lossy().into_owned();
+    let prefix = dir.join("prefix.rcsb").to_string_lossy().into_owned();
+    let full_out = dir.join("full_out.rcsb").to_string_lossy().into_owned();
+    let prefix_out = dir.join("prefix_out.rcsb").to_string_lossy().into_owned();
+    let n = 3400usize;
+    let cut = 3200usize;
+    let mut rows = wavy_rows("AAA", n, 0, 900, 0.0);
+    rows.extend(wavy_rows("BTCUSDT", n, 0, 900, 1.3));
+    let mut short = wavy_rows("AAA", cut, 0, 900, 0.0);
+    short.extend(wavy_rows("BTCUSDT", cut, 0, 900, 1.3));
+    write_store_with_flow(&full, &rows, 128);
+    write_store_with_flow(&prefix, &short, 128);
+    let spec = "all,py15m,ta:full,exotic:cheap,cross:btc,compact";
+    enrich::build(&opts(&full, &full_out, spec)).unwrap();
+    enrich::build(&opts(&prefix, &prefix_out, spec)).unwrap();
+    let input_names = FileStore::open(&full).unwrap().header().names();
+    let names = FileStore::open(&full_out).unwrap().header().names();
+    let (mut checked, mut missed) = (0usize, Vec::new());
+    for name in names.iter().skip(input_names.len()) {
+        let a = column(&full_out, name);
+        let b = column(&prefix_out, name);
+        assert!(!prefix_differs(&a, &b, cut), "{name}: the causal column must pass");
+        let mut leaked = a.clone();
+        for i in 0..cut {
+            leaked[i] = a[i + 1];
+        }
+        let varies = (0..cut).any(|i| {
+            a[i].is_nan() != a[i + 1].is_nan()
+                || (a[i].is_finite() && (a[i] - a[i + 1]).abs() > 1e-12)
+        });
+        if !varies {
+            continue;
+        }
+        checked += 1;
+        if !prefix_differs(&leaked, &b, cut) {
+            missed.push(name.clone());
+        }
+    }
+    assert!(checked > 100, "only {checked} engine columns exercised");
+    assert!(missed.is_empty(), "future-shifted columns not detected: {missed:?}");
+}
