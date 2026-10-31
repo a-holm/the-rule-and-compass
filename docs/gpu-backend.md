@@ -220,9 +220,11 @@ in shared memory and written once per expression.
 
 **Branchless operators, matched semantics.** Division, `log`, `sqrt`, `tan` and
 `pow` use the *same* domain guards as the host evaluator, expressed as predicated
-selects rather than branches. Anything non-finite, or larger than a shared
-magnitude limit of 1e30, counts as a hard failure on **both** sides — so the
-GPU and CPU agree on which candidates are hopeless.
+selects rather than branches. The legacy f32 SSE evaluator (`eval_batch`,
+`eval_pool`) and its host reference `cpu_sse` count a non-finite prediction, or
+one above a shared magnitude limit of 1e30, as a hard failure on **both** sides.
+The native score paths use the rule in "Large predictions and overflowing
+residuals (#422)" instead.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
@@ -494,11 +496,20 @@ squared error:
 The device kernel uses a fixed reduction tree, ascending row order and no
 floating-point atomics, so the same candidate scores identical bits alone or in
 a batch of 7 or 447. `maximum` compares the IEEE-754 bits of `|r|` and breaks an
-exact tie on the lowest row. A non-finite prediction (or one above the same
-`1e30` hard-magnitude limit used elsewhere) returns **`+inf` with status 2**,
-never the old finite `1e30/n`. `score_batch`/`score_pool` return `f64` values
+exact tie on the lowest row. A non-finite prediction returns **`+inf` with
+status 2**, never the old finite `1e30/n`; a finite prediction of any magnitude
+is scored (see below). `score_batch`/`score_pool` return `f64` values
 plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
+
+**Large predictions and overflowing residuals (#422).** The device follows the CPU scorer (`metrics::score_weighted`) exactly. There is no magnitude limit on the native score paths.
+
+* A prediction that is not finite on a row with positive weight scores `+inf` (status 2, `None` on the order-statistic paths). Nothing else does.
+* A finite prediction of any magnitude is scored. The f32 score kernels (`score_kernel`, `score_step`, the row-range and classification kernels) widen the f32 prediction to `f64` before the residual, so a residual cannot overflow there. A prediction that overflows the f32 range is `inf` in the kernel and is therefore `+inf`, because the f32 program cannot represent it. The CPU gives the same `+inf` when it scores those f32 rows.
+* The exact `f64` order-statistic paths (`median`, `maximum`, `interquartile`, sort and select) form `pred - y` in `f64`. A residual that overflows keys as `+inf`, the largest finite-or-infinite key, so the maximum is `+inf`, the median ignores it unless it is the middle key, and the interquartile mean is `+inf` only when the window holds it. A NaN residual (a NaN target) marks the segment non-finite.
+* The legacy f32 SSE evaluator (`eval_batch`, `eval_pool`, `cpu_sse`) keeps its 1e30 hard-failure limit. It serves the fit and test APIs, not scoring.
+
+`gpu::tests::large_finite_predictions_score_like_the_cpu`, `gpu::classification_parity_tests::large_finite_predictions_score_like_the_cpu` and `gpu::order_select_tests::large_predictions_and_overflowing_residuals_match_the_cpu` pin the rule for every native metric, with repeat bit identity.
 
 `median`, `interquartile`, `rank_correlation`, `rank_correlation_signed` and
 `auc` are `ScoreDispatch::Exact` rows of the same table (#288): they are scored
@@ -675,8 +686,8 @@ one or two order statistics, so they do not need the sort.
   negative, so the unsigned bit order is the numeric order; `fabs` maps `−0.0`
   to `+0.0` like the CPU's `f64::abs`, and subnormals and `f64::MAX` order as
   plain bits. Both paths call one row-key function (`md_row_key`), so a
-  non-finite prediction or residual (and `|pred| > 1e30`) marks the segment
-  non-finite on both, which scores `+inf` like the CPU.
+  non-finite prediction or a NaN residual marks the segment non-finite on both,
+  which scores `+inf` like the CPU. A residual that overflows keys as `+inf`.
 * **Passes** (`src/cuda/radix_select.h`). Six 11-bit digits, high to low. Every
   segment is spread over many blocks (grid `(segments, blocks per segment)`).
   Pass 0 is fused into the prediction sweep; later passes read the key buffer
