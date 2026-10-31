@@ -1568,6 +1568,9 @@ pub struct SplitSpec {
     /// #254: the target spec's scale column. Its raw values for the prepared
     /// rows are returned in [`Prepared::target_scale`].
     pub scale_column: Option<String>,
+    /// #263: the columns a long/flat P&L objective reads. `None` builds no
+    /// trading rows.
+    pub trading: Option<TradingColumns>,
 }
 
 impl Default for SplitSpec {
@@ -1587,6 +1590,7 @@ impl Default for SplitSpec {
             allow_lockbox: false,
             purge_seconds: None,
             scale_column: None,
+            trading: None,
         }
     }
 }
@@ -1683,9 +1687,37 @@ pub struct Prepared {
     /// #257: raw time keys of the prepared rows, aligned with the samples.
     /// `None` without a time column.
     pub keys: Option<RowKeys>,
+    /// #263: time, group, return and funding of the validation and test rows.
+    pub trading: Option<TradingSplit>,
     /// Adjacent-row pairs of every sample (see [`Sample::pairs`]), kept so the
     /// `slope` metric can adopt them through [`Prepared::require_slope_pairs`].
     pub slope_pairs: SlopePairs,
+}
+
+/// Columns of the long/flat P&L book (#263).
+#[derive(Clone, Debug, Default)]
+pub struct TradingColumns {
+    /// Per-row simple or log return realised by a long position. `None`
+    /// uses the target column itself.
+    pub return_column: Option<String>,
+    /// The return column holds log returns; they are converted to simple
+    /// returns (`exp_m1`).
+    pub log_returns: bool,
+    pub funding_column: Option<String>,
+}
+
+/// One slice of the trading rows, aligned with the sample rows.
+#[derive(Clone, Debug, Default)]
+pub struct TradingSlice {
+    pub rows: crate::trading::TradingRows,
+    pub ret: Vec<f64>,
+}
+
+/// Trading rows of the validation slice and the pooled test block (#263).
+#[derive(Clone, Debug, Default)]
+pub struct TradingSplit {
+    pub validation: Option<TradingSlice>,
+    pub test: TradingSlice,
 }
 
 /// The pair lists of [`Prepared`]'s samples, in the order of each sample.
@@ -3303,6 +3335,18 @@ fn prepare_full_targets_weighted_inner(
             test: pick(&test_idx),
         }
     });
+    let trading = match &spec.trading {
+        Some(cols) => Some(build_trading(
+            cols,
+            spec,
+            filtered,
+            &validation_idx,
+            &test_idx,
+            validation.as_ref(),
+            &test,
+        )?),
+        None => None,
+    };
     let slope_pairs = {
         let order = spec.time_col.map(|tc| sorted_by(&time_keys(filtered, tc)));
         let groups = spec.group_col.map(|gc| group_ids(filtered, gc).0);
@@ -3322,6 +3366,7 @@ fn prepare_full_targets_weighted_inner(
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
         keys,
+        trading,
         slope_pairs,
         target_scale,
         train,
@@ -4247,6 +4292,69 @@ fn sorted_by(keys: &TimeKeys) -> Vec<usize> {
     let mut order: Vec<usize> = (0..keys.len()).collect();
     order.sort_by(|&a, &b| keys.cmp(a, b).then(a.cmp(&b)));
     order
+}
+
+/// Time, group, return and funding of the validation and test rows (#263).
+fn build_trading(
+    cols: &TradingColumns,
+    spec: &SplitSpec,
+    filtered: &Table,
+    validation_idx: &[usize],
+    test_idx: &[usize],
+    validation: Option<&Sample>,
+    test: &Sample,
+) -> Result<TradingSplit, String> {
+    let tc = spec
+        .time_col
+        .ok_or("a P&L objective needs a time column (--time <col>)")?;
+    let time = time_keys(filtered, tc).to_f64();
+    let group: Vec<u64> = match spec.group_col {
+        Some(gc) => group_ids(filtered, gc).0.into_iter().map(|g| g as u64).collect(),
+        None => vec![0u64; filtered.len()],
+    };
+    let numeric = |name: &str, what: &str| -> Result<Vec<f64>, String> {
+        let j = filtered
+            .index_of(name)
+            .map_err(|e| format!("{} column: {}", what, e))?;
+        if !filtered.numeric[j] {
+            return Err(format!("{} column '{}' is not numeric", what, name));
+        }
+        Ok(filtered.col(j).to_vec())
+    };
+    let ret_col = match &cols.return_column {
+        Some(name) => Some(numeric(name, "return")?),
+        None => None,
+    };
+    let fund_col = match &cols.funding_column {
+        Some(name) => Some(numeric(name, "funding")?),
+        None => None,
+    };
+    let slice = |idx: &[usize], sample: &Sample| -> TradingSlice {
+        let ret: Vec<f64> = match &ret_col {
+            Some(c) => idx.iter().map(|&i| c[i]).collect(),
+            None => sample.y.clone(),
+        };
+        let ret = if cols.log_returns {
+            ret.into_iter().map(f64::exp_m1).collect()
+        } else {
+            ret
+        };
+        TradingSlice {
+            rows: crate::trading::TradingRows {
+                time: idx.iter().map(|&i| time[i]).collect(),
+                group: idx.iter().map(|&i| group[i]).collect(),
+                funding: match &fund_col {
+                    Some(c) => idx.iter().map(|&i| c[i]).collect(),
+                    None => Vec::new(),
+                },
+            },
+            ret,
+        }
+    };
+    Ok(TradingSplit {
+        validation: validation.map(|v| slice(validation_idx, v)),
+        test: slice(test_idx, test),
+    })
 }
 
 /// Comparable ordering key for every row of a time column.

@@ -1607,19 +1607,19 @@ fn ln_factorial(n: usize) -> f64 {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default)]
-struct Stats {
-    rows: usize,
-    active: usize,
-    hits: usize,
-    wins: usize,
-    losses: usize,
-    win_sum: f64,
-    loss_sum: f64,
-    total_cost: f64,
-    total_abs_delta: f64,
-    trades: usize,
-    entries: usize,
-    exits: usize,
+pub(crate) struct Stats {
+    pub(crate) rows: usize,
+    pub(crate) active: usize,
+    pub(crate) hits: usize,
+    pub(crate) wins: usize,
+    pub(crate) losses: usize,
+    pub(crate) win_sum: f64,
+    pub(crate) loss_sum: f64,
+    pub(crate) total_cost: f64,
+    pub(crate) total_abs_delta: f64,
+    pub(crate) trades: usize,
+    pub(crate) entries: usize,
+    pub(crate) exits: usize,
 }
 
 impl Stats {
@@ -1763,6 +1763,44 @@ impl CrossSection {
 /// `score == threshold` is flat.
 pub fn position_for(score: f64, threshold: f64) -> f64 {
     trading_gpu::long_position(score, threshold) as f64
+}
+
+/// The scalar long-only evaluator on explicit rows: the reference that
+/// `trading::evaluate` must reproduce bit for bit under the plain threshold
+/// rule.
+pub fn reference_metrics(
+    time: &[f64],
+    group: &[u64],
+    target: &[f64],
+    scores: &[f64],
+    threshold: f64,
+    cost_side: f64,
+    periods_per_year: f64,
+) -> Metrics {
+    let rows: Vec<RowBase> = (0..time.len())
+        .map(|i| RowBase {
+            time: time[i],
+            group: group[i],
+            target: target[i],
+        })
+        .collect();
+    let mut previous: HashMap<u64, f64> = HashMap::new();
+    evaluate_window(
+        &rows,
+        scores,
+        threshold,
+        cost_side,
+        periods_per_year,
+        &mut previous,
+        Policy::Threshold,
+        0.0,
+        1,
+        false,
+        false,
+        None,
+        false,
+    )
+    .metrics
 }
 
 /// `previous` carries each group's last position. Pass a fresh map for a
@@ -2173,7 +2211,7 @@ fn evaluate_window(
     }
 }
 
-fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics {
+pub(crate) fn summarize(returns: &[f64], gross: &[f64], stats: &Stats, ppy: f64) -> Metrics {
     let periods = returns.len();
     let mean_return = if periods == 0 {
         f64::NAN

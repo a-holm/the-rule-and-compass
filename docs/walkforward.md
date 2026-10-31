@@ -303,6 +303,26 @@ matched permutation itself is generated on the host.
 The full CPU ladder harness (mean, OLS, kNN, top-tercile) is #266 and is not
 part of this report.
 
+## Exact long/flat book (`--objective`)
+
+`src/trading.rs` scores one prediction vector as a long/flat book in exact CPU `f64`. It is the evaluator behind `rcsr --objective pnl|sharpe|log_growth`.
+
+```text
+p_t     = 1[pred_t > theta]  or  clip((pred_t - theta) / tau, 0, 1)    (times max_position)
+gross_t = p_t * r_t + (1 - p_t) * cash_return - p_t * funding_t
+cost_t  = c_side * |p_t - p_{t-1}|        (each group starts flat)
+net_t   = gross_t - cost_t                (the last row of a group also pays c_side * p_end)
+```
+
+* A position is never negative. `evaluate_positions` rejects a negative or non-finite position and a position above `max_position` as an error. There is no short leg, borrow or funding term.
+* Cost is charged per side on `|delta p|`, including the final exit. A 17-row hold pays one entry and one exit, not a charge per row.
+* Under the plain threshold rule with no cash return and no funding, the period metric block (`period` in the Rust API) equals the scalar walk-forward evaluator bit for bit. The strict `>` comparison and the shared score-and-return finite mask are the same.
+* Rows are equal-weighted per timestamp. The Sharpe is daily: sub-daily periods are compounded per calendar day and annualised with `sqrt(365)`, ddof 1. Daily or slower periods use their own annualisation. A series with no variance has a `NaN` Sharpe, which is unusable and never zero.
+* The book reports gross and net P&L, total return, log growth (`sum ln(1 + R)`), Sharpe, Sortino, maximum drawdown, Calmar, turnover, trades, entries, exits, trades per year, exposure (time in market), hit rate on long rows and the break-even cost per side. The break-even cost is `gross P&L / sum |delta p|` including exits; at that cost the net P&L is zero.
+* Every book also carries a cash book (flat the whole time, earning `cash_return`), a buy-and-hold book (long from the first row to the end, paying the entry and the exit) and a cost ladder that re-prices the same positions at 0, 5, 10, 20 and 50 bp per side.
+
+Finalist selection with `--objective` scores every Pareto member this way on the validation slice only. The winner has the lowest objective value (`-net P&L`, `-Sharpe` or `-log growth`; ties keep the archive order, so the smaller expression wins). Candidates below `--min-trades` or with a non-finite value are unusable. The test block is scored once, for the winner.
+
 ## Metrics
 
 Per window and pooled:
