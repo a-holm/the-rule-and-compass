@@ -7601,7 +7601,7 @@ mod tests {
             x.push(vec![a]);
             y.push(if law { 2.0 * a + 1.0 } else { a });
         }
-        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
         let cfg = Config {
             metric,
             generations: 6,
