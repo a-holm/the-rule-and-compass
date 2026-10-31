@@ -33,6 +33,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--allow-lockbox", "flag", "false", "permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only)"),
         ("--lockbox", "string", "2026-07-01,2027-01-01", "declared locked test START,END (UTC, half-open) reported in the run.json lockbox object: rows, date range, read count"),
         ("--ledger", "string", "none", "candidate ledger (JSONL) whose locked-test reads run.json reports as lockbox.read_count"),
+        ("--arm", "string", "none", "ablation arm label (A0..A5). run.json gains an ablation object with arm, feature_list_sha256 (SHA-256 of the ordered variable list, one name per line), generation_budget (--generations) and generations_run, so an arm can be audited and its seeds compared. See rcsr ablation"),
         ("--target-spec", "string", "<data stem>.targets.json when present", "declared target spec (rcsr-target-spec/1): D13 structure refusal, purge derived from the label window, zero-parameter rung baselines.target_structure; see \"target_spec\""),
         ("--allow-target-structure", "flag", "false", "run a target whose null prediction depends on a column (D13c) for a diagnostic replay: prints a warning, records check.status = overridden and a proxy table. D13a and D13b stay fatal"),
         ("--validation-frac", "float", "0", "fraction of the chronological training period held out as a validation slice for selection (0 = off); the test block is scoring-only"),
@@ -200,6 +201,39 @@ pub fn json() -> String {
 {{\"name\":\"--price\",\"type\":\"string\",\"default\":\"none\",\"description\":\"panel price column for D9\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"machine-readable report on stdout\"}},\
 {{\"name\":\"--report\",\"type\":\"string\",\"default\":\"none\",\"description\":\"write the JSON report to this path\"}}]}},\n  \
+         \"ladder\":{{\"command\":\"rcsr ladder\",\"summary\":\"long-only baseline ladder on one panel, one set of folds and one cost model: cash, buy-and-hold, equal-weight universe, constant long/flat, zero-parameter structure, OLS/ridge, best single feature, 20-bin E[y|vol], naive reversal, top-tercile basket, 1[f>tau], tuned GBM, symbolic-regression score and a matched-exposure random long book\",\"doc\":\"docs/overfitting.md\",\"options\":[\
+{{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"CSV or .rcsb store\"}},\
+{{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"fit target column\"}},\
+{{\"name\":\"--return-col\",\"type\":\"string\",\"default\":\"--target\",\"description\":\"realised forward return of the row\"}},\
+{{\"name\":\"--time\",\"type\":\"string\",\"default\":\"none\",\"description\":\"time column, epoch seconds or ISO dates\"}},\
+{{\"name\":\"--group\",\"type\":\"string\",\"default\":\"one group\",\"description\":\"symbol column\"}},\
+{{\"name\":\"--features\",\"type\":\"csv\",\"default\":\"all other numeric columns\",\"description\":\"feature columns of the shared projection\"}},\
+{{\"name\":\"--windows\",\"type\":\"path\",\"default\":\"none\",\"description\":\"protocol windows table; fit, validation and test ranges per fold\"}},\
+{{\"name\":\"--scheme\",\"type\":\"enum\",\"default\":\"expanding\",\"description\":\"expanding | rolling | locked\"}},\
+{{\"name\":\"--purge-seconds\",\"type\":\"float\",\"default\":\"219600\",\"description\":\"gap between the fit range and the validation slice\"}},\
+{{\"name\":\"--cost-bps\",\"type\":\"float\",\"default\":\"12\",\"description\":\"per-side cost of the headline book\"}},\
+{{\"name\":\"--cost-grid\",\"type\":\"csv\",\"default\":\"12,20,40\",\"description\":\"per-side costs at which every rung reports net P&L\"}},\
+{{\"name\":\"--quantiles\",\"type\":\"csv\",\"default\":\"0.5,0.6,0.7,0.8,0.9\",\"description\":\"score-threshold grid; the quantile is chosen on validation net P&L\"}},\
+{{\"name\":\"--vol-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"volatility column of the 20-bin rung\"}},\
+{{\"name\":\"--reversal-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"lagged return column of the naive reversal rung\"}},\
+{{\"name\":\"--signal-col\",\"type\":\"string\",\"default\":\"none\",\"description\":\"feature of the 1[f>tau] rung\"}},\
+{{\"name\":\"--target-spec\",\"type\":\"path\",\"default\":\"none\",\"description\":\"target spec file; enables the zero-parameter rung\"}},\
+{{\"name\":\"--sr-score\",\"type\":\"string\",\"default\":\"none\",\"description\":\"out-of-fold symbolic-regression score column\"}},\
+{{\"name\":\"--sr-evals\",\"type\":\"int\",\"default\":\"none\",\"description\":\"candidate evaluations of the symbolic-regression run, reported beside the GBM budget\"}},\
+{{\"name\":\"--sr-wall\",\"type\":\"float\",\"default\":\"none\",\"description\":\"wall seconds of the symbolic-regression run\"}},\
+{{\"name\":\"--gbm-trees\",\"type\":\"int\",\"default\":\"240\",\"description\":\"GBM tuning budget in trees per fold\"}},\
+{{\"name\":\"--draws\",\"type\":\"int\",\"default\":\"2000\",\"description\":\"bootstrap and SPA draws\"}},\
+{{\"name\":\"--block-len\",\"type\":\"int\",\"default\":\"auto\",\"description\":\"block length in periods\"}},\
+{{\"name\":\"--fdr-q\",\"type\":\"float\",\"default\":\"0.10\",\"description\":\"Benjamini-Hochberg rate\"}},\
+{{\"name\":\"--pbo-blocks\",\"type\":\"int\",\"default\":\"8\",\"description\":\"CSCV blocks of the PBO\"}},\
+{{\"name\":\"--seed\",\"type\":\"int\",\"default\":\"0\",\"description\":\"seed of every draw\"}},\
+{{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"write the JSON report (rcsr-ladder/1)\"}},\
+{{\"name\":\"--markdown\",\"type\":\"path\",\"default\":\"none\",\"description\":\"write the Markdown table ('-' = stdout)\"}}]}},\n  \
+         \"ablation\":{{\"command\":\"rcsr ablation\",\"summary\":\"add-one-family ablation: arm manifests, placebo and permuted columns, scoring of a finished run and the ship/drop verdict under the committed decision rule protocol/ablation.json\",\"doc\":\"docs/overfitting.md\",\"options\":[\
+{{\"name\":\"plan\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"write one manifest per arm (arm, feature list, SHA-256, generation budget, seeds), plan.json and commands.sh (--definition, --data, --target, --time, --windows, --out; --finalist for 5 seeds)\"}},\
+{{\"name\":\"prepare\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"write the projection CSV with placebo and circular-block-permuted columns (--definition, --data, --time, --group, --out, --keep, --seed)\"}},\
+{{\"name\":\"score\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"score a run.json finalist on every fold into a result file (--run, --data, --target, --time, --windows, --out, --thresholds, --headline-threshold)\"}},\
+{{\"name\":\"verdict\",\"type\":\"subcommand\",\"default\":\"none\",\"description\":\"ship or drop per family from the result files (--definition, --results, --plan, --out, --markdown)\"}}]}},\n  \
          \"walkforward\":{{\"command\":\"rcsr walkforward\",\"summary\":\"walk-forward evaluation/backtest of one expression over a .rcsb column store or CSV\",\"doc\":\"docs/walkforward.md\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"string\",\"default\":\"none\",\"description\":\"column store (.rcsb) or CSV table\"}},\
 {{\"name\":\"--target\",\"type\":\"string\",\"default\":\"none\",\"description\":\"forward-return column used for P&L\"}},\
