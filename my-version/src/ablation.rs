@@ -34,8 +34,9 @@
 //! * `dsr_above_min`: the deflated Sharpe ratio of the treatment, deflated by
 //!   `N_trials`, is at least `min_dsr`.
 //!
-//! The PBO of the arms' seed-mean series is reported and must not exceed
-//! `max_pbo` for any family to ship.
+//! The PBO of the arms' seed-mean series is reported with the verdict. It is
+//! an input record, not a gate: the CSCV centres every series, so it measures
+//! rank stability and not skill.
 //!
 //! The ablation is a selection on training data repeated inside every fold:
 //! each run selects its finalist on a validation slice and is scored on the
@@ -92,7 +93,6 @@ pub struct Rule {
     pub spa_alpha: f64,
     pub fdr_q: f64,
     pub min_dsr: f64,
-    pub max_pbo: f64,
     pub draws: usize,
     pub block_len: usize,
     pub seed: u32,
@@ -221,7 +221,6 @@ pub fn parse_definition(text: &str) -> Result<Definition, String> {
             spa_alpha: opt_f64(r, "spa_alpha", 0.05),
             fdr_q: opt_f64(r, "fdr_q", 0.10),
             min_dsr: opt_f64(r, "min_dsr", 0.5),
-            max_pbo: opt_f64(r, "max_pbo", 0.5),
             draws: opt_f64(r, "draws", 2000.0) as usize,
             block_len: opt_f64(r, "block_len", 0.0) as usize,
             seed: opt_f64(r, "seed", 0.0) as u32,
@@ -1158,7 +1157,6 @@ pub fn verdict(def: &Definition, results: &[SeedResult], expected_hashes: &BTree
             Err(e) => (None, Some(e)),
         }
     };
-    let pbo_ok = pbo.as_ref().map_or(true, |p| !(p.pbo > def.rule.max_pbo));
 
     let mut families: Vec<FamilyVerdict> = Vec::new();
     for fam in &def.rule.families {
@@ -1275,13 +1273,6 @@ pub fn verdict(def: &Definition, results: &[SeedResult], expected_hashes: &BTree
             Some(d) if d.dsr >= def.rule.min_dsr => {}
             Some(d) => failed.push(format!("dsr_above_min: DSR {} below {}", jnum(d.dsr), jnum(def.rule.min_dsr))),
             None => failed.push("dsr_above_min: too few periods".to_string()),
-        }
-        if !pbo_ok {
-            failed.push(format!(
-                "pbo_below_max: PBO {} above {}",
-                jnum(pbo.as_ref().map_or(f64::NAN, |p| p.pbo)),
-                jnum(def.rule.max_pbo)
-            ));
         }
         f.verdict = if failed.is_empty() { "ship" } else { "drop" };
         f.failed = failed;

@@ -180,7 +180,9 @@ fn a_placebo_matches_prevalence_and_autocorrelation_and_is_unrelated() {
     let pairs: Vec<(f64, f64)> = z.iter().zip(&placebo).filter(|(_, p)| p.is_finite()).map(|(a, b)| (*a, *b)).collect();
     let (a, b): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
     assert!(corr(&a, &b).abs() < 0.05, "the placebo is unrelated to the latent state");
-    assert_eq!(placebo, ablation::placebo_column(&template, &g, 11, 1), "reproducible");
+    let again = ablation::placebo_column(&template, &g, 11, 1);
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&placebo), bits(&again), "reproducible");
     assert_ne!(placebo, ablation::placebo_column(&template, &g, 11, 2), "each placebo is its own draw");
 }
 
@@ -455,8 +457,8 @@ fn results(d: &Definition, sc: &Scenario, seeds: u32) -> Vec<SeedResult> {
 }
 
 fn base_scenario() -> Scenario {
-    let mse: BTreeMap<_, _> = [("A0", 1.0), ("A1", 0.90), ("A2", 0.90), ("A3", 0.90), ("A4", 0.90), ("A5", 1.0)].into_iter().collect();
-    let net: BTreeMap<_, _> = [("A0", 0.0), ("A1", 0.0015), ("A2", 0.0015), ("A3", 0.0015), ("A4", 0.0015), ("A5", 0.0)].into_iter().collect();
+    let mse: BTreeMap<_, _> = [("A0", 1.0), ("A1", 0.90), ("A2", 0.95), ("A3", 0.95), ("A4", 0.95), ("A5", 1.0)].into_iter().collect();
+    let net: BTreeMap<_, _> = [("A0", 0.0), ("A1", 0.0015), ("A2", 0.0005), ("A3", 0.0005), ("A4", 0.0005), ("A5", 0.0)].into_iter().collect();
     Scenario { mse, net, mse_noise: 0.004, flip: None }
 }
 

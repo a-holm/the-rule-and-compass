@@ -28,7 +28,6 @@
     "spa_alpha": 0.05,
     "fdr_q": 0.10,
     "min_dsr": 0.5,
-    "max_pbo": 0.5,
     "draws": 2000,
     "block_len": 0,
     "seed": 0,

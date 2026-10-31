@@ -595,8 +595,9 @@ A family is `ship` only if every check passes against every control arm:
 * the gain exceeds the largest gain of the permuted arm (the null band);
 * the net difference keeps its sign across seeds, across folds and across the threshold grid;
 * BH-FDR at q = 0.10 over the families keeps it;
-* the DSR, deflated by `N_trials = families x columns x windows x seeds x folds x horizons`, is at least 0.5;
-* the PBO of the arms' series is at most 0.5.
+* the DSR, deflated by `N_trials = families x columns x windows x seeds x folds x horizons`, is at least 0.5.
+
+The PBO of the arms' series is reported with the verdict; it centres every series, so it records rank stability and does not gate.
 
 `A3` is compared with the placebo arm `A4` and with `A2`, so it must beat both. Otherwise the family is `drop`, with every failed check listed. No family enters the default set on a single-cell t-test. The ablation is a selection on training data repeated inside every fold, and a family that only wins by making the search bigger has not won.
 
