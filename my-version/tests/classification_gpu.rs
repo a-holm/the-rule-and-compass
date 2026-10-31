@@ -23,6 +23,8 @@
 //! Device tests skip cleanly without CUDA. Every pure-CPU invariant runs in
 //! every build.
 
+#![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_imports))]
+
 use rcsr::data::Sample;
 use rcsr::expr::{self, constant, input, node, Op};
 use rcsr::fit::{self, ProposalGate};

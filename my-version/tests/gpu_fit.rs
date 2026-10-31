@@ -5,6 +5,8 @@
 //! keep: the opt-in strategy, determinism, exact reporting and checkpoint
 //! round-trips. Device-dependent tests skip cleanly on a machine without CUDA.
 
+#![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_imports))]
+
 use rcsr::checkpoint::{Backend, Checkpoint};
 use rcsr::data::Sample;
 use rcsr::expr;

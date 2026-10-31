@@ -16,6 +16,8 @@
 //!
 //! Device-dependent tests skip cleanly on a machine without CUDA.
 
+#![cfg_attr(not(feature = "cuda"), allow(dead_code, unused_imports))]
+
 use rcsr::checkpoint::Backend;
 use rcsr::data::Sample;
 use rcsr::fit::FitStrategy;
