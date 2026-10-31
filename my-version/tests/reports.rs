@@ -355,6 +355,7 @@ fn sensitivity_puts_the_driving_input_first() {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         },
         &[1.0, 1.0],
     );

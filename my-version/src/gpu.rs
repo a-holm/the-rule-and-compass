@@ -5579,6 +5579,7 @@ mod fit_tests {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut worst = 0.0f64;
         for (k, ((tree, plan), res)) in trees.iter().zip(&plans).zip(&out).enumerate() {
@@ -8882,6 +8883,7 @@ mod classification_parity_tests {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         }
     }
 

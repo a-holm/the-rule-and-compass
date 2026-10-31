@@ -62,6 +62,7 @@ fn binary_sample(n: usize, positives: f64, noise: f64, seed: u64) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn the_gate_judges_the_configured_classification_metric() {
         y: (0..110).map(|i| if i < 100 { 1.0 } else { 0.0 }).collect(),
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     // `affine(slope, intercept)`: logit 2 − 2·x0 and 3 − 2·x0.
     let start = affine(-2.0, 2.0);
@@ -216,6 +218,7 @@ fn log_loss_improvement_cannot_replace_a_worse_auc() {
         y: vec![1.0, 0.0, 1.0],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let levels = |a: f64, b: f64, c: f64| {
         let c1 = node(Op::Less, vec![input(0), constant(0.5)]);

@@ -2742,13 +2742,7 @@ fn eval_error_and_descriptor(
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
-    let error = score_weighted(
-        &pred,
-        &s.y,
-        &s.w,
-        metric,
-        expr::count_constants(tree),
-    );
+    let error = crate::metrics::score_sample(&pred, s, metric, expr::count_constants(tree));
     let descriptor =
         want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
     (error, descriptor)
@@ -2841,6 +2835,14 @@ fn fit_constants_with_iters(
                     });
                 }
             }
+        }
+        if let (Metric::Slope, Some(pairs)) = (cfg.metric, &fit.pairs) {
+            let sse = crate::fit::fit_slope_pairs(tree, &fit.x, &fit.y, pairs, iters);
+            return Some(FitResult {
+                sse,
+                hash: expr::structural_hash(tree),
+                same_rows: std::ptr::eq(fit, score),
+            });
         }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::fit_weighted_strategy_metric(
@@ -3008,6 +3010,19 @@ fn subset_sample(train: &Sample, idx: &[usize]) -> Sample {
                 .map(|col| idx.iter().map(|&i| col[i]).collect())
                 .collect()
         },
+        pairs: train.pairs.as_ref().map(|pairs| {
+            let mut at = vec![u32::MAX; train.len()];
+            for (k, &i) in idx.iter().enumerate() {
+                at[i] = k as u32;
+            }
+            pairs
+                .iter()
+                .filter_map(|&[a, b]| {
+                    let (a, b) = (at[a as usize], at[b as usize]);
+                    (a != u32::MAX && b != u32::MAX).then_some([a, b])
+                })
+                .collect()
+        }),
     }
 }
 
@@ -6751,7 +6766,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new(), ys: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
     }
 
     /// `n` rows of a smooth one-variable target, for the large-sample gates.
@@ -6764,7 +6779,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new(), ys: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
     }
 
     /// #288: the dispatch gate admits exactly the metrics with an exact
@@ -7420,7 +7435,7 @@ mod tests {
             x.push(vec![v]);
             y.push(2.0 * v + 1.0);
         }
-        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
         let test = train.clone();
         let cfg = Config {
             generations: 4,
@@ -7474,7 +7489,7 @@ mod tests {
                 x.push(vec![a]);
                 y.push(slope * a);
             }
-            Sample { x, y, w: Vec::new(), ys: Vec::new() }
+            Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
         }
 
         let mut cfg = Config::default();
@@ -7534,6 +7549,7 @@ mod tests {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut cfg = Config::default();
         cfg.metric = Metric::Squared;
@@ -7701,6 +7717,7 @@ mod tests {
             y: vec![0.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let data = EvalSample::new(&s, &cfg);
         let mut tree = node(
@@ -7723,6 +7740,7 @@ mod tests {
             y: vec![0.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let data = EvalSample::new(&s, &cfg);
         let mut tree = node(

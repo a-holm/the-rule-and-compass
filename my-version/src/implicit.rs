@@ -430,6 +430,7 @@ mod tests {
             y: vec![0.0; 16],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
