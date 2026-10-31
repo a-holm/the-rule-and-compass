@@ -1275,6 +1275,40 @@ fn validate_scan(
     Ok(())
 }
 
+fn require_two_state(params: &BandParams) -> Result<(), String> {
+    if params.min_hold > 1 {
+        return Err(format!(
+            "band_scan is the 2-state carry; min_hold {} needs cooldown_scan ({} states)",
+            params.min_hold,
+            params.min_hold + 1
+        ));
+    }
+    Ok(())
+}
+
+fn validate_dp(returns: &[f64], groups: &[u64], side: f64, chunk_rows: usize) -> Result<(), String> {
+    if returns.len() != groups.len() {
+        return Err(format!(
+            "length mismatch: returns {}, groups {}",
+            returns.len(),
+            groups.len()
+        ));
+    }
+    if !side.is_finite() || side < 0.0 {
+        return Err(format!("side must be finite and non-negative, got {}", side));
+    }
+    if chunk_rows == 0 {
+        return Err("chunk_rows must be at least 1".to_string());
+    }
+    check_group_contiguous(groups)?;
+    for (i, &r) in returns.iter().enumerate() {
+        if !r.is_finite() {
+            return Err(format!("row {}: non-finite return {}", i, r));
+        }
+    }
+    Ok(())
+}
+
 /// Band scan with the 2-state [`Carry2`]. This is the `min_hold == 1` form;
 /// use [`cooldown_scan`] for a longer minimum hold.
 ///
@@ -1290,13 +1324,7 @@ pub fn band_scan(
     chunk_rows: usize,
 ) -> Result<BandScan, String> {
     validate_scan(scores, returns, groups, params, side, chunk_rows)?;
-    if params.min_hold > 1 {
-        return Err(format!(
-            "band_scan is the 2-state carry; min_hold {} needs cooldown_scan ({} states)",
-            params.min_hold,
-            params.min_hold + 1
-        ));
-    }
+    require_two_state(params)?;
     let positions = band_positions(scores, groups, params)?;
     let n = returns.len();
     let mut carries = Vec::new();
@@ -1460,25 +1488,7 @@ pub fn dp_scan(
     side: f64,
     chunk_rows: usize,
 ) -> Result<DpScan, String> {
-    if returns.len() != groups.len() {
-        return Err(format!(
-            "length mismatch: returns {}, groups {}",
-            returns.len(),
-            groups.len()
-        ));
-    }
-    if !side.is_finite() || side < 0.0 {
-        return Err(format!("side must be finite and non-negative, got {}", side));
-    }
-    if chunk_rows == 0 {
-        return Err("chunk_rows must be at least 1".to_string());
-    }
-    check_group_contiguous(groups)?;
-    for (i, &r) in returns.iter().enumerate() {
-        if !r.is_finite() {
-            return Err(format!("row {}: non-finite return {}", i, r));
-        }
-    }
+    validate_dp(returns, groups, side, chunk_rows)?;
     let n = returns.len();
     let mut carries = Vec::new();
     let mut carry = DpCarry::IDENTITY;
@@ -2244,6 +2254,426 @@ pub use device::reduce_device;
 #[cfg(not(feature = "cuda"))]
 pub fn device_available() -> bool {
     false
+}
+
+// ---------------------------------------------------------------------------
+// #306: device band/cooldown and hindsight DP scans
+// ---------------------------------------------------------------------------
+//
+// The CPU scans fold each chain left to right: one chain per (candidate, group,
+// start state) for the band, one per (group, source state) for the DP. The
+// reward and DP sums are f64 additions, which are not associative, so the
+// device does not reassociate them: one device thread folds one chain in
+// ascending row order. Block size, grid size and chunk size only change which
+// thread owns a chain and when it resumes, never the order of a chain's sums.
+// The cross-group totals ([`BandScan::net`], [`CooldownScan::net`],
+// [`DpScan::bound`]) are computed on the host by the same code as the CPU path.
+//
+// Every device entry point returns either the exact CPU bits or `Err(reason)`;
+// the caller then runs the CPU reference and reports the reason.
+
+/// Default device block size for the band/DP scans. Every size from 1 to
+/// [`band_dp_max_threads`] produces the same bits.
+pub const SCAN_THREADS: usize = 256;
+
+/// Validate a band batch exactly like the CPU scans and return its common
+/// `min_hold`.
+fn validate_band_batch(
+    scores: &[&[f64]],
+    returns: &[f64],
+    groups: &[u64],
+    params: &[BandParams],
+    side: f64,
+    chunk_rows: usize,
+) -> Result<usize, String> {
+    if scores.len() != params.len() {
+        return Err(format!(
+            "length mismatch: {} score vectors, {} parameter sets",
+            scores.len(),
+            params.len()
+        ));
+    }
+    let Some(first) = params.first() else {
+        return Err("no candidates to scan".to_string());
+    };
+    for (s, p) in scores.iter().zip(params) {
+        validate_scan(s, returns, groups, p, side, chunk_rows)?;
+        if p.min_hold != first.min_hold {
+            return Err(format!(
+                "one device batch needs one min_hold; got {} and {}",
+                first.min_hold, p.min_hold
+            ));
+        }
+    }
+    Ok(first.min_hold)
+}
+
+#[cfg(feature = "cuda")]
+mod scan_device {
+    use super::*;
+
+    extern "C" {
+        fn rc_band_dp_max_threads() -> i32;
+        fn rc_band_scan(
+            scores: *const f64,
+            returns: *const f64,
+            offsets: *const i64,
+            groups: i32,
+            n: i64,
+            candidates: i32,
+            thresholds: *const f64,
+            bands: *const f64,
+            states: i32,
+            side: f64,
+            threads: i32,
+            chunk_rows: i64,
+            positions: *mut u8,
+            end_states: *mut i32,
+            rewards: *mut f64,
+        ) -> i32;
+        fn rc_dp_scan(
+            returns: *const f64,
+            offsets: *const i64,
+            groups: i32,
+            n: i64,
+            side: f64,
+            threads: i32,
+            chunk_rows: i64,
+            values: *mut f64,
+        ) -> i32;
+    }
+
+    fn status_reason(code: i32) -> String {
+        let what = match code {
+            1 => "the device scan rejected its arguments",
+            2 => "CUDA device attributes unavailable",
+            3 => "device allocation refused",
+            4 => "host-to-device copy failed",
+            5 => "kernel launch failed",
+            6 => "kernel execution failed",
+            7 => "device-to-host copy failed",
+            _ => "unknown device scan status",
+        };
+        format!("{} (status {})", what, code)
+    }
+
+    /// Start offsets of each group run plus the row count: `[0, ..., n]`.
+    fn group_offsets(groups: &[u64]) -> Vec<i64> {
+        let mut offsets = Vec::new();
+        for (i, g) in groups.iter().enumerate() {
+            if i == 0 || groups[i - 1] != *g {
+                offsets.push(i as i64);
+            }
+        }
+        offsets.push(groups.len() as i64);
+        offsets
+    }
+
+    pub fn max_threads() -> Option<usize> {
+        if !crate::backend::probe().available() {
+            return None;
+        }
+        let max = unsafe { rc_band_dp_max_threads() };
+        if max > 0 {
+            Some(max as usize)
+        } else {
+            None
+        }
+    }
+
+    /// Device, thread count and size checks shared by both scans. Returns
+    /// `(groups, n, threads, chunk_rows)` as the C types.
+    fn launch_shape(
+        offsets: &[i64],
+        n: usize,
+        threads: usize,
+        chunk_rows: usize,
+    ) -> Result<(i32, i64, i32, i64), String> {
+        if n == 0 {
+            return Err("no rows to scan".to_string());
+        }
+        let probe = crate::backend::probe();
+        if !probe.available() {
+            return Err(probe
+                .reason
+                .unwrap_or_else(|| "no CUDA device".to_string()));
+        }
+        let max = unsafe { rc_band_dp_max_threads() };
+        if max <= 0 {
+            return Err("CUDA device attributes unavailable".to_string());
+        }
+        let max = max as usize;
+        if threads == 0 || threads > max {
+            return Err(format!("threads {} outside 1..={}", threads, max));
+        }
+        let groups = i32::try_from(offsets.len() - 1)
+            .map_err(|_| format!("{} groups exceed the device scan's i32 index", offsets.len() - 1))?;
+        let n = i64::try_from(n).map_err(|_| "row count exceeds i64".to_string())?;
+        let chunk = i64::try_from(chunk_rows).unwrap_or(i64::MAX);
+        Ok((groups, n, threads as i32, chunk))
+    }
+
+    /// One composed K+1-state carry per group and the start-flat positions, per
+    /// candidate. Candidates stream through the declared tile.
+    pub fn band_chains(
+        scores: &[&[f64]],
+        returns: &[f64],
+        groups: &[u64],
+        params: &[BandParams],
+        side: f64,
+        threads: usize,
+        chunk_rows: usize,
+    ) -> Result<Vec<(Vec<f64>, Vec<CooldownCarry>)>, String> {
+        let min_hold = validate_band_batch(scores, returns, groups, params, side, chunk_rows)?;
+        let offsets = group_offsets(groups);
+        let (g32, n64, t32, chunk) = launch_shape(&offsets, returns.len(), threads, chunk_rows)?;
+        let states = min_hold
+            .checked_add(1)
+            .and_then(|s| i32::try_from(s).ok())
+            .ok_or_else(|| format!("min_hold {} exceeds the device scan's i32 state", min_hold))?;
+        let n = returns.len();
+        let ngroups = offsets.len() - 1;
+        let s = states as usize;
+        let per_candidate = ngroups
+            .checked_mul(s)
+            .ok_or("group x state count overflows usize")?;
+        let mut out = Vec::with_capacity(scores.len());
+        for (tile_scores, tile_params) in scores
+            .chunks(MAX_TILE_CANDIDATES)
+            .zip(params.chunks(MAX_TILE_CANDIDATES))
+        {
+            let count = tile_scores.len();
+            let mut flat = Vec::with_capacity(count * n);
+            for v in tile_scores {
+                flat.extend_from_slice(v);
+            }
+            let thresholds: Vec<f64> = tile_params.iter().map(|p| p.threshold).collect();
+            let bands: Vec<f64> = tile_params.iter().map(|p| p.band).collect();
+            let mut positions = vec![0u8; count * n];
+            let mut end_states = vec![0i32; count * per_candidate];
+            let mut rewards = vec![0.0f64; count * per_candidate];
+            let rc = unsafe {
+                rc_band_scan(
+                    flat.as_ptr(),
+                    returns.as_ptr(),
+                    offsets.as_ptr(),
+                    g32,
+                    n64,
+                    count as i32,
+                    thresholds.as_ptr(),
+                    bands.as_ptr(),
+                    states,
+                    side,
+                    t32,
+                    chunk,
+                    positions.as_mut_ptr(),
+                    end_states.as_mut_ptr(),
+                    rewards.as_mut_ptr(),
+                )
+            };
+            if rc != 0 {
+                return Err(status_reason(rc));
+            }
+            for c in 0..count {
+                let pos: Vec<f64> = positions[c * n..(c + 1) * n]
+                    .iter()
+                    .map(|&p| if p != 0 { 1.0 } else { 0.0 })
+                    .collect();
+                let mut carries = Vec::with_capacity(ngroups);
+                for g in 0..ngroups {
+                    let base = c * per_candidate + g * s;
+                    let mut end = Vec::with_capacity(s);
+                    for &e in &end_states[base..base + s] {
+                        let e = usize::try_from(e)
+                            .ok()
+                            .filter(|&e| e < s)
+                            .ok_or_else(|| format!("device returned end state {} of {}", e, s))?;
+                        end.push(e);
+                    }
+                    carries.push(CooldownCarry {
+                        end,
+                        reward: rewards[base..base + s].to_vec(),
+                    });
+                }
+                out.push((pos, carries));
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn dp(
+        returns: &[f64],
+        groups: &[u64],
+        side: f64,
+        threads: usize,
+        chunk_rows: usize,
+    ) -> Result<DpScan, String> {
+        validate_dp(returns, groups, side, chunk_rows)?;
+        let offsets = group_offsets(groups);
+        let (g32, n64, t32, chunk) = launch_shape(&offsets, returns.len(), threads, chunk_rows)?;
+        let ngroups = offsets.len() - 1;
+        let mut values = vec![0.0f64; ngroups * 4];
+        let rc = unsafe {
+            rc_dp_scan(
+                returns.as_ptr(),
+                offsets.as_ptr(),
+                g32,
+                n64,
+                side,
+                t32,
+                chunk,
+                values.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(status_reason(rc));
+        }
+        // values[(2g + j) * 2 + i] is m[i][j] of group g.
+        let carries = values
+            .chunks_exact(4)
+            .map(|v| DpCarry {
+                m: [[v[0], v[2]], [v[1], v[3]]],
+            })
+            .collect();
+        Ok(DpScan { carries })
+    }
+}
+
+/// Largest device block size the band/DP scans accept, or `None` without a
+/// device.
+pub fn band_dp_max_threads() -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    {
+        scan_device::max_threads()
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn band_chains_device(
+    scores: &[&[f64]],
+    returns: &[f64],
+    groups: &[u64],
+    params: &[BandParams],
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<Vec<(Vec<f64>, Vec<CooldownCarry>)>, String> {
+    scan_device::band_chains(scores, returns, groups, params, side, threads, chunk_rows)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn band_chains_device(
+    scores: &[&[f64]],
+    returns: &[f64],
+    groups: &[u64],
+    params: &[BandParams],
+    side: f64,
+    _threads: usize,
+    chunk_rows: usize,
+) -> Result<Vec<(Vec<f64>, Vec<CooldownCarry>)>, String> {
+    validate_band_batch(scores, returns, groups, params, side, chunk_rows)?;
+    Err(crate::backend::probe()
+        .reason
+        .unwrap_or_else(|| "built without --features cuda".to_string()))
+}
+
+/// Device [`band_scan`] for a batch of candidates (`min_hold == 1`). Each
+/// result is bit-identical to the CPU scan of that candidate alone, or the
+/// call returns `Err(reason)`.
+pub fn band_scan_device_batch(
+    scores: &[&[f64]],
+    returns: &[f64],
+    groups: &[u64],
+    params: &[BandParams],
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<Vec<BandScan>, String> {
+    for p in params {
+        require_two_state(p)?;
+    }
+    let chains = band_chains_device(scores, returns, groups, params, side, threads, chunk_rows)?;
+    Ok(chains
+        .into_iter()
+        .map(|(positions, carries)| BandScan {
+            positions,
+            carries: carries
+                .into_iter()
+                .map(|c| Carry2::from_row([c.end[0], c.end[1]], [c.reward[0], c.reward[1]]))
+                .collect(),
+        })
+        .collect())
+}
+
+/// Device [`cooldown_scan`] for a batch of candidates sharing one `min_hold`.
+pub fn cooldown_scan_device_batch(
+    scores: &[&[f64]],
+    returns: &[f64],
+    groups: &[u64],
+    params: &[BandParams],
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<Vec<CooldownScan>, String> {
+    let chains = band_chains_device(scores, returns, groups, params, side, threads, chunk_rows)?;
+    Ok(chains
+        .into_iter()
+        .map(|(positions, carries)| CooldownScan { positions, carries })
+        .collect())
+}
+
+/// Device [`band_scan`] for one candidate.
+pub fn band_scan_device(
+    scores: &[f64],
+    returns: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<BandScan, String> {
+    band_scan_device_batch(&[scores], returns, groups, &[*params], side, threads, chunk_rows)
+        .map(|mut v| v.remove(0))
+}
+
+/// Device [`cooldown_scan`] for one candidate.
+pub fn cooldown_scan_device(
+    scores: &[f64],
+    returns: &[f64],
+    groups: &[u64],
+    params: &BandParams,
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<CooldownScan, String> {
+    cooldown_scan_device_batch(&[scores], returns, groups, &[*params], side, threads, chunk_rows)
+        .map(|mut v| v.remove(0))
+}
+
+/// Device [`dp_scan`]: bit-identical carries and bound, or `Err(reason)`.
+pub fn dp_scan_device(
+    returns: &[f64],
+    groups: &[u64],
+    side: f64,
+    threads: usize,
+    chunk_rows: usize,
+) -> Result<DpScan, String> {
+    #[cfg(feature = "cuda")]
+    {
+        scan_device::dp(returns, groups, side, threads, chunk_rows)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = threads;
+        validate_dp(returns, groups, side, chunk_rows)?;
+        Err(crate::backend::probe()
+            .reason
+            .unwrap_or_else(|| "built without --features cuda".to_string()))
+    }
 }
 
 #[cfg(test)]

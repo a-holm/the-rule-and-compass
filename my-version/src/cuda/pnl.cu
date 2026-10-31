@@ -637,3 +637,342 @@ done:
     if (status == 0) cudaGetLastError();
     return status;
 }
+
+/* ------------------------------------------------------------------------- */
+/* #306: band/cooldown and hindsight DP chain scans.                          */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The CPU reference (`band_scan`, `cooldown_scan`, `dp_scan`) folds each chain
+ * left to right: one chain per (candidate, group, start state) for the band,
+ * one per (group, source state) for the DP. f64 addition is not associative,
+ * so a parallel prefix over carries would round differently from that fold.
+ * Each chain is therefore folded by exactly one thread in ascending row order;
+ * the block and grid size only change which thread owns a chain.
+ *
+ * Chunk carry. The host launches once per [row_lo, row_hi) chunk. A chain
+ * whose group starts inside the chunk starts from its initial state; any other
+ * chain resumes its (state, value) from device memory. The fold order is the
+ * same for every chunk size.
+ *
+ * Bit identity with the CPU also relies on `-fmad=false` (build.rs): every
+ * product and sum below is rounded on its own, in the CPU's order.
+ */
+
+#include <limits.h>
+
+#define RC_SCAN_MAX_BLOCKS 65535
+
+__global__ void rc_band_chain_kernel(const double *__restrict__ scores,
+                                     const double *__restrict__ returns,
+                                     const long long *__restrict__ offsets,
+                                     const double *__restrict__ thresholds,
+                                     const double *__restrict__ bands,
+                                     int groups,
+                                     int states,
+                                     long long n,
+                                     long long chains,
+                                     double side,
+                                     long long row_lo,
+                                     long long row_hi,
+                                     int *__restrict__ chain_state,
+                                     double *__restrict__ chain_reward,
+                                     unsigned char *__restrict__ positions)
+{
+    const int hold = states - 1;
+    for (long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x; c < chains;
+         c += (long long)gridDim.x * blockDim.x) {
+        const int start = (int)(c % states);
+        const long long cg = c / states;
+        const int g = (int)(cg % groups);
+        const long long cand = cg / groups;
+        const long long gs = offsets[g];
+        const long long ge = offsets[g + 1];
+        const long long lo = row_lo > gs ? row_lo : gs;
+        const long long hi = row_hi < ge ? row_hi : ge;
+        if (lo >= hi) continue;
+
+        int state = start;
+        double acc = 0.0;
+        if (lo > gs) {
+            state = chain_state[c];
+            acc = chain_reward[c];
+        }
+        const double theta = thresholds[cand];
+        const double beta = bands[cand];
+        const double enter_above = theta + beta;
+        const double exit_at = theta - beta;
+        const double *zc = scores + cand * n;
+        unsigned char *pc = positions + cand * n;
+        for (long long i = lo; i < hi; ++i) {
+            const double z = zc[i];
+            int next;
+            if (state == 0) {
+                next = (isfinite(z) && z > enter_above) ? 1 : 0;
+            } else if ((!isfinite(z) || z <= exit_at) && state >= hold) {
+                next = 0;
+            } else {
+                next = state < hold ? state + 1 : hold;
+            }
+            const double p0 = state != 0 ? 1.0 : 0.0;
+            const double p1 = next != 0 ? 1.0 : 0.0;
+            double w = p1 * returns[i] - side * fabs(p1 - p0);
+            if (i + 1 == ge && p1 != 0.0) w -= side;
+            acc = acc + w;
+            state = next;
+            if (start == 0) pc[i] = (unsigned char)(next != 0);
+        }
+        chain_state[c] = state;
+        chain_reward[c] = acc;
+    }
+}
+
+/* `values` holds (V(flat), V(long)) per chain; chain c = 2 * group + source. */
+__global__ void rc_dp_chain_kernel(const double *__restrict__ returns,
+                                   const long long *__restrict__ offsets,
+                                   int groups,
+                                   double side,
+                                   long long row_lo,
+                                   long long row_hi,
+                                   double *__restrict__ values)
+{
+    const long long chains = 2LL * (long long)groups;
+    for (long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x; c < chains;
+         c += (long long)gridDim.x * blockDim.x) {
+        const int source = (int)(c & 1);
+        const long long g = c >> 1;
+        const long long gs = offsets[g];
+        const long long ge = offsets[g + 1];
+        const long long lo = row_lo > gs ? row_lo : gs;
+        const long long hi = row_hi < ge ? row_hi : ge;
+        if (lo >= hi) continue;
+
+        double v0 = source == 0 ? 0.0 : -INFINITY;
+        double v1 = source == 0 ? -INFINITY : 0.0;
+        if (lo > gs) {
+            v0 = values[2 * c];
+            v1 = values[2 * c + 1];
+        }
+        const double sell = -side;
+        for (long long i = lo; i < hi; ++i) {
+            const double r = returns[i];
+            const double buy = r - side;
+            double flat = -INFINITY;
+            double cand = 0.0 + v0;
+            if (cand > flat) flat = cand;
+            cand = sell + v1;
+            if (cand > flat) flat = cand;
+            double held = -INFINITY;
+            cand = buy + v0;
+            if (cand > held) held = cand;
+            cand = r + v1;
+            if (cand > held) held = cand;
+            v0 = flat;
+            v1 = held;
+        }
+        values[2 * c] = v0;
+        values[2 * c + 1] = v1;
+    }
+}
+
+static int rc_scan_offsets_ok(const long long *offsets, int groups, long long n)
+{
+    if (offsets[0] != 0 || offsets[groups] != n) return 0;
+    for (int g = 0; g < groups; ++g) {
+        if (offsets[g] >= offsets[g + 1]) return 0;
+    }
+    return 1;
+}
+
+static int rc_scan_blocks(long long chains, int threads)
+{
+    long long blocks = (chains + threads - 1) / threads;
+    return blocks > RC_SCAN_MAX_BLOCKS ? RC_SCAN_MAX_BLOCKS : (int)blocks;
+}
+
+extern "C" {
+
+/* The largest block size both chain kernels accept on this device, 0 when the
+ * device or its attributes are unavailable. */
+int rc_band_dp_max_threads(void)
+{
+    cudaFuncAttributes band, dp;
+    if (cudaFuncGetAttributes(&band, rc_band_chain_kernel) != cudaSuccess ||
+        cudaFuncGetAttributes(&dp, rc_dp_chain_kernel) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return band.maxThreadsPerBlock < dp.maxThreadsPerBlock ? band.maxThreadsPerBlock
+                                                           : dp.maxThreadsPerBlock;
+}
+
+/*
+ * Band/cooldown scan for `candidates` score vectors (candidate major, f64).
+ * `states` is min_hold + 1. Outputs, all host memory:
+ *   positions  candidates x n, the start-flat path (0 or 1);
+ *   end_states candidates x groups x states, the end-state index per start;
+ *   rewards    candidates x groups x states, the folded f64 reward per start.
+ * Returns 0 on success; 1 invalid argument, 2 device unavailable, 3 allocation
+ * refused, 4 upload, 5 launch, 6 kernel or synchronize, 7 download.
+ */
+int rc_band_scan(const double *scores,
+                 const double *returns,
+                 const long long *offsets,
+                 int groups,
+                 long long n,
+                 int candidates,
+                 const double *thresholds,
+                 const double *bands,
+                 int states,
+                 double side,
+                 int threads,
+                 long long chunk_rows,
+                 unsigned char *positions,
+                 int *end_states,
+                 double *rewards)
+{
+    if (scores == NULL || returns == NULL || offsets == NULL || thresholds == NULL ||
+        bands == NULL || positions == NULL || end_states == NULL || rewards == NULL)
+        return 1;
+    if (groups <= 0 || n <= 0 || candidates <= 0 || states < 2 || chunk_rows <= 0)
+        return 1;
+    if (!rc_scan_offsets_ok(offsets, groups, n)) return 1;
+    if ((long long)candidates * (long long)groups > LLONG_MAX / states) return 1;
+    if ((unsigned long long)n > (unsigned long long)(SIZE_MAX / sizeof(double)) / (unsigned long long)candidates)
+        return 1;
+    const int max_threads = rc_band_dp_max_threads();
+    if (max_threads <= 0) return 2;
+    if (threads < 1 || threads > max_threads) return 1;
+
+    const long long chains = (long long)candidates * (long long)groups * (long long)states;
+    const size_t cells = (size_t)n * (size_t)candidates;
+    double *d_scores = NULL, *d_returns = NULL, *d_thr = NULL, *d_band = NULL;
+    double *d_reward = NULL;
+    long long *d_offsets = NULL;
+    int *d_state = NULL;
+    unsigned char *d_pos = NULL;
+    int status = 0;
+
+    if (rc_checked_malloc((void **)&d_scores, cells * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_returns, (size_t)n * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_offsets, (size_t)(groups + 1) * sizeof(long long)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_thr, (size_t)candidates * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_band, (size_t)candidates * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_state, (size_t)chains * sizeof(int)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_reward, (size_t)chains * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_pos, cells) != cudaSuccess) {
+        status = 3;
+        goto done;
+    }
+    if (cudaMemcpy(d_scores, scores, cells * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_returns, returns, (size_t)n * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_offsets, offsets, (size_t)(groups + 1) * sizeof(long long), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_thr, thresholds, (size_t)candidates * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_band, bands, (size_t)candidates * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess) {
+        status = 4;
+        goto done;
+    }
+    {
+        const int blocks = rc_scan_blocks(chains, threads);
+        for (long long lo = 0; lo < n; lo += chunk_rows) {
+            long long hi = n - lo > chunk_rows ? lo + chunk_rows : n;
+            rc_band_chain_kernel<<<blocks, threads>>>(d_scores, d_returns, d_offsets, d_thr,
+                                                      d_band, groups, states, n, chains, side,
+                                                      lo, hi, d_state, d_reward, d_pos);
+            if (cudaGetLastError() != cudaSuccess) {
+                status = 5;
+                goto done;
+            }
+        }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        status = 6;
+        goto done;
+    }
+    if (cudaMemcpy(positions, d_pos, cells, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(end_states, d_state, (size_t)chains * sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(rewards, d_reward, (size_t)chains * sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        status = 7;
+        goto done;
+    }
+
+done:
+    if (d_pos != NULL) cudaFree(d_pos);
+    if (d_reward != NULL) cudaFree(d_reward);
+    if (d_state != NULL) cudaFree(d_state);
+    if (d_band != NULL) cudaFree(d_band);
+    if (d_thr != NULL) cudaFree(d_thr);
+    if (d_offsets != NULL) cudaFree(d_offsets);
+    if (d_returns != NULL) cudaFree(d_returns);
+    if (d_scores != NULL) cudaFree(d_scores);
+    if (status != 0) cudaGetLastError();
+    return status;
+}
+
+/*
+ * Hindsight DP scan. `values` (host) receives groups x 2 x 2 doubles: for
+ * group g and source state j, (V(flat), V(long)) at the end of the group, i.e.
+ * column j of the group's max-plus carry. Return codes as rc_band_scan.
+ */
+int rc_dp_scan(const double *returns,
+               const long long *offsets,
+               int groups,
+               long long n,
+               double side,
+               int threads,
+               long long chunk_rows,
+               double *values)
+{
+    if (returns == NULL || offsets == NULL || values == NULL) return 1;
+    if (groups <= 0 || n <= 0 || chunk_rows <= 0) return 1;
+    if (!rc_scan_offsets_ok(offsets, groups, n)) return 1;
+    const int max_threads = rc_band_dp_max_threads();
+    if (max_threads <= 0) return 2;
+    if (threads < 1 || threads > max_threads) return 1;
+
+    const long long chains = 2LL * (long long)groups;
+    double *d_returns = NULL, *d_values = NULL;
+    long long *d_offsets = NULL;
+    int status = 0;
+
+    if (rc_checked_malloc((void **)&d_returns, (size_t)n * sizeof(double)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_offsets, (size_t)(groups + 1) * sizeof(long long)) != cudaSuccess ||
+        rc_checked_malloc((void **)&d_values, (size_t)chains * 2 * sizeof(double)) != cudaSuccess) {
+        status = 3;
+        goto done;
+    }
+    if (cudaMemcpy(d_returns, returns, (size_t)n * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess ||
+        cudaMemcpy(d_offsets, offsets, (size_t)(groups + 1) * sizeof(long long), cudaMemcpyHostToDevice) != cudaSuccess) {
+        status = 4;
+        goto done;
+    }
+    {
+        const int blocks = rc_scan_blocks(chains, threads);
+        for (long long lo = 0; lo < n; lo += chunk_rows) {
+            long long hi = n - lo > chunk_rows ? lo + chunk_rows : n;
+            rc_dp_chain_kernel<<<blocks, threads>>>(d_returns, d_offsets, groups, side, lo, hi,
+                                                    d_values);
+            if (cudaGetLastError() != cudaSuccess) {
+                status = 5;
+                goto done;
+            }
+        }
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        status = 6;
+        goto done;
+    }
+    if (cudaMemcpy(values, d_values, (size_t)chains * 2 * sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        status = 7;
+        goto done;
+    }
+
+done:
+    if (d_values != NULL) cudaFree(d_values);
+    if (d_offsets != NULL) cudaFree(d_offsets);
+    if (d_returns != NULL) cudaFree(d_returns);
+    if (status != 0) cudaGetLastError();
+    return status;
+}
+
+} /* extern "C" */

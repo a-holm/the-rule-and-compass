@@ -179,7 +179,8 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
-strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
+strategy's P&L. `--gpu` runs both scans on the CUDA device, bit-identical to the
+CPU scans, and names the reason when it falls back to the CPU. See [`docs/walkforward.md`](docs/walkforward.md) for the
 semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
 the pinned 4M-row benchmark protocol and the measured wall time.
 

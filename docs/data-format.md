@@ -553,6 +553,8 @@ dependency and fail closed when requested. The compact 52-name profile is a
 regression subset of this registry, not a separate store format; see
 `docs/ohlcv.md`.
 
+The ten derivative columns (funding, open interest, basis, long/short ratio, taker flow, liquidations) are registered `family=derivatives`, `available:false`, `source:null`, with `required_source`, `publication_lag`, `required_raw_field` and `flip_condition`. A request for one is refused with the missing raw field. A future local snapshot is a CSV `field,symbol,publish_time,value`; it enables columns only after a coverage-by-symbol/date check and a PIT join check, and the panel manifest then records the source, its sha256 and the enabled columns. See `docs/ohlcv.md`.
+
 The multi-timeframe block is part of that contract: `--features mtf` appends all
 36 `mtf_<1h|4h|1d>_<leaf>` columns, each registered `available:true` with
 `family=mtf`, its `timeframe`, warm-up in higher bars and the close-time PIT

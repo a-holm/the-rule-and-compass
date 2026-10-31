@@ -455,28 +455,12 @@ fn cross_warmup(name: &str) -> usize {
     }
 }
 
-/// Reserved derivative columns. No funding/OI/basis/order-book snapshot exists
-/// locally, so these stay `available:false` with `source:null`.
-pub const DERIVATIVE_NAMES: &[&str] = &[
-    "funding_rate",
-    "funding_carry_24h",
-    "basis_bps",
-    "oi",
-    "oi_chg_1h",
-    "oi_chg_24h",
-    "ls_ratio",
-    "taker_buy_sell_ratio",
-];
+/// Reserved derivative columns; see `crate::derivatives`.
+pub const DERIVATIVE_NAMES: &[&str] = crate::derivatives::NAMES;
 
 /// Reason a registered name cannot be computed yet, if it is unavailable.
-pub fn unavailable_reason(name: &str) -> Option<&'static str> {
-    if DERIVATIVE_NAMES.contains(&name) {
-        return Some(
-            "no local funding, open-interest, basis, mark-price or liquidation snapshot; \
-             intentionally not filled with zero",
-        );
-    }
-    None
+pub fn unavailable_reason(name: &str) -> Option<String> {
+    crate::derivatives::refusal(name)
 }
 
 fn compact_formula(name: &str) -> &'static str {
@@ -830,7 +814,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             formula: "reserved derivative column".to_string(),
             source: "none",
             pit: "not available",
-            reason: unavailable_reason(name).map(|s| s.to_string()),
+            reason: unavailable_reason(name),
         });
     }
     out
@@ -844,7 +828,7 @@ pub fn registry_json() -> String {
             format!(
                 "{{\"name\":{},\"family\":{},\"timeframe\":{},\"warmup\":{},\
                  \"available\":{},\"derived\":{},\"parity_tier\":{},\"formula\":{},\"formula_sha256\":{},\
-                 \"source\":{},\"pit\":{},\"reason\":{}}}",
+                 \"source\":{},\"pit\":{},\"reason\":{}{}}}",
                 jstr(&e.name),
                 jstr(e.family),
                 jstr(e.timeframe),
@@ -854,9 +838,10 @@ pub fn registry_json() -> String {
                 jstr(e.parity_tier),
                 jstr(&e.formula),
                 jstr(&manifest::sha256_hex(e.formula.as_bytes())),
-                jstr(e.source),
+                if e.family == "derivatives" { "null".to_string() } else { jstr(e.source) },
                 jstr(e.pit),
-                e.reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string())
+                e.reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                crate::derivatives::registry_extra_json(&e.name)
             )
         })
         .collect();
@@ -1306,6 +1291,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "compact" => compact_names(),
             "flow" => flow_names(),
             "price_action" => price_action_names(),
+            "derivatives" => return Err(crate::derivatives::group_refusal()),
             "all" => {
                 let mut v = Vec::new();
                 for g in [
@@ -1604,6 +1590,12 @@ pub struct Report {
     pub projection_columns: Vec<String>,
     pub read_seconds: f64,
     pub feature_seconds: f64,
+    /// Host-thread partition of `feature_seconds` (#300): `feature_read_seconds` + `feature_context_seconds` + `feature_gpu_seconds` + `gpu_write_seconds` + `feature_cpu_seconds` + `feature_other_seconds`. The device times above are busy measures and may overlap this timeline.
+    pub feature_read_seconds: f64,
+    pub feature_context_seconds: f64,
+    pub feature_gpu_seconds: f64,
+    pub feature_cpu_seconds: f64,
+    pub feature_other_seconds: f64,
     pub xs_seconds: f64,
     pub write_seconds: f64,
     pub total_seconds: f64,
@@ -1656,6 +1648,15 @@ impl Report {
                 self.write_seconds,
                 self.total_seconds,
                 self.peak_rss_bytes as f64 / (1024.0 * 1024.0)
+            ),
+            format!(
+                "# enrich: feature_parts read={:.3}s context={:.3}s gpu={:.3}s write={:.3}s cpu={:.3}s other={:.3}s",
+                self.feature_read_seconds,
+                self.feature_context_seconds,
+                self.feature_gpu_seconds,
+                self.gpu_write_seconds,
+                self.feature_cpu_seconds,
+                self.feature_other_seconds
             ),
         ];
         if let Some(hash) = &self.projection_hash {
@@ -1759,7 +1760,7 @@ impl Report {
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
-             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
+             \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
             jstr(&self.output),
@@ -1808,6 +1809,11 @@ impl Report {
                 .join(","),
             self.read_seconds,
             self.feature_seconds,
+            self.feature_read_seconds,
+            self.feature_context_seconds,
+            self.feature_gpu_seconds,
+            self.feature_cpu_seconds,
+            self.feature_other_seconds,
             self.xs_seconds,
             self.write_seconds,
             self.total_seconds,
@@ -6757,6 +6763,13 @@ fn enrich_inner(
     // The feature phase includes both the GPU kernel pass and the CPU fallback
     // pass; the cross-sectional pass is timed separately below.
     let t_feat = Instant::now();
+    // Host-thread partition of the feature phase (#300): disjoint intervals on this thread.
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_read_seconds = 0.0f64;
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_context_seconds = 0.0f64;
+    #[allow(unused_mut, unused_variables)]
+    let mut feature_gpu_seconds = 0.0f64;
 
     // Which output columns the cost model sent to a registered kernel.
     let mut gpu_names: BTreeSet<String> = BTreeSet::new();
@@ -6817,14 +6830,17 @@ fn enrich_inner(
             .cloned()
             .collect();
         if !mtf_wanted.is_empty() {
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let open = column_all(&store, cols.open)?;
             let high = column_all(&store, cols.high)?;
             let low = column_all(&store, cols.low)?;
             let close = column_all(&store, cols.close)?;
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
             let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
-            match crate::mtf_gpu::compute(
+            let tg = Instant::now();
+            let mtf_result = crate::mtf_gpu::compute(
                 &times,
                 &open,
                 &high,
@@ -6834,11 +6850,15 @@ fn enrich_inner(
                 &seg_len,
                 step,
                 &mtf_wanted,
-            ) {
+            );
+            feature_gpu_seconds += tg.elapsed().as_secs_f64();
+            match mtf_result {
                 Ok((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }
@@ -6868,8 +6888,10 @@ fn enrich_inner(
             .cloned()
             .collect();
         if !bench_wanted.is_empty() {
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let close = column_all(&store, cols.close)?;
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let seg_start: Vec<u32> = segs.iter().map(|s| s.start as u32).collect();
             let seg_len: Vec<u32> = segs.iter().map(|s| s.len as u32).collect();
             let btc = cross.bench_series();
@@ -6882,7 +6904,8 @@ fn enrich_inner(
                         .map(|s| (!eth.symbol.is_empty() && s.symbol == eth.symbol) as u8),
                 )
                 .collect();
-            match crate::bench_gpu::compute(
+            let tg = Instant::now();
+            let bench_result = crate::bench_gpu::compute(
                 &times,
                 &close,
                 &seg_start,
@@ -6892,11 +6915,15 @@ fn enrich_inner(
                 Some(&eth_series),
                 &self_flags,
                 &bench_wanted,
-            ) {
+            );
+            feature_gpu_seconds += tg.elapsed().as_secs_f64();
+            match bench_result {
                 Some((columns, stats)) => {
                     for (name, values) in columns {
                         if let Some(t) = temp.get_mut(&name) {
+                            let tw = Instant::now();
                             t.write_values(&values)?;
+                            gpu_write_seconds += tw.elapsed().as_secs_f64();
                             gpu_done.insert(name);
                         }
                     }
@@ -6972,6 +6999,7 @@ fn enrich_inner(
             if disabled {
                 device_projection = None;
             } else {
+                let tc = Instant::now();
                 gpu_ctx = crate::enrich_gpu::EnrichGpu::from_projected(
                     &store,
                     projection,
@@ -6982,11 +7010,13 @@ fn enrich_inner(
                     &precompute,
                     3,
                 );
+                feature_context_seconds += tc.elapsed().as_secs_f64();
             }
         }
         if gpu_ctx.is_none() {
             // Fallback: the historical whole-column upload. It is the narrow
             // path for an exotic store layout, not the default.
+            let tr = Instant::now();
             let times = i64_column_all(&store, time_col, cols.time_dtype)?;
             let nan = vec![f64::NAN; store.n_rows()];
             let volume = match cols.volume {
@@ -7016,6 +7046,7 @@ fn enrich_inner(
                 Some(c) => column_all(&store, c)?,
                 None => nan,
             };
+            feature_read_seconds += tr.elapsed().as_secs_f64();
             let mut present = 0u32;
             if cols.volume.is_some() {
                 present |= crate::features_gpu::PRESENT_VOLUME;
@@ -7032,6 +7063,7 @@ fn enrich_inner(
             if cols.taker_buy_quote.is_some() {
                 present |= crate::features_gpu::PRESENT_TAKER_BUY_QV;
             }
+            let tc = Instant::now();
             gpu_ctx = crate::enrich_gpu::EnrichGpu::new_with_flow(
                 &times,
                 &open,
@@ -7048,6 +7080,7 @@ fn enrich_inner(
                 &seg_len,
                 step,
             );
+            feature_context_seconds += tc.elapsed().as_secs_f64();
         }
         if gpu_ctx.is_none() {
             // No device context: the whole planned GPU share falls back.
@@ -7065,6 +7098,8 @@ fn enrich_inner(
 
     #[cfg(feature = "cuda")]
     if let Some(gpu) = gpu_ctx.as_mut() {
+        let t_gpu_block = Instant::now();
+        let write_before_block = gpu_write_seconds;
         // Features computed per uploaded tile stay resident until downloaded.
         // Drain them first: they would otherwise hold the device memory the
         // fused flow and price-action planes need.
@@ -7275,6 +7310,8 @@ fn enrich_inner(
                 }
             }
         }
+        feature_gpu_seconds +=
+            t_gpu_block.elapsed().as_secs_f64() - (gpu_write_seconds - write_before_block);
         let stats = gpu.stats();
         gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
         gpu_transfer_bytes = stats.h2d_bytes + stats.d2h_bytes + side_transfer_bytes;
@@ -7292,6 +7329,7 @@ fn enrich_inner(
     }
 
     // Everything planned for the CPU (including failed GPU calls).
+    let t_cpu_pass = Instant::now();
     let cpu_own: Vec<String> = own
         .iter()
         .filter(|n| !gpu_done.contains(*n))
@@ -7371,7 +7409,14 @@ fn enrich_inner(
             }
         }
     }
+    let feature_cpu_seconds = t_cpu_pass.elapsed().as_secs_f64();
     let feature_seconds = t_feat.elapsed().as_secs_f64();
+    let feature_other_seconds = feature_seconds
+        - (feature_read_seconds
+            + feature_context_seconds
+            + feature_gpu_seconds
+            + gpu_write_seconds
+            + feature_cpu_seconds);
 
     // The cross-sectional pass reads the source columns back, so flush the
     // buffered writers first (the files are row-complete at this point).
@@ -7712,6 +7757,11 @@ fn enrich_inner(
                 .unwrap_or_default(),
             read_seconds,
             feature_seconds,
+            feature_read_seconds,
+            feature_context_seconds,
+            feature_gpu_seconds,
+            feature_cpu_seconds,
+            feature_other_seconds,
             xs_seconds,
             write_seconds: 0.0,
             total_seconds: started.elapsed().as_secs_f64(),
@@ -7770,6 +7820,11 @@ fn enrich_inner(
             .unwrap_or_default(),
         read_seconds,
         feature_seconds,
+        feature_read_seconds,
+        feature_context_seconds,
+        feature_gpu_seconds,
+        feature_cpu_seconds,
+        feature_other_seconds,
         xs_seconds,
         write_seconds,
         total_seconds: started.elapsed().as_secs_f64(),
@@ -8070,8 +8125,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   fails closed with the missing data dependency instead of being silently
   dropped. All 36 multi-timeframe columns are `available:true`, and the complete
   cross-asset/breadth/rank family is `available:true`; `cross` expands it.
-  Derivative columns have no local snapshot and are `available:false` with
-  source null.
+  The ten derivative columns (`funding_rate`, `funding_carry_24h`, `basis_bps`,
+  `oi`, `oi_chg_1h`, `oi_chg_24h`, `ls_ratio`, `taker_buy_sell_ratio`,
+  `liq_long`, `liq_short`) are `available:false` with source null. A request
+  for one, or for the group `derivatives`, is refused and names the missing raw
+  field; it never yields zeros, an empty column or a forward fill.
 
 
   Flow and compact flow features read the raw `volume`, `quote_volume`,
