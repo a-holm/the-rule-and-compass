@@ -32,9 +32,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable, gate_proposal,
-    is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
-    BatchedFitter, ProposalGate, VerifiedBatch,
+    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable,
+    gate_device_proposal, gate_proposal, is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
+    BatchedFitter, ProposalGate, VerifiedBatch, Verdict,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;
@@ -633,6 +633,26 @@ pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bo
 /// objective to fit and the device must not invent `max √wᵢ|rᵢ|`.
 pub fn maximum_fit_only(metric: Metric) -> bool {
     metric == Metric::Maximum
+}
+
+/// True when a device proposal for `metric` passes the exact `f64` gate
+/// ([`gate_device_proposal`]) before it replaces the starting constants, and
+/// so cannot run in the ungated pipeline write-back.
+pub fn device_fit_is_gated(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::LogLoss | Metric::Correlation | Metric::CorrelationSigned | Metric::Signed
+    )
+}
+
+/// True when the deferred fit admits every candidate with constants at any row
+/// count: the CPU arm fits each of them, so the `max(32, pop/4)` fraction would
+/// leave the gated arms with a smaller fit set than the exact arm.
+pub fn admits_every_candidate(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::Correlation | Metric::CorrelationSigned | Metric::Signed
+    )
 }
 
 /// #227: rows below which the device maximum-error polish is not worth its
