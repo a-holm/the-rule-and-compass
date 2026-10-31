@@ -126,7 +126,7 @@ A refusal names the stage, the bytes it needs, the budget and the smallest fixes
 
 ```text
 error: GPU memory plan refused the fit stage: the f64 fit twin does not fit beside the resident rows
-  need 19.55 GiB (20,992,000,000 bytes): rows f32 6.49 GiB + f64 fit twin 12.99 GiB + buffers 0.02 GiB (4,775,757 rows x 364 vars, P=10,000)
+  need 19.50 GiB (20,933,704,236 bytes): rows f32 6.49 GiB + f64 fit twin 12.99 GiB + buffers 15.15 MiB (4,775,757 rows x 364 vars, P=10,000)
   budget 10.09 GiB (10,830,741,504 bytes) = min(cap 10.50 GiB, free 11.09 GiB - reserve 1.00 GiB)
   smallest fix: --vars 187; or at most 2457450 training rows (--sample-rows on store input, scaled by the train fraction); or --fit-strategy exact; or --cpu
 ```
