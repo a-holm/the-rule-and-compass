@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "radix_select.h"
 #include <cub/cub.cuh>
 #include <math_constants.h>
 #include <math.h>
@@ -214,6 +215,12 @@ struct RcCtx {
        computed once from the resident f32 target at rc_create time. */
     double ybar;
     double syy;
+    /* Unweighted target moments, and the positive-weight row count of the
+       resident weight vector. `ybar`/`syy` hold the weighted moments while
+       `d_w64` is set. */
+    double ybar_u;
+    double syy_u;
+    int wrows;
     /* #122: fixed-capacity, double-buffered genome arena. */
     unsigned int *d_pool[2];
     unsigned long long *d_hash;
@@ -246,6 +253,15 @@ struct RcCtx {
     int nprog;
     int out_cap;
     cudaEvent_t t0, t1;
+    /* #284: device-time anchor. Kernel spans are placed by the event distance
+       from `ev_base`, whose host time is `base_host_ms` on the rc_now_ms clock.
+       The anchor is renewed once it is old, so the float event distance stays
+       fine-grained over a long run. */
+    cudaEvent_t ev_base;
+    int base_ok;
+    double base_host_ms;
+    double span_start_ms[2];
+    int span_ok[2];
     /* #118: the current batch's ledger and its start on the same monotonic
        clock, so `wall_ms` covers the whole begin..download path. */
     RcStats stats;
@@ -342,6 +358,32 @@ static char g_alloc_fail_tag[32] = "";
 static void rc_ledger_tag(char *dst, const char *tag)
 {
     snprintf(dst, 32, "%s", tag ? tag : "");
+}
+
+/* #284: place the kernel span `t0..t1` on the rc_now_ms clock from the event
+   distance to the anchor. `which` is 0 for the evaluator and 1 for the fit
+   stage. Both events are complete when this runs (the elapsed-time query
+   needs that). A failed query leaves the span unavailable and the Rust side
+   keeps the host envelope. */
+static void rc_span_capture(RcCtx *c, int which)
+{
+    c->span_ok[which] = 0;
+    if (!c->base_ok) return;
+    float off = 0.0f;
+    if (cudaEventElapsedTime(&off, c->ev_base, c->t0) != cudaSuccess || off < 0.0f) {
+        cudaGetLastError();
+        return;
+    }
+    c->span_start_ms[which] = c->base_host_ms + (double)off;
+    c->span_ok[which] = 1;
+    if ((double)off > 30000.0) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+        } else {
+            c->base_ok = 0;
+        }
+    }
 }
 
 static int rc_ledger_refuse(RcCtx *c, const char *tag, size_t bytes)
@@ -1005,6 +1047,49 @@ __device__ __forceinline__ void score_step(
             a += wi * (double)rc_class_row_loss(pred, t, MODE);
             b += wi;
         }
+    } else if (w && MODE != RC_SCORE_MAXIMUM) {
+        /* Weighted regression: `a` carries `Σ wᵢ·termᵢ`, `b` the weight sum
+           (correlation pass 1 keeps the cross moment in `b`). A zero-weight
+           row is skipped before the program runs. */
+        const bool corr = MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const double wi = w[i];
+            if (!isfinite(wi) || wi < 0.0) {
+                lbad = 1;
+                continue;
+            }
+            if (wi == 0.0) continue;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            if (corr) {
+                if (PASS == 0) {
+                    a += wi * (double)pred;
+                    b += wi;
+                } else {
+                    const double dp = (double)pred - pb;
+                    const double dy = (double)y[i] - ybar;
+                    a += wi * dp * dp;
+                    b += wi * dp * dy;
+                }
+                continue;
+            }
+            const double res = (double)pred - (double)y[i];
+            if (MODE == RC_SCORE_ABSOLUTE) {
+                a += wi * fabs(res);
+            } else if (MODE == RC_SCORE_LOG_SQUASHED) {
+                const double rr = res * res;
+                a += wi * (isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(res)));
+            } else if (MODE == RC_SCORE_SIGNED) {
+                a += wi * res;
+            } else {
+                a += wi * res * res;
+            }
+            b += wi;
+        }
     } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
         if (PASS == 0) {
             for (long long r = first; r < r_end; r += lanes) {
@@ -1157,6 +1242,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
                             a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
+        sh2[tid] = b;
         __syncthreads();
         if (bad) atomicOr(&sbad, 1);
         __syncthreads();
@@ -1168,10 +1254,21 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
             return;
         }
         for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                if (w) sh2[tid] += sh2[tid + st];
+            }
             __syncthreads();
         }
-        const double pbar = sh1[0] / (double)n;
+        if (w && !(sh2[0] > 0.0)) {
+            if (tid == 0) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            }
+            return;
+        }
+        const double pbar = w ? sh1[0] / sh2[0] : sh1[0] / (double)n;
+        __syncthreads();
 
         /* Pass 2: centred sums. ybar/syy were cached per fit sample. */
         bad = 0;
@@ -1220,6 +1317,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
                         a, b, best_key, best_row, bad);
     if (tid == 0) sbad = 0;
     sh1[tid] = a;
+    sh2[tid] = b;
     shk[tid] = best_key;
     shi[tid] = best_row;
     __syncthreads();
@@ -1250,19 +1348,28 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
         }
     } else {
         for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                if (w) sh2[tid] += sh2[tid + st];
+            }
             __syncthreads();
         }
         if (tid == 0) {
             const double sum = sh1[0];
-            if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+            const double denom = w ? sh2[0] : (double)n;
+            if (w && !(denom > 0.0)) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            } else if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
                 out[p] = sum; /* RSS; host applies the penalty. */
+                status[p] = 0;
             } else if (MODE == RC_SCORE_SIGNED) {
-                out[p] = fabs(sum) / (double)n;
+                out[p] = fabs(sum) / denom;
+                status[p] = 0;
             } else {
-                out[p] = sum / (double)n;
+                out[p] = sum / denom;
+                status[p] = 0;
             }
-            status[p] = 0;
         }
     }
 }
@@ -1347,19 +1454,25 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_mid_kernel(
     double *__restrict__ lane_a,
     double *__restrict__ lane_b,
     double *__restrict__ pbar,
-    long long n)
+    long long n,
+    int weighted)
 {
     const int tid = threadIdx.x;
     const int p = blockIdx.x;
     const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
     __shared__ double sh1[RC_MAX_THREADS];
+    __shared__ double sh2[RC_MAX_THREADS];
     sh1[tid] = lane_a[slot];
+    sh2[tid] = lane_b[slot];
     __syncthreads();
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-        if ((int)tid < st) sh1[tid] += sh1[tid + st];
+        if ((int)tid < st) {
+            sh1[tid] += sh1[tid + st];
+            if (weighted) sh2[tid] += sh2[tid + st];
+        }
         __syncthreads();
     }
-    if (tid == 0) pbar[p] = sh1[0] / (double)n;
+    if (tid == 0) pbar[p] = weighted ? (sh2[0] > 0.0 ? sh1[0] / sh2[0] : NAN) : sh1[0] / (double)n;
     lane_a[slot] = 0.0;
     lane_b[slot] = 0.0;
 }
@@ -1372,6 +1485,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
     const int *__restrict__ bad,
     long long n,
     double syy,
+    const double *__restrict__ pbar,
+    int weighted,
     double *__restrict__ out,
     int *__restrict__ status)
 {
@@ -1415,7 +1530,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
     sh2[tid] = lane_b[slot];
     __syncthreads();
     const int two = (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) ||
-                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED ||
+                    weighted;
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
         if ((int)tid < st) {
             sh1[tid] += sh1[tid + st];
@@ -1433,6 +1549,11 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
             status[p] = 0;
         }
     } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        if (weighted && !(pbar[p] == pbar[p])) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            return;
+        }
         const double spp = sh1[0];
         const double spy = sh2[0];
         const double rho = (spp <= 0.0 || syy <= 0.0)
@@ -1442,12 +1563,18 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
         status[p] = 0;
     } else {
         const double sum = sh1[0];
+        const double denom = weighted ? sh2[0] : (double)n;
+        if (weighted && !(denom > 0.0)) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            return;
+        }
         if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
             out[p] = sum;
         } else if (MODE == RC_SCORE_SIGNED) {
-            out[p] = fabs(sum) / (double)n;
+            out[p] = fabs(sum) / denom;
         } else {
-            out[p] = sum / (double)n;
+            out[p] = sum / denom;
         }
         status[p] = 0;
     }
@@ -3606,8 +3733,20 @@ static void *rc_create_impl(const float *cols, int n, int v, const float *y,
         }
         c->syy = ss;
     }
+    c->ybar_u = c->ybar;
+    c->syy_u = c->syy;
+    c->wrows = n;
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
+    c->base_ok = 0;
+    c->span_ok[0] = c->span_ok[1] = 0;
+    if (cudaEventCreate(&c->ev_base) == cudaSuccess) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+            c->base_ok = 1;
+        }
+    }
     /* #285: copy streams and the per-slot events. A failed stream/event
        creation is not fatal: the batch path then keeps its synchronous
        semantics with a recorded reason. */
@@ -3716,6 +3855,7 @@ void rc_destroy(void *ctx)
     if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
     if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
     if (c->s_eval) cudaStreamDestroy(c->s_eval);
+    cudaEventDestroy(c->ev_base);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -3869,6 +4009,7 @@ float rc_eval_collect(void *ctx, float *out)
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = c->pending.nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     if (failed) st->failed = 1;
@@ -4069,6 +4210,7 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
@@ -4106,6 +4248,44 @@ static double rc_aic_value(int kind, double rss, int n, int k)
     const double denom = dn - dk - 1.0;
     if (denom <= 0.0) return INFINITY;
     return base + 2.0 * dk + 2.0 * dk * (dk + 1.0) / denom;
+}
+
+/* Row-weighted target moments for the weighted correlation, computed from the
+   resident f32 target exactly as `metrics::weighted_correlation` computes them
+   over the positive-weight rows. A null `w` restores the unweighted moments. */
+static int rc_weighted_moments(RcCtx *c, const double *w)
+{
+    c->ybar = c->ybar_u;
+    c->syy = c->syy_u;
+    c->wrows = c->n;
+    if (!w) return 0;
+    float *y = (float *)malloc(sizeof(float) * (size_t)c->n);
+    if (!y) return -1;
+    rc_download(y, c->d_y, sizeof(float) * (size_t)c->n);
+    double total = 0.0, mb = 0.0;
+    int rows = 0;
+    for (int i = 0; i < c->n; ++i) {
+        if (w[i] > 0.0) {
+            total += w[i];
+            mb += w[i] * (double)y[i];
+            ++rows;
+        }
+    }
+    double sb = 0.0;
+    if (total > 0.0) {
+        mb /= total;
+        for (int i = 0; i < c->n; ++i) {
+            if (w[i] > 0.0) {
+                const double db = (double)y[i] - mb;
+                sb += w[i] * db * db;
+            }
+        }
+    }
+    free(y);
+    c->ybar = mb;
+    c->syy = sb;
+    c->wrows = rows;
+    return 0;
 }
 
 /* #293: lanes of the score launch, the block width of `score_kernel`. */
@@ -4172,11 +4352,12 @@ static void rc_rows_run(RcCtx *c, const unsigned int *prog, const unsigned int *
                     (size_t)nprog * ((size_t)lanes * 16 + 16), 0);
     rc_rows_pass<MODE, 0>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
         rc_rows_pass<MODE, 1>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     }
     score_finish_kernel<MODE><<<nprog, lanes>>>(
-        lane_a, lane_b, bad, (long long)c->n, c->syy, c->d_score_out, c->d_score_status);
+        lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
+        c->d_score_out, c->d_score_status);
 }
 
 static int rc_rows_dispatch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
@@ -4284,11 +4465,11 @@ static void rc_tiles_run(RcCtx *c, const unsigned int *prog, const unsigned int 
         cudaMemsetAsync(c->d_carry, 0, (size_t)nw * ((size_t)lanes * 16 + 16), 0);
         rc_tiles_pass<MODE, 0>(c, progw, offw, width, pooled, nw, lanes);
         if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
             rc_tiles_pass<MODE, 1>(c, progw, offw, width, pooled, nw, lanes);
         }
         score_finish_kernel<MODE><<<nw, lanes>>>(
-            lane_a, lane_b, bad, (long long)c->n, c->syy,
+            lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
             c->d_score_out + w0, c->d_score_status + w0);
         c->wave_count++;
     }
@@ -4339,6 +4520,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     st->alloc_ms += rc_now_ms() - t;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+
+    /* Maximum has no weighted form: a weighted launch is refused, never scored
+       unweighted. */
+    if (kind == RC_SCORE_MAXIMUM && c->d_w64) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
 
     /* #289: a classification launch without the uploaded label sign is refused
        here, so it can never be scored by another objective. */
@@ -4488,13 +4677,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         for (int i = 0; i < nprog; ++i) {
             if (status[i] == 0) {
                 const int k = pcount ? pcount[i] : 0;
-                out[i] = rc_aic_value(kind, out[i], c->n, k);
+                out[i] = rc_aic_value(kind, out[i], c->d_w64 ? c->wrows : c->n, k);
             }
         }
     }
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     if (bounds || c->tiled) c->carry_warm = 1;
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
@@ -4585,6 +4775,21 @@ int rc_last_stats(void *ctx, RcStats *out)
     return 0;
 }
 
+/* #284: the last kernel span of kind `which` (0 evaluator, 1 fit), placed by
+   event timestamps. Writes the span start and the current time on the same
+   monotonic clock, in milliseconds, and clears the span. Returns 1 when a span
+   was available, else 0 and the caller keeps its host envelope. */
+int rc_last_span(void *ctx, int which, double *start_ms, double *now_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !start_ms || !now_ms || which < 0 || which > 1) return 0;
+    if (!c->span_ok[which]) return 0;
+    c->span_ok[which] = 0;
+    *start_ms = c->span_start_ms[which];
+    *now_ms = rc_now_ms();
+    return 1;
+}
+
 /* Canonical postfix hashes of the last uploaded buffer. */
 int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long *out)
 {
@@ -4613,6 +4818,7 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
     if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
     if (c->d_y64) { rc_dev_free(c, c->d_y64); c->d_y64 = 0; }
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
+    rc_weighted_moments(c, 0);
     /* #288: the rank stage caches B from the previous target. Re-uploading
        exact rows invalidates it, or a scorer called after this would rank the
        new predictions against the old target. */
@@ -4637,6 +4843,7 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
             return -1;
         }
         rc_upload(c->d_w64, w, yb);
+        if (rc_weighted_moments(c, w) != 0) return -1;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -4664,6 +4871,7 @@ int rc_set_score_weights(void *ctx, const double *w)
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
+    rc_weighted_moments(c, 0);
     if (!w) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
     if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
@@ -4672,6 +4880,11 @@ int rc_set_score_weights(void *ctx, const double *w)
     }
     rc_upload(c->d_w64, w, yb);
     if (cudaGetLastError() != cudaSuccess) {
+        rc_dev_free(c, c->d_w64);
+        c->d_w64 = 0;
+        return -1;
+    }
+    if (rc_weighted_moments(c, w) != 0) {
         rc_dev_free(c, c->d_w64);
         c->d_w64 = 0;
         return -1;
@@ -4801,6 +5014,7 @@ float rc_fit_batch(void *ctx,
     rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5084,6 +5298,7 @@ float rc_rank_score_batch(void *ctx,
     rc_fs_ok(c, RC_FS_RANK);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5108,10 +5323,30 @@ __device__ __forceinline__ double md_key_value(unsigned long long k)
     return a;
 }
 
-/* One key per row of every `(candidate, trial)` segment: the bit pattern of
- * `|pred − y|` in exact f64. `status[seg] = 2` marks a segment with a
- * non-finite prediction or residual, which the caller reads as `non_finite`
- * and hands to the exact CPU arm (the landed #169 guard, never a silent 1e30). */
+/* The key of one row: the bit pattern of `|pred − y|` in exact f64, or the
+ * all-ones sentinel and a non-zero return for a non-finite prediction or
+ * residual (the landed #169 guard, never a silent 1e30). The sort and the
+ * select path both call this, so they admit exactly the same rows. */
+__device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const double *c,
+                                          const double *__restrict__ cols,
+                                          const double *__restrict__ y, int n, int row,
+                                          unsigned long long *key)
+{
+    double v[FT_MAX_NODES];
+    ft_forward_d(nd, m, cols, n, row, c, v);
+    const double pred = v[m - 1];
+    const double r = pred - y[row];
+    if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+        *key = 0xFFFFFFFFFFFFFFFFULL;
+        return 1;
+    }
+    *key = md_abs_key(r);
+    return 0;
+}
+
+/* One key per row of every `(candidate, trial)` segment. `status[seg] = 2`
+ * marks a segment with a non-finite prediction or residual, which the caller
+ * reads as `non_finite` and hands to the exact CPU arm. */
 __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
                               const unsigned int *__restrict__ off,
                               const double *__restrict__ c0, int kmax,
@@ -5133,16 +5368,77 @@ __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
         const unsigned int *nd = prog + off[cand];
         const int m = (int)((off[cand + 1] - off[cand]) / 4u);
         const double *c = c0 + (size_t)seg * (size_t)kmax;
-        double v[FT_MAX_NODES];
-        ft_forward_d(nd, m, cols, n, row, c, v);
-        const double pred = v[m - 1];
-        const double r = pred - y[row];
-        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
-            keys[i] = 0xFFFFFFFFFFFFFFFFULL;
+        if (md_row_key(nd, m, c, cols, y, n, row, &keys[i])) {
             status[seg] = 2; /* non-finite row: the caller falls back */
-        } else {
-            keys[i] = md_abs_key(r);
         }
+    }
+}
+
+/* #288: the select path's key producer, fused with radix pass 0. Grid
+ * `(segments, blocks per segment)`. Every row's key is written exactly as
+ * `k_order_stat_keys` writes it, and the top digit of every finite key is
+ * counted into query 0 of the segment's pass-0 histogram. */
+__global__ void k_order_stat_select_keys(const unsigned int *__restrict__ prog,
+                                         const unsigned int *__restrict__ off,
+                                         const double *__restrict__ c0, int kmax,
+                                         const double *__restrict__ cols,
+                                         const double *__restrict__ y, int n, int ns,
+                                         int ntrials,
+                                         unsigned long long *__restrict__ keys,
+                                         int *__restrict__ status,
+                                         unsigned int *__restrict__ hist)
+{
+    __shared__ unsigned int bins[RS_BINS];
+    const int seg = blockIdx.x;
+    if (seg >= ns) return;
+    for (int b = threadIdx.x; b < RS_BINS; b += blockDim.x) bins[b] = 0u;
+    __syncthreads();
+    const int cand = seg / ntrials;
+    const unsigned int *nd = prog + off[cand];
+    const int m = (int)((off[cand + 1] - off[cand]) / 4u);
+    const double *c = c0 + (size_t)seg * (size_t)kmax;
+    unsigned long long *ks = keys + (size_t)seg * (size_t)n;
+    const int shift = rs_shift(0);
+    int bad = 0;
+    const long long stride = (long long)gridDim.y * blockDim.x;
+    for (long long base = (long long)blockIdx.y * blockDim.x; base < n; base += stride) {
+        const long long row = base + threadIdx.x;
+        unsigned int d = RS_NO_DIGIT;
+        if (row < n) {
+            unsigned long long key;
+            if (md_row_key(nd, m, c, cols, y, n, (int)row, &key)) {
+                bad = 1;
+            } else {
+                d = (unsigned int)(key >> shift);
+            }
+            ks[row] = key;
+        }
+        rs_count(bins, d);
+    }
+    if (bad) status[seg] = 2;
+    __syncthreads();
+    rs_flush(bins, 1, hist + (size_t)seg * RS_MAX_QUERIES * RS_BINS);
+}
+
+/* #288: the statistic from the selected keys. `q == 1`: the one selected
+ * value (odd median, maximum). `q == 2`: the two middles of an even median,
+ * combined with the expression `metrics::median_abs` uses. */
+__global__ void k_order_stat_select_final(const unsigned long long *__restrict__ prefix,
+                                          int ns, int q,
+                                          const int *__restrict__ status,
+                                          double *__restrict__ out)
+{
+    const int seg = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seg >= ns) return;
+    if (status[seg] != 0) {
+        out[seg] = CUDART_NAN;
+        return;
+    }
+    const double a = md_key_value(prefix[(size_t)seg * RS_MAX_QUERIES]);
+    if (q == 1) {
+        out[seg] = a;
+    } else {
+        out[seg] = 0.5 * (a + md_key_value(prefix[(size_t)seg * RS_MAX_QUERIES + 1]));
     }
 }
 
@@ -5150,6 +5446,78 @@ __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
  * interquartile window sum is a tree reduction, and a fixed width is what makes
  * that reduction's rounding order (hence its value) reproducible. */
 #define RC_OS_PICK_THREADS 256
+
+/* #288: the `what` codes of `rc_order_stat_score_batch` and
+ * `rc_order_stat_select_batch`. Keep in sync with `gpu::OrderCode`. */
+#define RC_OS_MEDIAN 0
+#define RC_OS_IQR_TREE 1
+#define RC_OS_IQR_EXACT 2
+#define RC_OS_MAXIMUM 3
+
+/* Values staged per tile of the exact interquartile sum (two tiles are live). */
+#define RC_OS_SUM_TILE 1024
+
+/* Element `j` of the ascending window `a` copies of `lo_v`, then the sorted
+ * keys `mid[0..nmid)`, then copies of `hi_v`. */
+__device__ __forceinline__ double md_window_elem(long long j, double lo_v, long long a,
+                                                 const unsigned long long *mid, long long nmid,
+                                                 double hi_v)
+{
+    if (j < a) return lo_v;
+    if (j < a + nmid) return md_key_value(mid[j - a]);
+    return hi_v;
+}
+
+__device__ __forceinline__ void md_stage(double *dst, long long start, long long total, int lane,
+                                         int width, double lo_v, long long a,
+                                         const unsigned long long *mid, long long nmid,
+                                         double hi_v)
+{
+    long long cnt = total - start;
+    if (cnt > RC_OS_SUM_TILE) cnt = RC_OS_SUM_TILE;
+    for (int i = lane; i < cnt; i += width) {
+        dst[i] = md_window_elem(start + i, lo_v, a, mid, nmid, hi_v);
+    }
+}
+
+/* #288: the CPU's `iter().sum()` of an ascending window of `a + nmid + b`
+ * values, bit for bit: thread 0 adds them one after another in order. While it
+ * adds one tile, warps 1.. stage the next tile in shared memory, so only the
+ * dependent adds are on the critical path. Every thread of the block calls
+ * this (it synchronises); the sum is valid in thread 0. */
+__device__ double md_ordered_sum(double lo_v, long long a, const unsigned long long *mid,
+                                 long long nmid, double hi_v, long long b,
+                                 double (*tile)[RC_OS_SUM_TILE])
+{
+    const long long total = a + nmid + b;
+    const int tid = threadIdx.x;
+    double acc = 0.0;
+    if (total <= 0) return acc;
+    md_stage(tile[0], 0, total, tid, blockDim.x, lo_v, a, mid, nmid, hi_v);
+    __syncthreads();
+    const long long ntile = (total + RC_OS_SUM_TILE - 1) / RC_OS_SUM_TILE;
+    for (long long t = 0; t < ntile; ++t) {
+        const int cur = (int)(t & 1);
+        const long long start = t * RC_OS_SUM_TILE;
+        if (tid >= 32) {
+            if (t + 1 < ntile) {
+                md_stage(tile[cur ^ 1], start + RC_OS_SUM_TILE, total, tid - 32,
+                         (int)blockDim.x - 32, lo_v, a, mid, nmid, hi_v);
+            }
+        } else if (tid == 0) {
+            const double *s = tile[cur];
+            if (total - start >= RC_OS_SUM_TILE) {
+#pragma unroll 16
+                for (int i = 0; i < RC_OS_SUM_TILE; ++i) acc += s[i];
+            } else {
+                const int cnt = (int)(total - start);
+                for (int i = 0; i < cnt; ++i) acc += s[i];
+            }
+        }
+        __syncthreads();
+    }
+    return acc;
+}
 
 /* The rank window `[lo, hi)` that `metrics::interquartile_mean_abs` averages:
  * `lo = n/4`, `hi = (3n)/4` for `n >= 4`. Below four rows the CPU arm has no
@@ -5163,7 +5531,7 @@ __device__ __forceinline__ void md_iqr_window(int n, int *lo, int *hi)
         return;
     }
     *lo = n / 4;
-    *hi = (3 * n) / 4;
+    *hi = (int)((3LL * n) / 4);
 }
 
 /* Turn one sorted segment into its order statistic. `what` 0 is the median,
@@ -5184,6 +5552,12 @@ __device__ __forceinline__ void md_iqr_window(int n, int *lo, int *hi)
  *
  * Ties need no tie-break in either case: both statistics are functions of the
  * multiset `{|r_i|}`, so equal keys cannot change the value.
+ *
+ * #288 `RC_OS_IQR_EXACT` is the scoring definition of the interquartile mean:
+ * one thread adds the window in ascending order, exactly the CPU's
+ * left-to-right `iter().sum()`, so it is bit-identical. The block only stages
+ * tiles of the sorted keys through shared memory. `RC_OS_MAXIMUM` is the last
+ * sorted key.
  */
 __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
                                   int n, int ns, int what,
@@ -5191,6 +5565,7 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
                                   int *__restrict__ status)
 {
     __shared__ double part[RC_OS_PICK_THREADS];
+    __shared__ double tile[2][RC_OS_SUM_TILE];
     const int seg = blockIdx.x;
     const int tid = threadIdx.x;
     if (seg >= ns) return;
@@ -5202,7 +5577,7 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         return;
     }
     const unsigned long long *k = keys + (size_t)seg * (size_t)n;
-    if (what == 0) {
+    if (what == RC_OS_MEDIAN) {
         if (tid != 0) return;
         if (n & 1) {
             out[seg] = md_key_value(k[n / 2]);
@@ -5211,8 +5586,17 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         }
         return;
     }
+    if (what == RC_OS_MAXIMUM) {
+        if (tid == 0) out[seg] = md_key_value(k[n - 1]);
+        return;
+    }
     int lo, hi;
     md_iqr_window(n, &lo, &hi);
+    if (what == RC_OS_IQR_EXACT) {
+        const double acc = md_ordered_sum(0.0, 0, k + lo, hi - lo, 0.0, 0, tile);
+        if (tid == 0) out[seg] = acc / (double)(hi - lo);
+        return;
+    }
     double s = 0.0;
     for (int i = lo + tid; i < hi; i += RC_OS_PICK_THREADS) s += md_key_value(k[i]);
     part[tid] = s;
@@ -5222,6 +5606,133 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         __syncthreads();
     }
     if (tid == 0) out[seg] = part[0] / (double)(hi - lo);
+}
+
+/* #288: the interquartile mean on the select path. The two selected keys are
+ * the window boundaries `t_lo = s[lo]` and `t_hi = s[hi - 1]`. The window in
+ * ascending order is then `a` copies of `t_lo`, the interior keys
+ * `t_lo < k < t_hi` sorted, and `b` copies of `t_hi`, with
+ * `a = min(#{k <= t_lo}, hi) - lo` and `b = (hi - lo) - a - #interior`. Only
+ * the interior (at most `hi - lo - 2` keys) needs sorting.
+ *
+ * This kernel counts `#{k <= t_lo}` and copies the interior keys of a segment
+ * to its slice of `mid`. Grid `(segments, blocks per segment)`. A block
+ * reserves its slots once per iteration with one atomic, so the copied order
+ * varies from run to run; the segmented sort that follows removes it. A slot
+ * past the slice cannot happen for consistent boundaries; it is status 3. */
+__global__ void k_iqr_select_split(const unsigned long long *__restrict__ keys, int n, int ns,
+                                   long long w,
+                                   const unsigned long long *__restrict__ prefix,
+                                   int *__restrict__ status,
+                                   unsigned int *__restrict__ le_count,
+                                   unsigned int *__restrict__ mid_count,
+                                   unsigned long long *__restrict__ mid)
+{
+    __shared__ unsigned int warp_slot[RS_THREADS / 32];
+    __shared__ unsigned int block_slot;
+    const int seg = blockIdx.x;
+    if (seg >= ns || status[seg] != 0) return;
+    const unsigned long long t_lo = prefix[(size_t)seg * RS_MAX_QUERIES];
+    const unsigned long long t_hi = prefix[(size_t)seg * RS_MAX_QUERIES + 1];
+    const unsigned long long *ks = keys + (size_t)seg * (size_t)n;
+    unsigned long long *ms = mid + (size_t)seg * (size_t)w;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    unsigned int le = 0u;
+    int overflow = 0;
+    const long long stride = (long long)gridDim.y * blockDim.x;
+    for (long long base = (long long)blockIdx.y * blockDim.x; base < n; base += stride) {
+        const long long row = base + threadIdx.x;
+        unsigned long long key = 0ULL;
+        int inner = 0;
+        if (row < n) {
+            key = ks[row];
+            if (key <= t_lo) {
+                ++le;
+            } else if (key < t_hi) {
+                inner = 1;
+            }
+        }
+        const unsigned int ball = __ballot_sync(0xffffffffu, inner);
+        if (lane == 0) warp_slot[warp] = (unsigned int)__popc(ball);
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int total = 0u;
+            for (int i = 0; i < warps; ++i) {
+                const unsigned int c = warp_slot[i];
+                warp_slot[i] = total;
+                total += c;
+            }
+            block_slot = total ? atomicAdd(&mid_count[seg], total) : 0u;
+        }
+        __syncthreads();
+        if (inner) {
+            const unsigned long long slot = (unsigned long long)block_slot + warp_slot[warp] +
+                                            (unsigned int)__popc(ball & ((1u << lane) - 1u));
+            if (slot < (unsigned long long)w) {
+                ms[slot] = key;
+            } else {
+                overflow = 1;
+            }
+        }
+        __syncthreads();
+    }
+    for (int d = 16; d > 0; d >>= 1) le += __shfl_down_sync(0xffffffffu, le, d);
+    if (lane == 0 && le != 0u) atomicAdd(&le_count[seg], le);
+    if (overflow) status[seg] = 3;
+}
+
+/* Segment bounds of the interior keys for the segmented sort. */
+__global__ void k_iqr_select_bounds(int ns, long long w, const int *__restrict__ status,
+                                    const unsigned int *__restrict__ mid_count,
+                                    int *__restrict__ begin, int *__restrict__ end)
+{
+    const int seg = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seg >= ns) return;
+    const long long b = (long long)seg * w;
+    long long c = mid_count[seg];
+    if (c > w || status[seg] != 0) c = 0;
+    begin[seg] = (int)b;
+    end[seg] = (int)(b + c);
+}
+
+/* The window mean from the boundaries, the counts and the sorted interior. One
+ * block per segment. Counts that do not describe the window `[lo, hi)` are
+ * status 3. */
+__global__ void k_iqr_select_sum(const unsigned long long *__restrict__ prefix,
+                                 const unsigned long long *__restrict__ mid_sorted, int ns,
+                                 int lo, int hi,
+                                 const unsigned int *__restrict__ le_count,
+                                 const unsigned int *__restrict__ mid_count,
+                                 int *__restrict__ status, double *__restrict__ out)
+{
+    __shared__ double tile[2][RC_OS_SUM_TILE];
+    const int seg = blockIdx.x;
+    if (seg >= ns) return;
+    if (status[seg] != 0) {
+        if (threadIdx.x == 0) out[seg] = CUDART_NAN;
+        return;
+    }
+    const long long w = (long long)hi - lo;
+    const unsigned long long t_lo = prefix[(size_t)seg * RS_MAX_QUERIES];
+    const unsigned long long t_hi = prefix[(size_t)seg * RS_MAX_QUERIES + 1];
+    long long le = le_count[seg];
+    if (le > hi) le = hi;
+    const long long a = le - lo;
+    const long long nmid = mid_count[seg];
+    const long long b = w - a - nmid;
+    const int tied = t_lo == t_hi;
+    if (a < 1 || nmid > w || b < 0 || (tied && (nmid != 0 || b != 0)) || (!tied && b < 1)) {
+        if (threadIdx.x == 0) {
+            status[seg] = 3;
+            out[seg] = CUDART_NAN;
+        }
+        return;
+    }
+    const double acc = md_ordered_sum(md_key_value(t_lo), a, mid_sorted + (size_t)seg * (size_t)w,
+                                      nmid, md_key_value(t_hi), b, tile);
+    if (threadIdx.x == 0) out[seg] = acc / (double)w;
 }
 
 /* #227: the exact maximum-error scan, one block per `(candidate, trial)`
@@ -5448,11 +5959,13 @@ float rc_max_scan_batch(void *ctx,
     rc_fs_ok(c, RC_FS_MAX);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
-/* Exact median (what = 0) or interquartile mean of the absolute errors
- * (what = 1) of `nsets * ntrials` prediction vectors.
+/* Exact median (`RC_OS_MEDIAN`), interquartile mean of the absolute errors
+ * (`RC_OS_IQR_TREE` for the fit ladder, `RC_OS_IQR_EXACT` for scoring) or
+ * maximum (`RC_OS_MAXIMUM`) of `nsets * ntrials` prediction vectors.
  *
  * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
  * the same layout `rc_fit_batch`/`rc_rank_score_batch` use. `out_value`
@@ -5481,7 +5994,7 @@ float rc_order_stat_score_batch(void *ctx,
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
-    if (what != 0 && what != 1) return -1.0f;
+    if (what < RC_OS_MEDIAN || what > RC_OS_MAXIMUM) return -1.0f;
     if (c->n <= 0) return -1.0f;
     const int nsegs = nsets * ntrials;
     const long long total = (long long)nsegs * (long long)c->n;
@@ -5568,6 +6081,207 @@ float rc_order_stat_score_batch(void *ctx,
     if (rc_fs_finish(c) != 0) return -1.0f;
     memcpy(out_value, host + o_val, sizeof(double) * (size_t)nsegs);
     memcpy(out_status, host + o_status, sizeof(int) * (size_t)nsegs);
+    rc_fs_ok(c, RC_FS_ORDER);
+    float ms = -1.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
+    return ms;
+}
+
+/* #288: the radix select path of `rc_order_stat_score_batch`:
+ *   - `RC_OS_MEDIAN`: ranks `n/2`, or `n/2 - 1` and `n/2` for even `n`;
+ *   - `RC_OS_MAXIMUM`: rank `n - 1`;
+ *   - `RC_OS_IQR_EXACT`: the window boundaries `lo` and `hi - 1`, then the
+ *     interior split, a segmented sort of the interior only and the ordered
+ *     sum (`k_iqr_select_*`).
+ * Same inputs, outputs and status labels, and the same bits as the sort path:
+ * the selected keys are the sorted keys at those ranks, and the window sum adds
+ * the same ascending sequence in the same order.
+ *
+ * Work per call: the fused key and pass-0 kernel, then for each of the six
+ * digits a pick and (after the first) a prefix-filtered histogram, then the
+ * final combination. The device region holds one key per row, two `RS_BINS`
+ * histograms and two prefix/rank slots per segment; the interquartile mean
+ * adds two interior buffers of `hi - lo` keys per segment and CUB's workspace
+ * for sorting them.
+ *
+ * `blocks_per_seg <= 0` picks the production shape; a positive value forces
+ * it, which is how the tests show the value does not depend on the partition.
+ * Returns the stage time in ms, or a negative value when nothing may be trusted
+ * (including an internal consistency check, status 3), so the caller can run
+ * the sort path instead. */
+float rc_order_stat_select_batch(void *ctx,
+                                 const unsigned int *prog,
+                                 const unsigned int *off,
+                                 const int *pcount,
+                                 int nsets,
+                                 int ntrials,
+                                 int kmax,
+                                 const double *c0,
+                                 int what,
+                                 int blocks_per_seg,
+                                 double *out_value,
+                                 int *out_status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (what != RC_OS_MEDIAN && what != RC_OS_MAXIMUM && what != RC_OS_IQR_EXACT) return -1.0f;
+    if (c->n <= 0) return -1.0f;
+    const int n = c->n;
+    const int nsegs = nsets * ntrials;
+    const long long total = (long long)nsegs * (long long)n;
+    if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
+    const int iqr = what == RC_OS_IQR_EXACT;
+    int q = 1;
+    unsigned int r0 = 0u, r1 = 0u;
+    int lo = 0, hi = 0;
+    if (iqr) {
+        lo = n < 4 ? 0 : n / 4;
+        hi = n < 4 ? n : (int)((3LL * n) / 4);
+        q = 2;
+        r0 = (unsigned int)lo;
+        r1 = (unsigned int)(hi - 1);
+    } else if (what == RC_OS_MAXIMUM) {
+        r0 = (unsigned int)(n - 1);
+    } else if (n & 1) {
+        r0 = (unsigned int)(n / 2);
+    } else {
+        q = 2;
+        r0 = (unsigned int)(n / 2 - 1);
+        r1 = (unsigned int)(n / 2);
+    }
+    const long long w = (long long)hi - lo;
+    const long long mid_total = iqr ? (long long)nsegs * w : 0;
+    int bx = blocks_per_seg > 0 ? blocks_per_seg : rs_blocks_per_segment(n);
+    if (bx > RS_MAX_BLOCKS_PER_SEG) bx = RS_MAX_BLOCKS_PER_SEG;
+    size_t temp_bytes = 0;
+    if (iqr) {
+        cub::DeviceSegmentedRadixSort::SortKeys(
+            (void *)NULL, temp_bytes, (const unsigned long long *)NULL,
+            (unsigned long long *)NULL, (int)mid_total, nsegs, (const int *)NULL,
+            (const int *)NULL);
+        if (temp_bytes == 0) temp_bytes = 1;
+    }
+    const size_t prog_words = (size_t)off[nsets];
+    const size_t c0_bytes = sizeof(double) * (size_t)nsegs * (size_t)kmax;
+    const size_t hist_words = (size_t)nsegs * RS_MAX_QUERIES * RS_BINS;
+    const size_t mid_bytes = sizeof(unsigned long long) * (size_t)mid_total;
+    const size_t cnt_bytes = iqr ? sizeof(unsigned int) * (size_t)nsegs : 0;
+    const size_t bound_bytes = iqr ? sizeof(int) * (size_t)nsegs : 0;
+    /* [ prog | off | pcount | c0 ] then [ value | status ] then the keys, the
+       histograms, the per-query prefix and residual rank, and for the
+       interquartile mean the counts, the interior keys, their sorted copy,
+       the segment bounds and the sort workspace. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nsets + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nsets);
+    const size_t o_c0 = rc_fs_take(&cur, c0_bytes);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_val = rc_fs_take(&cur, sizeof(double) * (size_t)nsegs);
+    const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nsegs);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    const size_t o_keys = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)total);
+    const size_t o_hist = rc_fs_take(&cur, sizeof(unsigned int) * hist_words);
+    const size_t o_prefix =
+        rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)nsegs * RS_MAX_QUERIES);
+    const size_t o_rank = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)nsegs * RS_MAX_QUERIES);
+    const size_t o_le = rc_fs_take(&cur, cnt_bytes);
+    const size_t o_nmid = rc_fs_take(&cur, cnt_bytes);
+    const size_t o_mid = rc_fs_take(&cur, mid_bytes);
+    const size_t o_mid_sorted = rc_fs_take(&cur, mid_bytes);
+    const size_t o_begin = rc_fs_take(&cur, bound_bytes);
+    const size_t o_end = rc_fs_take(&cur, bound_bytes);
+    const size_t o_temp = rc_fs_take(&cur, temp_bytes);
+    if (rc_fs_reserve(c, RC_FS_ORDER, cur, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + o_c0, c0, c0_bytes);
+    rc_fs_h2d(c, base, host, in_end);
+    cudaMemsetAsync(base + o_status, 0, sizeof(int) * (size_t)nsegs, c->s_fit);
+    cudaMemsetAsync(base + o_hist, 0, sizeof(unsigned int) * hist_words, c->s_fit);
+    if (iqr) {
+        cudaMemsetAsync(base + o_le, 0, cnt_bytes, c->s_fit);
+        cudaMemsetAsync(base + o_nmid, 0, cnt_bytes, c->s_fit);
+    }
+    int *d_status = (int *)(base + o_status);
+    unsigned long long *d_keys = (unsigned long long *)(base + o_keys);
+    unsigned int *d_hist = (unsigned int *)(base + o_hist);
+    unsigned long long *d_prefix = (unsigned long long *)(base + o_prefix);
+    unsigned int *d_rank = (unsigned int *)(base + o_rank);
+    double *d_val = (double *)(base + o_val);
+    const dim3 grid((unsigned int)nsegs, (unsigned int)bx);
+    cudaEventRecord(c->t0, c->s_fit);
+    k_order_stat_select_keys<<<grid, RS_THREADS, 0, c->s_fit>>>(
+        (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+        (const double *)(base + o_c0), kmax, c->d_cols64, c->d_y64, n, nsegs, ntrials, d_keys,
+        d_status, d_hist);
+    int ok = cudaGetLastError() == cudaSuccess;
+    for (int pass = 0; ok && pass < RS_PASSES; ++pass) {
+        if (pass > 0) {
+            rs_hist_kernel<<<grid, RS_THREADS, 0, c->s_fit>>>(d_keys, n, nsegs, q, pass, d_status,
+                                                             d_prefix, d_hist);
+            ok = cudaGetLastError() == cudaSuccess;
+            if (!ok) break;
+        }
+        rs_pick_kernel<<<nsegs, RS_THREADS, 0, c->s_fit>>>(d_hist, nsegs, q, pass, r0, r1, d_prefix,
+                                                          d_rank, d_status);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok && iqr) {
+        unsigned int *d_le = (unsigned int *)(base + o_le);
+        unsigned int *d_nmid = (unsigned int *)(base + o_nmid);
+        unsigned long long *d_mid = (unsigned long long *)(base + o_mid);
+        unsigned long long *d_mid_sorted = (unsigned long long *)(base + o_mid_sorted);
+        int *d_begin = (int *)(base + o_begin);
+        int *d_end = (int *)(base + o_end);
+        k_iqr_select_split<<<grid, RS_THREADS, 0, c->s_fit>>>(d_keys, n, nsegs, w, d_prefix,
+                                                             d_status, d_le, d_nmid, d_mid);
+        ok = cudaGetLastError() == cudaSuccess;
+        if (ok) {
+            const int fb = (nsegs + 255) / 256;
+            k_iqr_select_bounds<<<fb, 256, 0, c->s_fit>>>(nsegs, w, d_status, d_nmid, d_begin,
+                                                         d_end);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        if (ok) {
+            size_t tb = temp_bytes;
+            cub::DeviceSegmentedRadixSort::SortKeys(
+                (void *)(base + o_temp), tb, d_mid, d_mid_sorted, (int)mid_total, nsegs, d_begin,
+                d_end, 0, (int)(sizeof(unsigned long long) * 8), c->s_fit);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+        if (ok) {
+            k_iqr_select_sum<<<nsegs, RS_THREADS, 0, c->s_fit>>>(
+                d_prefix, d_mid_sorted, nsegs, lo, hi, d_le, d_nmid, d_status, d_val);
+            ok = cudaGetLastError() == cudaSuccess;
+        }
+    } else if (ok) {
+        const int fb = (nsegs + 255) / 256;
+        k_order_stat_select_final<<<fb, 256, 0, c->s_fit>>>(d_prefix, nsegs, q, d_status, d_val);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    cudaEventRecord(c->t1, c->s_fit);
+    if (!ok) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    rc_fs_d2h(c, host + in_end, base + in_end, io_end - in_end);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    const int *h_status = (const int *)(host + o_status);
+    for (int s = 0; s < nsegs; ++s) {
+        if (h_status[s] != 0 && h_status[s] != 2) return -1.0f;
+    }
+    memcpy(out_value, host + o_val, sizeof(double) * (size_t)nsegs);
+    memcpy(out_status, h_status, sizeof(int) * (size_t)nsegs);
     rc_fs_ok(c, RC_FS_ORDER);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);

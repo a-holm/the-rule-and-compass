@@ -223,6 +223,33 @@ the model is not better, the rows are not independent.
 
 ---
 
+## 3b. Long-only labels and their purge
+
+**Check.** `rcsr::labels` builds the labels of a long-only book in exact CPU f64. For a row at bar `t`, horizon `h` bars and delay `d` bars:
+
+```text
+P0       = open[t+1+d]                       entry
+fwd      = ln(close[t+h+d] / P0)             long gross log return
+sigma_H  = max(s_W, floor) * sqrt(h)         s_W: population sd of the last W one-bar log returns (the vol<W> column)
+y        = clip(fwd / sigma_H, -3, +3)       gross regression target
+long_net = fwd - c                           c = 2*fee + spread + slippage (+ funding paid by a held long perp)
+action   = 1 if fwd > c else 0               {0, +1}; a negative return is "stay flat", never -1
+```
+
+The triple barrier is long side only: profit `P0*exp(+u*sigma_H)`, stop `P0*exp(-d*sigma_H)` (exit to flat), vertical bar `t+h+d`. A bar that touches both barriers exits at the stop. Barrier levels are the fill prices. `t1` is the end of the exit bar and never exceeds the end of the vertical bar. `m_net = 1[exit return > c]`, `m_barrier = 1[profit first]`, and the meta label `1[exit return - c > 0]` exists on primary-long rows only. Funding is charged only on a held long position and only when a funding column is supplied; a missing funding value makes the row `NaN`. There is no short label, barrier or borrow term: `--side short` and `--allow-short` are refused.
+
+A row is `NaN` when any bar from `t` to `t+h+d` is missing, partial or has a non-positive price. No label bridges a gap and nothing after `t+h+d` is read.
+
+**Purge.** `purge_seconds = entry_offset + h + delay`, derived from the spec and never from a name: a 60 minute label on 15 minute bars purges 4500 s, a 60 hour label on hourly bars 219600 s. `LongLabelSpec::target_spec` writes the matching `rcsr-target-spec/1` entry (`long_only: true`, `return_column`, scale column `vol<W>`), so the split purges `required_purge_seconds` around every validation and test row. `--gap` stays row based; with `--train-select`/`--test-select` write the purge into the selectors.
+
+**Overlap.** Uniqueness weights `u_i = mean over the label's bars of 1/c_t` and `w_i = u_i*n/sum(u)` are stored with the labels (`c_t` is the number of labels covering bar `t`). The report records `effective_n = sum(u)` and `effective_n_hours = effective_n * horizon hours`. A stride below the horizon is refused for horizons of 4 h and longer unless `--allow-overlap` is given (`rcsr enrich`, `rcsr prep`); stride at `h` is the primary fix.
+
+**Report.** The label report lists the share of rows clipped at the bound, the sign shares of `fwd`, its mean and the 1, 5, 25, 50, 75, 95 and 99 % quantiles, the cost-to-move ratio (round trip over mean absolute `fwd`), the exit counts, the purge and the label hash (SHA-256 of the definition version, spec and every column).
+
+**Verify.** `tests/long_labels.rs`: `horizon_windows_enter_next_open_and_exit_at_close_exactly`, `action_is_zero_or_plus_one_and_follows_the_cost`, `barrier_hits_profit_stop_and_vertical_in_the_expected_order`, `both_barriers_inside_one_bar_assume_the_stop`, `missing_partial_and_gap_crossing_windows_are_nan`, `purge_is_derived_from_the_spec_not_from_a_name`, `t1_and_the_derived_spec_drive_the_split_purge`, `overlap_is_guarded_and_uniqueness_weights_are_stored`.
+
+---
+
 ## 4. Audit preparation for look-ahead
 
 These flags are correct for i.i.d. tables and dangerous for ordered rows.

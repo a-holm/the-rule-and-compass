@@ -64,6 +64,7 @@ fn binary_sample(n: usize, positives: f64, noise: f64, seed: u64) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -494,6 +495,7 @@ mod device {
                 y: (0..n).map(|i| if i < k { 1.0 } else { 0.0 }).collect(),
                 w: Vec::new(),
                 ys: Vec::new(),
+                pairs: None,
             };
             let mut ev = evaluator(&s);
             let mut trees = vec![constant(0.0)];
@@ -627,6 +629,7 @@ mod device {
             y: vec![1.0; 200],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut ev = evaluator(&s);
         let mut trees = vec![affine(0.0, 0.0)];
@@ -731,6 +734,7 @@ mod device {
             y: vec![0.0; 300],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let cfg = Config {
             gpu: true,

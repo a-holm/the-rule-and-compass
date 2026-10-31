@@ -95,6 +95,10 @@ pub struct Config {
     /// affine in every constant and fall back to LM otherwise. Changing it
     /// changes the trajectory, so it is a saved search setting.
     pub fit_strategy: crate::fit::FitStrategy,
+    /// #223: which offspring the deferred GPU fit admits. A resolved default
+    /// or `auto` GPU arm admits every candidate with constants; an explicit
+    /// `gpu` arm keeps the screened fraction. Saved search state.
+    pub fit_admission: crate::fit::FitAdmission,
     /// #116: print one `# fit:` line with the arm counts. Reporting only; it is
     /// not saved in a checkpoint and is ignored by the search settings check.
     pub fit_report: bool,
@@ -321,6 +325,7 @@ impl Default for Config {
             init_depth: 3,
             fit_iters: 8,
             fit_strategy: crate::fit::FitStrategy::Exact, // #116
+            fit_admission: crate::fit::FitAdmission::Screened,
             fit_report: false,
             dedup: true,
             time_budget: None,
@@ -384,6 +389,7 @@ impl Config {
         compare!(init_depth, "init_depth");
         compare!(fit_iters, "fit_iters");
         compare!(fit_strategy, "fit_strategy"); // #116
+        compare!(fit_admission, "fit_admission");
         compare!(dedup, "dedup");
         // #256: `time_budget` is a per-process limit, not search state; a resumed
         // run may set a new one.
@@ -985,8 +991,14 @@ impl GpuSearch {
                 self.fit_ms += ms as f64;
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
-                self.ledger
-                    .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0);
+                match self.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
+                    Some(start_s) => self
+                        .ledger
+                        .record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                    None => self
+                        .ledger
+                        .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0),
+                }
             }
             if out.len() == jobs.len() {
                 // #290: a successful batch is what makes this run device-used.
@@ -1183,7 +1195,7 @@ impl GpuSearch {
             // The non-promoted offspring keep this screening score, so the
             // generation evaluates every candidate once and only survivors a
             // second time after the fit.
-            let wide = wide_admission(cfg.metric, train.len());
+            let wide = admits_all(cfg, train.len());
             // #393: with wide admission every candidate with constants is
             // fitted and scored once after the fit, so only the constant-free
             // ones need the screening score.
@@ -1615,6 +1627,7 @@ impl GpuSearch {
 fit_fallback_bounded: self.fit_fallback_bounded,
             fit_fallback_workers: self.fit_fallback_workers,
             fit_fallback_max: DEFAULT_FIT_FALLBACK_MAX,
+            fit_admission: crate::fit::FitAdmission::Screened,
             ledger,
             memory_plan: self.memory_plan.clone(),
             observed: Some(self.ev.alloc_report().observed()),
@@ -2296,9 +2309,10 @@ fn score_pipeline_batch(
 /// and every metric without a native kernel objective would be ranked by a
 /// proxy it is not defined on. Each of those keeps the CPU evaluator.
 ///
-/// #289: the classification scorer carries the per-row weights, so `--weight`
-/// is admitted for log_loss/Brier/the hinge forms; the regression kernels still
-/// have no weighted path, so a weighted regression run keeps the CPU.
+/// The native scorers carry the per-row weights, so `--weight` is admitted for
+/// every native metric with a weighted form (`metrics::weights_supported`):
+/// the regression family and the classification objectives. `maximum` refuses
+/// weights.
 ///
 /// #288: the order/rank family and `auc` are `ScoreDispatch::Exact` rows scored
 /// by the plan batch entry point; this gate admits them from their measured row
@@ -2310,14 +2324,16 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
         return Some("multi-output objective");
     }
-    // #289: only the classification scorer has a device weight path. A
-    // weighted regression run keeps the exact CPU evaluator rather than
-    // dropping the weights.
+    // Weighted rows run on the device only through a native scorer that has a
+    // weighted form; every other metric keeps the exact CPU evaluator rather
+    // than dropping the weights.
     if !train.w.is_empty() {
-        let class_native = crate::metrics::native_score_objective(cfg.metric)
-            .map_or(false, |o| o.is_classification());
-        if !class_native {
-            return Some("weighted rows need a native classification scorer");
+        match crate::metrics::native_score_objective(cfg.metric) {
+            Some(crate::metrics::ScoreObjective::Maximum) => {
+                return Some("weighted rows: maximum has no weighted form");
+            }
+            Some(_) if crate::metrics::weights_supported(cfg.metric) => {}
+            _ => return Some("weighted rows need a native scorer with a weighted form"),
         }
     }
     // #236/#287/#288: a metric may use the device only when the score-dispatch
@@ -2608,6 +2624,69 @@ pub fn device_plan_for(cfg: &Config, train: &Sample) -> Option<crate::memory::De
     Some(crate::memory::device_plan(&workload, &info, &caps))
 }
 
+/// #223: resolve the fit arm of a run that did not name one (`Unset`) or named
+/// `auto`. Run once before generation 0, never on a resume. The CPU arm it
+/// keeps when the device is not admissible is the arm the request names, so a
+/// CPU-only run is unchanged.
+pub fn resolve_fit_strategy(
+    cfg: &Config,
+    train: &Sample,
+    request: crate::fit::FitRequest,
+) -> crate::fit::FitResolution {
+    let backend_ok = if effective_backend(cfg, train) == Backend::Gpu {
+        Ok(())
+    } else if !cfg.gpu {
+        Err("--cpu/--no-gpu".to_string())
+    } else if let Some(why) = backend_blocker_reason(cfg, train) {
+        Err(why.to_string())
+    } else if cfg!(feature = "cuda") {
+        Err("no usable CUDA device".to_string())
+    } else {
+        Err("built without --features cuda".to_string())
+    };
+    let memory_ok = fit_memory_check(cfg, train);
+    let cost_ok = fit_cost_check(cfg);
+    crate::fit::resolve_fit_arm(
+        request,
+        cfg.metric,
+        cfg.fit_iters,
+        backend_ok,
+        memory_ok,
+        cost_ok,
+    )
+}
+
+#[cfg(feature = "cuda")]
+fn fit_memory_check(cfg: &Config, train: &Sample) -> Result<(), String> {
+    let mut probe = cfg.clone();
+    probe.fit_strategy = crate::fit::FitStrategy::Gpu;
+    match device_plan_for(&probe, train) {
+        Some(plan) if plan.refusal.as_ref().map_or(false, |r| r.stage == "fit") => {
+            Err("device_memory".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fit_memory_check(_cfg: &Config, _train: &Sample) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn fit_cost_check(cfg: &Config) -> bool {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let full = crate::fit::gpu_fit_op_coverage(&cfg.ops, !expr::current_blocks().is_empty());
+    crate::fit::ls_gpu_fit_worthwhile(cfg.islands.max(1), cores, fallback_workers(), full)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn fit_cost_check(_cfg: &Config) -> bool {
+    false
+}
+
 /// #293: why a device plan cannot run, or `None` when it can. A stat scorer
 /// routed to the CPU leaves the run without a device scorer.
 #[cfg(feature = "cuda")]
@@ -2770,13 +2849,7 @@ fn eval_error_and_descriptor(
     // The parameter count lets the information criteria (AIC/AICc/BIC) work as
     // search metrics; it is ignored by every other metric. The weight vector is
     // empty for an unweighted sample, which takes the identical unweighted path.
-    let error = score_weighted(
-        &pred,
-        &s.y,
-        &s.w,
-        metric,
-        expr::count_constants(tree),
-    );
+    let error = crate::metrics::score_sample(&pred, s, metric, expr::count_constants(tree));
     let descriptor =
         want_descriptor.then(|| qd::descriptor_from_prediction(tree, &pred, nvars));
     (error, descriptor)
@@ -2869,6 +2942,14 @@ fn fit_constants_with_iters(
                     });
                 }
             }
+        }
+        if let (Metric::Slope, Some(pairs)) = (cfg.metric, &fit.pairs) {
+            let sse = crate::fit::fit_slope_pairs(tree, &fit.x, &fit.y, pairs, iters);
+            return Some(FitResult {
+                sse,
+                hash: expr::structural_hash(tree),
+                same_rows: std::ptr::eq(fit, score),
+            });
         }
         // #116 + #117: strategy and metric together.
         let sse = crate::fit::fit_weighted_strategy_metric(
@@ -3036,6 +3117,19 @@ fn subset_sample(train: &Sample, idx: &[usize]) -> Sample {
                 .map(|col| idx.iter().map(|&i| col[i]).collect())
                 .collect()
         },
+        pairs: train.pairs.as_ref().map(|pairs| {
+            let mut at = vec![u32::MAX; train.len()];
+            for (k, &i) in idx.iter().enumerate() {
+                at[i] = k as u32;
+            }
+            pairs
+                .iter()
+                .filter_map(|&[a, b]| {
+                    let (a, b) = (at[a as usize], at[b as usize]);
+                    (a != u32::MAX && b != u32::MAX).then_some([a, b])
+                })
+                .collect()
+        }),
     }
 }
 
@@ -3278,6 +3372,13 @@ fn refresh_after_fit(ind: &mut Ind, cfg: &Config) {
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn wide_admission(metric: Metric, train_rows: usize) -> bool {
     train_rows >= WIDE_ADMISSION_ROWS || crate::fit::admits_every_candidate(metric)
+}
+
+/// #223: true when this run's deferred fit admits every candidate with
+/// constants: wide rows, a gated metric or a resolved `All` admission.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+fn admits_all(cfg: &Config, train_rows: usize) -> bool {
+    wide_admission(cfg.metric, train_rows) || cfg.fit_admission == crate::fit::FitAdmission::All
 }
 
 /// #169: how many offspring of one island are admitted to the fitted LM batch.
@@ -3729,7 +3830,7 @@ fn pipeline_fit_safe(cfg: &Config, train_rows: usize, screened: bool) -> bool {
     !screened
         && cfg.pipeline_depth > 0
         && defers_fit_to_gpu(cfg, true)
-        && train_rows >= WIDE_ADMISSION_ROWS
+        && (train_rows >= WIDE_ADMISSION_ROWS || cfg.fit_admission == crate::fit::FitAdmission::All)
         && cfg.fit_iters > 0
         && crate::fit::fit_loss(cfg.metric).is_some()
         && !crate::fit::device_fit_is_gated(cfg.metric)
@@ -4031,6 +4132,8 @@ pub struct GpuRunStats {
     pub fit_fallback_workers: usize,
     /// #255: configured per-generation fallback cap (`0` = unbounded).
     pub fit_fallback_max: usize,
+    /// #223: the admission the deferred fit ran under.
+    pub fit_admission: crate::fit::FitAdmission,
     /// #284: run-scoped stage/device ledger. `Default` is an empty ledger, so
     /// every existing fixture that builds `GpuRunStats` still compiles.
     pub ledger: crate::gpu_stats::RunLedger,
@@ -4766,6 +4869,7 @@ fn run_postfix_search(
         t0.elapsed().as_secs_f64(),
     );
     let mut eval_stage_total = 0.0f64;
+    let mut io_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     // #211: why the loop ends, for the development log's run_end event.
@@ -5011,6 +5115,7 @@ fn run_postfix_search(
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
+            let io_mark = std::time::Instant::now();
             let trees = next
                 .to_trees()
                 .ok_or_else(|| "postfix pool could not be decoded for a checkpoint".to_string())?;
@@ -5047,6 +5152,7 @@ fn run_postfix_search(
                 None,
             );
             emit(&mut on_checkpoint, &cp);
+            io_stage_total += io_mark.elapsed().as_secs_f64();
         }
 
         pool = next;
@@ -5062,6 +5168,7 @@ fn run_postfix_search(
     // #284: close measured generation stages to the run clock. The evaluator
     // window joins the ledger first so the fit reclassification can subtract
     // from it rather than add a second stage.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
     let tail_start = std::time::Instant::now();
     let pre_tail_elapsed = tail_start.duration_since(t0).as_secs_f64();
@@ -5075,6 +5182,8 @@ fn run_postfix_search(
 
     // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
     // carries the archive the run reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let trees = pool
             .to_trees()
@@ -5115,6 +5224,7 @@ fn run_postfix_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
@@ -5147,7 +5257,9 @@ fn run_postfix_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     let best = final_archive
@@ -5160,7 +5272,11 @@ fn run_postfix_search(
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
-    run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, tail_total);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        (tail_total - io_final_s).max(0.0),
+    );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
     let mut stats = gpu.run_stats();
@@ -5172,6 +5288,7 @@ fn run_postfix_search(
     ledger.set_wall(t0.elapsed().as_secs_f64());
     stats.ledger = ledger;
     stats.fit_fallback_max = cfg.fit_fallback_max;
+    stats.fit_admission = cfg.fit_admission;
 
     Ok(Outcome {
         archive: final_archive,
@@ -5880,6 +5997,7 @@ fn run_search(
         (setup_s - setup_fit_s).max(0.0),
     );
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables, unused_assignments))]
+    let mut io_stage_total = 0.0f64;
     let mut eval_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
@@ -6537,6 +6655,7 @@ fn run_search(
             // generation's work, including migration and restarts, is done.
             if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
                 last_save = std::time::Instant::now();
+                let io_mark = std::time::Instant::now();
                 let backend = if defer_gpu || gpu_used {
                     Backend::Gpu
                 } else {
@@ -6559,6 +6678,7 @@ fn run_search(
                     None,
                 );
                 emit(&mut on_checkpoint, &cp);
+                io_stage_total += io_mark.elapsed().as_secs_f64();
             }
 
             if budget_hit {
@@ -6574,6 +6694,7 @@ fn run_search(
     let _ = eval_stage_total;
     // The measured evaluator windows join the ledger before the closure check;
     // the fit part is reclassified below after the gadget's totals are known.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
 
     // #284: close the generation loop's measured stages to the run clock. Any
@@ -6604,6 +6725,8 @@ fn run_search(
     // saved search archive is the one at the last completed generation. It is
     // emitted after the rebuild (#256) so it also carries the archive the run
     // reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let backend = if (defer_gpu && !fit_only_device) || gpu_used {
             Backend::Gpu
@@ -6630,6 +6753,7 @@ fn run_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
@@ -6680,7 +6804,9 @@ fn run_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     // #18: the last in-loop reading describes the final generation. If no
@@ -6704,9 +6830,10 @@ fn run_search(
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
     run_ledger.record_stage(
         crate::gpu_stats::Stage::HostOther,
-        (tail_total - refit_tail_s).max(0.0),
+        (tail_total - refit_tail_s - io_final_s).max(0.0),
     );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
@@ -6717,6 +6844,7 @@ fn run_search(
         gpu.as_ref().map(|g| {
             let mut s = g.run_stats();
             s.fit_refits = gpu_fit_refits;
+            s.fit_admission = cfg.fit_admission;
 // #284: absorb the device intervals and fit leaves, then add the
             // exclusive main-thread stages. Fit is a sub-window of the measured
             // eval window, so it is partitioned out exactly once.
@@ -6814,7 +6942,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new(), ys: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
     }
 
     /// `n` rows of a smooth one-variable target, for the large-sample gates.
@@ -6827,7 +6955,7 @@ mod tests {
             x.push(vec![a, 0.5 * a + 1.0]);
             y.push(a);
         }
-        Sample { x, y, w: Vec::new(), ys: Vec::new() }
+        Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
     }
 
     /// #288: the dispatch gate admits exactly the metrics with an exact
@@ -6918,6 +7046,40 @@ mod tests {
         assert_eq!(admission_count(128, true), 128);
         assert_eq!(admission_count(256, true), 256);
         assert_eq!(admission_count(1, true), 1);
+    }
+
+    /// #223: a resolved `All` admission fits every candidate with constants at
+    /// any row count; the default and an explicit `gpu` arm stay screened.
+    #[test]
+    fn admit_all_admits_every_candidate_with_constants() {
+        let screened = Config { metric: Metric::Squared, ..Config::default() };
+        let all = Config { fit_admission: crate::fit::FitAdmission::All, ..screened.clone() };
+        for rows in [10, 1_500, 115_500, WIDE_ADMISSION_ROWS - 1] {
+            assert!(!admits_all(&screened, rows), "{rows}");
+            assert!(admits_all(&all, rows), "{rows}");
+        }
+        assert!(admits_all(&screened, WIDE_ADMISSION_ROWS));
+        assert_eq!(admission_count(256, admits_all(&screened, 1_500)), 64);
+        assert_eq!(admission_count(256, admits_all(&all, 1_500)), 256);
+    }
+
+    /// #223: with the CPU evaluator the resolver keeps the CPU arm the request
+    /// names and labels why.
+    #[test]
+    fn resolver_keeps_the_cpu_arm_without_a_device() {
+        use crate::fit::{FitRequest, FitStrategy};
+        let sample = Sample::new(vec![vec![1.0], vec![2.0]], vec![1.0, 2.0]);
+        let cpu = Config { metric: Metric::Squared, gpu: false, ..Config::default() };
+        let r = resolve_fit_strategy(&cpu, &sample, FitRequest::Unset);
+        assert_eq!((r.strategy, r.reason.as_str()), (FitStrategy::Exact, "--cpu/--no-gpu"));
+        let r = resolve_fit_strategy(&cpu, &sample, FitRequest::Auto);
+        assert_eq!((r.strategy, r.reason.as_str()), (FitStrategy::Auto, "--cpu/--no-gpu"));
+        let abs = Config { metric: Metric::Absolute, ..cpu.clone() };
+        let r = resolve_fit_strategy(&abs, &sample, FitRequest::Unset);
+        assert_eq!(r.reason, "metric_not_least_squares");
+        let nofit = Config { fit_iters: 0, ..cpu };
+        let r = resolve_fit_strategy(&nofit, &sample, FitRequest::Unset);
+        assert_eq!(r.reason, "no_fit");
     }
 
     /// #169: promotion is deterministic, per island, and ranks on the same
@@ -7561,7 +7723,7 @@ mod tests {
             x.push(vec![v]);
             y.push(2.0 * v + 1.0);
         }
-        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
         let test = train.clone();
         let cfg = Config {
             generations: 4,
@@ -7586,7 +7748,7 @@ mod tests {
             x.push(vec![a]);
             y.push(if law { 2.0 * a + 1.0 } else { a });
         }
-        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None };
         let cfg = Config {
             metric,
             generations: 6,
@@ -7656,7 +7818,7 @@ mod tests {
                 x.push(vec![a]);
                 y.push(slope * a);
             }
-            Sample { x, y, w: Vec::new(), ys: Vec::new() }
+            Sample { x, y, w: Vec::new(), ys: Vec::new(), pairs: None }
         }
 
         let mut cfg = Config::default();
@@ -7716,6 +7878,7 @@ mod tests {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut cfg = Config::default();
         cfg.metric = Metric::Squared;
@@ -7883,6 +8046,7 @@ mod tests {
             y: vec![0.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let data = EvalSample::new(&s, &cfg);
         let mut tree = node(
@@ -7905,6 +8069,7 @@ mod tests {
             y: vec![0.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let data = EvalSample::new(&s, &cfg);
         let mut tree = node(

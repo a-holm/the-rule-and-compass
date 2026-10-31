@@ -26,6 +26,7 @@ fn sample(n: usize, seed: u32) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -138,17 +139,19 @@ fn log_squashed_has_a_native_objective() {
         None,
         "AIC is not a squared objective for ranking"
     );
-    // Weighted rows keep the CPU: the kernel weighs its normal equations, but
-    // the evaluator has no per-row weight array, so a weighted run would be
-    // ranked on unweighted loss. The cause is labelled, never silent.
-    let mut weighted = sample(64, 7);
-    weighted.w = vec![1.0; weighted.len()];
-    let wcfg = Config {
-        gpu: true,
-        metric: Metric::LogSquashed,
-        ..Default::default()
-    };
-    assert_eq!(search::effective_backend(&wcfg, &weighted), Backend::Cpu);
+    // Weighted rows are scored natively on the device (the evaluator holds the
+    // per-row weights).
+    #[cfg(feature = "cuda")]
+    {
+        let mut weighted = sample(64, 7);
+        weighted.w = vec![1.0; weighted.len()];
+        let wcfg = Config {
+            gpu: true,
+            metric: Metric::LogSquashed,
+            ..Default::default()
+        };
+        assert_eq!(search::backend_blocker_reason(&wcfg, &weighted), None);
+    }
 }
 
 /// #222: `absolute` has a native `Σ|r|` fit and scoring objective with its own
@@ -171,15 +174,17 @@ fn absolute_has_a_native_objective() {
         rcsr::fit::gpu_fit_metric_error(Metric::Absolute).is_none(),
         "an explicit GPU strategy may fit absolute"
     );
-    // Weighted rows still keep the CPU evaluator (no per-row weight array).
-    let mut weighted = sample(64, 7);
-    weighted.w = vec![1.0; weighted.len()];
-    let wcfg = Config {
-        gpu: true,
-        metric: Metric::Absolute,
-        ..Default::default()
-    };
-    assert_eq!(search::effective_backend(&wcfg, &weighted), Backend::Cpu);
+    #[cfg(feature = "cuda")]
+    {
+        let mut weighted = sample(64, 7);
+        weighted.w = vec![1.0; weighted.len()];
+        let wcfg = Config {
+            gpu: true,
+            metric: Metric::Absolute,
+            ..Default::default()
+        };
+        assert_eq!(search::backend_blocker_reason(&wcfg, &weighted), None);
+    }
 }
 
 /// #222: with the native MAE scorer, an `absolute` run is admitted to the
@@ -463,6 +468,99 @@ fn reported_finalists_equal_cpu_score_for_every_native_metric() {
                 s.error.to_bits(),
                 cpu.to_bits(),
                 "{metric:?}: archive row is not the exact CPU score: {} vs {}",
+                s.error,
+                cpu
+            );
+        }
+    }
+}
+
+/// Weighted regression on the device: every native regression metric with a
+/// weighted form is admitted, `maximum` keeps a labelled refusal, and a metric
+/// without a native scorer keeps its own refusal.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_device_gate_admits_weighted_regression_metrics_with_a_weighted_form() {
+    let mut s = sample(64, 7);
+    s.w = (0..s.len()).map(|i| 0.5 + (i % 5) as f64).collect();
+    let cfg = |m: Metric| Config {
+        gpu: true,
+        metric: m,
+        ..Default::default()
+    };
+    for m in [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ] {
+        assert!(rcsr::metrics::weights_supported(m), "{m:?}");
+        assert_eq!(search::backend_blocker_reason(&cfg(m), &s), None, "{m:?}");
+    }
+    let why = search::backend_blocker_reason(&cfg(Metric::Maximum), &s).expect("maximum is refused");
+    assert!(why.contains("maximum"), "{why}");
+    assert!(!rcsr::metrics::weights_supported(Metric::Maximum));
+}
+
+/// Weighted regression: the reported score of each finalist after the exact
+/// refit is the CPU `score_weighted` of the stored tree under the same
+/// weights, bit for bit, for every admitted metric. The run claims the device.
+#[cfg(feature = "cuda")]
+#[test]
+fn weighted_reported_finalists_equal_cpu_score_for_every_admitted_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let metrics = [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ];
+    let weights = |n: usize| -> Vec<f64> {
+        (0..n)
+            .map(|i| if i % 7 == 0 { 0.0 } else { 0.5 + (i % 5) as f64 * 0.75 })
+            .collect()
+    };
+    for metric in metrics {
+        let mut train = sample(600, 7);
+        let mut test = sample(100, 8);
+        train.w = weights(train.len());
+        test.w = weights(test.len());
+        let cfg = Config {
+            metric,
+            ..gpu_config(13)
+        };
+        let out = search::run(&cfg, &train, &test);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{metric:?} backend");
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert!(g.fit_refits > 0, "{metric:?}: finalists were refit: {:?}", g);
+        assert_fit_ledger(g);
+        assert!(!out.archive.items.is_empty(), "{metric:?}: empty archive");
+        for s in &out.archive.items {
+            let pred: Vec<f64> = train.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+            let cpu = rcsr::metrics::score_weighted(
+                &pred,
+                &train.y,
+                &train.w,
+                metric,
+                expr::count_constants(&s.tree),
+            );
+            assert_eq!(
+                s.error.to_bits(),
+                cpu.to_bits(),
+                "{metric:?}: archive row is not the exact weighted CPU score: {} vs {}",
                 s.error,
                 cpu
             );
@@ -1333,4 +1431,128 @@ fn zero_adjoint_constant_is_frozen_and_the_rest_are_fitted() {
     assert!((device[0] - 1.3).abs() < 1e-3, "slope {}", device[0]);
     assert!((device[1] - 0.5).abs() < 1e-3, "intercept {}", device[1]);
     assert_eq!(device[2], 0.7, "the frozen slot does not move");
+}
+
+#[test]
+fn checkpoint_round_trip_preserves_the_admission() {
+    let train = sample(160, 1);
+    let test = sample(40, 2);
+    let base = Config {
+        generations: 2,
+        islands: 1,
+        pop: 12,
+        max_complexity: 8,
+        fit_iters: 2,
+        patience: 0,
+        seed: 4,
+        fit_strategy: FitStrategy::Gpu,
+        gpu: false,
+        ..Default::default()
+    };
+    assert_eq!(base.fit_admission, rcsr::fit::FitAdmission::Screened);
+    let save = |cfg: &Config| {
+        let mut text: Option<String> = None;
+        search::run_resumable(cfg, &train, &test, None, 0, |cp| {
+            text = Some(cp.to_text());
+        })
+        .expect("fresh run");
+        text.expect("a checkpoint callback")
+    };
+    let screened = save(&base);
+    assert!(
+        !screened.contains("fit_admission"),
+        "the default admission leaves the checkpoint bytes unchanged"
+    );
+    let cp = Checkpoint::from_text(&screened).expect("parse screened checkpoint");
+    assert_eq!(cp.config.fit_admission, rcsr::fit::FitAdmission::Screened);
+
+    let all = Config { fit_admission: rcsr::fit::FitAdmission::All, ..base.clone() };
+    let text = save(&all);
+    assert!(text.contains("config fit_admission all"));
+    let cp = Checkpoint::from_text(&text).expect("parse all checkpoint");
+    assert_eq!(cp.config.fit_strategy, FitStrategy::Gpu);
+    assert_eq!(cp.config.fit_admission, rcsr::fit::FitAdmission::All);
+    let again = Checkpoint::from_text(&cp.to_text()).expect("reparse");
+    assert_eq!(again.config.fit_admission, rcsr::fit::FitAdmission::All);
+    assert_ne!(
+        rcsr::checkpoint::config_hash(&again.config),
+        rcsr::checkpoint::config_hash(&base),
+        "the admission is part of the config hash"
+    );
+}
+
+fn cli_csv() -> String {
+    let mut text = String::from("x0,x1,y\n");
+    for i in 0..300 {
+        let a = ((i * 37) % 101) as f64 / 25.0 - 2.0;
+        let b = ((i * 53) % 97) as f64 / 24.0 - 2.0;
+        let noise = (((i * 29) % 13) as f64 - 6.0) / 100.0;
+        text.push_str(&format!("{a},{b},{}\n", 1.5 * (0.8 * a).sin() + 0.3 * b + noise));
+    }
+    text
+}
+
+/// The `fitting` object and the Pareto array of one `--json` run: everything
+/// the fit arm can change, without the wall-clock fields.
+fn cli_fit_and_front(extra: &[&str]) -> (String, String) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rcsr"))
+        .args([
+            "--data", "-", "--target", "y", "--vars", "x0,x1", "--islands", "1", "--pop", "30",
+            "--generations", "3", "--seed", "1", "--patience", "0", "--json", "--no-dev-log",
+        ])
+        .args(extra)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(cli_csv().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let json = String::from_utf8(out.stdout).unwrap();
+    let fitting = json.split("\"fitting\":").nth(1).unwrap().split('}').next().unwrap().to_string();
+    let front = json.split("\"pareto\":").nth(1).unwrap().to_string();
+    (fitting, front)
+}
+
+/// A CPU run keeps today's archive and `fitting` object whether the arm is
+/// unset or explicitly `exact`.
+#[test]
+fn cpu_default_run_is_byte_identical_to_explicit_exact() {
+    let default = cli_fit_and_front(&["--cpu", "--metric", "squared"]);
+    let exact = cli_fit_and_front(&["--cpu", "--metric", "squared", "--fit-strategy", "exact"]);
+    assert_eq!(default, exact);
+    assert!(!default.0.contains("strategy_source"), "{}", default.0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (fitting, front) = cli_fit_and_front(&["--metric", "squared"]);
+    assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_source\":\"default\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"admissible\""), "{fitting}");
+    let again = cli_fit_and_front(&["--metric", "squared"]);
+    assert_eq!(front, again.1, "two default-resolved runs give one front");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--no-fit"]);
+    assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"no_fit\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "absolute"]);
+    assert!(fitting.contains("\"strategy\":\"exact\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_reason\":\"metric_not_least_squares\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "auto"]);
+    assert!(fitting.contains("\"strategy\":\"gpu\""), "{fitting}");
+    assert!(fitting.contains("\"strategy_source\":\"auto\""), "{fitting}");
+
+    let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "gpu"]);
+    assert!(!fitting.contains("strategy_source"), "an explicit arm is never resolved: {fitting}");
 }

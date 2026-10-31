@@ -1312,6 +1312,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         "fit_samples",
         "front_parents", // #76
         "fit_strategy",  // #116: missing means `exact`
+        "fit_admission", // #223: missing means `screened`
         "fit_rows",      // #116: missing means 0 (off)
         "fit_fallback_max", // #255: missing means the default bound
         "qd_bins",       // #120
@@ -1520,6 +1521,12 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
             )
         })?,
     };
+    let fit_admission = match fields.get("fit_admission").map(|s| s.as_str()) {
+        None => crate::fit::FitAdmission::Screened,
+        Some(raw) => crate::fit::FitAdmission::parse(raw).ok_or_else(|| {
+            format!("config 'fit_admission' must be screened or all, got '{}'", raw)
+        })?,
+    };
     if require_dimensions && units.is_none() {
         return Err(
             "config 'require_dimensions' is true but 'units' is none; \
@@ -1603,6 +1610,7 @@ fn build_config(fields: &BTreeMap<String, String>) -> Result<Config, String> {
         init_depth: num_usize("init_depth")?,
         fit_iters: num_usize("fit_iters")?,
         fit_strategy, // #116
+        fit_admission, // #223
         fit_report: false,
         dedup: bool_val("dedup")?,
         time_budget,
@@ -1671,6 +1679,11 @@ fn write_config(cfg: &Config, out: &mut String) {
     writeln!(out, "config init_depth {}", cfg.init_depth).unwrap();
     writeln!(out, "config fit_iters {}", cfg.fit_iters).unwrap();
     writeln!(out, "config fit_strategy {}", cfg.fit_strategy.name()).unwrap(); // #116
+    // #223: written only when it differs from the default, so every other
+    // checkpoint and config hash keeps its bytes.
+    if cfg.fit_admission != crate::fit::FitAdmission::Screened {
+        writeln!(out, "config fit_admission {}", cfg.fit_admission.name()).unwrap();
+    }
     writeln!(out, "config fit_rows {}", cfg.fit_rows).unwrap(); // #116
     writeln!(out, "config fit_fallback_max {}", cfg.fit_fallback_max).unwrap(); // #255
     // #122: absent means auto (the historical path for every old checkpoint).

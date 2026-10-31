@@ -36,6 +36,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "cub_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -383,10 +384,12 @@ RcPit *rc_pit_create(const long long *times, const long long *chain, int n,
     ok &= rc_alloc((void **)&c->d_counter, sizeof(unsigned long long)) == 0;
     if (ok) {
         size_t a = 0, b = 0;
-        cub::DeviceScan::InclusiveSum(NULL, a, (int *)NULL, (int *)NULL, n);
-        cub::DeviceScan::ExclusiveSum(NULL, b, (int *)NULL, (int *)NULL, n);
+        ok &= rc_cub_status(cub::DeviceScan::InclusiveSum(
+                  NULL, a, (int *)NULL, (int *)NULL, n)) == cudaSuccess;
+        ok &= rc_cub_status(cub::DeviceScan::ExclusiveSum(
+                  NULL, b, (int *)NULL, (int *)NULL, n)) == cudaSuccess;
         c->scan_tmp_bytes = a > b ? a : b;
-        ok &= rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
+        ok = ok && rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
     }
     if (!ok) {
         rc_pit_destroy(c);
@@ -453,6 +456,13 @@ void rc_pit_destroy(RcPit *c)
 void rc_pit_last_stats(RcPit *c, RcPitStats *out)
 {
     if (c && out) *out = c->last;
+}
+
+static int g_force_cub_fail = 0;
+
+extern "C" void rc_pit_test_force_cub_fail(int on)
+{
+    g_force_cub_fail = on;
 }
 
 /* Run one join. `delay` is added to every leaf key; `fresh_tf` > 0 marks a
@@ -560,12 +570,21 @@ int rc_pit_run(RcPit *c, long long delay, long long fresh_tf, long long step,
     }
 
     size_t tmp = c->scan_tmp_bytes;
-    cub::DeviceScan::InclusiveSum(c->d_scan_tmp, tmp, c->d_start, c->d_chain_ord,
-                                  c->n);
+    err = RC_CUB(g_force_cub_fail, cub::DeviceScan::InclusiveSum(
+        c->d_scan_tmp, tmp, c->d_start, c->d_chain_ord, c->n));
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        return 11;
+    }
     k_rebase<<<nb, threads>>>(d_first, c->d_chain_ord, c->n, c->d_chain_loc);
     k_keep_int<<<nb, threads>>>(c->d_keep, c->n, c->d_start);
     tmp = c->scan_tmp_bytes;
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, tmp, c->d_start, c->d_dest, c->n);
+    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, tmp, c->d_start, c->d_dest, c->n));
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        return 12;
+    }
     k_scatter<<<nb, threads>>>(c->d_keep, c->d_dest, c->n, c->d_kept_rows);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
