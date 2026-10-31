@@ -627,6 +627,38 @@ fn engine_device_tier(name: &str) -> &'static str {
     }
 }
 
+/// Registry entry of a stored long-only label column (`lbl_<label>_<kind>`).
+/// The family is `label`: the column is a target or a training weight, never a
+/// model input. Label names are chosen per run, so entries are derived from
+/// the column name instead of being listed in [`default_registry`].
+pub fn label_registry_entry(name: &str) -> Option<RegistryEntry> {
+    let (_, kind) = crate::labels::parse_column(name)?;
+    let formula = match kind {
+        "fwd" => "ln(close[t+h+d] / open[t+1+d]), long gross log return",
+        "y" => "clip(fwd / (max(s_W, floor) * sqrt(h)), -clip, +clip)",
+        "long_net" => "fwd - long round-trip cost (- funding when supplied)",
+        "action" => "1 if fwd > cost else 0, never -1",
+        "t1" => "end of the exit bar, epoch seconds",
+        "exit_ret" => "ln(exit price / open[t+1+d]) of the long-side triple barrier",
+        "m_net" => "1[exit_ret > cost]",
+        "m_barrier" => "1[profit barrier touched first]",
+        _ => "average-uniqueness weight, mean 1 over the valid rows",
+    };
+    Some(RegistryEntry {
+        name: name.to_string(),
+        family: "label",
+        timeframe: "bar",
+        warmup: 0,
+        available: true,
+        derived: true,
+        parity_tier: "reference",
+        formula: formula.to_string(),
+        source: "labels",
+        pit: "label: reads bars t+1 through t+h+d, so it is a target only; vol-window kinds are NaN until s_W has W returns",
+        reason: None,
+    })
+}
+
 /// The default financial feature registry.
 ///
 /// It enumerates (a) the compact 52 regression subset with exact formulas,
@@ -1544,6 +1576,17 @@ pub struct FeatureReport {
     pub label: bool,
 }
 
+/// One long-only label family written to the store.
+#[derive(Clone, Debug)]
+pub struct LongLabelOutput {
+    pub spec: crate::labels::LongLabelSpec,
+    /// Stored column names in [`crate::labels::COLUMN_KINDS`] order.
+    pub columns: Vec<String>,
+    /// The regression target column (`lbl_<name>_y`).
+    pub target: String,
+    pub report: crate::labels::LabelReport,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Report {
     pub input: String,
@@ -1561,6 +1604,8 @@ pub struct Report {
     pub bar_seconds: i64,
     pub features: Vec<FeatureReport>,
     pub plans: Vec<GroupPlan>,
+    /// Long-only label families written by this run (#262).
+    pub long_labels: Vec<LongLabelOutput>,
     pub backend: String,
     pub gpu_requested: String,
     pub gpu_available: bool,
@@ -1687,6 +1732,24 @@ impl Report {
                 f.label
             ));
         }
+        for l in &self.long_labels {
+            let r = &l.report;
+            out.push(format!(
+                "# enrich-label: name={} target={} long_only=true rows={} valid_rows={} barrier_rows={} clipped_share={:.6} cost_to_move={:.6} effective_n={:.3} purge_seconds={} label_hash={}",
+                l.spec.name, l.target, r.rows, r.valid_rows, r.barrier_rows, r.clipped_share,
+                r.cost_to_move, r.effective_n, r.purge_seconds, r.label_hash
+            ));
+            for m in &r.top_moves {
+                out.push(format!(
+                    "# enrich-label-move: name={} symbol={} time={} iso={} fwd={:.6}",
+                    l.spec.name,
+                    m.symbol.as_deref().unwrap_or("none"),
+                    m.time,
+                    format_utc_seconds(m.time),
+                    m.fwd
+                ));
+            }
+        }
         for (name, reason) in &self.gpu_fallback_columns {
             out.push(format!("# enrich-fallback: name={name} reason={reason}"));
         }
@@ -1735,6 +1798,19 @@ impl Report {
                 )
             })
             .collect();
+        let long_labels: Vec<String> = self
+            .long_labels
+            .iter()
+            .map(|l| {
+                format!(
+                    "{{\"name\":{},\"target\":{},\"columns\":[{}],\"report\":{}}}",
+                    jstr(&l.spec.name),
+                    jstr(&l.target),
+                    l.columns.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+                    l.report.json()
+                )
+            })
+            .collect();
         let plans: Vec<String> = self
             .plans
             .iter()
@@ -1763,7 +1839,7 @@ impl Report {
              \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"feature_read_s\":{:.6},\"feature_context_s\":{:.6},\"feature_gpu_s\":{:.6},\"feature_cpu_s\":{:.6},\"feature_other_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
-             \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
+             \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"long_labels\":[{}],\n  \"plan\":[{}]\n}}\n",
             jstr(&self.input),
             jstr(&self.output),
             jstr(&self.input_sha256),
@@ -1821,6 +1897,7 @@ impl Report {
             self.total_seconds,
             self.peak_rss_bytes,
             features.join(","),
+            long_labels.join(","),
             plans.join(",")
         )
     }
@@ -2760,7 +2837,7 @@ fn time_at_row(
     }
 }
 
-fn format_utc_seconds(ts: i64) -> String {
+pub(crate) fn format_utc_seconds(ts: i64) -> String {
     let days = ts.div_euclid(86_400);
     let rem = ts.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
@@ -5244,6 +5321,7 @@ struct Context<'a> {
     mtf: Vec<String>,
     labels: Vec<(String, LabelSpec)>,
     tf: Option<Timeframe>,
+    long_labels: Vec<crate::labels::LongLabelSpec>,
     cross: &'a Cross,
     eth: &'a Cross,
 }
@@ -5252,9 +5330,10 @@ fn compute_series(
     s: &Series,
     ctx: &Context,
     cols: &mut BTreeMap<String, TempColumn>,
+    long_acc: &mut [crate::labels::LabelAccumulator],
 ) -> Result<(), String> {
     let base = Base::new(s);
-    let bars = if !ctx.legacy.is_empty() || !ctx.labels.is_empty() {
+    let bars = if !ctx.legacy.is_empty() || !ctx.labels.is_empty() || !ctx.long_labels.is_empty() {
         Some(s.bars())
     } else {
         None
@@ -5346,6 +5425,15 @@ fn compute_series(
             if let Some(t) = cols.get_mut(lname) {
                 t.write_values(&col.values)?;
             }
+        }
+        for (spec, acc) in ctx.long_labels.iter().zip(long_acc.iter_mut()) {
+            let built = crate::labels::build(&bars, spec, None)?;
+            for (kind, _) in crate::labels::COLUMN_KINDS {
+                if let (Some(t), Some(v)) = (cols.get_mut(&spec.column(kind)), built.column(kind)) {
+                    t.write_values(v)?;
+                }
+            }
+            acc.add(&s.symbol, &built);
         }
     }
     Ok(())
@@ -6437,6 +6525,16 @@ fn enrich_inner(
     if requested.is_empty() && opts.labels.is_empty() {
         return Err("enrich needs --features and/or --label".to_string());
     }
+    // The target spec names `vol<W>` as the scale column, so the store carries it.
+    for src in opts.labels.iter().filter(|l| l.trim_start().starts_with("long:")) {
+        let scale = format!("vol{}", crate::labels::LongLabelSpec::declared_sigma_window(src));
+        if !names.contains(&scale) && !requested.contains(&scale) {
+            if expand(&scale).is_err() {
+                return Err(format!("label scale column '{}' is not an enrich feature; use vol=5, 20, 60 or 120, or add the column to the store", scale));
+            }
+            requested.push(scale);
+        }
+    }
     let compact_profile = opts
         .features
         .iter()
@@ -6547,8 +6645,18 @@ fn enrich_inner(
     }
 
     // Labels.
+    let mut long_specs: Vec<crate::labels::LongLabelSpec> = Vec::new();
     let mut labels: Vec<(String, LabelSpec)> = Vec::new();
     for spec_src in &opts.labels {
+        if spec_src.trim_start().starts_with("long:") {
+            let spec = crate::labels::LongLabelSpec::parse(spec_src, step)?;
+            spec.check_overlap(opts.allow_overlap)?;
+            if long_specs.iter().any(|x| x.name == spec.name) {
+                return Err(format!("label name '{}' is used twice; set name=<id>", spec.name));
+            }
+            long_specs.push(spec);
+            continue;
+        }
         let tf = tf.ok_or_else(|| {
             format!(
                 "label '{}' needs a recognised bar spacing (got {}s); pass --bar-seconds",
@@ -6722,7 +6830,7 @@ fn enrich_inner(
         .unwrap_or_else(|_| "unknown".to_string());
 
     // Lockbox guard for labelled builds: a label is an evaluation target.
-    if !labels.is_empty() {
+    if !labels.is_empty() || !long_specs.is_empty() {
         for seg in &segs {
             let times = segment_i64(&store, seg, time_col, cols.time_dtype)?;
             crate::prep::check_labelled_rows(&times, opts.allow_lockbox)?;
@@ -6740,6 +6848,18 @@ fn enrich_inner(
     for (n, _) in &labels {
         temp.insert(n.clone(), TempColumn::create(work_dir, n, 0, true)?);
     }
+    let long_names: Vec<String> = long_specs
+        .iter()
+        .flat_map(|sp| crate::labels::COLUMN_KINDS.iter().map(move |(k, _)| sp.column(k)))
+        .collect();
+    for sp in &long_specs {
+        for (kind, _) in crate::labels::COLUMN_KINDS {
+            let n = sp.column(kind);
+            temp.insert(n.clone(), TempColumn::create(work_dir, &n, sp.column_warmup(kind), true)?);
+        }
+    }
+    let mut long_acc: Vec<crate::labels::LabelAccumulator> =
+        long_specs.iter().map(crate::labels::LabelAccumulator::new).collect();
 
     // Cross-sectional source columns are computed even when the user did not
     // ask for them, then removed if they are not part of the output. The same
@@ -7381,6 +7501,7 @@ fn enrich_inner(
         price_action: cpu_price_action,
         mtf: cpu_mtf,
         labels: cpu_labels,
+        long_labels: long_specs.clone(),
         tf,
         cross: &cross,
         eth: &eth,
@@ -7395,7 +7516,8 @@ fn enrich_inner(
         || !ctx.flow.is_empty()
         || !ctx.price_action.is_empty()
         || !ctx.mtf.is_empty()
-        || !ctx.labels.is_empty();
+        || !ctx.labels.is_empty()
+        || !ctx.long_labels.is_empty();
     if has_cpu_work {
         let mut i = 0usize;
         while i < segs.len() {
@@ -7407,7 +7529,7 @@ fn enrich_inner(
             }
             for seg in &segs[start..i] {
                 let s = load_series(&store, seg, &cols, step)?;
-                compute_series(&s, &ctx, &mut temp)?;
+                compute_series(&s, &ctx, &mut temp, &mut long_acc)?;
             }
         }
     }
@@ -7655,7 +7777,18 @@ fn enrich_inner(
     }
     let xs_seconds = t_xs.elapsed().as_secs_f64();
 
-    let total_columns = requested.len() + labels.len();
+    let long_outputs: Vec<LongLabelOutput> = long_specs
+        .iter()
+        .zip(long_acc)
+        .map(|(sp, acc)| LongLabelOutput {
+            spec: sp.clone(),
+            columns: crate::labels::COLUMN_KINDS.iter().map(|(k, _)| sp.column(k)).collect(),
+            target: sp.column("y"),
+            report: acc.finish(),
+        })
+        .collect();
+
+    let total_columns = requested.len() + labels.len() + long_names.len();
     let gpu_columns = gpu_done.len().min(total_columns);
     let cpu_columns = total_columns.saturating_sub(gpu_columns);
     let gpu_share = if total_columns == 0 {
@@ -7670,6 +7803,7 @@ fn enrich_inner(
     let order: Vec<String> = requested
         .iter()
         .chain(labels.iter().map(|(n, _)| n))
+        .chain(long_names.iter())
         .cloned()
         .collect();
     for name in &order {
@@ -7697,6 +7831,7 @@ fn enrich_inner(
     let order: Vec<String> = requested
         .iter()
         .chain(labels.iter().map(|(n, _)| n))
+        .chain(long_names.iter())
         .cloned()
         .collect();
     reports.sort_by_key(|r| order.iter().position(|n| n == &r.name).unwrap_or(usize::MAX));
@@ -7729,7 +7864,7 @@ fn enrich_inner(
             output_bytes: 0,
             rows: store.n_rows(),
             columns_in: store.n_cols(),
-            columns_out: expected_columns_out(&store, &requested, &labels, opts.replace),
+            columns_out: expected_columns_out(&store, &requested, &labels, &long_names, opts.replace),
             groups: store.n_groups(),
             symbols: segs.len(),
             group_rows: store.group_rows(),
@@ -7737,6 +7872,7 @@ fn enrich_inner(
             bar_seconds: step,
             features: reports,
             plans,
+            long_labels: long_outputs,
             backend: if gpu_columns > 0 { "gpu" } else { "cpu" }.to_string(),
             gpu_requested: format!("{:?}", opts.gpu).to_lowercase(),
             gpu_available,
@@ -7783,6 +7919,7 @@ fn enrich_inner(
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
 
     let columns_out = FileStore::open(out)?.n_cols();
+    write_label_sidecars(&opts.data, out, &long_outputs)?;
     let backend = if gpu_columns > 0 { "gpu" } else { "cpu" };
     Ok(Report {
         input: opts.data.clone(),
@@ -7800,6 +7937,7 @@ fn enrich_inner(
         bar_seconds: step,
         features: reports,
         plans,
+        long_labels: long_outputs,
         backend: backend.to_string(),
         gpu_requested: format!("{:?}", opts.gpu).to_lowercase(),
         gpu_available,
@@ -7834,6 +7972,63 @@ fn enrich_inner(
     })
 }
 
+/// Entry lines (`{"target":...}`, no trailing comma) of a label sidecar.
+fn label_sidecar_entries(path: &str) -> Vec<String> {
+    std::fs::read_to_string(path)
+        .map(|t| {
+            t.lines()
+                .filter(|l| l.starts_with("{\"target\":"))
+                .map(|l| l.trim_end().trim_end_matches(',').to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Write `<out>.labels.json` (the label reports) and add the `y` target specs
+/// to `<out>.targets.json`. Entries of an input store's sidecars that this run
+/// does not rewrite carry over, so chained enrich runs keep earlier labels.
+fn write_label_sidecars(data: &str, out: &str, outputs: &[LongLabelOutput]) -> Result<(), String> {
+    if outputs.is_empty() {
+        return Ok(());
+    }
+    let labels_path = crate::target::label_sidecar_path(out).ok_or("label sidecar needs a file output")?;
+    let from = if Path::new(&labels_path).is_file() {
+        Some(labels_path.clone())
+    } else {
+        crate::target::label_sidecar_path(data).filter(|p| Path::new(p).is_file())
+    };
+    let mut lines: Vec<String> = from.map(|p| label_sidecar_entries(&p)).unwrap_or_default();
+    for o in outputs {
+        let head = format!("{{\"target\":{},", jstr(&o.target));
+        lines.retain(|l| !l.starts_with(&head));
+        lines.push(format!("{}\"report\":{}}}", head, o.report.json()));
+    }
+    let body = format!("{{\"schema\":\"rcsr-label-report/1\",\"labels\":[\n{}\n]}}\n", lines.join(",\n"));
+    crate::atomic::write_text_atomic(&labels_path, &body)?;
+
+    let targets_path = crate::target::sidecar_path(out).ok_or("target sidecar needs a file output")?;
+    let from = if Path::new(&targets_path).is_file() {
+        Some(targets_path.clone())
+    } else {
+        crate::target::sidecar_path(data).filter(|p| Path::new(p).is_file())
+    };
+    let mut specs: Vec<crate::target::TargetSpec> = from
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| crate::target::parse_file(&t).ok())
+        .unwrap_or_default();
+    for o in outputs {
+        let ts = o.spec.target_spec(&o.target, &o.spec.column("fwd"));
+        specs.retain(|s| s.column != ts.column);
+        specs.push(ts);
+    }
+    let body = format!(
+        "{{\"schema\":{},\"targets\":[{}]}}\n",
+        jstr(crate::target::SCHEMA),
+        specs.iter().map(|s| format!("{{{}}}", s.fields_json())).collect::<Vec<_>>().join(",")
+    );
+    crate::atomic::write_text_atomic(&targets_path, &body)
+}
+
 fn tf_for_step(step: i64) -> Option<Timeframe> {
     match step {
         60 => Some(Timeframe::M1),
@@ -7854,10 +8049,11 @@ fn expected_columns_out(
     store: &FileStore,
     requested: &[String],
     labels: &[(String, LabelSpec)],
+    long_names: &[String],
     replace: bool,
 ) -> usize {
     let mut names: Vec<String> = store.header().names();
-    for n in requested.iter().chain(labels.iter().map(|(n, _)| n)) {
+    for n in requested.iter().chain(labels.iter().map(|(n, _)| n)).chain(long_names.iter()) {
         if names.contains(n) {
             if !replace {
                 // The writer will refuse this; the dry run still reports the
@@ -8034,6 +8230,14 @@ INPUT / OUTPUT:
   --eth-data <store>      ETH benchmark store when --data does not contain it
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
                           (repeatable; labels are targets, not features)
+  --label long:<tf|bars>[,name=<id>][,delay=<bars>][,fee=<bp>][,spread=<bp>]
+                          [,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>]
+                          [,down=<d>][,stride=<n>]
+                          long-only label family (CPU f64): lbl_<name>_{fwd,y,
+                          long_net,action,t1,exit_ret,m_net,m_barrier,weight};
+                          writes <out>.labels.json (reports, label hash, top
+                          10 absolute moves) and a y target spec in
+                          <out>.targets.json; never a --vars input
   --allow-overlap         permit a label stride below the horizon for horizons of
                           4h and longer (labels overlap; use uniqueness weights)
   --side long             the only side; --side short and --allow-short are refused

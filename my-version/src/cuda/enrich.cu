@@ -26,6 +26,7 @@
 
 #include <cub/cub.cuh>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -97,7 +98,64 @@ extern "C" void rc_enrich_set_test_budget(size_t bytes)
     g_budget_live = 0;
 }
 
-static int g_force_cub_fail = 0;
+/* Test-only fault injection. Allocation faults refuse the k-th allocation
+   made through the guard after arming; launch faults make one launch site
+   return failure before any kernel is queued. Both are off by default. */
+volatile int rc_fault_alloc_armed = 0;
+static std::atomic<unsigned long long> g_fault_alloc_count(0);
+static std::atomic<unsigned long long> g_fault_alloc_at(0);
+static volatile int g_fault_launch_site = 0;
+static std::atomic<unsigned long long> g_fault_launch_hits(0);
+
+enum {
+    RC_FAULT_SEG_ID = 1,
+    RC_FAULT_RING_FEATURE = 2,
+    RC_FAULT_BATCH = 3,
+    RC_FAULT_XS_PREPARE = 4,
+    RC_FAULT_XS_RANK = 5,
+    RC_FAULT_ELEMENT = 6
+};
+
+extern "C" int rc_fault_alloc_hit(void)
+{
+    unsigned long long n = g_fault_alloc_count.fetch_add(1) + 1;
+    return n == g_fault_alloc_at.load();
+}
+
+extern "C" void rc_enrich_set_test_alloc_fault(unsigned long long at)
+{
+    g_fault_alloc_count = 0;
+    g_fault_alloc_at = at;
+    rc_fault_alloc_armed = at != 0;
+}
+
+extern "C" unsigned long long rc_enrich_test_alloc_count(void)
+{
+    return g_fault_alloc_count.load();
+}
+
+extern "C" void rc_enrich_set_test_launch_fault(int site)
+{
+    g_fault_launch_hits = 0;
+    g_fault_launch_site = site;
+}
+
+static int rc_launch_fault(int site)
+{
+    if (g_fault_launch_site != site) return 0;
+    g_fault_launch_hits.fetch_add(1);
+    return 1;
+}
+
+extern "C" unsigned long long rc_enrich_test_launch_hits(void)
+{
+    return g_fault_launch_hits.load();
+}
+
+#define RC_LAUNCH_FAULT(site) rc_launch_fault(site)
+
+
+static thread_local int g_force_cub_fail = 0;
 
 extern "C" void rc_enrich_test_force_cub_fail(int on)
 {
@@ -1184,6 +1242,13 @@ void rc_enrich_last_stats(void *v, RcEnrichStats *out)
         double _l = rc_now_ms();
 
 #define RC_ELEM_LAUNCH(c, call)                                               \
+        if (RC_LAUNCH_FAULT(RC_FAULT_ELEMENT)) {                              \
+            cudaEventDestroy(ev0);                                            \
+            cudaEventDestroy(ev1);                                            \
+            c->last.failed = 1;                                               \
+            stats_end(c);                                                     \
+            return -1;                                                        \
+        }                                                                     \
         call;                                                                 \
         c->last.launch_ms += rc_now_ms() - _l;                                \
         double _s = rc_now_ms();                                              \
@@ -1215,7 +1280,7 @@ void rc_enrich_last_stats(void *v, RcEnrichStats *out)
         cudaEventCreate(&_e1);                                                \
         cudaEventRecord(_e0, 0);                                              \
         double _l = rc_now_ms();                                              \
-        int _rc = (call);                                                     \
+        int _rc = RC_LAUNCH_FAULT(RC_FAULT_ELEMENT) ? -1 : (call);            \
         c->last.launch_ms += rc_now_ms() - _l;                                \
         double _s = rc_now_ms();                                              \
         cudaEventRecord(_e1, 0);                                              \
@@ -1591,6 +1656,13 @@ int rc_enrich_label(void *v, int horizon, double cost_bps, int vol_window, int s
    with no host download. Returns the number of output slots written. */
 static int rc_batch_launch(RcEnrich *c, const RcEnrichOp *op)
 {
+    if (RC_LAUNCH_FAULT(RC_FAULT_BATCH)) return 0;
+    if (!c->d_times || !c->d_open || !c->d_high || !c->d_low || !c->d_close || !c->d_volume ||
+        !c->d_seg_id || !c->d_seg_start || !c->d_seg_len || !c->d_a || !c->d_b || !c->d_c ||
+        !c->d_d || !c->d_e || !c->d_cn || !c->d_bk || !c->d_out) {
+        return 0;
+    }
+    if (op->kind == RC_OP_MACD && (!c->d_out2 || !c->d_out3)) return 0;
     int threads = 256, blocks = (c->n + threads - 1) / threads;
     int sthreads = 128, sblocks = (c->nseg + sthreads - 1) / sthreads;
     switch (op->kind) {
@@ -1867,6 +1939,17 @@ int rc_enrich_xs_prepare(void *v, const unsigned int *sym_key,
     c->last.alloc_ms += rc_now_ms() - t0;
     c->xs_temp_bytes = temp_bytes;
 
+    if (RC_LAUNCH_FAULT(RC_FAULT_XS_PREPARE) || !c->d_times || !c->d_xs_order ||
+        !c->d_xs_order_tmp || !c->d_xs_rows_out || !c->d_xs_gid || !c->d_xs_sym ||
+        !c->d_xs_keys || !c->d_xs_keys_out || !c->d_xs_temp) {
+        cudaEventDestroy(ev0);
+        cudaEventDestroy(ev1);
+        rc_xs_free(c);
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
+
     int threads = 256;
     int blocks = (c->n + threads - 1) / threads;
     double l0 = rc_now_ms();
@@ -1977,6 +2060,14 @@ int rc_enrich_xs_rank(void *v, const double *src, double *out)
     RcEnrich *c = (RcEnrich *)v;
     if (!c) return -1;
     stats_begin(c);
+    if (c->xs_ready && (RC_LAUNCH_FAULT(RC_FAULT_XS_RANK) || !c->d_xs_src || !c->d_xs_order ||
+                        !c->d_xs_member || !c->d_xs_keys || !c->d_xs_keys_out ||
+                        !c->d_xs_rows_out || !c->d_xs_off || !c->d_xs_counts ||
+                        !c->d_xs_gid || !c->d_xs_temp)) {
+        c->last.failed = 1;
+        stats_end(c);
+        return -1;
+    }
     if (!c->xs_ready || !src || !out) {
         c->last.failed = 1;
         stats_end(c);
@@ -2237,6 +2328,8 @@ int rc_ring_launch_seg_id(void *rv, void *cv, int start, int len)
     RcRing *r = (RcRing *)rv;
     RcEnrich *c = (RcEnrich *)cv;
     if (!r || !c || len <= 0) return -1;
+    if (!c->d_seg_start || !c->d_seg_len || !c->d_seg_id) return -1;
+    if (RC_LAUNCH_FAULT(RC_FAULT_SEG_ID)) return (int)cudaErrorLaunchFailure;
     int threads = 256;
     int blocks = (len + threads - 1) / threads;
     /* cudaGetLastError also reports an earlier call's error on this thread,
@@ -2255,6 +2348,8 @@ int rc_ring_launch_feature(void *rv, void *cv, int kind, int k, int which,
     RcRing *r = (RcRing *)rv;
     RcEnrich *c = (RcEnrich *)cv;
     if (!r || !c || !out || len <= 0) return -1;
+    if (!c->d_times || !c->d_open || !c->d_high || !c->d_low || !c->d_close || !c->d_seg_id) return -1;
+    if (RC_LAUNCH_FAULT(RC_FAULT_RING_FEATURE)) return (int)cudaErrorLaunchFailure;
     int threads = 256;
     int blocks = (len + threads - 1) / threads;
     cudaStream_t s = r->compute_stream;

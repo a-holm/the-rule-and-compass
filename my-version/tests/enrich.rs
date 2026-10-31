@@ -3018,3 +3018,119 @@ fn default_financial_features_inventory_is_current_and_every_test_id_exists() {
         }
     }
 }
+
+fn two_symbol_rows(n: usize) -> Vec<(i64, String, f64, f64, f64, f64, f64)> {
+    let mut rows = wavy_rows("AAA", n, 0, 3600, 0.0);
+    rows.extend(wavy_rows("BBB", n, 0, 3600, 1.3));
+    rows
+}
+
+#[test]
+fn long_label_family_is_stored_registered_and_reported() {
+    use rcsr::labels::{self, LongLabelSpec, COLUMN_KINDS, TOP_MOVES};
+    let dir = tmp_dir("longlabel");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    let rows = two_symbol_rows(120);
+    write_store(&src, &rows, 50);
+    let mut o = opts(&src, &out, "r1");
+    o.labels = vec!["long:3,name=h3,vol=20,fee=5,spread=2".to_string()];
+    let report = enrich::build(&o).unwrap();
+
+    // Every kind is a stored label column and matches the library builder.
+    let spec = LongLabelSpec::parse("long:3,name=h3,vol=20,fee=5,spread=2", 3600).unwrap();
+    let bars_a: Vec<Bar> = rows[..120]
+        .iter()
+        .map(|(t, _, o, h, l, c, v)| Bar::new(*t, *o, *h, *l, *c, *v))
+        .collect();
+    let want = labels::build(&bars_a, &spec, None).unwrap();
+    for (kind, _) in COLUMN_KINDS {
+        let col = column(&out, &spec.column(kind));
+        assert_eq!(col.len(), 240, "{kind}");
+        let w = want.column(kind).unwrap();
+        for i in 0..120 {
+            assert_eq!(col[i].to_bits(), w[i].to_bits(), "{kind} row {i}");
+        }
+    }
+    assert_eq!(column(&out, "vol20").len(), 240, "the spec scale column is stored");
+    assert!(column(&out, "lbl_h3_action").iter().all(|v| v.is_nan() || *v == 0.0 || *v == 1.0));
+
+    // Registered with family `label`, never a model input.
+    for (kind, _) in COLUMN_KINDS {
+        let r = rcsr::registry::lookup(&spec.column(kind)).expect("registered");
+        assert_eq!(r.family, "label", "{kind}");
+        assert!(!r.pit_rule.is_empty());
+    }
+    assert!(rcsr::registry::check_no_labels(&["lbl_h3_weight".to_string()]).is_err());
+    assert!(rcsr::registry::check_vars(&out, &["lbl_h3_fwd".to_string()]).is_err());
+
+    // Warm-up is the volatility window on the barrier-scaled kinds only.
+    let warm = |n: &str| report.features.iter().find(|f| f.name == n).unwrap().warmup;
+    assert_eq!(warm("lbl_h3_y"), 20);
+    assert_eq!(warm("lbl_h3_fwd"), 0);
+    assert!(report.features.iter().filter(|f| f.name.starts_with("lbl_h3_")).all(|f| f.label));
+
+    // One report over both symbols, with a hash and the top absolute moves.
+    assert_eq!(report.long_labels.len(), 1);
+    let lr = &report.long_labels[0].report;
+    assert_eq!(lr.rows, 240);
+    assert_eq!(lr.label_hash.len(), 64);
+    assert_eq!(lr.top_moves.len(), TOP_MOVES);
+    assert!(lr.top_moves.windows(2).all(|w| w[0].fwd.abs() >= w[1].fwd.abs()));
+    assert!(lr.top_moves.iter().all(|m| m.symbol.is_some()));
+    assert!(report.json().contains("\"top_abs_moves\":{\"n\":10"));
+    assert!(report.text_lines().iter().any(|l| l.starts_with("# enrich-label-move:")));
+
+    // The report and the y target spec are written beside the store.
+    let found = rcsr::target::label_report_for(&out, "lbl_h3_y").expect("label sidecar entry");
+    assert!(found.contains(&format!("\"label_hash\":\"{}\"", lr.label_hash)));
+    let tpath = rcsr::target::sidecar_path(&out).unwrap();
+    let specs = rcsr::target::parse_file(&std::fs::read_to_string(&tpath).unwrap()).unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].column, "lbl_h3_y");
+    assert!(specs[0].long_only);
+    assert_eq!(specs[0].return_column.as_deref(), Some("lbl_h3_fwd"));
+}
+
+#[test]
+fn legacy_fwd_label_is_unchanged_next_to_a_long_label() {
+    let dir = tmp_dir("longlegacy");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let a = dir.join("a.rcsb").to_string_lossy().into_owned();
+    let b = dir.join("b.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &two_symbol_rows(60), 30);
+    let mut o = opts(&src, &a, "r1");
+    o.labels = vec!["fwd:2,cost=0".to_string()];
+    enrich::build(&o).unwrap();
+    o.out = Some(b.clone());
+    o.labels = vec!["fwd:2,cost=0".to_string(), "long:2".to_string()];
+    enrich::build(&o).unwrap();
+    let (x, y) = (column(&a, "fwd2"), column(&b, "fwd2"));
+    assert!(x.iter().zip(&y).all(|(p, q)| p.to_bits() == q.to_bits()));
+    assert!(rcsr::target::label_report_for(&a, "lbl_h2_y").is_none());
+    assert!(rcsr::target::label_report_for(&b, "lbl_h2_y").is_some());
+}
+
+#[test]
+fn long_label_dry_run_writes_no_sidecar_and_bad_specs_fail() {
+    let dir = tmp_dir("longdry");
+    let src = dir.join("in.rcsb").to_string_lossy().into_owned();
+    let out = dir.join("out.rcsb").to_string_lossy().into_owned();
+    write_store(&src, &two_symbol_rows(40), 30);
+    let mut o = opts(&src, &out, "r1");
+    o.labels = vec!["long:2".to_string()];
+    o.dry_run = true;
+    let r = enrich::build(&o).unwrap();
+    assert_eq!(r.columns_out, r.columns_in + 1 + 1 + 9);
+    assert!(rcsr::target::label_sidecar_path(&out).map_or(true, |p| !std::path::Path::new(&p).exists()));
+    for bad in ["long:2,side=short", "long:2,mystery=1", "long:2,name=Bad", "long:0"] {
+        o.labels = vec![bad.to_string()];
+        assert!(enrich::build(&o).is_err(), "{bad}");
+    }
+    o.labels = vec!["long:2".to_string(), "long:2".to_string()];
+    assert!(enrich::build(&o).unwrap_err().contains("used twice"));
+    o.labels = vec!["long:4".to_string()];
+    assert!(enrich::build(&o).unwrap_err().contains("overlap"));
+    o.allow_overlap = true;
+    assert!(enrich::build(&o).is_ok());
+}

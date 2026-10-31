@@ -2416,6 +2416,11 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if let Some(reason) = crate::metrics::score_refusal(cfg.metric) {
         return Some(reason);
     }
+    if cfg.metric == crate::metrics::Metric::ImplicitResidual
+        && train.y.iter().any(|&v| v != 0.0)
+    {
+        return Some("implicit_residual needs an all-zero training target");
+    }
     // #288: AUC needs exactly two distinct target values; the label rule is
     // the CPU midpoint rule, so any other target is refused, never collapsed.
     if cfg.metric == crate::metrics::Metric::Auc
@@ -7341,6 +7346,25 @@ mod tests {
         assert_eq!(expr::structural_hash(&ind.tree), expr::structural_hash(&want));
         assert_eq!(ind.complexity, cfg.complexity_model.complexity(&want));
         assert!(ind.complexity < before, "dead 0+ and 1* nodes carry no complexity");
+    }
+
+    /// `--fit-strategy gpu --metric signed` is accepted and defers the fit: the
+    /// kernel is the squared warm start of the CPU arm.
+    #[test]
+    fn signed_defers_to_the_device_as_a_squared_warm_start() {
+        assert!(crate::fit::gpu_fit_metric_error(Metric::Signed).is_none());
+        assert_eq!(
+            crate::fit::fit_loss(Metric::Signed),
+            Some(crate::fit::DeviceLoss::Squared)
+        );
+        let cfg = Config {
+            fit_strategy: crate::fit::FitStrategy::Gpu,
+            fit_iters: 8,
+            metric: Metric::Signed,
+            ..Default::default()
+        };
+        assert!(defers_fit_to_gpu(&cfg, true));
+        assert!(!defers_fit_to_gpu(&Config { fit_iters: 0, ..cfg }, true));
     }
 
     /// #393: the metrics whose proposals need the exact gate defer without the

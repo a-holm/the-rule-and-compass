@@ -548,6 +548,59 @@ Choices that the formulas leave open: block length `max(h, hold, ceil(n^(1/3)))`
 
 Verify: `tests/inference.rs` (hand-computed CVaR, break-even, BH, PSR and PBO fixtures, the AR(1) and overlapping-label design effects, SPA on signal and noise) and `tests/eval_protocol.rs`.
 
+### 3.13 Baseline ladder and add-one-family ablation (implemented)
+
+A formula is only as good as the best opponent it beat. `rcsr ladder` runs every opponent on the same rows, folds, preprocessing, projection and cost model. Every rung is a `{0, 1}` long/flat book or cash.
+
+| rung | what it is |
+|---|---|
+| `cash` | always flat |
+| `buy_and_hold` | always long, entry and exit costs paid per block |
+| `equal_weight_universe` | every row long at no cost; the beta reference |
+| `constant_long_flat` | long iff the fit-row mean target is positive |
+| `zero_param` | the label at a zero return (needs `--target-spec`) as a score |
+| `ols_ridge` | ridge path on the full projected view, lambda chosen on validation MSE |
+| `best_single_feature` | one signed feature, chosen on validation net P&L over all features; the search is counted in `N_trials` |
+| `vol_binned20` | 20 equal-count bins of a volatility column (`--vol-col`) |
+| `naive_reversal` | long when the lagged return column is negative (`--reversal-col`) |
+| `top_tercile_long` | long the top tercile of the OLS score per timestamp, cash for the rest |
+| `feature_threshold` | `1[f > tau]` on one declared feature (`--signal-col`) |
+| `gbm` | gradient-boosted trees (pure `std`), 6 depth and rate configurations, tree count chosen on validation MSE |
+| `symbolic_regression` | the caller's out-of-fold score column (`--sr-score`) |
+| `matched_exposure_random_long` | the run lengths of the searched book (else the OLS book) shuffled per symbol |
+
+Per fold, a model fits on `[train_start, validation_start - purge)`, chooses its hyperparameters and its score-threshold quantile on `[validation_start, train_end)` and is scored once on the test range. A score rung is long iff `score > theta`, with `theta` a fit-score quantile from `--quantiles`. A rung whose input column is not given is `not_run` with the reason. The test range is never used for selection; the best long/flat rule and the SPA benchmark are reported from it for the reader only.
+
+Equal cost. OLS gets the whole projection. The GBM gets `--gbm-trees` trees per fold. The report prints the GBM's trees grown and wall seconds beside the symbolic-regression run's `--sr-evals` and `--sr-wall`. If the GBM's net over cash is higher, the symbolic-regression row is labelled `interpretability_only`. A searched member that does not beat the zero-parameter rung has `beats_zero_param = false`; `rcsr` flags the same on the run report (`beats_zero_param_test`, `beats_zero_param_validation`).
+
+Reported per rung: exposure, beta on the equal-weight universe, net P&L at the cost grid (default 12, 20 and 40 bp per side), mean period net with a circular-block-bootstrap interval, annualised Sharpe, break-even bp, hit rate of long rows, MSE in return space, rank IC with a block interval, share of folds and of symbols with positive net, BH-FDR, and the rung's evaluations and wall seconds. Across rungs: SPA against the best of cash, buy-and-hold and constant, DSR of the best rung deflated by `N_trials`, PBO over the rungs, and the full `N_trials`. A long-only rule that is just market beta shows exposure near 1, beta near 1 and no net over buy-and-hold.
+
+`rcsr ablation` decides whether a feature family ships. The arms, the generation budget, the seeds and the decision rule are in `protocol/ablation.json` and are committed before any run.
+
+| arm | features |
+|---|---|
+| `A0` | `B0`, 10 base columns |
+| `A1` | `B0` and the continuous candle columns |
+| `A2` | `A1` and the multi-bar columns |
+| `A3` | `A2`, three conditional patterns and `trend96` |
+| `A4` | `A3` and three placebo columns matched on marginal distribution (so prevalence) and lag-1 autocorrelation |
+| `A5` | `B0` and circular-block-permuted copies of the `A2` family columns |
+
+Every arm runs a fixed generation count, 3 seeds for the screen and 5 for finalists. `rcsr ablation plan` writes one manifest per arm with the arm name, the ordered feature list, its SHA-256, the generation budget and the seeds. `rcsr --arm A1` writes `ablation.arm`, `ablation.feature_list_sha256`, `ablation.generation_budget` and `ablation.generations_run` into run.json, and `verdict` refuses a run whose hash or budget differs from the definition or the arm manifest. `rcsr ablation score` prices the run's validation-chosen finalist (`objective.finalist`) on every fold at a fixed threshold grid; no threshold is picked on the test range.
+
+A family is `ship` only if every check passes against every control arm:
+
+* the mean MSE gain in return space exceeds the across-seed range of either arm;
+* the SPA p-value of the seed-mean net difference is below 0.05;
+* the gain exceeds the largest gain of the permuted arm (the null band);
+* the net difference keeps its sign across seeds, across folds and across the threshold grid;
+* BH-FDR at q = 0.10 over the families keeps it;
+* the DSR, deflated by `N_trials = families x columns x windows x seeds x folds x horizons`, is at least 0.5.
+
+The PBO of the arms' series is reported with the verdict; it centres every series, so it records rank stability and does not gate.
+
+`A3` is compared with the placebo arm `A4` and with `A2`, so it must beat both. Otherwise the family is `drop`, with every failed check listed. No family enters the default set on a single-cell t-test. The ablation is a selection on training data repeated inside every fold, and a family that only wins by making the search bigger has not won.
+
 ## 4. What `rcsr` reports today
 
 ### The test lockbox and the validation slice

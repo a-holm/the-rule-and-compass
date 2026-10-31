@@ -76,6 +76,11 @@ pub fn lookup(name: &str) -> Option<Resolved> {
     if let Some(e) = registry_map().get(name) {
         return Some(resolve_entry(e, 0));
     }
+    if let Some(e) = enrich::label_registry_entry(name) {
+        let mut r = resolve_entry(&e, 0);
+        r.causal_offset = 1;
+        return Some(r);
+    }
     if QUALITY_COLUMNS.contains(&name) {
         return Some(Resolved {
             family: "quality".to_string(),
@@ -421,9 +426,23 @@ fn unknown_message(name: &str, schema_file: &str, panel_has: Option<&str>) -> St
     }
 }
 
+/// A column of the `label` family is a target or a weight, never an input.
+pub fn check_no_labels(vars: &[String]) -> Result<(), String> {
+    for v in vars {
+        if lookup(v).is_some_and(|r| r.family == "label") {
+            return Err(format!(
+                "column '{}' is a label-family column (it reads bars after the decision time) and cannot be a --vars input",
+                v
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate `--vars` against the store's schema sidecar. A store without a
 /// sidecar is not a registry panel and passes. An unknown name is an error.
 pub fn check_vars(store_path: &str, vars: &[String]) -> Result<(), String> {
+    check_no_labels(vars)?;
     let schema_file = schema_path(store_path);
     if !Path::new(&schema_file).is_file() {
         return Ok(());

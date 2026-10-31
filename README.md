@@ -72,7 +72,7 @@ and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
 form: its constants are projected in f64 onto the zero-mean-residual manifold by
 a constrained least-squares step (two passes, no optimiser), and when no
-constant can move the mean the arm says so instead of fabricating a fit — see
+constant can move the mean the arm says so instead of fabricating a fit. With `--fit-strategy gpu` the squared device LM is the warm start and the exact f64 gate projects each proposal. See
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
 
 See [`docs/how-symbolic-regression-works.md`](docs/how-symbolic-regression-works.md)
@@ -209,6 +209,28 @@ also works). Comparisons are non-associative, so write
 `cargo test` runs the unit tests and the end-to-end recovery tests
 (`y = x`, `y = x²`, `y = x1·x2`), plus a regression test that constant fitting
 reaches machine precision.
+
+### Baseline ladder and add-one-family ablation
+
+`rcsr ladder` prices a long-only baseline ladder on one panel, one set of folds and one cost model, so a searched formula is compared with the right opponents. Every rung is long or flat: cash, buy-and-hold, equal-weight universe, constant long/flat, the zero-parameter target structure, OLS/ridge on the full projection, the best single feature (selection counted), the 20-bin `E[y|vol]`, a naive long-only reversal, a cross-sectional top-tercile basket, `1[f > tau]`, a tuned GBM with the same tree budget per fold, the symbolic-regression score and a matched-exposure random long book. Cash, buy-and-hold and the equal-weight universe are in every table with exposure and beta. The report carries wall seconds and candidate evaluations per rung, net P&L at a cost grid, break-even bp, rank IC with a block interval, MSE in return space, fold and symbol sign agreement, BH-FDR, SPA, DSR, PBO and `N_trials`.
+
+```sh
+rcsr ladder --data panel.rcsb --target y60 --return-col fwd60 --time ts --group symbol \
+  --windows protocol/windows.csv --scheme expanding --target-spec panel.targets.json \
+  --vol-col vol96 --reversal-col ret_1 --signal-col trend96 --sr-score sr_score \
+  --sr-evals 1200000 --sr-wall 5400 --out ladder.json --markdown ladder.md
+```
+
+`rcsr ablation` runs the add-one-family ablation under the decision rule committed in `protocol/ablation.json`: arms `A0` (B0) to `A5`, a fixed generation budget, 3 seeds per arm (5 with `--finalist`), one manifest per arm, a placebo arm and a circular-block-permuted arm. `rcsr --arm A1` writes the arm, the feature-list hash, the generation budget and the generations reached into run.json.
+
+```sh
+rcsr ablation plan --definition protocol/ablation.json --data panel.rcsb --target y60 --time ts --group symbol \
+  --return-col fwd60 --windows protocol/windows.csv --out ablation \
+  --search-args "--objective pnl --cost-bps 12 --validation-frac 0.2 --target-spec panel.targets.json --split temporal"
+bash ablation/commands.sh   # prepare, one search and one score per arm and seed, then the verdict
+```
+
+The verdict (`ablation/verdict.json`, `ablation/verdict.md`) says ship or drop per family. See [`docs/overfitting.md`](docs/overfitting.md#313-baseline-ladder-and-add-one-family-ablation-implemented).
 
 ## GUI
 
@@ -585,7 +607,7 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--cost-bps f] [--slippage-bps f] [--cash-return f] [--funding col]
      [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
      [--equivalence-z z] [--noise-lag n|auto]
-     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--target-spec file] [--allow-target-structure]
+     [--allow-lockbox] [--lockbox START,END] [--ledger file] [--arm name] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
      [--smooth k] [--smooth-centred k]
      [--center mean|median|min|max|none] [--scale std|iqr|range|none]
@@ -757,9 +779,11 @@ run:
 | `--allow-lockbox` | permit train, validation or test rows in the 2026H2 crypto lockbox (declared final test only) |
 | `--lockbox START,END` | declared locked test reported in the run.json `lockbox` object (rows, date range, read count) |
 | `--ledger file` | candidate ledger whose locked reads run.json counts |
+| `--arm name` | ablation arm label; run.json gains an `ablation` object with the arm, the SHA-256 of the ordered variable list, the generation budget and the generations reached |
 | `--target-spec <file>` | declared target spec (`rcsr-target-spec/1`, default `<data stem>.targets.json`; `long_only` is always true): refuses a label whose zero-return prediction depends on a column (D13c, exit 5), the future return as an input (D13a) and a look-ahead scale (D13b); purges training rows within the label end offset of every validation and test row; reports `baselines.target_structure` |
 | `--allow-target-structure` | run a D13c target for a diagnostic replay (warns, records `check.status = overridden` and a proxy table) |
 | `--allow-overlap` (`rcsr enrich`, `rcsr prep`) | permit a `--label` stride below the horizon for horizons of 4 h and longer; without it such a label is refused. `--side short` and `--allow-short` are always refused: labels are long-only (action `{0,+1}`, long-side barriers, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge)) |
+| `--label long:<horizon>,...` (`rcsr enrich`) | long-only label family `lbl_<name>_{fwd,y,long_net,action,t1,exit_ret,m_net,m_barrier,weight}`, the label report with hash and top 10 absolute moves in `<out>.labels.json`, the enrich report and `run.json` (`target_spec.label_report`); label columns are never `--vars` inputs, see [`docs/time-series.md`](docs/time-series.md#3b-long-only-labels-and-their-purge) |
 | `--center <how>` | what to subtract before the search: `mean` (default), `median`, `min`, `max`, `none` |
 | `--scale <how>` | what to divide by: `std` (default), `iqr`, `range`, `none` |
 | `--filter expr` | keep rows where the expression is `> 0`, e.g. `"volume > 1e5 and close > 0"` |
@@ -1103,7 +1127,7 @@ and the default remains the historical LM path bit for bit. `--metric signed`
 (the absolute mean residual) is the one non-squared metric with an exact closed
 form: its constants are projected in f64 onto the zero-mean-residual manifold by
 a constrained least-squares step (two passes, no optimiser), and when no
-constant can move the mean the arm says so instead of fabricating a fit — see
+constant can move the mean the arm says so instead of fabricating a fit. With `--fit-strategy gpu` the squared device LM is the warm start and the exact f64 gate projects each proposal. See
 [`docs/optimisation.md`](docs/optimisation.md) §3.0.1.
   analytic derivatives for every differentiable primitive (`erf`/`erfc`,
   `atan2`, `asinh`/`acosh`/`atanh`, and documented subgradients for

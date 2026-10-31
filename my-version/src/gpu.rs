@@ -3796,6 +3796,65 @@ mod tests {
         }
     }
 
+    /// The device `Absolute` scorer, chosen by the dispatch table for
+    /// `implicit_residual`, equals the CPU `score_weighted(ImplicitResidual)` on an
+    /// implicit circle sample (target 0) at the absolute metric's tier.
+    #[test]
+    fn implicit_residual_device_score_matches_the_cpu_metric() {
+        use crate::metrics::{native_score_objective, score_weighted, Metric};
+
+        let n = 256;
+        let nv = 2;
+        let mut cols = vec![0.0f32; nv * n];
+        for i in 0..n {
+            let a = 2.0 * std::f32::consts::PI * i as f32 / n as f32;
+            let r = 1.0 + 0.05 * ((i * 7 % 13) as f32 / 13.0 - 0.5);
+            cols[i] = r * a.cos();
+            cols[n + i] = r * a.sin();
+        }
+        let y = vec![0.0f32; n];
+        let mut ev = match evaluator_or_skip(&cols, n, nv, &y) {
+            Some(ev) => ev,
+            None => return,
+        };
+        let circle = |c: f64| {
+            node(
+                Op::Sub,
+                vec![
+                    node(
+                        Op::Add,
+                        vec![
+                            node(Op::Square, vec![input(0)]),
+                            node(Op::Square, vec![input(1)]),
+                        ],
+                    ),
+                    constant(c),
+                ],
+            )
+        };
+        let trees = vec![circle(1.0), circle(0.0), circle(2.5)];
+        let pop = Population::from_trees(trees.iter());
+        let (prog, offsets) = pop.programs();
+        let preds = ev.predictions(prog, offsets).expect("prediction readback");
+        let objective = native_score_objective(Metric::ImplicitResidual)
+            .expect("implicit_residual is natively scored");
+        assert_eq!(objective, ScoreObjective::Absolute);
+        let batch = ev.score_batch(prog, offsets, objective, &[1i32; 3]);
+        assert!(batch.is_consistent());
+        let zeros = vec![0.0f64; n];
+        for k in 0..trees.len() {
+            let pred: Vec<f64> = preds[k * n..(k + 1) * n].iter().map(|&v| v as f64).collect();
+            let want = score_weighted(&pred, &zeros, &[], Metric::ImplicitResidual, 1);
+            assert_eq!(batch.status[k], ScoreStatus::Ok, "slot {k}");
+            let tol = 1e-12 * (1.0 + want.abs());
+            assert!(
+                (batch.values[k] - want).abs() <= tol,
+                "slot {k}: GPU {} vs CPU {want}",
+                batch.values[k]
+            );
+        }
+    }
+
     /// Weighted regression scoring: every native regression objective with a
     /// weighted form matches `metrics::score_weighted` on the same f32-rounded
     /// predictions, at the unweighted tiers (1e-12 relative, 1e-9 for the
@@ -7447,6 +7506,30 @@ mod rank_tests {
         assert_eq!(b, target.ranks(), "device B differs from the CPU average ranks");
     }
 
+    extern "C" {
+        fn rc_rank_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the rank call before any buffer is
+    /// sized, `rank_score_trials` reports `None` (the caller keeps the CPU
+    /// arm), and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_rank_call_then_recovers() {
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&linear());
+        let ok = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        assert!(ok.is_some(), "baseline rank call");
+        unsafe { rc_rank_test_force_cub_fail(1) };
+        let refused = ev.rank_score_trials(&[&p], &[vec![p.c0.clone()]]);
+        unsafe { rc_rank_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the rank call");
+        let again = ev
+            .rank_score_trials(&[&p], &[vec![p.c0.clone()]])
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(|s| (s.ab, s.aa)), ok.unwrap()[0][0].map(|s| (s.ab, s.aa)));
+    }
+
     #[test]
     fn rank_sums_are_bit_identical_to_the_cpu() {
         let f = fixture(96);
@@ -8557,6 +8640,32 @@ mod order_stat_tests {
 
     /// The device median is the configured metric for odd and even row counts,
     /// with ties and with a constant prediction.
+    extern "C" {
+        fn rc_os_test_force_cub_fail(on: i32);
+    }
+
+    /// #410: a refused CUB size query fails the order-statistic sort call,
+    /// `order_stat_score_trials` reports `None` (the caller keeps the CPU arm),
+    /// and the next call on the same context works.
+    #[test]
+    fn refused_cub_query_fails_the_order_stat_call_then_recovers() {
+        use crate::fit::OrderStat;
+        let f = fixture(96);
+        let Some(mut ev) = evaluator(&f) else { return };
+        let p = plan(&affine());
+        let trials = [vec![p.c0.clone()]];
+        let ok = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        assert!(ok.is_some(), "baseline median call");
+        unsafe { rc_os_test_force_cub_fail(1) };
+        let refused = ev.order_stat_score_trials(&[&p], &trials, OrderStat::Median);
+        unsafe { rc_os_test_force_cub_fail(0) };
+        assert!(refused.is_none(), "a refused CUB query must fail the call");
+        let again = ev
+            .order_stat_score_trials(&[&p], &trials, OrderStat::Median)
+            .expect("no error may stay pending");
+        assert_eq!(again[0][0].map(f64::to_bits), ok.unwrap()[0][0].map(f64::to_bits));
+    }
+
     #[test]
     fn the_device_median_is_the_configured_metric() {
         for n in [5usize, 6, 31, 32, 97, 128] {

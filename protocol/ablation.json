@@ -1,0 +1,41 @@
+{
+  "schema": "rcsr-ablation/1",
+  "b0": ["vol96", "vol16", "vol_ratio", "rsi14", "ma_slope672", "don96", "taker_imb16", "vwap_dev96", "btc_r96", "tod_sin"],
+  "groups": {
+    "candle_continuous": ["clv1", "clv4", "body1", "wasym1", "lower_wick", "rng1"],
+    "multi_bar": ["prev_range_pos", "inside_s", "outside_s", "nr4", "clv16", "body16"],
+    "conditional_patterns": ["engulf_s", "harami_s", "run8"],
+    "trend96": ["trend96"]
+  },
+  "placebo_template_group": "conditional_patterns",
+  "placebo_prefix": "placebo_",
+  "permute_prefix": "perm_",
+  "permute_block_len": 96,
+  "generation_budget": 300,
+  "screen_seeds": 3,
+  "finalist_seeds": 5,
+  "trials": {"windows": 1, "horizons": 1},
+  "arms": [
+    {"name": "A0", "add": []},
+    {"name": "A1", "add": ["candle_continuous"]},
+    {"name": "A2", "add": ["candle_continuous", "multi_bar"]},
+    {"name": "A3", "add": ["candle_continuous", "multi_bar", "conditional_patterns", "trend96"]},
+    {"name": "A4", "add": ["candle_continuous", "multi_bar", "conditional_patterns", "trend96"], "placebo": 3},
+    {"name": "A5", "add": [], "permute": ["candle_continuous", "multi_bar"]}
+  ],
+  "rule": {
+    "min_seeds": 3,
+    "spa_alpha": 0.05,
+    "fdr_q": 0.10,
+    "min_dsr": 0.5,
+    "draws": 2000,
+    "block_len": 0,
+    "seed": 0,
+    "pbo_blocks": 8,
+    "families": [
+      {"name": "candle", "treatment": "A1", "controls": ["A0"], "null_arm": "A5", "null_control": "A0"},
+      {"name": "multi_bar", "treatment": "A2", "controls": ["A1"], "null_arm": "A5", "null_control": "A0"},
+      {"name": "patterns_trend", "treatment": "A3", "controls": ["A4", "A2"]}
+    ]
+  }
+}

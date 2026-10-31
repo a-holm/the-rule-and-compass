@@ -811,3 +811,92 @@ fn a_run_without_a_spec_writes_no_target_spec_record() {
     ]);
     assert_eq!(code(&again), 0, "{}", stderr(&again));
 }
+
+// ---------------------------------------------------------------------------
+// Long-only label columns from `rcsr enrich`
+// ---------------------------------------------------------------------------
+
+/// A labelled store from `rcsr enrich --label long:3`; returns its path.
+fn labelled_store(dir: &std::path::Path) -> String {
+    let mut text = String::from("ts,symbol,open,high,low,close,volume\n");
+    for sym in ["AAA", "BBB"] {
+        for i in 0..260usize {
+            let x = i as f64;
+            let o = 100.0 + 4.0 * (x * 0.31).sin() + 0.02 * x;
+            let c = 100.0 + 4.0 * (x * 0.31 + 0.5).sin() + 0.02 * x;
+            text.push_str(&format!(
+                "{},{},{},{},{},{},{}\n",
+                T0 + 3600 * i as i64,
+                sym,
+                o,
+                o.max(c) + 0.4,
+                o.min(c) - 0.4,
+                c,
+                10.0 + (i % 7) as f64
+            ));
+        }
+    }
+    let csv = dir.join("bars.csv");
+    std::fs::write(&csv, text).unwrap();
+    let out = dir.join("bars.rcsb").to_string_lossy().into_owned();
+    let o = rcsr(&[
+        "enrich", "--data", csv.to_str().unwrap(), "--out", &out, "--features", "r1",
+        "--label", "long:3,name=h3,vol=20,fee=5", "--bar-seconds", "3600", "--time", "ts",
+        "--symbol", "symbol", "--cpu",
+    ]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    out
+}
+
+fn run_labelled(data: &str, vars: &[&str]) -> Output {
+    let mut args = vec![
+        "--data", data, "--target", "lbl_h3_y", "--time", "ts", "--fill", "drop", "--cpu",
+        "--no-dev-log", "--seed", "1", "--generations", "1", "--pop", "8", "--metric", "squared",
+        "--json", "--quiet",
+    ];
+    args.extend_from_slice(vars);
+    rcsr(&args)
+}
+
+#[test]
+fn run_json_echoes_the_label_report_of_an_enriched_target() {
+    let dir = scratch();
+    let data = labelled_store(&dir);
+    let o = run_labelled(&data, &["--vars", "r1"]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let j = json(&o);
+    let lr = at(&j, &["target_spec", "label_report"]);
+    assert_eq!(lr.get("name").and_then(|v| v.as_str()), Some("h3"));
+    let hash = lr.get("label_hash").and_then(|v| v.as_str()).unwrap().to_string();
+    assert_eq!(hash.len(), 64);
+    let sidecar = std::fs::read_to_string(dir.join("bars.labels.json")).unwrap();
+    assert!(sidecar.contains(&hash), "run.json hash matches the enrich sidecar");
+    assert_eq!(num(lr, &["top_abs_moves", "n"]), 10.0);
+    match at(lr, &["top_abs_moves", "moves"]) {
+        Json::Arr(a) => {
+            assert_eq!(a.len(), 10);
+            assert!(a[0].get("symbol").and_then(|v| v.as_str()).is_some());
+            assert!(a[0].get("time").and_then(|v| v.as_f64()).is_some());
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn label_columns_are_never_inputs_named_or_default() {
+    let dir = scratch();
+    let data = labelled_store(&dir);
+    for bad in ["r1,lbl_h3_fwd", "r1,lbl_h3_weight", "r1,lbl_h3_action"] {
+        let o = run_labelled(&data, &["--vars", bad]);
+        assert_eq!(code(&o), 5, "{bad}: {}", stderr(&o));
+        assert!(stderr(&o).contains("D13a"), "{bad}: {}", stderr(&o));
+    }
+    let o = run_labelled(&data, &[]);
+    assert_eq!(code(&o), 0, "{}", stderr(&o));
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    let j = Json::parse(text.trim()).unwrap();
+    match at(&j, &["variables"]) {
+        Json::Arr(a) => assert!(a.iter().all(|v| !v.as_str().unwrap().starts_with("lbl_")), "{a:?}"),
+        other => panic!("{other:?}"),
+    }
+}
