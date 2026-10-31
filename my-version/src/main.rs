@@ -563,9 +563,11 @@ SEARCH:
                              correlation`, `--metric correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
-                             strategy. `--metric signed` keeps the exact CPU
-                             fit projection (#228), but its score is native on
-                             the device since #287
+                             strategy. `--metric signed` fits on the device as
+                             the squared warm start of the exact f64 bias
+                             projection; every proposal passes the
+                             exact f64 gate and its score is native on the
+                             device
   --fit-report               print the constant-fitting arm counts (linear,
                              varpro, stream, exact, GPU fallback/refit, signed
                              projection labels) at the end of the run
