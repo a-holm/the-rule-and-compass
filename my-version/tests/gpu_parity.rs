@@ -37,8 +37,6 @@ const TOL: f64 = 1e-12;
 /// entry is `(name, measured fixture result)`. They are excluded from the main
 /// gate and asserted by `known_parity_bugs_stay_ignored`.
 const KNOWN_BUGS: &[(&str, &str)] = &[
-    ("ma96", "bitwise: 1243 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 188882)"),
-    ("ma672", "bitwise: 8731 NaN-mask mismatches, CPU finite and GPU NaN in the window of a NaN close (first row 189458)"),
 ];
 
 static HEAVY: Mutex<()> = Mutex::new(());
@@ -676,14 +674,12 @@ fn xs_rank_amihud96_is_bit_identical_to_the_cpu() {
 }
 
 #[test]
-#[ignore = "bug #356: ma96 NaN mask differs (1243 rows): CPU finite, GPU NaN around a NaN close"]
-fn bug_ma96() {
+fn ma96_matches_cpu_nan_mask_and_bits() {
     assert_known_bug_column("ma96");
 }
 
 #[test]
-#[ignore = "bug #356: ma672 NaN mask differs (8731 rows): CPU finite, GPU NaN around a NaN close"]
-fn bug_ma672() {
+fn ma672_matches_cpu_nan_mask_and_bits() {
     assert_known_bug_column("ma672");
 }
 

@@ -414,6 +414,15 @@ __global__ void k_ma(const long long *__restrict__ t, const double *__restrict__
         int i = start + p;
         out[i] = NAN;
         if (p + 1 < w || !rc_contig(t, i, w, step)) continue;
+        if (w == 96 || w == 672) {
+            /* Compact engine columns ma96/ma672 average the finite closes
+               of the window; the catalogue maN columns need the full window. */
+            double cnt = sc[pb + p + 1] - sc[pb + p + 1 - w];
+            if (!(cnt > 0.0) || !(close[i] > 0.0)) continue;
+            double m = (sa[pb + p + 1] - sa[pb + p + 1 - w]) / cnt;
+            if (isfinite(close[i]) && isfinite(m) && m != 0.0) out[i] = close[i] / m - 1.0;
+            continue;
+        }
         double m = rc_mean(sa, sc, pb, p, w);
         if (isfinite(m) && m > 0.0) out[i] = close[i] / m - 1.0;
     }
