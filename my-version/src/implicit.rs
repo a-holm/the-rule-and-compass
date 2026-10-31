@@ -295,9 +295,13 @@ impl Level {
         }
     }
 
-    fn residuals(&mut self, c: &[f64], x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
+    fn set(&mut self, c: &[f64]) {
         set_constants(&mut self.tree, c);
         self.grads.set_constants(c);
+    }
+
+    fn residuals(&mut self, c: &[f64], x: &[Vec<f64>], w: &[f64]) -> Option<Vec<f64>> {
+        self.set(c);
         residuals(&self.tree, &mut self.grads, x, w)
     }
 }
@@ -309,14 +313,91 @@ fn rss_of(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> f64 {
     }
 }
 
+/// The residuals and the Jacobian at `c` from three sweeps per row.
+///
+/// `∂rᵢ/∂cⱼ = (√wᵢ/N)·[aⱼ − d·Σₖ eₖ·hₖⱼ]` with `a = ∂f/∂c`, `N = ||∇f||`,
+/// `d = f/N`, `e = ∇f/N` and `h = ∂²f/∂p∂c`. The sum is the derivative of `a`
+/// along the unit normal `e`, taken by a central difference of the constant
+/// adjoint at `p ± ε·e`, so the cost does not grow with the constant count.
+/// `None` when any row, or any shifted point, is undefined.
+fn directional_jacobian(
+    level: &mut Level,
+    c: &[f64],
+    x: &[Vec<f64>],
+    w: &[f64],
+) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+    if !w.is_empty() && w.len() != x.len() {
+        return None;
+    }
+    level.set(c);
+    let k = c.len();
+    let mut r = Vec::with_capacity(x.len());
+    let mut jac = Vec::with_capacity(x.len());
+    let mut a = vec![0.0; k];
+    let mut ap = vec![0.0; k];
+    let mut am = vec![0.0; k];
+    let mut unit = Vec::new();
+    let mut shifted = Vec::new();
+    for (i, row) in x.iter().enumerate() {
+        let wi = w.get(i).copied().unwrap_or(1.0);
+        if !wi.is_finite() || wi < 0.0 {
+            return None;
+        }
+        if wi == 0.0 {
+            r.push(0.0);
+            jac.push(vec![0.0; k]);
+            continue;
+        }
+        let f = expr::eval(&level.tree, row);
+        if !f.is_finite() {
+            return None;
+        }
+        let grad = level.grads.both_gradients(row, &mut a);
+        let mut norm_sq = 0.0;
+        for g in grad {
+            if !g.is_finite() {
+                return None;
+            }
+            norm_sq += g * g;
+        }
+        let norm = norm_sq.sqrt();
+        if !finite_positive(norm) {
+            return None;
+        }
+        let d = f / norm;
+        if !d.is_finite() {
+            return None;
+        }
+        unit.clear();
+        unit.extend(grad.iter().map(|g| g / norm));
+        let scale = row.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let eps = 1e-6 * (1.0 + scale);
+        shifted.clear();
+        shifted.extend(row.iter().zip(&unit).map(|(p, e)| p + eps * e));
+        level.grads.constant_gradient(&shifted, &mut ap);
+        shifted.clear();
+        shifted.extend(row.iter().zip(&unit).map(|(p, e)| p - eps * e));
+        level.grads.constant_gradient(&shifted, &mut am);
+        let sw = wi.sqrt();
+        r.push(sw * d);
+        let mut jr = Vec::with_capacity(k);
+        for j in 0..k {
+            let h = (ap[j] - am[j]) / (2.0 * eps);
+            jr.push(sw / norm * (a[j] - d * h));
+        }
+        jac.push(jr);
+    }
+    Some((r, jac))
+}
+
 /// Fit the constants of `tree` to minimise `Σ wᵢ·(f(pᵢ)/||∇f(pᵢ)||)²`.
 ///
 /// This is the constant-fitting companion of the implicit-derivative metric:
 /// the same signed geometric residual the metric measures, squared so that the
 /// existing Levenberg–Marquardt idea applies. The Jacobian with respect to the
-/// constants is obtained by central differences of that residual (one perturbed
-/// evaluation per side per constant), which also covers the derivative of
-/// `||∇f||` without a second-order adjoint.
+/// constants comes from [`directional_jacobian`]: three sweeps per row, whatever
+/// the number of constants, with the derivative of `||∇f||` covered by a
+/// directional difference instead of a second-order adjoint.
 ///
 /// The fit is scale-free: multiplying the whole expression by a constant does
 /// not change the residual, so the fitter does not shrink the level set to the
@@ -325,6 +406,20 @@ fn rss_of(tree: &Node, x: &[Vec<f64>], w: &[f64]) -> f64 {
 ///
 /// Returns the final sum of squared geometric residuals.
 pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
+    fit_with(tree, x, w, iters, directional_jacobian)
+}
+
+/// Residuals and their Jacobian with respect to the constants, at `c`.
+type Jacobian =
+    fn(&mut Level, &[f64], &[Vec<f64>], &[f64]) -> Option<(Vec<f64>, Vec<Vec<f64>>)>;
+
+fn fit_with(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    w: &[f64],
+    iters: usize,
+    jacobian: Jacobian,
+) -> f64 {
     if x.is_empty() {
         return f64::INFINITY;
     }
@@ -351,39 +446,13 @@ pub fn fit(tree: &mut Node, x: &[Vec<f64>], w: &[f64], iters: usize) -> f64 {
     let n = x.len();
 
     for _ in 0..iters.max(1) {
-        let r = match level.residuals(&c, x, w) {
-            Some(r) => r,
+        // A row that is undefined under a perturbation gives no usable step:
+        // stop rather than fit a discontinuous model.
+        let (r, jac) = match jacobian(&mut level, &c, x, w) {
+            Some(v) => v,
             None => break,
         };
-        // Central-difference Jacobian of the geometric residual w.r.t. each
-        // constant. A row that is undefined under a perturbation gives no
-        // usable step: stop rather than fit a discontinuous model.
-        let mut jac = vec![vec![0.0; k]; n];
         let mut ok = true;
-        for j in 0..k {
-            let h = 1e-6 * (1.0 + c[j].abs());
-            let mut cp = c.clone();
-            let mut cm = c.clone();
-            cp[j] += h;
-            cm[j] -= h;
-            match (
-                level.residuals(&cp, x, w),
-                level.residuals(&cm, x, w),
-            ) {
-                (Some(rp), Some(rm)) => {
-                    for i in 0..n {
-                        jac[i][j] = (rp[i] - rm[i]) / (2.0 * h);
-                    }
-                }
-                _ => {
-                    ok = false;
-                    break;
-                }
-            }
-        }
-        if !ok {
-            break;
-        }
         let mut jtj = vec![vec![0.0; k]; k];
         let mut jtr = vec![0.0; k];
         for i in 0..n {
@@ -641,7 +710,7 @@ mod tests {
             }
             for iters in [0, 1, 8, 20] {
                 let mut t = tree.clone();
-                fnv(&mut h, fit(&mut t, &x, &w, iters));
+                fnv(&mut h, fit_with(&mut t, &x, &w, iters, central_jacobian));
                 for c in constants(&t) {
                     fnv(&mut h, c);
                 }
@@ -698,5 +767,205 @@ mod tests {
         }
         let fit_ms = t1.elapsed().as_secs_f64() * 1e3 / reps as f64;
         println!("TIMING score_ms={score_ms:.3} fit20_ms={fit_ms:.3} acc={acc:e} c={last:?}");
+    }
+
+    /// Central differences of the signed residual, `h = 1e-6·(1 + |cⱼ|)`.
+    fn central_jacobian(
+        level: &mut Level,
+        c: &[f64],
+        x: &[Vec<f64>],
+        w: &[f64],
+    ) -> Option<(Vec<f64>, Vec<Vec<f64>>)> {
+        let r = level.residuals(c, x, w)?;
+        let k = c.len();
+        let mut jac = vec![vec![0.0; k]; x.len()];
+        for j in 0..k {
+            let h = 1e-6 * (1.0 + c[j].abs());
+            let mut cp = c.to_vec();
+            let mut cm = c.to_vec();
+            cp[j] += h;
+            cm[j] -= h;
+            let rp = level.residuals(&cp, x, w)?;
+            let rm = level.residuals(&cm, x, w)?;
+            for i in 0..x.len() {
+                jac[i][j] = (rp[i] - rm[i]) / (2.0 * h);
+            }
+        }
+        Some((r, jac))
+    }
+
+    /// Double-double arithmetic (about 32 significant digits) for the
+    /// reference Jacobian.
+    #[derive(Clone, Copy)]
+    struct Dd(f64, f64);
+
+    impl Dd {
+        fn from(v: f64) -> Dd {
+            Dd(v, 0.0)
+        }
+        fn two_sum(a: f64, b: f64) -> Dd {
+            let s = a + b;
+            let bb = s - a;
+            Dd(s, (a - (s - bb)) + (b - bb))
+        }
+        fn add(self, o: Dd) -> Dd {
+            let s = Dd::two_sum(self.0, o.0);
+            let t = Dd::two_sum(self.1, o.1);
+            let u = Dd::two_sum(s.0, s.1 + t.0);
+            Dd::two_sum(u.0, u.1 + t.1)
+        }
+        fn neg(self) -> Dd {
+            Dd(-self.0, -self.1)
+        }
+        fn sub(self, o: Dd) -> Dd {
+            self.add(o.neg())
+        }
+        fn mul(self, o: Dd) -> Dd {
+            let p = self.0 * o.0;
+            let e = self.0.mul_add(o.0, -p);
+            let e = e + (self.0 * o.1 + self.1 * o.0);
+            Dd::two_sum(p, e)
+        }
+        fn div(self, o: Dd) -> Dd {
+            let q1 = self.0 / o.0;
+            let r = self.sub(o.mul(Dd::from(q1)));
+            let q2 = r.0 / o.0;
+            let r = r.sub(o.mul(Dd::from(q2)));
+            let q3 = r.0 / o.0;
+            Dd::two_sum(q1, q2).add(Dd::from(q3))
+        }
+        fn sqrt(self) -> Dd {
+            let s = self.0.sqrt();
+            let r = self.sub(Dd::from(s).mul(Dd::from(s)));
+            Dd::two_sum(s, r.0 / (2.0 * s))
+        }
+    }
+
+    /// Signed distance `f / ||∇f||` in double-double for the two reference
+    /// models: shifted circle `(x-c0)² + (y-c1)² - c2` and ellipse
+    /// `c0·x² + c1·y² + c2·x·y - c3`.
+    fn reference_residual(model: usize, c: &[Dd], p: &[f64]) -> Dd {
+        let (x, y) = (Dd::from(p[0]), Dd::from(p[1]));
+        let two = Dd::from(2.0);
+        let (f, fx, fy) = if model == 0 {
+            let dx = x.sub(c[0]);
+            let dy = y.sub(c[1]);
+            (
+                dx.mul(dx).add(dy.mul(dy)).sub(c[2]),
+                two.mul(dx),
+                two.mul(dy),
+            )
+        } else {
+            (
+                c[0].mul(x.mul(x))
+                    .add(c[1].mul(y.mul(y)))
+                    .add(c[2].mul(x.mul(y)))
+                    .sub(c[3]),
+                two.mul(c[0]).mul(x).add(c[2].mul(y)),
+                two.mul(c[1]).mul(y).add(c[2].mul(x)),
+            )
+        };
+        f.div(fx.mul(fx).add(fy.mul(fy)).sqrt())
+    }
+
+    fn reference_jacobian(model: usize, c: &[f64], x: &[Vec<f64>]) -> Vec<Vec<f64>> {
+        let k = c.len();
+        x.iter()
+            .map(|p| {
+                (0..k)
+                    .map(|j| {
+                        let h = 1e-10 * (1.0 + c[j].abs());
+                        let mut cp: Vec<Dd> = c.iter().map(|&v| Dd::from(v)).collect();
+                        let mut cm = cp.clone();
+                        cp[j] = cp[j].add(Dd::from(h));
+                        cm[j] = cm[j].sub(Dd::from(h));
+                        let d = reference_residual(model, &cp, p)
+                            .sub(reference_residual(model, &cm, p));
+                        let q = d.div(Dd::from(2.0 * h));
+                        q.0 + q.1
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Largest `|J - Jref|` over the largest `|Jref|` of the same column.
+    fn max_column_error(j: &[Vec<f64>], reference: &[Vec<f64>]) -> f64 {
+        let k = reference[0].len();
+        let mut worst = 0.0_f64;
+        for col in 0..k {
+            let scale = reference.iter().fold(0.0_f64, |m, r| m.max(r[col].abs()));
+            for (row, rref) in j.iter().zip(reference) {
+                worst = worst.max((row[col] - rref[col]).abs() / scale);
+            }
+        }
+        worst
+    }
+
+    #[test]
+    fn directional_jacobian_matches_central_differences_and_the_reference() {
+        let shifted = |c: f64, i: usize| {
+            node(Op::Square, vec![node(Op::Sub, vec![input(i), constant(c)])])
+        };
+        let mul = |c: f64, t: Node| node(Op::Mul, vec![constant(c), t]);
+        let ellipse = node(
+            Op::Sub,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Add, vec![mul(0.3, sq(0)), mul(0.9, sq(1))]),
+                        mul(0.2, node(Op::Mul, vec![input(0), input(1)])),
+                    ],
+                ),
+                constant(1.0),
+            ],
+        );
+        let cases = vec![
+            (
+                0,
+                weighted_sum(vec![shifted(0.8, 0), shifted(0.3, 1)], 3.5),
+                vec![0.8, 0.3, 3.5],
+                ellipse_rows(1000, 1.0, 0.0, 2.0, 2.0, 11),
+            ),
+            (
+                1,
+                ellipse,
+                vec![0.3, 0.9, 0.2, 1.0],
+                ellipse_rows(1000, 0.0, 0.0, 1.8, 1.0, 12),
+            ),
+        ];
+        for (model, tree, c, x) in cases {
+            let mut level = Level::new(&tree);
+            let (r, jd) = directional_jacobian(&mut level, &c, &x, &[]).unwrap();
+            let (rc, jc) = central_jacobian(&mut level, &c, &x, &[]).unwrap();
+            for (a, b) in r.iter().zip(&rc) {
+                assert_eq!(a.to_bits(), b.to_bits(), "residuals share one expression");
+            }
+            let reference = reference_jacobian(model, &c, &x);
+            let ed = max_column_error(&jd, &reference);
+            let ec = max_column_error(&jc, &reference);
+            let ed_c = max_column_error(&jd, &jc);
+            println!("JACOBIAN model={model} directional={ed:e} central={ec:e} directional_vs_central={ed_c:e}");
+            assert!(ed <= 1e-6, "directional error {ed}");
+            assert!(ed_c <= 1e-6, "directional vs central {ed_c}");
+        }
+    }
+
+    #[test]
+    fn directional_fit_recovers_the_shifted_circle() {
+        let x = ellipse_rows(400, 1.0, 0.0, 2.0, 2.0, 5);
+        let mut t = weighted_sum(
+            vec![
+                node(Op::Square, vec![node(Op::Sub, vec![input(0), constant(0.5)])]),
+                node(Op::Square, vec![node(Op::Sub, vec![input(1), constant(0.5)])]),
+            ],
+            2.0,
+        );
+        fit(&mut t, &x, &[], 20);
+        let c = constants(&t);
+        assert!((c[0] - 1.0).abs() < 1e-3, "centre x = {}", c[0]);
+        assert!(c[1].abs() < 1e-3, "centre y = {}", c[1]);
+        assert!((c[2] - 4.0).abs() < 2e-2, "r^2 = {}", c[2]);
     }
 }

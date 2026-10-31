@@ -4016,6 +4016,7 @@ pub(crate) struct InputGradients {
     v: Vec<f64>,
     adj: Vec<f64>,
     grad: Vec<f64>,
+    cgrad: Vec<f64>,
 }
 
 impl InputGradients {
@@ -4034,6 +4035,7 @@ impl InputGradients {
             v: vec![0.0; n],
             adj: vec![0.0; n],
             grad: Vec::new(),
+            cgrad: Vec::new(),
         }
     }
 
@@ -4050,6 +4052,39 @@ impl InputGradients {
         self.grad.resize(x.len(), 0.0);
         eval_row(&self.f, x, &self.c, &mut self.v);
         backward_impl(&self.f, &self.v, &mut self.adj, None, Some(&mut self.grad));
+        &self.grad
+    }
+
+    /// `∂f/∂cⱼ` at `x` for the tree's own constants (pre-order), written to
+    /// `out`; one forward and one backward sweep.
+    pub(crate) fn constant_gradient(&mut self, x: &[f64], out: &mut [f64]) {
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, Some(&mut self.cgrad), None);
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+    }
+
+    /// [`Self::gradient`] and [`Self::constant_gradient`] from one sweep: returns
+    /// `∇f` and writes `∂f/∂cⱼ` to `out`.
+    pub(crate) fn both_gradients(&mut self, x: &[f64], out: &mut [f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(
+            &self.f,
+            &self.v,
+            &mut self.adj,
+            Some(&mut self.cgrad),
+            Some(&mut self.grad),
+        );
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
         &self.grad
     }
 }
