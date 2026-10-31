@@ -149,3 +149,37 @@ fn cli_random_split_with_enough_rows_runs_on_adjacent_pairs() {
     assert!(!text.contains("among 300 training row(s)") || !text.contains("299 adjacent"), "{text}");
 }
 
+
+fn refused(extra: &[&str], target: &str, csv: &str) -> String {
+    let mut args = slope_args("random");
+    args.extend_from_slice(extra);
+    let i = args.iter().position(|a| *a == "y").unwrap();
+    args[i] = target;
+    let out = run(&args, csv);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn cli_bootstrap_resamples_refuse_slope() {
+    let err = refused(&["--bootstrap-error", "5"], "y", &csv(400));
+    assert!(err.contains("slope") && err.contains("--bootstrap-error"), "{err}");
+}
+
+#[test]
+fn cli_stability_and_cv_refuse_slope() {
+    let err = refused(&["--stability", "3"], "y", &csv(400));
+    assert!(err.contains("--stability"), "{err}");
+    let err = refused(&["--cv", "kfold"], "y", &csv(400));
+    assert!(err.contains("--cv"), "{err}");
+}
+
+#[test]
+fn cli_multi_output_refuses_slope() {
+    let mut s = String::from("t,x,y,z\n");
+    for i in 0..400 {
+        s.push_str(&format!("{i},{i},{},{}\n", i as f64, 2.0 * i as f64));
+    }
+    let err = refused(&[], "y,z", &s);
+    assert!(err.contains("--metric slope"), "{err}");
+}

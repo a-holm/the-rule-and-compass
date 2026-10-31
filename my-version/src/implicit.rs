@@ -702,6 +702,7 @@ mod tests {
                 y: vec![0.0; x.len()],
                 w: w.clone(),
                 ys: Vec::new(),
+                pairs: None,
             };
             for m in [Metric::ImplicitDerivative, Metric::ImplicitResidual] {
                 fnv(&mut h, score(&tree, &s, m));
@@ -733,7 +734,7 @@ mod tests {
         let mut t = before.clone();
         let score = fit::fit_weighted_metric(&mut t, &x, &y, &[], 20, Metric::ImplicitDerivative);
         assert!(score.is_finite(), "score = {score}");
-        let s = Sample { x: x.clone(), y, w: Vec::new(), ys: Vec::new() };
+        let s = Sample { x: x.clone(), y, w: Vec::new(), ys: Vec::new(), pairs: None };
         assert!(score < super::score(&before, &s, Metric::ImplicitDerivative));
         let c = -expr::eval(&t, &[0.0, 0.0]);
         assert!((c - 1.0).abs() < 0.01, "radius squared = {c}");
@@ -751,7 +752,7 @@ mod tests {
             ],
             2.0,
         );
-        let s = Sample { x: x.clone(), y: vec![0.0; x.len()], w: Vec::new(), ys: Vec::new() };
+        let s = Sample { x: x.clone(), y: vec![0.0; x.len()], w: Vec::new(), ys: Vec::new(), pairs: None };
         let reps = 20;
         let t0 = std::time::Instant::now();
         let mut acc = 0.0;

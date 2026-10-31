@@ -2811,6 +2811,19 @@ fn main() {
         eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
         std::process::exit(EXIT_USAGE);
     }
+    if cfg.metric == Metric::Slope {
+        for (present, flag) in [
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (cv_mode.is_some(), "--cv"),
+        ] {
+            if present {
+                eprintln!("error: --metric slope cannot be combined with {}", flag);
+                eprintln!("  slope differences rows that are adjacent in the data order; resampled or refolded rows have no such order");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
     if implicit_mode && bootstrap_resamples > 0 {
         eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
         eprintln!("  the bootstrap refits constants on |f|, not on the geometric residual");
@@ -3159,6 +3172,7 @@ fn main() {
             (require_validation, "--require-validation"),
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
+            (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
