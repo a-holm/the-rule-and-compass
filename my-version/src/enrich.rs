@@ -43,6 +43,7 @@ use crate::ohlcv::{
     civil_from_days, join_causal, resample, weekday, Bar, Timeframe,
 };
 use crate::store::{self, AppendColumn, DType, FileStore};
+use crate::window_stats::{self, WinStats};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::{BufWriter, Read, Write};
@@ -616,14 +617,10 @@ pub fn declared_parity_tier(name: &str, family: &str) -> &'static str {
 /// `1e-12`: anything that evaluates `ln`, `sin` or `cos` (CUDA and the host
 /// libm differ in the last bit), anything derived from the 1-bar log return,
 /// and the MTF `vol` leaf. `bitwise`: elementwise geometry, min/max, lags of
-/// exact values, ranks, and recurrences evaluated in the CPU order. `1e-6`:
-/// `ou_hl96` only; its AR(1) coefficient comes from a difference of window
-/// sums of last-bit-noisy log values and enters `ln(phi)`, which amplifies
-/// the last-bit logarithm difference far beyond 1e-12.
+/// exact values, ranks, rolling means and standard deviations (the compensated
+/// window sums of `window_stats` run the same operations on both sides), and
+/// recurrences evaluated in the CPU order.
 fn engine_device_tier(name: &str) -> &'static str {
-    if name == "ou_hl96" {
-        return "1e-6";
-    }
     let numeric = |s: Option<&str>| s.map_or(false, |r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()));
     let log_based = numeric(name.strip_prefix('r'))
         || numeric(name.strip_prefix("vol"))
@@ -636,7 +633,7 @@ fn engine_device_tier(name: &str) -> &'static str {
         || (is_mtf(name) && name.ends_with("_vol"))
         || matches!(
             name,
-            "ret1" | "ret5" | "vz96" | "vol_z96" | "acf1" | "vr4" | "rskew96"
+            "ret1" | "ret5" | "vz96" | "vol_z96" | "acf1" | "vr4" | "rskew96" | "ou_hl96"
                 | "jump_share" | "semivar_asym" | "cusum_abs_z" | "rmean5" | "rstd5"
         );
     if log_based {
@@ -2827,50 +2824,21 @@ fn contig(times: &[i64], i: usize, w: usize, step: i64) -> bool {
     times[i + 1 - w] == times[i] - (w as i64 - 1) * step
 }
 
-/// Causal prefix sums for a rolling mean/std. Non-finite cells are skipped and
-/// counted as missing, so a window with any missing cell is invalid.
-struct Prefix {
-    sum: Vec<f64>,
-    sum2: Vec<f64>,
-    count: Vec<usize>,
-}
+/// Causal window statistics for a rolling mean/std. Non-finite cells are
+/// skipped and counted as missing, so a window with any missing cell is
+/// invalid for the strict accessors. Sums are block-local compensated
+/// (`window_stats`), so a window depends only on its own rows to rounding.
+struct Prefix<'a>(WinStats<'a>);
 
-impl Prefix {
-    fn new(x: &[f64]) -> Self {
-        let mut sum = Vec::with_capacity(x.len() + 1);
-        let mut sum2 = Vec::with_capacity(x.len() + 1);
-        let mut count = Vec::with_capacity(x.len() + 1);
-        sum.push(0.0);
-        sum2.push(0.0);
-        count.push(0);
-        let (mut s, mut s2, mut c) = (0.0, 0.0, 0usize);
-        for &v in x {
-            if v.is_finite() {
-                s += v;
-                s2 += v * v;
-                c += 1;
-            }
-            sum.push(s);
-            sum2.push(s2);
-            count.push(c);
-        }
-        Prefix { sum, sum2, count }
+impl<'a> Prefix<'a> {
+    fn new(x: &'a [f64], times: &[i64], step: i64) -> Self {
+        Prefix(WinStats::new(x, times, step))
     }
     fn mean(&self, i: usize, w: usize) -> Option<f64> {
-        if i + 1 < w {
-            return None;
-        }
-        let lo = i + 1 - w;
-        if self.count[i + 1] - self.count[lo] < w {
-            return None;
-        }
-        Some((self.sum[i + 1] - self.sum[lo]) / w as f64)
+        self.0.mean_strict(i, w)
     }
     fn std(&self, i: usize, w: usize) -> Option<f64> {
-        let m = self.mean(i, w)?;
-        let lo = i + 1 - w;
-        let s2 = (self.sum2[i + 1] - self.sum2[lo]) / w as f64;
-        Some((s2 - m * m).max(0.0).sqrt())
+        self.0.std_pop(i, w)
     }
 }
 
@@ -2976,15 +2944,13 @@ fn rmean_py(x: &[f64], w: usize, times: &[i64], step: i64) -> Vec<f64> {
     if w == 0 || n < w {
         return out;
     }
-    let p = Prefix::new(x);
+    let p = WinStats::new(x, times, step);
     for i in w - 1..n {
         if !contig(times, i, w, step) {
             continue;
         }
-        let lo = i + 1 - w;
-        let cnt = p.count[i + 1] - p.count[lo];
-        if cnt > 0 {
-            out[i] = (p.sum[i + 1] - p.sum[lo]) / cnt as f64;
+        if let Some(m) = p.mean_finite(i, w) {
+            out[i] = m;
         }
     }
     out
@@ -2996,19 +2962,14 @@ fn rstd_py(x: &[f64], w: usize, times: &[i64], step: i64) -> Vec<f64> {
     if w == 0 || n < w {
         return out;
     }
-    let p = Prefix::new(x);
+    let p = WinStats::new(x, times, step);
     for i in w - 1..n {
         if !contig(times, i, w, step) {
             continue;
         }
-        let lo = i + 1 - w;
-        let cnt = p.count[i + 1] - p.count[lo];
-        if cnt < w {
-            continue;
+        if let Some(v) = p.std_pop(i, w) {
+            out[i] = v;
         }
-        let m = (p.sum[i + 1] - p.sum[lo]) / w as f64;
-        let s2 = (p.sum2[i + 1] - p.sum2[lo]) / w as f64;
-        out[i] = (s2 - m * m).max(0.0).sqrt();
     }
     out
 }
@@ -3071,7 +3032,7 @@ impl Base {
 }
 
 fn ma_ratio(s: &Series, w: usize) -> Vec<f64> {
-    let p = Prefix::new(&s.close);
+    let p = Prefix::new(&s.close, &s.times, s.step);
     let mut out = vec![f64::NAN; s.len()];
     for i in 0..s.len() {
         if !contig(&s.times, i, w, s.step) {
@@ -3087,7 +3048,7 @@ fn ma_ratio(s: &Series, w: usize) -> Vec<f64> {
 }
 
 fn vol_w(s: &Series, b: &Base, w: usize) -> Vec<f64> {
-    let p = Prefix::new(&b.ret1);
+    let p = Prefix::new(&b.ret1, &s.times, s.step);
     let mut out = vec![f64::NAN; s.len()];
     for i in w..s.len() {
         if !contig(&s.times, i, w, s.step) {
@@ -3101,7 +3062,7 @@ fn vol_w(s: &Series, b: &Base, w: usize) -> Vec<f64> {
 }
 
 fn bb_width(s: &Series, w: usize) -> Vec<f64> {
-    let p = Prefix::new(&s.close);
+    let p = Prefix::new(&s.close, &s.times, s.step);
     let mut out = vec![f64::NAN; s.len()];
     for i in 0..s.len() {
         if !contig(&s.times, i, w, s.step) {
@@ -3122,7 +3083,7 @@ fn vz(s: &Series, w: usize) -> Vec<f64> {
         .iter()
         .map(|v| if *v >= 0.0 { (1.0 + v).ln() } else { f64::NAN })
         .collect();
-    let p = Prefix::new(&x);
+    let p = Prefix::new(&x, &s.times, s.step);
     let mut out = vec![f64::NAN; s.len()];
     for i in 0..s.len() {
         if !contig(&s.times, i, w, s.step) {
@@ -3368,7 +3329,7 @@ fn mtf_range_pct(h: &Series) -> Vec<f64> {
 }
 
 fn mtf_trend_slope(h: &Series) -> Vec<f64> {
-    let p = Prefix::new(&h.close);
+    let p = Prefix::new(&h.close, &h.times, h.step);
     let mut out = vec![f64::NAN; h.len()];
     for i in 39..h.len() {
         if !contig(&h.times, i, 40, h.step) {
@@ -4315,16 +4276,14 @@ fn rmean_strict(x: &[f64], w: usize, times: &[i64], step: i64) -> Vec<f64> {
     if w == 0 || n < w {
         return out;
     }
-    let p = Prefix::new(x);
+    let p = WinStats::new(x, times, step);
     for i in w - 1..n {
         if !contig(times, i, w, step) {
             continue;
         }
-        let lo = i + 1 - w;
-        if p.count[i + 1] - p.count[lo] != w {
-            continue;
+        if let Some(m) = p.mean_strict(i, w) {
+            out[i] = m;
         }
-        out[i] = (p.sum[i + 1] - p.sum[lo]) / w as f64;
     }
     out
 }
@@ -4883,29 +4842,19 @@ fn compact_all(s: &Series, b: &Base, cross: &Cross) -> BTreeMap<String, Vec<f64>
 
     // Exotic statistical family.
     let x: Vec<f64> = (0..n)
-        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { c[i].ln() - ma96[i].ln() } else { f64::NAN })
+        .map(|i| if c[i] > 0.0 && ma96[i] > 0.0 { window_stats::log1p_det((c[i] - ma96[i]) / ma96[i]) } else { f64::NAN })
         .collect();
     let xl = rlag(&x, 1, times, step);
-    let xxl: Vec<f64> = x.iter().zip(&xl).map(|(a, b)| a * b).collect();
-    let xl2: Vec<f64> = xl.iter().map(|a| a * a).collect();
-    let xxl96 = rmean_py(&xxl, 96, times, step);
-    let x96 = rmean_py(&x, 96, times, step);
-    let xl96 = rmean_py(&xl, 96, times, step);
-    let xl2_96 = rmean_py(&xl2, 96, times, step);
+    let ou_ratio = window_stats::comoment_ratio(&x, &xl, 96, times, step);
     out.insert(
         "ou_hl96".to_string(),
-        (0..n)
-            .map(|i| {
-                if xxl96[i].is_finite() && x96[i].is_finite() && xl96[i].is_finite() && xl2_96[i].is_finite() {
-                    let cov = xxl96[i] - x96[i] * xl96[i];
-                    let var = xl2_96[i] - xl96[i] * xl96[i];
-                    if var > 0.0 {
-                        let phi = (cov / var).max(1e-6).min(0.999999);
-                        let hl = -std::f64::consts::LN_2 / phi.ln();
-                        (1.0 + hl.max(0.0).min(1000.0)).ln()
-                    } else {
-                        f64::NAN
-                    }
+        ou_ratio
+            .iter()
+            .map(|r| {
+                if r.is_finite() {
+                    let phi = r.max(1e-6).min(0.999999);
+                    let hl = -std::f64::consts::LN_2 / phi.ln();
+                    (1.0 + hl.max(0.0).min(1000.0)).ln()
                 } else {
                     f64::NAN
                 }
@@ -6185,7 +6134,7 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
         return gpu.ret(k);
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        return gpu.ma(w);
+        return gpu.ma(w, ma_window_policy(name));
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
         return gpu.vol(w);
@@ -6253,6 +6202,18 @@ fn gpu_feature(name: &str, gpu: &mut crate::enrich_gpu::EnrichGpu) -> Option<Vec
     }
 }
 
+/// NaN policy of the device `maN` mean: `ma96` and `ma672` average the finite
+/// closes of the window like the compact reference; the catalogue `maN`
+/// columns need a full window.
+#[cfg(feature = "cuda")]
+fn ma_window_policy(name: &str) -> i32 {
+    if matches!(name, "ma96" | "ma672") {
+        window_stats::MEAN_FINITE
+    } else {
+        window_stats::MEAN_STRICT
+    }
+}
+
 /// #300: the same dispatch as [`gpu_feature`], as a descriptor for the batched
 /// output arena. `None` means the name has no single-slot batch kernel.
 #[cfg(feature = "cuda")]
@@ -6262,7 +6223,7 @@ fn gpu_batch_op(name: &str) -> Option<crate::enrich_gpu::BatchOp> {
         return Some(BatchOp::ret(k));
     }
     if let Some(w) = name.strip_prefix("ma").and_then(|s| s.parse::<usize>().ok()) {
-        return Some(BatchOp::ma(w));
+        return Some(BatchOp::ma(w, ma_window_policy(name)));
     }
     if let Some(w) = name.strip_prefix("vol").and_then(|s| s.parse::<usize>().ok()) {
         return Some(BatchOp::vol(w));

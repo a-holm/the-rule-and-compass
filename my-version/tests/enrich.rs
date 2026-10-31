@@ -1200,6 +1200,11 @@ fn flow_family_requires_raw_fields_and_unknown_names_fail() {
     assert!(enrich::expand("flow_not_a_feature").is_err());
 }
 
+/// The Python builder takes rolling sums from whole-array cumulative sums, which
+/// lose about nine digits on the longest windows, so the tolerance is 1e-8; the
+/// engine windows are accurate to rounding (`tests/window_stats.rs`).
+const PARITY_TOL: f64 = 1e-8;
+
 /// Parity against the independent Python compact builder on a contiguous 15 m
 /// slice. The expected file holds the compact values for the last 300 hourly
 /// rows of two symbols (AAVEUSDT and BTCUSDT). Rows before index 3000 are
@@ -1252,7 +1257,7 @@ fn compact_matches_the_python_builder_on_a_contiguous_slice() {
             }
             worst_rel = worst_rel.max(r);
             assert!(
-                a <= 1e-10 || r <= 1e-10,
+                a <= PARITY_TOL || r <= PARITY_TOL,
                 "{name} at {sym}/{ts}: got {got}, expected {expected}, abs {a:e} rel {r:e}"
             );
             compared += 1;

@@ -73,4 +73,5 @@ pub mod target; // #254: declared target spec
 pub mod trading_gpu; // #304/#305: fused long-only P&L, exact threshold and shared mask
 pub mod units;
 pub mod walkforward;
+pub mod window_stats;
 pub mod zip; // #123: minimal stored/deflate ZIP reader

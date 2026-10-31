@@ -64,7 +64,7 @@ extern "C" {
     fn rc_enrich_range(ctx: *mut Raw, out: *mut f64) -> c_int;
     fn rc_enrich_clv(ctx: *mut Raw, out: *mut f64) -> c_int;
     fn rc_enrich_calendar(ctx: *mut Raw, which: c_int, out: *mut f64) -> c_int;
-    fn rc_enrich_ma(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
+    fn rc_enrich_ma(ctx: *mut Raw, w: c_int, mode: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_vol(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_bb_width(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
     fn rc_enrich_vz(ctx: *mut Raw, w: c_int, out: *mut f64) -> c_int;
@@ -176,8 +176,8 @@ impl BatchOp {
     pub fn calendar(which: usize) -> Self {
         Self { kind: 5, a: which as c_int, b: 0, c: 0, param: 0.0 }
     }
-    pub fn ma(w: usize) -> Self {
-        Self { kind: 6, a: w as c_int, b: 0, c: 0, param: 0.0 }
+    pub fn ma(w: usize, mode: i32) -> Self {
+        Self { kind: 6, a: w as c_int, b: mode as c_int, c: 0, param: 0.0 }
     }
     pub fn vol(w: usize) -> Self {
         Self { kind: 7, a: w as c_int, b: 0, c: 0, param: 0.0 }
@@ -688,9 +688,9 @@ impl EnrichGpu {
         self.one(|p| unsafe { rc_enrich_calendar(ctx, which as c_int, p) })
     }
 
-    pub fn ma(&mut self, w: usize) -> Option<Vec<f64>> {
+    pub fn ma(&mut self, w: usize, mode: i32) -> Option<Vec<f64>> {
         let ctx = self.ctx;
-        self.one(|p| unsafe { rc_enrich_ma(ctx, w as c_int, p) })
+        self.one(|p| unsafe { rc_enrich_ma(ctx, w as c_int, mode as c_int, p) })
     }
 
     pub fn vol(&mut self, w: usize) -> Option<Vec<f64>> {
