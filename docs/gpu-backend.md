@@ -1313,6 +1313,8 @@ archive still wait at the generation barrier, so all errors, the archive hash
 and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
 synchronous schedule.
 
+**Zero diagonal (#399).** `ft_solve` freezes a slot whose normal-equation diagonal is exactly `0.0` on every arm. A constant with a zero adjoint on all active rows cannot move the prediction, so its row and column become the identity, its right-hand side is `0` and its step is `0`. The other constants are still fitted, as the CPU ridge solve (`fit.rs::solve`, ridge `1e-12`) does. A negative or non-finite diagonal is still status `1`. `tests/gpu_fit.rs::zero_adjoint_constant_is_frozen_and_the_rest_are_fitted` pins it.
+
 ### LogSquashed on the batched kernel (issue #229)
 
 `--metric log_squashed` minimises the mean `ln(1 + r²)` — the Cauchy/Lorentzian
