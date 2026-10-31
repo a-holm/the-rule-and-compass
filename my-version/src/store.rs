@@ -1341,7 +1341,6 @@ pub fn write_store_with_time(
     group_rows: usize,
     time_col: Option<usize>,
 ) -> Result<(), String> {
-    let group_rows = group_rows.max(1);
     let n_rows = table.len();
     let n_cols = table.n_cols();
     if n_rows == 0 {
@@ -1365,11 +1364,10 @@ pub fn write_store_with_time(
         }
         None => (0..n_cols).find(|&c| table.ints(c).is_some()),
     };
-    let n_groups = (n_rows + group_rows - 1) / group_rows;
-    let mut columns: Vec<ColumnMeta> = (0..n_cols)
+    let plans: Vec<ColumnPlan> = (0..n_cols)
         .map(|c| {
             let dict = table.dict(c);
-            ColumnMeta {
+            ColumnPlan {
                 name: table.names[c].clone(),
                 numeric: table.numeric[c],
                 dtype: if Some(c) == time_col {
@@ -1381,9 +1379,84 @@ pub fn write_store_with_time(
                 },
                 levels: dict.map(|d| d.levels.clone()).unwrap_or_default(),
                 has_codes: dict.is_some(),
-                offsets: Vec::with_capacity(n_groups),
-                code_offsets: Vec::with_capacity(n_groups),
             }
+        })
+        .collect();
+    write_store_grouped(path, &plans, n_rows, group_rows, |lo, hi, out| {
+        for (c, plan) in plans.iter().enumerate() {
+            let slot = &mut out[c];
+            match plan.dtype {
+                DType::F64 => {
+                    let values = table.col(c);
+                    slot.f64s
+                        .extend((lo..hi).map(|r| values.get(r).copied().unwrap_or(f64::NAN)));
+                }
+                DType::I64 => {
+                    let ints = table.ints(c).ok_or_else(|| {
+                        format!("column '{}' has no i64 view", table.names[c])
+                    })?;
+                    slot.i64s
+                        .extend((lo..hi).map(|r| ints.get(r).copied().unwrap_or(i64::MIN)));
+                }
+                DType::U32 => {}
+            }
+            if let Some(dict) = table.dict(c) {
+                slot.codes.extend_from_slice(&dict.codes[lo..hi]);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Declared layout of one column of a store written group by group.
+#[derive(Clone, Debug)]
+pub struct ColumnPlan {
+    pub name: String,
+    pub numeric: bool,
+    pub dtype: DType,
+    /// Dictionary levels, known before the first group is produced.
+    pub levels: Vec<String>,
+    pub has_codes: bool,
+}
+
+/// One group of one column. Only the vectors the plan's dtype and `has_codes`
+/// call for are filled; the writer clears them before every group.
+#[derive(Default)]
+pub struct GroupColumn {
+    pub f64s: Vec<f64>,
+    pub i64s: Vec<i64>,
+    pub codes: Vec<u32>,
+}
+
+/// Write a version-1 store without holding the table: `produce(lo, hi, cols)`
+/// fills one group of rows `lo..hi` at a time, so peak memory is one group of
+/// every column. The bytes equal [`write_store_with_time`] for the same data.
+pub fn write_store_grouped<F>(
+    path: &str,
+    plans: &[ColumnPlan],
+    n_rows: usize,
+    group_rows: usize,
+    mut produce: F,
+) -> Result<(), String>
+where
+    F: FnMut(usize, usize, &mut [GroupColumn]) -> Result<(), String>,
+{
+    let group_rows = group_rows.max(1);
+    let n_cols = plans.len();
+    if n_rows == 0 {
+        return Err("cannot write a column store with no rows".to_string());
+    }
+    let n_groups = (n_rows + group_rows - 1) / group_rows;
+    let mut columns: Vec<ColumnMeta> = plans
+        .iter()
+        .map(|p| ColumnMeta {
+            name: p.name.clone(),
+            numeric: p.numeric,
+            dtype: p.dtype,
+            levels: p.levels.clone(),
+            has_codes: p.has_codes,
+            offsets: Vec::with_capacity(n_groups),
+            code_offsets: Vec::with_capacity(n_groups),
         })
         .collect();
     // Offsets are relative to the data section, so the header length does not
@@ -1400,7 +1473,6 @@ pub fn write_store_with_time(
             }
         }
     }
-    let dtypes: Vec<DType> = columns.iter().map(|c| c.dtype).collect();
     let header = Header {
         version: VERSION,
         n_rows,
@@ -1421,27 +1493,32 @@ pub fn write_store_with_time(
 
     // Values and codes are emitted group by group, column by column, in the
     // order the offsets describe.
+    let mut cols: Vec<GroupColumn> = (0..n_cols).map(|_| GroupColumn::default()).collect();
     let mut bytes: Vec<u8> = Vec::new();
     for g in 0..n_groups {
         let lo = g * group_rows;
         let hi = (lo + group_rows).min(n_rows);
-        for c in 0..n_cols {
+        for c in cols.iter_mut() {
+            c.f64s.clear();
+            c.i64s.clear();
+            c.codes.clear();
+        }
+        produce(lo, hi, &mut cols)?;
+        for (c, plan) in plans.iter().enumerate() {
             bytes.clear();
-            bytes.reserve((hi - lo) * 8);
-            match dtypes[c] {
+            match plan.dtype {
                 DType::F64 => {
-                    let values = table.col(c);
-                    for r in lo..hi {
-                        let v = values.get(r).copied().unwrap_or(f64::NAN);
+                    check_group_len(plan, cols[c].f64s.len(), hi - lo)?;
+                    bytes.reserve((hi - lo) * 8);
+                    for v in &cols[c].f64s {
                         bytes.extend_from_slice(&v.to_le_bytes());
                     }
                 }
                 DType::I64 => {
-                    let ints = table.ints(c).ok_or_else(|| {
-                        format!("column '{}' has no i64 view", table.names[c])
-                    })?;
-                    for r in lo..hi {
-                        bytes.extend_from_slice(&ints.get(r).copied().unwrap_or(i64::MIN).to_le_bytes());
+                    check_group_len(plan, cols[c].i64s.len(), hi - lo)?;
+                    bytes.reserve((hi - lo) * 8);
+                    for v in &cols[c].i64s {
+                        bytes.extend_from_slice(&v.to_le_bytes());
                     }
                 }
                 // Text/categorical: no value block, codes below.
@@ -1449,13 +1526,14 @@ pub fn write_store_with_time(
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
-            let Some(dict) = table.dict(c) else {
+            if !plan.has_codes {
                 continue;
-            };
+            }
+            check_group_len(plan, cols[c].codes.len(), hi - lo)?;
             bytes.clear();
             bytes.reserve((hi - lo) * 4);
-            for r in lo..hi {
-                bytes.extend_from_slice(&dict.codes[r].to_le_bytes());
+            for v in &cols[c].codes {
+                bytes.extend_from_slice(&v.to_le_bytes());
             }
             file.write_all(&bytes)
                 .map_err(|e| format!("{}: {}", path, e))?;
@@ -1463,6 +1541,17 @@ pub fn write_store_with_time(
     }
     file.flush().map_err(|e| format!("{}: {}", path, e))?;
     Ok(())
+}
+
+fn check_group_len(plan: &ColumnPlan, got: usize, want: usize) -> Result<(), String> {
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "column '{}': producer returned {} rows for a group of {}",
+            plan.name, got, want
+        ))
+    }
 }
 
 fn group_len(n_rows: usize, group_rows: usize, group: usize) -> usize {
