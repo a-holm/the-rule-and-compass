@@ -258,6 +258,7 @@ fn walk_spec(seed: u64, device: bool) -> EvalSpec {
         policy: walkforward::Policy::Threshold,
         band_width: 0.0,
         min_hold: 1,
+        gpu: false,
     }
 }
 

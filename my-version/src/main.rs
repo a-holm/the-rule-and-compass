@@ -8592,6 +8592,12 @@ OPTIONS:
                              the threshold rule bit for bit)
   --min-hold <n>             minimum consecutive long rows before a band exit
                              (default 1; requires --policy band)
+  --gpu                      run the --policy band/cooldown scan and the --policy
+                             dp hindsight scan on the CUDA device. The result is
+                             bit-identical to the CPU scan; when the device
+                             refuses (no device, non-CUDA build, allocation),
+                             the CPU scan runs and band/hindsight_bound carry
+                             backend=cpu and fallback_reason
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -8651,6 +8657,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut policy = walkforward::Policy::Threshold;
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
+    let mut gpu = false;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -8792,6 +8799,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--gpu" => gpu = true,
             "--control-seed" => {
                 let src = need(args, i + 1, "--control-seed");
                 control_seed = match src.parse::<u64>() {
@@ -8982,6 +8990,7 @@ fn run_walkforward(args: &[String]) -> ! {
         policy,
         band_width,
         min_hold,
+        gpu,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
@@ -8990,6 +8999,18 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     };
+    for w in &report.windows {
+        let reasons = [
+            w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),
+            w.hindsight_bound.as_ref().and_then(|h| h.fallback_reason.as_deref()),
+        ];
+        for reason in reasons.into_iter().flatten() {
+            eprintln!(
+                "note: window '{}': --gpu scan ran on the CPU: {}",
+                w.window.label, reason
+            );
+        }
+    }
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
     if let Some(path) = out {
