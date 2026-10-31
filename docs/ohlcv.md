@@ -51,6 +51,8 @@ DST is computed from the US/UK rules, so a 14:30 UTC open in January becomes a
 bar outside a session, so a bar cannot silently cross a session boundary. A
 crypto daily bucket is still the UTC day.
 
+`resample_calendar` aggregates whatever bars fall in a bucket and does not require all of them, so a 1h bucket built from one to three 15m bars looks complete. The default hourly panel does not use it. `rcsr panel base` (`src/panel_v2.rs`, folding with `src/panel_prep.rs`) requires four contiguous 15m bars, records `cov15m`, and drops or flags (`PARTIAL_BUCKET`) every other hour. See [`panel.md`](panel.md#default-hourly-panel-v2-259).
+
 ## Causal multi-timeframe joins
 
 `join_causal(base, higher, higher_tf)` gives every base bar the last higher bar
