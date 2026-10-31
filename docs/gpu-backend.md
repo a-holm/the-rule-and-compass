@@ -2182,7 +2182,7 @@ Definitions that matter:
   seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
   is a telemetry defect. `fit` separates raw device kernel seconds from the
   measured exact-CPU fallback and finalist-refit seconds, with
-  `fallback_by_cause`; `eval_fallback` does the same for the evaluator's CPU
+  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels; `gpu.fit` and each `gpu.generations[]` entry carry the same fields); `eval_fallback` does the same for the evaluator's CPU
   pool. Every derived value is
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
