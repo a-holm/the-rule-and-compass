@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "cub_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -631,9 +632,10 @@ RcMtf *rc_mtf_create(const long long *times, const double *open,
 
     /* CUB scan temporary storage for the new-bucket flags. */
     c->scan_tmp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(NULL, c->scan_tmp_bytes, (int *)NULL,
-                                  (int *)NULL, n);
-    ok &= rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
+    ok &= rc_cub_status(cub::DeviceScan::ExclusiveSum(
+              NULL, c->scan_tmp_bytes, (int *)NULL, (int *)NULL, n)) ==
+          cudaSuccess;
+    ok = ok && rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
     if (!ok) {
         rc_mtf_destroy(c);
         return NULL;
@@ -716,6 +718,13 @@ void rc_mtf_last_stats(RcMtf *c, RcMtfStats *out)
     if (c && out) *out = c->last;
 }
 
+static int g_force_cub_fail = 0;
+
+extern "C" void rc_mtf_test_force_cub_fail(int on)
+{
+    g_force_cub_fail = on;
+}
+
 /* Resample to one timeframe, compute all eleven higher leaves and the join
    cursor. A later `rc_mtf_gather` is then a pure row map. */
 int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
@@ -736,9 +745,8 @@ int rc_mtf_prepare(RcMtf *c, long long tf_seconds)
     }
 
     size_t tmp = c->scan_tmp_bytes;
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, tmp, c->d_flags,
-                                  c->d_bucket_of_row, c->n);
-    err = cudaGetLastError();
+    err = RC_CUB(g_force_cub_fail, cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, tmp, c->d_flags, c->d_bucket_of_row, c->n));
     if (err != cudaSuccess) {
         c->last.failed = 1;
         stats_end(c);

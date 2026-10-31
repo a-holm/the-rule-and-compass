@@ -561,3 +561,139 @@ fn the_audit_reports_jumps_and_fails_strict_on_an_undeclared_one() {
     assert_eq!(ok.status.code(), Some(0), "a listing break after a long outage is declared by the gap");
 }
 
+
+// #301: the device resample, duplicate scan and gap tags in `panel base`.
+
+/// A market with duplicates, a conflict, a partial hour and outages.
+fn device_market(dir: &Path) -> PathBuf {
+    let (raw, _) = market(dir, 24 * 40);
+    let one = hours(10.0, 0, 48, &[], Unit::Ms);
+    let mut four = Vec::new();
+    for _ in 0..4 {
+        four.extend(one.iter().cloned());
+    }
+    put_zip(&raw, "JUVUSDT", "2021-01", &four);
+    let mut conflict = hours(20.0, 0, 30, &[7], Unit::Ms);
+    let mut twin: Vec<String> = conflict[0].split(',').map(|s| s.to_string()).collect();
+    twin[4] = "99.5".to_string();
+    twin[2] = "100".to_string();
+    twin[5] = "7".to_string();
+    conflict.insert(1, twin.join(","));
+    conflict.remove(21);
+    put_zip(&raw, "CNFUSDT", "2021-01", &conflict);
+    raw
+}
+
+fn manifest_lines(base: &Path, keys: &[&str]) -> Vec<String> {
+    let text = std::fs::read_to_string(format!("{}.manifest.json", base.display())).unwrap();
+    text.lines()
+        .filter(|l| keys.iter().any(|k| l.trim_start().starts_with(k)))
+        .map(|l| l.to_string())
+        .collect()
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn the_device_base_is_byte_identical_to_the_cpu_and_labels_its_route() {
+    use panel_v2::GpuMode;
+    let dir = scratch("dev-base");
+    let raw = device_market(&dir);
+    let sha = |p: &Path| manifest::sha256_file(p).unwrap();
+    let keys = ["\"quality\"", "\"conflicts\"", "\"invalid_ohlc\"", "\"unit_histogram\""];
+    for keep in [false, true] {
+        let tag = if keep { "keep" } else { "full" };
+        let mut off = base_opts(&raw, &dir.join(format!("off-{tag}.rcsb")));
+        off.keep_partial = keep;
+        off.gpu = GpuMode::Off;
+        let cpu = panel_v2::build_base(&off).unwrap();
+        assert_eq!(cpu.route.requested, "off");
+        assert_eq!(cpu.route.passes, 0);
+
+        let cache = dir.join(format!("cache-{tag}"));
+        let mut on = base_opts(&raw, &dir.join(format!("on-{tag}.rcsb")));
+        on.keep_partial = keep;
+        on.gpu = GpuMode::On;
+        on.resume = Some(cache.to_str().unwrap().to_string());
+        let cold = panel_v2::build_base(&on).unwrap();
+        assert_eq!(cold.route.symbols_device, cold.symbols, "{tag}: every symbol is folded on the device");
+        assert_eq!(cold.route.symbols_cpu, 0);
+        assert!(cold.route.passes >= 1 && cold.route.fallbacks.is_empty(), "{tag}: no fallback");
+        assert!(cold.route.h2d_bytes > 0 && cold.route.d2h_bytes > 0, "{tag}: bytes moved");
+        assert_eq!(sha(&dir.join(format!("off-{tag}.rcsb"))), sha(&dir.join(format!("on-{tag}.rcsb"))), "{tag}: cold store bytes");
+        assert_eq!(
+            manifest_lines(&dir.join(format!("off-{tag}.rcsb")), &keys),
+            manifest_lines(&dir.join(format!("on-{tag}.rcsb")), &keys),
+            "{tag}: ledger lines"
+        );
+
+        let mut warm_o = base_opts(&raw, &dir.join(format!("warm-{tag}.rcsb")));
+        warm_o.keep_partial = keep;
+        warm_o.gpu = GpuMode::On;
+        warm_o.resume = on.resume.clone();
+        let warm = panel_v2::build_base(&warm_o).unwrap();
+        assert_eq!(warm.reused, warm.symbols);
+        assert_eq!(warm.route.passes, 0, "{tag}: a warm run launches nothing");
+        assert_eq!(sha(&dir.join(format!("off-{tag}.rcsb"))), sha(&dir.join(format!("warm-{tag}.rcsb"))), "{tag}: warm store bytes");
+
+        // A CPU cache is valid for the device and the reverse.
+        let mut cpu_cached = base_opts(&raw, &dir.join(format!("cpucache-{tag}.rcsb")));
+        cpu_cached.keep_partial = keep;
+        cpu_cached.gpu = GpuMode::Off;
+        cpu_cached.resume = on.resume.clone();
+        let c = panel_v2::build_base(&cpu_cached).unwrap();
+        assert_eq!(c.reused, c.symbols);
+        assert_eq!(sha(&dir.join(format!("off-{tag}.rcsb"))), sha(&dir.join(format!("cpucache-{tag}.rcsb"))));
+    }
+    let on_manifest = std::fs::read_to_string(dir.join("on-full.rcsb.manifest.json")).unwrap();
+    assert!(on_manifest.contains("\"backend\":{\"requested\":\"on\""), "{on_manifest}");
+    assert!(on_manifest.contains("\"fallbacks\":[]"));
+    let off_manifest = std::fs::read_to_string(dir.join("off-full.rcsb.manifest.json")).unwrap();
+    assert!(!off_manifest.contains("\"backend\""), "--gpu off keeps today's manifest");
+}
+
+#[test]
+fn a_cpu_wave_under_auto_or_without_a_device_is_labelled_in_the_manifest() {
+    use panel_v2::GpuMode;
+    let dir = scratch("dev-label");
+    let raw = device_market(&dir);
+    let mut o = base_opts(&raw, &dir.join("auto.rcsb"));
+    o.gpu = GpuMode::Auto;
+    let s = panel_v2::build_base(&o).unwrap();
+    assert_eq!(s.route.symbols_device, 0, "a small block stays on the CPU under auto");
+    assert_eq!(s.route.symbols_cpu, s.symbols);
+    let why = &s.route.fallbacks[0].0;
+    assert!(why.starts_with("too_few_rows") || why.starts_with("no_device"), "{why}");
+    let m = std::fs::read_to_string(format!("{}.manifest.json", dir.join("auto.rcsb").display())).unwrap();
+    assert!(m.contains("\"backend\":{\"requested\":\"auto\""));
+    assert!(m.contains(&format!("\"reason\":\"{why}\"")), "the manifest names the reason");
+    let off = {
+        let mut p = base_opts(&raw, &dir.join("off.rcsb"));
+        p.gpu = GpuMode::Off;
+        panel_v2::build_base(&p).unwrap();
+        manifest::sha256_file(&dir.join("off.rcsb")).unwrap()
+    };
+    assert_eq!(off, manifest::sha256_file(&dir.join("auto.rcsb")).unwrap());
+}
+
+#[test]
+fn the_planner_names_every_reason_for_the_cpu() {
+    use panel_v2::{plan_device, GpuMode};
+    use rcsr::backend::Probe;
+    let gpu = Probe::gpu("test device".to_string());
+    let none = Probe::cpu("no CUDA device found");
+    assert_eq!(plan_device(GpuMode::Off, 10_000_000, &gpu), Err("gpu_off".to_string()));
+    assert_eq!(plan_device(GpuMode::On, 10, &gpu), Ok(()));
+    assert_eq!(plan_device(GpuMode::Auto, 1_000_000, &gpu), Ok(()));
+    assert_eq!(
+        plan_device(GpuMode::Auto, 999_999, &gpu),
+        Err("too_few_rows: 999999 < 1000000".to_string())
+    );
+    assert_eq!(
+        plan_device(GpuMode::On, 10_000_000, &none),
+        Err("no_device: no CUDA device found".to_string())
+    );
+    assert_eq!(
+        plan_device(GpuMode::Auto, 10_000_000, &none),
+        Err("no_device: no CUDA device found".to_string())
+    );
+}

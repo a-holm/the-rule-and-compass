@@ -30,6 +30,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "cub_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -738,15 +739,16 @@ RcPrep *rc_prep_create(const long long *times, const double *open,
 
     /* CUB workspaces: one stable segmented sort and one int scan buffer. */
     c->sort_tmp_bytes = 0;
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        NULL, c->sort_tmp_bytes, (long long *)NULL, (long long *)NULL,
-        (int *)NULL, (int *)NULL, n, nseg, c->d_seg_start, c->d_seg_end,
-        0, (int)(sizeof(long long) * 8));
+    ok &= rc_cub_status(cub::DeviceSegmentedRadixSort::SortPairs(
+              NULL, c->sort_tmp_bytes, (long long *)NULL, (long long *)NULL,
+              (int *)NULL, (int *)NULL, n, nseg, c->d_seg_start, c->d_seg_end,
+              0, (int)(sizeof(long long) * 8))) == cudaSuccess;
     c->scan_tmp_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(NULL, c->scan_tmp_bytes, (int *)NULL,
-                                  (int *)NULL, n);
-    ok &= rc_alloc(&c->d_sort_tmp, c->sort_tmp_bytes) == 0;
-    ok &= rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
+    ok &= rc_cub_status(cub::DeviceScan::ExclusiveSum(
+              NULL, c->scan_tmp_bytes, (int *)NULL, (int *)NULL, n)) ==
+          cudaSuccess;
+    ok = ok && rc_alloc(&c->d_sort_tmp, c->sort_tmp_bytes) == 0;
+    ok = ok && rc_alloc(&c->d_scan_tmp, c->scan_tmp_bytes) == 0;
     if (!ok) {
         rc_prep_destroy(c);
         return NULL;
@@ -877,6 +879,13 @@ void rc_prep_counts(RcPrep *c, int *n_out, int *n_conflict, int *n_unique)
     if (n_unique) *n_unique = c->n_unique;
 }
 
+static int g_force_cub_fail = 0;
+
+extern "C" void rc_prep_test_force_cub_fail(int on)
+{
+    g_force_cub_fail = on;
+}
+
 int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
                 int keep_partial, int threads)
 {
@@ -890,11 +899,10 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     const int n = c->n;
     int nb = blocks_for(n, threads);
 
-    cub::DeviceSegmentedRadixSort::SortPairs(
+    cudaError_t err = RC_CUB(g_force_cub_fail, cub::DeviceSegmentedRadixSort::SortPairs(
         c->d_sort_tmp, c->sort_tmp_bytes, c->d_time, c->d_s_time,
         c->d_iota, c->d_s_index, n, c->nseg, c->d_seg_start, c->d_seg_end,
-        0, (int)(sizeof(long long) * 8));
-    cudaError_t err = cudaGetLastError();
+        0, (int)(sizeof(long long) * 8)));
     if (err != cudaSuccess) {
         c->last.failed = 1;
         stats_end(c);
@@ -912,9 +920,8 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
         c->d_s_traded, c->d_s_chain, c->d_s_seg);
 
     rc_prep_run_flags<<<nb, threads>>>(c->d_s_time, c->d_s_seg, n, c->d_run_flags);
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, c->scan_tmp_bytes,
-                                  c->d_run_flags, c->d_run_of, n);
-    err = cudaGetLastError();
+    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, c->scan_tmp_bytes, c->d_run_flags, c->d_run_of, n));
     if (err != cudaSuccess) {
         c->last.failed = 1;
         stats_end(c);
@@ -936,8 +943,14 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     rc_prep_unique<<<ub, threads>>>(c, c->n_unique);
 
     /* Deterministic conflict list: exclusive scan, then scatter. */
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, c->scan_tmp_bytes,
-                                  c->d_u_conflict, c->d_conf_off, c->n_unique);
+    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, c->scan_tmp_bytes, c->d_u_conflict, c->d_conf_off,
+        c->n_unique));
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 10;
+    }
     int conf_tail[2] = {0, 0};
     rc_download(&conf_tail[0], c->d_conf_off + (c->n_unique - 1), sizeof(int));
     rc_download(&conf_tail[1], c->d_u_conflict + (c->n_unique - 1), sizeof(int));
@@ -953,8 +966,14 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
 
     rc_prep_bucket_flags<<<ub, threads>>>(c->d_u_time, c->d_u_seg, c->n_unique,
                                     c->out_step, c->d_bucket_flags);
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, c->scan_tmp_bytes,
-                                  c->d_bucket_flags, c->d_bucket_of, c->n_unique);
+    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, c->scan_tmp_bytes, c->d_bucket_flags, c->d_bucket_of,
+        c->n_unique));
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 11;
+    }
     int bucket_tail[2] = {0, 0};
     rc_download(&bucket_tail[0], c->d_bucket_of + (c->n_unique - 1), sizeof(int));
     rc_download(&bucket_tail[1], c->d_bucket_flags + (c->n_unique - 1), sizeof(int));
@@ -972,8 +991,13 @@ int rc_prep_run(RcPrep *c, long long in_step, long long out_step,
     rc_prep_emit_flags<<<bb, threads>>>(c->d_u_time, c->d_bucket_lo, n_buckets,
                                   c->n_unique, in_step, out_step,
                                   keep_partial, c->d_emit);
-    cub::DeviceScan::ExclusiveSum(c->d_scan_tmp, c->scan_tmp_bytes,
-                                  c->d_emit, c->d_out_at, n_buckets);
+    err = rc_cub_status(cub::DeviceScan::ExclusiveSum(
+        c->d_scan_tmp, c->scan_tmp_bytes, c->d_emit, c->d_out_at, n_buckets));
+    if (err != cudaSuccess) {
+        c->last.failed = 1;
+        stats_end(c);
+        return 12;
+    }
     int emit_tail[2] = {0, 0};
     rc_download(&emit_tail[0], c->d_out_at + (n_buckets - 1), sizeof(int));
     rc_download(&emit_tail[1], c->d_emit + (n_buckets - 1), sizeof(int));
