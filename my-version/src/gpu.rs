@@ -899,9 +899,9 @@ extern "C" {
         out_value: *mut f64,
         out_status: *mut i32,
     ) -> f32;
-    /* #288: the radix select path of `rc_order_stat_score_batch` for the median
-       and the maximum. Same layout, codes and labels; `blocks_per_seg <= 0`
-       is the production launch shape. */
+    /* #288: the radix select path of `rc_order_stat_score_batch` for the
+       median, the maximum and the exact interquartile mean. Same layout, codes
+       and labels; `blocks_per_seg <= 0` is the production launch shape. */
     fn rc_order_stat_select_batch(
         ctx: *mut RawCtx,
         prog: *const u32,
