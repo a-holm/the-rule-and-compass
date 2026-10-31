@@ -62,6 +62,7 @@ fn binary_sample(n: usize, positives: f64, noise: f64, seed: u64) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 
@@ -160,6 +161,7 @@ fn the_gate_judges_the_configured_classification_metric() {
         y: (0..110).map(|i| if i < 100 { 1.0 } else { 0.0 }).collect(),
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     // `affine(slope, intercept)`: logit 2 − 2·x0 and 3 − 2·x0.
     let start = affine(-2.0, 2.0);
@@ -216,6 +218,7 @@ fn log_loss_improvement_cannot_replace_a_worse_auc() {
         y: vec![1.0, 0.0, 1.0],
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let levels = |a: f64, b: f64, c: f64| {
         let c1 = node(Op::Less, vec![input(0), constant(0.5)]);
@@ -331,7 +334,7 @@ fn weighted_labels_ignore_masked_rows() {
 /// #289/#288: `gpu_blocker` admits the classification objectives. `auc` is an
 /// exact rank statistic (#288): it is admitted from the order/rank row floor on
 /// a two-valued target and names the floor below it. A weighted regression run
-/// is still refused because its kernel has no weight path yet.
+/// is admitted except for `maximum`, which has no weighted form.
 #[cfg(feature = "cuda")]
 #[test]
 fn the_device_gate_admits_classification_and_names_auc() {
@@ -353,13 +356,18 @@ fn the_device_gate_admits_classification_and_names_auc() {
     assert!(why.contains("4096-row device floor"), "{why}");
     let big = binary_sample(fit::MEDIAN_GPU_MIN_ROWS + 64, 0.5, 0.1, 2);
     assert_eq!(search::backend_blocker_reason(&cfg(Metric::Auc), &big), None);
-    // A weighted classification run is admitted; a weighted squared run is not.
+    // Weighted classification and weighted squared runs are admitted; a
+    // weighted maximum run is not.
     s.w = vec![1.0; s.len()];
     assert_eq!(
         search::backend_blocker_reason(&cfg(Metric::Brier), &s),
         None
     );
-    let why = search::backend_blocker_reason(&cfg(Metric::Squared), &s).unwrap();
+    assert_eq!(
+        search::backend_blocker_reason(&cfg(Metric::Squared), &s),
+        None
+    );
+    let why = search::backend_blocker_reason(&cfg(Metric::Maximum), &s).unwrap();
     assert!(why.contains("weighted"), "{why}");
 }
 

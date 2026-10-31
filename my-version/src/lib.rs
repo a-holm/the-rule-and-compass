@@ -26,11 +26,15 @@ pub mod panel_pit; // #302: exact CPU reference for the PIT membership/MTF as-of
 pub mod panel_pit_gpu; // #302: device PIT as-of merge joins
 pub mod panel_prep; // #301: exact CPU reference for the panel prep policy
 pub mod panel_v2; // #259: default hourly point-in-time panel (snapshot, base, build, validate)
+pub mod panel_append; // #260: schema sidecar and time-major family append
+pub mod registry; // #260: versioned feature registry, schema sidecar, views
+pub mod derivatives; // reserved, gated funding/OI/basis family
 pub mod devlog; // #211: optional development log
 pub mod devreport; // #211: `rcsr dev-report`
 pub mod eval_soa;
 pub mod expr;
 pub mod features;
+pub mod labels; // #262: long-only horizon, action and triple-barrier labels
 pub mod bench_gpu; // #299: device benchmark joins, beta and cross means
 pub mod features_gpu; // #297: fused flow / price-action device producers
 pub mod fit;

@@ -139,6 +139,162 @@ impl FitStrategy {
     }
 }
 
+/// #223: which candidates the deferred GPU fit admits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FitAdmission {
+    /// `max(32, pop/4)` per island below the wide-row threshold.
+    #[default]
+    Screened,
+    /// Every candidate with constants, at every row count.
+    All,
+}
+
+impl FitAdmission {
+    pub fn name(self) -> &'static str {
+        match self {
+            FitAdmission::Screened => "screened",
+            FitAdmission::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "screened" => Some(FitAdmission::Screened),
+            "all" => Some(FitAdmission::All),
+            _ => None,
+        }
+    }
+}
+
+/// #223: what the person asked for when the engine resolves the fit arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FitRequest {
+    /// No `--fit-strategy`.
+    Unset,
+    /// `--fit-strategy auto`.
+    Auto,
+}
+
+impl FitRequest {
+    /// The provenance label of a resolution made for this request.
+    pub fn source(self) -> &'static str {
+        match self {
+            FitRequest::Unset => "default",
+            FitRequest::Auto => "auto",
+        }
+    }
+
+    /// The CPU arm this request keeps when the device arm is not admissible.
+    pub fn cpu_arm(self) -> FitStrategy {
+        match self {
+            FitRequest::Unset => FitStrategy::Exact,
+            FitRequest::Auto => FitStrategy::Auto,
+        }
+    }
+}
+
+/// #223: the resolved fit arm with its provenance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FitResolution {
+    pub strategy: FitStrategy,
+    pub admission: FitAdmission,
+    /// `default` or `auto`.
+    pub source: &'static str,
+    /// `admissible`, or the first failing factor.
+    pub reason: String,
+}
+
+/// #223: the pure decision. `backend_ok`, `memory_ok` and `cost_ok` are the
+/// run's device facts; the first failing factor is the labelled reason.
+pub fn resolve_fit_arm(
+    request: FitRequest,
+    metric: Metric,
+    fit_iters: usize,
+    backend_ok: Result<(), String>,
+    memory_ok: Result<(), String>,
+    cost_ok: bool,
+) -> FitResolution {
+    let refused = |reason: String| FitResolution {
+        strategy: request.cpu_arm(),
+        admission: FitAdmission::Screened,
+        source: request.source(),
+        reason,
+    };
+    if !metric.is_least_squares() {
+        return refused("metric_not_least_squares".to_string());
+    }
+    if fit_iters == 0 {
+        return refused("no_fit".to_string());
+    }
+    if let Err(why) = backend_ok {
+        return refused(why);
+    }
+    if let Err(why) = memory_ok {
+        return refused(why);
+    }
+    if !cost_ok {
+        return refused("dispatch_cost".to_string());
+    }
+    FitResolution {
+        strategy: FitStrategy::Gpu,
+        admission: FitAdmission::All,
+        source: request.source(),
+        reason: "admissible".to_string(),
+    }
+}
+
+/// #223: device cost of one fit-row relative to one CPU thread, the upper end
+/// of the observed range.
+pub const LS_FIT_DEVICE_ROW_RATIO: f64 = 0.05;
+/// #223: overhead of the batched arm at the decision boundary (generation
+/// barrier, seed-constant screen, finalist refits).
+pub const LS_FIT_OVERHEAD: f64 = 1.32;
+/// #223: the device arm must beat the CPU arm by this fraction.
+pub const LS_FIT_MARGIN: f64 = 0.3;
+
+/// #223: relative per-generation cost of the two arms, in units of one CPU
+/// thread fitting every candidate. Pure: no timing is read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LsFitCost {
+    pub cpu_s: f64,
+    /// Includes the required margin.
+    pub gpu_s: f64,
+}
+
+/// #223: `cpu = 1 / min(islands, cores)` and `gpu = (s * k + (1 - s) / W) * E *
+/// (1 + h)`, with `s = 1` when every configured operator has a fit opcode.
+pub fn ls_fit_cost(
+    island_threads: usize,
+    cores: usize,
+    workers: usize,
+    full_coverage: bool,
+) -> LsFitCost {
+    let parallel = island_threads.min(cores).max(1) as f64;
+    let share = if full_coverage { 1.0 } else { 0.0 };
+    let device = share * LS_FIT_DEVICE_ROW_RATIO + (1.0 - share) / workers.max(1) as f64;
+    LsFitCost {
+        cpu_s: 1.0 / parallel,
+        gpu_s: device * LS_FIT_OVERHEAD * (1.0 + LS_FIT_MARGIN),
+    }
+}
+
+/// #223: true when the cost model predicts the device arm wins.
+pub fn ls_gpu_fit_worthwhile(
+    island_threads: usize,
+    cores: usize,
+    workers: usize,
+    full_coverage: bool,
+) -> bool {
+    let cost = ls_fit_cost(island_threads, cores, workers, full_coverage);
+    cost.gpu_s < cost.cpu_s
+}
+
+/// #223: true when every configured operator has a fit opcode and no custom
+/// block is defined (block constants are shared, so they fall back to the CPU).
+pub fn gpu_fit_op_coverage(ops: &[Op], has_blocks: bool) -> bool {
+    !has_blocks && ops.iter().all(|&op| gpu_fit_opcode(op).is_some())
+}
+
 /// #229: an objective a device kernel computes natively.
 ///
 /// #236 closed the GPU evaluator to every non-squared metric because the
@@ -2971,6 +3127,12 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #398: the level-set distance has its own fit; the generic score of this
+    // metric is `+inf`, so every caller must reach `implicit::fit` here.
+    if metric == ImplicitDerivative {
+        crate::implicit::fit(tree, x, w, iters);
+        return crate::implicit::score_rows(tree, x, w, metric);
+    }
     // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
     // not only the squared family. IRLS, logistic IRLS and the coordinate
     // polish all force a minimum of one sweep, so return the current score
@@ -2994,6 +3156,7 @@ pub fn fit_weighted_metric(
         Squared | Aic | Aicc | Bic => {
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
+        ImplicitDerivative => unreachable!("the level-set metric returned above"),
         Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
@@ -3025,8 +3188,7 @@ pub fn fit_weighted_metric(
         | Median
         | Maximum
         | Interquartile
-        | Slope
-        | ImplicitDerivative => {
+        | Slope => {
             let start = metric_score(tree, x, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
@@ -3083,6 +3245,32 @@ pub fn fit_weighted_strategy_metric(
         fit_weighted_strategy(tree, x, y, w, iters, strategy)
     } else {
         fit_weighted_metric(tree, x, y, w, iters, metric)
+    }
+}
+
+/// `slope` fit over explicit adjacent-row pairs: the squared fit, then the
+/// coordinate polish on the pair-based slope. Keeps the incumbent unless the
+/// trial improves it. Returns the slope at the kept constants.
+pub fn fit_slope_pairs(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    pairs: &[[u32; 2]],
+    iters: usize,
+) -> f64 {
+    let score_of = |t: &Node| {
+        metrics::score_slope_pairs(&predictions(t, x), y, pairs)
+    };
+    let start = score_of(tree);
+    let mut trial = tree.clone();
+    fit_weighted(&mut trial, x, y, &[], iters);
+    coordinate_polish_by(&mut trial, iters.max(1), &score_of);
+    let score = score_of(&trial);
+    if improves(score, start) {
+        *tree = trial;
+        score
+    } else {
+        start
     }
 }
 
@@ -3400,6 +3588,11 @@ pub(crate) fn coordinate_polish(
         }
         _ => metric_score(tree, x, y, w, metric),
     };
+    coordinate_polish_by(tree, sweeps, &score_of);
+}
+
+/// The ladder walk of [`coordinate_polish`] for an arbitrary score.
+fn coordinate_polish_by(tree: &mut Node, sweeps: usize, score_of: &dyn Fn(&Node) -> f64) {
     let mut best = score_of(tree);
     if !best.is_finite() {
         return;
@@ -4027,26 +4220,188 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
 /// occur in `tree` receives `0`; an input index outside `x` is ignored (the
 /// same row would evaluate to `NaN`).
 pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
-    let f = flatten(tree);
-    let n = f.op.len();
-    let mut c = vec![0.0; f.nconst];
-    for i in 0..n {
-        if f.cslot[i] >= 0 {
-            c[f.cslot[i] as usize] = f.val[i];
+    InputGradients::new(tree).gradient(x).to_vec()
+}
+
+/// One tree prepared for repeated input-gradient sweeps: the flat form, the
+/// constant vector and the scratch buffers are built once and reused per row.
+pub(crate) struct InputGradients {
+    f: Flat,
+    c: Vec<f64>,
+    v: Vec<f64>,
+    adj: Vec<f64>,
+    grad: Vec<f64>,
+    cgrad: Vec<f64>,
+}
+
+impl InputGradients {
+    pub(crate) fn new(tree: &Node) -> Self {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        InputGradients {
+            f,
+            c,
+            v: vec![0.0; n],
+            adj: vec![0.0; n],
+            grad: Vec::new(),
+            cgrad: Vec::new(),
         }
     }
-    let mut v = vec![0.0; n];
-    eval_row(&f, x, &c, &mut v);
-    let mut adj = vec![0.0; n];
-    let mut grad = vec![0.0; x.len()];
-    backward_impl(&f, &v, &mut adj, None, Some(&mut grad));
-    grad
+
+    /// Replace the tree's own constants, in pre-order, with `values`.
+    pub(crate) fn set_constants(&mut self, values: &[f64]) {
+        for (&slot, &val) in self.f.normal_order.iter().zip(values) {
+            self.c[slot] = val;
+        }
+    }
+
+    /// `∇f` at `x`; one forward and one backward sweep, no allocation.
+    pub(crate) fn gradient(&mut self, x: &[f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, None, Some(&mut self.grad));
+        &self.grad
+    }
+
+    /// `∂f/∂cⱼ` at `x` for the tree's own constants (pre-order), written to
+    /// `out`; one forward and one backward sweep.
+    pub(crate) fn constant_gradient(&mut self, x: &[f64], out: &mut [f64]) {
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, Some(&mut self.cgrad), None);
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+    }
+
+    /// [`Self::gradient`] and [`Self::constant_gradient`] from one sweep: returns
+    /// `∇f` and writes `∂f/∂cⱼ` to `out`.
+    pub(crate) fn both_gradients(&mut self, x: &[f64], out: &mut [f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(
+            &self.f,
+            &self.v,
+            &mut self.adj,
+            Some(&mut self.cgrad),
+            Some(&mut self.grad),
+        );
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+        &self.grad
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::expr::{constant, input, node};
+
+    #[test]
+    fn resolve_fit_arm_table() {
+        let ok = || Ok(());
+        let no = |s: &str| Err(s.to_string());
+        for &metric in Metric::all() {
+            for request in [FitRequest::Unset, FitRequest::Auto] {
+                for backend in [ok(), no("built without --features cuda")] {
+                    for memory in [ok(), no("device_memory")] {
+                        for cost in [true, false] {
+                            for iters in [0usize, 8] {
+                                let r = resolve_fit_arm(
+                                    request,
+                                    metric,
+                                    iters,
+                                    backend.clone(),
+                                    memory.clone(),
+                                    cost,
+                                );
+                                let want_reason = if !metric.is_least_squares() {
+                                    "metric_not_least_squares".to_string()
+                                } else if iters == 0 {
+                                    "no_fit".to_string()
+                                } else if let Err(why) = &backend {
+                                    why.clone()
+                                } else if let Err(why) = &memory {
+                                    why.clone()
+                                } else if !cost {
+                                    "dispatch_cost".to_string()
+                                } else {
+                                    "admissible".to_string()
+                                };
+                                let device = want_reason == "admissible";
+                                let ctx = format!("{metric:?} {request:?} iters={iters} {want_reason}");
+                                assert_eq!(r.reason, want_reason, "{ctx}");
+                                assert_eq!(r.source, request.source(), "{ctx}");
+                                if device {
+                                    assert_eq!(r.strategy, FitStrategy::Gpu, "{ctx}");
+                                    assert_eq!(r.admission, FitAdmission::All, "{ctx}");
+                                } else {
+                                    assert_eq!(r.strategy, request.cpu_arm(), "{ctx}");
+                                    assert_eq!(r.admission, FitAdmission::Screened, "{ctx}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(FitRequest::Unset.cpu_arm(), FitStrategy::Exact);
+        assert_eq!(FitRequest::Auto.cpu_arm(), FitStrategy::Auto);
+    }
+
+    #[test]
+    fn ls_cost_model_is_monotone() {
+        for full in [false, true] {
+            let mut was_cpu = false;
+            for islands in 1..=16 {
+                let device = ls_gpu_fit_worthwhile(islands, 16, 8, full);
+                assert!(!(was_cpu && device), "more islands moved towards the device");
+                was_cpu = !device;
+            }
+        }
+        for islands in 1..=16 {
+            let partial = ls_gpu_fit_worthwhile(islands, 16, 8, false);
+            let full = ls_gpu_fit_worthwhile(islands, 16, 8, true);
+            assert!(full || !partial, "coverage moved towards the CPU at {islands}");
+        }
+        // The measured boundary with eight fallback workers.
+        assert!(ls_gpu_fit_worthwhile(1, 8, 8, false));
+        assert!(ls_gpu_fit_worthwhile(4, 8, 8, false));
+        assert!(!ls_gpu_fit_worthwhile(5, 8, 8, false));
+        assert!(ls_gpu_fit_worthwhile(8, 8, 8, true));
+        assert!(ls_gpu_fit_worthwhile(11, 16, 8, true));
+        assert!(!ls_gpu_fit_worthwhile(12, 16, 8, true));
+        // Cores cap the CPU side.
+        assert!(ls_gpu_fit_worthwhile(64, 4, 8, false));
+    }
+
+    #[test]
+    fn op_coverage_needs_a_fit_opcode_for_every_operator() {
+        assert!(!gpu_fit_op_coverage(&Op::default_set(), false), "`if` has no fit opcode");
+        assert!(gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], false));
+        assert!(!gpu_fit_op_coverage(&[Op::Add, Op::Mul, Op::Sin], true));
+    }
+
+    #[test]
+    fn fit_admission_names_round_trip() {
+        for a in [FitAdmission::Screened, FitAdmission::All] {
+            assert_eq!(FitAdmission::parse(a.name()), Some(a));
+        }
+        assert_eq!(FitAdmission::default(), FitAdmission::Screened);
+        assert_eq!(FitAdmission::parse("half"), None);
+    }
 
     fn implicit_circle() -> (Vec<Vec<f64>>, Vec<f64>) {
         let n = 60;

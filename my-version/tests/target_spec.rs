@@ -520,6 +520,7 @@ fn sidecar_is_loaded_and_the_flag_wins() {
         &Json::Arr(vec![Json::Num(900.0), Json::Num(4500.0)])
     );
     assert_eq!(at(&j, &["target_spec", "cost_in_label"]), &Json::Bool(false));
+    assert_eq!(at(&j, &["target_spec", "long_only"]), &Json::Bool(true));
     assert_eq!(at(&j, &["target_spec", "units"]).as_str(), Some("log_return"));
 
     let flag = Spec {

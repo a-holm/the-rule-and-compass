@@ -248,6 +248,7 @@ is mathematically well posed:
 | `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
 | `implicit_residual` (#396) | on an `--implicit` sample the target is 0, so `Σ w|f| / Σ w` is the `absolute` objective: the same L1 IRLS arm, scored by the finite residual (`score_with_constants` and `score_weighted` share the `absolute` branch). The level-set metric `implicit` keeps its own fit, `implicit::fit` |
+| `implicit` (#398) | `implicit::fit`: Levenberg–Marquardt on the signed geometric residual `f/||∇f||`, CPU `f64` only (no device arm; the measured cost is allocation, not arithmetic). `fit_weighted_metric` routes it there for every caller. The tree is flattened once per fit and per score, the constants are swapped in place per probe, and the Jacobian costs three sweeps per row (a directional difference of the constant adjoint along the unit normal, `ε = 1e-6·(1 + ||p||∞)`) instead of `1 + 2p` |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
 | `auc`, `log_loss`, `brier`, `hinge`, `hinge_ordinary`, `hinge_squared` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/Brier/hinge use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights. Brier's probability optimum is the same logit `ln(n₊/n₋)` and the exact Brier value is the gate |
 | `log_loss` with `--fit-strategy gpu` (#234) | the same Fisher scoring in the batched kernel (uploaded label sign, `q(1-q)` weights, `t/q` pseudo-response, `softplus` trial objective, `ln det Ã` gate). The exact CPU `f64` log-loss judges every proposal and refits every finalist; since #289 the **fitness** is native too (log_loss/Brier/hinge), so the search no longer pays a CPU rescoring pass |
@@ -750,8 +751,10 @@ approximation. The pre-registered acceptance rules are:
 | rank test | column-scaled pivot norm `> 1e-12`; otherwise exact LM |
 | size cap | `rows × constants <= 8e6` and `<= 64` constants; otherwise exact LM |
 | ineligible, rank-deficient, non-finite or non-improving | exact LM, tree untouched, bit-identical |
-| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
+| `--fit-strategy exact` (the CPU arm when no device arm is admissible) | historical LM, bit for bit; pinned constants and archive hashes unchanged |
 | `--fit-strategy gpu` (#169) | kernel p ≤ 16, nodes ≤ 96, squared/AIC metrics; median constant error ≤ 1e-5 and SSE relative ≤ 1e-8 vs CPU LM on well-conditioned fixtures; every ill-conditioned/non-finite/unsupported candidate falls back and is labelled; finalists refit in exact CPU f64 |
+
+With no `--fit-strategy`, or with `auto`, a run that qualifies resolves to the batched GPU LM with every candidate admitted (`docs/gpu-backend.md`, "Default fit arm"); every other run keeps `exact` (no flag) or the structural `auto`, so CPU-only runs are unchanged.
 
 Because the linear arm reaches the optimum in one solve instead of iterating,
 it **can** change the search trajectory (usually by fitting a linear candidate
@@ -859,7 +862,7 @@ complete (#226), `interquartile_declined` for the interquartile arm (#232) and
 
 | rule | tolerance / behaviour |
 |---|---|
-| `--fit-strategy exact` (default) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
+| `--fit-strategy exact` (the CPU arm when no device arm is admissible) | historical LM, bit for bit; pinned constants, fixtures and archive hashes unchanged |
 | linear objective versus exact LM | QR SSE `<=` LM SSE × `(1 + 1e-12)` |
 | linear constants versus exact LM | relative difference `<= 1e-8` on affine tests |
 | VarPro objective versus exact LM | projected SSE `<=` LM SSE × `(1 + 1e-9)` on separable tests |

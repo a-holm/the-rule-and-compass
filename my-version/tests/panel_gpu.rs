@@ -773,3 +773,56 @@ fn pit_paired_4_78m_row_join_measurement() {
         );
     }
 }
+
+extern "C" {
+    fn rc_prep_test_force_cub_fail(on: i32);
+    fn rc_pit_test_force_cub_fail(on: i32);
+}
+
+/// #410: a refused CUB sort fails the prep run, the one-shot wrapper returns
+/// `None` so the caller keeps the CPU reference, and the next run works.
+#[test]
+fn refused_cub_sort_fails_prep_run_then_recovers() {
+    if !would_use_gpu() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let (bars, segments) = mixed_fixture();
+    let mut gpu = PrepGpu::new(&bars, &segments).expect("context");
+
+    unsafe { rc_prep_test_force_cub_fail(1) };
+    let refused = gpu.run(900, 3600, true);
+    unsafe { rc_prep_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB sort must fail the run");
+
+    assert!(gpu.run(900, 3600, true), "no error may stay pending");
+    let cpu = cpu_prepare(&bars, &segments, 900, 3600, true).unwrap();
+    assert_outputs_equal("after refusal", &cpu, &gpu.output().expect("output"));
+}
+
+/// #410: a refused CUB scan fails the PIT run and the next run is correct.
+#[test]
+fn refused_cub_scan_fails_pit_run_then_recovers() {
+    if !would_use_gpu() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let block = PitBlock {
+        times: vec![999, 1000, 1001, 1999, 2000, 2001, 2999, 3000, 3001, 3500, 3501],
+        chain: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
+        segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 11, leaf_start: 0, leaf_len: 3 }],
+        keys: vec![1000, 2000, 3000],
+        member: vec![1, 0, 1],
+    };
+    let p = PitParams::membership(1);
+    let mut gpu = PitGpu::new(&block).expect("context");
+
+    unsafe { rc_pit_test_force_cub_fail(1) };
+    let refused = gpu.run(p);
+    unsafe { rc_pit_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB scan must fail the run");
+
+    assert!(gpu.run(p), "no error may stay pending");
+    let cpu = panel_pit::join(&block, p).unwrap();
+    pit::assert_same("after refusal", &cpu, &gpu.output().expect("output"));
+}

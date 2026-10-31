@@ -60,6 +60,8 @@ pub struct TargetSpec {
     pub cost_in_label: bool,
     pub construction_columns: Vec<String>,
     pub note: Option<String>,
+    /// Always true: the engine has no short label or barrier.
+    pub long_only: bool,
 }
 
 impl TargetSpec {
@@ -180,7 +182,7 @@ impl TargetSpec {
         };
         let cols: Vec<String> = self.construction_columns.iter().map(|c| text(c)).collect();
         format!(
-            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{}",
+            "\"column\":{},\"name\":{},\"kind\":{},\"deprecated\":{},\"return_column\":{},\"return_units\":{},\"horizon_seconds\":{},\"entry_offset_seconds\":{},\"delay_seconds\":{},\"entry_price\":{},\"exit_price\":{},\"offset\":{},\"scale\":{},\"clip\":{},\"units\":{},\"cost_bps\":{},\"cost_in_label\":{},\"construction_columns\":[{}],\"note\":{},\"long_only\":{}",
             text(&self.column),
             text(&self.name),
             text(&self.kind),
@@ -199,7 +201,8 @@ impl TargetSpec {
             opt_n(self.cost_bps),
             self.cost_in_label,
             cols.join(","),
-            opt_s(&self.note)
+            opt_s(&self.note),
+            self.long_only
         )
     }
 
@@ -359,6 +362,7 @@ fn parse_one(o: &Json, index: usize) -> Result<TargetSpec, String> {
         cost_in_label: opt_bool(o, "cost_in_label", &what, false)?,
         construction_columns,
         note: opt_str(o, "note", &what)?,
+        long_only: opt_bool(o, "long_only", &what, true)?,
     };
     validate(&spec, &what)?;
     Ok(spec)
@@ -371,6 +375,12 @@ fn validate(s: &TargetSpec, what: &str) -> Result<(), String> {
             what,
             s.kind,
             KINDS.join(" or ")
+        ));
+    }
+    if !s.long_only {
+        return Err(format!(
+            "{}: long_only must be true; the engine has no short label or barrier",
+            what
         ));
     }
     if !valid_name(&s.name) {
@@ -814,6 +824,7 @@ pub fn schema_json() -> String {
         ("cost_in_label", "bool", true, "true requires offset == cost_bps * 1e-4"),
         ("construction_columns", "string[]", true, "columns used to build the label"),
         ("note", "string|null", false, "free text"),
+        ("long_only", "bool", false, "default true; false is refused: labels are long-only (action {0,+1}, long-side barriers)"),
     ];
     let items: Vec<String> = fields
         .iter()

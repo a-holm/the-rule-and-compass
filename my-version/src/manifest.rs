@@ -62,8 +62,13 @@ pub struct Manifest {
     /// #294: the resolved projected read (hash, column list and header
     /// indices), or `None` when the run loaded every column.
     pub projection: Option<ProjectionRecord>,
+    /// #260: the `--project` view (id, seed, view index, columns by family)
+    /// as a JSON object, or `None` when no view was requested.
+    pub view: Option<String>,
     /// #254: the declared target spec `(source, path, sha256)`, or `None`.
     pub target_spec: Option<(String, String, String)>,
+    /// #223: `(source, reason)` when the engine resolved the fit arm.
+    pub fit_resolution: Option<(String, String)>,
 }
 
 impl Manifest {
@@ -126,6 +131,14 @@ impl Manifest {
                 gpu, fallback, refits
             ));
         }
+        if let Some((source, reason)) = &self.fit_resolution {
+            out.push_str(&format!(
+                "  \"fit_resolution\":{{\"strategy\":{},\"source\":{},\"reason\":{}}},\n",
+                jstr(self.config.fit_strategy.name()),
+                jstr(source),
+                jstr(reason)
+            ));
+        }
         if let Some(dispatch) = &self.dispatch {
             out.push_str(&format!("  \"dispatch\":{},\n", dispatch.manifest_json()));
         }
@@ -156,6 +169,10 @@ impl Manifest {
                 ));
             }
             None => out.push_str("  \"projection\":null,\n"),
+        }
+        match &self.view {
+            Some(v) => out.push_str(&format!("  \"view\":{},\n", v)),
+            None => out.push_str("  \"view\":null,\n"),
         }
         match &self.target_spec {
             Some((source, path, sha)) => out.push_str(&format!(
@@ -237,7 +254,9 @@ pub fn collect(
         sampled_rows,
         estimate_bytes,
         projection: None,
+        view: None,
         target_spec: None,
+        fit_resolution: None,
     }
 }
 

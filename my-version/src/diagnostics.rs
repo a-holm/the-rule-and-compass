@@ -698,14 +698,14 @@ fn score_folds(
     predict: &dyn Fn(&[f64]) -> f64,
 ) -> BaselineError {
     let train_pred: Vec<f64> = train.x.iter().map(|x| predict(x)).collect();
-    let train_error = metrics::score(&train_pred, &train.y, metric);
+    let train_error = metrics::score_sample(&train_pred, train, metric, 0);
     let test_error = if test_folds.is_empty() {
         f64::INFINITY
     } else {
         let mut acc = 0.0;
         for f in test_folds {
             let pred: Vec<f64> = f.x.iter().map(|x| predict(x)).collect();
-            acc += metrics::score(&pred, &f.y, metric);
+            acc += metrics::score_sample(&pred, f, metric, 0);
         }
         acc / test_folds.len() as f64
     };
@@ -983,6 +983,7 @@ pub fn breusch_pagan(resid: &[f64], fitted: &[f64]) -> BreuschPagan {
         y: u.clone(),
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     };
     let ss_res = match least_squares_linear(&aux) {
         Some(c) => u
@@ -1446,6 +1447,7 @@ pub fn bootstrap_error(
                 y: oob.iter().map(|&j| train.y[j]).collect(),
                 w: Vec::new(),
                 ys: Vec::new(),
+                pairs: None,
             };
             let e = crate::search::eval_error(&t, &scored, metric);
             if e.is_finite() {
@@ -1872,6 +1874,7 @@ mod tests {
                 y,
                 w: Vec::new(),
                 ys: Vec::new(),
+                pairs: None,
             },
             &[1.0, 1.0],
         );
@@ -1941,6 +1944,7 @@ mod tests {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
@@ -2163,6 +2167,7 @@ mod tests {
                     y: oob.iter().map(|&j| train.y[j]).collect(),
                     w: Vec::new(),
                     ys: Vec::new(),
+                    pairs: None,
                 };
                 let e = crate::search::eval_error(&t, &scored, metric);
                 if e.is_finite() {
@@ -2240,6 +2245,7 @@ mod tests {
             y: (0..n).map(|i| 1.5 + 0.25 * i as f64).collect(),
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut tree = poly2_tree();
         crate::fit::fit(&mut tree, &train.x, &train.y, 8);
@@ -2290,6 +2296,7 @@ mod tests {
             y: (0..n).map(|i| 2.0 + 0.001 * i as f64).collect(),
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let tree = crate::expr::constant(2.0);
         let mut rng = crate::rng::Mt::new(5);
@@ -2318,6 +2325,7 @@ mod tests {
             y: ys,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut tree = poly2_tree();
         crate::fit::fit(&mut tree, &train.x, &train.y, 16);
@@ -2365,6 +2373,7 @@ mod tests {
             y: vec![5.0; 20],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let mut tree = crate::expr::constant(5.0);
         crate::fit::fit(&mut tree, &train.x, &train.y, 8);
@@ -2384,6 +2393,7 @@ mod tests {
             y: (0..10).map(|i| 2.0 * i as f64 + 1.0).collect(),
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         // A tree with no constants: the refit is a no-op, but the estimator
         // still fits and scores.
@@ -2593,6 +2603,7 @@ mod target_rung_tests {
             y: vec![0.0; 6],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         let g = [0.001, 0.002, 0.004, 0.005, f64::NAN, -1.0];
         let mut skipped = 0;

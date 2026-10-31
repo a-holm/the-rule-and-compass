@@ -52,6 +52,12 @@ pub struct Sample {
     /// column per target**, including the first one; `y` is a copy of
     /// `ys[0]` so every single-target diagnostic keeps working unchanged.
     pub ys: Vec<Vec<f64>>,
+    /// Row pairs `[a, b]` (positions in this sample) that the order-dependent
+    /// `slope` metric differences: `b` is the row that directly follows `a` in
+    /// the original data order, within the same group. `None` means the rows
+    /// are already in data order and every consecutive pair counts (the
+    /// historical behaviour). Set by [`Prepared::require_slope_pairs`].
+    pub pairs: Option<Vec<[u32; 2]>>,
 }
 
 impl Sample {
@@ -62,6 +68,7 @@ impl Sample {
             y,
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
@@ -76,6 +83,7 @@ impl Sample {
             y,
             w,
             ys: Vec::new(),
+            pairs: None,
         }
     }
 
@@ -1675,6 +1683,89 @@ pub struct Prepared {
     /// #257: raw time keys of the prepared rows, aligned with the samples.
     /// `None` without a time column.
     pub keys: Option<RowKeys>,
+    /// Adjacent-row pairs of every sample (see [`Sample::pairs`]), kept so the
+    /// `slope` metric can adopt them through [`Prepared::require_slope_pairs`].
+    pub slope_pairs: SlopePairs,
+}
+
+/// The pair lists of [`Prepared`]'s samples, in the order of each sample.
+#[derive(Clone, Debug, Default)]
+pub struct SlopePairs {
+    pub train: Vec<[u32; 2]>,
+    pub validation: Option<Vec<[u32; 2]>>,
+    pub test: Vec<[u32; 2]>,
+    pub folds: Vec<Vec<[u32; 2]>>,
+    pub split: &'static str,
+}
+
+impl Prepared {
+    /// Hand the adjacent-row pairs to every sample, for the `slope` metric.
+    /// Refuses when the training side keeps fewer than
+    /// [`crate::metrics::SLOPE_MIN_PAIRS`] pairs. Returns the training pair
+    /// count.
+    pub fn require_slope_pairs(&mut self) -> Result<usize, String> {
+        let found = self.slope_pairs.train.len();
+        if found < crate::metrics::SLOPE_MIN_PAIRS {
+            return Err(format!(
+                "metric slope differences rows that are adjacent in the data order and in the same group; \
+                 the {} split leaves {} such pair(s) among {} training row(s), fewer than the minimum {}. \
+                 Use --split temporal (contiguous blocks keep adjacent rows together) or provide more rows",
+                self.slope_pairs.split,
+                found,
+                self.train.len(),
+                crate::metrics::SLOPE_MIN_PAIRS
+            ));
+        }
+        let p = &self.slope_pairs;
+        self.train.pairs = Some(p.train.clone());
+        if let Some(v) = self.validation.as_mut() {
+            v.pairs = p.validation.clone();
+        }
+        self.test.pairs = Some(p.test.clone());
+        for (s, f) in self.fold_samples.iter_mut().zip(&p.folds) {
+            s.pairs = Some(f.clone());
+        }
+        Ok(found)
+    }
+}
+
+/// For every table row, the closest earlier row of the same group in data
+/// order, or `usize::MAX` for the first row of a group. `order` lists the
+/// rows from first to last (time order); `None` means table order. `group`
+/// gives each row's group id; `None` means a single group.
+pub fn row_predecessors(n: usize, order: Option<&[usize]>, group: Option<&[usize]>) -> Vec<usize> {
+    let mut prev = vec![usize::MAX; n];
+    let mut last: HashMap<usize, usize> = HashMap::new();
+    let mut visit = |r: usize| {
+        let g = group.map_or(0, |g| g[r]);
+        if let Some(p) = last.insert(g, r) {
+            prev[r] = p;
+        }
+    };
+    match order {
+        Some(o) => o.iter().for_each(|&r| visit(r)),
+        None => (0..n).for_each(&mut visit),
+    }
+    prev
+}
+
+/// The pairs `[a, b]` of sample positions for the sample made of table `rows`:
+/// `b` holds a row whose predecessor `prev[row]` is also in the sample, at
+/// position `a`. Rows can be in any order (a shuffled training side); a pair
+/// never crosses a group boundary or skips a row that is missing from the side.
+pub fn adjacent_pairs(rows: &[usize], prev: &[usize]) -> Vec<[u32; 2]> {
+    let mut at = vec![u32::MAX; prev.len()];
+    for (k, &r) in rows.iter().enumerate() {
+        at[r] = k as u32;
+    }
+    let mut out = Vec::new();
+    for (k, &r) in rows.iter().enumerate() {
+        let p = prev[r];
+        if p != usize::MAX && at[p] != u32::MAX {
+            out.push([at[p], k as u32]);
+        }
+    }
+    out
 }
 
 /// Time keys of the prepared rows (#257). Equal keys are one timestamp.
@@ -3212,9 +3303,26 @@ fn prepare_full_targets_weighted_inner(
             test: pick(&test_idx),
         }
     });
+    let slope_pairs = {
+        let order = spec.time_col.map(|tc| sorted_by(&time_keys(filtered, tc)));
+        let groups = spec.group_col.map(|gc| group_ids(filtered, gc).0);
+        let prev = row_predecessors(filtered.len(), order.as_deref(), groups.as_deref());
+        SlopePairs {
+            train: adjacent_pairs(&train_idx, &prev),
+            validation: (!validation_idx.is_empty()).then(|| adjacent_pairs(&validation_idx, &prev)),
+            test: adjacent_pairs(&test_idx, &prev),
+            folds: if fold_idx.len() > 1 {
+                fold_idx.iter().map(|f| adjacent_pairs(f, &prev)).collect()
+            } else {
+                Vec::new()
+            },
+            split: spec.mode.name(),
+        }
+    };
     let hazards = time_hazards(t, spec);
     Ok(Prepared {
         keys,
+        slope_pairs,
         target_scale,
         train,
         validation,
@@ -4802,6 +4910,11 @@ pub struct LagSpec {
 #[derive(Clone, Default)]
 pub struct LagReport {
     pub lags: usize,
+    /// The declared bar menu (`--lag-set`), or `1..=lags` for `--lags`.
+    pub menu: Vec<usize>,
+    /// Variables before and after the delayed copies are added.
+    pub nvars_before: usize,
+    pub nvars_after: usize,
     pub series: usize,
     pub rows_in: usize,
     pub rows_kept: usize,
@@ -4825,13 +4938,33 @@ pub fn add_lags(
     time_col: Option<usize>,
     group_col: Option<usize>,
 ) -> Result<(Table, Vec<String>, LagReport), String> {
+    let menu: Vec<usize> = (1..=lag.lags).collect();
+    add_lags_menu(t, vars, lag, &menu, time_col, group_col)
+}
+
+/// [`add_lags`] with a declared menu of delays in bars (`--lag-set 1,4,24,96`).
+/// Column `x_lag<k>` is `x` delayed by `k` bars inside its series; `lag.lags` is
+/// ignored. The report carries the variable count before and after.
+pub fn add_lags_menu(
+    t: &Table,
+    vars: &[String],
+    lag: &LagSpec,
+    menu: &[usize],
+    time_col: Option<usize>,
+    group_col: Option<usize>,
+) -> Result<(Table, Vec<String>, LagReport), String> {
     let n = t.len();
+    let max_lag = menu.iter().copied().max().unwrap_or(0);
     let mut report = LagReport {
-        lags: lag.lags,
+        lags: max_lag,
+        menu: menu.to_vec(),
+        nvars_before: vars.len(),
+        nvars_after: vars.len() + vars.len() * menu.len(),
         rows_in: n,
         ..Default::default()
     };
-    if lag.lags == 0 && lag.history_frac <= 0.0 {
+    if menu.is_empty() && lag.history_frac <= 0.0 {
+        report.nvars_after = vars.len();
         report.rows_kept = n;
         return Ok((t.clone(), vars.to_vec(), report));
     }
@@ -4907,7 +5040,7 @@ pub fn add_lags(
     let mut keep = vec![false; n];
     for i in 0..n {
         let len = seg_rows[seg_id[i]].len() as f64;
-        let reserve = lag.lags.max((lag.history_frac * len).ceil() as usize);
+        let reserve = max_lag.max((lag.history_frac * len).ceil() as usize);
         if seg_pos[i] >= reserve {
             keep[i] = true;
         } else {
@@ -4919,7 +5052,7 @@ pub fn add_lags(
     let mut new_vars = vars.to_vec();
     let mut lag_names = Vec::new();
     for v in vars {
-        for k in 1..=lag.lags {
+        for &k in menu {
             let name = format!("{}_lag{}", v, k);
             lag_names.push(name.clone());
             new_vars.push(name);
@@ -4937,7 +5070,7 @@ pub fn add_lags(
     for (r, &i) in kept.iter().enumerate() {
         let mut c = 0usize;
         for &j in &var_idx {
-            for k in 1..=lag.lags {
+            for &k in menu {
                 let v = if seg_pos[i] >= k {
                     let src = seg_rows[seg_id[i]][seg_pos[i] - k];
                     t.value(src, j)
@@ -4971,7 +5104,7 @@ pub fn add_lags(
         "{} series, {} history row(s) dropped, {} delayed column(s) added",
         report.series,
         report.history_rows,
-        lag.lags * vars.len()
+        menu.len() * vars.len()
     ));
 
     Ok((out, new_vars, report))

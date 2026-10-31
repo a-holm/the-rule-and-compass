@@ -1553,6 +1553,9 @@ pub fn run(args: &[String]) -> ! {
     if matches!(cmd, "snapshot" | "base" | "validate") || v2_build {
         crate::panel_v2::cli(cmd, &args[1..]);
     }
+    if matches!(cmd, "schema" | "append") {
+        crate::panel_append::cli(cmd, &args[1..]);
+    }
     let mut data = None;
     let mut membership_path = None;
     let mut out = None;
@@ -2061,8 +2064,13 @@ HOURLY V2 PANEL (#259):
   rcsr panel base --input raw_15m_all --out base_h1.rcsb [options]
   rcsr panel build --data base_h1.rcsb --membership membership.csv --out panel.rcsb [options]
   rcsr panel validate --data panel.rcsb [--base base_h1.rcsb] [--membership membership.csv]
+  rcsr panel schema --data panel.rcsb [--panel-version V] [--verify]
+  rcsr panel append --data panel.rcsb --family symbol_major.rcsb --columns a,b --out out.rcsb [--scratch dir]
   --input <dir>           archive directory (SYMBOL/SYMBOL-15m-YYYY-MM.zip); no network
   --jobs <n>              parallel symbols for snapshot and base (default 1)
+  --gpu <auto|on|off>     base: run the 15m to 1h fold on the CUDA device (auto: from 1M decoded rows;
+                          on: always; off: the CPU path). Same store bytes either way; a CPU wave
+                          is labelled in <out>.manifest.json (backend). --no-gpu/--cpu = off
   --require-full-bucket   base: drop an hour with fewer than four 15m bars (default)
   --keep-partial          base: keep it with cov15m 1-3 and the PARTIAL_BUCKET flag
   --interval <15m|1m>     base: archive interval; 1m only reaches the lockbox guard
@@ -2074,6 +2082,16 @@ HOURLY V2 PANEL (#259):
   --replay <n>            validate: prefix-causality cuts (3)
   `build` uses the v2 builder when --data has a cov15m column. `validate` exits 3
   when a check fails. A 2026H2 archive or row is refused without --allow-lockbox.
+
+REGISTRY SCHEMA AND FAMILY APPEND (#260):
+  `build` and `append` write <panel>.schema.json: one entry per column with family,
+  timeframe, source columns, transform, causal offset, warm-up bars, dtype, unit,
+  availability start and end, PIT rule, semantic cost, status and the SHA-256 of the
+  stored values. `schema` rewrites it; `schema --verify` re-hashes the store and exits
+  3 on a mismatch. A column that is not in the feature registry is a hard error.
+  `append` carries registered columns of a symbol-major store (computed by `rcsr
+  enrich`) into the time-major panel by (symbol, ts) key. Existing blocks are copied
+  unchanged, the input file is untouched, a panel row without a family row is NaN.
 "
         .to_string()
 }

@@ -26,6 +26,7 @@ fn sample(n: usize) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 

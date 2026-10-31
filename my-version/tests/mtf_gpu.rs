@@ -535,3 +535,27 @@ fn a_forced_device_failure_warns_once_and_matches_the_cpu_bytes() {
         assert!(a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "{name}");
     }
 }
+
+extern "C" {
+    fn rc_mtf_test_force_cub_fail(on: i32);
+}
+
+/// #410: a refused CUB scan returns the scan's own status code, which the
+/// caller turns into a labelled CPU fallback, and the next prepare works.
+#[test]
+fn refused_cub_scan_fails_prepare_with_its_own_code_then_recovers() {
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let rows = holey("AAA", 2_000, 900, 0, 0.0);
+    let (times, open, high, low, close, seg_start, seg_len) = split_segments(&rows);
+    let mut gpu = mtf_gpu::MtfGpu::new(&times, &open, &high, &low, &close, &seg_start, &seg_len, 900).unwrap();
+
+    unsafe { rc_mtf_test_force_cub_fail(1) };
+    let err = gpu.prepare(3_600).unwrap_err();
+    unsafe { rc_mtf_test_force_cub_fail(0) };
+    assert_eq!((err.stage, err.code), ("prepare", 3));
+
+    gpu.prepare(3_600).expect("no error may stay pending");
+}

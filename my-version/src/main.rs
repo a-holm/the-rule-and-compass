@@ -22,7 +22,8 @@ use rcsr::rng::Mt;
 use rcsr::schema;
 use rcsr::units::{Unit, Units};
 use rcsr::{
-    backend, data, diagnostics, leakage, multi, qd, search, stability, store, target, walkforward,
+    backend, data, diagnostics, leakage, multi, qd, registry, search, stability, store, target,
+    walkforward,
 };
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -184,6 +185,10 @@ ROW WEIGHTS:
                              prediction or label is read. Refused for metrics
                              with no weighted definition (median, maximum,
                              interquartile, slope, rank_correlation, auc).
+                             On the GPU backend the device scorer carries the
+                             weights for every metric listed above that has a
+                             native scorer; a weighted run is never ranked on
+                             unweighted loss.
 
 DATA PREPARATION (all opt-in; defaults reproduce a plain mean/std run):
   See docs/time-series.md for which preparation steps read ahead.
@@ -247,6 +252,12 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
                              refused rather than guessed)
   --group-by <col>           group column; implies group (with --time: temporal
                              inside each group). Text columns are allowed.
+  --project <n|auto>         choose the variables as a deterministic family-stratified
+                             view of n registered feature columns (24-48, research
+                             cell 96-128; auto = 36), one or two per family, rotated
+                             by --seed and --view. Needs a .rcsb store; not with --vars.
+                             The view id and columns go to --run-manifest
+  --view <k>                 view index for --project (default 0)
   --no-project               load every store column. The default projects the
                              read to --vars, targets, --weight, --time and
                              --group-by when a .rcsb store is read with --vars
@@ -262,6 +273,9 @@ HOW ROWS ARE SPLIT (important for time series and panel data):
 HISTORY AND DELAYED VARIABLES (lags, for forecasting):
   --lags <k>                 add x_lag1..x_lagk as inputs per variable, computed
                              inside each series (group + time order + gaps)
+  --lag-set <k,..|default>  declared lag menu in bars, e.g. 1,4,24,96 (`default`
+                             is that menu): adds x_lag<k> only for the listed k. Instead of
+                             --lags; the run reports nvars before and after
   --history-frac <f>         keep the first fraction of each series as history:
                              those rows supply the past but are not scored
   --gap-break <f>            start a new series when the time step exceeds f x the
@@ -372,6 +386,12 @@ SEARCH:
                              absolute mean residual |mean(y-f)| (a weighted mean
                              with --weight); it has a documented degeneracy: its
                              optimum is a whole manifold at exactly 0.
+                             slope scores the mean absolute error of first
+                             differences over row pairs that are adjacent in the
+                             data order and in the same group (--group-by, or
+                             one group), whatever the split shuffles; fewer
+                             than 32 such training pairs is a usage error that
+                             points at --split temporal.
   --implicit                 fit an implicit relation f(inputs, target) = 0: the
                              target becomes one extra input (normalised with its
                              training mean/std) and the fit target is 0. Plain
@@ -439,7 +459,17 @@ SEARCH:
                              maximum on the device with --fit-strategy gpu,
                              #226/#232/#227)
   --fit-strategy <name>      exact | auto | linear | varpro | stream | gpu (default
-                             exact). `exact` is the historical CPU
+                             gpu where admissible, else exact). With no flag, or
+                             `auto`, the engine resolves the arm once: `gpu`
+                             admitting every candidate with constants for
+                             squared/aic/aicc/bic with fitting on, the GPU
+                             evaluator, device memory for the f64 fit rows and
+                             a run-level cost model that predicts a win; else
+                             `exact` (no flag) or the structural `auto`. Other
+                             resolutions are labelled with their reason on
+                             stderr, in --json (GPU runs), --run-manifest and
+                             the development log. A resume keeps the saved arm.
+                             `exact` is the historical CPU
                              Levenberg–Marquardt path, bit for bit. `auto`
                              dispatches by structure: closed-form QR for trees
                              affine in every constant, variable projection for
@@ -559,7 +589,9 @@ SEARCH:
                              through the exact f64 order-statistic/rank batch
                              scorer (#288) from 4096 rows (a two-valued target
                              for AUC); those statistics are bit-identical to
-                             the CPU for the same prediction vector. Every other
+                             the CPU for the same prediction vector (median and
+                             interquartile use a radix select from 4096 and
+                             65536 rows, rank and auc a sort). Every other
                              metric is *scored* on the CPU with its named
                              refusal, never with a proxy loss; with
                              --fit-strategy gpu its *constants* may still be
@@ -880,6 +912,18 @@ fn ledger_json(
         .map(|(name, n)| format!("{}:{}", jstr(name), n))
         .collect::<Vec<_>>()
         .join(",");
+    let structural_zero = Stage::ALL
+        .iter()
+        .filter(|s| s.structurally_zero_in_search())
+        .map(|s| jstr(s.label()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let outside = [Stage::Io, Stage::Features]
+        .iter()
+        .map(|s| format!("{}:{}", jstr(&format!("{}_s", s.label())), jnum(l.outside_s(*s))))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (by_event, by_host) = l.interval_counts();
     let closure = l.closure_residual();
     let quality = if metric_is_squared {
         l.quality_per_gpu_hour(best_error, baseline_error)
@@ -887,7 +931,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -897,6 +941,11 @@ fn ledger_json(
         jnum(l.device_busy_sum_s()),
         jnum(l.device_overlap_s()),
         l.intervals().len(),
+        jstr(l.interval_basis()),
+        by_event,
+        by_host,
+        structural_zero,
+        outside,
         jnum(a.kernel_s),
         jnum(a.launch_s),
         jnum(a.transfer_s()),
@@ -1016,8 +1065,9 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
+        jstr(g.fit_admission.name()),
         g.fit_screened,
         g.fit_attempts,
         g.fit_gpu,
@@ -1266,13 +1316,14 @@ fn eprint_run_summary(
             }
         );
         eprintln!(
-            "# gpu ledger: wall={:.3}s stages[vary={:.3} eval={:.3} fit={:.3} select={:.3} archive={:.3} host_other={:.3}] unaccounted={:.3}s ({:.2}%) | device_busy={:.3}s intervals={} overlap={:.3}s | fit kernel={:.3}s fallback={:.3}s refits={:.3}s | admitted={} device={} fallback={} [{}]",
+            "# gpu ledger: wall={:.3}s stages[vary={:.3} eval={:.3} fit={:.3} select={:.3} archive={:.3} io={:.3} host_other={:.3}] unaccounted={:.3}s ({:.2}%) | device_busy={:.3}s intervals={} overlap={:.3}s | fit kernel={:.3}s fallback={:.3}s refits={:.3}s | admitted={} device={} fallback={} [{}]",
             ledger.wall_s(),
             ledger.stage_s(rcsr::gpu_stats::Stage::Vary),
             ledger.stage_s(rcsr::gpu_stats::Stage::Eval),
             ledger.stage_s(rcsr::gpu_stats::Stage::Fit),
             ledger.stage_s(rcsr::gpu_stats::Stage::Select),
             ledger.stage_s(rcsr::gpu_stats::Stage::Archive),
+            ledger.stage_s(rcsr::gpu_stats::Stage::Io),
             ledger.stage_s(rcsr::gpu_stats::Stage::HostOther),
             ledger.unaccounted_s(),
             100.0 * if ledger.wall_s() > 0.0 {
@@ -1536,6 +1587,7 @@ fn dev_run_start(
     every: usize,
     max_bytes: u64,
     resumed_from: Option<String>,
+    fit_resolution: Option<(String, String)>,
 ) -> rcsr::devlog::RunStart {
     let (commit, dirty) = manifest::build_info();
     let exe = std::env::current_exe().unwrap_or_default();
@@ -1582,6 +1634,7 @@ fn dev_run_start(
         every,
         max_bytes,
         resumed_from,
+        fit_resolution,
     }
 }
 
@@ -1901,6 +1954,9 @@ fn main() {
     let mut gap_src: Option<String> = None;
     let mut folds = 1usize;
     let mut lags = 0usize;
+    let mut lag_set_src: Option<String> = None;
+    let mut project_src: Option<String> = None;
+    let mut view_index = 0usize;
     let mut history_frac = 0.0f64;
     let mut gap_break = 0.0f64;
     let mut date_only = data::DateOnlyPolicy::Error;
@@ -2237,6 +2293,9 @@ fn main() {
             "--gap" => gap_src = Some(val!()),
             "--folds" => folds = val!().parse().unwrap_or(1).max(1),
             "--lags" => lags = val!().parse().unwrap_or(0),
+            "--lag-set" => lag_set_src = Some(val!()),
+            "--project" => project_src = Some(val!()),
+            "--view" => view_index = val!().parse().unwrap_or(0),
             "--history-frac" => history_frac = val!().parse().unwrap_or(0.0),
             "--gap-break" => gap_break = val!().parse().unwrap_or(0.0),
             // #130: strict time parsing. Every choice is reported.
@@ -2747,6 +2806,15 @@ fn main() {
         );
         std::process::exit(EXIT_USAGE);
     }
+    // #223: the engine resolves the fit arm only when the person did not name
+    // one, or named `auto`. A resume keeps the saved arm.
+    let mut fit_request: Option<fit::FitRequest> = if !fit_strategy_set {
+        Some(fit::FitRequest::Unset)
+    } else if cfg.fit_strategy == fit::FitStrategy::Auto {
+        Some(fit::FitRequest::Auto)
+    } else {
+        None
+    };
     // #223 + #229 + #222: an explicit `--fit-strategy gpu` asks for the batched
     // GPU LM, which minimises squared error, log-squashed loss or mean absolute
     // error. Refuse a metric with no native device objective instead of
@@ -2795,6 +2863,19 @@ fn main() {
         eprintln!("error: --implicit cannot be combined with --cv (not implemented yet)");
         eprintln!("  cross-validation rebuilds each fold from the raw table, without the implicit input");
         std::process::exit(EXIT_USAGE);
+    }
+    if cfg.metric == Metric::Slope {
+        for (present, flag) in [
+            (bootstrap_resamples > 0, "--bootstrap-error"),
+            (stability_runs > 0, "--stability"),
+            (cv_mode.is_some(), "--cv"),
+        ] {
+            if present {
+                eprintln!("error: --metric slope cannot be combined with {}", flag);
+                eprintln!("  slope differences rows that are adjacent in the data order; resampled or refolded rows have no such order");
+                std::process::exit(EXIT_USAGE);
+            }
+        }
     }
     if implicit_mode && bootstrap_resamples > 0 {
         eprintln!("error: --implicit cannot be combined with --bootstrap-error (not implemented yet)");
@@ -2996,6 +3077,7 @@ fn main() {
         }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
+        fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
         resume_checkpoint = Some(cp);
@@ -3144,6 +3226,7 @@ fn main() {
             (require_validation, "--require-validation"),
             (null_block > 0, "--null-block"),
             (bootstrap_resamples > 0, "--bootstrap-error"),
+            (cfg.metric == Metric::Slope, "--metric slope (its row pairs follow one target column)"),
             (stability_runs > 0, "--stability"),
             (report.is_some(), "--report"),
             (run_manifest_path.is_some(), "--run-manifest"),
@@ -3218,6 +3301,27 @@ fn main() {
     // #294: the resolved read projection used by this run, recorded in the
     // manifest. `None` means the historical full-column load.
     let mut store_projection: Option<store::Projection> = None;
+    let mut view_record: Option<registry::View> = None;
+    let lag_menu: Vec<usize> = match &lag_set_src {
+        Some(s) => {
+            if lags > 0 {
+                eprintln!("error: --lags and --lag-set are alternatives; give one");
+                std::process::exit(EXIT_USAGE);
+            }
+            match registry::parse_lag_menu(s) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_USAGE);
+                }
+            }
+        }
+        None => Vec::new(),
+    };
+    if project_src.is_some() && !store::is_store_path(&data_path) {
+        eprintln!("error: --project needs a .rcsb store with registered feature columns");
+        std::process::exit(EXIT_USAGE);
+    }
     let table = if data_path == "-" {
         // #126: stdin cannot be reopened for the streaming parser's two passes,
         // so spool it to a temporary file. A whole-file `String` is never built.
@@ -3248,6 +3352,58 @@ fn main() {
     } else if store::is_store_path(&data_path) {
         match store::FileStore::open(&data_path) {
             Ok(fs) => {
+                // #260: a --project view fixes --vars from the registry; a store
+                // with a schema sidecar refuses a name it does not list.
+                if let Some(src) = &project_src {
+                    if !vars.is_empty() {
+                        eprintln!("error: --project selects the variables; do not combine it with --vars");
+                        std::process::exit(EXIT_USAGE);
+                    }
+                    let size = if src == "auto" {
+                        registry::DEFAULT_VIEW_SIZE
+                    } else {
+                        src.parse().unwrap_or_else(|_| {
+                            eprintln!("error: --project takes a view size or auto, got '{}'", src);
+                            std::process::exit(EXIT_USAGE);
+                        })
+                    };
+                    let excluded: Vec<&str> = target_names
+                        .iter()
+                        .map(|s| s.as_str())
+                        .chain(time_name.as_deref())
+                        .chain(group_name.as_deref())
+                        .chain(weight_name.as_deref())
+                        .collect();
+                    let candidates: Vec<String> = fs
+                        .header()
+                        .columns()
+                        .iter()
+                        .filter(|c| c.numeric && !excluded.contains(&c.name.as_str()))
+                        .map(|c| c.name.clone())
+                        .collect();
+                    match registry::select_view(&candidates, size, cfg.seed as u64, view_index) {
+                        Ok(v) => {
+                            eprintln!(
+                                "view {}: {} columns from {} families (seed {}, view {})",
+                                v.id,
+                                v.columns.len(),
+                                v.families.len(),
+                                v.seed,
+                                v.view
+                            );
+                            vars = v.columns.clone();
+                            view_record = Some(v);
+                        }
+                        Err(e) => {
+                            eprintln!("error: {}", e);
+                            std::process::exit(EXIT_INPUT);
+                        }
+                    }
+                }
+                if let Err(e) = registry::check_vars(&data_path, &vars) {
+                    eprintln!("error: {}", e);
+                    std::process::exit(EXIT_INPUT);
+                }
                 // #112: project from the header before reading a group. The
                 // search copies only variables, targets and the weight; time
                 // and group are scanned during preparation.
@@ -3331,7 +3487,10 @@ fn main() {
                     scan_cols,
                     projection: store_projection.as_ref().map(|p| p.indices()),
                     gpu: cfg.gpu,
-                    gpu_fit: cfg.gpu && cfg.fit_iters > 0 && cfg.fit_strategy.defers_to_gpu(),
+                    gpu_fit: cfg.gpu
+                        && cfg.fit_iters > 0
+                        && (cfg.fit_strategy.defers_to_gpu()
+                            || (fit_request.is_some() && cfg.metric.is_least_squares())),
                     mutable_prep,
                     simd: cfg.simd,
                 };
@@ -3436,6 +3595,7 @@ fn main() {
             std::process::exit(EXIT_INPUT);
         }
     };
+    let table_loaded_s = run_start.elapsed().as_secs_f64();
 
     // Weights are either applied or refused: never silently dropped. This runs
     // after the table is read so a piped input is consumed before a usage error.
@@ -3786,7 +3946,7 @@ fn main() {
     // `time_col`/`group_col` stay valid. The leading rows of each series become
     // history: they supply the past for later rows but are not scored.
     let mut lag_report = data::LagReport::default();
-    let table = if lags > 0 || history_frac > 0.0 {
+    let table = if lags > 0 || !lag_menu.is_empty() || history_frac > 0.0 {
         let lag_spec = data::LagSpec {
             lags,
             history_frac,
@@ -3797,8 +3957,15 @@ fn main() {
                 tz,
             },
         };
-        match data::add_lags(&table, &vars, &lag_spec, time_col, group_col) {
+        let lagged = if lag_menu.is_empty() {
+            data::add_lags(&table, &vars, &lag_spec, time_col, group_col)
+        } else {
+            data::add_lags_menu(&table, &vars, &lag_spec, &lag_menu, time_col, group_col)
+        };
+        match lagged {
             Ok((t2, v2, rep)) => {
+                eprintln!("nvars {} -> {}", rep.nvars_before, rep.nvars_after);
+                notes.push(format!("nvars {} -> {}", rep.nvars_before, rep.nvars_after));
                 lag_report = rep;
                 vars = v2;
                 t2
@@ -3893,6 +4060,7 @@ fn main() {
         && !multi_output
         && !implicit_mode
         && lags == 0
+        && lag_menu.is_empty()
         && history_frac == 0.0
         && prep.fill == data::FillMethod::None
         && prep.outlier_iqr.is_none()
@@ -3932,6 +4100,20 @@ fn main() {
         }
     };
     notes.extend(prepared.report.notes.iter().cloned());
+    let prepared_s = run_start.elapsed().as_secs_f64();
+    if cfg.metric == Metric::Slope {
+        match prepared.require_slope_pairs() {
+            Ok(pairs) => notes.push(format!(
+                "slope: differencing {} adjacent-row pair(s) among {} training row(s)",
+                pairs,
+                prepared.train.len()
+            )),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                std::process::exit(EXIT_USAGE);
+            }
+        }
+    }
 
     // #254: the zero-parameter rung and, under the override, the proxy table.
     let target_active: Option<target::Active> = match (target_resolved.take(), target_check.take()) {
@@ -4250,6 +4432,35 @@ fn main() {
     }
     let effective_backend = search::effective_backend(&cfg, &prepared.train);
 
+    // #223: resolve the fit arm once, before the memory plan and the run
+    // records. A CPU-only run keeps today's arm and prints nothing new.
+    let fit_resolution: Option<fit::FitResolution> = fit_request
+        .map(|request| search::resolve_fit_strategy(&cfg, &prepared.train, request));
+    if let Some(r) = &fit_resolution {
+        cfg.fit_strategy = r.strategy;
+        cfg.fit_admission = r.admission;
+        if !quiet && effective_backend == Backend::Gpu {
+            if r.strategy == fit::FitStrategy::Gpu {
+                eprintln!(
+                    "# gpu-fit: {} -> gpu ({}, admit {})",
+                    r.source,
+                    cfg.metric.name(),
+                    r.admission.name()
+                );
+            } else {
+                eprintln!(
+                    "# gpu-fit: {} -> {} ({})",
+                    r.source,
+                    r.strategy.name(),
+                    r.reason
+                );
+            }
+        }
+    }
+    let fit_provenance: Option<(String, String)> = fit_resolution
+        .as_ref()
+        .map(|r| (r.source.to_string(), r.reason.clone()));
+
     // Seed expressions are written in original units, like `--eval-expr`, and
     // rewritten into the search's normalised-input space before they enter the
     // population. A syntax error is a usage error and keeps the parser's
@@ -4349,12 +4560,16 @@ fn main() {
         );
         let mut m = m;
         m.start_utc = run_start_utc.clone();
+        m.fit_resolution = fit_provenance.clone();
         if let Some(p) = &store_projection {
             m.projection = Some(manifest::ProjectionRecord {
                 hash: p.hash_hex(),
                 columns: p.names(),
                 indices: p.indices(),
             });
+        }
+        if let Some(v) = &view_record {
+            m.view = Some(v.json());
         }
         if let Some(a) = &target_active {
             m.target_spec = Some((
@@ -4641,6 +4856,7 @@ fn main() {
                         dev_every,
                         dev_log_max_bytes,
                         resume_path.clone(),
+                        fit_provenance.clone(),
                     );
                     sink.write(&rcsr::devlog::run_start_json(&info), true);
                     if !quiet {
@@ -4775,13 +4991,18 @@ fn main() {
             |_| {},
         )
     };
-    let outcome = match outcome_result {
+    let mut outcome = match outcome_result {
         Ok(outcome) => outcome,
         Err(e) => {
             eprintln!("error: {}", e);
             std::process::exit(EXIT_INPUT);
         }
     };
+    if let Some(g) = outcome.gpu.as_mut() {
+        g.ledger.record_outside(rcsr::gpu_stats::Stage::Io, table_loaded_s);
+        g.ledger
+            .record_outside(rcsr::gpu_stats::Stage::Features, prepared_s - table_loaded_s);
+    }
     let search_seconds = search_start.elapsed().as_secs_f64();
     // #211: close the development log now that the search has returned: the
     // final archive, the stop reason, the wall and the process peak RSS. It is
@@ -5304,6 +5525,7 @@ fn main() {
                 y,
                 w: prepared.train.w.clone(),
                 ys: Vec::new(),
+                pairs: None,
             };
             let out = search::run(&cfg, &shuffled, &shuffled);
             let b = out
@@ -5778,7 +6000,7 @@ fn main() {
                 String::new()
             };
             let split_json = format!(
-                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
+                "{{\"mode\":{},\"rows\":{},\"train_rows\":{}{},\"test_rows\":{},\"folds\":[{}],\"gap\":{},\"excluded\":{},\"overlap\":{},\"unassigned\":{},\"groups_total\":{},\"groups_train\":{},\"groups_test\":{},\"lags\":{},\"lag_menu\":[{}],\"nvars_before\":{},\"nvars_after\":{},\"series\":{},\"history_rows\":{},\"notes\":[{}]{}}}",
                 jstr(prepared.report.mode),
                 prepared.report.rows_total,
                 prepared.train.len(),
@@ -5798,6 +6020,9 @@ fn main() {
                 prepared.report.groups_train,
                 prepared.report.groups_test,
                 lag_report.lags,
+                lag_report.menu.iter().map(|k| k.to_string()).collect::<Vec<_>>().join(","),
+                lag_report.nvars_before,
+                lag_report.nvars_after,
                 lag_report.series,
                 lag_report.history_rows,
                 notes.iter().map(|n| jstr(n)).collect::<Vec<_>>().join(","),
@@ -6029,7 +6254,20 @@ fn main() {
                 .iter()
                 .map(|r| r.train_error)
                 .fold(f64::INFINITY, f64::min);
-            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact && outcome.fit_rows == 0 {
+            // #223: the resolution is reported when the device ran the search,
+            // so a CPU-backend run keeps the historical object.
+            let fit_provenance_json = match (&fit_provenance, outcome.backend.name()) {
+                (Some((source, reason)), "gpu") => format!(
+                    ",\"strategy_source\":{},\"strategy_reason\":{}",
+                    jstr(source),
+                    jstr(reason)
+                ),
+                _ => String::new(),
+            };
+            let fitting_json = if cfg.fit_strategy == fit::FitStrategy::Exact
+                && outcome.fit_rows == 0
+                && fit_provenance_json.is_empty()
+            {
                 // #116: the historical default JSON stays byte-identical; the
                 // portfolio fields appear when a non-default arm or fit-row
                 // screen is in use.
@@ -6040,12 +6278,13 @@ fn main() {
                 )
             } else {
                 format!(
-                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}}}",
+                    "{{\"loss\":{},\"value\":{},\"strategy\":{},\"fit_rows\":{},\"gpu_batches\":{}{}}}",
                     jstr(cfg.metric.name()),
                     jnum(best_fit_loss),
                     jstr(cfg.fit_strategy.name()),
                     outcome.fit_rows,
-                    fit::fit_arm_counts_full().since(fit_before).gpu
+                    fit::fit_arm_counts_full().since(fit_before).gpu,
+                    fit_provenance_json
                 )
             };
             // #141: report the backend that actually guided the search, with
@@ -6874,7 +7113,7 @@ fn run_eval(
 
     let score = |s: &data::Sample| -> f64 {
         let pred: Vec<f64> = s.x.iter().map(|r| expr::eval(&tree, &raw_row(r))).collect();
-        metrics::score_weighted(&pred, &s.y, &s.w, metric, k)
+        metrics::score_sample(&pred, s, metric, k)
     };
     let train_error = score(&prepared.train);
     // One test block leaves `fold_samples` empty (#133): score the test block.
@@ -8496,6 +8735,12 @@ OPTIONS:
                              the threshold rule bit for bit)
   --min-hold <n>             minimum consecutive long rows before a band exit
                              (default 1; requires --policy band)
+  --gpu                      run the --policy band/cooldown scan and the --policy
+                             dp hindsight scan on the CUDA device. The result is
+                             bit-identical to the CPU scan; when the device
+                             refuses (no device, non-CUDA build, allocation),
+                             the CPU scan runs and band/hindsight_bound carry
+                             backend=cpu and fallback_reason
   --validation-frac <f>      trailing fraction of the training time range used to
                              set the threshold instead of all training rows
                              (default 0: use all training rows)
@@ -8555,6 +8800,7 @@ fn run_walkforward(args: &[String]) -> ! {
     let mut policy = walkforward::Policy::Threshold;
     let mut band_width = 0.0f64;
     let mut min_hold = 1usize;
+    let mut gpu = false;
     let mut validation_frac = 0.0f64;
     let mut periods_per_year: Option<f64> = None;
     let mut pool_reset_flat = false;
@@ -8696,6 +8942,7 @@ fn run_walkforward(args: &[String]) -> ! {
             }
             "--pool-reset-flat" => pool_reset_flat = true,
             "--device-pnl" => device_pnl = true,
+            "--gpu" => gpu = true,
             "--control-seed" => {
                 let src = need(args, i + 1, "--control-seed");
                 control_seed = match src.parse::<u64>() {
@@ -8886,6 +9133,7 @@ fn run_walkforward(args: &[String]) -> ! {
         policy,
         band_width,
         min_hold,
+        gpu,
     };
     let report = match walkforward::run_path(&data_path, &spec) {
         Ok(r) => r,
@@ -8894,6 +9142,18 @@ fn run_walkforward(args: &[String]) -> ! {
             std::process::exit(EXIT_INPUT);
         }
     };
+    for w in &report.windows {
+        let reasons = [
+            w.band.as_ref().and_then(|b| b.fallback_reason.as_deref()),
+            w.hindsight_bound.as_ref().and_then(|h| h.fallback_reason.as_deref()),
+        ];
+        for reason in reasons.into_iter().flatten() {
+            eprintln!(
+                "note: window '{}': --gpu scan ran on the CPU: {}",
+                w.window.label, reason
+            );
+        }
+    }
     let wrote_out = out.is_some();
     let wrote_markdown = markdown.is_some();
     if let Some(path) = out {
@@ -9834,6 +10094,7 @@ mod tests {
             y: vec![0.0, 2.0],
             w: Vec::new(),
             ys: Vec::new(),
+            pairs: None,
         };
         // SSE = 2, n = 2 -> MSE = 1.
         assert!((gpu_baseline_error(&train) - 1.0).abs() < 1e-12);

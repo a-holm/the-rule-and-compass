@@ -41,6 +41,7 @@ fn sample(n: usize, seed: u32, binary: bool) -> Sample {
         y,
         w: Vec::new(),
         ys: Vec::new(),
+        pairs: None,
     }
 }
 

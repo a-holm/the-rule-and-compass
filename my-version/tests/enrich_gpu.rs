@@ -319,6 +319,143 @@ fn gpu_cross_section_ranks_are_exact_and_chunk_invariant() {
     assert_eq!(gpu.gpu_fallback, 0);
 }
 
+/// #295 AC1/AC4: device rank edge cases on a small hand-built panel.
+///
+/// Timestamp classes by `i % 5`: 0 has 19 finite PIT members (five finite
+/// non-members), 1 has exactly 20 (four finite non-members), 2 has 19 (five NaN sources), 3 carries a
+/// `+0.0`/`-0.0` pair, 4 is plain. The rank path has no symbol-batch knob (it
+/// ranks every symbol of a timestamp in one `rc_enrich_xs_rank` call), so the
+/// partition check varies the segment layout instead.
+#[test]
+fn gpu_cross_section_rank_edge_cases() {
+    use rcsr::enrich_gpu::EnrichGpu;
+
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let symbols = 24usize;
+    let steps = 40usize;
+    let n = symbols * steps;
+    let mut times = Vec::with_capacity(n);
+    let mut sym = Vec::with_capacity(n);
+    let mut member = Vec::with_capacity(n);
+    let mut src = vec![0.0f64; n];
+    for k in 0..symbols {
+        for i in 0..steps {
+            times.push(1_700_000_000i64 + i as i64 * 900);
+            sym.push(k as u32);
+            member.push(!((i % 5 == 0 && k >= 19) || (i % 5 == 1 && k >= 20)));
+            let distinct = ((k * 7 + i * 3) % 29) as f64 / 10.0 + 0.05;
+            src[k * steps + i] = match (i % 5, k) {
+                (2, 19..) => f64::NAN,
+                (3, 0) => 0.0,
+                (3, 1) => -0.0,
+                (3, 2) => 0.0,
+                _ => distinct,
+            };
+        }
+    }
+    let close = vec![100.0f64; n];
+    let zeros = vec![0.0f64; n];
+    let open = |seg_start: &[u32], seg_len: &[u32]| {
+        EnrichGpu::new(
+            &times, &close, &close, &close, &close, &zeros, &zeros, seg_start, seg_len, 900,
+        )
+        .expect("CUDA context")
+    };
+    let whole_start: Vec<u32> = (0..symbols).map(|k| (k * steps) as u32).collect();
+    let whole_len = vec![steps as u32; symbols];
+
+    // Reference: the host `(time, symbol, row)` tie order of `rank_in_order`.
+    let reference = |src: &[f64]| {
+        let mut out = vec![f64::NAN; n];
+        for i in 0..steps {
+            let mut g: Vec<usize> = (0..symbols)
+                .map(|k| k * steps + i)
+                .filter(|&r| src[r].is_finite() && member[r])
+                .collect();
+            g.sort_by(|&a, &b| {
+                src[a].partial_cmp(&src[b]).unwrap().then(sym[a].cmp(&sym[b])).then(a.cmp(&b))
+            });
+            if g.len() >= 20 {
+                for (rank, &r) in g.iter().enumerate() {
+                    out[r] = 2.0 * rank as f64 / (g.len() - 1) as f64 - 1.0;
+                }
+            }
+        }
+        out
+    };
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+
+    let mut gpu = open(&whole_start, &whole_len);
+    assert!(gpu.prepare_cross_section(&sym, Some(&member)));
+    let got = gpu.rank(&src).expect("device rank");
+    let want = reference(&src);
+    for (r, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            w.to_bits(),
+            "symbol {} timestamp {}: device {g:?}, host {w:?}",
+            r / steps,
+            r % steps
+        );
+    }
+
+    // Fewer than 20 finite PIT members: every row of the timestamp is NaN.
+    for i in (0..steps).filter(|i| i % 5 == 0 || i % 5 == 2) {
+        for k in 0..symbols {
+            assert!(got[k * steps + i].is_nan(), "timestamp {i} symbol {k} ranked with 19 members");
+        }
+    }
+    // Exactly 20 members still rank, spanning -1 to +1.
+    for i in (0..steps).filter(|i| i % 5 == 1) {
+        let r: Vec<f64> = (0..symbols).map(|k| got[k * steps + i]).filter(|v| v.is_finite()).collect();
+        assert_eq!(r.len(), 20);
+        assert_eq!(r.iter().cloned().fold(f64::INFINITY, f64::min), -1.0);
+        assert_eq!(r.iter().cloned().fold(f64::NEG_INFINITY, f64::max), 1.0);
+    }
+
+    // +0.0 and -0.0 are one tie, broken by symbol order, never by sign.
+    let swapped: Vec<f64> = src
+        .iter()
+        .enumerate()
+        .map(|(r, &v)| match (r % steps % 5, r / steps) {
+            (3, 0) => -0.0,
+            (3, 1) => 0.0,
+            _ => v,
+        })
+        .collect();
+    let swapped_ranks = gpu.rank(&swapped).expect("device rank");
+    assert_eq!(bits(&swapped_ranks), bits(&got), "the sign of zero changed a rank");
+    for i in (0..steps).filter(|i| i % 5 == 3) {
+        for k in 0..3 {
+            assert_eq!(
+                got[k * steps + i],
+                2.0 * k as f64 / 23.0 - 1.0,
+                "timestamp {i}: zero of symbol {k} is not tie position {k}"
+            );
+        }
+    }
+
+    // Segment partition: the permutation is keyed by symbol and time, so a
+    // different segment layout must not change a bit.
+    let mut half_start = Vec::new();
+    let mut half_len = Vec::new();
+    for k in 0..symbols {
+        let h = steps / 2;
+        half_start.extend([(k * steps) as u32, (k * steps + h) as u32]);
+        half_len.extend([h as u32, (steps - h) as u32]);
+    }
+    let mut split = open(&half_start, &half_len);
+    assert!(split.prepare_cross_section(&sym, Some(&member)));
+    assert_eq!(
+        bits(&split.rank(&src).expect("device rank")),
+        bits(&got),
+        "segment partition changed a rank"
+    );
+}
+
 /// #295 paired measurement: the cross-section stage (`xs_seconds`) of the same
 /// PIT panel with `--gpu off` (host sorts) and `--gpu on` (one device
 /// permutation plus segmented sorts). `RCSR_XS_SYMBOLS` and `RCSR_XS_ROWS` size
@@ -770,4 +907,48 @@ fn batch_output_matches_per_column_downloads() {
         delta.d2h_s * 1e3,
         delta.kernel_s * 1e3
     );
+}
+
+extern "C" {
+    fn rc_enrich_test_force_cub_fail(on: i32);
+}
+
+/// #410: a refused CUB call in the cross-section sort reports failure, so the
+/// caller keeps the CPU path, and the next call on the same context works.
+#[test]
+fn refused_cub_sort_fails_cross_section_prepare_then_recovers() {
+    use rcsr::enrich_gpu::EnrichGpu;
+
+    if !rcsr::gpu::probe().available() {
+        eprintln!("skipping: no CUDA device");
+        return;
+    }
+    let (symbols, steps) = (24usize, 40usize);
+    let n = symbols * steps;
+    let mut times = Vec::with_capacity(n);
+    let mut sym = Vec::with_capacity(n);
+    for k in 0..symbols {
+        for i in 0..steps {
+            times.push(1_700_000_000i64 + i as i64 * 900);
+            sym.push(k as u32);
+        }
+    }
+    let close = vec![100.0f64; n];
+    let zeros = vec![0.0f64; n];
+    let seg_start: Vec<u32> = (0..symbols).map(|k| (k * steps) as u32).collect();
+    let seg_len = vec![steps as u32; symbols];
+    let mut gpu = EnrichGpu::new(
+        &times, &close, &close, &close, &close, &zeros, &zeros, &seg_start, &seg_len, 900,
+    )
+    .expect("CUDA context");
+    let src: Vec<f64> = (0..n).map(|i| (i % 29) as f64).collect();
+
+    unsafe { rc_enrich_test_force_cub_fail(1) };
+    let refused = gpu.prepare_cross_section(&sym, None);
+    unsafe { rc_enrich_test_force_cub_fail(0) };
+    assert!(!refused, "a refused CUB sort must fail the prepare");
+    assert!(gpu.rank(&src).is_none(), "no permutation may survive a failed prepare");
+
+    assert!(gpu.prepare_cross_section(&sym, None), "no error may stay pending");
+    assert!(gpu.rank(&src).is_some());
 }

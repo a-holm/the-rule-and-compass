@@ -134,16 +134,22 @@ choice, not a theorem.
 
 ## Weights on the CUDA evaluator
 
-The device evaluator carries the per-row weight vector and the classification
-label sign, uploaded once per sample (#289). A classification run therefore
-keeps its weights when the search is scored on the device: the kernel returns
-`Σ wᵢ·lossᵢ`, the host divides by `Σw`, and the zero-weight skip happens
-**before the program runs**, so a masked row with an undefined branch is never
-evaluated. The device value is the search fitness only; every reported number
-is the exact CPU `f64` rebuild of the same weighted mean. The weighted
-**regression** kernels are not part of #289: a weighted `squared`, `absolute`
-or `log_squashed` run still keeps the CPU evaluator, and the backend note names
-the reason rather than dropping the weights.
+The device evaluator carries the per-row weight vector, uploaded once per
+sample, and the classification label sign. A weighted run keeps its weights
+when the search is scored on the device: the kernel returns `Σ wᵢ·termᵢ`, the
+host divides by `Σw`, and the zero-weight skip happens **before the program
+runs**, so a masked row with an undefined branch is never evaluated. This holds
+for every native metric with a weighted form: `absolute`, `squared`,
+`log_squashed`, `signed`, `correlation`, `correlation_signed`, `aic`, `aicc`,
+`bic` and the classification family. `signed` is `|Σ wᵢ·rᵢ| / Σw`. The
+correlations use the weighted means and weighted centred moments of the CPU
+definition (the target side is computed once per sample). The information
+criteria use the weighted RSS and the count of positive-weight rows as `n`.
+The device value is the search fitness only; every reported number is the exact
+CPU `f64` rebuild of the same weighted score. `maximum` has no weighted form
+and keeps a labelled refusal. Device and CPU agree to 1e-12 relative for the
+mean-type and information-criterion scores and to 1e-9 for the correlations,
+the same tiers as the unweighted scores.
 
 ## What else is weighted, and what is not
 
