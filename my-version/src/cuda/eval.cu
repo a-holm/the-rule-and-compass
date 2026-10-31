@@ -2222,7 +2222,10 @@ __device__ double ft_loss(const unsigned int *nd,
 
 /* Damped Cholesky solve in f64. Returns 0 on success, 4 when the *undamped*
  * normal equations are rank deficient but the damped step was still solved,
- * and 1 when no finite step can be produced.
+ * and 1 when no finite step can be produced. A slot whose diagonal is exactly
+ * 0 has a zero adjoint on every active row: it is frozen (identity row and
+ * column, zero right-hand side, zero step) and the others are still fitted, as
+ * the CPU ridge solve does. A negative or non-finite diagonal is status 1.
  *
  * #286: every arm uses the scale-free `ln det Ã = 2Σ ln L_ii − Σ ln A_ii`
  * gate on `Ã = D^{-1/2} A D^{-1/2}`, with `D = diag(JᵀJ)`. The old absolute
@@ -2247,8 +2250,14 @@ __device__ int ft_solve(const double *jtj,
 {
     (void)scale_free; /* #286: the scale-free gate is universal now. */
     double dscale[MAXC];
+    bool frozen[MAXC];
     for (int i = 0; i < p; ++i) {
         const double aii = jtj[i * (i + 1) / 2 + i];
+        frozen[i] = (aii == 0.0);
+        if (frozen[i]) {
+            dscale[i] = 1.0;
+            continue;
+        }
         if (!(aii > 0.0) || !isfinite(aii)) return 1;
         dscale[i] = sqrt(aii);
     }
@@ -2262,7 +2271,8 @@ __device__ int ft_solve(const double *jtj,
     int ok = 1;
     for (int i = 0; i < p && ok; ++i) {
         for (int j = 0; j <= i; ++j) {
-            double s = jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
+            double s = (frozen[i] || frozen[j]) ? (i == j ? 1.0 : 0.0)
+                                                  : jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
             if (!isfinite(s)) return 1;
             for (int k = 0; k < j; ++k) s -= L[i * p + k] * L[j * p + k];
             if (i == j) {
@@ -2287,8 +2297,9 @@ __device__ int ft_solve(const double *jtj,
     /* Damped factorisation of the equilibrated system for the step itself. */
     for (int i = 0; i < p; ++i) {
         for (int j = 0; j <= i; ++j) {
-            double s = jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
-            if (i == j) s = s * (1.0 + lambda) + 1e-12;
+            double s = (frozen[i] || frozen[j]) ? (i == j ? 1.0 : 0.0)
+                                                  : jtj[i * (i + 1) / 2 + j] / (dscale[i] * dscale[j]);
+            if (i == j && !frozen[i]) s = s * (1.0 + lambda) + 1e-12;
             for (int k = 0; k < j; ++k) s -= L[i * p + k] * L[j * p + k];
             if (i == j) {
                 if (!(s > 1e-18) || !isfinite(s)) return 1;
@@ -2299,7 +2310,7 @@ __device__ int ft_solve(const double *jtj,
         }
     }
     double rhs[MAXC];
-    for (int i = 0; i < p; ++i) rhs[i] = -jtr[i] / dscale[i];
+    for (int i = 0; i < p; ++i) rhs[i] = frozen[i] ? 0.0 : -jtr[i] / dscale[i];
     for (int i = 0; i < p; ++i) {
         double s = rhs[i];
         for (int k = 0; k < i; ++k) s -= L[i * p + k] * rhs[k];
