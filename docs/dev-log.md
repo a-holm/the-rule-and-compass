@@ -72,7 +72,7 @@ overrides the cadence at either level.
 4. otherwise the working directory (`./rcsr.dev.ndjson`).
 
 A launcher that runs several windows must name one log per run — the tracked
-launchers do (`scripts/run-long.sh`, `scripts/launch-windows.py` write
+launchers do (`scripts/run-long.sh`, `rcsr-launch` write
 `<label>.dev.ndjson`) and `tests/launchers.rs` enforces it. A failure to open an
 explicit `--dev-log` path is an input error (exit 3); a failure to open the
 *default* path is a warning and the search runs on without a log, so a read-only
@@ -407,7 +407,7 @@ tail -f runs/btc-usd-2019h1.dev.ndjson        # watch it (summary level)
 rcsr dev-report runs/btc-usd-2019h1.dev.ndjson   # explain it
 ```
 
-`scripts/run-long.sh` and `scripts/launch-windows.py` name one
+`scripts/run-long.sh` and `rcsr-launch` name one
 `<label>.dev.ndjson` per run at `summary` level. The old scratch
 `monitor_10h.py` was never part of the documented flow; it is tracked for
 deletion in #200. What the engine log does **not** replace is 1 Hz *process*

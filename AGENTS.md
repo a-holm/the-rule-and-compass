@@ -50,6 +50,7 @@ Run long jobs under `scripts/stall-watch.sh -- <command>`: on a stall it writes 
 * Keep build output, datasets and local scratch out of git. `.gitignore` and the
   local exclude file handle the usual directories — do not add them to a commit.
 * Measure performance claims and record the before/after numbers in the issue.
+* Rust only. No Python files, no `python3` calls in tests, scripts, docs or workflows. Experiments, reference computations, fixtures and measurement tools are written in Rust; Python's runtime and library behaviour do not show what the Rust code does. The guard is `my-version/tests/no_python.rs`.
 
 ## Style
 
