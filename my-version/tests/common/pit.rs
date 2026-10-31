@@ -74,44 +74,10 @@ pub fn membership_block(seed: u64, nseg: usize, rows_per_seg: usize) -> PitBlock
     b
 }
 
-/// Random MTF-style block: `tf`-aligned higher bars with missing buckets.
-pub fn mtf_block(seed: u64, nseg: usize, rows_per_seg: usize, tf: i64) -> PitBlock {
-    let mut rng = Lcg(seed);
-    let mut b = PitBlock::default();
-    for _ in 0..nseg {
-        let start = b.times.len() as u32;
-        let leaf_start = b.keys.len() as u32;
-        let t0 = 1_600_000_000i64 + (rng.below(500) as i64) * 900;
-        let mut t = t0;
-        for _ in 0..rows_per_seg {
-            let r = rng.below(100);
-            t += if r < 6 { 900 * (1 + rng.below(30) as i64) } else { 900 };
-            b.times.push(t);
-            b.chain.push(0);
-        }
-        let end = *b.times.last().unwrap();
-        let mut h = (t0 / tf) * tf - tf * 2;
-        while h + tf <= end + tf {
-            if rng.below(10) != 0 {
-                b.keys.push(h);
-                b.member.push(1);
-            }
-            h += tf;
-        }
-        b.segments.push(PitSegment {
-            start,
-            len: rows_per_seg as u32,
-            leaf_start,
-            leaf_len: b.keys.len() as u32 - leaf_start,
-        });
-    }
-    b
-}
-
-/// The sub-block with rows `ts <= cut` and leaves not yet visible
-/// (`key + delay > cut`) removed. The leaves removed lie in the future of every
+/// The sub-block with rows `ts <= cut` and decisions not yet visible
+/// (`key > cut`) removed. The leaves removed lie in the future of every
 /// remaining row.
-pub fn prefix(block: &PitBlock, cut: i64, delay: i64) -> PitBlock {
+pub fn prefix(block: &PitBlock, cut: i64) -> PitBlock {
     let mut out = PitBlock::default();
     for s in &block.segments {
         let start = out.times.len() as u32;
@@ -123,7 +89,7 @@ pub fn prefix(block: &PitBlock, cut: i64, delay: i64) -> PitBlock {
             }
         }
         for j in s.leaf_start as usize..(s.leaf_start + s.leaf_len) as usize {
-            if block.keys[j] + delay <= cut {
+            if block.keys[j] <= cut {
                 out.keys.push(block.keys[j]);
                 out.member.push(block.member[j]);
             }
@@ -161,8 +127,6 @@ pub fn assert_prefix_equal(
             let fk = (full.leaf[fr] >= 0).then(|| full_block.keys[full.leaf[fr] as usize]);
             let pk = (pre.leaf[p] >= 0).then(|| pre_block.keys[pre.leaf[p] as usize]);
             assert_eq!(fk, pk, "{label}: visible key at row {p}");
-            assert_eq!(full.age[fr].to_bits(), pre.age[p].to_bits(), "{label}: age at {p}");
-            assert_eq!(full.fresh[fr], pre.fresh[p], "{label}: fresh at {p}");
             assert_eq!(full.keep[fr], pre.keep[p], "{label}: keep at {p}");
             assert_eq!(full.as_of[fr], pre.as_of[p], "{label}: as_of at {p}");
             assert_eq!(full.gap[fr], pre.gap[p], "{label}: gap at {p}");
@@ -175,12 +139,6 @@ pub fn assert_prefix_equal(
 
 pub fn assert_same(label: &str, a: &PitOutput, b: &PitOutput) {
     assert_eq!(a.leaf, b.leaf, "{label}: leaf");
-    assert_eq!(
-        a.age.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        b.age.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-        "{label}: age bits"
-    );
-    assert_eq!(a.fresh, b.fresh, "{label}: fresh");
     assert_eq!(a.keep, b.keep, "{label}: keep");
     assert_eq!(a.found, b.found, "{label}: found");
     assert_eq!(a.as_of, b.as_of, "{label}: as_of");
@@ -202,10 +160,6 @@ pub fn digest(o: &PitOutput) -> u64 {
     for v in &o.leaf {
         eat(&v.to_le_bytes());
     }
-    for v in &o.age {
-        eat(&v.to_bits().to_le_bytes());
-    }
-    eat(&o.fresh);
     eat(&o.keep);
     eat(&o.found);
     for v in &o.as_of {
