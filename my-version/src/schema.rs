@@ -59,6 +59,7 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--gap", "rows-or-time", "0", "embargo between train and test; an integer is rows, 90m/1.5h/30s/2d is wall time converted by ceil(seconds/median_dt); dropped with a warning under explicit row selection"),
         ("--folds", "int", "1", "contiguous test blocks to report"),
         ("--lags", "int", "0", "delayed copies per input (time-delay embedding)"),
+        ("--lag-set", "csv", "none", "declared lag menu in bars instead of --lags, e.g. 1,4,24,96 or default (1,4,24,96): adds x_lag<k> only for the listed k; the split report and stderr give nvars before and after"),
         ("--history-frac", "float", "0", "fraction of each series kept as history"),
         ("--gap-break", "float", "0", "new series when dt exceeds f x median dt"),
         ("--null-runs", "int", "0", "y-randomisation control runs (shuffled targets)"),
@@ -121,6 +122,8 @@ pub const OPTIONS: &[(&str, &str, &str, &str)] = &[
         ("--allow-backend-change", "flag", "false", "permit --resume across cpu<->gpu (recorded on stderr and in --run-manifest)"),
         ("--allow-build-change", "flag", "false", "permit --resume under a different binary, commit, version, device, driver or thread count than the checkpoint records (requires --resume)"),
         ("--no-project", "flag", "false", "load every column of a .rcsb store. The default projects a store read to --vars, targets, --weight, --time and --group-by when --vars and --time are both given; the resolved projection hash, column list and header indices are written to --run-manifest. --no-project is the A/B escape hatch and keeps the unprojected path"),
+        ("--project", "string", "none", "n or auto: choose --vars as a deterministic family-stratified view of n registered feature columns (24-48; research cell 96-128; auto = 36), one or two per family, rotated by --seed and --view; needs a .rcsb store, not combinable with --vars; the view id, seed, view index and columns per family go to --run-manifest under view. A store with a <store>.schema.json refuses a --vars name it does not list and names the nearest registry entry and its family"),
+        ("--view", "int", "0", "view index for --project; each index rotates the family and name choice"),
         // #140: run integrity.
         ("--run-manifest", "string", "none", "atomically write a JSON manifest (build-time commit, binary SHA-256, data checksum/fingerprint, resolved config, seed, backend, device/driver/CUDA, process UTC start/end, phase timings whose total is timing.total_seconds); updated atomically at the end"),
         ("--dev-log", "string", "rcsr.dev.ndjson next to --json-out/--save, else the working directory", "write the bounded NDJSON development log to this path instead of the default. The log is ON BY DEFAULT (see --dev-log-level and --no-dev-log): run_start, generation events, checkpoint and run_end, schema `rcsr-devlog/1`, documented in docs/dev-log.md. Never changes the archive, results or config hash; no raw rows"),
@@ -269,7 +272,7 @@ pub fn json() -> String {
 {{\"name\":\"--allow-lockbox\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"permit labelled rows in 2026H2 (final test only)\"}},\
 {{\"name\":\"--dry-run\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the report and write nothing\"}},\
 {{\"name\":\"--json\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"print the JSON report on stdout; gpu.fallback_columns lists the name and failing path of every column the device left to the CPU\"}}]}},\n  \
-         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, hourly v2 panel (snapshot, base, build, validate), canaries, costs and the 2026H2 lockbox\",\"options\":[\
+         \"panel\":{{\"command\":\"rcsr panel\",\"summary\":\"point-in-time membership, rebuilt panel, hourly v2 panel (snapshot, base, build, validate), registry schema and time-major family append (schema, append), canaries, costs and the 2026H2 lockbox\",\"options\":[\
 {{\"name\":\"--data\",\"type\":\"path\",\"default\":\"none\",\"description\":\"daily OHLCV with ts,symbol,open,high,low,close,volume\"}},\
 {{\"name\":\"--membership\",\"type\":\"path\",\"default\":\"membership.csv\",\"description\":\"point-in-time membership CSV\"}},\
 {{\"name\":\"--out\",\"type\":\"path\",\"default\":\"none\",\"description\":\"membership CSV or panel .rcsb\"}},\
@@ -296,10 +299,17 @@ pub fn json() -> String {
 {{\"name\":\"--jump-factor\",\"type\":\"float\",\"default\":\"5\",\"description\":\"build: undeclared open/previous-close ratio that fails the build\"}},\
 {{\"name\":\"--outage-share\",\"type\":\"float\",\"default\":\"0.5\",\"description\":\"build: share of the cross-section missing for a venue outage\"}},\
 {{\"name\":\"--replay\",\"type\":\"int\",\"default\":\"3\",\"description\":\"validate: prefix-causality cuts\"}},\
-{{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}}]}},\n  \
+{{\"name\":\"--snapshot\",\"type\":\"path\",\"default\":\"none\",\"description\":\"verified archive-snapshot JSON embedded in the panel manifest\"}},\
+{{\"name\":\"--family\",\"type\":\"path\",\"default\":\"none\",\"description\":\"append: symbol-major store that carries the family columns (computed by rcsr enrich)\"}},\
+{{\"name\":\"--columns\",\"type\":\"csv\",\"default\":\"none\",\"description\":\"append: registered columns to carry into the time-major panel by (symbol, ts) key; schema and append write <panel>.schema.json\"}},\
+{{\"name\":\"--verify\",\"type\":\"flag\",\"default\":\"false\",\"description\":\"schema: re-hash the store and exit 3 when a column hash differs from <panel>.schema.json\"}},\
+{{\"name\":\"--panel-version\",\"type\":\"string\",\"default\":\"2\",\"description\":\"schema and append: panel_version written to the schema file\"}},\
+{{\"name\":\"--scratch\",\"type\":\"path\",\"default\":\"next to --out\",\"description\":\"append: directory for temporary raw columns\"}}]}},\n  \
          \"dev_log\":{{\"schema\":\"rcsr-devlog/1\",\"version\":1,\"flag\":\"--dev-log\",\"default\":\"on (summary level)\",\"levels\":[\"summary\",\"full\"],\"default_path\":\"rcsr.dev.ndjson next to --json-out/--save, else the working directory\",\"disable\":\"--no-dev-log\",\"cadence\":\"summary clamp(generations/10,10,25), full 1; --dev-log-every overrides\",\"analyzer\":\"rcsr dev-report <log>\",\"events\":[\"run_start\",\"generation\",\"checkpoint\",\"run_end\"],\"atomic\":\"one complete line per write to an O_APPEND file; a killed run leaves a valid prefix\",\"bounded\":\"--dev-log-max-bytes caps generation and checkpoint events; run_start and run_end are always written\",\"trajectory\":\"the log is a reading: the archive, results and config hash are byte-identical with it on and off\",\"privacy\":\"counts, timings, hashes and error statistics only; no raw rows or personal data\",\"doc\":\"docs/dev-log.md\"}},\n  \
          \"exit_codes\":{{\"0\":\"success\",\"2\":\"usage error\",\"3\":\"input error\",\"4\":\"no finite solution\",\"5\":\"leakage audit failed\"}},\n  \
          \"engine_catalogue\":{},\n  \
+         \"feature_registry_version\":{},\n  \
+         \"schema_version\":{},\n  \
          \"feature_registry\":{},\n  \
          \"gpu_feature_parity\":{{\"mtf\":{{\"family\":\"mtf\",\"columns\":36,\"timeframes\":[\"1h\",\"4h\",\"1d\"],\"tier\":\"bitwise; vol sqrt <=1e-12\",\"dispatch\":\"opt-in: --gpu on until the 16M crossover is measured\",\"kernel\":\"src/cuda/mtf.cu\",\"test\":\"tests/mtf_gpu.rs\"}},\"benchmark\":{{\"family\":\"benchmark-beta\",\"columns\":30,\"market_columns\":13,\"tier\":\"bitwise lookups and btc_volume_share; rel_*/beta_*/market means <=1e-12\",\"dispatch\":\"registered; --gpu auto uses the measured join rates (CPU 0.36 M cells/s), --gpu on forces; market means follow --gpu above 1M rows\",\"kernel\":\"src/cuda/bench.cu\",\"test\":\"tests/bench_gpu.rs\"}},\"engine_tail\":{{\"family\":\"engine-tail\",\"columns\":26,\"tier\":\"bitwise extrema; log-derived exotic <=1e-12; recurrences <=1e-12\",\"dispatch\":\"registered; --gpu auto uses cost model v2, --gpu on forces\",\"kernel\":\"src/cuda/tail.cu\",\"test\":\"tests/enrich_gpu.rs\"}},\"pit_asof\":{{\"family\":\"panel-pit-asof\",\"joins\":[\"membership as_of <= t\",\"mtf h.time + tf <= t\"],\"outputs\":[\"leaf\",\"bar_age\",\"fresh\",\"keep\",\"gap\",\"chain_id\",\"lookahead_violations\"],\"tier\":\"bitwise vs the CPU reference at any block and chunk size\",\"dispatch\":\"library seam; rcsr panel build stays on the CPU until #259\",\"kernel\":\"src/cuda/pit.cu\",\"test\":\"tests/panel_gpu.rs\"}}}},\n  \
          \"target_spec\":{},\n  \
@@ -309,6 +319,8 @@ pub fn json() -> String {
         items,
         operators.join(","),
         crate::enrich::engine_catalogue_json(),
+        crate::registry::FEATURE_REGISTRY_VERSION,
+        crate::registry::SCHEMA_VERSION,
         crate::enrich::registry_json(),
         crate::target::schema_json()
     )

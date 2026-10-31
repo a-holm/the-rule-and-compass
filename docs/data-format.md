@@ -400,6 +400,18 @@ straight into a pinned slot, keeping the time column as `i64` and features as
 `f64`. A missing or dictionary-only name is an error, never a silent omission.
 The projection hash is FNV-1a 64 over `index:name:dtype;` in header order.
 
+### Schema sidecar, views and the grouped writer (issue #260)
+
+`<store>.schema.json` is the column contract of a registry panel. It carries `panel_version`, `schema_version`, `feature_registry_version` and one line per stored column: `name`, `family`, `timeframe`, `sources`, `transform`, `causal_offset` (largest forward reach in bars; 0 means data at or before bar `t`, `-k` a delay of `k` bars), `warmup_bars`, `dtype`, `unit`, `availability_start` and `availability_end` (timestamps of the first and last finite value), `pit_rule`, `semantic_cost` (0 input, 1 per-bar transform, 2 trailing window, 3 cross-sectional or multi-timeframe, +1 for a delay), `status` and `sha256` (SHA-256 of the stored value bytes, or code bytes for a dictionary column, in row order). `rcsr panel build` writes it; `rcsr panel schema --data p.rcsb` rewrites it and `--verify` re-hashes the store and exits 3 on a mismatch. A stored column with no registry entry is a hard error, and a `<name>_lag<k>` column resolves to its base entry delayed by `k` bars.
+
+When the sidecar exists, a `--vars` name that it does not list exits 3 with the nearest registry name and its family. A store without a sidecar is unchanged.
+
+`--project n|auto` chooses `--vars` as a deterministic view of `n` registered derived columns (24-48, research cell 96-128, `auto` = 36): one column per family, a second per family when `n` exceeds the family count, rotated by `(--seed, --view)`. The view depends only on column names and the registry, never on rows. The view id, seed, view index and columns per family are written to `--run-manifest` under `view`; the read is then projected as usual.
+
+`store::write_store_grouped` writes a store one group at a time from a producer closure, so peak memory is one group of every column and not the table. `write_store_with_time` is a producer over an in-memory table, so both paths write identical bytes (`tests/registry.rs`).
+
+`rcsr panel append --data panel.rcsb --family base_enriched.rcsb --columns a,b --out out.rcsb` appends registered columns computed on a symbol-major store to the time-major panel by `(symbol, ts)` key. Existing blocks are copied verbatim through `write_store_appending`, the input file is never opened for writing, a panel row without a family row is NaN and the output gets its own schema file.
+
 ## Measured
 
 ### Streaming CSV (issue #126)
