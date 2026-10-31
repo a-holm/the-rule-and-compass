@@ -1200,8 +1200,9 @@ floor, keep the CPU evaluator, print the *named* reason and record it in
 
 Cross-backend runs are **not bit-identical**: objective-kernel fitness is `f32`,
 so it can change the search trajectory. The #288 statistics are exact `f64` and
-match the CPU bit for bit for the same prediction vector (interquartile to
-`1e-12` relative), but the prediction itself may round differently on the two
+match the CPU bit for bit for the same prediction vector (median and
+interquartile through a radix select from 4 096 and 65 536 rows, rank and AUC
+through a sort), but the prediction itself may round differently on the two
 devices. Reported metrics, constants and diagnostics are always rebuilt on the
 CPU in exact `f64`; use `--cpu` for a byte-identical reproduction. A metric may
 use the GPU only when the score table names a native scorer for it, so no run is
