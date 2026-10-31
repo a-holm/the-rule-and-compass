@@ -261,7 +261,7 @@ because that loop has neither.
 | field | meaning |
 |---|---|
 | `generations` | generations completed |
-| `stop` | `solved` (error at or below the solved floor), `patience`, `time_budget`, `generations` (budget reached) or `already_stopped` (a resumed checkpoint was already finished) |
+| `stop` | `solved` (error at or below the solved floor; never for AIC, AICC, BIC), `patience`, `time_budget`, `generations` (budget reached) or `already_stopped` (a resumed checkpoint was already finished) |
 | `wall`, `search` | seconds from the CLI taking the clock to the end of the search, and the search phase alone |
 | `archive` | the final `size`, `best_error` and `hash` |
 | `json` | where the result JSON went (`null` = stdout) |

@@ -4892,7 +4892,7 @@ fn run_postfix_search(
         }
 
         if gen_best.is_finite() {
-            if gen_best <= 1e-24 {
+            if cfg.metric.is_solved(gen_best) {
                 converged_early = true;
                 stop_reason = "solved"; // #211
             }
@@ -6247,7 +6247,7 @@ fn run_search(
             }
 
             if gen_best.is_finite() {
-                if gen_best <= 1e-24 {
+                if cfg.metric.is_solved(gen_best) {
                     converged_early = true;
                     stop_reason = "solved"; // #211
                     break;
@@ -6741,6 +6741,7 @@ mod tests {
         assert_eq!(split_fit_window([1.0, 2.0, 3.0], f64::NAN).1, 0.0);
     }
     use crate::expr::{constant, input, node, Op};
+    use crate::metrics::Metric;
 
     /// `y = x0` on a small grid, two inputs.
     fn sample() -> Sample {
@@ -7436,6 +7437,47 @@ mod tests {
             out.archive.items.iter().all(|s| s.error.is_finite()),
             "every archived error is finite"
         );
+    }
+
+    fn stop_run(metric: crate::metrics::Metric, law: bool) -> Outcome {
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for i in 0..40 {
+            let a = -1.0 + 2.0 * i as f64 / 39.0;
+            x.push(vec![a]);
+            y.push(if law { 2.0 * a + 1.0 } else { a });
+        }
+        let train = Sample { x, y, w: Vec::new(), ys: Vec::new() };
+        let cfg = Config {
+            metric,
+            generations: 6,
+            pop: 30,
+            islands: 1,
+            seed: 5,
+            patience: 0,
+            gpu: false,
+            ..Config::default()
+        };
+        run(&cfg, &train, &train.clone())
+    }
+
+    /// #402: a negative information criterion is a good fit, not a solved run.
+    #[test]
+    fn information_criteria_run_every_generation() {
+        for metric in [Metric::Aic, Metric::Aicc, Metric::Bic] {
+            let out = stop_run(metric, true);
+            assert_eq!(out.stop_reason, "generations", "{}", metric.name());
+            assert_eq!(out.generations, 6, "{}", metric.name());
+        }
+    }
+
+    /// #402: squared and absolute still stop when the error reaches zero.
+    #[test]
+    fn squared_and_absolute_still_stop_at_zero_error() {
+        for metric in [Metric::Squared, Metric::Absolute] {
+            let out = stop_run(metric, false);
+            assert_eq!(out.stop_reason, "solved", "{}", metric.name());
+            assert!(out.generations < 6, "{}", metric.name());
+        }
     }
 
     #[test]

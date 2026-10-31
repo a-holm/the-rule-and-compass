@@ -205,6 +205,16 @@ impl Metric {
         )
     }
 
+    /// True when `best_error` means the run is solved and the search may stop.
+    ///
+    /// Error metrics are non-negative, so solved means the error reached the
+    /// floor [`crate::progress_stats::SOLVED_ERROR`]. The information criteria
+    /// go negative on a good fit and the search sites hold only the criterion,
+    /// not its residual sum of squares, so they are never solved.
+    pub fn is_solved(self, best_error: f64) -> bool {
+        !self.is_parameter_aware() && best_error <= crate::progress_stats::SOLVED_ERROR
+    }
+
     /// True for metrics that depend on the number of fitted constants.
     pub fn is_parameter_aware(self) -> bool {
         matches!(self, Metric::Aic | Metric::Aicc | Metric::Bic)
@@ -1687,6 +1697,26 @@ mod tests {
 
     fn approx(a: f64, b: f64, tol: f64) -> bool {
         (a - b).abs() <= tol
+    }
+
+    /// #402: solved means "error is zero" for the non-negative error metrics
+    /// and never for the information criteria, whose value goes negative on a
+    /// good fit.
+    #[test]
+    fn solved_is_defined_per_metric() {
+        for m in Metric::all() {
+            let name = m.name();
+            if m.is_parameter_aware() {
+                for v in [0.0, -1.0, -1e6, f64::NEG_INFINITY, 1e-30] {
+                    assert!(!m.is_solved(v), "{name} must not be solved at {v}");
+                }
+            } else {
+                assert!(m.is_solved(0.0), "{name} is solved at zero error");
+                assert!(m.is_solved(1e-25), "{name} is solved below the floor");
+                assert!(!m.is_solved(1e-6), "{name} is not solved at 1e-6");
+                assert!(!m.is_solved(0.5), "{name} is not solved at 0.5");
+            }
+        }
     }
 
     #[test]
