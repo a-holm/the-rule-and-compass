@@ -317,6 +317,7 @@ pub fn json() -> String {
          \"feature_registry_version\":{},\n  \
          \"schema_version\":{},\n  \
          \"feature_registry\":{},\n  \
+         \"availability_matrix\":{},\n  \
          \"gpu_feature_parity\":{{\"mtf\":{{\"family\":\"mtf\",\"columns\":36,\"timeframes\":[\"1h\",\"4h\",\"1d\"],\"tier\":\"bitwise; vol sqrt <=1e-12\",\"dispatch\":\"opt-in: --gpu on until the 16M crossover is measured\",\"kernel\":\"src/cuda/mtf.cu\",\"test\":\"tests/mtf_gpu.rs\"}},\"benchmark\":{{\"family\":\"benchmark-beta\",\"columns\":30,\"market_columns\":13,\"tier\":\"bitwise lookups and btc_volume_share; rel_*/beta_*/market means <=1e-12\",\"dispatch\":\"registered; --gpu auto uses the measured join rates (CPU 0.36 M cells/s), --gpu on forces; market means follow --gpu above 1M rows\",\"kernel\":\"src/cuda/bench.cu\",\"test\":\"tests/bench_gpu.rs\"}},\"engine_tail\":{{\"family\":\"engine-tail\",\"columns\":26,\"tier\":\"bitwise extrema; log-derived exotic <=1e-12; recurrences <=1e-12\",\"dispatch\":\"registered; --gpu auto uses cost model v2, --gpu on forces\",\"kernel\":\"src/cuda/tail.cu\",\"test\":\"tests/enrich_gpu.rs\"}},\"pit_asof\":{{\"family\":\"panel-pit-asof\",\"joins\":[\"membership as_of <= t\",\"mtf h.time + tf <= t\"],\"outputs\":[\"leaf\",\"bar_age\",\"fresh\",\"keep\",\"gap\",\"chain_id\",\"lookahead_violations\"],\"tier\":\"bitwise vs the CPU reference at any block and chunk size\",\"dispatch\":\"library seam; rcsr panel build stays on the CPU\",\"kernel\":\"src/cuda/pit.cu\",\"test\":\"tests/panel_gpu.rs\"}}}},\n  \
          \"target_spec\":{},\n  \
          \"stdout\":\"machine-readable result\",\n  \"stderr\":\"human-readable log and progress\"\n}}\n",
@@ -328,6 +329,7 @@ pub fn json() -> String {
         crate::registry::FEATURE_REGISTRY_VERSION,
         crate::registry::SCHEMA_VERSION,
         crate::enrich::registry_json(),
+        crate::registry::availability_matrix_json(),
         crate::target::schema_json()
     )
 }
