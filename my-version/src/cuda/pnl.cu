@@ -17,6 +17,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -199,10 +200,10 @@ void *rc_pnl_create(const double *returns,
     size_t part_bytes = (size_t)nsegments * (size_t)tile_candidates *
                         (size_t)PNL_LANES * sizeof(RcPnlTotals);
 
-    if (cudaMalloc((void **)&ctx->d_returns, ret_bytes) != cudaSuccess) goto fail;
-    if (cudaMalloc((void **)&ctx->d_groups, group_bytes) != cudaSuccess) goto fail;
-    if (cudaMalloc((void **)&ctx->d_scores, score_bytes) != cudaSuccess) goto fail;
-    if (cudaMalloc((void **)&ctx->d_partials, part_bytes) != cudaSuccess) goto fail;
+    if (rc_checked_malloc((void **)&ctx->d_returns, ret_bytes) != cudaSuccess) goto fail;
+    if (rc_checked_malloc((void **)&ctx->d_groups, group_bytes) != cudaSuccess) goto fail;
+    if (rc_checked_malloc((void **)&ctx->d_scores, score_bytes) != cudaSuccess) goto fail;
+    if (rc_checked_malloc((void **)&ctx->d_partials, part_bytes) != cudaSuccess) goto fail;
 
     if (cudaMemcpy(ctx->d_returns, returns, ret_bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
     if (cudaMemcpy(ctx->d_groups, groups, group_bytes, cudaMemcpyHostToDevice) != cudaSuccess) goto fail;
@@ -484,13 +485,13 @@ extern "C" int rc_threshold_select_f32_threads(const float *scores,
     unsigned int *h_hist = NULL;
     int status = 0;
 
-    cudaError_t err = cudaMalloc((void **)&d_scores, (size_t)n * sizeof(float));
+    cudaError_t err = rc_checked_malloc((void **)&d_scores, (size_t)n * sizeof(float));
     if (err != cudaSuccess) { status = 3; goto done; }
-    err = cudaMalloc((void **)&d_keys, (size_t)n * sizeof(unsigned int));
+    err = rc_checked_malloc((void **)&d_keys, (size_t)n * sizeof(unsigned int));
     if (err != cudaSuccess) { status = 4; goto done; }
-    err = cudaMalloc((void **)&d_hist, 256 * sizeof(unsigned int));
+    err = rc_checked_malloc((void **)&d_hist, 256 * sizeof(unsigned int));
     if (err != cudaSuccess) { status = 5; goto done; }
-    err = cudaMalloc((void **)&d_finite, sizeof(unsigned long long));
+    err = rc_checked_malloc((void **)&d_finite, sizeof(unsigned long long));
     if (err != cudaSuccess) { status = 6; goto done; }
     h_hist = (unsigned int *)malloc(256 * sizeof(unsigned int));
     if (h_hist == NULL) { status = 7; goto done; }
@@ -605,11 +606,11 @@ extern "C" int rc_valid_mask_f32(const float *scores,
     unsigned long long *d_words = NULL;
     int status = 0;
 
-    cudaError_t err = cudaMalloc((void **)&d_scores, (size_t)n * sizeof(float));
+    cudaError_t err = rc_checked_malloc((void **)&d_scores, (size_t)n * sizeof(float));
     if (err != cudaSuccess) { status = 2; goto done; }
-    err = cudaMalloc((void **)&d_targets, (size_t)n * sizeof(float));
+    err = rc_checked_malloc((void **)&d_targets, (size_t)n * sizeof(float));
     if (err != cudaSuccess) { status = 3; goto done; }
-    err = cudaMalloc((void **)&d_words, words_bytes);
+    err = rc_checked_malloc((void **)&d_words, words_bytes);
     if (err != cudaSuccess) { status = 4; goto done; }
     err = cudaMemcpy(d_scores, scores, (size_t)n * sizeof(float),
                      cudaMemcpyHostToDevice);

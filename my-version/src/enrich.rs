@@ -1581,8 +1581,10 @@ pub struct Report {
     pub cpu_columns: usize,
     /// `gpu_columns / (gpu_columns + cpu_columns)`.
     pub gpu_share: f64,
-    /// Columns planned for the GPU that fell back after a kernel error.
+    /// Columns planned for the GPU that fell back to the CPU; always `gpu_fallback_columns.len()`.
     pub gpu_fallback: usize,
+    /// Name and reason (`<path>: <detail>`) of every fallback column.
+    pub gpu_fallback_columns: Vec<(String, String)>,
     /// Measured device windows for the enrichment phase (#118 ledger).
     pub gpu_kernel_seconds: f64,
     /// Measured device→host time (#294/#300), separate from kernel time.
@@ -1680,6 +1682,9 @@ impl Report {
                 f.label
             ));
         }
+        for (name, reason) in &self.gpu_fallback_columns {
+            out.push(format!("# enrich-fallback: name={name} reason={reason}"));
+        }
         for p in &self.plans {
             out.push(format!(
                 "# enrich-plan: group={} rows={} cols={} gpu_cols={} cpu_cols={} op={} cpu_ms={:.1} gpu_ms={:.1} backend={} reason={}",
@@ -1750,7 +1755,7 @@ impl Report {
              \"rows\":{},\"columns_in\":{},\"columns_out\":{},\"groups\":{},\"symbols\":{},\n  \
              \"group_rows\":{},\"chunk_rows\":{},\"bar_seconds\":{},\n  \
              \"backend\":{},\"gpu_requested\":{},\"gpu_available\":{},\"gpu_device\":{},\n  \
-             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0}}},\n  \
+             \"gpu\":{{\"columns\":{},\"cpu_columns\":{},\"share\":{:.6},\"fallback\":{},\"kernel_s\":{:.6},\"h2d_s\":{:.6},\"d2h_s\":{:.6},\"write_s\":{:.6},\"transfer_bytes\":{},\"write_bw\":{:.0},\"fallback_columns\":[{}]}},\n  \
              \"projection\":{{\"hash\":{},\"columns\":[{}]}},\n  \
              \"timing\":{{\"read_s\":{:.6},\"feature_s\":{:.6},\"xs_s\":{:.6},\"write_s\":{:.6},\"total_s\":{:.6}}},\n  \
              \"peak_rss_bytes\":{},\n  \"features\":[{}],\n  \"plan\":[{}]\n}}\n",
@@ -1784,6 +1789,12 @@ impl Report {
             self.gpu_write_seconds,
             self.gpu_transfer_bytes,
             self.write_bw,
+            self
+                .gpu_fallback_columns
+                .iter()
+                .map(|(n, r)| format!("{{\"name\":{},\"reason\":{}}}", jstr(n), jstr(r)))
+                .collect::<Vec<_>>()
+                .join(","),
             self.projection_hash
                 .as_deref()
                 .map(jstr)
@@ -1802,6 +1813,40 @@ impl Report {
             features.join(","),
             plans.join(",")
         )
+    }
+}
+
+/// Columns planned for the device that the CPU computed instead, with the
+/// path that failed. Each group prints one warning.
+#[derive(Default)]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+pub(crate) struct FallbackLog {
+    pub(crate) columns: Vec<(String, String)>,
+}
+
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+impl FallbackLog {
+    pub(crate) fn record<'a>(
+        &mut self,
+        path: &str,
+        detail: &str,
+        names: impl IntoIterator<Item = &'a str>,
+    ) {
+        let fresh: Vec<&str> = names
+            .into_iter()
+            .filter(|n| !self.columns.iter().any(|(c, _)| c == n))
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        eprintln!(
+            "warning: device {path} failed ({detail}); computing {} columns on the CPU: {}",
+            fresh.len(),
+            fresh.join(",")
+        );
+        for n in fresh {
+            self.columns.push((n.to_string(), format!("{path}: {detail}")));
+        }
     }
 }
 
@@ -6731,7 +6776,7 @@ fn enrich_inner(
             .any(|p| p.group == "labels" && p.backend == "gpu");
 
     let mut gpu_done: BTreeSet<String> = BTreeSet::new();
-    let mut gpu_fallback = 0usize;
+    let mut fallback_log = FallbackLog::default();
     #[allow(unused_mut)]
     let mut gpu_kernel_seconds = 0.0;
     #[allow(unused_mut)]
@@ -6803,7 +6848,7 @@ fn enrich_inner(
                         "warning: device MTF failed ({e}); computing {} columns on the CPU",
                         mtf_wanted.len()
                     );
-                    gpu_fallback += mtf_wanted.len();
+                    fallback_log.record("mtf", &e.to_string(), mtf_wanted.iter().map(String::as_str));
                 }
             }
             for name in &mtf_wanted {
@@ -6856,7 +6901,7 @@ fn enrich_inner(
                     side_h2d_seconds += stats.h2d_s;
                     side_d2h_seconds += stats.d2h_s;
                 }
-                None => gpu_fallback += bench_wanted.len(),
+                None => fallback_log.record("bench", "no result", bench_wanted.iter().map(String::as_str)),
             }
             for name in &bench_wanted {
                 gpu_names.remove(name);
@@ -7002,13 +7047,40 @@ fn enrich_inner(
         }
         if gpu_ctx.is_none() {
             // No device context: the whole planned GPU share falls back.
-            gpu_fallback += gpu_names.len() + if gpu_labels { labels.len() } else { 0 };
+            fallback_log.record(
+                "no-device",
+                "no device context",
+                gpu_names
+                    .iter()
+                    .map(String::as_str)
+                    .chain(if gpu_labels { labels.iter().map(|(n, _)| n.as_str()).collect() } else { Vec::new() }),
+            );
             gpu_names.clear();
         }
     }
 
     #[cfg(feature = "cuda")]
     if let Some(gpu) = gpu_ctx.as_mut() {
+        // Features computed per uploaded tile stay resident until downloaded.
+        // Drain them first: they would otherwise hold the device memory the
+        // fused flow and price-action planes need.
+        for name in gpu.precomputed_names() {
+            let Some(vals) = gpu.take_precomputed(&name) else {
+                continue;
+            };
+            let tw = Instant::now();
+            let ok = match temp.get_mut(&name) {
+                Some(t) => t.write_values(&vals).is_ok(),
+                None => false,
+            };
+            gpu_write_seconds += tw.elapsed().as_secs_f64();
+            if ok {
+                gpu_done.insert(name.clone());
+            } else {
+                fallback_log.record("feature", "temp write failed", [name.as_str()]);
+            }
+            gpu_names.remove(&name);
+        }
         // MACD is three output columns from one scan; compute it once.
         let macd_wanted: Vec<String> = gpu_names
             .iter()
@@ -7031,7 +7103,7 @@ fn enrich_inner(
                     }
                 }
             } else {
-                gpu_fallback += macd_wanted.len();
+                fallback_log.record("macd", "no result", macd_wanted.iter().map(String::as_str));
             }
             for n in &macd_wanted {
                 gpu_names.remove(n);
@@ -7056,7 +7128,7 @@ fn enrich_inner(
                         }
                     }
                 }
-                None => gpu_fallback += flow_wanted.len(),
+                None => fallback_log.record("flow", "no result", flow_wanted.iter().map(String::as_str)),
             }
             for n in &flow_wanted {
                 gpu_names.remove(n);
@@ -7078,7 +7150,7 @@ fn enrich_inner(
                         }
                     }
                 }
-                None => gpu_fallback += pa_wanted.len(),
+                None => fallback_log.record("price_action", "no result", pa_wanted.iter().map(String::as_str)),
             }
             for n in &pa_wanted {
                 gpu_names.remove(n);
@@ -7103,24 +7175,6 @@ fn enrich_inner(
         };
         let mut jobs: Vec<(String, crate::enrich_gpu::BatchOp)> = Vec::new();
         for name in &names {
-            // #294: a feature computed while the projected tiles uploaded is
-            // already on the device; write it once and keep it out of the
-            // batch arena so its temp file cannot be appended twice.
-            if let Some(vals) = gpu.take_precomputed(name) {
-                let tw = Instant::now();
-                let ok = match temp.get_mut(name) {
-                    Some(t) => t.write_values(&vals).is_ok(),
-                    None => false,
-                };
-                gpu_write_seconds += tw.elapsed().as_secs_f64();
-                if ok {
-                    gpu_done.insert(name.clone());
-                    gpu_names.remove(name);
-                } else {
-                    fallback.push(name.clone());
-                }
-                continue;
-            }
             match gpu_batch_op(name) {
                 Some(op) => jobs.push((name.clone(), op)),
                 None => fallback.push(name.clone()),
@@ -7165,24 +7219,10 @@ fn enrich_inner(
             }
         }
         let _ = fallback;
+        let mut no_result: Vec<String> = Vec::new();
+        let mut write_failed: Vec<String> = Vec::new();
         for name in names {
             if gpu_done.contains(&name) {
-                gpu_names.remove(&name);
-                continue;
-            }
-            // A feature computed per uploaded tile already lives on the device.
-            if let Some(vals) = gpu.take_precomputed(&name) {
-                let tw = Instant::now();
-                let ok = match temp.get_mut(&name) {
-                    Some(t) => t.write_values(&vals).is_ok(),
-                    None => false,
-                };
-                gpu_write_seconds += tw.elapsed().as_secs_f64();
-                if ok {
-                    gpu_done.insert(name.clone());
-                } else {
-                    gpu_fallback += 1;
-                }
                 gpu_names.remove(&name);
                 continue;
             }
@@ -7193,19 +7233,28 @@ fn enrich_inner(
                         let tw = Instant::now();
                         let ok = t.write_values(&vals).is_ok();
                         gpu_write_seconds += tw.elapsed().as_secs_f64();
+                        if !ok {
+                            write_failed.push(name.clone());
+                        }
                         ok
                     }
-                    None => false,
+                    None => {
+                        write_failed.push(name.clone());
+                        false
+                    }
                 },
-                None => false,
+                None => {
+                    no_result.push(name.clone());
+                    false
+                }
             };
             if ok {
                 gpu_done.insert(name.clone());
-            } else {
-                gpu_fallback += 1;
             }
             gpu_names.remove(&name);
         }
+        fallback_log.record("feature", "no result", no_result.iter().map(String::as_str));
+        fallback_log.record("feature", "temp write failed", write_failed.iter().map(String::as_str));
         if gpu_labels {
             for (name, spec) in &labels {
                 let vals = gpu.label(spec.horizon, spec.cost_bps, spec.vol_window, spec.stride);
@@ -7218,7 +7267,7 @@ fn enrich_inner(
                             gpu_done.insert(name.clone());
                         }
                     }
-                    None => gpu_fallback += 1,
+                    None => fallback_log.record("label", "no result", [name.as_str()]),
                 }
             }
         }
@@ -7447,12 +7496,16 @@ fn enrich_inner(
             )?;
             #[cfg(feature = "cuda")]
             if market_gpu {
-                gpu_fallback += requested
-                    .iter()
-                    .filter(|n| {
-                        crate::bench_gpu::is_device_market(n) && !market_done.contains(*n)
-                    })
-                    .count();
+                fallback_log.record(
+                    "market",
+                    "no result",
+                    requested
+                        .iter()
+                        .filter(|n| {
+                            crate::bench_gpu::is_device_market(n) && !market_done.contains(*n)
+                        })
+                        .map(String::as_str),
+                );
                 if let Some(gpu) = gpu_ctx.as_ref() {
                     let stats = gpu.stats();
                     gpu_kernel_seconds = stats.kernel_s + side_kernel_seconds;
@@ -7515,7 +7568,7 @@ fn enrich_inner(
                     Some(r) => (r, true),
                     None => {
                         if gpu_eligible {
-                            gpu_fallback += 1;
+                            fallback_log.record("rank", "no result", [rank_name.as_str()]);
                         }
                         (
                             rank_with_membership(
@@ -7640,7 +7693,8 @@ fn enrich_inner(
             gpu_columns,
             cpu_columns,
             gpu_share,
-            gpu_fallback,
+            gpu_fallback: fallback_log.columns.len(),
+            gpu_fallback_columns: fallback_log.columns.clone(),
             gpu_kernel_seconds,
             gpu_d2h_seconds,
             gpu_write_seconds,
@@ -7697,7 +7751,8 @@ fn enrich_inner(
         gpu_columns,
         cpu_columns,
         gpu_share,
-        gpu_fallback,
+        gpu_fallback: fallback_log.columns.len(),
+        gpu_fallback_columns: fallback_log.columns,
         gpu_kernel_seconds,
         gpu_d2h_seconds,
         gpu_write_seconds,
@@ -7928,7 +7983,8 @@ INPUT / OUTPUT:
   --write-bw <MB/s>       measured sequential write bandwidth for cost model v2
                           (default 222 MB/s on the shared ext4 store)
   --dry-run               print the report and write nothing
-  --json                  print the JSON report on stdout
+  --json                  print the JSON report on stdout; gpu.fallback_columns lists
+                          each column the device left to the CPU, with the failing path
 
 FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   returns    r1..r120, log close-to-close over exactly k contiguous bars
@@ -8022,3 +8078,46 @@ The output store checksum and every feature column hash are written to
     .to_string()
 }
 
+
+#[cfg(test)]
+mod fallback_tests {
+    use super::*;
+
+    #[test]
+    fn every_fallback_records_name_and_path_reason_once() {
+        let mut log = FallbackLog::default();
+        log.record("flow", "no result", ["flow_a", "flow_b"]);
+        log.record("feature", "no result", ["flow_b", "ema8"]);
+        log.record("rank", "no result", std::iter::empty());
+        let got: Vec<(&str, &str)> = log
+            .columns
+            .iter()
+            .map(|(n, r)| (n.as_str(), r.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("flow_a", "flow: no result"),
+                ("flow_b", "flow: no result"),
+                ("ema8", "feature: no result"),
+            ]
+        );
+    }
+
+    #[test]
+    fn report_lists_fallback_columns_in_text_and_json() {
+        let mut log = FallbackLog::default();
+        log.record("market", "no result", ["breadth"]);
+        let report = Report {
+            gpu_fallback: log.columns.len(),
+            gpu_fallback_columns: log.columns,
+            ..Default::default()
+        };
+        assert!(report
+            .text_lines()
+            .contains(&"# enrich-fallback: name=breadth reason=market: no result".to_string()));
+        assert!(report
+            .json()
+            .contains("\"fallback_columns\":[{\"name\":\"breadth\",\"reason\":\"market: no result\"}]"));
+    }
+}
