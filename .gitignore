@@ -15,3 +15,6 @@ my-version/target/
 # directory (including `cargo test`) writes this file.
 rcsr.dev.ndjson
 **.dev.ndjson
+
+# Run artifacts of the workshop (verksted/) are git-ignored; the workshop itself is tracked.
+verksted/**/output/
