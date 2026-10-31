@@ -1528,6 +1528,7 @@ pub fn build_panel(opts: &PanelOptions) -> Result<PanelSummary, String> {
     debug_assert!(panel.rows.iter().zip(&asm.rows).all(|(a, b)| a == &b.row));
     let table = v2_table(&asm.rows);
     store::write_store_with_time(&opts.out, &table, opts.group_rows, Some(0))?;
+    crate::registry::write_schema(&opts.out, crate::registry::DEFAULT_PANEL_VERSION)?;
     let ledger_misses = ledger_violations(&asm.rows, &membership);
     let snapshot_text = match &opts.snapshot {
         Some(p) => {
@@ -1615,8 +1616,9 @@ fn v2_block(
     let mut s = String::from("{");
     let _ = write!(
         s,
-        "\"panel_version\":2,\"columns\":[{}],\"derivatives\":{{\"available\":false,\"source\":null}},",
-        PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(",")
+        "\"panel_version\":2,\"columns\":[{}],\"derivatives\":{},",
+        PANEL_COLUMNS.iter().map(|c| jstr(c)).collect::<Vec<_>>().join(","),
+        crate::derivatives::manifest_json(None)
     );
     let _ = write!(
         s,
