@@ -979,8 +979,12 @@ full admission preserves both exact-arm coverage and a large speed-up. Every CPU
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
 `non_finite`, `launch`, `rank_declined`, `median_declined`,
 `interquartile_declined`, `single_class`, `log_loss_worse`,
-`maximum_declined`) in
-`gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+`maximum_declined`, `worse`, `not_identifiable`) in
+`gpu.fit.fallback_by_cause`.
+
+**Deferred-fit contract.** The deferred arm does per candidate what the CPU arm does. (1) Gate: for `log_loss`, `correlation`, `correlation_signed` and `signed` (`fit::device_fit_is_gated`) every device proposal passes the exact `f64` gate `fit::gate_device_proposal` on the configured metric, the same entry point as `fit_batch_verified`. A worse proposal restores the incoming constants and the exact CPU arm refits, labelled `worse` (`log_loss_worse` for `log_loss`); a non-finite proposal or objective does the same, labelled `non_finite`; a `signed` proposal that cannot represent the mean is labelled `not_identifiable`. (2) Refresh: after the device write-back, the CPU fallback batch and the pipeline write-back, each fitted tree is simplified and its complexity recomputed (`refresh_after_fit`), as `evolve_island` does after `fit_counted`. (3) Pipeline exclusion: a gated metric never takes the ungated pipeline write-back (`pipeline_fit_safe`). (4) Wide admission: with at least 1 048 576 training rows, or for `correlation`, `correlation_signed` and `signed` (`fit::admits_every_candidate`) at any size, every candidate with constants is fitted and only constant-free candidates are screened; other metrics keep `max(32, pop/4)` below the threshold.
+
+`--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, `absolute` (#222) with per-row Lawson weights

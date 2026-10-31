@@ -5643,10 +5643,10 @@ struct CrossPanel {
     /// `member_asof <= t` when the input carries a membership column; every
     /// row otherwise. Pre-listing/post-delisting rows never enter a statistic.
     member: Vec<bool>,
-    /// Row order `(time, symbol, row)`, the deterministic tie order.
-    order: Vec<u32>,
-    /// Start index in `order` of each timestamp group; `starts.len() == groups+1`.
-    starts: Vec<usize>,
+    /// Row order `(time, symbol, row)` and the start index of each timestamp
+    /// group (`starts.len() == groups+1`). Built on first CPU use only; the
+    /// device path keeps its own permutation.
+    grouped: std::sync::OnceLock<(Vec<u32>, Vec<usize>)>,
 }
 
 impl CrossPanel {
@@ -5682,37 +5682,38 @@ impl CrossPanel {
                 member[r] = vals[r].is_finite() && vals[r] <= times[r] as f64;
             }
         }
-        let mut order: Vec<u32> = (0..rows as u32).collect();
-        order.sort_unstable_by(|&a, &b| {
-            let (a, b) = (a as usize, b as usize);
-            times[a]
-                .cmp(&times[b])
-                .then(sym_key[a].cmp(&sym_key[b]))
-                .then(a.cmp(&b))
-        });
-        let mut starts = Vec::new();
-        let mut i = 0usize;
-        while i < order.len() {
-            starts.push(i);
-            let t = times[order[i] as usize];
-            while i < order.len() && times[order[i] as usize] == t {
-                i += 1;
-            }
-        }
-        starts.push(order.len());
         Ok(CrossPanel {
             times,
             sym_key,
             member,
-            order,
-            starts,
+            grouped: std::sync::OnceLock::new(),
         })
     }
 
     fn groups(&self) -> impl Iterator<Item = &[u32]> {
-        self.starts
-            .windows(2)
-            .map(move |w| &self.order[w[0]..w[1]])
+        let (order, starts) = self.grouped.get_or_init(|| {
+            let (times, sym_key) = (&self.times, &self.sym_key);
+            let mut order: Vec<u32> = (0..times.len() as u32).collect();
+            order.sort_unstable_by(|&a, &b| {
+                let (a, b) = (a as usize, b as usize);
+                times[a]
+                    .cmp(&times[b])
+                    .then(sym_key[a].cmp(&sym_key[b]))
+                    .then(a.cmp(&b))
+            });
+            let mut starts = Vec::new();
+            let mut i = 0usize;
+            while i < order.len() {
+                starts.push(i);
+                let t = times[order[i] as usize];
+                while i < order.len() && times[order[i] as usize] == t {
+                    i += 1;
+                }
+            }
+            starts.push(order.len());
+            (order, starts)
+        });
+        starts.windows(2).map(move |w| &order[w[0]..w[1]])
     }
 }
 
