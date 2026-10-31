@@ -21,6 +21,7 @@ use crate::metrics::{self, Metric};
 // share one arithmetic story and one fallback contract.
 mod correlation;
 mod gpu;
+mod hinge;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
 mod interquartile;
 #[cfg_attr(not(any(feature = "cuda", test)), allow(dead_code))]
@@ -328,6 +329,17 @@ pub enum FitObjective {
     /// or logit semantics. Reachable through [`fit_loss`] (fit dispatch) and
     /// the fit kernel's direct batch API only.
     Logistic,
+    /// `Σ w·max(0, 1 − t·p)²` on the label sign `t`, minimised by Gauss-Newton
+    /// on the active set `t·p < 1` (row weight `w·[t·p < 1]`, response `p − t`).
+    HingeSquared,
+    /// `Σ w·max(0, 1 − t·p)`: logistic Fisher steps while they lower the
+    /// hinge, then majorise-minimise steps (row weight `w/(2a)`, response
+    /// `p − t(1 + a)`, `a = max(|1 − t·p|, 1e-6)`). Every trial is judged on
+    /// the hinge.
+    HingeOrdinary,
+    /// `Σ w·(1 − t(2σ(p) − 1))`, the bounded sigmoid hinge: the logistic
+    /// Fisher step, every trial judged on the sigmoid hinge.
+    HingeSigmoid,
 }
 
 /// Backwards-compatible name for the fit objective. New code should say
@@ -345,7 +357,23 @@ impl FitObjective {
             DeviceLoss::CorrelationSigned => 3,
             DeviceLoss::Absolute => 4,
             DeviceLoss::Logistic => 5,
+            DeviceLoss::HingeSquared => 6,
+            DeviceLoss::HingeOrdinary => 7,
+            DeviceLoss::HingeSigmoid => 8,
         }
+    }
+
+    /// Whether the kernel reads the uploaded label sign for this objective.
+    /// A launch without it is refused, and a single-class sample is declined
+    /// before launch.
+    pub fn needs_label_sign(self) -> bool {
+        matches!(
+            self,
+            DeviceLoss::Logistic
+                | DeviceLoss::HingeSquared
+                | DeviceLoss::HingeOrdinary
+                | DeviceLoss::HingeSigmoid
+        )
     }
 
     /// Whether the legacy f32 evaluator entry points (`rc_eval`, `rc_pool_eval`)
@@ -355,7 +383,12 @@ impl FitObjective {
     pub fn scores_on_device(self) -> bool {
         match self {
             DeviceLoss::Squared | DeviceLoss::LogSquashed | DeviceLoss::Absolute => true,
-            DeviceLoss::Correlation | DeviceLoss::CorrelationSigned | DeviceLoss::Logistic => false,
+            DeviceLoss::Correlation
+            | DeviceLoss::CorrelationSigned
+            | DeviceLoss::Logistic
+            | DeviceLoss::HingeSquared
+            | DeviceLoss::HingeOrdinary
+            | DeviceLoss::HingeSigmoid => false,
         }
     }
 
@@ -388,6 +421,9 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
         // #234: a native fit objective with no native fitness. The search
         // admits it as a fit-only arm; every score is the exact CPU log-loss.
         Metric::LogLoss => Some(DeviceLoss::Logistic),
+        Metric::Hinge => Some(DeviceLoss::HingeSigmoid),
+        Metric::HingeOrdinary => Some(DeviceLoss::HingeOrdinary),
+        Metric::HingeSquared => Some(DeviceLoss::HingeSquared),
         Metric::Correlation => Some(DeviceLoss::Correlation),
         Metric::CorrelationSigned => Some(DeviceLoss::CorrelationSigned),
         m => DeviceLoss::for_metric(m),
@@ -422,8 +458,9 @@ pub fn fit_only_loss(metric: Metric) -> Option<DeviceLoss> {
 /// The batched kernel (`src/cuda/eval.cu`, `fit_kernel`) minimises one
 /// configured objective per launch: weighted squared error for the
 /// least-squares family, `log_squashed` as weighted LM/IRLS since #229,
-/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222, and
-/// the logistic cross-entropy on the binary label since #234.
+/// `absolute` as weighted LM/IRLS with true-`|r|` acceptance since #222, the
+/// logistic cross-entropy on the binary label since #234, and the three hinge
+/// forms on the same label with every trial judged on the configured hinge.
 /// Every metric outside [`fit_loss`] fits on the CPU through logistic IRLS or
 /// the coordinate polish, so accepting the combination would silently
 /// substitute a different objective for the one the user asked to optimise.
@@ -456,12 +493,13 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
-         absolute error, the logistic log-loss, the exact correlation \
-         objectives or the exact rank, median, interquartile and maximum \
-         objectives, but --metric {} has no device \
+         absolute error, the logistic log-loss, the three hinge forms, the \
+         exact correlation objectives or the exact rank, median, interquartile \
+         and maximum objectives, but --metric {} has no device \
          fit objective, so the GPU arms cannot fit it. Use --metric squared \
          (aic, aicc and bic also fit by least squares), --metric log_squashed, \
-         --metric absolute, --metric log_loss, --metric correlation, \
+         --metric absolute, --metric log_loss, --metric hinge, hinge_ordinary \
+         or hinge_squared, --metric correlation, \
          --metric correlation_signed, --metric rank_correlation or \
          rank_correlation_signed, --metric median, --metric interquartile, \
          --metric maximum, or a CPU fit strategy: --fit-strategy exact, auto, \
@@ -3104,6 +3142,10 @@ fn qr_least_squares(a: &mut [f64], m: usize, n: usize, b: &mut [f64]) -> Option<
 ///   `auc` and `hinge` share the logistic surrogate because their own
 ///   objectives are piecewise constant or non-smooth; the surrogate is convex
 ///   and the scored metric decides whether a trial is accepted.
+/// * `hinge_ordinary` — the same logistic rounds, then majorise-minimise
+///   rounds for the rest of the round budget; `hinge_squared` — Gauss-Newton
+///   rounds on the active set (see [`hinge`]). Every round is accepted only on
+///   the configured hinge.
 /// * `correlation`, `correlation_signed` — the exact analytic gradient and
 ///   Gauss–Newton curvature of the Pearson correlation, with a frozen affine
 ///   gauge (see [`correlation`]). No squared pre-fit is involved.
@@ -3168,12 +3210,9 @@ pub fn fit_weighted_metric(
         // a warm start and the configured metric decides whether it is kept, so
         // the arm never claims to minimise a different objective: the returned
         // value is always `metric_score` of the configured metric.
-        Auc
-        | LogLoss
-        | Brier
-        | Hinge
-        | HingeOrdinary
-        | HingeSquared => logistic_irls(tree, x, y, w, iters, metric),
+        Auc | LogLoss | Brier | Hinge => logistic_irls(tree, x, y, w, iters, metric),
+        HingeOrdinary => hinge::fit_ordinary(tree, x, y, w, iters),
+        HingeSquared => hinge::fit_squared(tree, x, y, w, iters),
         // #224: correlation has an exact objective, an analytic gradient and a
         // structural gauge handler; it never falls back to a squared fit.
         Correlation | CorrelationSigned => {
@@ -3323,6 +3362,39 @@ fn irls_fit<F>(
 where
     F: Fn(f64, usize) -> f64,
 {
+    // Keep the total number of LM sweeps close to `--fit-iters`: four weight
+    // updates with `iters/4` inner sweeps each for the default of 8.
+    let rounds = iters.clamp(1, 4);
+    let inner = (iters / rounds).max(1);
+    irls_rounds(tree, x, y, w, metric, rounds, inner, iters.max(4), |p, i| {
+        let r = p - y[i];
+        r.is_finite().then(|| (weight_of(r, i), y[i]))
+    })
+}
+
+/// IRLS with a per-row `(weight, target)` pair derived from the prediction at
+/// the current constants.
+///
+/// Each of at most `rounds` rounds fits weighted least squares to the targets
+/// with `inner` LM sweeps and is kept only if the configured metric strictly
+/// improves; the first round that does not ends the loop. `row` returning
+/// `None` ends the fit at the incumbent. The base `w` multiplies the weight,
+/// and a zero-weight row gets weight 0.
+#[allow(clippy::too_many_arguments)]
+fn irls_rounds<F>(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    metric: Metric,
+    rounds: usize,
+    inner: usize,
+    last: usize,
+    row: F,
+) -> f64
+where
+    F: Fn(f64, usize) -> Option<(f64, f64)>,
+{
     if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
         return f64::INFINITY;
     }
@@ -3330,29 +3402,26 @@ where
     if !best.is_finite() {
         return best;
     }
-    // Keep the total number of LM sweeps close to `--fit-iters`: four weight
-    // updates with `iters/4` inner sweeps each for the default of 8.
-    let rounds = iters.clamp(1, 4);
-    let inner = (iters / rounds).max(1);
-    for _ in 0..rounds {
-        let pred = predictions(tree, x);
-        let mut target = Vec::with_capacity(x.len());
-        let mut weights = Vec::with_capacity(x.len());
-        for i in 0..x.len() {
-            let r = pred[i] - y[i];
-            if !r.is_finite() {
-                return best;
-            }
+    let pairs = |pred: &[f64]| -> Option<(Vec<f64>, Vec<f64>)> {
+        let mut target = Vec::with_capacity(pred.len());
+        let mut weights = Vec::with_capacity(pred.len());
+        for (i, &p) in pred.iter().enumerate() {
+            let (factor, t) = row(p, i)?;
             let base = if w.is_empty() { 1.0 } else { w[i] };
             // A zero-weight row must stay invisible to the fit, exactly as in
             // `fit_weighted`.
-            weights.push(if base > 0.0 {
-                base * weight_of(r, i).max(0.0)
-            } else {
-                0.0
-            });
-            target.push(y[i]);
+            weights.push(if base > 0.0 { base * factor.max(0.0) } else { 0.0 });
+            target.push(t);
         }
+        Some((target, weights))
+    };
+    for _ in 0..rounds {
+        if best == 0.0 {
+            return best;
+        }
+        let Some((target, weights)) = pairs(&predictions(tree, x)) else {
+            return best;
+        };
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, inner);
         let score = metric_score(&trial, x, y, w, metric);
@@ -3366,22 +3435,12 @@ where
     // A final weighted solve at the converged weights removes the LM damping
     // that the short inner solves deliberately leave behind. It is only kept
     // when the configured loss improves, so it cannot make the fit worse.
-    let pred = predictions(tree, x);
-    if pred.iter().all(|p| p.is_finite()) {
-        let mut target = Vec::with_capacity(x.len());
-        let mut weights = Vec::with_capacity(x.len());
-        for i in 0..x.len() {
-            let r = pred[i] - y[i];
-            let base = if w.is_empty() { 1.0 } else { w[i] };
-            weights.push(if base > 0.0 {
-                base * weight_of(r, i).max(0.0)
-            } else {
-                0.0
-            });
-            target.push(y[i]);
-        }
+    if best == 0.0 {
+        return best;
+    }
+    if let Some((target, weights)) = pairs(&predictions(tree, x)) {
         let mut trial = tree.clone();
-        fit_weighted(&mut trial, x, &target, &weights, iters.max(4));
+        fit_weighted(&mut trial, x, &target, &weights, last);
         let score = metric_score(&trial, x, y, w, metric);
         if improves(score, best) {
             best = score;
@@ -3515,15 +3574,28 @@ fn logistic_irls(
     iters: usize,
     metric: Metric,
 ) -> f64 {
+    logistic_irls_counted(tree, x, y, w, iters, metric).0
+}
+
+/// [`logistic_irls`] and the number of rounds it accepted.
+fn logistic_irls_counted(
+    tree: &mut Node,
+    x: &[Vec<f64>],
+    y: &[f64],
+    w: &[f64],
+    iters: usize,
+    metric: Metric,
+) -> (f64, usize) {
     if x.len() != y.len() || (!w.is_empty() && w.len() != x.len()) {
-        return f64::INFINITY;
+        return (f64::INFINITY, 0);
     }
     let mut best = metric_score(tree, x, y, w, metric);
     if !best.is_finite() {
-        return best;
+        return (best, 0);
     }
     let labels = classification_labels(y);
     let rounds = iters.max(1).min(16);
+    let mut accepted = 0;
     for _ in 0..rounds {
         let pred = predictions(tree, x);
         if pred.iter().any(|p| !p.is_finite()) {
@@ -3544,11 +3616,12 @@ fn logistic_irls(
         if improves(score, best) {
             best = score;
             *tree = trial;
+            accepted += 1;
         } else {
             break;
         }
     }
-    best
+    (best, accepted)
 }
 
 /// Deterministic coordinate polish on a metric without a least-squares form.

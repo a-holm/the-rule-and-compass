@@ -1794,6 +1794,28 @@ the proposal gate (worse / non-finite / kept), exact-CPU-reported errors at the
 search level, the `--no-fit` no-op, and the paired measurement as an ignored
 benchmark.
 
+### Hinge on the batched kernel
+
+`--metric hinge`, `hinge_ordinary` and `hinge_squared` fit on the device through `fit::fit_loss` (fit codes 6-8, `DeviceLoss::HingeSigmoid`, `HingeOrdinary`, `HingeSquared`). Each code reads the uploaded label sign `t` and accumulates a per-row `(weight, response, loss)` triple. The loss statistic of the assembly and of every trial is the configured hinge form, `rc_class_row_loss` in `f32` and its twin `rc_class_row_loss_d` in `f64`, term for term `metrics::classification_row_loss`. The kernel never accumulates a log-loss or an SSE under a hinge metric.
+
+```text
+code  metric          step                          sw           resp
+6     hinge_squared   Gauss-Newton, active set      w·[u < 1]    p − t
+7     hinge_ordinary  phase 0: logistic             w·q(1−q)     −t/q
+                      phase 1: majorise-minimise    w/(2a)       p − t(1 + a)
+8     hinge           logistic                      w·q(1−q)     −t/q
+u = t·p,  q = σ(u) clamped to [1e-9, 1−1e-9],  a = max(|1 − u|, 1e-6)
+```
+
+* **`hinge_squared`.** With `t² = 1`, `max(0, 1 − u)² = (p − t)²` on the active rows `u < 1` and 0 elsewhere, so the squared step with response `p − t` and row weight `w·[u < 1]`, re-derived at every assembly, is its Gauss-Newton step. No Armijo halving: the loss is `C¹`.
+* **`hinge_ordinary`.** `max(0, z) ≤ (z + a)²/(4a)` with `z = 1 − u`, equal at the current constants, and `z + a = t·(t(1 + a) − p)`. The MM pair is the curvature and gradient of that majoriser: an active row gives `sw·resp = −w·t`, an inactive row `resp = 0`. The kernel runs the outer IRLS rounds of the `absolute` arm. Phase 0 takes the logistic triple with single-trial acceptance on the hinge; the first rejected trial switches to phase 1, rebuilds the normal equations and keeps `λ`. Phase 1 uses the two true-hinge Armijo halvings, and the `f64` polish always runs in phase 1 with one `f64` halving. The phase is a block-uniform register derived from the trial objective and the incumbent.
+* **`hinge`.** The bounded sigmoid hinge `1 − t(2σ(p) − 1)` keeps the logistic Fisher step; every trial is accepted only when the sigmoid hinge falls. On separable data it has no finite minimiser: `λ` climbs past `1e9` or the `±1e6` clamp binds, the status label (`no_improvement`, `recovered`) reports it and the exact refit owns the number.
+* **No host gate.** `fit::device_fit_is_gated` is false for the hinge forms. The kernel accepts only trials that lower the configured hinge, the device scorer ranks the candidate on the same hinge, and `refit_finalists_exact` refits every finalist with the CPU arm of `docs/optimisation.md` §3.0, so every reported constant and error is exact CPU `f64`.
+* **Labels and weights.** The sign is the weighted midpoint rule of the scorer (`classification_signs_weighted`). A launch without it is refused on the device. A single-class sample is declined before launch in `fit_pending` and `BatchedGpu::fit_batch_metric` (`single_class`) and keeps the exact CPU arm. A zero-weight row is skipped before its prediction or label is read. The overlap pipeline write-back has no single-class decline, so the label-sign codes always take the synchronous fit batch (`pipeline_fit_safe`).
+* **Zero diagonal.** A constant that moves only inactive rows has an exactly zero Gauss-Newton diagonal under `hinge_squared`; `ft_solve` freezes it and fits the rest, as on every arm.
+
+**Tests** (`src/gpu_hinge_fit_tests.rs`, `src/fit/hinge.rs`): the kernel probe `rc_fit_probe` pins the four loss statistics (`f32` and `f64` assembly and trial) against `classification_row_loss` row for row and the `f64` `Jᵀr` against the analytic gradient of each triple, for both `hinge_ordinary` phases; refusal without a sign; device against CPU arm on overlap, separable, imbalanced and noisy cells (`device ≤ cpu·(1 + 1e-5)`); the constant-model optima `(n₊ − n₋)/n` and `sign(n₊ − n₋)`; a log-loss-only improvement rejected under `hinge`; separable data reaching loss 0; the single-class decline; zero-weight rows with a NaN target; determinism and batch independence; the zero-diagonal freeze; and search runs whose archive is the exact CPU metric, with `--fit-iters 0` a no-op and a labelled single-class run.
+
 ### Classification fitness (#289)
 
 The #287 score table now has a label-aware block for long-only binary
@@ -1815,8 +1837,8 @@ and `hinge_squared` are the separate SVM forms. A constant model has
 pin both optima.
 
 **Codes and dispatch.** The classification objectives occupy the score codes
-10–14, after the regression block 0–9 (#287); the fit `RC_LOSS_*` codes remain
-0–5. `metrics::score_dispatch` maps every classification metric to one of them,
+10–14, after the regression block 0–9 (#287); the fit `RC_LOSS_*` codes are
+0–8. `metrics::score_dispatch` maps every classification metric to one of them,
 so `auc` stays a **named** refusal (`auc needs the exact rank scorer with
 labels (#288)`) rather than the old generic "classification metric" gate. The
 CPU reference is `metrics::score_native_weighted`, which the kernel mirrors.

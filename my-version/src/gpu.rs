@@ -863,6 +863,21 @@ extern "C" {
         outsse: *mut f64,
         outstatus: *mut i32,
     ) -> f32;
+    /* SM-1: the fit kernel's loss statistics and f64 J^T r at the start
+       constants, `4 + kmax` doubles per candidate. Test support. */
+    #[cfg(test)]
+    fn rc_fit_probe(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nprog: i32,
+        kmax: i32,
+        c0: *const f64,
+        metric: i32,
+        phase: i32,
+        out: *mut f64,
+    ) -> i32;
     /* #230: exact rank sums of a batch of prediction vectors against the cached
        target ranks. `out` holds four u64 per segment `(num_hi, num_lo, aa_hi,
        aa_lo)`; `out_bb` receives the target's `Sigma B^2`. */
@@ -2437,6 +2452,65 @@ impl GpuEvaluator {
             })
             .collect();
         (out, ms)
+    }
+
+    /// SM-1: the loss statistics `fit_kernel` sees at each plan's start
+    /// constants, without a step: `[f32 assembly, f32 trial, f64 assembly,
+    /// f64 trial]` and the f64 assembly's `Jᵀr`. `phase` selects the
+    /// `hinge_ordinary` triple (0 logistic, 1 majorise-minimise). `None` when
+    /// the device refused the batch.
+    #[cfg(test)]
+    pub(crate) fn fit_probe(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        loss: crate::fit::DeviceLoss,
+        phase: i32,
+    ) -> Option<Vec<([f64; 4], Vec<f64>)>> {
+        let nprog = plans.len();
+        let kmax = plans.iter().map(|p| p.nconst).max().unwrap_or(0);
+        if nprog == 0 || kmax == 0 {
+            return None;
+        }
+        let mut words: Vec<u32> = Vec::new();
+        let mut off: Vec<u32> = Vec::with_capacity(nprog + 1);
+        let mut pcount: Vec<i32> = Vec::with_capacity(nprog);
+        let mut c0 = vec![0.0f64; nprog * kmax];
+        off.push(0);
+        for (k, plan) in plans.iter().enumerate() {
+            words.extend_from_slice(&plan.words);
+            off.push(words.len() as u32);
+            pcount.push(plan.nconst as i32);
+            c0[k * kmax..k * kmax + plan.nconst].copy_from_slice(&plan.c0);
+        }
+        let stride = 4 + kmax;
+        let mut out = vec![0.0f64; nprog * stride];
+        let rc = unsafe {
+            rc_fit_probe(
+                self.ctx,
+                words.as_ptr(),
+                off.as_ptr(),
+                pcount.as_ptr(),
+                nprog as i32,
+                kmax as i32,
+                c0.as_ptr(),
+                loss.code(),
+                phase,
+                out.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        Some(
+            plans
+                .iter()
+                .enumerate()
+                .map(|(k, plan)| {
+                    let o = &out[k * stride..(k + 1) * stride];
+                    ([o[0], o[1], o[2], o[3]], o[4..4 + plan.nconst].to_vec())
+                })
+                .collect(),
+        )
     }
 
     /// #230: device memory the rank stage may use for one wave, in bytes.
@@ -10027,3 +10101,7 @@ mod carry_tests {
 #[cfg(test)]
 #[path = "gpu_order_select_tests.rs"]
 mod order_select_tests;
+
+#[cfg(test)]
+#[path = "gpu_hinge_fit_tests.rs"]
+mod hinge_fit_tests;

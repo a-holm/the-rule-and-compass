@@ -33,7 +33,13 @@ on the binary label for `log_loss` (#234; the device proposes the constants
 and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
 and since #289 the search also scores log-loss, Brier and the three hinge forms
 with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
-surrogate, not the SVM hinge), and the exact correlation objective with
+surrogate, not the SVM hinge), the three hinge forms on the same label sign
+(`hinge_squared` by Gauss-Newton on the active set, `hinge_ordinary` by
+logistic steps while they lower the hinge and then majorise-minimise steps,
+`hinge` by the logistic step judged on the sigmoid hinge; every trial is
+judged on the configured hinge, a single-class sample is labelled
+`single_class`, and finalists are refit by the same schedule in CPU `f64`),
+and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;
@@ -1074,7 +1080,13 @@ on the binary label for `log_loss` (#234; the device proposes the constants
 and the exact CPU `f64` log-loss judges the proposal and refits every finalist,
 and since #289 the search also scores log-loss, Brier and the three hinge forms
 with a native label-aware kernel — `hinge` is explicitly the bounded sigmoid
-surrogate, not the SVM hinge), and the exact correlation objective with
+surrogate, not the SVM hinge), the three hinge forms on the same label sign
+(`hinge_squared` by Gauss-Newton on the active set, `hinge_ordinary` by
+logistic steps while they lower the hinge and then majorise-minimise steps,
+`hinge` by the logistic step judged on the sigmoid hinge; every trial is
+judged on the configured hinge, a single-class sample is labelled
+`single_class`, and finalists are refit by the same schedule in CPU `f64`),
+and the exact correlation objective with
 a frozen affine gauge
 (#224) — and labels every larger or unsupported candidate for the exact CPU
 arm; the correlation *scorer* is native on the device since #287;
