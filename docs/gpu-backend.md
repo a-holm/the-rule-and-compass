@@ -224,7 +224,7 @@ selects rather than branches. The legacy f32 SSE evaluator (`eval_batch`,
 `eval_pool`) and its host reference `cpu_sse` count a non-finite prediction, or
 one above a shared magnitude limit of 1e30, as a hard failure on **both** sides.
 The native score paths use the rule in "Large predictions and overflowing
-residuals (#422)" instead.
+residuals" instead.
 
 **Native hard operators (#131).** `floor`, `ceil`, `round`, `min`, `max`, `if`,
 `sign`, the comparisons, `and`/`or`/`xor`/`not`, `mod`, `atan2`, `erf` and `erfc`
@@ -502,7 +502,7 @@ is scored (see below). `score_batch`/`score_pool` return `f64` values
 plus a per-candidate status; the legacy `eval_batch`/`eval_pool` f32 SSE path
 remains for the fit and test APIs.
 
-**Large predictions and overflowing residuals (#422).** The device follows the CPU scorer (`metrics::score_weighted`) exactly. There is no magnitude limit on the native score paths.
+**Large predictions and overflowing residuals.** The device follows the CPU scorer (`metrics::score_weighted`) exactly. There is no magnitude limit on the native score paths.
 
 * A prediction that is not finite on a row with positive weight scores `+inf` (status 2, `None` on the order-statistic paths). Nothing else does.
 * A finite prediction of any magnitude is scored. The f32 score kernels (`score_kernel`, `score_step`, the row-range and classification kernels) widen the f32 prediction to `f64` before the residual, so a residual cannot overflow there. A prediction that overflows the f32 range is `inf` in the kernel and is therefore `+inf`, because the f32 program cannot represent it. The CPU gives the same `+inf` when it scores those f32 rows.
