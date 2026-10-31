@@ -179,9 +179,45 @@ The band and the hindsight DP are implemented as associative carries in
   deterministic. The DP resets at every group seam and its per-group bounds add.
 * Chunks are merged in ascending order. A chunk that ends inside a group
   continues the same carry, so **alone, 1-row, 4 k and 64 k chunks produce
-  identical carry bits and bounds**. Nothing in these scans depends on the
-  thread count (the serial reference is used for the reported book) or on a
+  identical carry bits and bounds**. Nothing in these scans depends on a
   `P×N` allocation.
+* The carries are associative as algebra, but their rewards and DP values are
+  `f64` sums, and `f64` addition is not associative: rewards
+  `[1, 2^-53, 2^-53]` fold to `1.0` left to right and to `1 + 2^-52` when the
+  last two are added first. The CPU reference is the left fold, so a parallel
+  prefix over carries cannot reproduce its bits
+  (`f64_carry_rewards_do_not_reassociate_but_end_states_do` in
+  `tests/pnl_gpu.rs`). Only the end-state map, an integer function
+  composition, reassociates exactly.
+
+### Device scan (`--gpu`)
+
+`--gpu` runs the band/cooldown scan (`--policy band`) and the hindsight DP
+(`--policy dp`) on the CUDA device (`src/cuda/pnl.cu`). The device result is
+bit-identical to the CPU scan: same positions, same carry bits, same net and
+bound.
+
+* A **chain** is one `(group, start state)` fold: `K+1` chains per group for
+  the band, two (one per source state) for the DP. One device thread folds one
+  chain over the group's rows in ascending order, with the same `f64`
+  operations in the same order as the CPU. The kernels are built with
+  `-fmad=false`, so no product is fused into an add.
+* The block size (1 up to the device limit) only changes which thread owns a
+  chain, never the order of its sums. The scan is launched once per row chunk;
+  a chain whose group continues from an earlier chunk resumes its state and
+  value from device memory.
+* The per-group carries come back to the host, and the net and the bound are
+  summed there by the same code as the CPU path.
+* Scores stay `f64` on the device, so a score on `θ ± β` compares exactly as on
+  the CPU. Candidates stream through the declared 8-candidate tile; there is no
+  persistent `P×N` buffer.
+* When the device refuses (non-CUDA build, no device, a refused allocation, a
+  launch or copy error) the CPU scan runs instead. The `band` and
+  `hindsight_bound` JSON objects carry `backend` (`cuda` or `cpu`) and
+  `fallback_reason` (`null` unless `--gpu` fell back), the report's `policy`
+  object carries `gpu`, and the CLI prints one `note:` line per fallback on
+  stderr. Invalid input fails with the CPU's own error.
+* Without `--gpu` the walk-forward runs the CPU scans exactly as before.
 
 ```sh
 # no-trade band, beta 0.1, minimum hold 3 rows
@@ -189,6 +225,9 @@ rcsr walkforward ... --policy band --band 0.1 --min-hold 3
 
 # threshold strategy plus the exact hindsight bound (never a strategy)
 rcsr walkforward ... --policy dp
+
+# the same scans on the device, bit-identical to the CPU
+rcsr walkforward ... --policy band --band 0.1 --gpu
 ```
 
 ## Fused long-only P&L (`--device-pnl`)
