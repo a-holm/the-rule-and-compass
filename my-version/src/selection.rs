@@ -12,6 +12,10 @@ use crate::trading_gpu::{self, ValidMask};
 pub enum SelectBy {
     Train,
     Validation,
+    /// Validation slice, ranked by an exact trading objective. The candidate's
+    /// `validation` score holds the objective value (lower is better), never
+    /// an error metric.
+    ValidationObjective,
     Aicc,
 }
 
@@ -32,6 +36,7 @@ impl SelectBy {
         match self {
             SelectBy::Train => "train",
             SelectBy::Validation => "validation",
+            SelectBy::ValidationObjective => "validation_objective",
             SelectBy::Aicc => "aicc",
         }
     }
@@ -59,7 +64,7 @@ impl Candidate {
     fn score(self, by: SelectBy) -> f64 {
         match by {
             SelectBy::Train => finite_or_worst(self.train),
-            SelectBy::Validation => finite_or_worst(self.validation.unwrap_or(f64::INFINITY)),
+            SelectBy::Validation | SelectBy::ValidationObjective => finite_or_worst(self.validation.unwrap_or(f64::INFINITY)),
             SelectBy::Aicc => finite_or_worst(self.aicc),
         }
     }

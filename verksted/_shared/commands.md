@@ -12,7 +12,7 @@ BASE=integration/gpu-hardening              # or main
 W=$WT/issue-$N-$SLUG                        # this ticket's worktree
 RUN=$W                                      # checkout that holds this run's output/ files
 V=$RUN/verksted
-B=/mnt/lager/tmp/opencode/build-slot.sh   # builds: 3 concurrent, nice 19, MemAvailable >= 8 GiB
+B=/mnt/lager/tmp/opencode/build-slot.sh   # builds: 3 concurrent (1 while streaming), SCHED_IDLE, MemAvailable >= 8 GiB
 L=/mnt/lager/tmp/opencode/one-full-suite.sh  # tests and benchmarks: one at a time
 G=/mnt/lager/tmp/eureqa-gates               # logs: $G/issue$N-<what>.log
 PAUSE=/mnt/lager/tmp/opencode/PAUSE
@@ -48,7 +48,15 @@ $L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=sm_86 timeout 
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
 ```
 
-The lock runs the command at nice 19 and ionice idle, waits while `$PAUSE` exists, and gives up after 7200 s with exit 75 (rerun then). Keep each hold under 10 minutes. Count results with `grep -c 'test result: ok' <log>` and `grep -c 'test result: FAILED' <log>`.
+The lock runs the command under SCHED_IDLE (`chrt -i 0`), nice 19 and ionice idle, waits while `$PAUSE` exists, and gives up after 7200 s with exit 75 (rerun then). Keep each hold under 10 minutes. Count results with `grep -c 'test result: ok' <log>` and `grep -c 'test result: FAILED' <log>`.
+
+While the desktop streams video both scripts pin work to CPUs 2,3,6,7, the build slots drop to 1 and `RUST_TEST_THREADS=4`. Otherwise 3 slots on all CPUs. Force the streaming restriction, clear it, and check it:
+
+```sh
+touch /mnt/lager/tmp/opencode/STREAMING
+rm /mnt/lager/tmp/opencode/STREAMING
+/mnt/lager/tmp/opencode/desktop-busy.sh; echo $?   # 0 = desktop busy, 1 = free
+```
 
 ## Full gate (once, on the integration tip)
 

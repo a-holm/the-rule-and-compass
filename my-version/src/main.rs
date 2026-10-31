@@ -162,6 +162,31 @@ INPUT:
                              member comes from the validation gates, not from
                              this order. test_error is scoring-only, never a
                              criterion.
+  --objective mse|pnl|sharpe|log_growth
+                             what finalist selection minimises on the
+                             validation slice (default mse: the fit metric).
+                             pnl, sharpe and log_growth score each Pareto
+                             member's exact CPU f64 predictions as a long/flat
+                             book (positions 0 or 1, never short) with cost per
+                             side on |delta p| including the final exit; the
+                             fit and the archive still use --metric. Needs a
+                             temporal split with --validation-frac, a
+                             forward_return --target-spec, and --cost-bps.
+                             The test block is read once, for the winner only
+  --position long_only       the only position map (default). short is refused
+  --allow-short              refused: there is no short P&L, borrow or funding
+  --threshold <f>            long when the prediction is strictly above <f>
+                             (default 0)
+  --cost-bps <f>             cost per side in basis points (required with a
+                             P&L objective; 0 only when stated)
+  --slippage-bps <f>         extra cost per side in basis points (default 0)
+  --cash-return <f>          return per row earned while flat (default 0)
+  --funding <col>            per-row funding rate paid while long
+  --max-position <f>         position cap in (0, 1] (default 1)
+  --min-trades <n>           fewer trades on validation make a candidate
+                             unusable (default 1)
+  --min-holding <n>          rows a long position is held before an exit
+                             (default 1)
   --require-validation       refuse (exit 2) when there is no validation slice
   --equivalence-z <z>        z for the validation gates: a member is supported
                              when it improves on the last supported entry by
@@ -497,7 +522,13 @@ SEARCH:
                              a softplus trial objective (#234; the device
                              proposes constants and the exact CPU f64 log-loss
                              judges and refits; since #289 the search also
-                             scores log_loss natively on the device), or — for
+                             scores log_loss natively on the device), the exact correlation
+                             objective 1-|rho| or 1-rho with a frozen affine
+                             gauge (correlation_signed refines both gauge
+                             orientations; a tree affine in every constant takes
+                             the CPU least-squares closed form, labelled
+                             affine_closed_form; every proposal passes the
+                             exact f64 gate), or - for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
                              (#230), with rank_correlation_signed scored as
@@ -522,7 +553,8 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, `--metric log_loss`, a rank
+                             `--metric absolute`, `--metric log_loss`, `--metric
+                             correlation`, `--metric correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
                              strategy. `--metric signed` keeps the exact CPU
@@ -830,6 +862,22 @@ fn jstr(s: &str) -> String {
     }
     o.push('"');
     o
+}
+
+fn parse_trade_number(flag: &str, text: &str) -> f64 {
+    match text.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() => v,
+        _ => {
+            eprintln!("error: {} needs a finite number, got '{}'", flag, text);
+            std::process::exit(EXIT_USAGE);
+        }
+    }
+}
+
+/// #263: a usage error for the P&L objective, exit 2.
+fn trading_usage(msg: &str) -> ! {
+    eprintln!("error: {}", msg);
+    std::process::exit(EXIT_USAGE);
 }
 
 /// JSON number, with non-finite values rendered as `null` (valid JSON).
@@ -1803,6 +1851,9 @@ struct Row {
     /// Selection reads this (or train/AICc), never `test_error`.
     validation_error: f64,
     test_error: f64,
+    /// #263: the P&L objective on the validation slice, lower is better;
+    /// `NaN` without a trading objective.
+    objective_value: f64,
     /// Small-sample-corrected AIC (fit vs. constants), lower is better.
     aicc: f64,
     /// Bayesian information criterion, lower is better.
@@ -1951,6 +2002,19 @@ fn main() {
     // the test lockbox.
     let mut validation_frac = 0.0f64;
     let mut select_by_arg: Option<String> = None;
+    // #263: exact long/flat P&L objective for finalist selection.
+    let mut objective_arg: Option<String> = None;
+    let mut trading_flags: Vec<&'static str> = Vec::new();
+    let mut position_arg: Option<String> = None;
+    let mut allow_short = false;
+    let mut trade_threshold = 0.0f64;
+    let mut trade_cost_bps: Option<f64> = None;
+    let mut trade_slippage_bps = 0.0f64;
+    let mut trade_cash_return = 0.0f64;
+    let mut trade_funding: Option<String> = None;
+    let mut trade_max_position = 1.0f64;
+    let mut trade_min_trades = 1usize;
+    let mut trade_min_holding = 1usize;
     let mut out_path: Option<String> = None;
     let mut format = Format::Text;
     let mut progress = false;
@@ -2220,6 +2284,47 @@ fn main() {
             "--test-frac" => test_frac = val!().parse().unwrap_or(test_frac),
             "--validation-frac" => validation_frac = val!().parse().unwrap_or(validation_frac),
             "--select-by" => select_by_arg = Some(val!()),
+            "--objective" => objective_arg = Some(val!()),
+            "--position" => {
+                trading_flags.push("--position");
+                position_arg = Some(val!());
+            }
+            "--allow-short" => {
+                trading_flags.push("--allow-short");
+                allow_short = true;
+            }
+            "--threshold" => {
+                trading_flags.push("--threshold");
+                trade_threshold = parse_trade_number("--threshold", &val!());
+            }
+            "--cost-bps" => {
+                trading_flags.push("--cost-bps");
+                trade_cost_bps = Some(parse_trade_number("--cost-bps", &val!()));
+            }
+            "--slippage-bps" => {
+                trading_flags.push("--slippage-bps");
+                trade_slippage_bps = parse_trade_number("--slippage-bps", &val!());
+            }
+            "--cash-return" => {
+                trading_flags.push("--cash-return");
+                trade_cash_return = parse_trade_number("--cash-return", &val!());
+            }
+            "--funding" => {
+                trading_flags.push("--funding");
+                trade_funding = Some(val!());
+            }
+            "--max-position" => {
+                trading_flags.push("--max-position");
+                trade_max_position = parse_trade_number("--max-position", &val!());
+            }
+            "--min-trades" => {
+                trading_flags.push("--min-trades");
+                trade_min_trades = parse_trade_number("--min-trades", &val!()) as usize;
+            }
+            "--min-holding" => {
+                trading_flags.push("--min-holding");
+                trade_min_holding = parse_trade_number("--min-holding", &val!()) as usize;
+            }
             "--fill" => {
                 let v = val!();
                 match data::FillMethod::parse(&v) {
@@ -4031,6 +4136,96 @@ fn main() {
         }
     }
 
+    // #263: the exact long/flat P&L objective. Every refusal is a usage error
+    // raised before any data is read.
+    let objective = match rcsr::trading::Objective::parse(objective_arg.as_deref().unwrap_or("mse")) {
+        Ok(o) => o,
+        Err(e) => trading_usage(&e),
+    };
+    if !objective.is_trading() {
+        if let Some(flag) = trading_flags.first() {
+            trading_usage(&format!("{} needs --objective pnl, sharpe or log_growth", flag));
+        }
+    }
+    let mut trading_spec: Option<rcsr::trading::TradingSpec> = None;
+    let mut trading_cols: Option<data::TradingColumns> = None;
+    if objective.is_trading() {
+        let name = objective.name();
+        if multi_output {
+            trading_usage("--objective is not supported with multiple targets (--target y1,y2)");
+        }
+        if allow_short || position_arg.as_deref().is_some_and(|p| p != "long_only") {
+            trading_usage(
+                "--position short and --allow-short are refused: the book is long-only, \
+                 there is no short P&L, borrow or funding",
+            );
+        }
+        if !matches!(mode, data::SplitMode::Temporal | data::SplitMode::TemporalGroup)
+            || time_col.is_none()
+        {
+            trading_usage(&format!(
+                "--objective {} needs a temporal split: add --time <col> and --split temporal",
+                name
+            ));
+        }
+        let ts = match &target_resolved {
+            Some(r) => &r.spec,
+            None => trading_usage(&format!(
+                "--objective {} needs a forward-return target: declare it with --target-spec",
+                name
+            )),
+        };
+        if ts.kind != "forward_return" {
+            trading_usage(&format!(
+                "--objective {} needs a forward_return target, the spec declares '{}'",
+                name, ts.kind
+            ));
+        }
+        let cost = match trade_cost_bps {
+            Some(c) => c,
+            None => trading_usage(&format!(
+                "--objective {} needs a cost assumption: --cost-bps <f> per side (0 only when stated)",
+                name
+            )),
+        };
+        if cost < 0.0 || trade_slippage_bps < 0.0 {
+            trading_usage("--cost-bps and --slippage-bps must be non-negative");
+        }
+        if ts.cost_in_label && cost + trade_slippage_bps != 0.0 {
+            trading_usage(
+                "cost_already_in_label: the target spec says the label is net of cost, \
+                 so a non-zero --cost-bps or --slippage-bps would charge it twice",
+            );
+        }
+        let unit_scale = matches!(&ts.scale, target::Scale::Constant { value } if *value == 1.0);
+        if ts.return_column.is_none() && (ts.offset != 0.0 || ts.clip.is_some() || !unit_scale) {
+            trading_usage(
+                "the target is scaled, clipped or offset: declare a return_column in the \
+                 target spec so the P&L uses realised returns",
+            );
+        }
+        trading_cols = Some(data::TradingColumns {
+            return_column: ts.return_column.clone(),
+            log_returns: ts.return_units == "log",
+            funding_column: trade_funding.clone(),
+        });
+        let tspec = rcsr::trading::TradingSpec {
+            cost_bps: cost,
+            slippage_bps: trade_slippage_bps,
+            funding_col: trade_funding.clone(),
+            cash_return: trade_cash_return,
+            min_trades: trade_min_trades,
+            min_holding: trade_min_holding,
+            threshold: trade_threshold,
+            max_position: trade_max_position,
+            ..Default::default()
+        };
+        if let Err(e) = tspec.validate() {
+            trading_usage(&e);
+        }
+        trading_spec = Some(tspec);
+    }
+
     let spec = data::SplitSpec {
         mode,
         time_col,
@@ -4049,6 +4244,7 @@ fn main() {
         },
         allow_lockbox,
         purge_seconds: target_resolved.as_ref().map(|r| r.spec.required_purge_seconds()),
+        trading: trading_cols.clone(),
         scale_column: target_resolved
             .as_ref()
             .and_then(|r| r.spec.scale_column())
@@ -4303,6 +4499,21 @@ fn main() {
     };
     if select_by.is_none() && prepared.validation.is_some() {
         select_by = Some(rcsr::selection::SelectBy::Validation);
+    }
+    if objective.is_trading() {
+        if select_by_arg
+            .as_deref()
+            .is_some_and(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "validation" | "val"))
+        {
+            trading_usage("--objective selects on the validation slice; use --select-by validation or drop it");
+        }
+        if prepared.validation.is_none() {
+            trading_usage(&format!(
+                "--objective {} needs a validation slice: add --validation-frac <f>",
+                objective.name()
+            ));
+        }
+        select_by = Some(rcsr::selection::SelectBy::ValidationObjective);
     }
     if select_by == Some(rcsr::selection::SelectBy::Validation) && prepared.validation.is_none() {
         eprintln!(
@@ -5191,6 +5402,16 @@ fn main() {
                 Some(v) => search::eval_error(&s.tree, v, cfg.metric),
                 None => f64::NAN,
             };
+            let objective_value = match (&trading_spec, &prepared.validation, prepared.trading.as_ref().and_then(|t| t.validation.as_ref())) {
+                (Some(tspec), Some(v), Some(slice)) => {
+                    let vpred: Vec<f64> = v.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+                    match rcsr::trading::evaluate(&vpred, &slice.ret, &slice.rows, tspec) {
+                        Ok(stats) => objective.score(&stats, tspec.min_trades),
+                        Err(_) => f64::INFINITY,
+                    }
+                }
+                _ => f64::NAN,
+            };
             let pred: Vec<f64> = prepared
                 .train
                 .x
@@ -5252,6 +5473,7 @@ fn main() {
                 train_error,
                 validation_error,
                 test_error,
+                objective_value,
                 aicc,
                 bic,
                 dw,
@@ -5324,7 +5546,9 @@ fn main() {
             .iter()
             .map(|r| rcsr::selection::Candidate {
                 train: r.train_error,
-                validation: if r.validation_error.is_finite() {
+                validation: if objective.is_trading() {
+                    Some(r.objective_value)
+                } else if r.validation_error.is_finite() {
                     Some(r.validation_error)
                 } else {
                     None
@@ -5341,6 +5565,50 @@ fn main() {
         }
         if !quiet {
             eprintln!("# selection: {} (test errors are scoring-only)", by.name());
+        }
+    }
+
+    // #263: the trading objective's finalist. Selection above read only the
+    // validation slice; the test book is scored here, for the winner alone.
+    let objective_report: Option<rcsr::trading::FinalistReport> = match (&trading_spec, rows.first()) {
+        (Some(tspec), Some(top)) => {
+            let tree = &sorted[top.archive_rank - 1].tree;
+            let book = |sample: &data::Sample, slice: Option<&data::TradingSlice>| match slice {
+                Some(slice) => {
+                    let pred: Vec<f64> = sample.x.iter().map(|row| expr::eval(tree, row)).collect();
+                    rcsr::trading::evaluate(&pred, &slice.ret, &slice.rows, tspec)
+                }
+                None => Err("no trading rows".to_string()),
+            };
+            let split = prepared.trading.as_ref();
+            let usable = rows.iter().filter(|r| r.objective_value.is_finite()).count();
+            if usable == 0 && !quiet {
+                eprintln!("# warning: no candidate has a usable P&L book on the validation slice");
+            }
+            Some(rcsr::trading::FinalistReport {
+                objective,
+                spec: tspec.clone(),
+                candidates: rows.len(),
+                usable,
+                expression: top.expression.clone(),
+                archive_rank: top.archive_rank,
+                fit_metric: cfg.metric.name().to_string(),
+                fit_error: top.train_error,
+                validation_error: top.validation_error,
+                test_error: top.test_error,
+                validation_value: top.objective_value,
+                validation: match &prepared.validation {
+                    Some(v) => book(v, split.and_then(|t| t.validation.as_ref())),
+                    None => Err("no validation slice".to_string()),
+                },
+                test: book(&prepared.test, split.map(|t| &t.test)),
+            })
+        }
+        _ => None,
+    };
+    if let Some(rep) = &objective_report {
+        if format == Format::Text && !quiet {
+            eprintln!("{}", rep.text());
         }
     }
 
@@ -6356,6 +6624,14 @@ fn main() {
                     .map(jstr)
                     .unwrap_or_else(|| "null".to_string())
             );
+            let backend_json = match &objective_report {
+                Some(rep) => format!(
+                    "{}\"objective\":{},",
+                    backend_json,
+                    rep.json(outcome.backend.name(), backend_reason.as_deref())
+                ),
+                None => backend_json,
+            };
             let result_json = format!(
                 "{{{}{}\"tool\":\"rcsr\",\"version\":{},\"seed\":{},\"metric\":{},\"fitting\":{},\"target\":{},\"variables\":[{}],\"variables_detail\":[{}],\"weight_column\":{},\"weight_sum\":{},\"weight_rows\":{},\"weight_positive_rows\":{},\"train_rows\":{},\"test_rows\":{},\"split\":{},\"lockbox\":{},\"target_spec\":{},\"preparation\":{},\"generations_run\":{},\"converged_early\":{},\"stop_reason\":{},\"convergence\":{},\"elapsed_seconds\":{},\"timing\":{},\"gpu\":{},\"dispatch\":{},\"checkpoint\":{},\"null_control\":{},\"baselines\":{},\"residual_tests\":{},\"cross_validation\":{},\"stability\":{},\"validation_hv\":{}{},\"qd\":{},\"seeds\":[{}],\"pareto\":[{}]}}",
                 search_meta_json, // #85 #86

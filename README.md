@@ -451,9 +451,9 @@ atomically instead of streaming it. See
   (`mkt_*`, `breadth`, `dispersion`, `rel_mkt*`, `avg_corr`,
   `btc_volume_share`) run one thread per timestamp in the CPU addition order
   (`--features cuda`, tiers per column in `rcsr schema` `gpu_feature_parity`),
-  the point-in-time membership and MTF as-of joins (`src/cuda/pit.cu`, #302: `as_of <= t` and
-  `h.time + tf <= t` merges with `bar_age`, chain resets and `lookahead_violations`; bitwise vs the
-  CPU reference, membership decisions stay on the CPU, `rcsr panel build` is not rewired),
+  the point-in-time membership as-of join (`src/cuda/pit.cu`: an `as_of <= t` merge with chain
+  resets and `lookahead_violations`; bitwise vs the CPU reference, membership decisions stay on
+  the CPU, `rcsr panel build --gpu auto|on|off` runs it),
   the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;
@@ -581,6 +581,9 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
      [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
+     [--objective mse|pnl|sharpe|log_growth] [--position long_only] [--threshold f]
+     [--cost-bps f] [--slippage-bps f] [--cash-return f] [--funding col]
+     [--max-position f] [--min-trades n] [--min-holding n] [--allow-short]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--lockbox START,END] [--ledger file] [--target-spec file] [--allow-target-structure]
      [--gap-break f] [--fill method] [--allow-interpolate] [--outlier-iqr k]
@@ -704,6 +707,15 @@ rcsr --data d.csv --target y --vars x1,x2 --exclude "warmup == 1"
   `--select-by train|validation|aicc` chooses the display order; the test
   block is a scoring-only lockbox and is never used to select. See
   [`docs/overfitting.md`](docs/overfitting.md) for the lockbox argument.
+* `--objective pnl|sharpe|log_growth` chooses the finalist on the validation
+  slice by an exact long/flat book (position 0 or 1, never short, cost per side
+  on `|delta p|` including the exit, daily `sqrt(365)` Sharpe) instead of the
+  fit error. The fit and the archive keep `--metric`. It needs a temporal
+  split, `--validation-frac`, a `forward_return` `--target-spec` and
+  `--cost-bps`. `--json` adds an `objective` block with the validation and test
+  books, cash and buy-and-hold comparisons and the break-even cost. See
+  [`docs/walkforward.md`](docs/walkforward.md) and
+  [`docs/optimisation.md`](docs/optimisation.md).
 * Time-ordered runs, runs with a target spec and runs with `--require-validation`
   run the **validation gates** (section 3.10b of `docs/overfitting.md`): a
   noise-scaled supported front on the validation slice (`--equivalence-z`,
