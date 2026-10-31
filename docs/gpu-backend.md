@@ -189,6 +189,11 @@ upload is measured in `gpu.transfer_bytes`. On a store that cannot be projected
 (e.g. a text-only field required as a numeric kernel input) the historical
 whole-column upload is used and reported, never silently.
 
+`rcsr enrich --json` partitions `timing.feature_s` on the host thread into
+read, context, GPU section, `gpu.write_s`, CPU pass and a non-negative
+`feature_other_s` remainder. The device times `kernel_s`, `h2d_s` and `d2h_s`
+are busy measures that may overlap that timeline (docs/ohlcv.md).
+
 Measured on the RTX 3060 with the 6 400-row fixture: a 3-slot 7-column ring is
 constant across 100 groups, tiled `r1/r5/lag/range/clv/calendar` columns are
 bit-identical to the whole-column kernels, and the copy/compute event windows
