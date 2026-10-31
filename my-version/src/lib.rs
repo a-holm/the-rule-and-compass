@@ -16,6 +16,8 @@ pub mod enrich; // #200: append-only OHLCV feature enrichment
 #[cfg(feature = "cuda")]
 pub mod enrich_gpu; // #200: resident CUDA enrichment kernels
 #[cfg(feature = "cuda")]
+pub mod dispatch_gpu; // #290: device calibration probe
+#[cfg(feature = "cuda")]
 pub mod projected_ring; // #294: bounded pinned ring and direct projected upload
 #[cfg(feature = "cuda")]
 pub mod mtf_gpu; // #296: device MTF resample and causal join

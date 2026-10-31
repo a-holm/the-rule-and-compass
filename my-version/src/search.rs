@@ -5344,8 +5344,15 @@ fn run_search(
     // startup cost model; contract stages (variation, selection, archive, I/O,
     // features, P&L and exact refit) are planned once and recorded so the
     // ledger answers for every stage, not only the two that can move.
-    let mut dispatcher =
-        crate::dispatch::Dispatcher::new(crate::dispatch::Calibration::probe());
+    #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+    let mut calibration = crate::dispatch::Calibration::probe();
+    #[cfg(feature = "cuda")]
+    if cfg.gpu {
+        if let Some(rates) = crate::dispatch_gpu::device_rates() {
+            calibration = calibration.with_device_rates(rates);
+        }
+    }
+    let mut dispatcher = crate::dispatch::Dispatcher::new(calibration);
     for stage in [
         crate::dispatch::Stage::Vary,
         crate::dispatch::Stage::Select,

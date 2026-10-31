@@ -3048,11 +3048,15 @@ hysteresis band `h = 0.3` so a stage does not oscillate at the crossover.
 `vary` stays CPU until #291; `select`, `archive`, `features`, `pnl`, `io` and
 the exact `refit` are CPU by contract.
 
-A ~100 ms startup probe measures the host rate and anchors the device rates;
-the values, source, sample count and reproducibility band are written to
-`--json` under `dispatch.calibration` (the probe wall time is provenance and
-appears only in the manifest, so the result JSON stays byte-stable) and to
-`--run-manifest` under `dispatch`.
+A host probe times the host rate. With `--gpu` and a usable device, one device
+probe per process times the scoring rate, the batched fit rate, the H2D and D2H
+bandwidth and the launch overhead on a small resident dataset, and those values
+replace the corpus anchors. Without a device the anchors stay and are labelled
+`anchor`. Every probed term is the median of its timed reps and carries the
+spread of those reps. `--json` under `dispatch.calibration` carries the
+provenance labels (`source`, `device_source`, sample counts), so the result JSON
+stays byte-stable. `--run-manifest` under `dispatch.calibration` adds the
+measured rates, their `spread` and the probe wall time.
 The per-stage `dispatch.route_ledger` carries `route`, `reason`, `calls`,
 `candidates`, `predicted_s`, `actual_s`, `actual_over_predicted`, `bytes` and
 `switches`.

@@ -834,6 +834,7 @@ extern "C" {
     ) -> i32;
     fn rc_device_name() -> *const std::os::raw::c_char;
     fn rc_unified() -> i32;
+    fn rc_copy_probe(ctx: *mut RawCtx, bytes: u64, reps: i32, h2d_ms: *mut f64, d2h_ms: *mut f64) -> i32;
     fn rc_set_fit_data(ctx: *mut RawCtx, cols: *const f64, y: *const f64, w: *const f64) -> i32;
     /* #234: the per-row label sign `t = 2l - 1` the log-loss fit arm reads. A
        null pointer clears it, and every log-loss launch is then refused.
@@ -1674,6 +1675,22 @@ impl GpuEvaluator {
     /// default for `RCSR_CUDA_ARCH=sm_121`.
     pub fn unified_memory() -> bool {
         unsafe { rc_unified() != 0 }
+    }
+
+    /// #290: wall time in milliseconds of `reps` pinned-host copies of `bytes`
+    /// each way, one entry per rep. `None` when the device refuses the buffer
+    /// or a copy fails.
+    pub(crate) fn copy_probe(&mut self, bytes: usize, reps: usize) -> Option<(Vec<f64>, Vec<f64>)> {
+        let mut h2d = vec![0.0f64; reps];
+        let mut d2h = vec![0.0f64; reps];
+        let rc = unsafe {
+            rc_copy_probe(self.ctx, bytes as u64, reps as i32, h2d.as_mut_ptr(), d2h.as_mut_ptr())
+        };
+        if rc == 0 {
+            Some((h2d, d2h))
+        } else {
+            None
+        }
     }
 
     /// #131 fixtures: raw per-row predictions for a packed batch, `P × N`

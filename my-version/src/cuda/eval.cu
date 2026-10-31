@@ -6299,6 +6299,37 @@ int rc_rank_debug_b(void *ctx, long long *out)
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+/* #290: time `reps` pinned-host copies of `bytes` each way over the context's
+   device. `h2d_ms` and `d2h_ms` receive one wall time per rep. Returns 0, or -1
+   when an allocation or copy fails. */
+int rc_copy_probe(void *ctx, unsigned long long bytes, int reps, double *h2d_ms, double *d2h_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || bytes == 0 || reps <= 0 || !h2d_ms || !d2h_ms) return -1;
+    void *dev = 0;
+    void *host = 0;
+    if (rc_dev_alloc_kind(c, "copy_probe", &dev, (size_t)bytes, 0) != 0) return -1;
+    if (cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocDefault) != cudaSuccess) {
+        cudaGetLastError();
+        rc_dev_free(c, dev);
+        return -1;
+    }
+    memset(host, 0, (size_t)bytes);
+    int rc = 0;
+    for (int i = 0; i < reps && rc == 0; ++i) {
+        double t = rc_now_ms();
+        if (cudaMemcpy(dev, host, (size_t)bytes, cudaMemcpyHostToDevice) != cudaSuccess) rc = -1;
+        h2d_ms[i] = rc_now_ms() - t;
+        t = rc_now_ms();
+        if (cudaMemcpy(host, dev, (size_t)bytes, cudaMemcpyDeviceToHost) != cudaSuccess) rc = -1;
+        d2h_ms[i] = rc_now_ms() - t;
+    }
+    if (rc != 0) cudaGetLastError();
+    cudaFreeHost(host);
+    rc_dev_free(c, dev);
+    return rc;
+}
+
 /* 1 when the context uses managed (unified) memory, 0 for plain device memory.
    The benchmark prints this so a recorded run states which path it measured. */
 int rc_unified(void)
