@@ -1242,3 +1242,123 @@ fn large_store_parity_at_the_declared_tiers() {
         other => panic!("unknown RCSR_PARITY_ARM '{other}'"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// cusum_abs_z after a gap: the window sum covers the window's own rows only
+// ---------------------------------------------------------------------------
+
+const CUSUM_ROWS: usize = 700;
+const CUSUM_GAP_ROW: usize = 300;
+
+/// One symbol, `CUSUM_ROWS` bars, five bars missing so that row `CUSUM_GAP_ROW`
+/// is the first row after the hole.
+fn cusum_gap_rows() -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut close = 100.0;
+    for i in 0..CUSUM_ROWS + 5 {
+        if (CUSUM_GAP_ROW..CUSUM_GAP_ROW + 5).contains(&i) {
+            continue;
+        }
+        let ret = ((mix(11, i as u64) % 2001) as f64 - 1000.0) / 1.0e5;
+        let open = close;
+        close *= 1.0 + ret;
+        rows.push(Row {
+            t: T0 + i as i64 * STEP,
+            sym: 2,
+            o: open,
+            h: open.max(close) + 0.1,
+            l: open.min(close) - 0.1,
+            c: close,
+            v: 10.0 + (i % 97) as f64,
+            qv: 1.0,
+            trades: 1.0,
+            tb: 1.0,
+            tq: 1.0,
+            member: T0 + i as i64 * STEP,
+        });
+    }
+    rows
+}
+
+/// `|sum of the window's z| / sqrt(96)` from the rows alone: z is the log
+/// return standardised by the mean and population deviation of its own 96-bar
+/// window, and a window sums the z of its rows only.
+fn cusum_direct(rows: &[Row]) -> Vec<f64> {
+    let n = rows.len();
+    let contig = |i: usize, w: usize| i + 1 >= w && rows[i + 1 - w].t == rows[i].t - (w as i64 - 1) * STEP;
+    let mut lr = vec![f64::NAN; n];
+    for i in 1..n {
+        if rows[i].t - rows[i - 1].t == STEP && rows[i].c > 0.0 && rows[i - 1].c > 0.0 {
+            lr[i] = (rows[i].c / rows[i - 1].c).ln();
+        }
+    }
+    let mut z = vec![f64::NAN; n];
+    for i in 95..n {
+        let win = &lr[i - 95..=i];
+        if !contig(i, 96) || !lr[i].is_finite() || win.iter().any(|v| !v.is_finite()) {
+            continue;
+        }
+        let m = win.iter().sum::<f64>() / 96.0;
+        let sd = (win.iter().map(|v| (v - m) * (v - m)).sum::<f64>() / 96.0).sqrt();
+        if sd > 0.0 {
+            z[i] = (lr[i] - m) / sd;
+        }
+    }
+    let mut out = vec![f64::NAN; n];
+    for i in 96..n {
+        if contig(i, 96) {
+            let s: f64 = z[i - 95..=i].iter().filter(|v| v.is_finite()).sum();
+            out[i] = s.abs() / 96f64.sqrt();
+        }
+    }
+    out
+}
+
+fn cusum_build(dir: &std::path::Path, tag: &str, gpu: GpuMode) -> Vec<f64> {
+    let rows = cusum_gap_rows();
+    let src = p(dir, &format!("{tag}-in.rcsb"));
+    let out = p(dir, &format!("{tag}-out.rcsb"));
+    write_fixture(&src, &rows, 4_096);
+    let names = vec!["cusum_abs_z".to_string()];
+    enrich::build(&options(&src, &out, &names, gpu, 4_096)).unwrap();
+    read_column(&out, "cusum_abs_z")
+}
+
+fn assert_cusum_matches_direct(label: &str, got: &[f64]) {
+    let want = cusum_direct(&cusum_gap_rows());
+    assert_eq!(got.len(), want.len());
+    assert!(want[CUSUM_GAP_ROW + 94].is_nan());
+    assert!(want[CUSUM_GAP_ROW + 95].is_finite());
+    assert!(want[CUSUM_GAP_ROW - 1].abs() > 0.0, "the run before the gap must carry a nonzero sum");
+    for i in 0..got.len() {
+        assert_eq!(got[i].is_nan(), want[i].is_nan(), "{label}: NaN mask at row {i}: got {} want {}", got[i], want[i]);
+        if want[i].is_finite() {
+            assert!((got[i] - want[i]).abs() <= 1e-9, "{label}: row {i}: got {} want {}", got[i], want[i]);
+        }
+    }
+}
+
+#[test]
+fn cusum_abs_z_one_gap_window_uses_only_its_own_rows_on_the_cpu() {
+    let dir = work_dir("cusum-cpu");
+    let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
+    assert_cusum_matches_direct("cpu", &cpu);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn cusum_abs_z_one_gap_window_matches_the_cpu_on_the_device() {
+    if !have_device() {
+        return;
+    }
+    let _g = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    enrich::set_gpu_floor_for_tests(0);
+    let dir = work_dir("cusum-gpu");
+    let c = device_columns().into_iter().find(|c| c.name == "cusum_abs_z").expect("device column");
+    let cpu = cusum_build(&dir, "cpu", GpuMode::Off);
+    let gpu = cusum_build(&dir, "gpu", GpuMode::On);
+    assert_cusum_matches_direct("gpu", &gpu);
+    let (o, cs, gs) = observe(&cpu, &gpu);
+    verdict(c.tier, &o, &cs, &gs).unwrap_or_else(|e| panic!("cusum_abs_z [{}] {}: {e}", c.family, c.tier));
+    std::fs::remove_dir_all(&dir).ok();
+}
