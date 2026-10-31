@@ -665,6 +665,21 @@ SEARCH:
                              order scorers then run on the CPU and an explicit
                              --fit-strategy gpu exits 2. JSON reports
                              gpu.memory_plan
+  --dispatch <auto|device>   how the per-stage cost model (#290) routes the movable
+                             stages (default auto). device skips the timing
+                             comparison only and sends every stage that is not
+                             refused (launch, unsupported_plan, too_few_rows,
+                             too_many_constants, ill_conditioned, non_finite,
+                             metric_not_native, device_memory, no_device,
+                             exactness) and not CPU by contract to the device;
+                             the route ledger records reason forced. Needs
+                             --gpu (exit 2 otherwise). Required for
+                             compute-sanitizer runs: the sanitized device is
+                             slow, so auto keeps every stage on the CPU and no
+                             kernel launches. With auto, a CPU run whose stages
+                             all lost the timing comparison reports
+                             backend_reason `dispatch: cost model kept
+                             every stage on the cpu`
   --no-gpu                   force CPU evaluation (alias --cpu); also the
                              reproducibility escape hatch for a byte-identical
                              CPU trajectory
@@ -1994,6 +2009,8 @@ fn main() {
     let mut gpu_explicit: Option<bool> = None;
     // #293: `--gpu-memory`, a device memory cap for the plan.
     let mut gpu_memory: Option<u64> = None;
+    // #438: `--dispatch auto|device`.
+    let mut dispatch_mode = rcsr::dispatch::DispatchMode::Auto;
     let mut data_path: Option<String> = None;
     let mut target: Option<String> = None;
     let mut vars: Vec<String> = Vec::new();
@@ -2623,6 +2640,17 @@ fn main() {
                     }
                 }
             }
+            // #438: `device` skips the timing comparison; refusals still win.
+            "--dispatch" => {
+                let v = val!();
+                match rcsr::dispatch::DispatchMode::parse(&v) {
+                    Some(mode) => dispatch_mode = mode,
+                    None => {
+                        eprintln!("error: --dispatch needs auto or device, got '{}'", v);
+                        std::process::exit(EXIT_USAGE);
+                    }
+                }
+            }
             "--no-gpu" | "--cpu" => {
                 cfg.gpu = false;
                 gpu_explicit = Some(false);
@@ -3192,6 +3220,7 @@ fn main() {
         // continued on the CPU.
         let requested_gpu = cfg.gpu;
         let requested_simd = cfg.simd;
+        let requested_dispatch = cfg.dispatch;
         let mut effective = saved;
         if generations_set {
             effective.generations = cfg.generations;
@@ -3204,6 +3233,7 @@ fn main() {
         }
         effective.gpu = requested_gpu;
         effective.simd = requested_simd;
+        effective.dispatch = requested_dispatch;
         fit_request = None;
         cfg = effective;
         resumed_generation = Some(cp.generations);
@@ -3213,6 +3243,12 @@ fn main() {
     // #141: probe the device once, before the dataset is loaded. The probe
     // allocates nothing; the search opens its own resident context later. This
     // is the single runtime decision behind the startup summary and JSON.
+    if dispatch_mode == rcsr::dispatch::DispatchMode::Device && gpu_explicit != Some(true) {
+        eprintln!("error: --dispatch device needs --gpu (and a build with --features cuda)");
+        std::process::exit(EXIT_USAGE);
+    }
+    cfg.dispatch = dispatch_mode;
+
     let gpu_probe = backend::probe();
     match gpu_explicit {
         Some(true) => {

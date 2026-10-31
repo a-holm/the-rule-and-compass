@@ -62,6 +62,7 @@ fn no_fit_config(metric: Metric, seed: u32) -> Config {
         seed,
         metric,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         gpu_notes: false,
         ..Default::default()
     }

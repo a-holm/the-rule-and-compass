@@ -64,6 +64,7 @@ fn maximum_config(seed: u32) -> Config {
         fit_strategy: FitStrategy::Gpu,
         metric: Metric::Maximum,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         gpu_notes: false,
         ..Default::default()
     }

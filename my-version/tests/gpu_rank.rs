@@ -58,6 +58,7 @@ fn rank_config(seed: u32, metric: Metric) -> Config {
         fit_strategy: FitStrategy::Gpu,
         metric,
         gpu: true,
+        dispatch: rcsr::dispatch::DispatchMode::Device,
         gpu_notes: false,
         ..Default::default()
     }

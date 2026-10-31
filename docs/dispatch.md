@@ -94,6 +94,8 @@ Each run records one row per stage:
 it makes a wrong route or a tuning regression visible without reading source.
 A CPU-only run still gets the ledger (with `no_device`/`cpu_contract` reasons).
 
+`--dispatch device` records reason `forced` for a stage routed to the device without a timing comparison; refusals and `cpu_contract` still win. See `docs/gpu-backend.md` for why sanitizer runs need it.
+
 ## Refusals are a cause set, never a stopwatch
 
 Structural and arithmetic refusals are checked **before** any timing

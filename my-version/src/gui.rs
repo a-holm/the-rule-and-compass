@@ -776,6 +776,7 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     ("--max-memory", "the server does not enforce the CLI memory guard"),
     ("--force", "the server does not enforce the CLI memory guard"),
     ("--gpu-memory", "the server does not take a device memory cap"),
+    ("--dispatch", "the server does not force the device route"),
     ("--select-by", "the GUI uses the engine's default selection criterion"),
     ("--objective", "the GUI does not run the long/flat P&L objective"),
     ("--position", "the GUI does not run the long/flat P&L objective"),
