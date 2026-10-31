@@ -679,10 +679,12 @@ RUN INTEGRITY (#140):
                              any mismatch (exit 0 when everything matches)
 
 DISPATCH (#290):
-  Dispatch is planned per stage, not per run. A ~100 ms startup probe
-  calibrates the host and anchors the device rates; every run records the
-  values and a route ledger in --json (dispatch.calibration and
-  dispatch.route_ledger) and in --run-manifest. The route is device, cpu or
+  Dispatch is planned per stage, not per run. A short startup probe times the
+  host; with --gpu one device probe per process times the eval rate, fit rate,
+  H2D/D2H bandwidth and launch overhead, and without a device the corpus
+  anchors stay (device_source anchor). --json carries dispatch.calibration
+  labels and dispatch.route_ledger; --run-manifest adds the measured rates and
+  their spreads. The route is device, cpu or
   split with a machine reason; hysteresis (h=0.3) prevents oscillation at the
   crossover. A structural/arithmetic refusal (launch, unsupported_plan,
   too_few_rows, too_many_constants, ill_conditioned, non_finite,
