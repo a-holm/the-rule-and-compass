@@ -986,6 +986,8 @@ full admission preserves both exact-arm coverage and a large speed-up. Every CPU
 
 **Deferred-fit contract.** The deferred arm does per candidate what the CPU arm does. (1) Gate: for `log_loss`, `correlation`, `correlation_signed` and `signed` (`fit::device_fit_is_gated`) every device proposal passes the exact `f64` gate `fit::gate_device_proposal` on the configured metric, the same entry point as `fit_batch_verified`. A worse proposal restores the incoming constants and the exact CPU arm refits, labelled `worse` (`log_loss_worse` for `log_loss`); a non-finite proposal or objective does the same, labelled `non_finite`; a `signed` proposal that cannot represent the mean is labelled `not_identifiable`. (2) Refresh: after the device write-back, the CPU fallback batch and the pipeline write-back, each fitted tree is simplified and its complexity recomputed (`refresh_after_fit`), as `evolve_island` does after `fit_counted`. (3) Pipeline exclusion: a gated metric never takes the ungated pipeline write-back (`pipeline_fit_safe`). (4) Wide admission: with at least 1 048 576 training rows, or for `correlation`, `correlation_signed` and `signed` (`fit::admits_every_candidate`) at any size, every candidate with constants is fitted and only constant-free candidates are screened; other metrics keep `max(32, pop/4)` below the threshold.
 
+**Correlation arm.** `correlation` and `correlation_signed` fit on the device with the exact `1 − |ρ|` or `1 − ρ` objective and a frozen affine gauge. The signed kernel refines both gauge orientations and keeps the better one; a tree affine in every constant takes the CPU weighted least-squares closed form (label `affine_closed_form`); every proposal passes the exact gate. See `gpu-backend.md`, section "Correlation arm".
+
 `--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
@@ -1204,6 +1206,22 @@ startup population dominate there. The JSON report for a 5-generation
 stages; fitting and all f64 reporting stay on the CPU.
 
 ---
+
+### 3.5 Selecting finalists on a trading objective
+
+`--objective pnl|sharpe|log_growth` separates the loss the fitter minimises from the value that picks the finalist.
+
+* The fitter, the archive and every dominance test keep `--metric`. A surrogate error and a P&L value are never compared in one dominance test.
+* After the exact finalist refit, each Pareto member's prediction vector on the validation slice is scored by the exact CPU `f64` long/flat book of [`docs/walkforward.md`](walkforward.md). The member with the lowest objective value is reported first. There is no complexity penalty term: ties keep the archive order, which is complexity first.
+* `--gpu` may speed up the fit. It does not change the finalist, which is always rebuilt on the CPU, and the device has no P&L metric arm.
+* A direct in-search P&L fitness is not implemented. The objective only chooses among archived members.
+
+```sh
+rcsr --data bars.csv --target y --time t --split temporal --validation-frac 0.3 \
+     --target-spec bars.targets.json --objective sharpe --cost-bps 5 --json
+```
+
+The JSON `objective` block carries the fit error, the validation and test books, the cash and buy-and-hold comparisons, the number of candidates and usable candidates, and `backend_reason`.
 
 ## 4. Hardware
 

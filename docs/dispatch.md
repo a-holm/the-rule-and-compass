@@ -46,26 +46,38 @@ generation. The ledger labels the held case `hysteresis_device`.
 
 ## Calibration
 
-`Calibration::probe()` is the startup probe (well under 100 ms on the reference
-host). It measures the host evaluation rate and anchors the device rates from
-the measured corpus:
+`Calibration::probe()` times the host (median of 31 reps). The host terms that
+route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of their anchors,
+so the route ledger of two identical CPU runs has identical bytes (`predicted_s`
+in the result JSON follows the host rate); the raw probe
+rate is reported unclamped as `host_rate` with its spread. With `--gpu` and a
+usable device, `dispatch_gpu::device_rates()` times the device once per process
+and `Calibration::with_device_rates` installs the result. The launch term is small
+in the model and its band is wide; the other terms dominate a route. Without a device the
+device terms stay the corpus anchors:
 
-| term | anchor | source |
+| term | anchor | device probe |
 |---|---:|---|
-| `r_eval` | 20e9 row-evals/s | RTX 3060 saturated batch |
-| `r_fit` | 1 / 89.5 ms at 2.456 M rows | batched LM corpus |
-| `BW` | 12 GB/s | effective PCIe 3.0 x16 |
-| `launch` | 5 µs | 3–7 µs measured range |
+| `r_eval` | 20e9 row-evals/s (RTX 3060 saturated batch) | `eval_batch` kernel time over a resident batch, rows x candidates x nodes per second |
+| `r_fit` | 1 / 89.5 ms at 2.456 M rows (batched LM corpus) | `fit_batch` kernel time, scaled to the reference shape by rows, constants and sweeps |
+| `BW` | 12 GB/s (effective PCIe 3.0 x16) | pinned-host `cudaMemcpy` of 16 MiB each way, `2*bytes/(h2d+d2h)` per rep; `bw_h2d` and `bw_d2h` are recorded too |
+| `launch` | 5 µs (3–7 µs measured range) | host time in the launch calls of a one-program batch |
 
-The host term scales the device anchors by at most 0.75–1.33×, and the values
-are clamped so three probes on one host agree within the stated band
-(`dispatch.calibration.band = 2.0`). A hardware probe can replace the anchors
-with `Calibration::with_device_rates`. The calibration, its source, sample count,
-reproducibility band and (in the manifest) probe time are written to:
+Each device term is the median of its timed reps after untimed warm-up reps
+(15 for eval and bandwidth, five for fit, 33 for launch). Its
+spread is the largest rep over the smallest rep. Nothing is clamped. Two probes
+agree on a term when their values differ by no more than the larger of the two
+probes' spreads (`Calibration::agreement`); the tests assert this for three runs
+of the host probe and, with a device, three runs of the device probe.
 
-* `--json` → `dispatch.calibration`
-* `--ndjson` done event → `dispatch`
-* `--run-manifest` → top-level `dispatch` object
+The result JSON (`--json` → `dispatch.calibration`, `--ndjson` done event →
+`dispatch`) carries the provenance labels only: `source` (`startup_probe` or
+`anchors`), `device_source` (`probe` or `anchor`), the sample counts, the
+hysteresis and the fit reference shape. The measured values are wall-clock noise
+and stay out of it, so the result bytes of two identical runs match. The
+`--run-manifest` `dispatch.calibration` object adds `probe_s`, `r_eval`,
+`r_fit`, `bw`, `bw_h2d`, `bw_d2h`, `launch_s`, `cpu_eval`, `cpu_fit`, `host_rate` and
+`spread` (`r_eval`, `r_fit`, `bw`, `launch_s`, `cpu_eval`).
 
 ## Route ledger
 
@@ -118,7 +130,7 @@ come from the `f64` rebuild.
 * hysteresis at the crossover and stable re-entry;
 * the cause-set rule (timing cannot override a refusal);
 * the split route;
-* three-probe reproducibility within the stated band;
+* three-probe reproducibility within the larger of the probes' own spreads, for the host and for the device terms;
 * manifest/JSON and ledger fields;
 * the compact-cell batch still routes to the device.
 

@@ -309,14 +309,12 @@ pub enum FitObjective {
     Squared,
     /// `Σ w·ln(1 + r²)`, minimised by IRLS with `2/(1 + r²)` row weights.
     LogSquashed,
-    /// #224: `1 − |ρ|`. A **fit-only** objective: scoring is the separate
-    /// [`crate::metrics::ScoreObjective::Correlation`] table (#287), so
-    /// [`DeviceLoss::for_metric`] and [`fit_loss`] do not map it. Reachable
-    /// through the fit kernel's direct batch API, not through the search fit
-    /// dispatch.
+    /// `1 − |ρ|`. [`fit_loss`] maps `correlation` to it; scoring is the separate
+    /// [`crate::metrics::ScoreObjective::Correlation`] table, so
+    /// [`DeviceLoss::for_metric`] does not.
     Correlation,
-    /// #224: `1 − ρ`. Fit-only for the same reason as [`DeviceLoss::Correlation`];
-    /// native scoring is [`crate::metrics::ScoreObjective::CorrelationSigned`].
+    /// `1 − ρ`. [`fit_loss`] maps `correlation_signed` to it; native scoring is
+    /// [`crate::metrics::ScoreObjective::CorrelationSigned`].
     CorrelationSigned,
     /// #222: `Σ w·|r|`, minimised by per-row IRLS weights `1/max(|r|, 1e-6)`
     /// with true-`|r|` acceptance. Both the evaluator and the batched fit use
@@ -391,6 +389,8 @@ pub fn fit_loss(metric: Metric) -> Option<DeviceLoss> {
         // #234: a native fit objective with no native fitness. The search
         // admits it as a fit-only arm; every score is the exact CPU log-loss.
         Metric::LogLoss => Some(DeviceLoss::Logistic),
+        Metric::Correlation => Some(DeviceLoss::Correlation),
+        Metric::CorrelationSigned => Some(DeviceLoss::CorrelationSigned),
         // Warm start only: the CPU arm runs `fit_weighted`, then `signed_projection`,
         // then the polish. The kernel replaces the first stage; the exact gate
         // projects every proposal.
@@ -414,7 +414,7 @@ pub fn fit_only_loss(metric: Metric) -> Option<DeviceLoss> {
     // **score** objective either. `log_loss` used to be the example; it now
     // has a native per-row scorer (`ScoreObjective::LogLoss`), so it is no
     // longer fit-only and the split stays a single predicate.
-    if loss.scores_on_device() || crate::metrics::ScoreObjective::for_metric(metric).is_some() {
+    if loss.scores_on_device() || crate::metrics::native_score_objective(metric).is_some() {
         None
     } else {
         Some(loss)
@@ -461,12 +461,14 @@ pub fn gpu_fit_metric_error(metric: Metric) -> Option<String> {
     }
     Some(format!(
         "--fit-strategy gpu minimises squared error, log-squashed loss, mean \
-         absolute error, the logistic log-loss or the exact rank, median, \
-         interquartile and maximum objectives, plus the squared warm start of the \
-         signed-bias projection, but --metric {} has no device \
+         absolute error, the logistic log-loss, the exact correlation \
+         objectives or the exact rank, median, interquartile and maximum \
+         objectives, plus the squared warm start of the signed-bias projection, \
+         but --metric {} has no device \
          fit objective, so the GPU arms cannot fit it. Use --metric squared \
          (aic, aicc and bic also fit by least squares), --metric log_squashed, \
-         --metric absolute, --metric log_loss, --metric rank_correlation or \
+         --metric absolute, --metric log_loss, --metric correlation, \
+         --metric correlation_signed, --metric rank_correlation or \
          rank_correlation_signed, --metric median, --metric interquartile, \
          --metric maximum, --metric signed, or a CPU fit strategy: --fit-strategy exact, auto, \
          linear, varpro or stream.",
@@ -795,6 +797,12 @@ pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bo
 /// objective to fit and the device must not invent `max √wᵢ|rᵢ|`.
 pub fn maximum_fit_only(metric: Metric) -> bool {
     metric == Metric::Maximum
+}
+
+/// True when every constant of `tree` enters affinely, so the correlation
+/// optimum is the weighted least-squares solution computed on the CPU.
+pub fn is_affine_correlation_tree(tree: &Node) -> bool {
+    correlation::is_affine(&flatten(tree))
 }
 
 /// True when a device proposal for `metric` passes the exact `f64` gate
@@ -5586,6 +5594,34 @@ mod tests {
         assert!(FitStrategy::parse("convex").is_none());
         assert!(FitStrategy::Gpu.defers_to_gpu());
         assert!(!FitStrategy::Auto.defers_to_gpu());
+    }
+
+    /// The correlation family maps to its own device objective, is accepted
+    /// for an explicit GPU request, and routes affine trees to the closed form.
+    #[test]
+    fn the_correlation_family_has_a_device_fit_objective() {
+        assert_eq!(fit_loss(Metric::Correlation), Some(DeviceLoss::Correlation));
+        assert_eq!(
+            fit_loss(Metric::CorrelationSigned),
+            Some(DeviceLoss::CorrelationSigned)
+        );
+        assert!(gpu_fit_metric_error(Metric::Correlation).is_none());
+        assert!(gpu_fit_metric_error(Metric::CorrelationSigned).is_none());
+        assert!(fit_only_loss(Metric::Correlation).is_none());
+        assert!(fit_only_loss(Metric::CorrelationSigned).is_none());
+        let affine = node(
+            Op::Add,
+            vec![node(Op::Mul, vec![constant(1.0), input(0)]), constant(0.0)],
+        );
+        assert!(is_affine_correlation_tree(&affine));
+        let shaped = node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(1.0), node(Op::Sin, vec![node(Op::Mul, vec![constant(1.0), input(0)])])]),
+                constant(0.0),
+            ],
+        );
+        assert!(!is_affine_correlation_tree(&shaped));
     }
 
     /// #223 + #229 + #230 + #226 + #222 + #227 + #232: an explicit GPU request
