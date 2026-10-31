@@ -1034,8 +1034,9 @@ and f64 reporting stay authoritative meanwhile.
 
 Scoring was on the GPU long before fitting was: non-affine candidates still ran
 the scalar CPU Levenberg–Marquardt loop, which dominated wall time at large `N`.
-`--fit-strategy gpu` (opt-in; `exact` remains the default) moves that loop into
-one CUDA block per candidate:
+`--fit-strategy gpu` moves that loop into one CUDA block per candidate. It is
+the default where admissible (see [Default fit arm](#default-fit-arm)); an
+explicit `gpu` is always honoured:
 
 1. The postorder tree is flattened into 4-word records `[op, kid0, kid1, slot]`.
    Only operators with an analytic value and adjoint are eligible.
@@ -1324,6 +1325,45 @@ and the exact CPU finalist are unchanged; `--pipeline-depth 0` remains the
 synchronous schedule.
 
 **Zero diagonal (#399).** `ft_solve` freezes a slot whose normal-equation diagonal is exactly `0.0` on every arm. A constant with a zero adjoint on all active rows cannot move the prediction, so its row and column become the identity, its right-hand side is `0` and its step is `0`. The other constants are still fitted, as the CPU ridge solve (`fit.rs::solve`, ridge `1e-12`) does. A negative or non-finite diagonal is still status `1`. `tests/gpu_fit.rs::zero_adjoint_constant_is_frozen_and_the_rest_are_fitted` pins it.
+
+### Default fit arm
+
+A run that names no `--fit-strategy`, or names `auto`, resolves its fit arm once, before generation 0 and before the device memory plan. An explicit arm (`exact`, `linear`, `varpro`, `stream`, `gpu`) is never resolved, and a resume keeps the saved arm and admission. The resolved arm is `gpu` when all of these hold, checked in this order; the first failing factor is the labelled reason:
+
+1. `metric_not_least_squares`: the metric is `squared`, `aic`, `aicc` or `bic`.
+2. `no_fit`: `--fit-iters` is above 0.
+3. The backend reason: the GPU evaluator runs the search (`--cpu/--no-gpu`, `no usable CUDA device`, `built without --features cuda` and the evaluator refusals keep the CPU).
+4. `device_memory`: the memory plan has no `fit` refusal for the f64 fit rows.
+5. `dispatch_cost`: the run-level cost model predicts a win.
+
+When one fails, no flag keeps `exact` and `auto` keeps the structural CPU `auto`, so every CPU-only run (non-CUDA build, `--cpu`, no device, an ineligible run) keeps its archive and JSON byte for byte.
+
+A resolved `gpu` arm admits every candidate with constants at every row count (`gpu.fit.admission` is `all`). An explicit `--fit-strategy gpu` keeps the `max(32, pop/4)` admission below 1 048 576 rows (`screened`). The admission is saved in checkpoints (`config fit_admission all`; a missing line means `screened`) and is part of the config hash.
+
+The cost model is pure and reads no timing. With `I` island threads, `C` cores, `W = min(C, 8)` fallback workers, `s = 1` when every configured operator has a device fit opcode and no custom block is defined (else `0`), `k = 0.05` (device cost of one fit-row relative to one CPU thread), `E = 1.32` (overhead of the batched arm) and `h = 0.3` (required margin):
+
+```text
+cpu = 1 / min(I, C)
+gpu = (s * k + (1 - s) / W) * E * (1 + h)
+device iff gpu < cpu
+```
+
+With `W = 8`: without full operator coverage (the default operator set, because `if` has no fit opcode) the device is chosen up to 4 islands and `exact` from 5 (`dispatch_cost`); with full coverage the device is chosen up to 11 islands. There is no row floor. The per-candidate floor of `32p` rows in the fit stage is unchanged. This run-level rule is separate from the per-candidate stage model in `docs/dispatch.md`.
+
+Evidence for the default is a paired comparison against `exact` on the GPU evaluator at equal generations (default operators, `--fit-iters 8`): admitting every candidate matched `exact` in test error and hypervolume and ran 1.5x to 5.1x faster; the screened fraction was faster still but lost on hypervolume. Fallbacks in these runs were `unsupported_plan` only, from `if`.
+
+| cell (train rows, islands x pop, generations) | arm | seeds | speed-up | test error better/worse/tie | hypervolume better/worse |
+|---|---|---:|---:|---|---|
+| 300, 1 x 200, 20 | screened | 3 | 3.75x | 3/0/0 | 2/1 |
+| 300, 1 x 200, 20 | all | 3 | 2.60x | 2/1/0 | 2/1 |
+| 1 500, 1 x 200, 20 | screened | 13 | 6.11x | 3/9/1 | 3/10 |
+| 1 500, 1 x 200, 20 | all | 13 | 5.08x | 6/5/2 | 9/4 |
+| 1 500, 4 x 50, 20 | all | 13 | 1.80x | 6/6/1 | 5/7 |
+| 15 000, 1 x 200, 10 | screened | 3 | 7.75x | 1/2/0 | 1/2 |
+| 15 000, 1 x 200, 10 | all | 3 | 4.20x | 2/1/0 | 2/1 |
+| 115 500, 4 x 64, 3 | all | 2 | 1.52x | 0/2/0 | 0/2 |
+
+Provenance. The non-quiet stderr line `# gpu-fit: default -> gpu (squared, admit all)` (or `-> exact (dispatch_cost)`) appears when the GPU evaluator runs the search. On a GPU run `--json` `fitting` carries `strategy_source` (`default` or `auto`) and `strategy_reason` (`admissible` or the failing factor). `--run-manifest` carries `fit_resolution` and the development log `run_start` carries `fit_strategy_source` and `fit_strategy_reason`, both for every resolved run.
 
 ### LogSquashed on the batched kernel (issue #229)
 
@@ -2340,7 +2380,7 @@ order and **commits the first strict improver**, never the best of the six
 trials. A test drives `coordinate_polish` and the device polish from the same
 starting constants and asserts bit-identical constants, for the unsigned and the
 signed objective. `--no-fit` never enters the arm (nothing to fit), and the
-`--fit-strategy exact` default keeps the CPU path bit for bit.
+CPU `--fit-strategy exact` arm stays bit for bit.
 
 **Fallbacks.** A candidate is offered only when it has a GPU fit plan (`p ≤ 20`,
 ≤ 96 nodes, no shared block constants, analytic operators) and at least `32p`
