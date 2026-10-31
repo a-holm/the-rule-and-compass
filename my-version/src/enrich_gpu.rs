@@ -115,6 +115,10 @@ extern "C" {
     fn rc_enrich_new_output(ctx: *mut Raw) -> *mut f64;
     fn rc_enrich_release_output(p: *mut f64);
     fn rc_enrich_set_test_budget(bytes: usize);
+    fn rc_enrich_set_test_alloc_fault(at: u64);
+    fn rc_enrich_test_alloc_count() -> u64;
+    fn rc_enrich_set_test_launch_fault(site: c_int);
+    fn rc_enrich_test_launch_hits() -> u64;
     fn rc_enrich_download_ptr(src: *const f64, dst: *mut f64, n: c_int) -> c_int;
     fn rc_enrich_note_projected_upload(ctx: *mut Raw, bytes: u64, ms: f64);
     fn rc_enrich_note_projected_download(ctx: *mut Raw, bytes: u64, ms: f64);
@@ -960,6 +964,37 @@ impl Drop for EnrichGpu {
 /// without exhausting the device.
 pub fn set_device_budget_for_tests(bytes: usize) {
     unsafe { rc_enrich_set_test_budget(bytes) };
+}
+
+/// Refuses the `at`-th device allocation made from now on, before cudaMalloc is
+/// called. Zero turns the hook off. `u64::MAX` only counts. Resets the count.
+pub fn set_alloc_fault_for_tests(at: u64) {
+    unsafe { rc_enrich_set_test_alloc_fault(at) };
+}
+
+/// Allocations seen since `set_alloc_fault_for_tests` was last called.
+pub fn alloc_count_for_tests() -> u64 {
+    unsafe { rc_enrich_test_alloc_count() }
+}
+
+/// Launch sites that can be made to fail before any kernel is queued.
+pub const LAUNCH_FAULT_SITES: [(&str, i32); 6] = [
+    ("ring segment-id", 1),
+    ("ring tile feature", 2),
+    ("batch launch", 3),
+    ("cross-section prepare", 4),
+    ("cross-section rank", 5),
+    ("element-wise and tail", 6),
+];
+
+/// Launches refused at the armed site since `set_launch_fault_for_tests`.
+pub fn launch_fault_hits_for_tests() -> u64 {
+    unsafe { rc_enrich_test_launch_hits() }
+}
+
+/// Makes every launch at `site` fail. Zero turns the hook off.
+pub fn set_launch_fault_for_tests(site: i32) {
+    unsafe { rc_enrich_set_test_launch_fault(site) };
 }
 
 /// Map a catalogue name to the tiled kernel the transport can run while the

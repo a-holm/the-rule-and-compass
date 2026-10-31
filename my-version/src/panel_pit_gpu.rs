@@ -1,10 +1,10 @@
 //! Device point-in-time as-of joins (issue #302).
 //!
 //! [`crate::panel_pit::join`] is the CPU reference. [`PitGpu`] uploads one
-//! symbol-major block (base times, input chains, per-symbol leaf lists) and runs
-//! the monotone merge in `src/cuda/pit.cu`. The membership decisions are made by
-//! the CPU; only the join, `bar_age`, the gap tags and the chain numbering run
-//! on the device. The result must be bit-identical to the reference for any
+//! symbol-major block (base times, input chains, per-symbol decision lists) and
+//! runs the monotone merge in `src/cuda/pit.cu`. The membership decisions are
+//! made by the CPU; only the join, the gap tags and the chain numbering run on
+//! the device. The result must be bit-identical to the reference for any
 //! block size and chunk size.
 
 use crate::gpu_stats::GpuStats;
@@ -34,8 +34,6 @@ struct RawStats {
 #[repr(C)]
 struct HostOut {
     leaf: *mut i32,
-    age: *mut f64,
-    fresh: *mut u8,
     keep: *mut u8,
     found: *mut u8,
     as_of: *mut i64,
@@ -65,13 +63,11 @@ extern "C" {
     fn rc_pit_last_stats(ctx: *mut Raw, out: *mut RawStats);
     fn rc_pit_run(
         ctx: *mut Raw,
-        delay: i64,
-        fresh_tf: i64,
         step: i64,
         threads: c_int,
         chunk_rows: c_int,
     ) -> c_int;
-    fn rc_pit_check(ctx: *mut Raw, idx: *const c_int, delay: i64, violations: *mut u64) -> c_int;
+    fn rc_pit_check(ctx: *mut Raw, idx: *const c_int, violations: *mut u64) -> c_int;
     fn rc_pit_download(ctx: *mut Raw, out: *mut HostOut) -> c_int;
 }
 
@@ -156,7 +152,7 @@ impl PitGpu {
 
     /// Run with an explicit block and chunk size. Neither may change the bytes.
     pub fn run_with(&mut self, p: PitParams, threads: usize, chunk_rows: usize) -> bool {
-        if p.step <= 0 || p.delay < 0 || p.fresh_tf < 0 || chunk_rows == 0 {
+        if p.step <= 0 || chunk_rows == 0 {
             return false;
         }
         if !(32..=1024).contains(&threads) || threads % 32 != 0 {
@@ -164,14 +160,7 @@ impl PitGpu {
         }
         let started = std::time::Instant::now();
         let rc = unsafe {
-            rc_pit_run(
-                self.ctx,
-                p.delay,
-                p.fresh_tf,
-                p.step,
-                threads as c_int,
-                chunk_rows as c_int,
-            )
+            rc_pit_run(self.ctx, p.step, threads as c_int, chunk_rows as c_int)
         };
         let ok = rc == 0;
         let mut raw = RawStats::default();
@@ -192,13 +181,13 @@ impl PitGpu {
     }
 
     /// Count look-ahead violations of a caller-supplied leaf index column.
-    pub fn lookahead_violations(&mut self, leaf: &[i32], delay: i64) -> Option<u64> {
+    pub fn lookahead_violations(&mut self, leaf: &[i32]) -> Option<u64> {
         if leaf.len() != self.n {
             return None;
         }
         let started = std::time::Instant::now();
         let mut v = 0u64;
-        let rc = unsafe { rc_pit_check(self.ctx, leaf.as_ptr(), delay, &mut v) };
+        let rc = unsafe { rc_pit_check(self.ctx, leaf.as_ptr(), &mut v) };
         self.record(Some(started));
         if rc == 0 {
             Some(v)
@@ -215,8 +204,6 @@ impl PitGpu {
         unsafe { rc_pit_last_stats(self.ctx, &mut raw) };
         let n_kept = raw.n_kept.max(0) as usize;
         let mut leaf = vec![0i32; n];
-        let mut age = vec![0.0f64; n];
-        let mut fresh = vec![0u8; n];
         let mut keep = vec![0u8; n];
         let mut found = vec![0u8; n];
         let mut as_of = vec![0i64; n];
@@ -225,8 +212,6 @@ impl PitGpu {
         let mut kept = vec![0i32; n_kept];
         let mut out = HostOut {
             leaf: leaf.as_mut_ptr(),
-            age: age.as_mut_ptr(),
-            fresh: fresh.as_mut_ptr(),
             keep: keep.as_mut_ptr(),
             found: found.as_mut_ptr(),
             as_of: as_of.as_mut_ptr(),
@@ -241,8 +226,6 @@ impl PitGpu {
         }
         Some(PitOutput {
             leaf,
-            age,
-            fresh,
             keep,
             found,
             as_of,

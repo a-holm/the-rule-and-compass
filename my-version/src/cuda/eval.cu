@@ -911,7 +911,7 @@ __device__ __forceinline__ float rc_sigmoid_f(float x)
 
    The surrogate keeps the historical expression rather than `2*sigmoid(-u)`
    so the pre-#289 `hinge` value does not move by a rounding step. */
-__device__ __forceinline__ float rc_class_row_loss(float p, float tsign, int loss)
+__device__ __forceinline__ double rc_class_row_loss(float p, float tsign, int loss)
 {
     const float u = tsign * p;
     if (loss == RC_SCORE_LOG_LOSS) {
@@ -928,8 +928,8 @@ __device__ __forceinline__ float rc_class_row_loss(float p, float tsign, int los
         return h > 0.0f ? h : 0.0f;
     }
     if (loss == RC_SCORE_HINGE_SQUARED) {
-        const float h = 1.0f - u;
-        return h > 0.0f ? h * h : 0.0f;
+        const double h = 1.0 - (double)u;
+        return h > 0.0 ? h * h : 0.0;
     }
     if (loss == RC_SCORE_HINGE_SIGMOID) {
         const float s = 2.0f * rc_sigmoid_f(p) - 1.0f;
@@ -1129,11 +1129,11 @@ __device__ __forceinline__ void score_step(
             if (wi == 0.0) continue;
             const float t = tsign ? tsign[i] : CUDART_NAN_F;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(t) || !isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(t) || !isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
-            a += wi * (double)rc_class_row_loss(pred, t, MODE);
+            a += wi * rc_class_row_loss(pred, t, MODE);
             b += wi;
         }
     } else if (w && MODE != RC_SCORE_MAXIMUM) {
@@ -1150,7 +1150,7 @@ __device__ __forceinline__ void score_step(
             }
             if (wi == 0.0) continue;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
@@ -1183,7 +1183,7 @@ __device__ __forceinline__ void score_step(
         if (PASS == 0) {
             for (long long r = first; r < r_end; r += lanes) {
                 const float pred = rc_exec_row(code, wc, ld, (int)r);
-                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                if (!isfinite(pred)) {
                     lbad = 1;
                 } else {
                     a += (double)pred;
@@ -1193,7 +1193,7 @@ __device__ __forceinline__ void score_step(
             for (long long r = first; r < r_end; r += lanes) {
                 const int i = (int)r;
                 const float pred = rc_exec_row(code, wc, ld, i);
-                if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                if (!isfinite(pred)) {
                     lbad = 1;
                     continue;
                 }
@@ -1207,7 +1207,7 @@ __device__ __forceinline__ void score_step(
         for (long long r = first; r < r_end; r += lanes) {
             const int i = (int)r;
             const float pred = rc_exec_row(code, wc, ld, i);
-            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+            if (!isfinite(pred)) {
                 lbad = 1;
                 continue;
             }
@@ -1246,8 +1246,8 @@ __device__ __forceinline__ void score_step(
  * template, not by a runtime switch inside the row loop. Correlation needs two
  * passes (sum p, then centred moments); every other objective is one pass.
  *
- * A non-finite prediction (or one above the same 1e30 hard-magnitude limit the
- * old f32 evaluator used) writes `+inf` and status 2. It never writes a finite
+ * A non-finite prediction writes `+inf` and status 2. A finite prediction of any
+ * magnitude is scored, as the CPU does. The kernel never writes a finite
  * sentinel that the host could divide by n.
  */
 template <int MODE>
@@ -5608,8 +5608,8 @@ __device__ __forceinline__ double md_key_value(unsigned long long k)
 }
 
 /* The key of one row: the bit pattern of `|pred − y|` in exact f64, or the
- * all-ones sentinel and a non-zero return for a non-finite prediction or
- * residual (the landed #169 guard, never a silent 1e30). The sort and the
+ * all-ones sentinel and a non-zero return for a non-finite prediction or a NaN
+ * residual. An overflowing residual keys as `+inf`. The sort and the
  * select path both call this, so they admit exactly the same rows. */
 __device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const double *c,
                                           const double *__restrict__ cols,
@@ -5620,7 +5620,7 @@ __device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const d
     ft_forward_d(nd, m, cols, n, row, c, v);
     const double pred = v[m - 1];
     const double r = pred - y[row];
-    if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+    if (!isfinite(pred) || isnan(r)) {
         *key = 0xFFFFFFFFFFFFFFFFULL;
         return 1;
     }
@@ -6098,7 +6098,7 @@ __global__ void k_max_scan(const unsigned int *__restrict__ prog,
         ft_forward_d(nd, m, cols, n, row, c, v);
         const double pred = v[m - 1];
         const double r = pred - y[row];
-        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+        if (!isfinite(pred) || isnan(r)) {
             mybad |= 1;
             break;
         }

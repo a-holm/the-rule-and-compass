@@ -1,32 +1,23 @@
-//! #302: point-in-time as-of joins for panel membership and MTF leaves.
+//! #302: point-in-time as-of join for panel membership.
 //!
 //! This module is the exact CPU reference for [`crate::panel_pit_gpu`] /
 //! `src/cuda/pit.cu`. The membership **decisions** (ranking, ADV tie-breaks,
 //! `member`) are made by [`crate::panel`] on the CPU; this join only maps every
-//! base row to the latest decision (or higher bar) that was visible at its
-//! timestamp.
+//! base row to the latest decision that was visible at its timestamp.
 //!
-//! A leaf is visible to a row at time `t` when `key + delay <= t`:
+//! A decision is visible to a row at time `t` when `as_of <= t`, so a decision at
+//! `as_of` is visible to a row at `as_of`.
 //!
-//! * membership: `key = as_of`, `delay = 0`, so a decision at `as_of` is visible
-//!   to a row at `as_of`;
-//! * MTF: `key = higher bar start`, `delay = timeframe`, so the bar is visible
-//!   only once it has closed.
-//!
-//! Base rows and leaves are non-decreasing inside one symbol segment. Ties in
-//! the leaf list resolve to the **last** equal key, like
+//! Base rows and decisions are non-decreasing inside one symbol segment. Ties in
+//! the decision list resolve to the **last** equal key, like
 //! `partition_point(|r| r.as_of <= t)`.
 //!
 //! Outputs per base row:
 //!
-//! * `leaf`: index of the visible leaf in the global leaf list, or `-1`;
-//! * `age`: `t - (key + delay)` in seconds, `NaN` when no leaf is visible. It
-//!   stays finite on a stale bucket;
-//! * `fresh`: the visible leaf is exactly the previous expected bucket
-//!   (`fresh_tf > 0`), or any visible leaf (`fresh_tf == 0`). A stale bucket
-//!   yields `NaN` value leaves downstream and is never bridged;
-//! * `keep`: a leaf is visible and its decision has `member = 1`;
-//! * `as_of`: the `key` of the visible leaf (0 when none);
+//! * `leaf`: index of the visible decision in the global decision list, or `-1`;
+//! * `found`: a decision is visible;
+//! * `keep`: a decision is visible and has `member = 1`;
+//! * `as_of`: the `as_of` of the visible decision (0 when none);
 //! * `gap`: `max(0, (t[i] - t[i-1]) / step - 1)` when row `i` and row `i - 1`
 //!   are both kept, in one segment and in one input chain; else 0;
 //! * `chain_id`: running number of chain starts, counted from 1 inside each
@@ -58,37 +49,27 @@ pub struct PitBlock {
     pub chain: Vec<i64>,
     pub segments: Vec<PitSegment>,
     pub keys: Vec<i64>,
-    /// `member` flag per leaf (always 1 for MTF leaves).
+    /// `member` flag per leaf.
     pub member: Vec<u8>,
 }
 
 /// Join parameters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PitParams {
-    pub delay: i64,
-    /// MTF timeframe for the freshness test; 0 disables it.
-    pub fresh_tf: i64,
     /// Gap bucket size in seconds.
     pub step: i64,
 }
 
 impl PitParams {
-    /// Membership join: `<=` at `as_of`, no freshness test.
+    /// Membership join: `<=` at `as_of`.
     pub fn membership(step: i64) -> Self {
-        PitParams { delay: 0, fresh_tf: 0, step }
-    }
-
-    /// MTF join for a higher timeframe of `tf` seconds.
-    pub fn mtf(tf: i64, step: i64) -> Self {
-        PitParams { delay: tf, fresh_tf: tf, step }
+        PitParams { step }
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PitOutput {
     pub leaf: Vec<i32>,
-    pub age: Vec<f64>,
-    pub fresh: Vec<u8>,
     pub keep: Vec<u8>,
     pub found: Vec<u8>,
     pub as_of: Vec<i64>,
@@ -142,6 +123,15 @@ impl PitBlock {
     /// `series` (map order), leaves sorted by `as_of` (stable, as
     /// `panel::membership_index`).
     pub fn from_membership(series: &BTreeMap<String, Vec<Bar>>, membership: &Membership) -> Self {
+        Self::from_membership_slices(series.iter().map(|(s, b)| (s.as_str(), b.as_slice())), membership)
+    }
+
+    /// [`Self::from_membership`] over borrowed bar slices, one segment each in
+    /// iteration order.
+    pub fn from_membership_slices<'a>(
+        series: impl Iterator<Item = (&'a str, &'a [Bar])>,
+        membership: &Membership,
+    ) -> Self {
         let mut by_symbol: BTreeMap<&str, Vec<(i64, u8)>> = BTreeMap::new();
         for r in &membership.rows {
             by_symbol.entry(r.symbol.as_str()).or_default().push((r.as_of, r.member as u8));
@@ -157,7 +147,7 @@ impl PitBlock {
                 block.times.push(b.time);
                 block.chain.push(0);
             }
-            if let Some(v) = by_symbol.get(symbol.as_str()) {
+            if let Some(v) = by_symbol.get(symbol) {
                 for (as_of, m) in v {
                     block.keys.push(*as_of);
                     block.member.push(*m);
@@ -172,52 +162,17 @@ impl PitBlock {
         }
         block
     }
-
-    /// MTF join input: base bars and the higher-timeframe bars per symbol.
-    pub fn from_mtf(base: &[&[Bar]], higher: &[&[Bar]]) -> Self {
-        let mut block = PitBlock::default();
-        for (b, h) in base.iter().zip(higher.iter()) {
-            let start = block.times.len() as u32;
-            let leaf_start = block.keys.len() as u32;
-            for bar in b.iter() {
-                block.times.push(bar.time);
-                block.chain.push(0);
-            }
-            for bar in h.iter() {
-                block.keys.push(bar.time);
-                block.member.push(1);
-            }
-            block.segments.push(PitSegment {
-                start,
-                len: b.len() as u32,
-                leaf_start,
-                leaf_len: h.len() as u32,
-            });
-        }
-        block
-    }
-}
-
-fn floor_div(a: i64, b: i64) -> i64 {
-    let q = a / b;
-    if a % b != 0 && ((a < 0) != (b < 0)) {
-        q - 1
-    } else {
-        q
-    }
 }
 
 /// The exact CPU reference join.
 pub fn join(block: &PitBlock, p: PitParams) -> Result<PitOutput, String> {
     block.validate()?;
-    if p.step <= 0 || p.delay < 0 || p.fresh_tf < 0 {
-        return Err("pit: step must be positive and delay/fresh_tf non-negative".to_string());
+    if p.step <= 0 {
+        return Err("pit: step must be positive".to_string());
     }
     let n = block.times.len();
     let mut out = PitOutput {
         leaf: vec![-1; n],
-        age: vec![f64::NAN; n],
-        fresh: vec![0; n],
         keep: vec![0; n],
         found: vec![0; n],
         as_of: vec![0; n],
@@ -233,13 +188,11 @@ pub fn join(block: &PitBlock, p: PitParams) -> Result<PitOutput, String> {
         let keys = &block.keys[ls..le];
         for r in s.start as usize..(s.start + s.len) as usize {
             let t = block.times[r];
-            let pos = keys.partition_point(|k| *k + p.delay <= t);
+            let pos = keys.partition_point(|k| *k <= t);
             if pos > 0 {
                 let j = ls + pos - 1;
                 let key = block.keys[j];
                 out.leaf[r] = j as i32;
-                out.age[r] = (t - (key + p.delay)) as f64;
-                out.fresh[r] = (p.fresh_tf <= 0 || key == floor_div(t, p.fresh_tf) * p.fresh_tf - p.fresh_tf) as u8;
                 out.found[r] = 1;
                 out.keep[r] = block.member[j];
                 out.as_of[r] = key;
@@ -261,13 +214,13 @@ pub fn join(block: &PitBlock, p: PitParams) -> Result<PitOutput, String> {
             }
         }
     }
-    out.lookahead_violations = lookahead_violations(block, &out.leaf, p.delay);
+    out.lookahead_violations = lookahead_violations(block, &out.leaf);
     Ok(out)
 }
 
 /// Count rows whose leaf index is outside the row's leaf range or not yet
-/// visible (`key + delay > t`). A future-shifted column is reported here.
-pub fn lookahead_violations(block: &PitBlock, leaf: &[i32], delay: i64) -> u64 {
+/// visible (`as_of > t`). A future-shifted column is reported here.
+pub fn lookahead_violations(block: &PitBlock, leaf: &[i32]) -> u64 {
     let mut bad = 0u64;
     for s in &block.segments {
         let ls = s.leaf_start as i64;
@@ -277,7 +230,7 @@ pub fn lookahead_violations(block: &PitBlock, leaf: &[i32], delay: i64) -> u64 {
             if j < 0 {
                 continue;
             }
-            if j < ls || j >= le || block.keys[j as usize] + delay > block.times[r] {
+            if j < ls || j >= le || block.keys[j as usize] > block.times[r] {
                 bad += 1;
             }
         }

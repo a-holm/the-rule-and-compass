@@ -457,9 +457,9 @@ atomically instead of streaming it. See
   (`mkt_*`, `breadth`, `dispersion`, `rel_mkt*`, `avg_corr`,
   `btc_volume_share`) run one thread per timestamp in the CPU addition order
   (`--features cuda`, tiers per column in `rcsr schema` `gpu_feature_parity`),
-  the point-in-time membership and MTF as-of joins (`src/cuda/pit.cu`, #302: `as_of <= t` and
-  `h.time + tf <= t` merges with `bar_age`, chain resets and `lookahead_violations`; bitwise vs the
-  CPU reference, membership decisions stay on the CPU, `rcsr panel build` is not rewired),
+  the point-in-time membership as-of join (`src/cuda/pit.cu`: an `as_of <= t` merge with chain
+  resets and `lookahead_violations`; bitwise vs the CPU reference, membership decisions stay on
+  the CPU, `rcsr panel build --gpu auto|on|off` runs it),
   the `price_action` group adds the continuous
   candle geometry and multi-bar structure of #261 (`clv16 body16 rng_atr
   prev_range_pos inside_s outside_s engulf_s harami_s run8 nr4 trend96`;

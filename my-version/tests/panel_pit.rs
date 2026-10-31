@@ -1,7 +1,7 @@
-//! #302: CPU reference for the PIT membership / MTF as-of joins.
+//! #302: CPU reference for the PIT membership as-of join.
 //!
-//! The reference is checked against the production CPU paths it mirrors
-//! (`panel::build_panel_with_step`, `ohlcv::join_causal`) on boundary fixtures
+//! The reference is checked against the production CPU path it mirrors
+//! (`panel::build_panel_with_step`) on boundary fixtures
 //! and a random block, then against its own prefix replay and a future-shift
 //! canary. The device pass is compared against this reference in
 //! `tests/panel_gpu.rs`.
@@ -10,7 +10,7 @@
 mod pit;
 
 use pit::*;
-use rcsr::ohlcv::{self, Bar, Timeframe};
+use rcsr::ohlcv::Bar;
 use rcsr::panel::{self, Membership, MembershipRow};
 use rcsr::panel_pit::{self, PitBlock, PitParams};
 use rcsr::panel_prep::{prepare, PrepBar, PrepSegment};
@@ -135,44 +135,6 @@ fn membership_matches_build_panel_on_a_random_block() {
 }
 
 #[test]
-fn mtf_matches_join_causal_age_and_staleness() {
-    let tf = Timeframe::parse("1h").unwrap();
-    let base: Vec<Bar> = (0..40).map(|i| bar(7200 + i * 900)).collect();
-    // The 09:00 and 10:00 hourly buckets (relative) are missing.
-    let higher: Vec<Bar> = [0, 3600, 7200, 14400, 18000].iter().map(|t| bar(*t)).collect();
-    let block = PitBlock::from_mtf(&[&base], &[&higher]);
-    let out = panel_pit::join(&block, PitParams::mtf(tf.seconds(), 900)).unwrap();
-    let joined = ohlcv::join_causal(&base, &higher, tf).unwrap();
-    for (i, slot) in joined.iter().enumerate() {
-        match slot {
-            Some(h) => {
-                assert_eq!(block.keys[out.leaf[i] as usize], h.time);
-                let age = base[i].time - (h.time + tf.seconds());
-                assert_eq!(out.age[i], age as f64);
-                let expected = (base[i].time / 3600) * 3600 - 3600;
-                assert_eq!(out.fresh[i] == 1, h.time == expected, "row {i}");
-            }
-            None => {
-                assert_eq!(out.leaf[i], -1);
-                assert!(out.age[i].is_nan());
-            }
-        }
-    }
-    // MTF exactly at t: the bar [0,3600) is visible at 3600, not at 3599.
-    let b2 = [bar(3599), bar(3600)];
-    let h2 = [bar(0)];
-    let blk = PitBlock::from_mtf(&[&b2], &[&h2]);
-    let o = panel_pit::join(&blk, PitParams::mtf(3600, 900)).unwrap();
-    assert_eq!(o.leaf, vec![-1, 0]);
-    assert_eq!(o.age[1], 0.0);
-    // A stale bucket keeps a finite age but is not fresh.
-    let stale = base.iter().position(|b| b.time >= 25_200).unwrap();
-    assert!(out.age[stale].is_finite());
-    assert_eq!(out.fresh[stale], 0);
-    assert!(out.age[0].is_finite());
-}
-
-#[test]
 fn membership_exclusion_and_chain_reset_do_not_bridge_a_gap() {
     // 15m bars for 10 hours, excluded from hour 4 up to hour 6.
     let hour = 3600i64;
@@ -217,17 +179,13 @@ fn membership_exclusion_and_chain_reset_do_not_bridge_a_gap() {
 
 #[test]
 fn prefix_replay_at_twenty_cuts_is_bit_identical() {
-    for (name, block, params) in [
-        ("membership", pit::membership_block(11, 5, 3000), PitParams::membership(900)),
-        ("mtf1h", pit::mtf_block(12, 5, 3000, 3600), PitParams::mtf(3600, 900)),
-        ("mtf1d", pit::mtf_block(13, 5, 3000, 86_400), PitParams::mtf(86_400, 900)),
-    ] {
+    for (name, block, params) in [("membership", pit::membership_block(11, 5, 3000), PitParams::membership(900))] {
         let full = panel_pit::join(&block, params).unwrap();
         let lo = *block.times.iter().min().unwrap();
         let hi = *block.times.iter().max().unwrap();
         for k in 0..20 {
             let cut = lo + (hi - lo) * (k + 1) / 21;
-            let pre_block = pit::prefix(&block, cut, params.delay);
+            let pre_block = pit::prefix(&block, cut);
             let pre = panel_pit::join(&pre_block, params).unwrap();
             assert_prefix_equal(&format!("{name} cut {k}"), &block, &full, &pre_block, &pre);
         }
@@ -236,10 +194,7 @@ fn prefix_replay_at_twenty_cuts_is_bit_identical() {
 
 #[test]
 fn future_shifted_column_fails_lookahead_violations() {
-    for (block, params) in [
-        (pit::membership_block(21, 3, 2000), PitParams::membership(900)),
-        (pit::mtf_block(22, 3, 2000, 3600), PitParams::mtf(3600, 900)),
-    ] {
+    for (block, params) in [(pit::membership_block(21, 3, 2000), PitParams::membership(900))] {
         let out = panel_pit::join(&block, params).unwrap();
         assert_eq!(out.lookahead_violations, 0);
         // Shift every visible leaf one step into the future.
@@ -252,31 +207,9 @@ fn future_shifted_column_fails_lookahead_violations() {
                 }
             }
         }
-        let bad = panel_pit::lookahead_violations(&block, &shifted, params.delay);
+        let bad = panel_pit::lookahead_violations(&block, &shifted);
         assert!(bad > 0, "a future-shifted column must be reported");
     }
-}
-
-#[test]
-fn future_shift_count_equals_the_production_ohlcv_check() {
-    let block = pit::mtf_block(23, 1, 3000, 3600);
-    let out = panel_pit::join(&block, PitParams::mtf(3600, 900)).unwrap();
-    let mut shifted = out.leaf.clone();
-    let le = block.keys.len() as i32;
-    for v in shifted.iter_mut() {
-        if *v >= 0 && *v + 1 < le {
-            *v += 1;
-        }
-    }
-    let tf = Timeframe::parse("1h").unwrap();
-    let base: Vec<Bar> = block.times.iter().map(|t| bar(*t)).collect();
-    let joined: Vec<Option<Bar>> = shifted
-        .iter()
-        .map(|j| (*j >= 0).then(|| bar(block.keys[*j as usize])))
-        .collect();
-    let want = ohlcv::lookahead_violations(&base, &joined, tf).len() as u64;
-    assert!(want > 0);
-    assert_eq!(panel_pit::lookahead_violations(&block, &shifted, 3600), want);
 }
 
 #[test]

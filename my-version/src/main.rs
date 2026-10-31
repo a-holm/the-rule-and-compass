@@ -403,6 +403,9 @@ SEARCH:
                              interquartile  slope  auc  log_loss  brier  hinge
                              hinge_ordinary  hinge_squared  aic  aicc  bic
                              implicit  implicit_residual  (implicit model)
+                             implicit_residual is the absolute metric on the all-zero
+                             implicit target: it is scored and fitted on the GPU
+                             like absolute
                              correlation/rank_correlation score 1-|r| and accept an
                              inverted model; the _signed variants score 1-r and
                              require the right direction. auc/log_loss/brier and
@@ -967,6 +970,12 @@ fn ledger_json(
         .map(|(name, n)| format!("{}:{}", jstr(name), n))
         .collect::<Vec<_>>()
         .join(",");
+    let improved_causes = l
+        .fallback_improved_by_cause()
+        .iter()
+        .map(|(name, n)| format!("{}:{}", jstr(name), n))
+        .collect::<Vec<_>>()
+        .join(",");
     let structural_zero = Stage::ALL
         .iter()
         .filter(|s| s.structurally_zero_in_search())
@@ -986,7 +995,7 @@ fn ledger_json(
         rcsr::gpu_stats::Ratio::undefined(f64::NAN, f64::NAN, "decades_per_gpu_hour", "run")
     };
     format!(
-        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
+        "{{\"scope\":\"run\",\"wall_s\":{},\"stages\":{{{}}},\"stage_sum_s\":{},\"unaccounted_s\":{},\"closure\":{},\"device_busy_s\":{},\"device_busy_sum_s\":{},\"device_overlap_s\":{},\"device_intervals\":{},\"device_interval_basis\":{{\"basis\":{},\"events\":{},\"host_envelope\":{}}},\"structural_zero_stages\":[{}],\"outside_run\":{{\"scope\":\"process_before_search\",\"units\":\"seconds\",{},\"json_write\":\"emitted after the report is serialised; not measurable inside its own report\"}},\"device_split\":{{\"eval_kernel_s\":{},\"eval_launch_s\":{},\"eval_copy_s\":{},\"eval_alloc_s\":{},\"fit_kernel_s\":{},\"units\":\"seconds\"}},\"duty_run\":{},\"eval_kernel_duty\":{},\"fit_kernel_duty\":{},\"fit\":{{\"host_s\":{},\"kernel_s\":{},\"fallback_s\":{},\"refit_s\":{},\"refits\":{},\"admitted\":{},\"device_fits\":{},\"fallback_fits\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"alloc\":{{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":{},\"growths\":{},\"steady_alloc_calls\":{},\"batches\":{}}}}},\"eval_fallback\":{{\"programs\":{},\"seconds\":{}}},\"quality_per_gpu_hour\":{}}}",
         jnum(l.wall_s()),
         stages,
         jnum(l.stage_sum_s()),
@@ -1018,6 +1027,8 @@ fn ledger_json(
         l.device_fits(),
         l.fallback_fits(),
         causes,
+        l.fallback_improved(),
+        improved_causes,
         l.fit_alloc().alloc_calls,
         l.fit_alloc().growths,
         l.fit_alloc().steady_alloc_calls,
@@ -1067,7 +1078,7 @@ fn gpu_json(
         .iter()
         .map(|s| {
             format!(
-                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
+                "{{\"generation\":{},\"programs\":{},\"native\":{},\"supported\":{},\"lowered\":{},\"fallbacks\":{},\"unsupported_programs\":{},\"fallback_seconds\":{},\"fallback_workers\":{},\"fit_screened\":{},\"fit_attempts\":{},\"fit_gpu\":{},\"fit_fallback\":{},\"fit_fallback_by_cause\":{{{}}},\"fit_fallback_improved\":{},\"fit_fallback_improved_by_cause\":{{{}}},\"fit_fallback_seconds\":{},\"fit_fallback_bounded\":{},\"fit_fallback_workers\":{},\"opcodes\":{{{}}}}}",
                 s.generation,
                 s.programs,
                 s.native,
@@ -1082,6 +1093,8 @@ fn gpu_json(
                 s.fit_gpu,
                 s.fit_fallback,
                 ops_json(&s.fit_fallback_by_cause),
+                s.fit_fallback_improved_by_cause.values().sum::<usize>(),
+                ops_json(&s.fit_fallback_improved_by_cause),
                 jnum(s.fit_fallback_seconds),
                 s.fit_fallback_bounded,
                 s.fit_fallback_workers,
@@ -1120,7 +1133,7 @@ fn gpu_json(
     // #169: the run-level fit-arm ledger. Emitted for every GPU run, so the
     // strategy and its attempt/fallback/refit counts are always auditable.
     let fit = format!(
-        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
+        "\"fit\":{{\"strategy\":{},\"admission\":{},\"screened\":{},\"attempts\":{},\"gpu\":{},\"fallback\":{},\"fallback_by_cause\":{{{}}},\"fallback_improved\":{},\"fallback_improved_by_cause\":{{{}}},\"status_by_label\":{{{}}},\"refits\":{},\"seconds\":{},\"host_seconds\":{},\"fallback_seconds\":{},\"fallback_bounded\":{},\"fallback_workers\":{},\"fallback_max\":{}}}",
         jstr(fit_strategy),
         jstr(g.fit_admission.name()),
         g.fit_screened,
@@ -1128,6 +1141,8 @@ fn gpu_json(
         g.fit_gpu,
         g.fit_fallback,
         ops_json(&g.fit_fallback_by_cause),
+        g.fit_fallback_improved_by_cause.values().sum::<usize>(),
+        ops_json(&g.fit_fallback_improved_by_cause),
         ops_json(&g.fit_status_by_label),
         g.fit_refits,
         jnum(g.fit_ms / 1000.0),
@@ -10587,6 +10602,8 @@ mod tests {
         g.fit_fallback_by_cause
             .insert("ill_conditioned".to_string(), 2);
         g.fit_fallback_by_cause.insert("non_finite".to_string(), 1);
+        g.fit_fallback_improved_by_cause
+            .insert("ill_conditioned".to_string(), 1);
         g.fit_status_by_label
             .insert("rank_deficient".to_string(), 4);
         g.fit_refits = 5;
@@ -10600,7 +10617,7 @@ mod tests {
         g.fit_fallback_max = 4096;
         let json = gpu_json(&Some(g), 1.0, 2.0, "gpu", true, 10.0);
         assert!(
-            json.contains("\"fit\":{\"strategy\":\"gpu\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
+            json.contains("\"fit\":{\"strategy\":\"gpu\",\"admission\":\"screened\",\"screened\":100,\"attempts\":40,\"gpu\":37,\"fallback\":3,\"fallback_by_cause\":{\"ill_conditioned\":2,\"non_finite\":1},\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"ill_conditioned\":1},\"status_by_label\":{\"rank_deficient\":4},\"refits\":5,\"seconds\":0.25,\"host_seconds\":0.5,\"fallback_seconds\":0.125,\"fallback_bounded\":0,\"fallback_workers\":8,\"fallback_max\":4096}"),
             "{}",
             json
         );
@@ -10621,7 +10638,7 @@ mod tests {
         l.record_stage(Stage::Archive, 0.5);
         l.record_stage(Stage::HostOther, 3.0);
         l.record_fit(2.0, 1.5, 0.4);
-        l.record_fit_counters(10, 8, 2, [("non_finite".to_string(), 2)].into_iter().collect());
+        l.record_fit_counters(10, 8, 2, [("non_finite".to_string(), 2)].into_iter().collect(), [("non_finite".to_string(), 1)].into_iter().collect());
         l.record_eval_fallback(3, 0.2);
         l.record_interval(Stage::Eval, 0, 1.0, 4.0);
         l.record_interval(Stage::Fit, 1, 3.0, 5.0);
@@ -10637,6 +10654,7 @@ mod tests {
             "\"device_split\":{\"eval_kernel_s\":0,\"eval_launch_s\":0,\"eval_copy_s\":0,\"eval_alloc_s\":0,\"fit_kernel_s\":1.5,\"units\":\"seconds\"}",
             "\"duty_run\":{\"value\":0.4,\"numerator\":4,\"denominator\":10,\"units\":\"fraction\",\"scope\":\"run\"}",
             "\"fallback_by_cause\":{\"non_finite\":2}",
+            "\"fallback_improved\":1,\"fallback_improved_by_cause\":{\"non_finite\":1}",
             "\"alloc\":{\"scope\":\"run\",\"units\":\"allocator calls\",\"calls\":0,\"growths\":0,\"steady_alloc_calls\":0,\"batches\":0}",
             "\"units\":\"fraction\"",
             "\"scope\":\"run\"",

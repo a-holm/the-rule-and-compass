@@ -444,3 +444,44 @@ fn bench_order_select_crossover() {
         }
     }
 }
+
+/// #422: a finite prediction above 1e30, up to `f64::MAX`, is scored like the
+/// CPU scores it, and so is a residual that overflows to infinity: the median,
+/// maximum and interquartile mean take it as the largest key. Both paths agree
+/// with the CPU, and with each other, on every one of these shapes.
+#[test]
+fn large_predictions_and_overflowing_residuals_match_the_cpu() {
+    let t = scaled();
+    let big = [1.5e30, -2e30, 1e300, -1e300, 3.0, -0.5, f64::MAX, -f64::MAX, 0.0];
+    let small = [0.25, -1.0, 7.0, 0.0, -3.5, 1.0, 0.5, -0.125, 2.0];
+    let opposite = [-1.5e30, 2e30, -1e300, 1e300, 3.0, 0.5, -f64::MAX, f64::MAX, 0.0];
+    for n in [9usize, 40, 300] {
+        let x: Vec<f64> = (0..n).map(|i| big[i % big.len()]).collect();
+        let cases = [
+            ("large finite predictions", small.to_vec()),
+            ("overflowing residuals", opposite.to_vec()),
+            ("large predictions and targets", big.to_vec()),
+        ];
+        for (what, ys) in cases {
+            let y: Vec<f64> = (0..n).map(|i| ys[i % ys.len()]).collect();
+            let f = one_column(&x, &y);
+            let Some(mut ev) = evaluator(&f) else { return };
+            let p = plan(&t);
+            let cs = [vec![1.0], vec![-1.0], vec![0.5]];
+            for (code, path) in PAIRS {
+                let got = run(&mut ev, &p, &cs, code, path, 0);
+                let again = run(&mut ev, &p, &cs, code, path, 0);
+                assert_eq!(bits(&got), bits(&again), "n={n} {what}: {code:?} on {path:?} repeat");
+                for (j, c) in cs.iter().enumerate() {
+                    let want = cpu(&f, &t, c, code);
+                    assert_eq!(
+                        got[j].unwrap_or(f64::INFINITY).to_bits(),
+                        want.to_bits(),
+                        "n={n} {what}: {code:?} on {path:?} trial {j}: device {:?} vs CPU {want}",
+                        got[j]
+                    );
+                }
+            }
+        }
+    }
+}
