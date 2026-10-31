@@ -259,10 +259,10 @@ fn band_beta_zero_is_the_threshold_rule_bit_for_bit() {
     check_long_only(&band).unwrap();
 }
 
-#[test]
-fn dp_matches_brute_force_over_all_paths_for_n_le_20() {
-    // Several 2-group fixtures, including a mid-series entry and a final exit.
-    let cases: Vec<(Vec<f64>, Vec<f64>, Vec<u64>)> = vec![
+/// Fixtures with up to 20 rows, including a mid-series entry, a final exit, a
+/// one-row group and non-dyadic returns.
+fn brute_force_cases() -> Vec<(Vec<f64>, Vec<f64>, Vec<u64>)> {
+    vec![
         (
             vec![1.0, -1.0, 1.0, 1.0, -1.0, 1.0],
             vec![0.01, -0.02, 0.03, 0.0, 0.015, -0.004],
@@ -282,8 +282,21 @@ fn dp_matches_brute_force_over_all_paths_for_n_le_20() {
                 .collect(),
             (0..16).map(|i| (i / 8) as u64).collect(),
         ),
-    ];
-    for (case, (scores, returns, groups)) in cases.iter().enumerate() {
+        (
+            (0..20)
+                .map(|i| ((i * 37) % 23) as f64 / 11.0 - 1.0)
+                .collect(),
+            (0..20)
+                .map(|i| ((i * 13) % 29) as f64 / 1000.0 - 0.0135)
+                .collect(),
+            (0..20).map(|i| if i < 9 { 0 } else if i == 9 { 1 } else { 2 }).collect(),
+        ),
+    ]
+}
+
+#[test]
+fn dp_matches_brute_force_over_all_paths_for_n_le_20() {
+    for (case, (scores, returns, groups)) in brute_force_cases().iter().enumerate() {
         let side = 0.001;
         let best = brute_force_best(returns, groups, side);
         let dp = dp_scan(returns, groups, side, 3).unwrap();
@@ -443,6 +456,34 @@ fn carry2_composition_is_associative_and_has_the_identity() {
     assert_eq!(a.bits(), b.bits());
     assert_eq!(DpCarry::IDENTITY.then(&dp_rows[0]).bits(), dp_rows[0].bits());
     assert_eq!(dp_rows[0].then(&DpCarry::IDENTITY).bits(), dp_rows[0].bits());
+}
+
+/// The algebra is associative, but the f64 sums inside it are not. This is why
+/// the device scan folds each chain serially instead of running a parallel
+/// prefix over carries.
+#[test]
+fn f64_carry_rewards_do_not_reassociate_but_end_states_do() {
+    let tiny = f64::EPSILON / 2.0;
+    let rows = [
+        Carry2::from_row([1, 1], [1.0, 1.0]),
+        Carry2::from_row([0, 1], [tiny, tiny]),
+        Carry2::from_row([1, 0], [tiny, tiny]),
+    ];
+    let left = rows[0].then(&rows[1]).then(&rows[2]);
+    let right = rows[0].then(&rows[1].then(&rows[2]));
+    assert_eq!((left.e0, left.e1), (right.e0, right.e1));
+    assert_eq!(left.w0.to_bits(), 1.0f64.to_bits());
+    assert_eq!(right.w0.to_bits(), (1.0 + f64::EPSILON).to_bits());
+
+    let dp = [
+        DpCarry::row(1.0, 0.0),
+        DpCarry::row(tiny, 0.0),
+        DpCarry::row(tiny, 0.0),
+    ];
+    let a = dp[0].then(&dp[1]).then(&dp[2]);
+    let b = dp[0].then(&dp[1].then(&dp[2]));
+    assert_eq!(a.m[1][0].to_bits(), 1.0f64.to_bits());
+    assert_eq!(b.m[1][0].to_bits(), (1.0 + f64::EPSILON).to_bits());
 }
 
 #[test]
@@ -1752,5 +1793,535 @@ mod device_conformance {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #306 / #311: device band, cooldown and hindsight DP scans
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cuda")]
+mod device_band_dp {
+    use super::*;
+    use rcsr::trading_gpu::{
+        band_dp_max_threads, band_scan_device, band_scan_device_batch, cooldown_scan_device,
+        cooldown_scan_device_batch, device_available, dp_scan_device, BandScan, CooldownScan,
+        DpScan,
+    };
+
+    const CHUNKS: [usize; 2] = [4_096, 65_536];
+
+    fn thread_counts() -> Vec<usize> {
+        let max = band_dp_max_threads().expect("device block-size limit");
+        vec![1, 32, 256, max]
+    }
+
+    /// Non-dyadic returns, so a different summation order changes the bits,
+    /// plus NaN and infinite scores.
+    fn rounding_data(n: usize, group_len: usize) -> (Vec<f64>, Vec<f64>, Vec<u64>) {
+        let mut scores = Vec::with_capacity(n);
+        let mut returns = Vec::with_capacity(n);
+        let mut groups = Vec::with_capacity(n);
+        for i in 0..n {
+            let z = match i % 997 {
+                13 => f64::NAN,
+                29 => f64::INFINITY,
+                31 => f64::NEG_INFINITY,
+                _ => ((i * 37) % 101) as f64 / 50.0 - 1.0 + (i % 7) as f64 * 1e-3,
+            };
+            scores.push(z);
+            returns.push(((i * 13) % 29) as f64 / 1000.0 - 0.0135 + (i % 11) as f64 * 1e-7);
+            groups.push((i / group_len) as u64);
+        }
+        (scores, returns, groups)
+    }
+
+    fn pairwise(v: &[f64]) -> f64 {
+        match v.len() {
+            0 => 0.0,
+            1 => v[0],
+            len => pairwise(&v[..len / 2]) + pairwise(&v[len / 2..]),
+        }
+    }
+
+    /// True when the first group's start-flat rewards fold to different bits
+    /// serially and pairwise: a device that reassociated would be caught.
+    fn fold_order_matters(positions: &[f64], returns: &[f64], groups: &[u64], side: f64) -> bool {
+        let end = groups.iter().position(|&g| g != groups[0]).unwrap_or(groups.len());
+        let mut terms = Vec::with_capacity(end);
+        let mut prev = 0.0f64;
+        for i in 0..end {
+            let p = positions[i];
+            let mut w = p * returns[i] - side * (p - prev).abs();
+            if i + 1 == end && p != 0.0 {
+                w -= side;
+            }
+            terms.push(w);
+            prev = p;
+        }
+        let serial = terms.iter().fold(0.0f64, |acc, &w| acc + w);
+        serial.to_bits() != pairwise(&terms).to_bits()
+    }
+
+    fn same_band(cpu: &BandScan, dev: &BandScan, what: &str) {
+        assert_eq!(cpu.positions.len(), dev.positions.len(), "{what}");
+        for (i, (a, b)) in cpu.positions.iter().zip(&dev.positions).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}: position row {i}");
+        }
+        assert_eq!(cpu.carries.len(), dev.carries.len(), "{what}");
+        for (g, (a, b)) in cpu.carries.iter().zip(&dev.carries).enumerate() {
+            assert_eq!(a.bits(), b.bits(), "{what}: carry group {g}");
+        }
+        assert_eq!(cpu.net().to_bits(), dev.net().to_bits(), "{what}: net");
+    }
+
+    fn same_cooldown(cpu: &CooldownScan, dev: &CooldownScan, what: &str) {
+        assert_eq!(cpu.positions.len(), dev.positions.len(), "{what}");
+        for (i, (a, b)) in cpu.positions.iter().zip(&dev.positions).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "{what}: position row {i}");
+        }
+        assert_eq!(cpu.carries.len(), dev.carries.len(), "{what}");
+        for (g, (a, b)) in cpu.carries.iter().zip(&dev.carries).enumerate() {
+            assert_eq!(a.bits(), b.bits(), "{what}: cooldown carry group {g}");
+        }
+        assert_eq!(cpu.net().to_bits(), dev.net().to_bits(), "{what}: net");
+    }
+
+    fn same_dp(cpu: &DpScan, dev: &DpScan, side: f64, what: &str) {
+        assert_eq!(cpu.carries.len(), dev.carries.len(), "{what}");
+        for (g, (a, b)) in cpu.carries.iter().zip(&dev.carries).enumerate() {
+            assert_eq!(a.bits(), b.bits(), "{what}: dp carry group {g}");
+        }
+        assert_eq!(cpu.bound(side).to_bits(), dev.bound(side).to_bits(), "{what}: bound");
+    }
+
+    #[test]
+    fn device_band_cooldown_and_dp_scans_are_bit_identical_at_every_thread_count_and_chunk() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let side = 0.001;
+        let band = BandParams::new(0.0, 0.1, 1).unwrap();
+        let hold = BandParams::new(0.0, 0.1, 3).unwrap();
+        // Few long groups (chunk boundaries fall inside groups) and many short ones.
+        for (n, group_len) in [(70_000usize, 9_001usize), (20_000, 7)] {
+            let (scores, returns, groups) = rounding_data(n, group_len);
+            let b0 = band_scan(&scores, &returns, &groups, &band, side, n).unwrap();
+            let c0 = cooldown_scan(&scores, &returns, &groups, &hold, side, n).unwrap();
+            let d0 = dp_scan(&returns, &groups, side, n).unwrap();
+            if group_len > 1_000 {
+                assert!(fold_order_matters(&b0.positions, &returns, &groups, side));
+            }
+            for threads in thread_counts() {
+                for chunk in CHUNKS {
+                    let what = format!("n {n} group {group_len} threads {threads} chunk {chunk}");
+                    let b = band_scan_device(&scores, &returns, &groups, &band, side, threads, chunk)
+                        .unwrap();
+                    same_band(&b0, &b, &what);
+                    let c = cooldown_scan_device(&scores, &returns, &groups, &hold, side, threads, chunk)
+                        .unwrap();
+                    same_cooldown(&c0, &c, &what);
+                    let d = dp_scan_device(&returns, &groups, side, threads, chunk).unwrap();
+                    same_dp(&d0, &d, side, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_padded_band_candidate_equals_its_own_alone_run_at_every_thread_and_chunk() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let n = 20_000usize;
+        let side = 0.0005;
+        let (base, returns, groups) = rounding_data(n, 3_001);
+        // Two tiles: one full, one padded.
+        let count = MAX_TILE_CANDIDATES + 3;
+        let cands: Vec<Vec<f64>> = (0..count)
+            .map(|k| {
+                base.iter()
+                    .enumerate()
+                    .map(|(i, &z)| z + ((i * (k + 3)) % 17) as f64 * 1e-3)
+                    .collect()
+            })
+            .collect();
+        let params: Vec<BandParams> = (0..count)
+            .map(|k| BandParams::new(-0.2 + 0.05 * k as f64, 0.02 * (k % 4) as f64, 1).unwrap())
+            .collect();
+        let holds: Vec<BandParams> = params
+            .iter()
+            .map(|p| BandParams { min_hold: 4, ..*p })
+            .collect();
+        let cpu: Vec<BandScan> = cands
+            .iter()
+            .zip(&params)
+            .map(|(s, p)| band_scan(s, &returns, &groups, p, side, n).unwrap())
+            .collect();
+        let cpu_hold: Vec<CooldownScan> = cands
+            .iter()
+            .zip(&holds)
+            .map(|(s, p)| cooldown_scan(s, &returns, &groups, p, side, n).unwrap())
+            .collect();
+        let refs: Vec<&[f64]> = cands.iter().map(|v| v.as_slice()).collect();
+        for threads in thread_counts() {
+            for chunk in CHUNKS {
+                let batch =
+                    band_scan_device_batch(&refs, &returns, &groups, &params, side, threads, chunk)
+                        .unwrap();
+                let hold_batch =
+                    cooldown_scan_device_batch(&refs, &returns, &groups, &holds, side, threads, chunk)
+                        .unwrap();
+                assert_eq!(batch.len(), count);
+                assert_eq!(hold_batch.len(), count);
+                for k in 0..count {
+                    let what = format!("cand {k} threads {threads} chunk {chunk}");
+                    let alone =
+                        band_scan_device(&cands[k], &returns, &groups, &params[k], side, threads, chunk)
+                            .unwrap();
+                    same_band(&cpu[k], &alone, &format!("alone {what}"));
+                    same_band(&cpu[k], &batch[k], &format!("padded {what}"));
+                    same_cooldown(&cpu_hold[k], &hold_batch[k], &format!("padded hold {what}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_dp_matches_brute_force_over_all_paths_for_n_le_20() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let side = 0.001;
+        let params = BandParams::new(0.0, 0.2, 1).unwrap();
+        for (case, (scores, returns, groups)) in brute_force_cases().iter().enumerate() {
+            let best = brute_force_best(returns, groups, side);
+            let cpu_dp = dp_scan(returns, groups, side, returns.len()).unwrap();
+            let cpu_band = band_scan(scores, returns, groups, &params, side, returns.len()).unwrap();
+            for threads in thread_counts() {
+                for chunk in [1usize, 3, 4_096] {
+                    let what = format!("case {case} threads {threads} chunk {chunk}");
+                    let dp = dp_scan_device(returns, groups, side, threads, chunk).unwrap();
+                    let bound = dp.bound(side);
+                    assert!((bound - best).abs() <= 1e-12, "{what}: dp {bound} vs brute {best}");
+                    same_dp(&cpu_dp, &dp, side, &what);
+                    let band =
+                        band_scan_device(scores, returns, groups, &params, side, threads, chunk)
+                            .unwrap();
+                    assert!(band.net() <= bound + 1e-12, "{what}: band {} > dp {bound}", band.net());
+                    same_band(&cpu_band, &band, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_band_beta_zero_is_the_threshold_rule_bit_for_bit() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let scores = vec![
+            f64::NAN,
+            0.5,
+            0.2,
+            0.2,
+            -0.3,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.7,
+            0.0,
+        ];
+        let returns = vec![0.01, -0.02, 0.03, 0.0, 0.015, -0.004, 0.02, -0.01, 0.005];
+        let groups = vec![0u64, 0, 0, 0, 1, 1, 1, 2, 2];
+        let (big_scores, big_returns, big_groups) = rounding_data(50_000, 977);
+        let side = 0.001;
+        for (scores, returns, groups) in [
+            (&scores, &returns, &groups),
+            (&big_scores, &big_returns, &big_groups),
+        ] {
+            let threshold = 0.2;
+            let params = BandParams::new(threshold, 0.0, 1).unwrap();
+            let plain = threshold_positions(scores, threshold);
+            let cpu = band_scan(scores, returns, groups, &params, side, scores.len()).unwrap();
+            for threads in thread_counts() {
+                for chunk in [1usize, 2, 4_096, 65_536] {
+                    let what = format!("rows {} threads {threads} chunk {chunk}", scores.len());
+                    let dev = band_scan_device(scores, returns, groups, &params, side, threads, chunk)
+                        .unwrap();
+                    for (i, (a, b)) in plain.iter().zip(&dev.positions).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "{what}: row {i}");
+                    }
+                    check_long_only(&dev.positions).unwrap();
+                    same_band(&cpu, &dev, &what);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn device_scan_edges_seams_entry_final_exit_and_cooldown_minimum_match_the_cpu() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let side = 0.001;
+        let fixtures: Vec<(&str, Vec<f64>, Vec<f64>, Vec<u64>, usize)> = vec![
+            // Entry on the first row of each group, a seam, a final exit.
+            (
+                "seam",
+                vec![1.0, 1.0, -1.0, 1.0, 1.0],
+                vec![0.01, 0.02, -0.01, 0.03, 0.04],
+                vec![0, 0, 0, 1, 1],
+                1,
+            ),
+            // The minimum hold keeps the book long until the counter reaches 4.
+            (
+                "hold",
+                vec![1.0, -1.0, -1.0, -1.0, -1.0],
+                vec![0.01, -0.02, 0.03, -0.01, 0.02],
+                vec![0; 5],
+                4,
+            ),
+            // A minimum hold longer than the group: long to the end, final exit paid.
+            (
+                "hold-past-end",
+                vec![1.0, -1.0, -1.0, 1.0, -1.0, -1.0, -1.0],
+                vec![0.011, -0.013, 0.007, 0.002, -0.003, 0.009, -0.001],
+                vec![0, 0, 0, 1, 1, 1, 1],
+                10,
+            ),
+            // One-row groups and non-finite scores forcing exits.
+            (
+                "one-row-groups",
+                vec![1.0, f64::NAN, 1.0, f64::INFINITY, f64::NEG_INFINITY, 1.0],
+                vec![0.01, 0.02, -0.03, 0.04, -0.05, 0.06],
+                vec![0, 1, 2, 3, 4, 5],
+                1,
+            ),
+            (
+                "non-finite-exit",
+                vec![1.0, 1.0, f64::NAN, 1.0, f64::NEG_INFINITY, 1.0, 1.0],
+                vec![0.01, 0.02, -0.03, 0.04, -0.05, 0.06, 0.07],
+                vec![7; 7],
+                2,
+            ),
+        ];
+        for (name, scores, returns, groups, min_hold) in &fixtures {
+            let params = BandParams::new(0.0, 0.0, *min_hold).unwrap();
+            let cpu_hold = cooldown_scan(scores, returns, groups, &params, side, 1).unwrap();
+            let cpu_dp = dp_scan(returns, groups, side, 1).unwrap();
+            for threads in [1usize, 32] {
+                for chunk in [1usize, 2, 4_096] {
+                    let what = format!("{name} threads {threads} chunk {chunk}");
+                    let dev = cooldown_scan_device(scores, returns, groups, &params, side, threads, chunk)
+                        .unwrap();
+                    same_cooldown(&cpu_hold, &dev, &what);
+                    if *min_hold == 1 {
+                        let cpu = band_scan(scores, returns, groups, &params, side, 1).unwrap();
+                        let dev = band_scan_device(scores, returns, groups, &params, side, threads, chunk)
+                            .unwrap();
+                        same_band(&cpu, &dev, &what);
+                    }
+                    let dp = dp_scan_device(returns, groups, side, threads, chunk).unwrap();
+                    same_dp(&cpu_dp, &dp, side, &what);
+                }
+            }
+        }
+        let seam = cooldown_scan_device(
+            &fixtures[0].1,
+            &fixtures[0].2,
+            &fixtures[0].3,
+            &BandParams::new(0.0, 0.0, 1).unwrap(),
+            side,
+            32,
+            2,
+        )
+        .unwrap();
+        assert_eq!(seam.positions, vec![1.0, 1.0, 0.0, 1.0, 1.0]);
+        let hold = cooldown_scan_device(
+            &fixtures[1].1,
+            &fixtures[1].2,
+            &fixtures[1].3,
+            &BandParams::new(0.0, 0.0, 4).unwrap(),
+            side,
+            32,
+            2,
+        )
+        .unwrap();
+        assert_eq!(hold.positions, vec![1.0, 1.0, 1.0, 1.0, 0.0]);
+        let past_end = cooldown_scan_device(
+            &fixtures[2].1,
+            &fixtures[2].2,
+            &fixtures[2].3,
+            &BandParams::new(0.0, 0.0, 10).unwrap(),
+            side,
+            32,
+            2,
+        )
+        .unwrap();
+        assert_eq!(past_end.positions, vec![1.0; 7]);
+    }
+
+    #[test]
+    fn device_scan_refuses_with_a_label_instead_of_returning_inexact_bits() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let (scores, returns, groups) = rounding_data(100, 10);
+        let params = BandParams::new(0.0, 0.1, 1).unwrap();
+        let side = 0.001;
+        let max = band_dp_max_threads().unwrap();
+
+        let e = band_scan_device(&scores, &returns, &groups, &params, side, 0, 64).unwrap_err();
+        assert!(e.contains("threads 0 outside"), "{e}");
+        let e = dp_scan_device(&returns, &groups, side, max + 1, 64).unwrap_err();
+        assert!(e.contains(&format!("threads {} outside 1..={}", max + 1, max)), "{e}");
+        let e = band_scan_device(&[], &[], &[], &params, side, 32, 64).unwrap_err();
+        assert_eq!(e, "no rows to scan");
+
+        // Invalid input fails with the CPU's own message, before any upload.
+        let mut bad_returns = returns.clone();
+        bad_returns[17] = f64::NAN;
+        assert_eq!(
+            band_scan_device(&scores, &bad_returns, &groups, &params, side, 32, 64).unwrap_err(),
+            band_scan(&scores, &bad_returns, &groups, &params, side, 64).unwrap_err()
+        );
+        assert_eq!(
+            dp_scan_device(&bad_returns, &groups, side, 32, 64).unwrap_err(),
+            dp_scan(&bad_returns, &groups, side, 64).unwrap_err()
+        );
+        let mut interleaved = groups.clone();
+        interleaved[50] = 0;
+        assert_eq!(
+            dp_scan_device(&returns, &interleaved, side, 32, 64).unwrap_err(),
+            dp_scan(&returns, &interleaved, side, 64).unwrap_err()
+        );
+        let hold = BandParams::new(0.0, 0.1, 2).unwrap();
+        assert_eq!(
+            band_scan_device(&scores, &returns, &groups, &hold, side, 32, 64).unwrap_err(),
+            band_scan(&scores, &returns, &groups, &hold, side, 64).unwrap_err()
+        );
+        let e = cooldown_scan_device_batch(
+            &[scores.as_slice(), scores.as_slice()],
+            &returns,
+            &groups,
+            &[params, hold],
+            side,
+            32,
+            64,
+        )
+        .unwrap_err();
+        assert!(e.contains("one device batch needs one min_hold"), "{e}");
+    }
+
+    #[test]
+    fn walkforward_gpu_band_and_dp_equal_the_cpu_report_bit_for_bit() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let mut rows: Vec<(f64, &str, f64, f64)> = Vec::new();
+        for t in 0..240 {
+            for (k, sym) in ["A", "B", "C"].iter().enumerate() {
+                let x = (((t * 37 + k * 11) % 101) as f64) / 50.0 - 1.0;
+                let y = (((t * 13 + k * 7) % 29) as f64) / 1000.0 - 0.0135;
+                rows.push((t as f64, *sym, x, y));
+            }
+        }
+        let table = table(&rows);
+        for (policy, band_width, min_hold) in [
+            (walkforward::Policy::Band, 0.1, 1usize),
+            (walkforward::Policy::Band, 0.05, 3),
+            (walkforward::Policy::Dp, 0.0, 1),
+        ] {
+            let mut cpu = spec("x", vec![window("w", 0.0, 120.0, 120.0, 240.0)]);
+            cpu.group = Some("sym".to_string());
+            cpu.threshold_quantile = 0.5;
+            cpu.cost_bps = 10.0;
+            cpu.policy = policy;
+            cpu.band_width = band_width;
+            cpu.min_hold = min_hold;
+            let mut gpu = cpu.clone();
+            gpu.gpu = true;
+            let c = walkforward::run_table(&table, &cpu, "test").unwrap();
+            let g = walkforward::run_table(&table, &gpu, "test").unwrap();
+            let what = format!("{policy:?} band {band_width} hold {min_hold}");
+            let (cw, gw) = (&c.windows[0], &g.windows[0]);
+            match policy {
+                walkforward::Policy::Dp => {
+                    let (ch, gh) = (cw.hindsight_bound.as_ref().unwrap(), gw.hindsight_bound.as_ref().unwrap());
+                    assert_eq!(ch.backend, "cpu", "{what}");
+                    assert_eq!(gh.backend, "cuda", "{what}");
+                    assert_eq!(gh.fallback_reason, None, "{what}");
+                    assert_eq!(ch.net.to_bits(), gh.net.to_bits(), "{what}");
+                }
+                _ => {
+                    let (cb, gb) = (cw.band.as_ref().unwrap(), gw.band.as_ref().unwrap());
+                    assert_eq!(cb.backend, "cpu", "{what}");
+                    assert_eq!(gb.backend, "cuda", "{what}");
+                    assert_eq!(gb.fallback_reason, None, "{what}");
+                    assert_eq!(cb.groups, 3, "{what}");
+                    assert_eq!(cb.net.to_bits(), gb.net.to_bits(), "{what}");
+                }
+            }
+            // Apart from the backend labels the two reports are the same text,
+            // so every reported number has the same bits.
+            let normalised = g
+                .json()
+                .replace("\"backend\":\"cuda\"", "\"backend\":\"cpu\"")
+                .replace("\"gpu\":true", "\"gpu\":false");
+            assert_eq!(c.json(), normalised, "{what}");
+            assert!(g.json().contains("\"backend\":\"cuda\",\"fallback_reason\":null"));
+        }
+    }
+
+    /// Paired CPU/device timing at the #306 bench size. Ignored by default:
+    ///
+    /// ```sh
+    /// cargo test --release --features cuda --test pnl_gpu -- --ignored --nocapture bench_band_dp_device_vs_cpu
+    /// ```
+    #[test]
+    #[ignore]
+    fn bench_band_dp_device_vs_cpu() {
+        if !device_available() {
+            eprintln!("skipped: no CUDA device");
+            return;
+        }
+        let env = |name: &str, default: usize| -> usize {
+            std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+        };
+        let n = env("RCSR_BAND_BENCH_ROWS", 3_943_856);
+        let group_len = env("RCSR_BAND_BENCH_GROUP_ROWS", 9_001);
+        let (scores, returns, groups) = rounding_data(n, group_len);
+        let side = 0.001;
+        let band = BandParams::new(0.0, 0.1, 1).unwrap();
+        let time = |f: &mut dyn FnMut()| {
+            let t = std::time::Instant::now();
+            f();
+            t.elapsed().as_secs_f64()
+        };
+        let (mut b0, mut b1, mut d0, mut d1) = (None, None, None, None);
+        let cpu_band = time(&mut || b0 = Some(band_scan(&scores, &returns, &groups, &band, side, 65_536).unwrap()));
+        let dev_band = time(&mut || {
+            b1 = Some(band_scan_device(&scores, &returns, &groups, &band, side, 256, 65_536).unwrap())
+        });
+        let cpu_dp = time(&mut || d0 = Some(dp_scan(&returns, &groups, side, 65_536).unwrap()));
+        let dev_dp = time(&mut || d1 = Some(dp_scan_device(&returns, &groups, side, 256, 65_536).unwrap()));
+        same_band(b0.as_ref().unwrap(), b1.as_ref().unwrap(), "bench band");
+        same_dp(d0.as_ref().unwrap(), d1.as_ref().unwrap(), side, "bench dp");
+        println!(
+            "n={} groups={} band cpu={:.4}s device={:.4}s dp cpu={:.4}s device={:.4}s (device includes upload and download)",
+            n,
+            b0.as_ref().unwrap().carries.len(),
+            cpu_band,
+            dev_band,
+            cpu_dp,
+            dev_dp
+        );
     }
 }
