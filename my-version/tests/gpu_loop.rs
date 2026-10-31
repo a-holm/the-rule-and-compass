@@ -696,3 +696,48 @@ fn failed_batch_is_timed_but_not_counted_as_an_eval() {
     assert_eq!(a.evals_per_s(), 0.0);
     assert!(a.wall_s >= 0.0);
 }
+
+/// #284: a GPU run that writes checkpoints books the time in the `io` stage, its
+/// device intervals are placed from CUDA event timestamps, and the ledger still
+/// closes to the run wall within 1 %.
+#[cfg(feature = "cuda")]
+#[test]
+fn gpu_run_ledger_books_checkpoint_io_and_uses_event_intervals() {
+    let train = sample(64);
+    let test = sample(64);
+    let mut cfg = config(13, true);
+    cfg.generations = 8;
+    let mut saved = 0usize;
+    let out = search::run_resumable(&cfg, &train, &test, None, 1, |_| {
+        saved += 1;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    })
+    .expect("a resumable GPU run");
+    assert!(saved >= 2, "the run must write checkpoints, wrote {saved}");
+    let g = out.gpu.expect("the GPU path scored generations");
+    let l = &g.ledger;
+    use rcsr::gpu_stats::{IntervalSource, Stage};
+    assert!(
+        l.stage_s(Stage::Io) >= 0.9 * 0.020 * saved as f64,
+        "io stage must hold the checkpoint writes: {} s for {saved} writes",
+        l.stage_s(Stage::Io)
+    );
+    assert_eq!(l.stage_s(Stage::Pnl), 0.0);
+    assert_eq!(l.stage_s(Stage::Features), 0.0);
+    assert!(
+        l.closure_residual().value.abs() < 0.01,
+        "closure with io booked: stages {} + unaccounted {} vs wall {}",
+        l.stage_sum_s(),
+        l.unaccounted_s(),
+        l.wall_s()
+    );
+    assert!(!l.intervals().is_empty());
+    assert!(
+        l.intervals().iter().all(|i| i.source == IntervalSource::Event),
+        "every device interval must come from event timestamps: {:?}",
+        l.interval_counts()
+    );
+    assert_eq!(l.interval_basis(), "events");
+    assert!(l.device_busy_s() <= l.wall_s() + 1e-9);
+    assert!((0.0..=1.0).contains(&l.duty_run().value));
+}

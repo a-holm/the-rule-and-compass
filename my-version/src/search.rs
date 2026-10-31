@@ -991,8 +991,14 @@ impl GpuSearch {
                 self.fit_ms += ms as f64;
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
-                self.ledger
-                    .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0);
+                match self.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
+                    Some(start_s) => self
+                        .ledger
+                        .record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                    None => self
+                        .ledger
+                        .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0),
+                }
             }
             if out.len() == jobs.len() {
                 // #290: a successful batch is what makes this run device-used.
@@ -4845,6 +4851,7 @@ fn run_postfix_search(
         t0.elapsed().as_secs_f64(),
     );
     let mut eval_stage_total = 0.0f64;
+    let mut io_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     // #211: why the loop ends, for the development log's run_end event.
@@ -5090,6 +5097,7 @@ fn run_postfix_search(
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
+            let io_mark = std::time::Instant::now();
             let trees = next
                 .to_trees()
                 .ok_or_else(|| "postfix pool could not be decoded for a checkpoint".to_string())?;
@@ -5126,6 +5134,7 @@ fn run_postfix_search(
                 None,
             );
             emit(&mut on_checkpoint, &cp);
+            io_stage_total += io_mark.elapsed().as_secs_f64();
         }
 
         pool = next;
@@ -5141,6 +5150,7 @@ fn run_postfix_search(
     // #284: close measured generation stages to the run clock. The evaluator
     // window joins the ledger first so the fit reclassification can subtract
     // from it rather than add a second stage.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
     let tail_start = std::time::Instant::now();
     let pre_tail_elapsed = tail_start.duration_since(t0).as_secs_f64();
@@ -5154,6 +5164,8 @@ fn run_postfix_search(
 
     // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
     // carries the archive the run reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let trees = pool
             .to_trees()
@@ -5194,6 +5206,7 @@ fn run_postfix_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
@@ -5226,7 +5239,9 @@ fn run_postfix_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     let best = final_archive
@@ -5239,7 +5254,11 @@ fn run_postfix_search(
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
-    run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, tail_total);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        (tail_total - io_final_s).max(0.0),
+    );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
     let mut stats = gpu.run_stats();
@@ -5960,6 +5979,7 @@ fn run_search(
         (setup_s - setup_fit_s).max(0.0),
     );
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables, unused_assignments))]
+    let mut io_stage_total = 0.0f64;
     let mut eval_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
@@ -6617,6 +6637,7 @@ fn run_search(
             // generation's work, including migration and restarts, is done.
             if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
                 last_save = std::time::Instant::now();
+                let io_mark = std::time::Instant::now();
                 let backend = if defer_gpu || gpu_used {
                     Backend::Gpu
                 } else {
@@ -6639,6 +6660,7 @@ fn run_search(
                     None,
                 );
                 emit(&mut on_checkpoint, &cp);
+                io_stage_total += io_mark.elapsed().as_secs_f64();
             }
 
             if budget_hit {
@@ -6654,6 +6676,7 @@ fn run_search(
     let _ = eval_stage_total;
     // The measured evaluator windows join the ledger before the closure check;
     // the fit part is reclassified below after the gadget's totals are known.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
 
     // #284: close the generation loop's measured stages to the run clock. Any
@@ -6684,6 +6707,8 @@ fn run_search(
     // saved search archive is the one at the last completed generation. It is
     // emitted after the rebuild (#256) so it also carries the archive the run
     // reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let backend = if (defer_gpu && !fit_only_device) || gpu_used {
             Backend::Gpu
@@ -6710,6 +6735,7 @@ fn run_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
@@ -6760,7 +6786,9 @@ fn run_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     // #18: the last in-loop reading describes the final generation. If no
@@ -6784,9 +6812,10 @@ fn run_search(
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
     run_ledger.record_stage(
         crate::gpu_stats::Stage::HostOther,
-        (tail_total - refit_tail_s).max(0.0),
+        (tail_total - refit_tail_s - io_final_s).max(0.0),
     );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
