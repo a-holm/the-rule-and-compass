@@ -12,7 +12,7 @@ Provisional answer: right: "Gate on 9957f26: cargo test 1173 passed; cuda 1415 p
 
 ## 3. Hard limits that never bend
 
-Provisional answer: `../_shared/rules.md`. In short: one issue per worktree and PR, `Refs` not `Closes`, everything through the lock, no `pgrep -f`, no Python, one gate on the integration tip, Sonnet implements and Opus only researches. Confirm or adjust.
+Provisional answer: `../_shared/rules.md`. In short: one issue per worktree and PR, `Refs` not `Closes`, everything through the lock, no `pgrep -f`, no Python, one gate on the integration tip, Sonnet implements by default and Opus takes hard tasks with tractatus thinking and context7. Confirm or adjust.
 
 ## 4. What is always checked before anything ships, and can a machine do it?
 

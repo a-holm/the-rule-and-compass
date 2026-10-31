@@ -17,8 +17,8 @@ Do NOT load: briefs, dispatch, running agents' worktrees.
 ## Process
 
 1. List candidate tickets and the files each will touch (from the issue's design section).
-2. Pick at most 3 tickets and at most 10 agents. Tickets that share a file wait for the first to merge. A fourth ticket needs a line `exception: <who allowed it, YYYY-MM-DD>` in `wave.md`.
-3. Write `wave.md`: one row per ticket `| #N | file,file | sonnet |`. Research tickets run `opus` and use `../../02_research/CONTEXT.md`.
+2. Pick file-disjoint tickets: at most 10 agents, at most 3 tickets using the machine at once. A ticket whose agent waits on the lock does not count. Tickets that share a file wait for the first to merge. A fourth ticket needs a line `exception: <who allowed it, YYYY-MM-DD>` in `wave.md`.
+3. Write `wave.md`: one row per ticket `| #N | file,file | sonnet |`. Research tickets and genuinely difficult implementation run `opus` and use `../../02_research/CONTEXT.md`.
 4. Parked issues stay untouched unless the user names them.
 
 ## Outputs
