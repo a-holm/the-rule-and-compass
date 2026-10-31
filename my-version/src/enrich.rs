@@ -455,28 +455,12 @@ fn cross_warmup(name: &str) -> usize {
     }
 }
 
-/// Reserved derivative columns. No funding/OI/basis/order-book snapshot exists
-/// locally, so these stay `available:false` with `source:null`.
-pub const DERIVATIVE_NAMES: &[&str] = &[
-    "funding_rate",
-    "funding_carry_24h",
-    "basis_bps",
-    "oi",
-    "oi_chg_1h",
-    "oi_chg_24h",
-    "ls_ratio",
-    "taker_buy_sell_ratio",
-];
+/// Reserved derivative columns; see `crate::derivatives`.
+pub const DERIVATIVE_NAMES: &[&str] = crate::derivatives::NAMES;
 
 /// Reason a registered name cannot be computed yet, if it is unavailable.
-pub fn unavailable_reason(name: &str) -> Option<&'static str> {
-    if DERIVATIVE_NAMES.contains(&name) {
-        return Some(
-            "no local funding, open-interest, basis, mark-price or liquidation snapshot; \
-             intentionally not filled with zero",
-        );
-    }
-    None
+pub fn unavailable_reason(name: &str) -> Option<String> {
+    crate::derivatives::refusal(name)
 }
 
 fn compact_formula(name: &str) -> &'static str {
@@ -830,7 +814,7 @@ pub fn default_registry() -> Vec<RegistryEntry> {
             formula: "reserved derivative column".to_string(),
             source: "none",
             pit: "not available",
-            reason: unavailable_reason(name).map(|s| s.to_string()),
+            reason: unavailable_reason(name),
         });
     }
     out
@@ -844,7 +828,7 @@ pub fn registry_json() -> String {
             format!(
                 "{{\"name\":{},\"family\":{},\"timeframe\":{},\"warmup\":{},\
                  \"available\":{},\"derived\":{},\"parity_tier\":{},\"formula\":{},\"formula_sha256\":{},\
-                 \"source\":{},\"pit\":{},\"reason\":{}}}",
+                 \"source\":{},\"pit\":{},\"reason\":{}{}}}",
                 jstr(&e.name),
                 jstr(e.family),
                 jstr(e.timeframe),
@@ -854,9 +838,10 @@ pub fn registry_json() -> String {
                 jstr(e.parity_tier),
                 jstr(&e.formula),
                 jstr(&manifest::sha256_hex(e.formula.as_bytes())),
-                jstr(e.source),
+                if e.family == "derivatives" { "null".to_string() } else { jstr(e.source) },
                 jstr(e.pit),
-                e.reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string())
+                e.reason.as_deref().map(jstr).unwrap_or_else(|| "null".to_string()),
+                crate::derivatives::registry_extra_json(&e.name)
             )
         })
         .collect();
@@ -1306,6 +1291,7 @@ pub fn expand(spec: &str) -> Result<Vec<String>, String> {
             "compact" => compact_names(),
             "flow" => flow_names(),
             "price_action" => price_action_names(),
+            "derivatives" => return Err(crate::derivatives::group_refusal()),
             "all" => {
                 let mut v = Vec::new();
                 for g in [
@@ -8125,8 +8111,11 @@ FEATURE GROUPS (the default financial feature set; see `rcsr schema`):
   fails closed with the missing data dependency instead of being silently
   dropped. All 36 multi-timeframe columns are `available:true`, and the complete
   cross-asset/breadth/rank family is `available:true`; `cross` expands it.
-  Derivative columns have no local snapshot and are `available:false` with
-  source null.
+  The ten derivative columns (`funding_rate`, `funding_carry_24h`, `basis_bps`,
+  `oi`, `oi_chg_1h`, `oi_chg_24h`, `ls_ratio`, `taker_buy_sell_ratio`,
+  `liq_long`, `liq_short`) are `available:false` with source null. A request
+  for one, or for the group `derivatives`, is refused and names the missing raw
+  field; it never yields zeros, an empty column or a forward fill.
 
 
   Flow and compact flow features read the raw `volume`, `quote_volume`,
