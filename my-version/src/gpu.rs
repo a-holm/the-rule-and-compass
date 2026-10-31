@@ -893,6 +893,23 @@ extern "C" {
         out_value: *mut f64,
         out_status: *mut i32,
     ) -> f32;
+    /* #288: the radix select path of `rc_order_stat_score_batch` for the median
+       and the maximum. Same layout, codes and labels; `blocks_per_seg <= 0`
+       is the production launch shape. */
+    fn rc_order_stat_select_batch(
+        ctx: *mut RawCtx,
+        prog: *const u32,
+        off: *const u32,
+        pcount: *const i32,
+        nsets: i32,
+        ntrials: i32,
+        kmax: i32,
+        c0: *const f64,
+        what: i32,
+        blocks_per_seg: i32,
+        out_value: *mut f64,
+        out_status: *mut i32,
+    ) -> f32;
     /* #227: exact maximum-error scan of a batch of prediction vectors: per
        segment the exact `f64` `max |r|`, its lowest maximiser row, and — when
        `coords`/`levels` are given — the intersection `[lo, hi]` of the per-row
@@ -1326,6 +1343,68 @@ pub(crate) const RANK_ROW_BYTES: u64 = 72;
 /// Device bytes an order-statistic segment holds per row: the keys, the sorted
 /// copy and the radix sort's alternate keys.
 pub(crate) const ORDER_ROW_BYTES: u64 = 64;
+
+/// #288: device bytes a radix-select segment holds per row: the keys only. The
+/// histograms and prefixes are per segment and fit the fixed 1 MiB charge.
+pub(crate) const SELECT_ROW_BYTES: u64 = 8;
+
+/// #288: the order statistic a device call computes. The discriminants are the
+/// `what` codes of `src/cuda/eval.cu` (`RC_OS_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrderCode {
+    /// `metrics::median_abs`, bit for bit.
+    Median = 0,
+    /// The #232 fit ladder's window mean: a fixed tree reduction that agrees
+    /// with the CPU to `1e-12` relative. The ladder only compares trials.
+    InterquartileTree = 1,
+    /// `metrics::interquartile_mean_abs`, bit for bit: the rank window added
+    /// in ascending order, like the CPU's left-to-right sum.
+    InterquartileExact = 2,
+    /// The largest `|r|`, bit for bit.
+    Maximum = 3,
+}
+
+impl OrderCode {
+    /// The fit ladder's statistic, read from its device code
+    /// ([`crate::fit::OrderStat::device_code`]).
+    fn for_fit(want: crate::fit::OrderStat) -> Self {
+        if want.device_code() == OrderCode::Median as i32 {
+            OrderCode::Median
+        } else {
+            OrderCode::InterquartileTree
+        }
+    }
+
+    /// One or two order statistics, which the radix select path computes. The
+    /// interquartile mean needs its whole window in ascending order, so only
+    /// the sort path computes it.
+    pub(crate) fn selectable(self) -> bool {
+        matches!(self, OrderCode::Median | OrderCode::Maximum)
+    }
+}
+
+/// #288: the device path of an order statistic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OrderPath {
+    /// CUB segmented radix sort of the keys, then a pick.
+    Sort,
+    /// Six prefix-filtered radix histogram passes (`src/cuda/radix_select.h`).
+    Select,
+}
+
+/// #288: rows from which the radix select path is faster than the segmented
+/// sort, measured by `bench_order_select_crossover` (`docs/gpu-backend.md`).
+pub(crate) const ORDER_SELECT_MIN_ROWS: usize = 4096;
+
+/// #288: the measured path for `code` on `n` rows. Below the crossover, and for
+/// a statistic the select path does not compute, the sort path runs.
+pub(crate) fn order_stat_path(code: OrderCode, n: usize) -> OrderPath {
+    if code.selectable() && n >= ORDER_SELECT_MIN_ROWS {
+        OrderPath::Select
+    } else {
+        OrderPath::Sort
+    }
+}
 
 
 /// #293 F1: how a rank or order-statistic score call is split so that one
@@ -2587,15 +2666,17 @@ impl GpuEvaluator {
     /// `Some(None)`, which the caller maps to an inactive trial and the exact
     /// CPU arm, never to a fabricated value.
     ///
-    /// The device predicts in exact `f64` from the resident rows, sorts the
-    /// `u64` bit patterns of `|pred − y|` per segment (CUB
-    /// `DeviceSegmentedRadixSort::SortKeys`, which is stable) and then either
-    /// * `median`: averages the two middle values for even `n` — exactly what
+    /// The device predicts in exact `f64` from the resident rows and keys each
+    /// row by the `u64` bit pattern of `|pred − y|`, then
+    /// * `median`: selects the middle key(s) (the radix select path from
+    ///   [`ORDER_SELECT_MIN_ROWS`], the segmented sort below) and averages the
+    ///   two middle values for even `n` — exactly what
     ///   [`crate::metrics::score_weighted`] reports, bit for bit;
-    /// * `interquartile`: averages the sorted keys at ranks `[⌊n/4⌋, ⌊3n/4⌋)`
+    /// * `interquartile`: sorts the keys and averages ranks `[⌊n/4⌋, ⌊3n/4⌋)`
     ///   (all rows below `n = 4`) with a fixed 256-thread tree reduction, which
     ///   is the configured objective to `f64` rounding (`≤ 1e-12` relative),
-    ///   not bit for bit.
+    ///   not bit for bit. The ladder only compares trials; scoring uses
+    ///   [`OrderCode::InterquartileExact`].
     pub(crate) fn order_stat_score_trials(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
@@ -2606,13 +2687,65 @@ impl GpuEvaluator {
     }
 
     /// [`Self::order_stat_score_trials`] with an explicit wave size in bytes.
-    /// Every segment is sorted on its own, so the split cannot change a value.
+    /// Every segment is computed on its own, so the split cannot change a value.
     pub(crate) fn order_stat_score_trials_capped(
         &mut self,
         plans: &[&crate::fit::GpuFitPlan],
         trials: &[Vec<Vec<f64>>],
         want: crate::fit::OrderStat,
         wave_bytes: u64,
+    ) -> Option<Vec<Vec<Option<f64>>>> {
+        self.order_code_score(plans, trials, OrderCode::for_fit(want), wave_bytes)
+    }
+
+    /// #288: `code` on the measured path ([`order_stat_path`]), with the sort
+    /// path as the fallback. Both paths return the same bits for every
+    /// statistic the select path computes, so the choice is invisible to the
+    /// caller.
+    pub(crate) fn order_code_score(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        code: OrderCode,
+        wave_bytes: u64,
+    ) -> Option<Vec<Vec<Option<f64>>>> {
+        let path = order_stat_path(code, self.n_rows as usize);
+        self.order_code_score_on(plans, trials, code, path, wave_bytes)
+    }
+
+    /// #288: [`Self::order_code_score`] on a given first path. A select call
+    /// that fails as a whole (allocation, launch, an internal rank check, a
+    /// statistic it does not compute) is re-run on the sort path with the sort
+    /// path's own wave shape.
+    pub(crate) fn order_code_score_on(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        code: OrderCode,
+        path: OrderPath,
+        wave_bytes: u64,
+    ) -> Option<Vec<Vec<Option<f64>>>> {
+        if path == OrderPath::Select {
+            if let Some(out) =
+                self.order_code_trials(plans, trials, code, OrderPath::Select, wave_bytes, 0)
+            {
+                return Some(out);
+            }
+        }
+        self.order_code_trials(plans, trials, code, OrderPath::Sort, wave_bytes, 0)
+    }
+
+    /// #226/#232/#288: one order statistic on one device path, split into
+    /// waves of at most `wave_bytes`. `blocks_per_seg` is the select path's
+    /// launch shape (`0` = production); the sort path ignores it.
+    pub(crate) fn order_code_trials(
+        &mut self,
+        plans: &[&crate::fit::GpuFitPlan],
+        trials: &[Vec<Vec<f64>>],
+        code: OrderCode,
+        path: OrderPath,
+        wave_bytes: u64,
+        blocks_per_seg: i32,
     ) -> Option<Vec<Vec<Option<f64>>>> {
         let nsets = plans.len();
         if nsets == 0 || trials.len() != nsets {
@@ -2633,7 +2766,11 @@ impl GpuEvaluator {
             return None;
         }
         let kmax = plans.iter().map(|p| p.nconst).max()?;
-        let (wave_sets, chunk) = wave_shape(n, ntrials, wave_bytes, ORDER_ROW_BYTES);
+        let row_bytes = match path {
+            OrderPath::Sort => ORDER_ROW_BYTES,
+            OrderPath::Select => SELECT_ROW_BYTES,
+        };
+        let (wave_sets, chunk) = wave_shape(n, ntrials, wave_bytes, row_bytes);
         let mut out: Vec<Vec<Option<f64>>> = vec![vec![None; ntrials]; nsets];
         let mut start = 0usize;
         while start < nsets {
@@ -2666,19 +2803,35 @@ impl GpuEvaluator {
                 let mut values = vec![f64::NAN; nsegs];
                 let mut status = vec![0i32; nsegs];
                 let ms = unsafe {
-                    rc_order_stat_score_batch(
-                        self.ctx,
-                        words.as_ptr(),
-                        off.as_ptr(),
-                        pcount.as_ptr(),
-                        (end - start) as i32,
-                        width as i32,
-                        kmax as i32,
-                        c0.as_ptr(),
-                        want.device_code(),
-                        values.as_mut_ptr(),
-                        status.as_mut_ptr(),
-                    )
+                    match path {
+                        OrderPath::Sort => rc_order_stat_score_batch(
+                            self.ctx,
+                            words.as_ptr(),
+                            off.as_ptr(),
+                            pcount.as_ptr(),
+                            (end - start) as i32,
+                            width as i32,
+                            kmax as i32,
+                            c0.as_ptr(),
+                            code as i32,
+                            values.as_mut_ptr(),
+                            status.as_mut_ptr(),
+                        ),
+                        OrderPath::Select => rc_order_stat_select_batch(
+                            self.ctx,
+                            words.as_ptr(),
+                            off.as_ptr(),
+                            pcount.as_ptr(),
+                            (end - start) as i32,
+                            width as i32,
+                            kmax as i32,
+                            c0.as_ptr(),
+                            code as i32,
+                            blocks_per_seg,
+                            values.as_mut_ptr(),
+                            status.as_mut_ptr(),
+                        ),
+                    }
                 };
                 if ms < 0.0 {
                     return None;
@@ -2976,8 +3129,10 @@ impl GpuEvaluator {
     /// constant values in slot order. The device predicts every row in exact
     /// `f64`, then computes the configured statistic:
     ///
-    /// * `Median` / `Interquartile`: the exact order statistic of `|r|` used by
-    ///   the fit arms (#226/#232);
+    /// * `Median`: the exact middle order statistic of `|r|`, on the radix
+    ///   select path from [`ORDER_SELECT_MIN_ROWS`] and the sort path below;
+    /// * `Interquartile`: the exact window mean of `|r|` on the sort path,
+    ///   added in ascending order like the CPU, so bit for bit;
     /// * `Maximum`: the exact order-free `max |r|` scan (#227);
     /// * `RankCorrelation` / `RankCorrelationSigned`: the exact integer rank
     ///   sums of #230 mapped to `1 − |ρ|` / `1 − ρ`;
@@ -3011,11 +3166,18 @@ impl GpuEvaluator {
             Some(v.into_iter().map(|mut t| t.drain(..).next().flatten()).collect())
         };
         match stat {
-            ScoreStat::Median | ScoreStat::Interquartile => {
-                let want = crate::fit::OrderStat::for_metric(stat.metric())
-                    .expect("an order statistic maps to an OrderStat");
-                per_set(self.order_stat_score_trials(plans, &trials, want)?)
-            }
+            ScoreStat::Median => per_set(self.order_code_score(
+                plans,
+                &trials,
+                OrderCode::Median,
+                Self::MEDIAN_WAVE_BYTES,
+            )?),
+            ScoreStat::Interquartile => per_set(self.order_code_score(
+                plans,
+                &trials,
+                OrderCode::InterquartileExact,
+                Self::MEDIAN_WAVE_BYTES,
+            )?),
             ScoreStat::Maximum => {
                 let raw = self.max_score_trials(plans, &trials)?;
                 if raw.len() != plans.len() {
@@ -7124,7 +7286,10 @@ mod rank_tests {
             let p = plan(&t);
             let pred = cpu_pred(&f, &t);
             let constants = vec![p.c0.clone()];
-            for stat in [ScoreStat::Median, ScoreStat::Maximum] {
+            // The interquartile mean is scored by adding the window in
+            // ascending order, the CPU's own left-to-right sum, so it is bit
+            // for bit like the single order statistics.
+            for stat in [ScoreStat::Median, ScoreStat::Interquartile, ScoreStat::Maximum] {
                 let got = ev
                     .score_stat_batch(&[&p], &constants, stat)
                     .expect("device stat call")[0]
@@ -7137,19 +7302,6 @@ mod rank_tests {
                     stat.name()
                 );
             }
-            // The interquartile mean is T2: a fixed 256-thread tree reduction
-            // against the CPU's left-to-right mean, so it agrees to f64
-            // rounding rather than bit for bit (the fit arm's documented
-            // contract, 1e-12 relative).
-            let got = ev
-                .score_stat_batch(&[&p], &constants, ScoreStat::Interquartile)
-                .expect("device stat call")[0]
-                .expect("a finite segment");
-            let want = crate::metrics::score(&pred, &f.y, Metric::Interquartile);
-            assert!(
-                (got - want).abs() <= 1e-12 * want.abs().max(1.0),
-                "interquartile differs: {got} vs {want}"
-            );
             for (stat, signed) in [
                 (ScoreStat::RankCorrelation, false),
                 (ScoreStat::RankCorrelationSigned, true),
@@ -9480,3 +9632,7 @@ mod carry_tests {
         assert_eq!(steady.refused, 0);
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_order_select_tests.rs"]
+mod order_select_tests;

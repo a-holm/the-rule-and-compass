@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "radix_select.h"
 #include <cub/cub.cuh>
 #include <math_constants.h>
 #include <math.h>
@@ -5108,10 +5109,30 @@ __device__ __forceinline__ double md_key_value(unsigned long long k)
     return a;
 }
 
-/* One key per row of every `(candidate, trial)` segment: the bit pattern of
- * `|pred − y|` in exact f64. `status[seg] = 2` marks a segment with a
- * non-finite prediction or residual, which the caller reads as `non_finite`
- * and hands to the exact CPU arm (the landed #169 guard, never a silent 1e30). */
+/* The key of one row: the bit pattern of `|pred − y|` in exact f64, or the
+ * all-ones sentinel and a non-zero return for a non-finite prediction or
+ * residual (the landed #169 guard, never a silent 1e30). The sort and the
+ * select path both call this, so they admit exactly the same rows. */
+__device__ __forceinline__ int md_row_key(const unsigned int *nd, int m, const double *c,
+                                          const double *__restrict__ cols,
+                                          const double *__restrict__ y, int n, int row,
+                                          unsigned long long *key)
+{
+    double v[FT_MAX_NODES];
+    ft_forward_d(nd, m, cols, n, row, c, v);
+    const double pred = v[m - 1];
+    const double r = pred - y[row];
+    if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
+        *key = 0xFFFFFFFFFFFFFFFFULL;
+        return 1;
+    }
+    *key = md_abs_key(r);
+    return 0;
+}
+
+/* One key per row of every `(candidate, trial)` segment. `status[seg] = 2`
+ * marks a segment with a non-finite prediction or residual, which the caller
+ * reads as `non_finite` and hands to the exact CPU arm. */
 __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
                               const unsigned int *__restrict__ off,
                               const double *__restrict__ c0, int kmax,
@@ -5133,16 +5154,77 @@ __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
         const unsigned int *nd = prog + off[cand];
         const int m = (int)((off[cand + 1] - off[cand]) / 4u);
         const double *c = c0 + (size_t)seg * (size_t)kmax;
-        double v[FT_MAX_NODES];
-        ft_forward_d(nd, m, cols, n, row, c, v);
-        const double pred = v[m - 1];
-        const double r = pred - y[row];
-        if (!isfinite(pred) || fabs(pred) > 1e30 || !isfinite(r)) {
-            keys[i] = 0xFFFFFFFFFFFFFFFFULL;
+        if (md_row_key(nd, m, c, cols, y, n, row, &keys[i])) {
             status[seg] = 2; /* non-finite row: the caller falls back */
-        } else {
-            keys[i] = md_abs_key(r);
         }
+    }
+}
+
+/* #288: the select path's key producer, fused with radix pass 0. Grid
+ * `(segments, blocks per segment)`. Every row's key is written exactly as
+ * `k_order_stat_keys` writes it, and the top digit of every finite key is
+ * counted into query 0 of the segment's pass-0 histogram. */
+__global__ void k_order_stat_select_keys(const unsigned int *__restrict__ prog,
+                                         const unsigned int *__restrict__ off,
+                                         const double *__restrict__ c0, int kmax,
+                                         const double *__restrict__ cols,
+                                         const double *__restrict__ y, int n, int ns,
+                                         int ntrials,
+                                         unsigned long long *__restrict__ keys,
+                                         int *__restrict__ status,
+                                         unsigned int *__restrict__ hist)
+{
+    __shared__ unsigned int bins[RS_BINS];
+    const int seg = blockIdx.x;
+    if (seg >= ns) return;
+    for (int b = threadIdx.x; b < RS_BINS; b += blockDim.x) bins[b] = 0u;
+    __syncthreads();
+    const int cand = seg / ntrials;
+    const unsigned int *nd = prog + off[cand];
+    const int m = (int)((off[cand + 1] - off[cand]) / 4u);
+    const double *c = c0 + (size_t)seg * (size_t)kmax;
+    unsigned long long *ks = keys + (size_t)seg * (size_t)n;
+    const int shift = rs_shift(0);
+    int bad = 0;
+    const long long stride = (long long)gridDim.y * blockDim.x;
+    for (long long base = (long long)blockIdx.y * blockDim.x; base < n; base += stride) {
+        const long long row = base + threadIdx.x;
+        unsigned int d = RS_NO_DIGIT;
+        if (row < n) {
+            unsigned long long key;
+            if (md_row_key(nd, m, c, cols, y, n, (int)row, &key)) {
+                bad = 1;
+            } else {
+                d = (unsigned int)(key >> shift);
+            }
+            ks[row] = key;
+        }
+        rs_count(bins, d);
+    }
+    if (bad) status[seg] = 2;
+    __syncthreads();
+    rs_flush(bins, 1, hist + (size_t)seg * RS_MAX_QUERIES * RS_BINS);
+}
+
+/* #288: the statistic from the selected keys. `q == 1`: the one selected
+ * value (odd median, maximum). `q == 2`: the two middles of an even median,
+ * combined with the expression `metrics::median_abs` uses. */
+__global__ void k_order_stat_select_final(const unsigned long long *__restrict__ prefix,
+                                          int ns, int q,
+                                          const int *__restrict__ status,
+                                          double *__restrict__ out)
+{
+    const int seg = blockIdx.x * blockDim.x + threadIdx.x;
+    if (seg >= ns) return;
+    if (status[seg] != 0) {
+        out[seg] = CUDART_NAN;
+        return;
+    }
+    const double a = md_key_value(prefix[(size_t)seg * RS_MAX_QUERIES]);
+    if (q == 1) {
+        out[seg] = a;
+    } else {
+        out[seg] = 0.5 * (a + md_key_value(prefix[(size_t)seg * RS_MAX_QUERIES + 1]));
     }
 }
 
@@ -5150,6 +5232,16 @@ __global__ void k_order_stat_keys(const unsigned int *__restrict__ prog,
  * interquartile window sum is a tree reduction, and a fixed width is what makes
  * that reduction's rounding order (hence its value) reproducible. */
 #define RC_OS_PICK_THREADS 256
+
+/* #288: the `what` codes of `rc_order_stat_score_batch` and
+ * `rc_order_stat_select_batch`. Keep in sync with `gpu::OrderCode`. */
+#define RC_OS_MEDIAN 0
+#define RC_OS_IQR_TREE 1
+#define RC_OS_IQR_EXACT 2
+#define RC_OS_MAXIMUM 3
+
+/* Sorted keys staged per tile of the exact interquartile sum. */
+#define RC_OS_SUM_TILE (RC_OS_PICK_THREADS * 8)
 
 /* The rank window `[lo, hi)` that `metrics::interquartile_mean_abs` averages:
  * `lo = n/4`, `hi = (3n)/4` for `n >= 4`. Below four rows the CPU arm has no
@@ -5163,7 +5255,7 @@ __device__ __forceinline__ void md_iqr_window(int n, int *lo, int *hi)
         return;
     }
     *lo = n / 4;
-    *hi = (3 * n) / 4;
+    *hi = (int)((3LL * n) / 4);
 }
 
 /* Turn one sorted segment into its order statistic. `what` 0 is the median,
@@ -5184,6 +5276,12 @@ __device__ __forceinline__ void md_iqr_window(int n, int *lo, int *hi)
  *
  * Ties need no tie-break in either case: both statistics are functions of the
  * multiset `{|r_i|}`, so equal keys cannot change the value.
+ *
+ * #288 `RC_OS_IQR_EXACT` is the scoring definition of the interquartile mean:
+ * one thread adds the window in ascending order, exactly the CPU's
+ * left-to-right `iter().sum()`, so it is bit-identical. The block only stages
+ * tiles of the sorted keys through shared memory. `RC_OS_MAXIMUM` is the last
+ * sorted key.
  */
 __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
                                   int n, int ns, int what,
@@ -5191,6 +5289,7 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
                                   int *__restrict__ status)
 {
     __shared__ double part[RC_OS_PICK_THREADS];
+    __shared__ double tile[RC_OS_SUM_TILE];
     const int seg = blockIdx.x;
     const int tid = threadIdx.x;
     if (seg >= ns) return;
@@ -5202,7 +5301,7 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         return;
     }
     const unsigned long long *k = keys + (size_t)seg * (size_t)n;
-    if (what == 0) {
+    if (what == RC_OS_MEDIAN) {
         if (tid != 0) return;
         if (n & 1) {
             out[seg] = md_key_value(k[n / 2]);
@@ -5211,8 +5310,26 @@ __global__ void k_order_stat_pick(const unsigned long long *__restrict__ keys,
         }
         return;
     }
+    if (what == RC_OS_MAXIMUM) {
+        if (tid == 0) out[seg] = md_key_value(k[n - 1]);
+        return;
+    }
     int lo, hi;
     md_iqr_window(n, &lo, &hi);
+    if (what == RC_OS_IQR_EXACT) {
+        double acc = 0.0;
+        for (int base = lo; base < hi; base += RC_OS_SUM_TILE) {
+            const int cnt = (hi - base) < RC_OS_SUM_TILE ? (hi - base) : RC_OS_SUM_TILE;
+            for (int i = tid; i < cnt; i += RC_OS_PICK_THREADS) tile[i] = md_key_value(k[base + i]);
+            __syncthreads();
+            if (tid == 0) {
+                for (int i = 0; i < cnt; ++i) acc += tile[i];
+            }
+            __syncthreads();
+        }
+        if (tid == 0) out[seg] = acc / (double)(hi - lo);
+        return;
+    }
     double s = 0.0;
     for (int i = lo + tid; i < hi; i += RC_OS_PICK_THREADS) s += md_key_value(k[i]);
     part[tid] = s;
@@ -5451,8 +5568,9 @@ float rc_max_scan_batch(void *ctx,
     return ms;
 }
 
-/* Exact median (what = 0) or interquartile mean of the absolute errors
- * (what = 1) of `nsets * ntrials` prediction vectors.
+/* Exact median (`RC_OS_MEDIAN`), interquartile mean of the absolute errors
+ * (`RC_OS_IQR_TREE` for the fit ladder, `RC_OS_IQR_EXACT` for scoring) or
+ * maximum (`RC_OS_MAXIMUM`) of `nsets * ntrials` prediction vectors.
  *
  * Constants are `c0[(seg * kmax) + slot]` with `seg = set * ntrials + trial`,
  * the same layout `rc_fit_batch`/`rc_rank_score_batch` use. `out_value`
@@ -5481,7 +5599,7 @@ float rc_order_stat_score_batch(void *ctx,
 {
     RcCtx *c = (RcCtx *)ctx;
     if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
-    if (what != 0 && what != 1) return -1.0f;
+    if (what < RC_OS_MEDIAN || what > RC_OS_MAXIMUM) return -1.0f;
     if (c->n <= 0) return -1.0f;
     const int nsegs = nsets * ntrials;
     const long long total = (long long)nsegs * (long long)c->n;
@@ -5568,6 +5686,140 @@ float rc_order_stat_score_batch(void *ctx,
     if (rc_fs_finish(c) != 0) return -1.0f;
     memcpy(out_value, host + o_val, sizeof(double) * (size_t)nsegs);
     memcpy(out_status, host + o_status, sizeof(int) * (size_t)nsegs);
+    rc_fs_ok(c, RC_FS_ORDER);
+    float ms = -1.0f;
+    cudaEventElapsedTime(&ms, c->t0, c->t1);
+    return ms;
+}
+
+/* #288: the radix select path of `rc_order_stat_score_batch` for the
+ * statistics that are one or two order statistics: `RC_OS_MEDIAN` (ranks
+ * `n/2`, or `n/2 - 1` and `n/2` for even `n`) and `RC_OS_MAXIMUM` (rank
+ * `n - 1`). Same inputs, outputs and status labels; the value is the same bits
+ * as the sort path because the selected keys are the sorted keys at those
+ * ranks.
+ *
+ * Work per call: the fused key and pass-0 kernel, then for each of the six
+ * digits a pick and (after the first) a prefix-filtered histogram, then the
+ * final combination. The device region holds one key per row, two
+ * `RS_BINS` histograms and two prefix/rank slots per segment: no sorted copy
+ * and no CUB workspace.
+ *
+ * `blocks_per_seg <= 0` picks the production shape; a positive value forces
+ * it, which is how the tests show the value does not depend on the partition.
+ * Returns the stage time in ms, or a negative value when nothing may be trusted
+ * (including an internal rank check, status 3), so the caller can run the sort
+ * path instead. */
+float rc_order_stat_select_batch(void *ctx,
+                                 const unsigned int *prog,
+                                 const unsigned int *off,
+                                 const int *pcount,
+                                 int nsets,
+                                 int ntrials,
+                                 int kmax,
+                                 const double *c0,
+                                 int what,
+                                 int blocks_per_seg,
+                                 double *out_value,
+                                 int *out_status)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || c->tiled || nsets <= 0 || ntrials <= 0 || kmax <= 0) return -1.0f;
+    if (what != RC_OS_MEDIAN && what != RC_OS_MAXIMUM) return -1.0f;
+    if (c->n <= 0) return -1.0f;
+    const int n = c->n;
+    const int nsegs = nsets * ntrials;
+    const long long total = (long long)nsegs * (long long)n;
+    if (total <= 0 || total > 0x7FFFFFFFLL) return -1.0f;
+    int q = 1;
+    unsigned int r0 = 0u, r1 = 0u;
+    if (what == RC_OS_MAXIMUM) {
+        r0 = (unsigned int)(n - 1);
+    } else if (n & 1) {
+        r0 = (unsigned int)(n / 2);
+    } else {
+        q = 2;
+        r0 = (unsigned int)(n / 2 - 1);
+        r1 = (unsigned int)(n / 2);
+    }
+    int bx = blocks_per_seg > 0 ? blocks_per_seg : rs_blocks_per_segment(n);
+    if (bx > RS_MAX_BLOCKS_PER_SEG) bx = RS_MAX_BLOCKS_PER_SEG;
+    const size_t prog_words = (size_t)off[nsets];
+    const size_t c0_bytes = sizeof(double) * (size_t)nsegs * (size_t)kmax;
+    const size_t hist_words = (size_t)nsegs * RS_MAX_QUERIES * RS_BINS;
+    /* [ prog | off | pcount | c0 ] then [ value | status ] then the keys, the
+       histograms and the per-query prefix and residual rank. */
+    size_t cur = 0;
+    const size_t o_prog = rc_fs_take(&cur, sizeof(unsigned int) * prog_words);
+    const size_t o_off = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)(nsets + 1));
+    const size_t o_p = rc_fs_take(&cur, sizeof(int) * (size_t)nsets);
+    const size_t o_c0 = rc_fs_take(&cur, c0_bytes);
+    const size_t in_end = rc_fs_take(&cur, 0);
+    const size_t o_val = rc_fs_take(&cur, sizeof(double) * (size_t)nsegs);
+    const size_t o_status = rc_fs_take(&cur, sizeof(int) * (size_t)nsegs);
+    const size_t io_end = rc_fs_take(&cur, 0);
+    const size_t o_keys = rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)total);
+    const size_t o_hist = rc_fs_take(&cur, sizeof(unsigned int) * hist_words);
+    const size_t o_prefix =
+        rc_fs_take(&cur, sizeof(unsigned long long) * (size_t)nsegs * RS_MAX_QUERIES);
+    const size_t o_rank = rc_fs_take(&cur, sizeof(unsigned int) * (size_t)nsegs * RS_MAX_QUERIES);
+    if (rc_fs_reserve(c, RC_FS_ORDER, cur, io_end) != 0) return -1.0f;
+    rc_fs_begin(c);
+    if (rc_fs_f64_twins(c) != 0) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    unsigned char *base = c->fs_dev;
+    unsigned char *host = c->fs_host;
+    memcpy(host + o_prog, prog, sizeof(unsigned int) * prog_words);
+    memcpy(host + o_off, off, sizeof(unsigned int) * (size_t)(nsets + 1));
+    memcpy(host + o_p, pcount, sizeof(int) * (size_t)nsets);
+    memcpy(host + o_c0, c0, c0_bytes);
+    rc_fs_h2d(c, base, host, in_end);
+    cudaMemsetAsync(base + o_status, 0, sizeof(int) * (size_t)nsegs, c->s_fit);
+    cudaMemsetAsync(base + o_hist, 0, sizeof(unsigned int) * hist_words, c->s_fit);
+    int *d_status = (int *)(base + o_status);
+    unsigned long long *d_keys = (unsigned long long *)(base + o_keys);
+    unsigned int *d_hist = (unsigned int *)(base + o_hist);
+    unsigned long long *d_prefix = (unsigned long long *)(base + o_prefix);
+    unsigned int *d_rank = (unsigned int *)(base + o_rank);
+    const dim3 grid((unsigned int)nsegs, (unsigned int)bx);
+    cudaEventRecord(c->t0, c->s_fit);
+    k_order_stat_select_keys<<<grid, RS_THREADS, 0, c->s_fit>>>(
+        (const unsigned int *)(base + o_prog), (const unsigned int *)(base + o_off),
+        (const double *)(base + o_c0), kmax, c->d_cols64, c->d_y64, n, nsegs, ntrials, d_keys,
+        d_status, d_hist);
+    int ok = cudaGetLastError() == cudaSuccess;
+    for (int pass = 0; ok && pass < RS_PASSES; ++pass) {
+        if (pass > 0) {
+            rs_hist_kernel<<<grid, RS_THREADS, 0, c->s_fit>>>(d_keys, n, nsegs, q, pass, d_status,
+                                                             d_prefix, d_hist);
+            ok = cudaGetLastError() == cudaSuccess;
+            if (!ok) break;
+        }
+        rs_pick_kernel<<<nsegs, RS_THREADS, 0, c->s_fit>>>(d_hist, nsegs, q, pass, r0, r1, d_prefix,
+                                                          d_rank, d_status);
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    if (ok) {
+        const int fb = (nsegs + 255) / 256;
+        k_order_stat_select_final<<<fb, 256, 0, c->s_fit>>>(d_prefix, nsegs, q, d_status,
+                                                            (double *)(base + o_val));
+        ok = cudaGetLastError() == cudaSuccess;
+    }
+    cudaEventRecord(c->t1, c->s_fit);
+    if (!ok) {
+        rc_fs_drain(c);
+        return -1.0f;
+    }
+    rc_fs_d2h(c, host + in_end, base + in_end, io_end - in_end);
+    if (rc_fs_finish(c) != 0) return -1.0f;
+    const int *h_status = (const int *)(host + o_status);
+    for (int s = 0; s < nsegs; ++s) {
+        if (h_status[s] != 0 && h_status[s] != 2) return -1.0f;
+    }
+    memcpy(out_value, host + o_val, sizeof(double) * (size_t)nsegs);
+    memcpy(out_status, h_status, sizeof(int) * (size_t)nsegs);
     rc_fs_ok(c, RC_FS_ORDER);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
