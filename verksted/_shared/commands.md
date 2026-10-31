@@ -12,7 +12,8 @@ BASE=integration/gpu-hardening              # or main
 W=$WT/issue-$N-$SLUG                        # this ticket's worktree
 RUN=$W                                      # checkout that holds this run's output/ files
 V=$RUN/verksted
-L=/mnt/lager/tmp/opencode/one-full-suite.sh
+B=/mnt/lager/tmp/opencode/build-slot.sh   # builds: 3 concurrent, nice 19, MemAvailable >= 8 GiB
+L=/mnt/lager/tmp/opencode/one-full-suite.sh  # tests and benchmarks: one at a time
 G=/mnt/lager/tmp/eureqa-gates               # logs: $G/issue$N-<what>.log
 PAUSE=/mnt/lager/tmp/opencode/PAUSE
 ```
@@ -38,9 +39,10 @@ git -C "$ROOT" worktree list
 
 New tickets branch from the integration branch, not from `main`. Do not set `CARGO_TARGET_DIR`: each worktree keeps its own `my-version/target/`.
 
-## Build and test (always through the lock)
+## Build (build slot) and test (test lock)
 
 ```sh
+$B bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 timeout 1500 cargo test --release --no-run --test <file>" > "$G/issue$N-build.log" 2>&1
 $L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 timeout 580 cargo test --release --test <file> <filter>" > "$G/issue$N-<what>.log" 2>&1
 $L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=sm_86 timeout 580 cargo test --release --features cuda --test <file> <filter>" > "$G/issue$N-<what>.log" 2>&1
 ps -eo pcpu,args | grep -E 'cargo|rustc'          # look first: one cargo at a time
@@ -119,7 +121,7 @@ git ls-files '*.py'                                                             
 
 ```sh
 $L bash -c "cd $W/my-version && CARGO_BUILD_JOBS=2 RCSR_CUDA_ARCH=sm_86 timeout 580 cargo test --release --features cuda --no-run" > "$G/issue$N-build.log" 2>&1
-$L bash -c "cd $W/my-version && timeout 580 compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99 target/release/deps/<test>-<hash> <filter> --nocapture" > "$G/issue$N-memcheck.log" 2>&1   # exit 0 before any plain GPU run
+$L bash -c "cd $W/my-version && timeout 580 /usr/local/cuda-13.0/bin/compute-sanitizer --tool memcheck --leak-check no --error-exitcode 99 target/release/deps/<test>-<hash> <filter> --nocapture" > "$G/issue$N-memcheck.log" 2>&1   # exit 0 before any plain GPU run
 journalctl -k --since "<start>" | grep -i xid   # must print nothing
 ```
 

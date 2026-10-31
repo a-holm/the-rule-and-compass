@@ -21,6 +21,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <cub/cub.cuh>
 #include <math_constants.h>
 #include <math.h>
@@ -368,10 +369,10 @@ static int rc_dev_alloc_kind(RcCtx *c, const char *tag, void **p, size_t bytes, 
     }
     int rc;
 #ifdef RCSR_UNIFIED
-    rc = managed ? (int)cudaMallocManaged(p, bytes, cudaMemAttachGlobal) : (int)cudaMalloc(p, bytes);
+    rc = managed ? (int)rc_checked_malloc_managed(p, bytes) : (int)rc_checked_malloc(p, bytes);
 #else
     (void)managed;
-    rc = (int)cudaMalloc(p, bytes);
+    rc = (int)rc_checked_malloc(p, bytes);
 #endif
     if (rc != 0) {
         g_alloc_fail_bytes = bytes;

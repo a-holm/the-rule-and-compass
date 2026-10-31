@@ -32,6 +32,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -108,9 +109,9 @@ static double rc_now_ms(void)
 static int rc_alloc(void **p, size_t bytes)
 {
 #ifdef RCSR_UNIFIED
-    return cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+    return (int)rc_checked_malloc_managed(p, bytes);
 #else
-    return cudaMalloc(p, bytes);
+    return (int)rc_checked_malloc(p, bytes);
 #endif
 }
 
@@ -923,11 +924,16 @@ static int feat_ensure(RcEnrich *c, int planes)
     if (c->feat_cap >= planes && c->d_feat) return 0;
     if (c->d_feat) {
         cudaFree(c->d_feat);
+        rc_budget_give((size_t)c->feat_cap * (size_t)c->n * sizeof(double));
         c->d_feat = NULL;
         c->feat_cap = 0;
     }
     size_t bytes = (size_t)planes * (size_t)c->n * sizeof(double);
-    if (rc_alloc((void **)&c->d_feat, bytes) != 0) return -1;
+    if (rc_budget_take(bytes) != 0) return -1;
+    if (rc_alloc((void **)&c->d_feat, bytes) != 0) {
+        rc_budget_give(bytes);
+        return -1;
+    }
     c->feat_cap = planes;
     return 0;
 }

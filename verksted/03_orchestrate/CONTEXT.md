@@ -21,7 +21,7 @@ Do NOT load: the ticket pipelines' stages, earlier runs' `output/`, the rest of 
 
 ## Process
 
-1. `stages/01_wave_plan/`: pick file-disjoint tickets, at most 3, at most 10 agents.
+1. `stages/01_wave_plan/`: pick file-disjoint tickets, at most 10 agents, at most 3 tickets using the machine (lock waiters do not count).
 2. `stages/02_brief/`: one brief per ticket from the template.
 3. `stages/03_dispatch/`: dispatch with the model set explicitly, record agent ids.
 4. `stages/04_watchdog/`: one background watcher, alert after 45 minutes of silence.

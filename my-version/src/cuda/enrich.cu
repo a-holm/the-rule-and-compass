@@ -15,6 +15,7 @@
  */
 
 #include <cuda_runtime.h>
+#include "alloc_guard.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,6 +24,9 @@
 #include <time.h>
 
 #include <cub/cub.cuh>
+
+#include <map>
+#include <mutex>
 
 #include "enrich_common.h"
 #include "win_stats.h"
@@ -66,12 +70,38 @@ static double rc_now_ms(void)
     return (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6;
 }
 
+static std::mutex g_budget_mu;
+static size_t g_budget = 0;
+static size_t g_budget_live = 0;
+static std::map<void *, size_t> g_output_bytes;
+
+extern "C" int rc_budget_take(size_t bytes)
+{
+    std::lock_guard<std::mutex> g(g_budget_mu);
+    if (g_budget && g_budget_live + bytes > g_budget) return -1;
+    g_budget_live += bytes;
+    return 0;
+}
+
+extern "C" void rc_budget_give(size_t bytes)
+{
+    std::lock_guard<std::mutex> g(g_budget_mu);
+    g_budget_live = g_budget_live >= bytes ? g_budget_live - bytes : 0;
+}
+
+extern "C" void rc_enrich_set_test_budget(size_t bytes)
+{
+    std::lock_guard<std::mutex> g(g_budget_mu);
+    g_budget = bytes;
+    g_budget_live = 0;
+}
+
 static int rc_alloc(void **p, size_t bytes)
 {
 #ifdef RCSR_UNIFIED
-    return cudaMallocManaged(p, bytes, cudaMemAttachGlobal);
+    return (int)rc_checked_malloc_managed(p, bytes);
 #else
-    return cudaMalloc(p, bytes);
+    return (int)rc_checked_malloc(p, bytes);
 #endif
 }
 
@@ -1123,6 +1153,7 @@ void rc_enrich_destroy(void *v)
 #else
     if (c->h_pinned) cudaFreeHost(c->h_pinned);
 #endif
+    if (c->d_feat) rc_budget_give((size_t)c->feat_cap * (size_t)c->n * sizeof(double));
     cudaFree(c->d_feat);
     rc_xs_free(c);
     free(c);
@@ -1368,7 +1399,7 @@ int rc_enrich_stoch(void *v, int which, double *out)
     double *scratch = NULL;
     if (which == 1) {
         size_t nb = (size_t)c->n + (size_t)c->nseg + 1;
-        if (cudaMalloc((void **)&scratch, 2 * nb * sizeof(double)) != cudaSuccess) {
+        if (rc_checked_malloc((void **)&scratch, 2 * nb * sizeof(double)) != cudaSuccess) {
             return -1;
         }
     }
@@ -2295,13 +2326,31 @@ double *rc_enrich_new_output(void *v)
     RcEnrich *c = (RcEnrich *)v;
     if (!c) return NULL;
     double *p = NULL;
-    if (rc_alloc((void **)&p, (size_t)c->n * sizeof(double)) != 0) return NULL;
+    size_t bytes = (size_t)c->n * sizeof(double);
+    if (rc_budget_take(bytes) != 0) return NULL;
+    if (rc_alloc((void **)&p, bytes) != 0) {
+        rc_budget_give(bytes);
+        return NULL;
+    }
+    std::lock_guard<std::mutex> g(g_budget_mu);
+    g_output_bytes[p] = bytes;
     return p;
 }
 
 void rc_enrich_release_output(double *p)
 {
-    if (p) cudaFree(p);
+    if (!p) return;
+    size_t bytes = 0;
+    {
+        std::lock_guard<std::mutex> g(g_budget_mu);
+        auto it = g_output_bytes.find(p);
+        if (it != g_output_bytes.end()) {
+            bytes = it->second;
+            g_output_bytes.erase(it);
+        }
+    }
+    cudaFree(p);
+    rc_budget_give(bytes);
 }
 
 int rc_enrich_download_ptr(const double *src, double *dst, int n)

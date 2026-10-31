@@ -401,6 +401,75 @@ fn reported_finalists_are_refit_exactly_on_the_cpu() {
     }
 }
 
+/// #287 AC6: for every metric the device scores natively, the reported score of
+/// each finalist after the exact refit is the CPU `score_weighted` of the stored
+/// tree on the same data, bit for bit. Metrics the device refuses are not run.
+#[cfg(feature = "cuda")]
+#[test]
+fn reported_finalists_equal_cpu_score_for_every_native_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let metrics = [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Maximum,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
+    ];
+    for metric in metrics {
+        let objective = rcsr::metrics::native_score_objective(metric)
+            .unwrap_or_else(|| panic!("{metric:?} has no native objective"));
+        let mut train = sample(600, 7);
+        let mut test = sample(100, 8);
+        if objective.is_classification() {
+            for s in [&mut train, &mut test] {
+                for y in s.y.iter_mut() {
+                    *y = if *y > 0.0 { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        let cfg = Config {
+            metric,
+            ..gpu_config(13)
+        };
+        let out = search::run(&cfg, &train, &test);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{metric:?} backend");
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert!(g.fit_refits > 0, "{metric:?}: finalists were refit: {:?}", g);
+        assert_fit_ledger(g);
+        assert!(!out.archive.items.is_empty(), "{metric:?}: empty archive");
+        for s in &out.archive.items {
+            let pred: Vec<f64> = train.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+            let cpu = rcsr::metrics::score_weighted(
+                &pred,
+                &train.y,
+                &train.w,
+                metric,
+                expr::count_constants(&s.tree),
+            );
+            assert_eq!(
+                s.error.to_bits(),
+                cpu.to_bits(),
+                "{metric:?}: archive row is not the exact CPU score: {} vs {}",
+                s.error,
+                cpu
+            );
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn unsupported_trees_fall_back_and_the_kernel_is_not_a_noop() {

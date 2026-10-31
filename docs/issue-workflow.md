@@ -299,12 +299,25 @@ Rules:
 
 * **Never run `cargo build`, `cargo test` or `rcsr-bench` while another one is
   running.** Look first (`ps -eo pcpu,args | grep -E 'cargo|rustc'`), then wait.
-* Run full suites through the shared lock, which queues instead of competing:
+* Builds run in a build slot: up to 3 concurrent machine-wide, at nice 19 and
+  ionice idle, only while MemAvailable is at least 8 GiB and the `PAUSE` file is
+  absent. Builds use the CPU only:
+
+  ```sh
+  /mnt/lager/tmp/opencode/build-slot.sh bash -c \
+    'cd worktrees/issue-<n>-<slug>/my-version && CARGO_BUILD_JOBS=2 cargo test --release --no-run'
+  ```
+
+* Tests and benchmarks keep the single test lock, which queues instead of competing:
 
   ```sh
   /mnt/lager/tmp/opencode/one-full-suite.sh bash -c \
     'cd worktrees/issue-<n>-<slug>/my-version && cargo test --release'
   ```
+
+* Ticket tests are minimal: only the tests a change adds or touches. The one
+  full test (gate plus large-store arms) runs once on the integration branch,
+  after all issues are done.
 
 * **Never point several worktrees at one `CARGO_TARGET_DIR`.** Cargo's
   fingerprints do not distinguish two checkouts of the same crate and version,

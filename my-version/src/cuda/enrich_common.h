@@ -99,4 +99,15 @@ typedef struct RcEnrich {
     double batch_start_ms;
 } RcEnrich;
 
+/* Test-only device byte budget for the allocations made after context
+   creation (tile outputs and fused planes). Zero means unlimited. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+int rc_budget_take(size_t bytes);
+void rc_budget_give(size_t bytes);
+#ifdef __cplusplus
+}
+#endif
+
 #endif /* RCSR_ENRICH_COMMON_H */
