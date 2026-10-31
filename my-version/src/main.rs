@@ -522,7 +522,13 @@ SEARCH:
                              a softplus trial objective (#234; the device
                              proposes constants and the exact CPU f64 log-loss
                              judges and refits; since #289 the search also
-                             scores log_loss natively on the device), or — for
+                             scores log_loss natively on the device), the exact correlation
+                             objective 1-|rho| or 1-rho with a frozen affine
+                             gauge (correlation_signed refines both gauge
+                             orientations; a tree affine in every constant takes
+                             the CPU least-squares closed form, labelled
+                             affine_closed_form; every proposal passes the
+                             exact f64 gate), or - for
                              rank_correlation / rank_correlation_signed — the
                              exact integer rank polish after a squared LM start
                              (#230), with rank_correlation_signed scored as
@@ -547,7 +553,8 @@ SEARCH:
                              The device refuses any other metric instead of
                              substituting an objective: use
                              `--metric squared`, `--metric log_squashed`,
-                             `--metric absolute`, `--metric log_loss`, a rank
+                             `--metric absolute`, `--metric log_loss`, `--metric
+                             correlation`, `--metric correlation_signed`, a rank
                              metric, `--metric median`, `--metric
                              interquartile`, `--metric maximum`, or a CPU
                              strategy. `--metric signed` keeps the exact CPU

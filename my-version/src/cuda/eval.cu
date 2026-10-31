@@ -2833,118 +2833,153 @@ __global__ void fit_kernel(const float *__restrict__ cols,
             if (go >= 0 && go < p) S->sc[go] = 0.0;
         }
         __syncthreads();
-        int status = 0;
+        /* Signed correlation has a genuine orientation: the scale slot of the
+           frozen gauge is the only sign that moves. Both orientations are
+           refined from the same entry constants and the better endpoint is
+           kept; a tie keeps the incoming one. iters == 0 never flips. */
+        const bool flip = iters > 0 && metric == RC_LOSS_CORRELATION_SIGNED && g[0] >= 0 &&
+                          g[0] < p;
+        const int passes = flip ? 2 : 1;
+        const double entry = (tid < p) ? S->sc[tid] : 0.0;
+        double kept = entry;
+        double overall = 1.0;
         double best = 1.0;
-        if (iters > 0) {
-            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
-                                          S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
-                                          &S->sbest, &S->srho, &S->sbad, metric);
-            if (tid == 0) S->sstart = S->sbad ? 0 : 1;
-            if (S->sbad) {
-                status = 2;
-            } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
-                best = 1.0;
-            } else if (S->svar < 1e-24 * S->syy) {
-                status = 1;
-            } else {
-                best = S->sbest;
-                double lambda = 1e-3;
-                int assembled = 1;
-                for (int it = 0; it < iters && status == 0; ++it) {
-                    if (!assembled) {
-                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
-                                                      S->sr, S->sjtj, S->sjtr, S->scorr,
-                                                      &S->svar, &S->syy, &S->sbest, &S->srho,
-                                                      &S->sbad, metric);
-                        assembled = 1;
-                        if (S->sbad) {
-                            status = 2;
-                            break;
-                        }
-                        if (S->svar < 1e-24 * S->syy) {
-                            status = 1;
-                            break;
-                        }
-                    }
-                    if (tid == 0) {
-                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
-                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
-                                                         S->sL, 0);
-                        S->ssolved = (solve != 1);
-                        if (solve == 4) S->srank = 1;
-                    }
-                    __syncthreads();
-                    if (!S->ssolved) {
-                        status = 1;
-                        break;
-                    }
-                    if (tid < p) {
-                        double t = S->sc[tid] + S->sdelta[tid];
-                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
-                    }
-                    __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
-                                                        S->sred, metric);
-                    if (trial < best) {
-                        if (tid < p) S->sc[tid] = S->strial[tid];
-                        best = trial;
-                        lambda = fmax(lambda / 8.0, 1e-12);
-                        assembled = 0;
-                        if (tid == 0) S->simproved = 1;
-                        if (best <= 0.0) break;
-                    } else {
-                        lambda *= 6.0;
-                        if (lambda > 1e9) break;
-                    }
-                    __syncthreads();
+        int status = 0;
+        for (int pass = 0; pass < passes; ++pass) {
+            if (pass == 1) {
+                if (tid < p) S->sc[tid] = entry;
+                if (tid == 0) {
+                    S->sbad = 0;
+                    S->srank = 0;
+                    S->simproved = 0;
+                    S->sstart = 0;
                 }
-                for (int it = 0; it < 4 && status == 0 && best > 0.0; ++it) {
-                    ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
-                                                  S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
-                                                  &S->sbest, &S->srho, &S->sbad, metric);
-                    if (S->sbad) {
-                        status = 2;
-                        break;
-                    }
-                    if (tid == 0) {
-                        ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
-                        const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
-                                                         S->sL, 0);
-                        S->ssolved = (solve != 1);
-                        if (solve == 4) S->srank = 1;
-                    }
-                    __syncthreads();
-                    if (!S->ssolved) break;
-                    if (tid < p) {
-                        double t = S->sc[tid] + S->sdelta[tid];
-                        S->strial[tid] = fmin(1e6, fmax(-1e6, t));
-                    }
-                    __syncthreads();
-                    double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
-                                                        S->sred, metric);
-                    if (trial < best) {
-                        if (tid < p) S->sc[tid] = S->strial[tid];
-                        best = trial;
-                        if (tid == 0) S->simproved = 1;
-                    } else {
-                        break;
-                    }
-                    __syncthreads();
-                }
+                __syncthreads();
+                if (tid == 0) S->sc[g[0]] = -S->sc[g[0]];
+                __syncthreads();
             }
-        } else {
-            best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
-        }
-        __syncthreads();
-        if (tid == 0) {
+            int pass_status = 0;
+            double pass_best = 1.0;
+            if (iters > 0) {
+                ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                              S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                              &S->sbest, &S->srho, &S->sbad, metric);
+                if (tid == 0) S->sstart = S->sbad ? 0 : 1;
+                if (S->sbad) {
+                    pass_status = 2;
+                } else if (!(S->svar > 0.0) || !(S->syy > 0.0)) {
+                    pass_best = 1.0;
+                } else if (S->svar < 1e-24 * S->syy) {
+                    pass_status = 1;
+                } else {
+                    pass_best = S->sbest;
+                    double lambda = 1e-3;
+                    int assembled = 1;
+                    for (int it = 0; it < iters && pass_status == 0; ++it) {
+                        if (!assembled) {
+                            ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg,
+                                                          S->sr, S->sjtj, S->sjtr, S->scorr,
+                                                          &S->svar, &S->syy, &S->sbest, &S->srho,
+                                                          &S->sbad, metric);
+                            assembled = 1;
+                            if (S->sbad) {
+                                pass_status = 2;
+                                break;
+                            }
+                            if (S->svar < 1e-24 * S->syy) {
+                                pass_status = 1;
+                                break;
+                            }
+                        }
+                        if (tid == 0) {
+                            ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                            const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, lambda, p, S->sdelta,
+                                                             S->sL, 0);
+                            S->ssolved = (solve != 1);
+                            if (solve == 4) S->srank = 1;
+                        }
+                        __syncthreads();
+                        if (!S->ssolved) {
+                            pass_status = 1;
+                            break;
+                        }
+                        if (tid < p) {
+                            double t = S->sc[tid] + S->sdelta[tid];
+                            S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                        }
+                        __syncthreads();
+                        double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                            S->sred, metric);
+                        if (trial < pass_best) {
+                            if (tid < p) S->sc[tid] = S->strial[tid];
+                            pass_best = trial;
+                            lambda = fmax(lambda / 8.0, 1e-12);
+                            assembled = 0;
+                            if (tid == 0) S->simproved = 1;
+                            if (pass_best <= 0.0) break;
+                        } else {
+                            lambda *= 6.0;
+                            if (lambda > 1e9) break;
+                        }
+                        __syncthreads();
+                    }
+                    for (int it = 0; it < 4 && pass_status == 0 && pass_best > 0.0; ++it) {
+                        ft_corr_assemble<MAXC, CHUNK>(nd, m, cols, y, w64, n, p, S->sc, S->sg, S->sr,
+                                                      S->sjtj, S->sjtr, S->scorr, &S->svar, &S->syy,
+                                                      &S->sbest, &S->srho, &S->sbad, metric);
+                        if (S->sbad) {
+                            pass_status = 2;
+                            break;
+                        }
+                        if (tid == 0) {
+                            ft_corr_mask_gauge(S->sjtj, S->sjtr, p, S->srho, metric, g);
+                            const int solve = ft_solve<MAXC>(S->sjtj, S->sjtr, 0.0, p, S->sdelta,
+                                                             S->sL, 0);
+                            S->ssolved = (solve != 1);
+                            if (solve == 4) S->srank = 1;
+                        }
+                        __syncthreads();
+                        if (!S->ssolved) break;
+                        if (tid < p) {
+                            double t = S->sc[tid] + S->sdelta[tid];
+                            S->strial[tid] = fmin(1e6, fmax(-1e6, t));
+                        }
+                        __syncthreads();
+                        double trial = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->strial,
+                                                            S->sred, metric);
+                        if (trial < pass_best) {
+                            if (tid < p) S->sc[tid] = S->strial[tid];
+                            pass_best = trial;
+                            if (tid == 0) S->simproved = 1;
+                        } else {
+                            break;
+                        }
+                        __syncthreads();
+                    }
+                }
+            } else {
+                pass_best = ft_corr_score<CHUNK>(nd, m, cols, y, w64, n, S->sc, S->sred, metric);
+            }
+            __syncthreads();
             /* #286: a finite correlation answer is returned, never refit for a
                rank/gauge label the exact finalist refit already owns. */
-            if (status == 1 || status == 2) {
-                if (!S->sstart) status = 7;
-                else status = S->simproved ? 5 : 6;
-            } else if (status == 0 && S->srank) {
-                status = 4;
+            if (pass_status == 1 || pass_status == 2) {
+                if (!S->sstart) pass_status = 7;
+                else pass_status = S->simproved ? 5 : 6;
+            } else if (pass_status == 0 && S->srank) {
+                pass_status = 4;
             }
+            __syncthreads();
+            if (pass == 0 || pass_best < overall) {
+                overall = pass_best;
+                best = pass_best;
+                status = pass_status;
+                if (tid < p) kept = S->sc[tid];
+            }
+        }
+        if (tid < p) S->sc[tid] = kept;
+        __syncthreads();
+        if (tid == 0) {
             for (int i = 0; i < p; ++i) outc[(size_t)cand * (size_t)kmax + (size_t)i] = S->sc[i];
             outsse[cand] = best;
             outstatus[cand] = status;

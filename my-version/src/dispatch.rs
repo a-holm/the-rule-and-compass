@@ -315,6 +315,20 @@ impl FallbackCause {
     }
 }
 
+/// Cost of one candidate relative to one squared LM run, `(device, cpu)`.
+///
+/// A squared LM run is `2·sweeps + 3` row passes on either side, so the sweep
+/// count cancels. The device kernel runs it once per gauge orientation: twice
+/// for `correlation_signed`. `correlation::fit` on the CPU runs one LM per
+/// orientation tried: three for `correlation_signed`. Unsigned correlation has
+/// one orientation on both sides.
+fn fit_pass_scale(objective: Option<crate::fit::DeviceLoss>) -> (f64, f64) {
+    match objective {
+        Some(crate::fit::DeviceLoss::CorrelationSigned) => (2.0, 3.0),
+        _ => (1.0, 1.0),
+    }
+}
+
 /// Work shape offered to the planner.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Workload {
@@ -335,6 +349,9 @@ pub struct Workload {
     pub split_fraction: Option<f64>,
     /// A structural or arithmetic refusal checked before timing.
     pub refusal: Option<FallbackCause>,
+    /// The fit objective; `None` and the squared family use the calibrated
+    /// rates unscaled.
+    pub objective: Option<crate::fit::DeviceLoss>,
 }
 
 impl Workload {
@@ -353,6 +370,7 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
@@ -371,6 +389,7 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
@@ -388,11 +407,17 @@ impl Workload {
             device_s: None,
             split_fraction: None,
             refusal: None,
+            objective: None,
         }
     }
 
     pub fn with_min_rows(mut self, rows: usize) -> Self {
         self.min_rows = rows.max(1);
+        self
+    }
+
+    pub fn with_objective(mut self, objective: crate::fit::DeviceLoss) -> Self {
+        self.objective = Some(objective);
         self
     }
 
@@ -969,8 +994,12 @@ impl Dispatcher {
                 }
                 Stage::Fit => {
                     let candidates = workload.candidates.max(1) as f64;
-                    let fit = candidates / cal.fit_rate(workload.rows, workload.constants, workload.sweeps);
-                    let cpu = candidates / cal.cpu_fit_rate(workload.rows, workload.constants, workload.sweeps);
+                    let (dev_passes, cpu_passes) =
+                        fit_pass_scale(workload.objective);
+                    let fit = dev_passes * candidates
+                        / cal.fit_rate(workload.rows, workload.constants, workload.sweeps);
+                    let cpu = cpu_passes * candidates
+                        / cal.cpu_fit_rate(workload.rows, workload.constants, workload.sweeps);
                     (0.0, fit, cpu)
                 }
                 _ => (0.0, 0.0, 0.0),

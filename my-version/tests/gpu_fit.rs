@@ -1556,3 +1556,98 @@ fn default_run_resolves_to_the_gpu_arm_and_labels_every_other_resolution() {
     let (fitting, _) = cli_fit_and_front(&["--metric", "squared", "--fit-strategy", "gpu"]);
     assert!(!fitting.contains("strategy_source"), "an explicit arm is never resolved: {fitting}");
 }
+
+#[cfg(feature = "cuda")]
+fn correlation_run(metric: Metric, seed: u32, fit_iters: usize) -> (Outcome, Sample) {
+    let train = sample(2000, seed);
+    let test = sample(200, seed + 1);
+    let cfg = Config {
+        generations: 4,
+        pop: 32,
+        fit_iters,
+        metric,
+        ..gpu_config(seed + 2)
+    };
+    (search::run(&cfg, &train, &test), train)
+}
+
+/// The correlation family fits on the device through the exact gate: two runs
+/// are bit-identical and every archive error is the exact CPU `f64` metric.
+#[cfg(feature = "cuda")]
+fn assert_correlation_gpu_fit_is_deterministic_and_exact(metric: Metric, seed: u32) {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (a, train) = correlation_run(metric, seed, 4);
+    let (b, _) = correlation_run(metric, seed, 4);
+    assert_eq!(describe(&a), describe(&b), "a fixed seed must be deterministic");
+    assert_eq!(a.test_errors, b.test_errors);
+    assert_eq!(a.backend, rcsr::backend::Kind::Gpu, "{:?}", a.backend_reason);
+    let g = a.gpu.as_ref().expect("a GPU report");
+    assert!(g.fit_gpu > 0, "the correlation fit kernel must run: {:?}", g);
+    assert_fit_ledger(g);
+    for s in &a.archive.items {
+        let cpu = search::eval_error(&s.tree, &train, metric);
+        assert_eq!(
+            s.error.to_bits(),
+            cpu.to_bits(),
+            "archive row is not the exact CPU {} score: {} vs {}",
+            metric.name(),
+            s.error,
+            cpu
+        );
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_gpu_fit_run_is_deterministic_and_exact() {
+    assert_correlation_gpu_fit_is_deterministic_and_exact(Metric::Correlation, 81);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn signed_gpu_fit_run_is_deterministic_and_exact() {
+    assert_correlation_gpu_fit_is_deterministic_and_exact(Metric::CorrelationSigned, 91);
+}
+
+/// `--fit-iters 0` attempts no fit and moves no constant for either metric.
+#[cfg(feature = "cuda")]
+#[test]
+fn correlation_gpu_no_fit_is_a_true_noop() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    for metric in [Metric::Correlation, Metric::CorrelationSigned] {
+        let (out, train) = correlation_run(metric, 101, 0);
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert_eq!(g.fit_attempts, 0, "no fit may be attempted: {:?}", g);
+        assert_eq!(g.fit_gpu, 0);
+        for s in &out.archive.items {
+            let cpu = search::eval_error(&s.tree, &train, metric);
+            assert_eq!(s.error.to_bits(), cpu.to_bits());
+        }
+    }
+}
+
+/// Affine-in-constants correlation trees take the CPU closed form, labelled
+/// `affine_closed_form`, and the ledger still closes.
+#[cfg(feature = "cuda")]
+#[test]
+fn an_affine_correlation_tree_takes_the_closed_form() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let (out, _) = correlation_run(Metric::CorrelationSigned, 111, 4);
+    let g = out.gpu.as_ref().expect("a GPU report");
+    assert_fit_ledger(g);
+    let affine = g
+        .fit_fallback_by_cause
+        .get("affine_closed_form")
+        .copied()
+        .unwrap_or(0);
+    assert!(affine > 0, "no affine tree was routed: {:?}", g.fit_fallback_by_cause);
+}
