@@ -2188,7 +2188,7 @@ Definitions that matter:
   seconds. `Σ stage_s + unaccounted_s = wall_s`, and more than 1 % unaccounted
   is a telemetry defect. `fit` separates raw device kernel seconds from the
   measured exact-CPU fallback and finalist-refit seconds, with
-  `fallback_by_cause`; `eval_fallback` does the same for the evaluator's CPU
+  `fallback_by_cause` and `fallback_improved` with `fallback_improved_by_cause` (the fallbacks whose exact CPU refit lowered the exact error against the device constants, or the incoming constants when the device gave none, counted under the same cause labels; `gpu.fit` and each `gpu.generations[]` entry carry the same fields); `eval_fallback` does the same for the evaluator's CPU
   pool. Every derived value is
   `{value,numerator,denominator,units,scope}`. `features`, `pnl` and `io` are
   present even when their stage did not run, so a reader never has to infer a
@@ -3103,3 +3103,7 @@ The rank and order-statistic score calls split their trials into sub-waves, so o
 ### Throughput at the wide-panel scale
 
 Resident scoring of 400 candidates over 4,775,757 x 20 f32 rows takes 0.139 s (median) and 4,096 candidates take 1.285 s, inside the 0.25 s and 2 s targets. Tiled scoring at 1,000,000 x 20 and P = 400 with 8,192-row tiles takes 0.95 times the resident time, because the next tile uploads while the current kernel runs. A 364-column store searched with 20 variables is `resident` and holds 0.88 GiB on the device; the numbers and the command are in [`memory-model.md`](memory-model.md).
+
+## Panel build on the device
+
+`rcsr panel build --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) joins every base bar against the membership decisions with the monotone as-of merge of `src/cuda/pit.cu`, then derives the gap tags and chain starts. The planner is the one of `panel base`: `off` is always CPU, `auto` needs a usable device and at least 1M base rows, `on` needs a device. The block is one segment per symbol and one launch. The store is byte-identical on every route. A CPU join under `auto` or `on` is named in the `v2.backend` block of the panel manifest with its reason (`too_few_rows`, `no_device`, `launch`). The device buffers go through `src/cuda/alloc_guard.h`. `panel validate` replays prefixes on the CPU reference. MTF columns have their own device path in `src/cuda/mtf.cu`. See `docs/panel.md`.

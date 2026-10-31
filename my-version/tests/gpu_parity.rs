@@ -1052,9 +1052,6 @@ fn panel_prep_is_byte_identical_cpu_gpu_cold_warm_and_across_block_sizes() {
 fn pit_cases() -> Vec<(&'static str, PitBlock, PitParams)> {
     vec![
         ("membership", pit::membership_block(31, 7, 5000), PitParams::membership(STEP)),
-        ("mtf1h", pit::mtf_block(32, 7, 5000, 3600), PitParams::mtf(3600, STEP)),
-        ("mtf4h", pit::mtf_block(33, 7, 5000, 14_400), PitParams::mtf(14_400, STEP)),
-        ("mtf1d", pit::mtf_block(34, 7, 5000, 86_400), PitParams::mtf(86_400, STEP)),
     ]
 }
 
@@ -1089,7 +1086,7 @@ fn pit_asof_joins_are_byte_identical_and_causal() {
         let hi = *block.times.iter().max().unwrap();
         for k in 0..20 {
             let cut = lo + (hi - lo) * (k + 1) / 21;
-            let pre_block = pit::prefix(&block, cut, p.delay);
+            let pre_block = pit::prefix(&block, cut);
             if pre_block.times.is_empty() {
                 continue;
             }
@@ -1109,9 +1106,9 @@ fn pit_asof_joins_are_byte_identical_and_causal() {
                 }
             }
         }
-        let bad = g.lookahead_violations(&shifted, p.delay).unwrap();
+        let bad = g.lookahead_violations(&shifted).unwrap();
         assert!(bad > 0, "{name}: a future-shifted leaf must be reported");
-        assert_eq!(bad, panel_pit::lookahead_violations(&block, &shifted, p.delay), "{name}");
+        assert_eq!(bad, panel_pit::lookahead_violations(&block, &shifted), "{name}");
         eprintln!("[parity] pit {name} tier=bitwise digest={want:016x} canary_violations={bad}");
     }
 }
