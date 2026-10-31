@@ -879,7 +879,7 @@ void rc_prep_counts(RcPrep *c, int *n_out, int *n_conflict, int *n_unique)
     if (n_unique) *n_unique = c->n_unique;
 }
 
-static int g_force_cub_fail = 0;
+static thread_local int g_force_cub_fail = 0;
 
 extern "C" void rc_prep_test_force_cub_fail(int on)
 {

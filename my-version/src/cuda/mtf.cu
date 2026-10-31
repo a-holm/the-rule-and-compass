@@ -718,7 +718,7 @@ void rc_mtf_last_stats(RcMtf *c, RcMtfStats *out)
     if (c && out) *out = c->last;
 }
 
-static int g_force_cub_fail = 0;
+static thread_local int g_force_cub_fail = 0;
 
 extern "C" void rc_mtf_test_force_cub_fail(int on)
 {

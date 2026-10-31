@@ -4,7 +4,8 @@
  * runtime's last-error slot set, so the next launch check would blame an
  * unrelated kernel. rc_cub_status clears the slot and hands the code back.
  *
- * rc_cub_take implements the test hook: when a one-shot flag is set, the
+ * rc_cub_take implements the test hook: when a one-shot flag is set (the
+ * flags are thread_local so a forced failure never reaches another test), the
  * guarded call is refused before it reaches CUB and reports a failure. */
 #ifndef RCSR_CUB_GUARD_H
 #define RCSR_CUB_GUARD_H

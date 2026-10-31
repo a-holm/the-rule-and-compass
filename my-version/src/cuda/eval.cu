@@ -22,6 +22,7 @@
 
 #include <cuda_runtime.h>
 #include "alloc_guard.h"
+#include "cub_guard.h"
 #include "radix_select.h"
 #include <cub/cub.cuh>
 #include <math_constants.h>
@@ -5080,19 +5081,34 @@ typedef struct RcRankWork {
     size_t temp_bytes;
 } RcRankWork;
 
+/* Test hook: the next guarded CUB call of the rank sweep is refused before it
+ * reaches CUB and reports a failure. */
+static thread_local int g_force_rank_cub_fail = 0;
+
+extern "C" void rc_rank_test_force_cub_fail(int on)
+{
+    g_force_rank_cub_fail = on;
+}
+
 /* Bytes of CUB temporary storage the rank sweep needs for `total` keys in
  * `nsegs` segments: the largest of the sort and the two scans. Pure size
- * queries, no device pointer is read. */
+ * queries, no device pointer is read. Returns 0 when a query fails. */
 static size_t rc_rank_temp_bytes(long long total, int nsegs)
 {
     size_t tb = 0, ts = 0, tsc = 0;
-    cub::DeviceSegmentedRadixSort::SortPairs(
+    cudaError_t e = RC_CUB(g_force_rank_cub_fail, cub::DeviceSegmentedRadixSort::SortPairs(
         (void *)NULL, tb, (const unsigned long long *)NULL, (unsigned long long *)NULL,
         (const unsigned int *)NULL, (unsigned int *)NULL, (int)total, nsegs,
-        (const int *)NULL, (const int *)NULL);
-    cub::DeviceScan::InclusiveSum((void *)NULL, ts, (const int *)NULL, (int *)NULL, (int)total);
-    cub::DeviceScan::ExclusiveSum((void *)NULL, tsc, (const long long *)NULL, (long long *)NULL,
-                                  (int)total);
+        (const int *)NULL, (const int *)NULL));
+    if (e != cudaSuccess) return 0;
+    e = RC_CUB(g_force_rank_cub_fail,
+               cub::DeviceScan::InclusiveSum((void *)NULL, ts, (const int *)NULL, (int *)NULL,
+                                             (int)total));
+    if (e != cudaSuccess) return 0;
+    e = RC_CUB(g_force_rank_cub_fail,
+               cub::DeviceScan::ExclusiveSum((void *)NULL, tsc, (const long long *)NULL,
+                                             (long long *)NULL, (int)total));
+    if (e != cudaSuccess) return 0;
     if (ts > tb) tb = ts;
     if (tsc > tb) tb = tsc;
     /* CUB may report a zero-byte requirement for a tiny input; keep at least
@@ -5149,17 +5165,23 @@ static int rc_rank_runs(RcCtx *c, RcRankWork *w, const long long *d_b, int n, lo
     if (blocks > 65535) blocks = 65535;
     if (blocks < 1) blocks = 1;
     size_t tb = w->temp_bytes;
-    cub::DeviceSegmentedRadixSort::SortPairs(
-        w->temp, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
-        d_off + 1, 0, (int)(sizeof(unsigned long long) * 8), s);
-    if (cudaGetLastError() != cudaSuccess) return -1;
+    if (RC_CUB(g_force_rank_cub_fail, cub::DeviceSegmentedRadixSort::SortPairs(
+            w->temp, tb, w->keys, w->keys_out, w->rows, w->rows_out, total, nsegs, d_off,
+            d_off + 1, 0, (int)(sizeof(unsigned long long) * 8), s)) != cudaSuccess)
+        return -1;
     k_rank_flags<<<(int)blocks, threads, 0, s>>>(w->keys_out, w->rows_out, d_b, n, total,
                                                  w->flags, w->gather);
     if (cudaGetLastError() != cudaSuccess) return -1;
     tb = w->temp_bytes;
-    cub::DeviceScan::InclusiveSum(w->temp, tb, w->flags, w->ord, (int)total, s);
+    if (RC_CUB(g_force_rank_cub_fail,
+                cub::DeviceScan::InclusiveSum(w->temp, tb, w->flags, w->ord, (int)total, s)) !=
+        cudaSuccess)
+        return -1;
     tb = w->temp_bytes;
-    cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total, s);
+    if (RC_CUB(g_force_rank_cub_fail,
+                cub::DeviceScan::ExclusiveSum(w->temp, tb, w->gather, w->prefix, (int)total, s)) !=
+        cudaSuccess)
+        return -1;
     k_rank_tail<<<1, 1, 0, s>>>(w->prefix, w->gather, total);
     if (cudaGetLastError() != cudaSuccess) return -1;
     k_rank_starts<<<(int)blocks, threads, 0, s>>>(w->flags, w->ord, w->starts, total);
@@ -5178,6 +5200,7 @@ static int rc_rank_prepare(void *ctx)
     if (!c->s_fit) return -1;
     const long long total = c->n;
     const size_t temp_bytes = rc_rank_temp_bytes(total, 1);
+    if (temp_bytes == 0) return -1;
     size_t cur = 0;
     const size_t o_seg = rc_fs_take(&cur, sizeof(int) * 2);
     const size_t in_end = rc_fs_take(&cur, 0);
@@ -5265,6 +5288,7 @@ float rc_rank_score_batch(void *ctx,
     const size_t prog_words = (size_t)off[nsets];
     const size_t c0_bytes = sizeof(double) * (size_t)nsegs * (size_t)kmax;
     const size_t temp_bytes = rc_rank_temp_bytes(total, nsegs);
+    if (temp_bytes == 0) return -1.0f;
     /* #334: [ prog | off | pcount | c0 | seg_off ] then [ out | status | bb ]
        then the rank workspace. */
     size_t cur = 0;
@@ -5998,6 +6022,15 @@ float rc_max_scan_batch(void *ctx,
     return ms;
 }
 
+/* Test hook: the next guarded CUB call of an order-statistic sort is refused
+ * before it reaches CUB and reports a failure. */
+static thread_local int g_force_os_cub_fail = 0;
+
+extern "C" void rc_os_test_force_cub_fail(int on)
+{
+    g_force_os_cub_fail = on;
+}
+
 /* Exact median (`RC_OS_MEDIAN`), interquartile mean of the absolute errors
  * (`RC_OS_IQR_TREE` for the fit ladder, `RC_OS_IQR_EXACT` for scoring) or
  * maximum (`RC_OS_MAXIMUM`) of `nsets * ntrials` prediction vectors.
@@ -6039,9 +6072,11 @@ float rc_order_stat_score_batch(void *ctx,
     /* Size the CUB temporary storage once per call (it depends on the segment
        count and length, not on the values). */
     size_t temp_bytes = 0;
-    cub::DeviceSegmentedRadixSort::SortKeys(
-        (void *)NULL, temp_bytes, (const unsigned long long *)NULL, (unsigned long long *)NULL,
-        (int)total, nsegs, (const int *)NULL, (const int *)NULL);
+    if (RC_CUB(g_force_os_cub_fail, cub::DeviceSegmentedRadixSort::SortKeys(
+            (void *)NULL, temp_bytes, (const unsigned long long *)NULL,
+            (unsigned long long *)NULL, (int)total, nsegs, (const int *)NULL,
+            (const int *)NULL)) != cudaSuccess)
+        return -1.0f;
     if (temp_bytes == 0) temp_bytes = 1;
     /* #334: [ prog | off | pcount | c0 | seg_off ] then [ value | status ] then
        the key buffers and the sort workspace. */
@@ -6097,10 +6132,9 @@ float rc_order_stat_score_batch(void *ctx,
     int ok = cudaGetLastError() == cudaSuccess;
     if (ok) {
         size_t tb = temp_bytes;
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            d_temp, tb, d_keys, d_keys_out, (int)total, nsegs, d_seg_off, d_seg_off + 1, 0,
-            (int)(sizeof(unsigned long long) * 8), c->s_fit);
-        ok = cudaGetLastError() == cudaSuccess;
+        ok = RC_CUB(g_force_os_cub_fail, cub::DeviceSegmentedRadixSort::SortKeys(
+                 d_temp, tb, d_keys, d_keys_out, (int)total, nsegs, d_seg_off, d_seg_off + 1, 0,
+                 (int)(sizeof(unsigned long long) * 8), c->s_fit)) == cudaSuccess;
     }
     if (ok) {
         k_order_stat_pick<<<nsegs, RC_OS_PICK_THREADS, 0, c->s_fit>>>(d_keys_out, c->n, nsegs,
@@ -6191,10 +6225,11 @@ float rc_order_stat_select_batch(void *ctx,
     if (bx > RS_MAX_BLOCKS_PER_SEG) bx = RS_MAX_BLOCKS_PER_SEG;
     size_t temp_bytes = 0;
     if (iqr) {
-        cub::DeviceSegmentedRadixSort::SortKeys(
-            (void *)NULL, temp_bytes, (const unsigned long long *)NULL,
-            (unsigned long long *)NULL, (int)mid_total, nsegs, (const int *)NULL,
-            (const int *)NULL);
+        if (RC_CUB(g_force_os_cub_fail, cub::DeviceSegmentedRadixSort::SortKeys(
+                (void *)NULL, temp_bytes, (const unsigned long long *)NULL,
+                (unsigned long long *)NULL, (int)mid_total, nsegs, (const int *)NULL,
+                (const int *)NULL)) != cudaSuccess)
+            return -1.0f;
         if (temp_bytes == 0) temp_bytes = 1;
     }
     const size_t prog_words = (size_t)off[nsets];
@@ -6289,10 +6324,10 @@ float rc_order_stat_select_batch(void *ctx,
         }
         if (ok) {
             size_t tb = temp_bytes;
-            cub::DeviceSegmentedRadixSort::SortKeys(
-                (void *)(base + o_temp), tb, d_mid, d_mid_sorted, (int)mid_total, nsegs, d_begin,
-                d_end, 0, (int)(sizeof(unsigned long long) * 8), c->s_fit);
-            ok = cudaGetLastError() == cudaSuccess;
+            ok = RC_CUB(g_force_os_cub_fail, cub::DeviceSegmentedRadixSort::SortKeys(
+                     (void *)(base + o_temp), tb, d_mid, d_mid_sorted, (int)mid_total, nsegs,
+                     d_begin, d_end, 0, (int)(sizeof(unsigned long long) * 8), c->s_fit)) ==
+                 cudaSuccess;
         }
         if (ok) {
             k_iqr_select_sum<<<nsegs, RS_THREADS, 0, c->s_fit>>>(

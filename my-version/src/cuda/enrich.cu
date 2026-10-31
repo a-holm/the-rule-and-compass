@@ -97,7 +97,7 @@ extern "C" void rc_enrich_set_test_budget(size_t bytes)
     g_budget_live = 0;
 }
 
-static int g_force_cub_fail = 0;
+static thread_local int g_force_cub_fail = 0;
 
 extern "C" void rc_enrich_test_force_cub_fail(int on)
 {
