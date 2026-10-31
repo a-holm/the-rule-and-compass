@@ -1706,7 +1706,7 @@ fn refit_lowers_error(
     let before = exact_error(tree, x, y, w, metric);
     crate::fit::fit_weighted_metric(tree, x, y, w, iters, metric);
     let after = exact_error(tree, x, y, w, metric);
-    false && after.is_finite() && (before.is_nan() || after < before)
+    after.is_finite() && (before.is_nan() || after < before)
 }
 
 /// #265: count one improved refit under its fallback cause.
