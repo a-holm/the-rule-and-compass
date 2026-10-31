@@ -302,6 +302,8 @@ pub struct Options {
     /// #145: permit a labelled build (an evaluation target) inside 2026H2.
     /// Unlabelled bars are provenance and are always allowed.
     pub allow_lockbox: bool,
+    /// #262: permit a label stride below the horizon for horizons of 4h and longer.
+    pub allow_overlap: bool,
 }
 
 impl Default for Options {
@@ -324,6 +326,7 @@ impl Default for Options {
             group_rows: store::DEFAULT_GROUP_ROWS,
             resume: None,
             allow_lockbox: false,
+            allow_overlap: false,
         }
     }
 }
@@ -2014,6 +2017,14 @@ pub fn run(args: &[String]) -> ! {
             "--resume" => opts.resume = Some(val!()),
             "--dry-run" => opts.dry_run = true,
             "--allow-lockbox" => opts.allow_lockbox = true,
+            "--allow-overlap" => opts.allow_overlap = true,
+            "--allow-short" => fail(&crate::labels::refuse_allow_short()),
+            "--side" => {
+                let v = val!();
+                if let Err(e) = crate::labels::check_side(&v) {
+                    fail(&e);
+                }
+            }
             "--jobs" | "-j" => {
                 let v = val!();
                 opts.jobs = v.parse().unwrap_or(0);
@@ -2042,6 +2053,11 @@ pub fn run(args: &[String]) -> ! {
     }
     if opts.out.is_none() && !opts.dry_run {
         fail("prep needs --out <store.rcsb> (or --dry-run)");
+    }
+    if let Some(l) = opts.label {
+        if let Err(e) = l.check_overlap(opts.resample.unwrap_or(Timeframe::M1), opts.allow_overlap) {
+            fail(&e);
+        }
     }
     let build = match build(&opts) {
         Ok(b) => b,
@@ -2112,6 +2128,9 @@ TRANSFORMS:
   --features <list>       ta:core, ta:full, exotic:cheap, candle:geometry,
                           cross:btc, calendar, or explicit feature names
   --label <spec>          fwd:<tf|bars>,cost=<bp>,volnorm=<bars>,stride=<n>
+  --allow-overlap         permit a label stride below the horizon for horizons of
+                          4h and longer
+  --side long             the only side; --side short and --allow-short are refused
   --spec <file>           key=value spec (features/label/resample/mtf/...)
   --jobs, -j <n>          parallel symbol workers (default 1)
   --group-rows <n>        column-store group size (default 65536)
