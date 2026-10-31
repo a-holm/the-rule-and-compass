@@ -2296,9 +2296,10 @@ fn score_pipeline_batch(
 /// and every metric without a native kernel objective would be ranked by a
 /// proxy it is not defined on. Each of those keeps the CPU evaluator.
 ///
-/// #289: the classification scorer carries the per-row weights, so `--weight`
-/// is admitted for log_loss/Brier/the hinge forms; the regression kernels still
-/// have no weighted path, so a weighted regression run keeps the CPU.
+/// The native scorers carry the per-row weights, so `--weight` is admitted for
+/// every native metric with a weighted form (`metrics::weights_supported`):
+/// the regression family and the classification objectives. `maximum` refuses
+/// weights.
 ///
 /// #288: the order/rank family and `auc` are `ScoreDispatch::Exact` rows scored
 /// by the plan batch entry point; this gate admits them from their measured row
@@ -2310,14 +2311,16 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
         return Some("multi-output objective");
     }
-    // #289: only the classification scorer has a device weight path. A
-    // weighted regression run keeps the exact CPU evaluator rather than
-    // dropping the weights.
+    // Weighted rows run on the device only through a native scorer that has a
+    // weighted form; every other metric keeps the exact CPU evaluator rather
+    // than dropping the weights.
     if !train.w.is_empty() {
-        let class_native = crate::metrics::native_score_objective(cfg.metric)
-            .map_or(false, |o| o.is_classification());
-        if !class_native {
-            return Some("weighted rows need a native classification scorer");
+        match crate::metrics::native_score_objective(cfg.metric) {
+            Some(crate::metrics::ScoreObjective::Maximum) => {
+                return Some("weighted rows: maximum has no weighted form");
+            }
+            Some(_) if crate::metrics::weights_supported(cfg.metric) => {}
+            _ => return Some("weighted rows need a native scorer with a weighted form"),
         }
     }
     // #236/#287/#288: a metric may use the device only when the score-dispatch
