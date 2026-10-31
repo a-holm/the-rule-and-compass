@@ -651,7 +651,7 @@ impl Tally {
         self.uniqueness_sum += other.uniqueness_sum;
         self.top.extend(other.top);
         self.top.sort_by(move_order);
-        self.top.truncate(1);
+        self.top.truncate(TOP_MOVES);
     }
 
     fn into_report(mut self, spec: &LongLabelSpec, label_hash: String) -> LabelReport {

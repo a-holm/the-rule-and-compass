@@ -429,7 +429,7 @@ fn unknown_message(name: &str, schema_file: &str, panel_has: Option<&str>) -> St
 /// A column of the `label` family is a target or a weight, never an input.
 pub fn check_no_labels(vars: &[String]) -> Result<(), String> {
     for v in vars {
-        if lookup(v).is_some_and(|r| r.family == "nolabel") {
+        if lookup(v).is_some_and(|r| r.family == "label") {
             return Err(format!(
                 "column '{}' is a label-family column (it reads bars after the decision time) and cannot be a --vars input",
                 v

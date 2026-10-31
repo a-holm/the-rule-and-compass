@@ -627,7 +627,7 @@ pub fn target_structure(spec: &crate::target::TargetSpec, vars: &[String]) -> Re
     }
     for v in vars {
         let reported = spec.return_column.as_deref() == Some(v.as_str()) || *v == spec.column;
-        if !reported && crate::registry::lookup(v).is_some_and(|r| r.family == "nolabel") {
+        if !reported && crate::registry::lookup(v).is_some_and(|r| r.family == "label") {
             report.leaks.push(Leak::new(
                 "D13a",
                 Some(v.clone()),
