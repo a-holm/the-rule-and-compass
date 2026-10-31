@@ -2359,6 +2359,10 @@ exit, the cooldown minimum, one-row groups and non-finite scores match the CPU;
 refusals carry a reason; and `rcsr walkforward --gpu` reports the same JSON as
 the CPU run apart from the backend labels.
 
+## Panel base on the device
+
+`rcsr panel base --gpu auto|on|off` (alias `--no-gpu`/`--cpu` for `off`) folds the decoded 15m bars of a wave of symbols into hourly base rows with the fused duplicate scan, resample and gap pass of `src/cuda/prep.cu`. The planner chooses per wave: `off` is always CPU, `auto` needs a usable device and at least 1M decoded rows, `on` needs a device. The store is byte-identical on every route. Each CPU wave under `auto` or `on` is named in the base manifest `backend` block with its reason (`too_few_rows`, `no_device`, `launch`). The pass adds no device allocation of its own beyond the context of `src/panel_prep_gpu.rs`. See `docs/panel.md`.
+
 ## Verified versus unverified
 
 | Item | Where it was tested | Status |
