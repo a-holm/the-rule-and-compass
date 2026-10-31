@@ -139,17 +139,19 @@ fn log_squashed_has_a_native_objective() {
         None,
         "AIC is not a squared objective for ranking"
     );
-    // Weighted rows keep the CPU: the kernel weighs its normal equations, but
-    // the evaluator has no per-row weight array, so a weighted run would be
-    // ranked on unweighted loss. The cause is labelled, never silent.
-    let mut weighted = sample(64, 7);
-    weighted.w = vec![1.0; weighted.len()];
-    let wcfg = Config {
-        gpu: true,
-        metric: Metric::LogSquashed,
-        ..Default::default()
-    };
-    assert_eq!(search::effective_backend(&wcfg, &weighted), Backend::Cpu);
+    // Weighted rows are scored natively on the device (the evaluator holds the
+    // per-row weights).
+    #[cfg(feature = "cuda")]
+    {
+        let mut weighted = sample(64, 7);
+        weighted.w = vec![1.0; weighted.len()];
+        let wcfg = Config {
+            gpu: true,
+            metric: Metric::LogSquashed,
+            ..Default::default()
+        };
+        assert_eq!(search::backend_blocker_reason(&wcfg, &weighted), None);
+    }
 }
 
 /// #222: `absolute` has a native `Σ|r|` fit and scoring objective with its own
@@ -172,15 +174,17 @@ fn absolute_has_a_native_objective() {
         rcsr::fit::gpu_fit_metric_error(Metric::Absolute).is_none(),
         "an explicit GPU strategy may fit absolute"
     );
-    // Weighted rows still keep the CPU evaluator (no per-row weight array).
-    let mut weighted = sample(64, 7);
-    weighted.w = vec![1.0; weighted.len()];
-    let wcfg = Config {
-        gpu: true,
-        metric: Metric::Absolute,
-        ..Default::default()
-    };
-    assert_eq!(search::effective_backend(&wcfg, &weighted), Backend::Cpu);
+    #[cfg(feature = "cuda")]
+    {
+        let mut weighted = sample(64, 7);
+        weighted.w = vec![1.0; weighted.len()];
+        let wcfg = Config {
+            gpu: true,
+            metric: Metric::Absolute,
+            ..Default::default()
+        };
+        assert_eq!(search::backend_blocker_reason(&wcfg, &weighted), None);
+    }
 }
 
 /// #222: with the native MAE scorer, an `absolute` run is admitted to the
@@ -464,6 +468,99 @@ fn reported_finalists_equal_cpu_score_for_every_native_metric() {
                 s.error.to_bits(),
                 cpu.to_bits(),
                 "{metric:?}: archive row is not the exact CPU score: {} vs {}",
+                s.error,
+                cpu
+            );
+        }
+    }
+}
+
+/// Weighted regression on the device: every native regression metric with a
+/// weighted form is admitted, `maximum` keeps a labelled refusal, and a metric
+/// without a native scorer keeps its own refusal.
+#[cfg(feature = "cuda")]
+#[test]
+fn the_device_gate_admits_weighted_regression_metrics_with_a_weighted_form() {
+    let mut s = sample(64, 7);
+    s.w = (0..s.len()).map(|i| 0.5 + (i % 5) as f64).collect();
+    let cfg = |m: Metric| Config {
+        gpu: true,
+        metric: m,
+        ..Default::default()
+    };
+    for m in [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ] {
+        assert!(rcsr::metrics::weights_supported(m), "{m:?}");
+        assert_eq!(search::backend_blocker_reason(&cfg(m), &s), None, "{m:?}");
+    }
+    let why = search::backend_blocker_reason(&cfg(Metric::Maximum), &s).expect("maximum is refused");
+    assert!(why.contains("maximum"), "{why}");
+    assert!(!rcsr::metrics::weights_supported(Metric::Maximum));
+}
+
+/// Weighted regression: the reported score of each finalist after the exact
+/// refit is the CPU `score_weighted` of the stored tree under the same
+/// weights, bit for bit, for every admitted metric. The run claims the device.
+#[cfg(feature = "cuda")]
+#[test]
+fn weighted_reported_finalists_equal_cpu_score_for_every_admitted_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let metrics = [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+    ];
+    let weights = |n: usize| -> Vec<f64> {
+        (0..n)
+            .map(|i| if i % 7 == 0 { 0.0 } else { 0.5 + (i % 5) as f64 * 0.75 })
+            .collect()
+    };
+    for metric in metrics {
+        let mut train = sample(600, 7);
+        let mut test = sample(100, 8);
+        train.w = weights(train.len());
+        test.w = weights(test.len());
+        let cfg = Config {
+            metric,
+            ..gpu_config(13)
+        };
+        let out = search::run(&cfg, &train, &test);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{metric:?} backend");
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert!(g.fit_refits > 0, "{metric:?}: finalists were refit: {:?}", g);
+        assert_fit_ledger(g);
+        assert!(!out.archive.items.is_empty(), "{metric:?}: empty archive");
+        for s in &out.archive.items {
+            let pred: Vec<f64> = train.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+            let cpu = rcsr::metrics::score_weighted(
+                &pred,
+                &train.y,
+                &train.w,
+                metric,
+                expr::count_constants(&s.tree),
+            );
+            assert_eq!(
+                s.error.to_bits(),
+                cpu.to_bits(),
+                "{metric:?}: archive row is not the exact weighted CPU score: {} vs {}",
                 s.error,
                 cpu
             );

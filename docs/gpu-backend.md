@@ -516,10 +516,13 @@ The GPU path is used for single-output, full-sample runs whose metric has a
 native score objective or an exact order/rank statistic. Multi-output (`--target y1,y2`), a refused metric and
 `--predictor-samples` keep the CPU evaluator, because they need more than one
 prediction per row, a different objective, or a different set of rows every
-generation. `--weight` is admitted for the classification objectives (the
-device carries the weight vector, #289) and still refused for the regression
-objectives, whose weighted parity is a separate change; the reason is printed in
-the one-line note.
+generation. `--weight` is admitted for every native metric with a weighted form:
+the regression family (`squared`, `absolute`, `log_squashed`, `signed`,
+`correlation`, `correlation_signed`, `aic`, `aicc`, `bic`) and the classification
+objectives. The device carries the weight vector, divides by `Σw`, skips
+zero-weight rows before the program runs and scores all-zero weights as `+inf`
+with status 4. `maximum` has no weighted form and keeps the CPU evaluator; the
+reason is printed in the one-line note.
 
 The **fit** stage is a separate decision. `--fit-strategy gpu` moves the
 constants of a rank (`rank_correlation` / `rank_correlation_signed`), median,
@@ -629,7 +632,9 @@ names every refusal:
 * sample below the measured floor: `order/rank scoring: the sample is below the
   4096-row device floor`;
 * AUC with a target that is not two-valued: `auc needs a two-valued target`;
-* weighted rows: `weighted rows need a native classification scorer`.
+* weighted `maximum`: `weighted rows: maximum has no weighted form`;
+* weighted rows with a metric that has no native weighted scorer: `weighted rows
+  need a native scorer with a weighted form`.
 
 When admitted, `GpuSearch::evaluate_pending_stat` flattens each pending tree with
 `gpu_fit_plan_reason`, scores the whole generation through `score_stat_batch`, and
@@ -719,7 +724,7 @@ returns an empty result when the program upload fails.
 - The lane of a row is `r mod L` in absolute rows. It does not depend on the partition, the chunk count or the grid.
 - Per candidate, the carry holds `L` lane states (two f64 each) and an `int` bad flag. Maximum keeps its key bits and row in the two slots. The region is zeroed at the start of a batch.
 - `score_rows_kernel<MODE, PASS>` applies one row range: lane `l` continues from its carried state over the rows of the range with `r mod L = l`. Correlation runs two passes with `score_mid_kernel` between them (mean prediction, lanes reset).
-- `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero classification weights, the AIC penalty on the host.
+- `score_finish_kernel<MODE>` runs the resident tree and epilogue: `+inf` and status 2 on a bad row, status 4 for all-zero weights, the AIC penalty on the host. A weighted launch carries `Σ w·term` in lane A and `Σ w` in lane B (weighted correlation: `Σ w·dp²` and `Σ w·dp·dy`, with the weighted mean prediction from the mid kernel); the weighted target moments are computed once when the weights are uploaded.
 
 The ranges form a left fold in row order, so every score kind returns the same bits as the resident kernel for any partition, including unaligned cuts and 1-row ranges. A lane index relative to the range start gives different bits on unaligned cuts. The production resident path keeps `score_kernel`.
 
@@ -1354,9 +1359,8 @@ loss += w · log1pf(r·r)      // ONE f64 add per row
   **comparator, never a reported number**.
 * A base `--weight` vector is uploaded with the f64 fit rows and multiplies the
   IRLS weight. A zero-weight row is skipped before any arithmetic, so a masked
-  row cannot contribute `0 · inf = NaN`. Weighted **runs** still use the CPU
-  evaluator, because the evaluator has no per-row weight array and would rank
-  them on unweighted loss.
+  row cannot contribute `0 · inf = NaN`. Weighted **runs** are scored on the
+  device with the same weights.
 
 **Gate.** The robust objective is native in both kernels: `eval_kernel` and
 `eval_pool_kernel` accumulate `Σ ln(1+r²)` and the host divides by the row
@@ -1483,8 +1487,7 @@ loss += w · |r|                  // the accepted objective, f64 sum
   finite answer `rank_deficient`; only a system with no finite step remains
   status `1` and goes to the exact CPU IRLS.
 * The base `--weight` vector multiplies the L1 weight exactly as in #229; a
-  weighted *run* still scores on the CPU evaluator because the evaluator has no
-  per-row weight array.
+  weighted *run* is scored on the device with the same weights.
 
 **Gate.** `eval_kernel`/`eval_pool_kernel` accumulate `Σ|r|` for the new loss
 code (`FitObjective::Absolute = 4`), so the search ranks a `--metric absolute`
@@ -2255,6 +2258,7 @@ the CPU run apart from the backend labels.
 | `log_squashed` native loss in the evaluator and fit kernel, weighted-LM parity with CPU IRLS, determinism, ill-conditioning/fallback labels, `--no-fit` no-op (#229) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` fit tests, `src/fit/gpu.rs`, `tests/gpu_fit.rs`) | **verified** (see the #229 section) |
 | logistic log-loss constants on the batched kernel: Fisher weights `q(1-q)`, uploaded label sign, softplus trial objective, closed-form and parity fixtures, extreme logits, single-class refusal, proposal gate, determinism, `--no-fit`, 28/32/64-iteration termination guard (#234) | RTX 3060, `cargo test --release --features cuda --test logloss_gpu` (21 tests) and the ignored `bench_logloss_end_to_end` | **verified** on three paired seeds (2.38×/3.92×/3.14×, quality a wash) |
 | **Native classification fitness**: `log_loss`, `brier`, `hinge`, `hinge_ordinary`, `hinge_squared` in the label-aware score kernel; stable softplus/sigmoid; uploaded sign and weights; zero-weight skip; `f64` fixed reduction; exact CPU-finalist rebuild; metric-aware gate (#289) | RTX 3060, `cargo test --release --features cuda --test classification_gpu` and the ignored paired benchmark | **verified** (device/CPU ≤1e-6 on the same f32 rows, ≤1e-5 vs f64; weighted parity; no rank inversion; masked-row skip; deterministic; native-Brier search reports exact CPU values). The large-`N` paired cost is the table in [Classification fitness](#classification-fitness-issue-289) |
+| **Weighted regression scoring**: the nine weighted regression objectives in the score kernels (resident and row-range paths), weighted target moments, `Σw` normalisation, zero-weight skip, all-zero weights as status 4, weighted `maximum` refused (`gpu::tests::weighted_regression_scores_match_the_cpu_weighted_score`, `gpu::carry_tests`, `tests/gpu_fit.rs`) | RTX 3060, `cargo test --release --features cuda` | **verified** (device/CPU 1e-12 relative, 1e-9 for the correlations; reported finalists equal CPU `score_weighted` bit for bit) |
 | `log_squashed` quality of the robust arm against the CPU IRLS over a corpus (basin splits on heavy tails) | RTX 3060, paired fit-stage and end-to-end benchmarks | **measured on one workload** — 34–49× fit-stage, 2.61× end-to-end, no-worse 64/64 at `p=4,8`; the corpus-wide basin-split rate is not measured |
 | Exact median selection (odd/even `n`, ties, constant predictions), CPU parity of the polished constants, determinism, fallback labels and the `--no-fit` no-op (#226) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` median tests, `src/fit/median.rs`, `src/fit/gpu.rs`, `tests/gpu_median.rs`) | **verified** (see the #226 section) |
 | Exact maximum and its lowest maximiser (unique/non-unique/ties/all-zero), the exact level interval on an affine coordinate, the exact 1-D minimiser (hand-solved midrange and Chebyshev line), dominance over the start and over the CPU polish, determinism, fallback labels, cost-model floor and the `--no-fit` no-op (#227) | RTX 3060, `cargo test --release --features cuda` (`src/gpu.rs` maximum tests, `src/fit/minimax.rs`, `src/fit/gpu.rs`, `tests/gpu_max.rs`) | **verified** (see the #227 section) |

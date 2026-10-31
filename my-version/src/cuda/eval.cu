@@ -214,6 +214,12 @@ struct RcCtx {
        computed once from the resident f32 target at rc_create time. */
     double ybar;
     double syy;
+    /* Unweighted target moments, and the positive-weight row count of the
+       resident weight vector. `ybar`/`syy` hold the weighted moments while
+       `d_w64` is set. */
+    double ybar_u;
+    double syy_u;
+    int wrows;
     /* #122: fixed-capacity, double-buffered genome arena. */
     unsigned int *d_pool[2];
     unsigned long long *d_hash;
@@ -246,6 +252,15 @@ struct RcCtx {
     int nprog;
     int out_cap;
     cudaEvent_t t0, t1;
+    /* #284: device-time anchor. Kernel spans are placed by the event distance
+       from `ev_base`, whose host time is `base_host_ms` on the rc_now_ms clock.
+       The anchor is renewed once it is old, so the float event distance stays
+       fine-grained over a long run. */
+    cudaEvent_t ev_base;
+    int base_ok;
+    double base_host_ms;
+    double span_start_ms[2];
+    int span_ok[2];
     /* #118: the current batch's ledger and its start on the same monotonic
        clock, so `wall_ms` covers the whole begin..download path. */
     RcStats stats;
@@ -342,6 +357,32 @@ static char g_alloc_fail_tag[32] = "";
 static void rc_ledger_tag(char *dst, const char *tag)
 {
     snprintf(dst, 32, "%s", tag ? tag : "");
+}
+
+/* #284: place the kernel span `t0..t1` on the rc_now_ms clock from the event
+   distance to the anchor. `which` is 0 for the evaluator and 1 for the fit
+   stage. Both events are complete when this runs (the elapsed-time query
+   needs that). A failed query leaves the span unavailable and the Rust side
+   keeps the host envelope. */
+static void rc_span_capture(RcCtx *c, int which)
+{
+    c->span_ok[which] = 0;
+    if (!c->base_ok) return;
+    float off = 0.0f;
+    if (cudaEventElapsedTime(&off, c->ev_base, c->t0) != cudaSuccess || off < 0.0f) {
+        cudaGetLastError();
+        return;
+    }
+    c->span_start_ms[which] = c->base_host_ms + (double)off;
+    c->span_ok[which] = 1;
+    if ((double)off > 30000.0) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+        } else {
+            c->base_ok = 0;
+        }
+    }
 }
 
 static int rc_ledger_refuse(RcCtx *c, const char *tag, size_t bytes)
@@ -1005,6 +1046,49 @@ __device__ __forceinline__ void score_step(
             a += wi * (double)rc_class_row_loss(pred, t, MODE);
             b += wi;
         }
+    } else if (w && MODE != RC_SCORE_MAXIMUM) {
+        /* Weighted regression: `a` carries `Σ wᵢ·termᵢ`, `b` the weight sum
+           (correlation pass 1 keeps the cross moment in `b`). A zero-weight
+           row is skipped before the program runs. */
+        const bool corr = MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+        for (long long r = first; r < r_end; r += lanes) {
+            const int i = (int)r;
+            const double wi = w[i];
+            if (!isfinite(wi) || wi < 0.0) {
+                lbad = 1;
+                continue;
+            }
+            if (wi == 0.0) continue;
+            const float pred = rc_exec_row(code, wc, ld, i);
+            if (!isfinite(pred) || fabsf(pred) > 1e30f) {
+                lbad = 1;
+                continue;
+            }
+            if (corr) {
+                if (PASS == 0) {
+                    a += wi * (double)pred;
+                    b += wi;
+                } else {
+                    const double dp = (double)pred - pb;
+                    const double dy = (double)y[i] - ybar;
+                    a += wi * dp * dp;
+                    b += wi * dp * dy;
+                }
+                continue;
+            }
+            const double res = (double)pred - (double)y[i];
+            if (MODE == RC_SCORE_ABSOLUTE) {
+                a += wi * fabs(res);
+            } else if (MODE == RC_SCORE_LOG_SQUASHED) {
+                const double rr = res * res;
+                a += wi * (isfinite(rr) ? log1p(rr) : 2.0 * log(fabs(res)));
+            } else if (MODE == RC_SCORE_SIGNED) {
+                a += wi * res;
+            } else {
+                a += wi * res * res;
+            }
+            b += wi;
+        }
     } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
         if (PASS == 0) {
             for (long long r = first; r < r_end; r += lanes) {
@@ -1157,6 +1241,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
                             a, b, best_key, best_row, bad);
         if (tid == 0) sbad = 0;
         sh1[tid] = a;
+        sh2[tid] = b;
         __syncthreads();
         if (bad) atomicOr(&sbad, 1);
         __syncthreads();
@@ -1168,10 +1253,21 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
             return;
         }
         for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                if (w) sh2[tid] += sh2[tid + st];
+            }
             __syncthreads();
         }
-        const double pbar = sh1[0] / (double)n;
+        if (w && !(sh2[0] > 0.0)) {
+            if (tid == 0) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            }
+            return;
+        }
+        const double pbar = w ? sh1[0] / sh2[0] : sh1[0] / (double)n;
+        __syncthreads();
 
         /* Pass 2: centred sums. ybar/syy were cached per fit sample. */
         bad = 0;
@@ -1220,6 +1316,7 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
                         a, b, best_key, best_row, bad);
     if (tid == 0) sbad = 0;
     sh1[tid] = a;
+    sh2[tid] = b;
     shk[tid] = best_key;
     shi[tid] = best_row;
     __syncthreads();
@@ -1250,19 +1347,28 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_kernel(
         }
     } else {
         for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-            if ((int)tid < st) sh1[tid] += sh1[tid + st];
+            if ((int)tid < st) {
+                sh1[tid] += sh1[tid + st];
+                if (w) sh2[tid] += sh2[tid + st];
+            }
             __syncthreads();
         }
         if (tid == 0) {
             const double sum = sh1[0];
-            if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
+            const double denom = w ? sh2[0] : (double)n;
+            if (w && !(denom > 0.0)) {
+                out[p] = INFINITY;
+                status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            } else if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
                 out[p] = sum; /* RSS; host applies the penalty. */
+                status[p] = 0;
             } else if (MODE == RC_SCORE_SIGNED) {
-                out[p] = fabs(sum) / (double)n;
+                out[p] = fabs(sum) / denom;
+                status[p] = 0;
             } else {
-                out[p] = sum / (double)n;
+                out[p] = sum / denom;
+                status[p] = 0;
             }
-            status[p] = 0;
         }
     }
 }
@@ -1347,19 +1453,25 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_mid_kernel(
     double *__restrict__ lane_a,
     double *__restrict__ lane_b,
     double *__restrict__ pbar,
-    long long n)
+    long long n,
+    int weighted)
 {
     const int tid = threadIdx.x;
     const int p = blockIdx.x;
     const size_t slot = (size_t)p * (size_t)blockDim.x + (size_t)tid;
     __shared__ double sh1[RC_MAX_THREADS];
+    __shared__ double sh2[RC_MAX_THREADS];
     sh1[tid] = lane_a[slot];
+    sh2[tid] = lane_b[slot];
     __syncthreads();
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
-        if ((int)tid < st) sh1[tid] += sh1[tid + st];
+        if ((int)tid < st) {
+            sh1[tid] += sh1[tid + st];
+            if (weighted) sh2[tid] += sh2[tid + st];
+        }
         __syncthreads();
     }
-    if (tid == 0) pbar[p] = sh1[0] / (double)n;
+    if (tid == 0) pbar[p] = weighted ? (sh2[0] > 0.0 ? sh1[0] / sh2[0] : NAN) : sh1[0] / (double)n;
     lane_a[slot] = 0.0;
     lane_b[slot] = 0.0;
 }
@@ -1372,6 +1484,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
     const int *__restrict__ bad,
     long long n,
     double syy,
+    const double *__restrict__ pbar,
+    int weighted,
     double *__restrict__ out,
     int *__restrict__ status)
 {
@@ -1415,7 +1529,8 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
     sh2[tid] = lane_b[slot];
     __syncthreads();
     const int two = (MODE >= RC_SCORE_LOG_LOSS && MODE <= RC_SCORE_HINGE_SQUARED) ||
-                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED;
+                    MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED ||
+                    weighted;
     for (int st = blockDim.x / 2; st > 0; st >>= 1) {
         if ((int)tid < st) {
             sh1[tid] += sh1[tid + st];
@@ -1433,6 +1548,11 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
             status[p] = 0;
         }
     } else if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
+        if (weighted && !(pbar[p] == pbar[p])) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            return;
+        }
         const double spp = sh1[0];
         const double spy = sh2[0];
         const double rho = (spp <= 0.0 || syy <= 0.0)
@@ -1442,12 +1562,18 @@ __global__ void __launch_bounds__(RC_MAX_THREADS, 6) score_finish_kernel(
         status[p] = 0;
     } else {
         const double sum = sh1[0];
+        const double denom = weighted ? sh2[0] : (double)n;
+        if (weighted && !(denom > 0.0)) {
+            out[p] = INFINITY;
+            status[p] = RC_SCORE_ALL_ZERO_WEIGHT;
+            return;
+        }
         if (MODE == RC_SCORE_AIC || MODE == RC_SCORE_AICC || MODE == RC_SCORE_BIC) {
             out[p] = sum;
         } else if (MODE == RC_SCORE_SIGNED) {
-            out[p] = fabs(sum) / (double)n;
+            out[p] = fabs(sum) / denom;
         } else {
-            out[p] = sum / (double)n;
+            out[p] = sum / denom;
         }
         status[p] = 0;
     }
@@ -3606,8 +3732,20 @@ static void *rc_create_impl(const float *cols, int n, int v, const float *y,
         }
         c->syy = ss;
     }
+    c->ybar_u = c->ybar;
+    c->syy_u = c->syy;
+    c->wrows = n;
     cudaEventCreate(&c->t0);
     cudaEventCreate(&c->t1);
+    c->base_ok = 0;
+    c->span_ok[0] = c->span_ok[1] = 0;
+    if (cudaEventCreate(&c->ev_base) == cudaSuccess) {
+        cudaEventRecord(c->ev_base, 0);
+        if (cudaEventSynchronize(c->ev_base) == cudaSuccess) {
+            c->base_host_ms = rc_now_ms();
+            c->base_ok = 1;
+        }
+    }
     /* #285: copy streams and the per-slot events. A failed stream/event
        creation is not fatal: the batch path then keeps its synchronous
        semantics with a recorded reason. */
@@ -3716,6 +3854,7 @@ void rc_destroy(void *ctx)
     if (c->s_h2d) cudaStreamDestroy(c->s_h2d);
     if (c->s_d2h) cudaStreamDestroy(c->s_d2h);
     if (c->s_eval) cudaStreamDestroy(c->s_eval);
+    cudaEventDestroy(c->ev_base);
     cudaEventDestroy(c->t0);
     cudaEventDestroy(c->t1);
     free(c);
@@ -3869,6 +4008,7 @@ float rc_eval_collect(void *ctx, float *out)
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = c->pending.nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     if (failed) st->failed = 1;
@@ -4069,6 +4209,7 @@ float rc_pool_eval(void *ctx, int which, int nprog, int width, float *out, int l
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
     return ms;
@@ -4106,6 +4247,44 @@ static double rc_aic_value(int kind, double rss, int n, int k)
     const double denom = dn - dk - 1.0;
     if (denom <= 0.0) return INFINITY;
     return base + 2.0 * dk + 2.0 * dk * (dk + 1.0) / denom;
+}
+
+/* Row-weighted target moments for the weighted correlation, computed from the
+   resident f32 target exactly as `metrics::weighted_correlation` computes them
+   over the positive-weight rows. A null `w` restores the unweighted moments. */
+static int rc_weighted_moments(RcCtx *c, const double *w)
+{
+    c->ybar = c->ybar_u;
+    c->syy = c->syy_u;
+    c->wrows = c->n;
+    if (!w) return 0;
+    float *y = (float *)malloc(sizeof(float) * (size_t)c->n);
+    if (!y) return -1;
+    rc_download(y, c->d_y, sizeof(float) * (size_t)c->n);
+    double total = 0.0, mb = 0.0;
+    int rows = 0;
+    for (int i = 0; i < c->n; ++i) {
+        if (w[i] > 0.0) {
+            total += w[i];
+            mb += w[i] * (double)y[i];
+            ++rows;
+        }
+    }
+    double sb = 0.0;
+    if (total > 0.0) {
+        mb /= total;
+        for (int i = 0; i < c->n; ++i) {
+            if (w[i] > 0.0) {
+                const double db = (double)y[i] - mb;
+                sb += w[i] * db * db;
+            }
+        }
+    }
+    free(y);
+    c->ybar = mb;
+    c->syy = sb;
+    c->wrows = rows;
+    return 0;
 }
 
 /* #293: lanes of the score launch, the block width of `score_kernel`. */
@@ -4172,11 +4351,12 @@ static void rc_rows_run(RcCtx *c, const unsigned int *prog, const unsigned int *
                     (size_t)nprog * ((size_t)lanes * 16 + 16), 0);
     rc_rows_pass<MODE, 0>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+        score_mid_kernel<MODE><<<nprog, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
         rc_rows_pass<MODE, 1>(c, prog, off, width, pooled, nprog, lanes, bounds, nbounds);
     }
     score_finish_kernel<MODE><<<nprog, lanes>>>(
-        lane_a, lane_b, bad, (long long)c->n, c->syy, c->d_score_out, c->d_score_status);
+        lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
+        c->d_score_out, c->d_score_status);
 }
 
 static int rc_rows_dispatch(RcCtx *c, const unsigned int *prog, const unsigned int *off,
@@ -4284,11 +4464,11 @@ static void rc_tiles_run(RcCtx *c, const unsigned int *prog, const unsigned int 
         cudaMemsetAsync(c->d_carry, 0, (size_t)nw * ((size_t)lanes * 16 + 16), 0);
         rc_tiles_pass<MODE, 0>(c, progw, offw, width, pooled, nw, lanes);
         if (MODE == RC_SCORE_CORRELATION || MODE == RC_SCORE_CORRELATION_SIGNED) {
-            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n);
+            score_mid_kernel<MODE><<<nw, lanes>>>(lane_a, lane_b, pbar, (long long)c->n, c->d_w64 ? 1 : 0);
             rc_tiles_pass<MODE, 1>(c, progw, offw, width, pooled, nw, lanes);
         }
         score_finish_kernel<MODE><<<nw, lanes>>>(
-            lane_a, lane_b, bad, (long long)c->n, c->syy,
+            lane_a, lane_b, bad, (long long)c->n, c->syy, pbar, c->d_w64 ? 1 : 0,
             c->d_score_out + w0, c->d_score_status + w0);
         c->wave_count++;
     }
@@ -4339,6 +4519,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
     st->alloc_ms += rc_now_ms() - t;
     int threads = RC_MIN_THREADS;
     while (threads < RC_MAX_THREADS && threads < c->n) threads <<= 1;
+
+    /* Maximum has no weighted form: a weighted launch is refused, never scored
+       unweighted. */
+    if (kind == RC_SCORE_MAXIMUM && c->d_w64) {
+        st->failed = 1;
+        st->wall_ms = rc_now_ms() - c->batch_start_ms;
+        return -1.0f;
+    }
 
     /* #289: a classification launch without the uploaded label sign is refused
        here, so it can never be scored by another objective. */
@@ -4488,13 +4676,14 @@ static float rc_score_launch(RcCtx *c, const unsigned int *prog,
         for (int i = 0; i < nprog; ++i) {
             if (status[i] == 0) {
                 const int k = pcount ? pcount[i] : 0;
-                out[i] = rc_aic_value(kind, out[i], c->n, k);
+                out[i] = rc_aic_value(kind, out[i], c->d_w64 ? c->wrows : c->n, k);
             }
         }
     }
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
     st->kernel_ms = (double)ms;
+    rc_span_capture(c, 0);
     if (bounds || c->tiled) c->carry_warm = 1;
     st->batch = nprog;
     st->wall_ms = rc_now_ms() - c->batch_start_ms;
@@ -4585,6 +4774,21 @@ int rc_last_stats(void *ctx, RcStats *out)
     return 0;
 }
 
+/* #284: the last kernel span of kind `which` (0 evaluator, 1 fit), placed by
+   event timestamps. Writes the span start and the current time on the same
+   monotonic clock, in milliseconds, and clears the span. Returns 1 when a span
+   was available, else 0 and the caller keeps its host envelope. */
+int rc_last_span(void *ctx, int which, double *start_ms, double *now_ms)
+{
+    RcCtx *c = (RcCtx *)ctx;
+    if (!c || !start_ms || !now_ms || which < 0 || which > 1) return 0;
+    if (!c->span_ok[which]) return 0;
+    c->span_ok[which] = 0;
+    *start_ms = c->span_start_ms[which];
+    *now_ms = rc_now_ms();
+    return 1;
+}
+
 /* Canonical postfix hashes of the last uploaded buffer. */
 int rc_pool_hash(void *ctx, int which, int nprog, int width, unsigned long long *out)
 {
@@ -4613,6 +4817,7 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
     if (c->d_cols64) { rc_dev_free(c, c->d_cols64); c->d_cols64 = 0; }
     if (c->d_y64) { rc_dev_free(c, c->d_y64); c->d_y64 = 0; }
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
+    rc_weighted_moments(c, 0);
     /* #288: the rank stage caches B from the previous target. Re-uploading
        exact rows invalidates it, or a scorer called after this would rank the
        new predictions against the old target. */
@@ -4637,6 +4842,7 @@ int rc_set_fit_data(void *ctx, const double *cols, const double *y, const double
             return -1;
         }
         rc_upload(c->d_w64, w, yb);
+        if (rc_weighted_moments(c, w) != 0) return -1;
     }
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
@@ -4664,6 +4870,7 @@ int rc_set_score_weights(void *ctx, const double *w)
     RcCtx *c = (RcCtx *)ctx;
     if (!c) return -1;
     if (c->d_w64) { rc_dev_free(c, c->d_w64); c->d_w64 = 0; }
+    rc_weighted_moments(c, 0);
     if (!w) return 0;
     size_t yb = sizeof(double) * (size_t)c->n;
     if (rc_dev_alloc(c, "w_f64", (void **)&c->d_w64, yb) != 0) {
@@ -4672,6 +4879,11 @@ int rc_set_score_weights(void *ctx, const double *w)
     }
     rc_upload(c->d_w64, w, yb);
     if (cudaGetLastError() != cudaSuccess) {
+        rc_dev_free(c, c->d_w64);
+        c->d_w64 = 0;
+        return -1;
+    }
+    if (rc_weighted_moments(c, w) != 0) {
         rc_dev_free(c, c->d_w64);
         c->d_w64 = 0;
         return -1;
@@ -4801,6 +5013,7 @@ float rc_fit_batch(void *ctx,
     rc_fs_ok(c, RC_FS_FIT);
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5084,6 +5297,7 @@ float rc_rank_score_batch(void *ctx,
     rc_fs_ok(c, RC_FS_RANK);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5448,6 +5662,7 @@ float rc_max_scan_batch(void *ctx,
     rc_fs_ok(c, RC_FS_MAX);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 
@@ -5571,6 +5786,7 @@ float rc_order_stat_score_batch(void *ctx,
     rc_fs_ok(c, RC_FS_ORDER);
     float ms = -1.0f;
     cudaEventElapsedTime(&ms, c->t0, c->t1);
+    rc_span_capture(c, 1);
     return ms;
 }
 

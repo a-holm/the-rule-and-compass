@@ -985,8 +985,14 @@ impl GpuSearch {
                 self.fit_ms += ms as f64;
                 // #284: the fit kernel is one device interval on the run clock;
                 // its duration is the raw event time, not the host envelope.
-                self.ledger
-                    .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0);
+                match self.ev.take_span_start_s(crate::gpu::SPAN_FIT) {
+                    Some(start_s) => self
+                        .ledger
+                        .record_fit_kernel_event(0, start_s, ms as f64 / 1000.0),
+                    None => self
+                        .ledger
+                        .record_fit_kernel_interval(0, fit_device_start, ms as f64 / 1000.0),
+                }
             }
             if out.len() == jobs.len() {
                 // #290: a successful batch is what makes this run device-used.
@@ -2296,9 +2302,10 @@ fn score_pipeline_batch(
 /// and every metric without a native kernel objective would be ranked by a
 /// proxy it is not defined on. Each of those keeps the CPU evaluator.
 ///
-/// #289: the classification scorer carries the per-row weights, so `--weight`
-/// is admitted for log_loss/Brier/the hinge forms; the regression kernels still
-/// have no weighted path, so a weighted regression run keeps the CPU.
+/// The native scorers carry the per-row weights, so `--weight` is admitted for
+/// every native metric with a weighted form (`metrics::weights_supported`):
+/// the regression family and the classification objectives. `maximum` refuses
+/// weights.
 ///
 /// #288: the order/rank family and `auc` are `ScoreDispatch::Exact` rows scored
 /// by the plan batch entry point; this gate admits them from their measured row
@@ -2310,14 +2317,16 @@ fn gpu_blocker(cfg: &Config, train: &Sample) -> Option<&'static str> {
     if train.is_multi() {
         return Some("multi-output objective");
     }
-    // #289: only the classification scorer has a device weight path. A
-    // weighted regression run keeps the exact CPU evaluator rather than
-    // dropping the weights.
+    // Weighted rows run on the device only through a native scorer that has a
+    // weighted form; every other metric keeps the exact CPU evaluator rather
+    // than dropping the weights.
     if !train.w.is_empty() {
-        let class_native = crate::metrics::native_score_objective(cfg.metric)
-            .map_or(false, |o| o.is_classification());
-        if !class_native {
-            return Some("weighted rows need a native classification scorer");
+        match crate::metrics::native_score_objective(cfg.metric) {
+            Some(crate::metrics::ScoreObjective::Maximum) => {
+                return Some("weighted rows: maximum has no weighted form");
+            }
+            Some(_) if crate::metrics::weights_supported(cfg.metric) => {}
+            _ => return Some("weighted rows need a native scorer with a weighted form"),
         }
     }
     // #236/#287/#288: a metric may use the device only when the score-dispatch
@@ -4781,6 +4790,7 @@ fn run_postfix_search(
         t0.elapsed().as_secs_f64(),
     );
     let mut eval_stage_total = 0.0f64;
+    let mut io_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
     // #211: why the loop ends, for the development log's run_end event.
@@ -5026,6 +5036,7 @@ fn run_postfix_search(
 
         if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
             last_save = std::time::Instant::now();
+            let io_mark = std::time::Instant::now();
             let trees = next
                 .to_trees()
                 .ok_or_else(|| "postfix pool could not be decoded for a checkpoint".to_string())?;
@@ -5062,6 +5073,7 @@ fn run_postfix_search(
                 None,
             );
             emit(&mut on_checkpoint, &cp);
+            io_stage_total += io_mark.elapsed().as_secs_f64();
         }
 
         pool = next;
@@ -5077,6 +5089,7 @@ fn run_postfix_search(
     // #284: close measured generation stages to the run clock. The evaluator
     // window joins the ledger first so the fit reclassification can subtract
     // from it rather than add a second stage.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
     let tail_start = std::time::Instant::now();
     let pre_tail_elapsed = tail_start.duration_since(t0).as_secs_f64();
@@ -5090,6 +5103,8 @@ fn run_postfix_search(
 
     // #256: the exit checkpoint is emitted after the exact f64 rebuild so it
     // carries the archive the run reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let trees = pool
             .to_trees()
@@ -5130,6 +5145,7 @@ fn run_postfix_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // Exact f64 rebuild over the surviving front only. The generation errors
     // were the f32 kernel proxy; every number the user reads comes from here.
@@ -5162,7 +5178,9 @@ fn run_postfix_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     let best = final_archive
@@ -5175,7 +5193,11 @@ fn run_postfix_search(
     // #284: the remaining tail is one measured host window (final f64 rebuild,
     // test scoring and archive canonicalisation).
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
-    run_ledger.record_stage(crate::gpu_stats::Stage::HostOther, tail_total);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
+    run_ledger.record_stage(
+        crate::gpu_stats::Stage::HostOther,
+        (tail_total - io_final_s).max(0.0),
+    );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
     let mut stats = gpu.run_stats();
@@ -5895,6 +5917,7 @@ fn run_search(
         (setup_s - setup_fit_s).max(0.0),
     );
     #[cfg_attr(not(feature = "cuda"), allow(unused_variables, unused_assignments))]
+    let mut io_stage_total = 0.0f64;
     let mut eval_stage_total = 0.0f64;
     let mut last_save = std::time::Instant::now();
     let save_interval_s = checkpoint_interval_s();
@@ -6552,6 +6575,7 @@ fn run_search(
             // generation's work, including migration and restarts, is done.
             if checkpoint_due(save_every, gens_done, last_save.elapsed().as_secs_f64(), save_interval_s) {
                 last_save = std::time::Instant::now();
+                let io_mark = std::time::Instant::now();
                 let backend = if defer_gpu || gpu_used {
                     Backend::Gpu
                 } else {
@@ -6574,6 +6598,7 @@ fn run_search(
                     None,
                 );
                 emit(&mut on_checkpoint, &cp);
+                io_stage_total += io_mark.elapsed().as_secs_f64();
             }
 
             if budget_hit {
@@ -6589,6 +6614,7 @@ fn run_search(
     let _ = eval_stage_total;
     // The measured evaluator windows join the ledger before the closure check;
     // the fit part is reclassified below after the gadget's totals are known.
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_stage_total);
     run_ledger.record_stage(crate::gpu_stats::Stage::Eval, eval_stage_total);
 
     // #284: close the generation loop's measured stages to the run clock. Any
@@ -6619,6 +6645,8 @@ fn run_search(
     // saved search archive is the one at the last completed generation. It is
     // emitted after the rebuild (#256) so it also carries the archive the run
     // reports.
+    let mut io_final_s = 0.0f64;
+    let io_mark = std::time::Instant::now();
     let pending_cp: Option<Checkpoint> = if on_checkpoint.is_some() {
         let backend = if (defer_gpu && !fit_only_device) || gpu_used {
             Backend::Gpu
@@ -6645,6 +6673,7 @@ fn run_search(
     } else {
         None
     };
+    io_final_s += io_mark.elapsed().as_secs_f64();
 
     // #169: with the GPU-fit arm every finalist is also refit by the exact CPU
     // f64 LM before it is scored on all training rows.
@@ -6695,7 +6724,9 @@ fn run_search(
             items: final_archive.items.clone(),
             cap: final_archive.cap,
         });
+        let io_mark = std::time::Instant::now();
         emit(&mut on_checkpoint, &cp);
+        io_final_s += io_mark.elapsed().as_secs_f64();
     }
 
     // #18: the last in-loop reading describes the final generation. If no
@@ -6719,9 +6750,10 @@ fn run_search(
     run_ledger.record_stage(crate::gpu_stats::Stage::Fit, refit_tail_s);
     run_ledger.record_refit(gpu_fit_refits as u64, refit_tail_s);
     let tail_total = (t0.elapsed().as_secs_f64() - pre_tail_elapsed).max(0.0);
+    run_ledger.record_stage(crate::gpu_stats::Stage::Io, io_final_s);
     run_ledger.record_stage(
         crate::gpu_stats::Stage::HostOther,
-        (tail_total - refit_tail_s).max(0.0),
+        (tail_total - refit_tail_s - io_final_s).max(0.0),
     );
     run_ledger.set_wall(t0.elapsed().as_secs_f64());
 
