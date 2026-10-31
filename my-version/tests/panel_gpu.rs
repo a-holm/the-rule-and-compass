@@ -6,8 +6,8 @@
 //! and conflicting duplicates, listing/delisting/migration/membership chain
 //! resets, prefix replay and block-size invariance.
 //!
-//! #302 adds the PIT membership / MTF as-of joins (`pit_*` tests): boundary
-//! fixtures, `bar_age`, chain resets, prefix replay at 20 cuts, the
+//! #302 adds the PIT membership as-of join (`pit_*` tests): boundary
+//! fixtures, chain resets, prefix replay at 20 cuts, the
 //! future-shift canary, cold/warm and CPU/GPU byte identity, and block and chunk
 //! size invariance.
 //!
@@ -542,7 +542,7 @@ fn nan_is_a_gap_not_zero_and_negative_zero_is_a_conflict() {
 }
 
 // ---------------------------------------------------------------------------
-// #302: PIT membership / MTF as-of joins
+// #302: PIT membership as-of join
 // ---------------------------------------------------------------------------
 
 fn pit_gpu(block: &PitBlock, p: PitParams) -> rcsr::panel_pit::PitOutput {
@@ -553,9 +553,6 @@ fn pit_gpu(block: &PitBlock, p: PitParams) -> rcsr::panel_pit::PitOutput {
 fn pit_cases() -> Vec<(&'static str, PitBlock, PitParams)> {
     vec![
         ("membership", pit::membership_block(31, 7, 5000), PitParams::membership(900)),
-        ("mtf1h", pit::mtf_block(32, 7, 5000, 3600), PitParams::mtf(3600, 900)),
-        ("mtf4h", pit::mtf_block(33, 7, 5000, 14_400), PitParams::mtf(14_400, 900)),
-        ("mtf1d", pit::mtf_block(34, 7, 5000, 86_400), PitParams::mtf(86_400, 900)),
     ]
 }
 
@@ -567,7 +564,7 @@ fn pit_boundaries_and_chain_resets_match_the_cpu_reference() {
     // Decisions at 1000 (member), 2000 (excluded), 3000 (member again); rows one
     // second before, at and after each; a migration chain change at 3500.
     let times = [999i64, 1000, 1001, 1999, 2000, 2001, 2999, 3000, 3001, 3500, 3501];
-    let mut block = PitBlock {
+    let block = PitBlock {
         times: times.to_vec(),
         chain: vec![0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1],
         segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 11, leaf_start: 0, leaf_len: 3 }],
@@ -585,24 +582,6 @@ fn pit_boundaries_and_chain_resets_match_the_cpu_reference() {
     assert_eq!(gpu.gap[9], 0, "a migration chain change is not bridged");
     assert_ne!(gpu.chain_id[9], gpu.chain_id[8]);
 
-    // MTF exactly at t and one second before; bar_age finite on a stale bucket.
-    block = PitBlock {
-        times: vec![3599, 3600, 7199, 7200, 14_400],
-        chain: vec![0; 5],
-        segments: vec![rcsr::panel_pit::PitSegment { start: 0, len: 5, leaf_start: 0, leaf_len: 2 }],
-        keys: vec![0, 3600],
-        member: vec![1, 1],
-    };
-    let p = PitParams::mtf(3600, 900);
-    let cpu = panel_pit::join(&block, p).unwrap();
-    let gpu = pit_gpu(&block, p);
-    pit::assert_same("mtf boundary", &cpu, &gpu);
-    assert_eq!(gpu.leaf, vec![-1, 0, 0, 1, 1]);
-    assert!(gpu.age[0].is_nan());
-    assert_eq!(gpu.age[1], 0.0);
-    assert_eq!(gpu.fresh[2], 1);
-    assert_eq!(gpu.fresh[4], 0, "the 2h-old bucket is stale");
-    assert!(gpu.age[4].is_finite() && gpu.age[4] == 7200.0);
 }
 
 #[test]
@@ -647,7 +626,7 @@ fn pit_prefix_replay_at_twenty_cuts_on_the_device() {
         let hi = *block.times.iter().max().unwrap();
         for k in 0..20 {
             let cut = lo + (hi - lo) * (k + 1) / 21;
-            let pre_block = pit::prefix(&block, cut, p.delay);
+            let pre_block = pit::prefix(&block, cut);
             if pre_block.times.is_empty() {
                 continue;
             }
@@ -669,7 +648,7 @@ fn pit_future_shifted_column_fails_the_device_check() {
         assert!(gpu.run(p));
         let out = gpu.output().unwrap();
         assert_eq!(out.lookahead_violations, 0, "{name}");
-        assert_eq!(gpu.lookahead_violations(&out.leaf, p.delay), Some(0), "{name}");
+        assert_eq!(gpu.lookahead_violations(&out.leaf), Some(0), "{name}");
         let mut shifted = out.leaf.clone();
         for s in &block.segments {
             let le = (s.leaf_start + s.leaf_len) as i32;
@@ -679,8 +658,8 @@ fn pit_future_shifted_column_fails_the_device_check() {
                 }
             }
         }
-        let cpu_bad = panel_pit::lookahead_violations(&block, &shifted, p.delay);
-        let gpu_bad = gpu.lookahead_violations(&shifted, p.delay).unwrap();
+        let cpu_bad = panel_pit::lookahead_violations(&block, &shifted);
+        let gpu_bad = gpu.lookahead_violations(&shifted).unwrap();
         assert!(gpu_bad > 0, "{name}: shifted column must be reported");
         assert_eq!(gpu_bad, cpu_bad, "{name}");
     }
@@ -728,7 +707,6 @@ fn pit_paired_4_78m_row_join_measurement() {
     }
     for (name, block, p) in [
         ("membership", pit::membership_block(61, 40, 119_500), PitParams::membership(900)),
-        ("mtf1h", pit::mtf_block(62, 40, 119_500, 3600), PitParams::mtf(3600, 900)),
     ] {
         let n = block.times.len();
         assert_eq!(n, 4_780_000);
@@ -743,7 +721,7 @@ fn pit_paired_4_78m_row_join_measurement() {
                 while lo < hi {
                     let mid = (lo + hi) / 2;
                     cpu_loads += 1;
-                    if keys[mid] + p.delay <= t {
+                    if keys[mid] <= t {
                         lo = mid + 1;
                     } else {
                         hi = mid;
