@@ -405,6 +405,72 @@ mod device {
         }
     }
 
+    #[test]
+    fn segment_partitions_give_bit_identical_columns() {
+        if !have_device() {
+            return;
+        }
+        let segs = segs();
+        let nseg = segs.len();
+        let p = panel(&segs, 7);
+        let btc = bench_series(1300, 11, 500);
+        let eth = bench_series(1300, 13, 450);
+        let mut flags = vec![0u8; 2 * nseg];
+        flags[1] = 1;
+        flags[nseg + 2] = 1;
+        let all: Vec<String> = bg::BENCH_DEVICE_COLUMNS.iter().map(|c| c.name.to_string()).collect();
+        let full = bg::compute(
+            &p.times, &p.close, &p.starts, &p.lens, STEP, Some(&btc), Some(&eth), &flags, &all,
+        )
+        .expect("full panel")
+        .0;
+
+        let part = |lo: usize, hi: usize| {
+            let base = p.starts[lo] as usize;
+            let end = (p.starts[hi - 1] + p.lens[hi - 1]) as usize;
+            let starts: Vec<u32> = p.starts[lo..hi].iter().map(|s| s - base as u32).collect();
+            let mut f: Vec<u8> = flags[lo..hi].to_vec();
+            f.extend_from_slice(&flags[nseg + lo..nseg + hi]);
+            bg::compute(
+                &p.times[base..end],
+                &p.close[base..end],
+                &starts,
+                &p.lens[lo..hi],
+                STEP,
+                Some(&btc),
+                Some(&eth),
+                &f,
+                &all,
+            )
+            .expect("partition")
+            .0
+        };
+
+        let one_each: Vec<(usize, usize)> = (0..nseg).map(|i| (i, i + 1)).collect();
+        let partitions: [(&str, Vec<(usize, usize)>); 3] = [
+            ("one segment per call", one_each),
+            ("uneven 1/2/6", vec![(0, 1), (1, 3), (3, nseg)]),
+            ("uneven 4/5", vec![(0, 4), (4, nseg)]),
+        ];
+        for (label, ranges) in &partitions {
+            let mut stitched: Vec<Vec<f64>> = vec![Vec::new(); full.len()];
+            for &(lo, hi) in ranges {
+                let cols = part(lo, hi);
+                assert_eq!(cols.len(), full.len());
+                for (k, (name, v)) in cols.into_iter().enumerate() {
+                    assert_eq!(name, full[k].0);
+                    stitched[k].extend(v);
+                }
+            }
+            for (k, (name, want)) in full.iter().enumerate() {
+                assert_eq!(stitched[k].len(), want.len(), "{label} {name} length");
+                for (i, (g, w)) in stitched[k].iter().zip(want).enumerate() {
+                    assert!(same_bits(*g, *w), "{label} {name} row {i}: partition {g:?} full {w:?}");
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Cross-section means
     // ---------------------------------------------------------------------
