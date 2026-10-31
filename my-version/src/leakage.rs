@@ -591,7 +591,7 @@ pub const AUDIT_EXIT_CODE: i32 = 5;
 
 /// D13: checks of a declared target against the model inputs (#254).
 ///
-/// * `D13a` the future return, or the target itself, is an input;
+/// * `D13a` the future return, the target itself or a label-family column is an input;
 /// * `D13b` the scale column's window ends after the decision time;
 /// * `D13c` the label has a structural term: its null prediction depends on a
 ///   column, so a model can score by recovering that column from proxies. The
@@ -624,6 +624,20 @@ pub fn target_structure(spec: &crate::target::TargetSpec, vars: &[String]) -> Re
             None,
             format!("target '{}' is an input variable", spec.column),
         ));
+    }
+    for v in vars {
+        let reported = spec.return_column.as_deref() == Some(v.as_str()) || *v == spec.column;
+        if !reported && crate::registry::lookup(v).is_some_and(|r| r.family == "nolabel") {
+            report.leaks.push(Leak::new(
+                "D13a",
+                Some(v.clone()),
+                None,
+                format!(
+                    "label-family column '{}' reads bars after the decision time and is an input variable",
+                    v
+                ),
+            ));
+        }
     }
     if let crate::target::Scale::Column {
         column,

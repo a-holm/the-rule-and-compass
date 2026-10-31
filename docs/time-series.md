@@ -163,7 +163,7 @@ symmetric clip and a scale that ends at or before the decision time
 
 | detector | refuses | override |
 |---|---|---|
-| `D13a` | `return_column` or the target in `--vars` | none |
+| `D13a` | `return_column`, the target or any label-family column (`lbl_*`) in `--vars` | none |
 | `D13b` | a scale window that ends after the decision time | none |
 | `D13c` | a structural term | `--allow-target-structure` (diagnostic replays) |
 
@@ -244,9 +244,11 @@ A row is `NaN` when any bar from `t` to `t+h+d` is missing, partial or has a non
 
 **Overlap.** Uniqueness weights `u_i = mean over the label's bars of 1/c_t` and `w_i = u_i*n/sum(u)` are stored with the labels (`c_t` is the number of labels covering bar `t`). The report records `effective_n = sum(u)` and `effective_n_hours = effective_n * horizon hours`. A stride below the horizon is refused for horizons of 4 h and longer unless `--allow-overlap` is given (`rcsr enrich`, `rcsr prep`); stride at `h` is the primary fix.
 
-**Report.** The label report lists the share of rows clipped at the bound, the sign shares of `fwd`, its mean and the 1, 5, 25, 50, 75, 95 and 99 % quantiles, the cost-to-move ratio (round trip over mean absolute `fwd`), the exit counts, the purge and the label hash (SHA-256 of the definition version, spec and every column).
+**Report.** The label report lists the share of rows clipped at the bound, the sign shares of `fwd`, its mean and the 1, 5, 25, 50, 75, 95 and 99 % quantiles, the cost-to-move ratio (round trip over mean absolute `fwd`), the exit counts, the purge and the label hash (SHA-256 of the definition version, spec and every column). It also lists the 10 largest absolute forward moves with symbol, decision timestamp and value, the replacement for the retired jumps audit. A panel report merges all symbols; its label hash is the SHA-256 of the spec and each symbol's series hash in store order.
 
-**Verify.** `tests/long_labels.rs`: `horizon_windows_enter_next_open_and_exit_at_close_exactly`, `action_is_zero_or_plus_one_and_follows_the_cost`, `barrier_hits_profit_stop_and_vertical_in_the_expected_order`, `both_barriers_inside_one_bar_assume_the_stop`, `missing_partial_and_gap_crossing_windows_are_nan`, `purge_is_derived_from_the_spec_not_from_a_name`, `t1_and_the_derived_spec_drive_the_split_purge`, `overlap_is_guarded_and_uniqueness_weights_are_stored`.
+**Columns.** `rcsr enrich --label long:<tf|bars>[,name=<id>][,fee=<bp>][,spread=<bp>][,slip=<bp>][,vol=<bars>][,floor=<bp>][,clip=<c>][,up=<u>][,down=<d>][,delay=<bars>][,stride=<n>]` appends the scale column `vol<W>` when the store lacks it, and `lbl_<name>_fwd`, `_y`, `_long_net`, `_action`, `_t1`, `_exit_ret`, `_m_net`, `_m_barrier` and `_weight` (default name `h<bars>`). They are registered in family `label`: the barrier-scaled kinds (`_y`, `_exit_ret`, `_m_net`, `_m_barrier`) are `NaN` for the first `W` bars of a symbol, the PIT rule is "reads bars t+1 through t+h+d". Next to the store it writes `<out>.labels.json` (the report per target column) and a `y` entry in `<out>.targets.json`, so a run on `lbl_<name>_y` loads the spec and echoes the report in `run.json` as `target_spec.label_report`. A label-family column is refused in `--vars` (D13a, exit 5) and is left out of the default variable list. `rcsr prep` keeps the legacy `fwd:` label only.
+
+**Verify.** `tests/long_labels.rs`: `horizon_windows_enter_next_open_and_exit_at_close_exactly`, `action_is_zero_or_plus_one_and_follows_the_cost`, `barrier_hits_profit_stop_and_vertical_in_the_expected_order`, `both_barriers_inside_one_bar_assume_the_stop`, `missing_partial_and_gap_crossing_windows_are_nan`, `purge_is_derived_from_the_spec_not_from_a_name`, `t1_and_the_derived_spec_drive_the_split_purge`, `overlap_is_guarded_and_uniqueness_weights_are_stored`, `spec_parses_and_refuses_what_it_cannot_label`, `top_moves_are_the_largest_absolute_forward_moves_with_stamps`, `accumulator_merges_symbols_and_hash_follows_every_series`, `label_family_columns_are_refused_as_inputs_by_the_d13a_canary`; `tests/enrich.rs`: `long_label_family_is_stored_registered_and_reported`, `legacy_fwd_label_is_unchanged_next_to_a_long_label`, `long_label_dry_run_writes_no_sidecar_and_bad_specs_fail`.
 
 ---
 
