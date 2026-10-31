@@ -32,9 +32,9 @@ mod stream;
 mod varpro;
 
 pub use gpu::{
-    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable, gate_proposal,
-    is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
-    BatchedFitter, ProposalGate, VerifiedBatch,
+    backend_description, exact_metric_score, fit_batch_verified, fit_status_usable,
+    gate_device_proposal, gate_proposal, is_squared_family, maximum_finalist, refit_finalists_exact, signed_finalist, BatchStatus,
+    BatchedFitter, ProposalGate, VerifiedBatch, Verdict,
 };
 #[cfg(feature = "cuda")]
 pub use gpu::BatchedGpu;
@@ -633,6 +633,26 @@ pub fn interquartile_gpu_fit_worthwhile(n: usize, p: usize, sweeps: usize) -> bo
 /// objective to fit and the device must not invent `max √wᵢ|rᵢ|`.
 pub fn maximum_fit_only(metric: Metric) -> bool {
     metric == Metric::Maximum
+}
+
+/// True when a device proposal for `metric` passes the exact `f64` gate
+/// ([`gate_device_proposal`]) before it replaces the starting constants, and
+/// so cannot run in the ungated pipeline write-back.
+pub fn device_fit_is_gated(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::LogLoss | Metric::Correlation | Metric::CorrelationSigned | Metric::Signed
+    )
+}
+
+/// True when the deferred fit admits every candidate with constants at any row
+/// count: the CPU arm fits each of them, so the `max(32, pop/4)` fraction would
+/// leave the gated arms with a smaller fit set than the exact arm.
+pub fn admits_every_candidate(metric: Metric) -> bool {
+    matches!(
+        metric,
+        Metric::Correlation | Metric::CorrelationSigned | Metric::Signed
+    )
 }
 
 /// #227: rows below which the device maximum-error polish is not worth its
@@ -2943,6 +2963,12 @@ pub fn fit_weighted_metric(
     metric: Metric,
 ) -> f64 {
     use Metric::*;
+    // #398: the level-set distance has its own fit; the generic score of this
+    // metric is `+inf`, so every caller must reach `implicit::fit` here.
+    if metric == ImplicitDerivative {
+        crate::implicit::fit(tree, x, w, iters);
+        return crate::implicit::score_rows(tree, x, w, metric);
+    }
     // #135: `--no-fit` / `--fit-iters 0` must be a true no-op for every metric,
     // not only the squared family. IRLS, logistic IRLS and the coordinate
     // polish all force a minimum of one sweep, so return the current score
@@ -2966,7 +2992,8 @@ pub fn fit_weighted_metric(
         Squared | Aic | Aicc | Bic => {
             unreachable!("least-squares metrics are fitted by fit_weighted")
         }
-        Absolute => irls_fit(tree, x, y, w, iters, metric, |r, _| {
+        ImplicitDerivative => unreachable!("the level-set metric returned above"),
+        Absolute | ImplicitResidual => irls_fit(tree, x, y, w, iters, metric, |r, _| {
             1.0 / r.abs().max(1e-6)
         }),
         LogSquashed => irls_fit(tree, x, y, w, iters, metric, |r, _| {
@@ -2997,15 +3024,13 @@ pub fn fit_weighted_metric(
         | Median
         | Maximum
         | Interquartile
-        | Slope
-        | ImplicitResidual
-        | ImplicitDerivative => {
+        | Slope => {
             let start = metric_score(tree, x, y, w, metric);
             let mut trial = tree.clone();
             fit_weighted(&mut trial, x, y, w, iters);
             coordinate_polish(&mut trial, x, y, w, metric, iters.max(1));
             let score = metric_score(&trial, x, y, w, metric);
-            if score.is_finite() && score < start {
+            if improves(score, start) {
                 *tree = trial;
                 score
             } else {
@@ -3084,6 +3109,13 @@ fn metric_score(tree: &Node, x: &[Vec<f64>], y: &[f64], w: &[f64], metric: Metri
     metrics::score_weighted(&pred, y, w, metric, expr::count_constants(tree))
 }
 
+/// The metric-monotone keep rule: a trial replaces the incumbent only when its
+/// score is finite and strictly lower. Two infinite scores never compare as an
+/// improvement.
+fn improves(score: f64, incumbent: f64) -> bool {
+    score.is_finite() && score < incumbent
+}
+
 /// One IRLS round: fit weighted least squares to `target` with per-row
 /// `weights`, then keep the trial only if the configured metric improves.
 ///
@@ -3134,7 +3166,7 @@ where
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, inner);
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         } else {
@@ -3161,7 +3193,7 @@ where
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, iters.max(4));
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         }
@@ -3319,7 +3351,7 @@ fn logistic_irls(
         let mut trial = tree.clone();
         fit_weighted(&mut trial, x, &target, &weights, 2);
         let score = metric_score(&trial, x, y, w, metric);
-        if score.is_finite() && score < best {
+        if improves(score, best) {
             best = score;
             *tree = trial;
         } else {
@@ -3993,26 +4025,150 @@ pub fn partial(tree: &Node, x: &[f64], var: usize) -> f64 {
 /// occur in `tree` receives `0`; an input index outside `x` is ignored (the
 /// same row would evaluate to `NaN`).
 pub fn input_gradients(tree: &Node, x: &[f64]) -> Vec<f64> {
-    let f = flatten(tree);
-    let n = f.op.len();
-    let mut c = vec![0.0; f.nconst];
-    for i in 0..n {
-        if f.cslot[i] >= 0 {
-            c[f.cslot[i] as usize] = f.val[i];
+    InputGradients::new(tree).gradient(x).to_vec()
+}
+
+/// One tree prepared for repeated input-gradient sweeps: the flat form, the
+/// constant vector and the scratch buffers are built once and reused per row.
+pub(crate) struct InputGradients {
+    f: Flat,
+    c: Vec<f64>,
+    v: Vec<f64>,
+    adj: Vec<f64>,
+    grad: Vec<f64>,
+    cgrad: Vec<f64>,
+}
+
+impl InputGradients {
+    pub(crate) fn new(tree: &Node) -> Self {
+        let f = flatten(tree);
+        let n = f.op.len();
+        let mut c = vec![0.0; f.nconst];
+        for i in 0..n {
+            if f.cslot[i] >= 0 {
+                c[f.cslot[i] as usize] = f.val[i];
+            }
+        }
+        InputGradients {
+            f,
+            c,
+            v: vec![0.0; n],
+            adj: vec![0.0; n],
+            grad: Vec::new(),
+            cgrad: Vec::new(),
         }
     }
-    let mut v = vec![0.0; n];
-    eval_row(&f, x, &c, &mut v);
-    let mut adj = vec![0.0; n];
-    let mut grad = vec![0.0; x.len()];
-    backward_impl(&f, &v, &mut adj, None, Some(&mut grad));
-    grad
+
+    /// Replace the tree's own constants, in pre-order, with `values`.
+    pub(crate) fn set_constants(&mut self, values: &[f64]) {
+        for (&slot, &val) in self.f.normal_order.iter().zip(values) {
+            self.c[slot] = val;
+        }
+    }
+
+    /// `∇f` at `x`; one forward and one backward sweep, no allocation.
+    pub(crate) fn gradient(&mut self, x: &[f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, None, Some(&mut self.grad));
+        &self.grad
+    }
+
+    /// `∂f/∂cⱼ` at `x` for the tree's own constants (pre-order), written to
+    /// `out`; one forward and one backward sweep.
+    pub(crate) fn constant_gradient(&mut self, x: &[f64], out: &mut [f64]) {
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(&self.f, &self.v, &mut self.adj, Some(&mut self.cgrad), None);
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+    }
+
+    /// [`Self::gradient`] and [`Self::constant_gradient`] from one sweep: returns
+    /// `∇f` and writes `∂f/∂cⱼ` to `out`.
+    pub(crate) fn both_gradients(&mut self, x: &[f64], out: &mut [f64]) -> &[f64] {
+        self.grad.clear();
+        self.grad.resize(x.len(), 0.0);
+        self.cgrad.clear();
+        self.cgrad.resize(self.f.nconst, 0.0);
+        eval_row(&self.f, x, &self.c, &mut self.v);
+        backward_impl(
+            &self.f,
+            &self.v,
+            &mut self.adj,
+            Some(&mut self.cgrad),
+            Some(&mut self.grad),
+        );
+        for (o, &slot) in out.iter_mut().zip(&self.f.normal_order) {
+            *o = self.cgrad[slot];
+        }
+        &self.grad
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::expr::{constant, input, node};
+
+    fn implicit_circle() -> (Vec<Vec<f64>>, Vec<f64>) {
+        let n = 60;
+        let x = (0..n)
+            .map(|i| {
+                let a = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+                let r = 1.0 + 0.1 * ((i * 7 % 11) as f64 - 5.0) / 5.0;
+                vec![r * a.cos(), r * a.sin()]
+            })
+            .collect();
+        (x, vec![0.0; n])
+    }
+
+    fn circle_tree(c: f64) -> Node {
+        node(
+            Op::Sub,
+            vec![
+                node(
+                    Op::Add,
+                    vec![
+                        node(Op::Square, vec![input(0)]),
+                        node(Op::Square, vec![input(1)]),
+                    ],
+                ),
+                constant(c),
+            ],
+        )
+    }
+
+    /// #396: on an implicit sample (`y == 0`) `implicit_residual` is the
+    /// `absolute` objective, so its fit moves the constant and matches the
+    /// `absolute` fit bit for bit.
+    #[test]
+    fn implicit_residual_fit_matches_absolute_and_moves_constants() {
+        let (x, y) = implicit_circle();
+        let mut a = circle_tree(1.7);
+        let mut r = circle_tree(1.7);
+        let before = r.clone();
+        let ea = fit_weighted_metric(&mut a, &x, &y, &[], 8, Metric::Absolute);
+        let er = fit_weighted_metric(&mut r, &x, &y, &[], 8, Metric::ImplicitResidual);
+        assert!(er.is_finite());
+        assert_ne!(r, before, "constants must move");
+        assert_eq!(er.to_bits(), ea.to_bits());
+        assert_eq!(r, a);
+    }
+
+    #[test]
+    fn keep_rule_never_compares_infinite_scores() {
+        let inf = f64::INFINITY;
+        assert!(!improves(inf, inf));
+        assert!(!improves(f64::NAN, inf));
+        assert!(!improves(inf, 1.0));
+        assert!(improves(1.0, inf));
+        assert!(improves(0.5, 1.0));
+        assert!(!improves(1.0, 1.0));
+    }
 
     /// #169: the GPU fit plan's constant cap is 20. `p <= 20` is offered to the
     /// kernel (no silent fallback) and `p = 21` is the first labelled

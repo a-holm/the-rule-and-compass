@@ -112,9 +112,13 @@ rᵢ = sqrt(wᵢ) · f(pᵢ) / ||∇f(pᵢ)||,
 minimising `Σ rᵢ²`. The residual is the same quantity the metric measures
 (squared rather than absolute, as least squares requires), and it is invariant
 to the overall scale of `f`, so fitting cannot shrink the level set away. Its
-Jacobian with respect to the constants is obtained by central differences of
-that residual, which also carries the derivative of `||∇f||` without needing a
-second-order adjoint.
+Jacobian with respect to the constants takes three forward-and-backward sweeps
+per row, whatever the number of constants: one at the row, and two at the row
+shifted along the unit normal by `±ε`, whose constant adjoints give the
+derivative of `||∇f||` without a second-order adjoint. Every caller that fits
+this metric, including the finalist refit and the fallback pool, reaches
+`implicit::fit` through `fit_weighted_metric`. The level-set metric stays on the
+CPU (see [`docs/optimisation.md`](optimisation.md) §3.0).
 
 `implicit_residual` starts from the historical least-squares fit
 (`Σ wᵢ·(f(pᵢ) − 0)²`) and then polishes `mean |f|`, the metric it scores

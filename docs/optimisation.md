@@ -247,6 +247,8 @@ is mathematically well posed:
 |---|---|
 | `squared`, `aic`, `aicc`, `bic` | the exact historical Levenberg–Marquardt least-squares path, bit for bit |
 | `absolute` | IRLS with weights `1 / max(|r|, 1e-6)`, each weighted solve on the same LM/QR solver |
+| `implicit_residual` (#396) | on an `--implicit` sample the target is 0, so `Σ w|f| / Σ w` is the `absolute` objective: the same L1 IRLS arm, scored by the finite residual (`score_with_constants` and `score_weighted` share the `absolute` branch). The level-set metric `implicit` keeps its own fit, `implicit::fit` |
+| `implicit` (#398) | `implicit::fit`: Levenberg–Marquardt on the signed geometric residual `f/||∇f||`, CPU `f64` only (no device arm; the measured cost is allocation, not arithmetic). `fit_weighted_metric` routes it there for every caller. The tree is flattened once per fit and per score, the constants are swapped in place per probe, and the Jacobian costs three sweeps per row (a directional difference of the constant adjoint along the unit normal, `ε = 1e-6·(1 + ||p||∞)`) instead of `1 + 2p` |
 | `log_squashed` | IRLS with weights `1 / (1 + r²)`, the derivative of `ln(1 + r²)` |
 | `auc`, `log_loss`, `brier`, `hinge`, `hinge_ordinary`, `hinge_squared` | logistic IRLS on the two-class label, with the model output as a logit; `auc`/Brier/hinge use the smooth logistic surrogate and the configured metric accepts or rejects each step. For `log_loss` the surrogate **is** the metric: Newton/Fisher scoring on `Σ ln(1 + exp(-t·p))` with `q(1-q)` row weights. Brier's probability optimum is the same logit `ln(n₊/n₋)` and the exact Brier value is the gate |
 | `log_loss` with `--fit-strategy gpu` (#234) | the same Fisher scoring in the batched kernel (uploaded label sign, `q(1-q)` weights, `t/q` pseudo-response, `softplus` trial objective, `ln det Ã` gate). The exact CPU `f64` log-loss judges every proposal and refits every finalist; since #289 the **fitness** is native too (log_loss/Brier/hinge), so the search no longer pays a CPU rescoring pass |
@@ -978,8 +980,12 @@ full admission preserves both exact-arm coverage and a large speed-up. Every CPU
 `too_few_rows`, `too_many_constants`, `metric_not_native`, `ill_conditioned`,
 `non_finite`, `launch`, `rank_declined`, `median_declined`,
 `interquartile_declined`, `single_class`, `log_loss_worse`,
-`maximum_declined`) in
-`gpu.fit.fallback_by_cause`. `--fit-strategy gpu`
+`maximum_declined`, `worse`, `not_identifiable`) in
+`gpu.fit.fallback_by_cause`.
+
+**Deferred-fit contract.** The deferred arm does per candidate what the CPU arm does. (1) Gate: for `log_loss`, `correlation`, `correlation_signed` and `signed` (`fit::device_fit_is_gated`) every device proposal passes the exact `f64` gate `fit::gate_device_proposal` on the configured metric, the same entry point as `fit_batch_verified`. A worse proposal restores the incoming constants and the exact CPU arm refits, labelled `worse` (`log_loss_worse` for `log_loss`); a non-finite proposal or objective does the same, labelled `non_finite`; a `signed` proposal that cannot represent the mean is labelled `not_identifiable`. (2) Refresh: after the device write-back, the CPU fallback batch and the pipeline write-back, each fitted tree is simplified and its complexity recomputed (`refresh_after_fit`), as `evolve_island` does after `fit_counted`. (3) Pipeline exclusion: a gated metric never takes the ungated pipeline write-back (`pipeline_fit_safe`). (4) Wide admission: with at least 1 048 576 training rows, or for `correlation`, `correlation_signed` and `signed` (`fit::admits_every_candidate`) at any size, every candidate with constants is fitted and only constant-free candidates are screened; other metrics keep `max(32, pop/4)` below the threshold.
+
+`--fit-strategy gpu`
 applies to metrics with a native device objective: the squared/AIC family,
 `log_squashed` (#229) with per-row IRLS weights `2/(1 + r²)` and an f64 loss
 accumulator, `absolute` (#222) with per-row Lawson weights

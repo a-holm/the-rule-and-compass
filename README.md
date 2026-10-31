@@ -179,7 +179,8 @@ long/flat from the training mean, matched-exposure random long seeded by
 `--policy band` adds a long-only no-trade band (`--band`, `--min-hold`) whose
 associative `Carry2`/`CooldownCarry` is chunk-invariant, and `--policy dp`
 adds the exact `O(2n)` hindsight DP as a labelled bound, never as the
-strategy's P&L. See [`docs/walkforward.md`](docs/walkforward.md) for the
+strategy's P&L. `--gpu` runs both scans on the CUDA device, bit-identical to the
+CPU scans, and names the reason when it falls back to the CPU. See [`docs/walkforward.md`](docs/walkforward.md) for the
 semantics and metric definitions, and [`docs/eval-benchmark.md`](docs/eval-benchmark.md) for
 the pinned 4M-row benchmark protocol and the measured wall time.
 
@@ -492,6 +493,14 @@ atomically instead of streaming it. See
   same way. `prep --resume` caches one checksum-keyed spool per symbol;
   `--snapshot` embeds a verified archive snapshot. See
   [`docs/panel.md`](docs/panel.md).
+* **Default hourly PIT panel v2**: `rcsr panel snapshot|base|membership|build|validate`
+  builds `panel_hourly_default.rcsb` in staged, cacheable steps. `snapshot` hashes
+  every archive and lists the duplicate and invalid-OHLC bars. `base` keeps only
+  full four-bar hours (`cov15m`), collapses identical duplicate instants, flags
+  differing ones and stores the unit of each source. `build` keeps point-in-time
+  members, numbers listings, fails on an undeclared level jump and refuses the
+  lockbox. `validate` runs V1-V12 and exits 3 on a failure. See
+  [`docs/panel.md`](docs/panel.md#default-hourly-panel-v2-259).
 * **Stable exit codes**: `0` success, `2` usage error, `3` input error,
   `4` no finite solution.
 
@@ -560,7 +569,8 @@ rcsr --data <file|-> --target <col> [--vars a,b,..]
      [--op-complexity spec] [--complexity-weights spec] [--depth-weight w]
      [--split random|temporal|group|temporal-group|auto] [--time col]
      [--date-only error|utc-midnight|session-close] [--time-unit s|ms|us|ns] [--tz offset]
-     [--group-by col] [--no-project] [--gap N] [--folds K] [--lags K] [--history-frac f]
+     [--group-by col] [--no-project] [--project n|auto] [--view k] [--gap N] [--folds K]
+     [--lags K | --lag-set k,..|default] [--history-frac f]
      [--validation-frac f] [--select-by train|validation|aicc] [--require-validation]
      [--equivalence-z z] [--noise-lag n|auto]
      [--allow-lockbox] [--target-spec file] [--allow-target-structure]
@@ -863,6 +873,10 @@ use them like any other column:
 # y_t = 1 + 3·x_{t-1}:  let the engine look one step back
 rcsr --data lag.csv --target y --vars x --split temporal --time t --lags 1
 ```
+
+`--lag-set 1,4,24,96` (or `default`, the same menu) replaces the blanket `--lags K`: it adds `x_lag<k>` only for the listed bar counts, which keeps the variable count and the mutation dilution down on a wide store. The two flags are alternatives. Stderr and the split report give `nvars` before and after (`nvars 2 -> 10` for two variables and four lags). The first `max(k)` rows of each series are history, as with `--lags`; no normalisation or centred window is involved.
+
+`--project n|auto` (with `--view k`) selects `--vars` from the feature registry instead: a deterministic family-stratified view of 24-48 columns (research cell 96-128), rotated by `--seed` and `--view`, recorded in `--run-manifest`.
 
 `--history-frac f` keeps the first share of every series as *history*: those
 rows provide the past for later rows but are not scored, so a delay near the

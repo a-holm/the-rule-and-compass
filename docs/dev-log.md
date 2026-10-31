@@ -261,7 +261,7 @@ because that loop has neither.
 | field | meaning |
 |---|---|
 | `generations` | generations completed |
-| `stop` | `solved` (error at or below the solved floor), `patience`, `time_budget`, `generations` (budget reached) or `already_stopped` (a resumed checkpoint was already finished) |
+| `stop` | `solved` (error at or below the solved floor; never for AIC, AICC, BIC), `patience`, `time_budget`, `generations` (budget reached) or `already_stopped` (a resumed checkpoint was already finished) |
 | `wall`, `search` | seconds from the CLI taking the clock to the end of the search, and the search phase alone |
 | `archive` | the final `size`, `best_error` and `hash` |
 | `json` | where the result JSON went (`null` = stdout) |
@@ -270,6 +270,7 @@ because that loop has neither.
 | `device_seconds_incl_fit`, `device_hours`, `device_fraction_of_run` | #256: evaluator wall plus fit kernel seconds, that over 3600, and that over `wall` |
 | `run_wall_s`, `device_busy_s`, `duty_run` | #284 run ledger: run wall, **union** of device intervals, and their ratio |
 | `unaccounted_s` | `run_wall_s − Σ stage_s`; >1 % of wall is a telemetry defect |
+| `device_busy_s` basis | the union uses CUDA event timestamps when they are available; the stage seconds (including `io`), the placement basis (`events`, `host_envelope`, `mixed`) and the structural-zero stages (`features`, `pnl`) are in `--json` `gpu.ledger`, not in this event |
 | `fit_kernel_s`, `fit_fallback_s` | raw device fit-kernel seconds and measured exact-CPU fit-fallback seconds |
 | `events`, `bytes`, `dropped` | log bookkeeping **before** this event; `dropped` counts events lost to the byte cap |
 | `end` | UTC end time |

@@ -51,6 +51,8 @@ DST is computed from the US/UK rules, so a 14:30 UTC open in January becomes a
 bar outside a session, so a bar cannot silently cross a session boundary. A
 crypto daily bucket is still the UTC day.
 
+`resample_calendar` aggregates whatever bars fall in a bucket and does not require all of them, so a 1h bucket built from one to three 15m bars looks complete. The default hourly panel does not use it. `rcsr panel base` (`src/panel_v2.rs`, folding with `src/panel_prep.rs`) requires four contiguous 15m bars, records `cov15m`, and drops or flags (`PARTIAL_BUCKET`) every other hour. See [`panel.md`](panel.md#default-hourly-panel-v2-259).
+
 ## Causal multi-timeframe joins
 
 `join_causal(base, higher, higher_tf)` gives every base bar the last higher bar
@@ -372,7 +374,7 @@ expanded panel. It is the union of:
   `available:true` with a tested causal join;
 * the 45 `cross` columns (benchmark joins, market state, breadth, dispersion,
   average correlation, ranks), which are `available:true`;
-* the reserved derivative columns, which are the only `available:false` entries
+* the ten reserved derivative columns, which are the only `available:false` entries
   and carry an explicit dependency.
 
 `rcsr schema` prints two machine-readable inventories. `engine_catalogue`
@@ -387,6 +389,15 @@ Unknown names remain hard errors; a registered-but-unavailable name fails with
 its missing dependency, never an empty column. Adding a compact-only engine name
 to the registry does not remove it from `engine_catalogue`; runtime projection is
 the only way a requested column is omitted.
+
+### Derivatives family (reserved, gated)
+
+The ten derivative columns are `family=derivatives`, `available:false`, `source:null`: `funding_rate`, `funding_carry_24h`, `basis_bps`, `oi`, `oi_chg_1h`, `oi_chg_24h`, `ls_ratio`, `taker_buy_sell_ratio`, `liq_long`, `liq_short`. Each registry entry also carries `required_source`, `publication_lag`, `required_raw_field` and `flip_condition`. No funding, open-interest, basis or liquidation data exists locally and `rcsr` does not download any.
+
+* A request for one of these names, or for the group `derivatives`, is refused with the missing raw field. It never writes zeros, an empty column or a forward-filled value.
+* A name that is not in the list (`funding_rate_8h`) is an unknown feature.
+* A column can become available only through `derivatives::verify`, which reads a local snapshot CSV (`field,symbol,publish_time,value`; `field` is the raw vendor field, `publish_time` is when the value became known). The snapshot must cover every panel symbol on at least 99% of the days for every required field, and its rows must pass the PIT join check. No command line flag enables this path; the registry and the panel manifest stay `available:false` by default.
+* Join rules (`derivatives::column`): a bar at `t` sees only rows with `publish_time <= t`, otherwise `NaN`. A value older than two cadences is `NaN`. `funding_carry_24h` is the sum of the three latest published payments. `oi_chg_*` compares two known snapshots. `basis_bps = (mark / spot - 1) * 1e4` needs both legs at the same timestamp; one missing leg is `NaN`, never a splice from another bar. `liq_long` and `liq_short` have no join and stay unavailable.
 
 Every engine formula has one name and one definition. The cross-group names are
 registered explicitly, not left to group order:
@@ -610,6 +621,12 @@ report (`# enrich-feature: ...`) and the JSON sidecar. The candle/price-action
 registry entries record `source: "15m OHLCV bars; not a target construction
 column"`, and no candle column is used to construct a label.
 
+### Registry schema, views and time-major append (#260)
+
+Every column of the default financial feature set resolves to a registry entry (`registry::lookup`): family, timeframe, source columns, transform, causal offset, warm-up, unit, PIT rule, semantic cost, status. `<panel>.schema.json` adds the dtype, availability range and a per-column SHA-256 (docs/data-format.md). `rcsr schema` prints `feature_registry_version`, `schema_version` and the `feature_registry` array. Compact 52-feature parity is owned by #269; the registry only registers and hashes columns.
+
+`rcsr enrich` still needs one contiguous run per symbol. Compute a family on the symbol-major store, then carry it into the time-major panel with `rcsr panel append` (see `rcsr panel --help`); the panel's own blocks and per-column hashes do not change, and prefix causality is inherited from the enrich pass (`tests/registry.rs::an_appended_family_is_causal_on_a_prefix`, `every_registered_available_column_is_causal_on_a_prefix`).
+
 ### Causality, gaps and warm-up
 
 `rcsr enrich` reads one symbol at a time, so the input must contain one
@@ -704,7 +721,7 @@ Parity tiers are declared per column in `feature_registry.parity_tier`:
 
 | tier | columns |
 |---|---|
-| `bitwise` | `vwap`, `taker_ratio96`, `taker_imb16`, `zero_ret_share96`, `obv_z96`, `cvd_proxy`, `vwap_dev96`, `cmf20`, `vwap20_dev`, and all eleven `price_action` columns |
+| `bitwise` | `vwap`, `taker_ratio96`, `taker_imb16`, `zero_ret_share96`, `obv_z96`, `cvd_proxy`, `vwap_dev96`, `cmf20`, `vwap20_dev`, and all eleven `price_action` columns (`nr4` included; `nr4_is_bit_exact_on_the_device` asserts it bit-exact against the CPU) |
 | `1e-12` | `trade_intensity96`, `avg_trade_size96`, `amihud96` (each takes a logarithm) |
 | `reference` | every other registered column (CPU reference; no device claim in #297) |
 | `unavailable` | the reserved derivative columns |
@@ -935,6 +952,22 @@ per-column staging path with the reason recorded. `RCSR_ENRICH_GPU_BATCH=0`
 selects the per-column path for an A/B measurement. The report now carries
 `gpu.kernel_s`, `gpu.d2h_s`, `gpu.write_s`, `gpu.transfer_bytes` and the
 `write_bw` charged by the planner, separately.
+
+`timing.feature_s` is the host-thread wall time of the feature phase. It is
+partitioned into disjoint intervals on that thread:
+
+| Field | Interval |
+|---|---|
+| `timing.feature_read_s` | whole-column host reads for the MTF, benchmark and whole-column upload paths |
+| `timing.feature_context_s` | device context creation, including the projected upload |
+| `timing.feature_gpu_s` | host-side launch, sync and download wall of the GPU section, excluding `gpu.write_s` |
+| `gpu.write_s` | host staging writes of GPU output blocks |
+| `timing.feature_cpu_s` | the CPU fallback pass |
+| `timing.feature_other_s` | `feature_s` minus the five above; never negative beyond clock rounding |
+
+`gpu.kernel_s`, `gpu.h2d_s` and `gpu.d2h_s` are device-busy measures. They
+overlap the host timeline and are not summed into the partition. The text
+report prints the partition on the `# enrich: feature_parts` line.
 
 Paired A/B on the 3,874,994-row store, `--features returns --gpu auto
 --dry-run` (same input, same 118 dispatched columns, alternating order, two runs

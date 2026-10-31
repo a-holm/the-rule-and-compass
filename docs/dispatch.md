@@ -48,10 +48,12 @@ generation. The ledger labels the held case `hysteresis_device`.
 
 `Calibration::probe()` times the host (median of 31 reps). The host terms that
 route stages (`cpu_eval`, `cpu_fit`) stay within a fixed factor of their anchors,
-so the route ledger of two identical CPU runs has identical bytes; the raw probe
+so the route ledger of two identical CPU runs has identical bytes (`predicted_s`
+in the result JSON follows the host rate); the raw probe
 rate is reported unclamped as `host_rate` with its spread. With `--gpu` and a
 usable device, `dispatch_gpu::device_rates()` times the device once per process
-and `Calibration::with_device_rates` installs the result. Without a device the
+and `Calibration::with_device_rates` installs the result. The launch term is small
+in the model and its band is wide; the other terms dominate a route. Without a device the
 device terms stay the corpus anchors:
 
 | term | anchor | device probe |

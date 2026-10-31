@@ -55,6 +55,13 @@ impl Stage {
         Stage::HostOther,
     ];
 
+    /// Stages a search run has no work for by design. Enrichment and P&L are
+    /// separate commands; their ledger value inside a search run is zero by
+    /// construction, not by omission.
+    pub fn structurally_zero_in_search(self) -> bool {
+        matches!(self, Stage::Features | Stage::Pnl)
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Stage::Vary => "vary",
@@ -128,6 +135,16 @@ impl Ratio {
     }
 }
 
+/// #284: where an interval's placement on the run clock came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntervalSource {
+    /// Start and stop are CUDA event timestamps, read back after the sync.
+    Event,
+    /// Placed from the host envelope of the call; used when events are not
+    /// available.
+    HostEnvelope,
+}
+
 /// #284: one half-open `[start_s, end_s)` interval on the run clock. Device
 /// intervals are merged by [`RunLedger::device_busy_s`]; `stream` is retained
 /// so a reader can see that two intervals were concurrent.
@@ -137,6 +154,7 @@ pub struct Interval {
     pub stream: u32,
     pub start_s: f64,
     pub end_s: f64,
+    pub source: IntervalSource,
 }
 
 /// #334: allocator activity of the persistent fit and score regions. Counters
@@ -192,6 +210,9 @@ pub struct RunLedger {
     refits: u64,
     /// #334: allocator activity of the fit and score regions.
     fit_alloc: FitAlloc,
+    /// Windows before the search clock starts (data load, preparation). They
+    /// are not part of the run wall, so they never enter the closure.
+    outside_s: [f64; 9],
 }
 
 impl RunLedger {
@@ -222,6 +243,18 @@ impl RunLedger {
     /// Add one device interval. The interval is clamped to a finite,
     /// non-negative half-open window; an invalid interval is not recorded.
     pub fn record_interval(&mut self, stage: Stage, stream: u32, start_s: f64, end_s: f64) {
+        self.record_interval_from(stage, stream, start_s, end_s, IntervalSource::HostEnvelope);
+    }
+
+    /// Add one device interval with an explicit placement source.
+    pub fn record_interval_from(
+        &mut self,
+        stage: Stage,
+        stream: u32,
+        start_s: f64,
+        end_s: f64,
+        source: IntervalSource,
+    ) {
         if !start_s.is_finite() || !end_s.is_finite() || end_s <= start_s {
             return;
         }
@@ -229,7 +262,22 @@ impl RunLedger {
         if end_s <= start_s {
             return;
         }
-        self.intervals.push(Interval { stage, stream, start_s, end_s });
+        self.intervals.push(Interval { stage, stream, start_s, end_s, source });
+    }
+
+    /// Record the evaluator's kernel window from CUDA event timestamps.
+    /// `start_s` is the event start on the run clock.
+    pub fn record_eval_kernel_event(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
+        if kernel_s.is_finite() && kernel_s > 0.0 {
+            self.eval_kernel_s += kernel_s;
+            self.record_interval_from(
+                Stage::Eval,
+                stream,
+                start_s,
+                start_s + kernel_s,
+                IntervalSource::Event,
+            );
+        }
     }
 
     /// Record the evaluator's measured device kernel window. `start_s` is on the
@@ -261,6 +309,19 @@ impl RunLedger {
     pub fn record_fit_kernel_interval(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
         if kernel_s.is_finite() && kernel_s > 0.0 {
             self.record_interval(Stage::Fit, stream, start_s, start_s + kernel_s);
+        }
+    }
+
+    /// Record one fit device kernel interval placed from CUDA event timestamps.
+    pub fn record_fit_kernel_event(&mut self, stream: u32, start_s: f64, kernel_s: f64) {
+        if kernel_s.is_finite() && kernel_s > 0.0 {
+            self.record_interval_from(
+                Stage::Fit,
+                stream,
+                start_s,
+                start_s + kernel_s,
+                IntervalSource::Event,
+            );
         }
     }
 
@@ -320,6 +381,9 @@ impl RunLedger {
     /// main-thread decomposition.
     pub fn absorb(&mut self, other: &RunLedger) {
         self.intervals.extend_from_slice(&other.intervals);
+        for (mine, theirs) in self.outside_s.iter_mut().zip(other.outside_s) {
+            *mine += theirs;
+        }
         self.eval_kernel_s += other.eval_kernel_s;
         self.eval_window_s += other.eval_window_s;
         self.fit_host_s += other.fit_host_s;
@@ -338,6 +402,39 @@ impl RunLedger {
         self.fit_alloc.batches += other.fit_alloc.batches;
         for (name, count) in &other.fallback_by_cause {
             *self.fallback_by_cause.entry(name.clone()).or_default() += *count;
+        }
+    }
+
+    /// Add a window that ran before the search clock started.
+    pub fn record_outside(&mut self, stage: Stage, seconds: f64) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.outside_s[stage.index()] += seconds;
+        }
+    }
+
+    pub fn outside_s(&self, stage: Stage) -> f64 {
+        self.outside_s[stage.index()]
+    }
+
+    /// Number of device intervals placed from event timestamps and from the host
+    /// envelope.
+    pub fn interval_counts(&self) -> (usize, usize) {
+        let event = self
+            .intervals
+            .iter()
+            .filter(|i| i.source == IntervalSource::Event)
+            .count();
+        (event, self.intervals.len() - event)
+    }
+
+    /// How the device intervals were placed: `events`, `host_envelope`, `mixed`
+    /// or `none`.
+    pub fn interval_basis(&self) -> &'static str {
+        match self.interval_counts() {
+            (0, 0) => "none",
+            (_, 0) => "events",
+            (0, _) => "host_envelope",
+            _ => "mixed",
         }
     }
 
@@ -892,5 +989,50 @@ mod tests {
         assert_eq!(d.d2h_bytes, 40);
         assert!((d.wall_s - 0.004).abs() < 1e-12);
         assert!((d.accounted_s() - 0.001).abs() < 1e-12); // five 0.2 ms windows
+    }
+
+    /// #284: an interval placed from event timestamps is labelled as such; the
+    /// host envelope stays the labelled fallback and a mix says so.
+    #[test]
+    fn run_ledger_labels_event_and_host_envelope_intervals() {
+        let mut l = RunLedger::new();
+        assert_eq!(l.interval_basis(), "none");
+        l.record_eval_kernel_event(0, 1.0, 0.5);
+        l.record_fit_kernel_event(1, 1.25, 0.5);
+        assert_eq!(l.interval_basis(), "events");
+        assert_eq!(l.interval_counts(), (2, 0));
+        assert!((l.device_busy_s() - 0.75).abs() < 1e-12);
+        l.record_eval_kernel(0, 4.0, 0.5);
+        assert_eq!(l.interval_basis(), "mixed");
+        assert_eq!(l.interval_counts(), (2, 1));
+        let mut host = RunLedger::new();
+        host.record_fit_kernel_interval(0, 0.0, 1.0);
+        assert_eq!(host.interval_basis(), "host_envelope");
+        l.absorb(&host);
+        assert_eq!(l.interval_counts(), (2, 2));
+    }
+
+    /// #284: stages with no work in a search run are named, and windows before
+    /// the run clock stay outside the closure.
+    #[test]
+    fn run_ledger_names_structural_zero_stages_and_keeps_outside_windows_out_of_closure() {
+        let zero: Vec<&str> = Stage::ALL
+            .iter()
+            .filter(|s| s.structurally_zero_in_search())
+            .map(|s| s.label())
+            .collect();
+        assert_eq!(zero, ["features", "pnl"]);
+        let mut l = RunLedger::new();
+        l.record_outside(Stage::Io, 2.0);
+        l.record_outside(Stage::Features, 1.5);
+        l.record_stage(Stage::Eval, 1.0);
+        l.set_wall(1.0);
+        assert_eq!(l.outside_s(Stage::Io), 2.0);
+        assert_eq!(l.outside_s(Stage::Features), 1.5);
+        assert_eq!(l.stage_s(Stage::Io), 0.0);
+        assert!(l.closure_residual().value.abs() < 1e-12);
+        let mut total = RunLedger::new();
+        total.absorb(&l);
+        assert_eq!(total.outside_s(Stage::Io), 2.0);
     }
 }

@@ -401,6 +401,75 @@ fn reported_finalists_are_refit_exactly_on_the_cpu() {
     }
 }
 
+/// #287 AC6: for every metric the device scores natively, the reported score of
+/// each finalist after the exact refit is the CPU `score_weighted` of the stored
+/// tree on the same data, bit for bit. Metrics the device refuses are not run.
+#[cfg(feature = "cuda")]
+#[test]
+fn reported_finalists_equal_cpu_score_for_every_native_metric() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    let metrics = [
+        Metric::Squared,
+        Metric::Absolute,
+        Metric::LogSquashed,
+        Metric::Signed,
+        Metric::Maximum,
+        Metric::Correlation,
+        Metric::CorrelationSigned,
+        Metric::Aic,
+        Metric::Aicc,
+        Metric::Bic,
+        Metric::LogLoss,
+        Metric::Brier,
+        Metric::Hinge,
+        Metric::HingeOrdinary,
+        Metric::HingeSquared,
+    ];
+    for metric in metrics {
+        let objective = rcsr::metrics::native_score_objective(metric)
+            .unwrap_or_else(|| panic!("{metric:?} has no native objective"));
+        let mut train = sample(600, 7);
+        let mut test = sample(100, 8);
+        if objective.is_classification() {
+            for s in [&mut train, &mut test] {
+                for y in s.y.iter_mut() {
+                    *y = if *y > 0.0 { 1.0 } else { 0.0 };
+                }
+            }
+        }
+        let cfg = Config {
+            metric,
+            ..gpu_config(13)
+        };
+        let out = search::run(&cfg, &train, &test);
+        assert_eq!(out.backend, rcsr::backend::Kind::Gpu, "{metric:?} backend");
+        let g = out.gpu.as_ref().expect("a GPU report");
+        assert!(g.fit_refits > 0, "{metric:?}: finalists were refit: {:?}", g);
+        assert_fit_ledger(g);
+        assert!(!out.archive.items.is_empty(), "{metric:?}: empty archive");
+        for s in &out.archive.items {
+            let pred: Vec<f64> = train.x.iter().map(|row| expr::eval(&s.tree, row)).collect();
+            let cpu = rcsr::metrics::score_weighted(
+                &pred,
+                &train.y,
+                &train.w,
+                metric,
+                expr::count_constants(&s.tree),
+            );
+            assert_eq!(
+                s.error.to_bits(),
+                cpu.to_bits(),
+                "{metric:?}: archive row is not the exact CPU score: {} vs {}",
+                s.error,
+                cpu
+            );
+        }
+    }
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 fn unsupported_trees_fall_back_and_the_kernel_is_not_a_noop() {
@@ -1181,4 +1250,87 @@ fn the_usage_gate_only_refuses_explicit_gpu_outside_the_family() {
             "--fit-strategy {strategy} keeps metric-aware CPU fitting: {stderr}"
         );
     }
+}
+
+/// #399: an exactly zero normal-equation diagonal freezes that slot; the other
+/// constants are still fitted on the device and match the CPU fit.
+#[cfg(feature = "cuda")]
+#[test]
+fn zero_adjoint_constant_is_frozen_and_the_rest_are_fitted() {
+    if !device_available() {
+        eprintln!("skipping GPU test: no usable CUDA device");
+        return;
+    }
+    use rcsr::expr::{constant, input, node, Op};
+    use rcsr::fit::{fit_weighted_metric, BatchedFitter, BatchedGpu};
+
+    let n = 256;
+    let x: Vec<Vec<f64>> = (0..n)
+        .map(|i| vec![i as f64 / (n - 1) as f64 * 4.0 - 2.0, 0.0])
+        .collect();
+    let y: Vec<f64> = x.iter().map(|r| 1.3 * r[0] + 0.5).collect();
+    let nv = 2;
+    let cols: Vec<f32> = (0..nv)
+        .flat_map(|v| x.iter().map(move |r| r[v] as f32))
+        .collect();
+    let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+    let mut cols64 = vec![0.0f64; n * nv];
+    for (r, row) in x.iter().enumerate() {
+        for (v, &val) in row.iter().enumerate() {
+            cols64[v * n + r] = val;
+        }
+    }
+    let mut ev = match rcsr::gpu::GpuEvaluator::new(&cols, n, nv, &y32) {
+        Some(ev) => ev,
+        None => {
+            eprintln!("skipping GPU test: evaluator construction failed");
+            return;
+        }
+    };
+    assert!(ev.set_fit_data(&cols64, &y, &[]), "f64 fit rows uploaded");
+
+    // c1*x0 + c0 + c2*x1, where x1 is identically zero: c2 has a zero adjoint.
+    let model = || {
+        node(
+            Op::Add,
+            vec![
+                node(Op::Mul, vec![constant(1.0), input(0)]),
+                constant(0.0),
+                node(Op::Mul, vec![constant(0.7), input(1)]),
+            ],
+        )
+    };
+    let consts = |t: &rcsr::expr::Node| {
+        fn walk(n: &rcsr::expr::Node, out: &mut Vec<f64>) {
+            if n.op == Op::Const {
+                out.push(n.val);
+            }
+            for k in &n.kids {
+                walk(k, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(t, &mut out);
+        out
+    };
+
+    let trees = vec![model()];
+    let backend = BatchedGpu::new(&mut ev);
+    let proposals = backend.fit_batch_metric(&trees, &x, &y, &[], 8, Metric::Squared);
+    let device = proposals[0]
+        .clone()
+        .expect("a zero diagonal must not drop the candidate");
+    let mut cpu = model();
+    fit_weighted_metric(&mut cpu, &x, &y, &[], 8, Metric::Squared);
+    let cpu_c = consts(&cpu);
+    assert_eq!(device.len(), 3);
+    for (d, c) in device.iter().zip(&cpu_c) {
+        assert!(
+            (d - c).abs() <= 1e-4 * (1.0 + c.abs()),
+            "device {d} vs CPU {c}"
+        );
+    }
+    assert!((device[0] - 1.3).abs() < 1e-3, "slope {}", device[0]);
+    assert!((device[1] - 0.5).abs() < 1e-3, "intercept {}", device[1]);
+    assert_eq!(device[2], 0.7, "the frozen slot does not move");
 }
