@@ -370,7 +370,7 @@ expanded panel. It is the union of:
   (`enrich::engine_names()`), emitted by the same command plus `compact`;
 * the 36 multi-timeframe columns (`--features mtf`), which are
   `available:true` with a tested causal join;
-* the 45 `cross` columns (#273: benchmark joins, market state, breadth, dispersion,
+* the 45 `cross` columns (benchmark joins, market state, breadth, dispersion,
   average correlation, ranks), which are `available:true`;
 * the reserved derivative columns, which are the only `available:false` entries
   and carry an explicit dependency.
